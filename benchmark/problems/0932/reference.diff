@@ -1,0 +1,472 @@
+diff --git a/gittensor/utils/github_api_tools.py b/gittensor/utils/github_api_tools.py
+index 6fd58f52..db35a738 100644
+--- a/gittensor/utils/github_api_tools.py
++++ b/gittensor/utils/github_api_tools.py
+@@ -6,6 +6,7 @@
+ from contextlib import contextmanager
+ from dataclasses import dataclass
+ from datetime import datetime, timedelta, timezone
++from enum import Enum
+ from math import ceil
+ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
+ 
+@@ -38,6 +39,19 @@
+ # Beyond this many CHANGES_REQUESTED reviews the quality multiplier is already 0
+ _MAX_CHANGES_REQUESTED_REVIEWS = ceil(1 / REVIEW_PENALTY_RATE)
+ 
++
++class GitHubIdentityStatus(Enum):
++    VALID = 'VALID'
++    INVALID_AUTH = 'INVALID_AUTH'
++    TRANSIENT_FAILURE = 'TRANSIENT_FAILURE'
++
++
++@dataclass(frozen=True)
++class GitHubIdentityResult:
++    github_id: Optional[str]
++    status: GitHubIdentityStatus
++
++
+ # core github graphql query
+ QUERY = """
+     query($userId: ID!, $limit: Int!, $cursor: String, $maxChangesRequestedReviews: Int!) {
+@@ -222,17 +236,33 @@ def get_session(token: str) -> requests.Session:
+     return _session_cache[key]
+ 
+ 
+-def get_github_id(token: str) -> Optional[str]:
+-    """Get GitHub numeric user id (as string) using a PAT.
++def _is_rate_limited_response(response: requests.Response) -> bool:
++    if response.status_code == 429:
++        return True
++    if response.status_code != 403:
++        return False
++    if response.headers.get('x-ratelimit-remaining') == '0':
++        return True
++    try:
++        message = str(response.json().get('message', '')).lower()
++    except Exception:
++        message = getattr(response, 'text', '').lower()
++    return 'rate limit' in message
++
++
++def get_github_identity(token: str) -> GitHubIdentityResult:
++    """Get GitHub numeric user id and whether lookup failure is cacheable.
+ 
+     Args:
+         token (str): GitHub personal access token.
+ 
+     Returns:
+-        Optional[str]: Numeric user id as a string, or None if it cannot be determined.
++        GitHubIdentityResult: Numeric user id on success, invalid auth for
++            permanent auth failures, or transient failure when GitHub/user JSON
++            could not be reached after retries.
+     """
+     if not token:
+-        return None
++        return GitHubIdentityResult(None, GitHubIdentityStatus.INVALID_AUTH)
+ 
+     session = get_session(token)
+ 
+@@ -243,12 +273,35 @@ def get_github_id(token: str) -> Optional[str]:
+             if response.status_code == 200:
+                 try:
+                     user_data: Dict[str, Any] = response.json()
+-                except Exception as e:  # pragma: no cover
++                except Exception as e:
+                     bt.logging.warning(f'Failed to parse GitHub /user JSON response: {e}')
+-                    return None
++                    if attempt < 5:
++                        time.sleep(2)
++                        continue
++                    return GitHubIdentityResult(None, GitHubIdentityStatus.TRANSIENT_FAILURE)
+ 
+                 user_id = user_data.get('id')
+-                return str(user_id) if user_id is not None else None
++                if user_id is not None:
++                    return GitHubIdentityResult(str(user_id), GitHubIdentityStatus.VALID)
++
++                bt.logging.warning(f'GitHub /user response missing id (attempt {attempt + 1}/6)')
++                if attempt < 5:
++                    time.sleep(2)
++                    continue
++                return GitHubIdentityResult(None, GitHubIdentityStatus.TRANSIENT_FAILURE)
++
++            if response.status_code == 408 or _is_rate_limited_response(response):
++                bt.logging.warning(
++                    f'GitHub /user request failed with status {response.status_code} (attempt {attempt + 1}/6)'
++                )
++                if attempt < 5:
++                    time.sleep(2)
++                    continue
++                return GitHubIdentityResult(None, GitHubIdentityStatus.TRANSIENT_FAILURE)
++
++            if 400 <= response.status_code < 500:
++                bt.logging.warning(f'GitHub /user auth failed with status {response.status_code}')
++                return GitHubIdentityResult(None, GitHubIdentityStatus.INVALID_AUTH)
+ 
+             bt.logging.warning(
+                 f'GitHub /user request failed with status {response.status_code} (attempt {attempt + 1}/6)'
+@@ -261,7 +314,12 @@ def get_github_id(token: str) -> Optional[str]:
+             if attempt < 5:  # Don't sleep on last attempt
+                 time.sleep(2)
+ 
+-    return None
++    return GitHubIdentityResult(None, GitHubIdentityStatus.TRANSIENT_FAILURE)
++
++
++def get_github_id(token: str) -> Optional[str]:
++    """Get GitHub numeric user id (as string) using a PAT."""
++    return get_github_identity(token).github_id
+ 
+ 
+ def get_merge_base_sha(repository: str, base_sha: str, head_sha: str, token: str) -> Optional[str]:
+diff --git a/gittensor/validator/oss_contributions/inspections.py b/gittensor/validator/oss_contributions/inspections.py
+index 85997839..1cf61f9c 100644
+--- a/gittensor/validator/oss_contributions/inspections.py
++++ b/gittensor/validator/oss_contributions/inspections.py
+@@ -8,7 +8,7 @@
+ 
+ from gittensor.classes import MinerEvaluation
+ from gittensor.constants import RECYCLE_UID
+-from gittensor.validator.utils.github_validation import validate_github_credentials
++from gittensor.validator.utils.github_validation import validate_github_credentials_result
+ 
+ 
+ def detect_and_penalize_miners_sharing_github(miner_evaluations: Dict[int, MinerEvaluation]) -> Set[int]:
+@@ -98,7 +98,11 @@ def _zero_for_duplicate_penalty(eval_: MinerEvaluation, reason: str) -> None:
+ 
+ 
+ def validate_response_and_initialize_miner_evaluation(
+-    uid: int, hotkey: str, pat: Optional[str], stale_hotkey: Optional[str] = None
++    uid: int,
++    hotkey: str,
++    pat: Optional[str],
++    stale_hotkey: Optional[str] = None,
++    stored_github_id: Optional[str] = None,
+ ) -> MinerEvaluation:
+     """
+     Validate a miner's stored PAT and initialize their evaluation object.
+@@ -108,6 +112,8 @@ def validate_response_and_initialize_miner_evaluation(
+         hotkey: The miner's hotkey
+         pat: The miner's GitHub PAT from local storage (may be None if not stored)
+         stale_hotkey: If set, the UID has a stored PAT from this old hotkey (re-registration detected)
++        stored_github_id: GitHub id pinned when the PAT was accepted; used only
++            to allow cache fallback if GitHub /user is transiently unavailable.
+ 
+     Returns:
+         MinerEvaluation: Initialized evaluation object with failure reason if validation failed
+@@ -131,11 +137,15 @@ def validate_response_and_initialize_miner_evaluation(
+ 
+     miner_eval = MinerEvaluation(uid=uid, hotkey=hotkey)
+ 
+-    github_id, error = validate_github_credentials(uid, pat)
+-    if error:
+-        miner_eval.failed_reason = error
++    validation = validate_github_credentials_result(uid, pat, stored_github_id=stored_github_id)
++    if validation.error:
++        miner_eval.failed_reason = validation.error
++        return miner_eval
++
++    miner_eval.github_id = validation.github_id
++    if validation.transient_failure:
++        miner_eval.github_pr_fetch_failed = True
+         return miner_eval
+ 
+-    miner_eval.github_id = github_id
+     miner_eval.github_pat = pat
+     return miner_eval
+diff --git a/gittensor/validator/oss_contributions/reward.py b/gittensor/validator/oss_contributions/reward.py
+index 9c92a08a..e868c5e7 100644
+--- a/gittensor/validator/oss_contributions/reward.py
++++ b/gittensor/validator/oss_contributions/reward.py
+@@ -39,6 +39,7 @@ async def evaluate_miners_pull_requests(
+     programming_languages: Dict[str, LanguageConfig],
+     token_config: TokenConfig,
+     stale_hotkey: Optional[str] = None,
++    stored_github_id: Optional[str] = None,
+ ) -> MinerEvaluation:
+     """
+     Entry point from taking a miners response -> Get PRs -> Score PRs
+@@ -51,6 +52,7 @@ async def evaluate_miners_pull_requests(
+         programming_languages: The programming languages and their weights
+         token_config: Token-based scoring weights configuration
+         stale_hotkey: If set, the UID has a stored PAT from this old hotkey (re-registration detected)
++        stored_github_id: GitHub id recorded when the stored PAT was accepted
+ 
+     Returns:
+         MinerEvaluation: The object containing scores, valid_prs, etc.
+@@ -58,11 +60,21 @@ async def evaluate_miners_pull_requests(
+ 
+     bt.logging.info(f'******* Reward function called for UID: {uid} *******')
+ 
+-    miner_eval = validate_response_and_initialize_miner_evaluation(uid, hotkey, pat, stale_hotkey=stale_hotkey)
++    miner_eval = validate_response_and_initialize_miner_evaluation(
++        uid,
++        hotkey,
++        pat,
++        stale_hotkey=stale_hotkey,
++        stored_github_id=stored_github_id,
++    )
+     if miner_eval.failed_reason is not None:
+         bt.logging.info(f'UID {uid} not being evaluated: {miner_eval.failed_reason}')
+         return miner_eval
+ 
++    if miner_eval.github_pr_fetch_failed:
++        bt.logging.warning(f'UID {uid}: GitHub identity lookup failed transiently; deferring to cache fallback')
++        return miner_eval
++
+     # Partition repos by source: legacy (PAT) vs mirror (das-github-mirror).
+     # Each path is a closed loop that populates its own slots on the miner_eval;
+     # combine() merges the mirror scratch container into the returned MinerEvaluation.
+@@ -127,9 +139,11 @@ async def get_rewards(
+         pat_entry = pat_by_uid.get(uid)
+         pat = None
+         stale_hotkey = None
++        stored_github_id = None
+         if pat_entry:
+             if pat_entry.get('hotkey') == hotkey:
+                 pat = pat_entry['pat']
++                stored_github_id = pat_entry.get('github_id')
+             else:
+                 stale_hotkey = pat_entry.get('hotkey')
+ 
+@@ -142,6 +156,7 @@ async def get_rewards(
+             programming_languages,
+             token_config,
+             stale_hotkey=stale_hotkey,
++            stored_github_id=stored_github_id,
+         )
+         miner_evaluations[uid] = miner_evaluation
+ 
+diff --git a/gittensor/validator/utils/github_validation.py b/gittensor/validator/utils/github_validation.py
+index dd194629..e8399ef0 100644
+--- a/gittensor/validator/utils/github_validation.py
++++ b/gittensor/validator/utils/github_validation.py
+@@ -3,18 +3,45 @@
+ 
+ """Shared GitHub credential validation used by multiple validator subsystems."""
+ 
++from dataclasses import dataclass
+ from typing import Optional, Tuple
+ 
+-from gittensor.utils.github_api_tools import get_github_id
++from gittensor.utils.github_api_tools import GitHubIdentityStatus, get_github_identity
++
++
++@dataclass(frozen=True)
++class GitHubCredentialValidation:
++    github_id: Optional[str]
++    error: Optional[str]
++    transient_failure: bool = False
+ 
+ 
+ def validate_github_credentials(uid: int, pat: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+     """Validate PAT and return (github_id, error_reason) tuple."""
++    validation = validate_github_credentials_result(uid, pat)
++    return validation.github_id, validation.error
++
++
++def validate_github_credentials_result(
++    uid: int,
++    pat: Optional[str],
++    stored_github_id: Optional[str] = None,
++) -> GitHubCredentialValidation:
++    """Validate PAT and expose transient /user lookup failures to scoring."""
+     if not pat:
+-        return None, f'No Github PAT provided by miner {uid}'
++        return GitHubCredentialValidation(None, f'No Github PAT provided by miner {uid}')
++
++    identity = get_github_identity(pat)
++    if identity.status is GitHubIdentityStatus.VALID:
++        return GitHubCredentialValidation(identity.github_id, None)
+ 
+-    github_id = get_github_id(pat)
+-    if not github_id:
+-        return None, f"No Github id found for miner {uid}'s PAT"
++    if identity.status is GitHubIdentityStatus.TRANSIENT_FAILURE:
++        if stored_github_id and stored_github_id != '0':
++            return GitHubCredentialValidation(stored_github_id, None, transient_failure=True)
++        return GitHubCredentialValidation(
++            None,
++            f'Could not validate Github id for miner {uid}: GitHub /user lookup failed transiently',
++            transient_failure=True,
++        )
+ 
+-    return github_id, None
++    return GitHubCredentialValidation(None, f"No Github id found for miner {uid}'s PAT")
+diff --git a/tests/utils/test_github_api_tools.py b/tests/utils/test_github_api_tools.py
+index a9de61a5..899f0aec 100644
+--- a/tests/utils/test_github_api_tools.py
++++ b/tests/utils/test_github_api_tools.py
+@@ -27,6 +27,7 @@
+ )
+ 
+ get_github_graphql_query = github_api_tools.get_github_graphql_query
++get_github_identity = github_api_tools.get_github_identity
+ get_github_id = github_api_tools.get_github_id
+ get_pull_request_file_changes = github_api_tools.get_pull_request_file_changes
+ get_merge_base_sha = github_api_tools.get_merge_base_sha
+@@ -377,6 +378,76 @@ def test_get_github_id_retry_logic(self, mock_logging, mock_sleep, mock_get):
+         assert result == '12345'
+         assert mock_get.call_count == 3
+ 
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    @patch('gittensor.utils.github_api_tools.time.sleep')
++    @patch('gittensor.utils.github_api_tools.bt.logging')
++    def test_get_github_identity_marks_5xx_as_transient(self, mock_logging, mock_sleep, mock_get):
++        mock_response = Mock(status_code=500)
++        mock_get.return_value = mock_response
++
++        result = get_github_identity('fake_token')
++
++        assert result.github_id is None
++        assert result.status is github_api_tools.GitHubIdentityStatus.TRANSIENT_FAILURE
++        assert mock_get.call_count == 6
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    @patch('gittensor.utils.github_api_tools.time.sleep')
++    @patch('gittensor.utils.github_api_tools.bt.logging')
++    def test_get_github_identity_marks_rate_limit_as_transient(self, mock_logging, mock_sleep, mock_get):
++        mock_response = Mock(status_code=429)
++        mock_get.return_value = mock_response
++
++        result = get_github_identity('fake_token')
++
++        assert result.github_id is None
++        assert result.status is github_api_tools.GitHubIdentityStatus.TRANSIENT_FAILURE
++        assert mock_get.call_count == 6
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    @patch('gittensor.utils.github_api_tools.time.sleep')
++    @patch('gittensor.utils.github_api_tools.bt.logging')
++    def test_get_github_identity_marks_403_rate_limit_as_transient(self, mock_logging, mock_sleep, mock_get):
++        mock_response = Mock(status_code=403)
++        mock_response.headers = {'x-ratelimit-remaining': '0'}
++        mock_get.return_value = mock_response
++
++        result = get_github_identity('fake_token')
++
++        assert result.github_id is None
++        assert result.status is github_api_tools.GitHubIdentityStatus.TRANSIENT_FAILURE
++        assert mock_get.call_count == 6
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    @patch('gittensor.utils.github_api_tools.time.sleep')
++    @patch('gittensor.utils.github_api_tools.bt.logging')
++    def test_get_github_identity_fails_closed_on_auth_status(self, mock_logging, mock_sleep, mock_get):
++        mock_response = Mock(status_code=403)
++        mock_response.headers = {}
++        mock_response.json.return_value = {'message': 'Resource not accessible by personal access token'}
++        mock_get.return_value = mock_response
++
++        result = get_github_identity('fake_token')
++
++        assert result.github_id is None
++        assert result.status is github_api_tools.GitHubIdentityStatus.INVALID_AUTH
++        assert mock_get.call_count == 1
++        mock_sleep.assert_not_called()
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    @patch('gittensor.utils.github_api_tools.time.sleep')
++    @patch('gittensor.utils.github_api_tools.bt.logging')
++    def test_get_github_identity_marks_bad_json_as_transient(self, mock_logging, mock_sleep, mock_get):
++        mock_response = Mock(status_code=200)
++        mock_response.json.side_effect = ValueError('bad json')
++        mock_get.return_value = mock_response
++
++        result = get_github_identity('fake_token')
++
++        assert result.github_id is None
++        assert result.status is github_api_tools.GitHubIdentityStatus.TRANSIENT_FAILURE
++        assert mock_get.call_count == 6
++
+ 
+ # ============================================================================
+ # File Changes Retry Logic Tests
+diff --git a/tests/validator/oss_contributions/mirror/test_routing.py b/tests/validator/oss_contributions/mirror/test_routing.py
+index 9bcdcf52..129f04b8 100644
+--- a/tests/validator/oss_contributions/mirror/test_routing.py
++++ b/tests/validator/oss_contributions/mirror/test_routing.py
+@@ -171,3 +171,30 @@ def test_failed_init_short_circuits():
+         assert result is me
+         mock_legacy_load.assert_not_called()
+         mock_mirror_load.assert_not_called()
++
++
++def test_identity_fetch_failure_short_circuits_to_cache_fallback():
++    """Transient /user failure should not fetch legacy or mirror PRs."""
++    me = _make_miner_eval(github_id='12345')
++    me.github_pr_fetch_failed = True
++
++    with (
++        patch.object(reward_module, 'validate_response_and_initialize_miner_evaluation', return_value=me),
++        patch.object(reward_module, 'load_miners_prs') as mock_legacy_load,
++        patch.object(reward_module, 'load_mirror_miner_prs') as mock_mirror_load,
++    ):
++        result = _run(
++            evaluate_miners_pull_requests(
++                uid=1,
++                hotkey='hk',
++                pat='fake-pat',
++                master_repositories=_configs(),
++                programming_languages={},
++                token_config=TokenConfig(),
++            )
++        )
++
++        assert result is me
++        assert result.should_use_cache_fallback is True
++        mock_legacy_load.assert_not_called()
++        mock_mirror_load.assert_not_called()
+diff --git a/tests/validator/test_github_identity_fallback.py b/tests/validator/test_github_identity_fallback.py
+new file mode 100644
+index 00000000..a0a912dd
+--- /dev/null
++++ b/tests/validator/test_github_identity_fallback.py
+@@ -0,0 +1,45 @@
++from typing import Optional
++from unittest.mock import patch
++
++from gittensor.utils.github_api_tools import GitHubIdentityResult, GitHubIdentityStatus
++from gittensor.validator.oss_contributions.inspections import validate_response_and_initialize_miner_evaluation
++
++
++def _identity_result(status: GitHubIdentityStatus, github_id: Optional[str] = None) -> GitHubIdentityResult:
++    return GitHubIdentityResult(github_id=github_id, status=status)
++
++
++def test_transient_identity_lookup_uses_stored_id_for_cache_fallback():
++    with patch(
++        'gittensor.validator.utils.github_validation.get_github_identity',
++        return_value=_identity_result(GitHubIdentityStatus.TRANSIENT_FAILURE),
++    ):
++        evaluation = validate_response_and_initialize_miner_evaluation(
++            uid=7,
++            hotkey='hk',
++            pat='ghp_stored',
++            stored_github_id='12345',
++        )
++
++    assert evaluation.failed_reason is None
++    assert evaluation.github_id == '12345'
++    assert evaluation.github_pr_fetch_failed is True
++    assert evaluation.should_use_cache_fallback is True
++    assert evaluation.github_pat is None
++
++
++def test_auth_identity_failure_does_not_use_stored_id_for_cache_fallback():
++    with patch(
++        'gittensor.validator.utils.github_validation.get_github_identity',
++        return_value=_identity_result(GitHubIdentityStatus.INVALID_AUTH),
++    ):
++        evaluation = validate_response_and_initialize_miner_evaluation(
++            uid=7,
++            hotkey='hk',
++            pat='ghp_revoked',
++            stored_github_id='12345',
++        )
++
++    assert evaluation.failed_reason == "No Github id found for miner 7's PAT"
++    assert evaluation.github_id == '0'
++    assert evaluation.github_pr_fetch_failed is False

@@ -1,0 +1,1026 @@
+diff --git a/app/controllers/api/v1/users_controller.rb b/app/controllers/api/v1/users_controller.rb
+index 121fded348..fa1c934a9e 100644
+--- a/app/controllers/api/v1/users_controller.rb
++++ b/app/controllers/api/v1/users_controller.rb
+@@ -70,14 +70,8 @@ def ensure_admin
+     end
+ 
+     def reset_target_counts(family)
+-      {
+-        accounts: family.accounts.count,
+-        categories: family.categories.count,
+-        tags: family.tags.count,
+-        merchants: family.merchants.count,
+-        plaid_items: family.plaid_items.count,
+-        imports: family.imports.count,
+-        budgets: family.budgets.count
+-      }
++      counts = Family::FinancialDataReset.new(family: family, dry_run: true, confirmed: false).call.before_counts.except(:syncs)
++
++      counts.merge(plaid_items: family.plaid_items.count)
+     end
+ end
+diff --git a/app/jobs/family_reset_job.rb b/app/jobs/family_reset_job.rb
+index 60d4916f7c..68a6a017fd 100644
+--- a/app/jobs/family_reset_job.rb
++++ b/app/jobs/family_reset_job.rb
+@@ -2,17 +2,11 @@ class FamilyResetJob < ApplicationJob
+   queue_as :low_priority
+ 
+   def perform(family, load_sample_data_for_email: nil)
+-    # Delete all family data except users
+-    ActiveRecord::Base.transaction do
+-      # Delete accounts and related data
+-      family.accounts.destroy_all
+-      family.categories.destroy_all
+-      family.tags.destroy_all
+-      family.merchants.destroy_all
+-      family.plaid_items.destroy_all
+-      family.imports.destroy_all
+-      family.budgets.destroy_all
+-    end
++    Family::FinancialDataReset.new(
++      family: family,
++      dry_run: false,
++      confirmed: true
++    ).call
+ 
+     if load_sample_data_for_email.present?
+       Demo::Generator.new.generate_new_user_data_for!(family.reload, email: load_sample_data_for_email)
+diff --git a/app/models/family/financial_data_reset.rb b/app/models/family/financial_data_reset.rb
+new file mode 100644
+index 0000000000..91759e2395
+--- /dev/null
++++ b/app/models/family/financial_data_reset.rb
+@@ -0,0 +1,329 @@
++class Family::FinancialDataReset
++  ConfirmationRequiredError = Class.new(StandardError)
++
++  CONFIRMATION_PHRASE = "RESET FINANCIAL DATA"
++
++  COUNT_KEYS = %i[
++    account_statements
++    family_exports
++    imports
++    import_rows
++    import_mappings
++    accounts
++    account_shares
++    account_providers
++    entries
++    transactions
++    transfers
++    rejected_transfers
++    valuations
++    trades
++    holdings
++    balances
++    recurring_transactions
++    rules
++    rule_actions
++    rule_conditions
++    rule_runs
++    budgets
++    budget_categories
++    categories
++    tags
++    taggings
++    merchants
++    family_merchant_associations
++    provider_items
++    syncs
++    active_storage_attachments
++  ].freeze
++  STATUS_COUNT_KEYS = (COUNT_KEYS - %i[syncs]) + %i[plaid_items]
++  PROVIDER_ITEM_ASSOCIATIONS = %i[
++    binance_items
++    brex_items
++    coinbase_items
++    coinstats_items
++    enable_banking_items
++    ibkr_items
++    indexa_capital_items
++    kraken_items
++    lunchflow_items
++    mercury_items
++    plaid_items
++    simplefin_items
++    snaptrade_items
++    sophtron_items
++  ].freeze
++
++  Result = Struct.new(:user, :family, :dry_run, :before_counts, :deleted_counts, :after_counts, keyword_init: true)
++
++  class << self
++    def provider_item_associations
++      PROVIDER_ITEM_ASSOCIATIONS.select do |association_name|
++        association = Family.reflect_on_association(association_name)
++
++        association&.klass&.included_modules&.include?(Syncable)
++      rescue NameError
++        false
++      end
++    end
++  end
++
++  attr_reader :user, :family
++
++  def initialize(user: nil, family: nil, dry_run: true, confirmed: false)
++    if user && family && user.family != family
++      raise ArgumentError, "user and family must belong to the same family"
++    end
++
++    @user = user
++    @family = family || user&.family
++    @dry_run = ActiveModel::Type::Boolean.new.cast(dry_run)
++    @confirmed = ActiveModel::Type::Boolean.new.cast(confirmed)
++
++    raise ArgumentError, "user or family is required" unless @family
++  end
++
++  def call
++    before_counts = counts
++    if destructive_without_confirmation?
++      raise ConfirmationRequiredError, "Pass confirmed: true to Family::FinancialDataReset to delete financial data."
++    end
++
++    if dry_run?
++      after_counts = before_counts
++    else
++      blob_ids = []
++      ActiveRecord::Base.transaction do
++        blob_ids = active_storage_blob_ids
++        delete_financial_data!
++      end
++      purge_unattached_blobs(blob_ids)
++      family.reload
++      after_counts = counts
++    end
++
++    Result.new(
++      user: user,
++      family: family,
++      dry_run: dry_run?,
++      before_counts: before_counts,
++      deleted_counts: deleted_counts(before_counts, after_counts),
++      after_counts: after_counts
++    )
++  end
++
++  def dry_run?
++    @dry_run
++  end
++
++  private
++
++    def destructive_without_confirmation?
++      !dry_run? && !@confirmed
++    end
++
++    def delete_financial_data!
++      scope(:syncs).delete_all
++      delete_active_storage_attachments!
++      scope(:transfers).destroy_all
++      scope(:rejected_transfers).destroy_all
++      scope(:import_mappings).destroy_all
++      scope(:import_rows).destroy_all
++      scope(:rule_runs).destroy_all
++      scope(:rule_actions).destroy_all
++      scope(:rule_conditions).destroy_all
++      scope(:budget_categories).destroy_all
++      scope(:taggings).destroy_all
++      scope(:family_merchant_associations).delete_all
++      scope(:account_statements).destroy_all
++      scope(:family_exports).destroy_all
++      scope(:imports).destroy_all
++      scope(:entries).destroy_all
++      scope(:holdings).destroy_all
++      scope(:balances).destroy_all
++      scope(:account_shares).destroy_all
++      scope(:account_providers).destroy_all
++      scope(:recurring_transactions).destroy_all
++      scope(:rules).destroy_all
++      scope(:budgets).destroy_all
++      scope(:categories).destroy_all
++      scope(:tags).destroy_all
++      scope(:merchants).destroy_all
++      delete_provider_items!
++      scope(:accounts).destroy_all
++    end
++
++    def active_storage_blob_ids
++      active_storage_attachment_scopes.flat_map do |scope|
++        scope.distinct.pluck(:blob_id)
++      end.uniq
++    end
++
++    def delete_active_storage_attachments!
++      active_storage_attachment_scopes.each do |scope|
++        scope.delete_all
++      end
++    end
++
++    def purge_unattached_blobs(blob_ids)
++      return if blob_ids.empty?
++
++      ActiveStorage::Blob
++        .where(id: blob_ids)
++        .left_outer_joins(:attachments)
++        .where(active_storage_attachments: { id: nil })
++        .find_each(&:purge)
++    end
++
++    def delete_provider_items!
++      provider_item_associations.each do |association|
++        reflection = family.class.reflect_on_association(association)
++        item_class = reflection&.klass
++        next unless item_class
++
++        item_scope = provider_item_scope(association)
++        item_ids = item_scope.select(:id)
++        Sync.for_family(family).where(syncable_type: item_class.name, syncable_id: item_ids).delete_all
++
++        item_class.reflect_on_all_associations(:has_many).each do |reflection|
++          next if reflection.options[:through].present?
++          next unless reflection.name.to_s.end_with?("_accounts")
++
++          provider_accounts_scope = reflection.klass.where(reflection.foreign_key => item_ids)
++          provider_account_ids = provider_accounts_scope.select(:id)
++          legacy_account_column = legacy_account_provider_column(reflection.klass)
++          if legacy_account_column
++            scope(:accounts)
++              .where(legacy_account_column => provider_account_ids)
++              .update_all(legacy_account_column => nil)
++          end
++          AccountProvider.where(
++            account_id: account_ids,
++            provider_type: reflection.klass.name,
++            provider_id: provider_account_ids
++          ).delete_all
++          provider_accounts_scope.delete_all
++        end
++
++        item_scope.destroy_all
++      end
++    end
++
++    def counts
++      COUNT_KEYS.index_with do |key|
++        case key
++        when :provider_items
++          provider_item_associations.sum { |association| provider_item_scope(association).count }
++        when :active_storage_attachments
++          active_storage_attachments_count
++        else
++          scope(key).count
++        end
++      end
++    end
++
++    def deleted_counts(before_counts, after_counts)
++      COUNT_KEYS.index_with { |key| before_counts.fetch(key, 0) - after_counts.fetch(key, 0) }
++    end
++
++    def provider_item_associations
++      self.class.provider_item_associations.select { |association| family.respond_to?(association) }
++    end
++
++    def scope(key)
++      scope_relations.fetch(key)
++    end
++
++    def scope_relations
++      @scope_relations ||= begin
++        account_scope = Account.where(family_id: family.id)
++        account_ids = account_scope.select(:id)
++        import_scope = Import.where(family_id: family.id)
++        import_ids = import_scope.select(:id)
++        rule_scope = Rule.where(family_id: family.id)
++        rule_ids = rule_scope.select(:id)
++        budget_scope = Budget.where(family_id: family.id)
++        budget_ids = budget_scope.select(:id)
++        transaction_scope = Transaction.joins(:entry).where(entries: { account_id: account_ids })
++        transaction_ids = transaction_scope.select(:id)
++        tag_scope = Tag.where(family_id: family.id)
++
++        {
++          account_statements: AccountStatement.where(family_id: family.id),
++          family_exports: FamilyExport.where(family_id: family.id),
++          imports: import_scope,
++          import_rows: Import::Row.where(import_id: import_ids),
++          import_mappings: Import::Mapping.where(import_id: import_ids),
++          accounts: account_scope,
++          account_shares: AccountShare.where(account_id: account_ids),
++          account_providers: AccountProvider.where(account_id: account_ids),
++          entries: Entry.where(account_id: account_ids),
++          transactions: transaction_scope,
++          transfers: Transfer.where(inflow_transaction_id: transaction_ids)
++                             .or(Transfer.where(outflow_transaction_id: transaction_ids)),
++          rejected_transfers: RejectedTransfer.where(inflow_transaction_id: transaction_ids)
++                                             .or(RejectedTransfer.where(outflow_transaction_id: transaction_ids)),
++          valuations: Valuation.joins(:entry).where(entries: { account_id: account_ids }),
++          trades: Trade.joins(:entry).where(entries: { account_id: account_ids }),
++          holdings: Holding.where(account_id: account_ids),
++          balances: Balance.where(account_id: account_ids),
++          recurring_transactions: RecurringTransaction.where(family_id: family.id),
++          rules: rule_scope,
++          rule_actions: Rule::Action.where(rule_id: rule_ids),
++          rule_conditions: Rule::Condition.where(rule_id: rule_ids),
++          rule_runs: RuleRun.where(rule_id: rule_ids),
++          budgets: budget_scope,
++          budget_categories: BudgetCategory.where(budget_id: budget_ids),
++          categories: Category.where(family_id: family.id),
++          tags: tag_scope,
++          taggings: Tagging.where(tag_id: tag_scope.select(:id)),
++          merchants: FamilyMerchant.where(family_id: family.id),
++          family_merchant_associations: FamilyMerchantAssociation.where(family_id: family.id),
++          syncs: Sync.for_family(family)
++        }
++      end
++    end
++
++    def account_ids
++      scope(:accounts).select(:id)
++    end
++
++    def active_storage_attachments_count
++      active_storage_attachment_scopes.sum(&:count)
++    end
++
++    def active_storage_attachment_scopes
++      scopes = [
++        attachment_scope(Account, account_ids),
++        attachment_scope(AccountStatement, scope(:account_statements).select(:id)),
++        attachment_scope(FamilyExport, scope(:family_exports).select(:id)),
++        attachment_scope(Import, scope(:imports).select(:id)),
++        attachment_scope(Transaction, scope(:transactions).select(:id))
++      ]
++
++      provider_item_associations.filter_map do |association|
++        reflection = family.class.reflect_on_association(association)
++        attachment_scope(reflection.klass, provider_item_scope(association).select(:id)) if reflection&.klass
++      end + scopes
++    end
++
++    def attachment_scope(record_class, record_ids)
++      ActiveStorage::Attachment.where(record_type: record_class.name, record_id: record_ids)
++    end
++
++    def provider_item_scope(association)
++      item_class = family.class.reflect_on_association(association)&.klass
++      return family.public_send(association).none unless item_class
++
++      if item_class.column_names.include?("family_id")
++        item_class.where(family_id: family.id)
++      else
++        family.public_send(association)
++      end
++    end
++
++    def legacy_account_provider_column(provider_account_class)
++      column_name = "#{provider_account_class.model_name.singular}_id"
++      column_name if Account.column_names.include?(column_name)
++    end
++end
+diff --git a/docs/api/openapi.yaml b/docs/api/openapi.yaml
+index 456e7ffbfc..1102d6fc64 100644
+--- a/docs/api/openapi.yaml
++++ b/docs/api/openapi.yaml
+@@ -2889,33 +2889,132 @@ components:
+         counts:
+           type: object
+           required:
++          - account_statements
++          - family_exports
++          - imports
++          - import_rows
++          - import_mappings
+           - accounts
++          - account_shares
++          - account_providers
++          - entries
++          - transactions
++          - transfers
++          - rejected_transfers
++          - valuations
++          - trades
++          - holdings
++          - balances
++          - recurring_transactions
++          - rules
++          - rule_actions
++          - rule_conditions
++          - rule_runs
++          - budgets
++          - budget_categories
+           - categories
+           - tags
++          - taggings
+           - merchants
++          - family_merchant_associations
++          - provider_items
++          - active_storage_attachments
+           - plaid_items
+-          - imports
+-          - budgets
++          additionalProperties:
++            type: integer
++            minimum: 0
+           properties:
++            account_statements:
++              type: integer
++              minimum: 0
++            family_exports:
++              type: integer
++              minimum: 0
++            imports:
++              type: integer
++              minimum: 0
++            import_rows:
++              type: integer
++              minimum: 0
++            import_mappings:
++              type: integer
++              minimum: 0
+             accounts:
+               type: integer
+               minimum: 0
++            account_shares:
++              type: integer
++              minimum: 0
++            account_providers:
++              type: integer
++              minimum: 0
++            entries:
++              type: integer
++              minimum: 0
++            transactions:
++              type: integer
++              minimum: 0
++            transfers:
++              type: integer
++              minimum: 0
++            rejected_transfers:
++              type: integer
++              minimum: 0
++            valuations:
++              type: integer
++              minimum: 0
++            trades:
++              type: integer
++              minimum: 0
++            holdings:
++              type: integer
++              minimum: 0
++            balances:
++              type: integer
++              minimum: 0
++            recurring_transactions:
++              type: integer
++              minimum: 0
++            rules:
++              type: integer
++              minimum: 0
++            rule_actions:
++              type: integer
++              minimum: 0
++            rule_conditions:
++              type: integer
++              minimum: 0
++            rule_runs:
++              type: integer
++              minimum: 0
++            budgets:
++              type: integer
++              minimum: 0
++            budget_categories:
++              type: integer
++              minimum: 0
+             categories:
+               type: integer
+               minimum: 0
+             tags:
+               type: integer
+               minimum: 0
++            taggings:
++              type: integer
++              minimum: 0
+             merchants:
+               type: integer
+               minimum: 0
+-            plaid_items:
++            family_merchant_associations:
+               type: integer
+               minimum: 0
+-            imports:
++            provider_items:
+               type: integer
+               minimum: 0
+-            budgets:
++            active_storage_attachments:
++              type: integer
++              minimum: 0
++            plaid_items:
+               type: integer
+               minimum: 0
+ paths:
+diff --git a/spec/swagger_helper.rb b/spec/swagger_helper.rb
+index 0372ce03a1..c17ec07f26 100644
+--- a/spec/swagger_helper.rb
++++ b/spec/swagger_helper.rb
+@@ -4,6 +4,7 @@
+ 
+ RSpec.configure do |config|
+   config.openapi_root = Rails.root.join('docs', 'api').to_s
++  reset_count_keys = Family::FinancialDataReset::STATUS_COUNT_KEYS.map(&:to_s)
+ 
+   config.openapi_specs = {
+     'openapi.yaml' => {
+@@ -1607,16 +1608,9 @@
+               },
+               counts: {
+                 type: :object,
+-                required: %w[accounts categories tags merchants plaid_items imports budgets],
+-                properties: {
+-                  accounts: { type: :integer, minimum: 0 },
+-                  categories: { type: :integer, minimum: 0 },
+-                  tags: { type: :integer, minimum: 0 },
+-                  merchants: { type: :integer, minimum: 0 },
+-                  plaid_items: { type: :integer, minimum: 0 },
+-                  imports: { type: :integer, minimum: 0 },
+-                  budgets: { type: :integer, minimum: 0 }
+-                }
++                required: reset_count_keys,
++                additionalProperties: { type: :integer, minimum: 0 },
++                properties: reset_count_keys.index_with { { type: :integer, minimum: 0 } }
+               }
+             }
+           }
+diff --git a/test/controllers/api/v1/users_controller_test.rb b/test/controllers/api/v1/users_controller_test.rb
+index 853348d49c..570c0bd9d5 100644
+--- a/test/controllers/api/v1/users_controller_test.rb
++++ b/test/controllers/api/v1/users_controller_test.rb
+@@ -123,13 +123,22 @@ class Api::V1::UsersControllerTest < ActionDispatch::IntegrationTest
+     assert_equal @user.family.id, body["family_id"]
+     assert_includes %w[complete data_remaining], body["status"]
+     assert_equal body["counts"].values.sum.zero?, body["reset_complete"]
+-    assert body["counts"].key?("accounts")
+-    assert body["counts"].key?("categories")
+-    assert body["counts"].key?("tags")
+-    assert body["counts"].key?("merchants")
+-    assert body["counts"].key?("plaid_items")
+-    assert body["counts"].key?("imports")
+-    assert body["counts"].key?("budgets")
++    assert_equal expected_reset_count_keys.sort, body["counts"].keys.sort
++  end
++
++  test "reset status ignores the follow-up family sync after reset" do
++    family = @user.family
++    Provider::Registry.stubs(:plaid_provider_for_region).returns(nil)
++    Family::FinancialDataReset.new(family: family, dry_run: false, confirmed: true).call
++    family.syncs.create!
++
++    get "/api/v1/users/reset/status", headers: api_headers(@read_only_api_key)
++
++    assert_response :ok
++    body = JSON.parse(response.body)
++    assert_equal "complete", body["status"]
++    assert_equal true, body["reset_complete"]
++    assert_not body["counts"].key?("syncs")
+   end
+ 
+   # -- Delete account --------------------------------------------------------
+@@ -186,4 +195,8 @@ class Api::V1::UsersControllerTest < ActionDispatch::IntegrationTest
+     def api_headers(api_key)
+       { "X-Api-Key" => api_key.plain_key }
+     end
++
++    def expected_reset_count_keys
++      Family::FinancialDataReset::STATUS_COUNT_KEYS.map(&:to_s)
++    end
+ end
+diff --git a/test/models/family/financial_data_reset_test.rb b/test/models/family/financial_data_reset_test.rb
+new file mode 100644
+index 0000000000..650542482f
+--- /dev/null
++++ b/test/models/family/financial_data_reset_test.rb
+@@ -0,0 +1,419 @@
++require "test_helper"
++
++class Family::FinancialDataResetTest < ActiveSupport::TestCase
++  setup do
++    @user = users(:family_admin)
++    @family = @user.family
++    @other_family = families(:empty)
++    @other_category = @other_family.categories.create!(
++      name: "Keep Me",
++      color: "#12B76A",
++      lucide_icon: "tag"
++    )
++    Provider::Registry.stubs(:plaid_provider_for_region).returns(nil)
++  end
++
++  test "dry run reports target counts and deletes nothing" do
++    result = Family::FinancialDataReset.new(user: @user).call
++
++    assert result.dry_run
++    assert_operator result.before_counts[:accounts], :>, 0
++    assert_operator result.before_counts[:categories], :>, 0
++    assert_equal result.before_counts, result.after_counts
++    assert result.deleted_counts.values.all?(&:zero?)
++    assert User.exists?(@user.id)
++  end
++
++  test "provider item associations are limited to explicit syncable family associations" do
++    associations = Family::FinancialDataReset.provider_item_associations
++
++    assert_not_empty associations
++    assert_equal associations, Family::FinancialDataReset::PROVIDER_ITEM_ASSOCIATIONS
++    assert associations.all? { |name| name.to_s.end_with?("_items") }
++
++    associations.each do |name|
++      reflection = Family.reflect_on_association(name)
++
++      assert reflection
++      assert_equal :has_many, reflection.macro
++      assert_includes reflection.klass.included_modules, Syncable
++    end
++  end
++
++  test "sync counts use the family sync scope without double counting" do
++    account = @family.accounts.first
++    provider_item = @family.plaid_items.first
++    @family.syncs.create!
++    account.syncs.create!
++    provider_item.syncs.create!
++
++    result = Family::FinancialDataReset.new(user: @user).call
++
++    assert_equal Sync.for_family(@family).count, result.before_counts[:syncs]
++  end
++
++  test "destructive reset requires explicit confirmation" do
++    assert_raises Family::FinancialDataReset::ConfirmationRequiredError do
++      Family::FinancialDataReset.new(user: @user, dry_run: false).call
++    end
++  end
++
++  test "destructive reset without confirmation does not partially mutate financial data" do
++    create_extra_target_data!(family: @family, label: "Unconfirmed")
++    before_counts = reset_counts(@family)
++
++    assert_raises Family::FinancialDataReset::ConfirmationRequiredError do
++      Family::FinancialDataReset.new(user: @user, dry_run: false).call
++    end
++
++    assert_equal before_counts, reset_counts(@family)
++    assert User.exists?(@user.id)
++  end
++
++  test "rejects mismatched user and family inputs" do
++    error = assert_raises ArgumentError do
++      Family::FinancialDataReset.new(user: @user, family: @other_family)
++    end
++
++    assert_equal "user and family must belong to the same family", error.message
++  end
++
++  test "destructive reset preserves financial data for other families" do
++    create_extra_target_data!(family: @family, label: "Current Family")
++    other_records = create_extra_target_data!(family: @other_family, label: "Other Family")
++    other_family_counts = reset_counts(@other_family)
++
++    assert_no_changes -> { reset_target_snapshot(other_records) } do
++      Family::FinancialDataReset.new(
++        user: @user,
++        dry_run: false,
++        confirmed: true
++      ).call
++    end
++
++    assert_equal 0, reset_counts(@family).values.sum
++    assert_equal other_family_counts, reset_counts(@other_family)
++  end
++
++  test "destructive reset clears financial data for one family and preserves users" do
++    create_extra_target_data!(family: @family, label: "Reset Test")
++
++    result = Family::FinancialDataReset.new(
++      user: @user,
++      dry_run: false,
++      confirmed: true
++    ).call
++
++    assert_not result.dry_run
++    assert result.before_counts.values.any?(&:positive?)
++    assert_equal 0, result.after_counts.values.sum
++    assert result.deleted_counts.values.any?(&:positive?)
++    assert User.exists?(@user.id)
++    assert_equal @family.id, User.find(@user.id).family_id
++    assert Category.exists?(@other_category.id)
++  end
++
++  test "destructive reset revokes provider item and clears provider account attachments" do
++    account = @other_family.accounts.create!(
++      name: "Provider Reset Checking",
++      balance: 100,
++      currency: "USD",
++      accountable: Depository.new
++    )
++    plaid_item = @other_family.plaid_items.create!(
++      name: "Provider Reset Bank",
++      plaid_id: "provider_reset_item",
++      access_token: "provider_reset_access_token",
++      plaid_region: "us"
++    )
++    plaid_account = plaid_item.plaid_accounts.create!(
++      plaid_id: "provider_reset_account",
++      plaid_type: "depository",
++      current_balance: 100,
++      currency: "USD",
++      name: "Provider Reset Account"
++    )
++    account_provider = AccountProvider.create!(account: account, provider: plaid_account)
++    plaid_item.logo.attach(io: StringIO.new("logo"), filename: "logo.png", content_type: "image/png")
++    attachment = plaid_item.logo.attachment
++
++    plaid_provider = mock
++    Provider::Registry.stubs(:plaid_provider_for_region).returns(plaid_provider)
++    plaid_provider.expects(:remove_item).with(plaid_item.access_token).once
++
++    result = Family::FinancialDataReset.new(family: @other_family, dry_run: false, confirmed: true).call
++
++    assert_equal 0, result.after_counts.values.sum
++    assert_not PlaidItem.exists?(plaid_item.id)
++    assert_not PlaidAccount.exists?(plaid_account.id)
++    assert_not AccountProvider.exists?(account_provider.id)
++    assert_not ActiveStorage::Attachment.exists?(attachment.id)
++  end
++
++  test "destructive reset is idempotent" do
++    first = Family::FinancialDataReset.new(user: @user, dry_run: false, confirmed: true).call
++    second = Family::FinancialDataReset.new(user: @user, dry_run: false, confirmed: true).call
++
++    assert_equal 0, first.after_counts.values.sum
++    assert_equal 0, second.before_counts.values.sum
++    assert_equal 0, second.after_counts.values.sum
++  end
++
++  private
++
++    def reset_counts(family)
++      Family::FinancialDataReset.new(family: family).call.before_counts
++    end
++
++    def create_extra_target_data!(family:, label:)
++      safe_label = label.parameterize
++      account = family.accounts.create!(
++        name: "#{label} Checking",
++        balance: 100,
++        currency: "USD",
++        accountable: Depository.new
++      )
++      transfer_account = family.accounts.create!(
++        name: "#{label} Transfer Target",
++        balance: 50,
++        currency: "USD",
++        accountable: Depository.new
++      )
++      share_user = family.users.create!(
++        email: "#{safe_label}-#{SecureRandom.hex(4)}@example.com",
++        password: "password123",
++        password_confirmation: "password123",
++        role: :member
++      )
++      account_share = account.account_shares.create!(user: share_user)
++      category = family.categories.create!(
++        name: "#{label} Category",
++        color: "#407706",
++        lucide_icon: "shapes"
++      )
++      tag = family.tags.create!(name: "#{label} Tag", color: "#12B76A")
++      merchant = family.merchants.create!(name: "#{label} Merchant", color: "#12B76A")
++      family_merchant_association = FamilyMerchantAssociation.create!(family: family, merchant: merchant)
++      transaction = Transaction.create!(category: category, merchant: merchant)
++      tagging = transaction.taggings.create!(tag: tag)
++      entry = account.entries.create!(
++        entryable: transaction,
++        name: "#{label} transaction",
++        date: Date.current,
++        amount: 12,
++        currency: "USD"
++      )
++      transaction.attachments.attach(io: StringIO.new("%PDF-1.4\nreceipt\n%%EOF\n"), filename: "#{safe_label}.pdf", content_type: "application/pdf")
++      valuation = Valuation.create!
++      valuation_entry = account.entries.create!(
++        entryable: valuation,
++        name: "#{label} valuation",
++        date: Date.current - 1.day,
++        amount: 100,
++        currency: "USD"
++      )
++      trade = Trade.create!(security: securities(:aapl), qty: 1, price: 100, currency: "USD")
++      trade_entry = account.entries.create!(
++        entryable: trade,
++        name: "#{label} trade",
++        date: Date.current - 2.days,
++        amount: 100,
++        currency: "USD"
++      )
++      transfer = create_transfer!(source_account: account, target_account: transfer_account, label: label)
++      rejected_transfer = create_rejected_transfer!(source_account: account, target_account: transfer_account, label: label)
++      balance = account.balances.create!(date: Date.current, balance: 100, currency: "USD")
++      holding = account.holdings.create!(
++        security: securities(:aapl),
++        date: Date.current,
++        qty: 1,
++        price: 100,
++        amount: 100,
++        currency: "USD"
++      )
++      recurring_transaction = family.recurring_transactions.create!(
++        account: account,
++        merchant: merchant,
++        amount: 12,
++        currency: "USD",
++        expected_day_of_month: 1,
++        last_occurrence_date: 1.month.ago.to_date,
++        next_expected_date: 1.month.from_now.to_date,
++        status: "active"
++      )
++      rule = family.rules.build(name: "#{label} Rule", resource_type: "transaction").tap do |rule|
++        rule.conditions.build(condition_type: "transaction_name", operator: "like", value: label)
++        rule.actions.build(action_type: "set_transaction_category", value: category.id)
++        rule.save!
++      end
++      rule_run = rule.rule_runs.create!(
++        execution_type: "manual",
++        status: "success",
++        transactions_queued: 1,
++        transactions_processed: 1,
++        transactions_modified: 1,
++        executed_at: Time.current
++      )
++      budget_start = 10.years.from_now.to_date.beginning_of_month
++      budget = family.budgets.create!(
++        start_date: budget_start,
++        end_date: budget_start.end_of_month,
++        budgeted_spending: 100,
++        expected_income: 200,
++        currency: family.currency
++      )
++      budget_category = budget.budget_categories.create!(
++        category: category,
++        budgeted_spending: 50,
++        currency: family.currency
++      )
++      import = family.imports.create!(type: "TransactionImport", status: "pending")
++      import_row = import.rows.create!(
++        source_row_number: 1,
++        date: Date.current.strftime(import.date_format),
++        amount: "12.00",
++        currency: family.currency,
++        name: "#{label} Imported Transaction"
++      )
++      import_mapping = Import::AccountMapping.create!(import: import, key: "#{label} Checking", mappable: account)
++      family_export = family.family_exports.create!(status: "completed")
++      family_export.export_file.attach(io: StringIO.new("zip"), filename: "#{safe_label}.zip", content_type: "application/zip")
++      account_statement = create_account_statement!(family: family, account: account, label: label)
++      plaid_item = family.plaid_items.create!(
++        name: "#{label} Plaid Item",
++        plaid_id: "plaid_item_#{safe_label}_#{family.id.delete("-")}",
++        access_token: "access_#{safe_label}_#{family.id.delete("-")}",
++        plaid_region: "us"
++      )
++      plaid_account = plaid_item.plaid_accounts.create!(
++        plaid_id: "plaid_account_#{safe_label}",
++        plaid_type: "depository",
++        current_balance: 100,
++        currency: family.currency,
++        name: "#{label} Plaid Account"
++      )
++      account_provider = AccountProvider.create!(account: account, provider: plaid_account)
++      plaid_item.logo.attach(io: StringIO.new("logo"), filename: "#{safe_label}.png", content_type: "image/png")
++      family_sync = family.syncs.create!
++      account_sync = account.syncs.create!
++      provider_sync = plaid_item.syncs.create!
++
++      {
++        account: account,
++        transfer_account: transfer_account,
++        account_share: account_share,
++        category: category,
++        tag: tag,
++        merchant: merchant,
++        family_merchant_association: family_merchant_association,
++        transaction: transaction,
++        tagging: tagging,
++        entry: entry,
++        valuation: valuation,
++        valuation_entry: valuation_entry,
++        trade: trade,
++        trade_entry: trade_entry,
++        transfer: transfer,
++        rejected_transfer: rejected_transfer,
++        balance: balance,
++        holding: holding,
++        recurring_transaction: recurring_transaction,
++        rule: rule,
++        rule_action: rule.actions.first,
++        rule_condition: rule.conditions.first,
++        rule_run: rule_run,
++        budget: budget,
++        budget_category: budget_category,
++        import: import,
++        import_row: import_row,
++        import_mapping: import_mapping,
++        family_export: family_export,
++        account_statement: account_statement,
++        plaid_item: plaid_item,
++        plaid_account: plaid_account,
++        account_provider: account_provider,
++        family_sync: family_sync,
++        account_sync: account_sync,
++        provider_sync: provider_sync
++      }
++    end
++
++    def create_transfer!(source_account:, target_account:, label:)
++      outflow = create_transaction_entry!(account: source_account, name: "#{label} transfer out", amount: 25)
++      inflow = create_transaction_entry!(account: target_account, name: "#{label} transfer in", amount: -25)
++
++      Transfer.create!(
++        outflow_transaction: outflow.entryable,
++        inflow_transaction: inflow.entryable,
++        status: "confirmed"
++      )
++    end
++
++    def create_rejected_transfer!(source_account:, target_account:, label:)
++      outflow = create_transaction_entry!(account: source_account, name: "#{label} rejected transfer out", amount: 35)
++      inflow = create_transaction_entry!(account: target_account, name: "#{label} rejected transfer in", amount: -35)
++
++      RejectedTransfer.create!(
++        outflow_transaction: outflow.entryable,
++        inflow_transaction: inflow.entryable
++      )
++    end
++
++    def create_transaction_entry!(account:, name:, amount:)
++      transaction = Transaction.create!(kind: "funds_movement")
++
++      account.entries.create!(
++        entryable: transaction,
++        name: name,
++        date: Date.current - 3.days,
++        amount: amount,
++        currency: account.currency
++      )
++    end
++
++    def create_account_statement!(family:, account:, label:)
++      safe_label = label.parameterize
++      content = "%PDF-1.4\n#{label}\n%%EOF\n"
++      account_statement = family.account_statements.build(
++        account: account,
++        filename: "#{safe_label}.pdf",
++        content_type: "application/pdf",
++        byte_size: content.bytesize,
++        checksum: Digest::MD5.base64digest(content),
++        content_sha256: Digest::SHA256.hexdigest(content),
++        source: :manual_upload,
++        upload_status: :stored,
++        review_status: :linked,
++        currency: account.currency
++      )
++      account_statement.original_file.attach(
++        io: StringIO.new(content),
++        filename: "#{safe_label}.pdf",
++        content_type: "application/pdf"
++      )
++      account_statement.save!
++      account_statement
++    end
++
++    def reset_target_snapshot(records)
++      records.transform_values { |record| record_snapshot(record) }.merge(
++        attachments: [
++          attachment_snapshot(records[:transaction], "attachments"),
++          attachment_snapshot(records[:family_export], "export_file"),
++          attachment_snapshot(records[:account_statement], "original_file"),
++          attachment_snapshot(records[:plaid_item], "logo")
++        ]
++      )
++    end
++
++    def record_snapshot(record)
++      record.class.where(id: record.id).pluck(*record.class.column_names).first
++    end
++
++    def attachment_snapshot(record, attachment_name)
++      ActiveStorage::Attachment
++        .where(record_type: record.class.name, record_id: record.id, name: attachment_name)
++        .order(:id)
++        .pluck(:id, :blob_id, :created_at)
++    end
++end

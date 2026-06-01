@@ -1,28 +1,32 @@
 """
-Build and refresh the benchmark problem pool from all registered Gittensor repos.
+Build and refresh the benchmark problem pool using the Gittensor DAS API.
 
-Fetches merged PRs with linked issues from every repo in pool_config.json,
-applying the same curation criteria as the original curate_problems.py but
-across the full registered-repo corpus.
+Primary source: api.gittensor.io/prs — all scored merged PRs across every
+registered repo, with Gittensor's own scoring breakdown already computed.
 
-Problem IDs: <owner>_<repo>_<pr_number> for multi-repo entries.
-Legacy problems from entrius/gittensor use their PR number directly (backward compat).
+For each candidate PR we:
+  1. Fetch the PR body from DAS (/prs/details) and extract linked GitHub issues.
+  2. Pull the actual diff + issue body from GitHub (diffs aren't in DAS).
+  3. Apply quality filters and write the problem file.
+
+DAS API gives us 1300+ merged PRs across all registered repos in one request,
+avoiding GitHub rate-limit pagination entirely for discovery.
 
 Usage:
-    # Refresh all repos (adds new problems, skips existing ones)
+    # Build / refresh the full pool
     python scripts/build_pool.py
 
-    # Single repo, useful for targeted updates
-    python scripts/build_pool.py --repo entrius/allways
+    # Target a single repo
+    python scripts/build_pool.py --repo phase-rs/phase
 
-    # Dry run: show what would be curated without writing
+    # Dry run — show what would be added without writing
     python scripts/build_pool.py --dry-run
 
     # Override output directory
     python scripts/build_pool.py --output benchmark/problems
 
-    # Limit how many new problems are added per repo
-    python scripts/build_pool.py --limit-per-repo 10
+    # Limit new problems added per repo
+    python scripts/build_pool.py --limit-per-repo 20
 """
 
 from __future__ import annotations
@@ -32,19 +36,32 @@ import base64
 import json
 import re
 import subprocess
-import sys
+import time
+import urllib.request
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).parent.parent
 POOL_CONFIG_PATH = REPO_ROOT / "benchmark" / "pool_config.json"
+DAS_API = "https://api.gittensor.io"
+DAS_RATE_DELAY = 0.25  # seconds between DAS requests (50 req/10s limit)
 
 
 def load_pool_config() -> dict:
     return json.loads(POOL_CONFIG_PATH.read_text())
 
 
-def gh_get(endpoint: str) -> dict | list:
+def das_get(path: str) -> dict | list:
+    url = f"{DAS_API}{path}"
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/json",
+        "User-Agent": "gittensor-base-miner/build_pool",
+    })
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+def gh_api(endpoint: str) -> dict | list:
     result = subprocess.run(
         ["gh", "api", endpoint],
         capture_output=True, text=True, check=True,
@@ -52,18 +69,18 @@ def gh_get(endpoint: str) -> dict | list:
     return json.loads(result.stdout)
 
 
-def extract_issue_numbers(body: str) -> list[int]:
-    pattern = r"(?:fixes|closes|resolves)\s+#(\d+)"
-    return [int(m) for m in re.findall(pattern, body or "", re.IGNORECASE)]
-
-
-def get_pr_diff(repo: str, pr_number: int) -> str:
+def gh_diff(repo: str, pr_number: int) -> str:
     result = subprocess.run(
         ["gh", "api", f"repos/{repo}/pulls/{pr_number}",
          "--header", "Accept: application/vnd.github.diff"],
         capture_output=True, text=True, check=True,
     )
     return result.stdout
+
+
+def extract_issue_numbers(body: str) -> list[int]:
+    pattern = r"(?:fixes|closes|resolves)\s+#(\d+)"
+    return [int(m) for m in re.findall(pattern, body or "", re.IGNORECASE)]
 
 
 def has_test_files(diff: str) -> bool:
@@ -75,13 +92,17 @@ def has_test_files(diff: str) -> bool:
     )
 
 
+def is_substantive(pr: dict) -> bool:
+    """True if the PR has meaningful scored code changes."""
+    return (
+        pr.get("totalNodesScored", 0) > 0
+        and float(pr.get("tokenScore", 0)) > 0
+    )
+
+
 def get_file_tree(repo: str, commit: str) -> list[str]:
     try:
-        result = subprocess.run(
-            ["gh", "api", f"repos/{repo}/git/trees/{commit}?recursive=1"],
-            capture_output=True, text=True, check=True,
-        )
-        data = json.loads(result.stdout)
+        data = gh_api(f"repos/{repo}/git/trees/{commit}?recursive=1")
         return [item["path"] for item in data.get("tree", []) if item["type"] == "blob"]
     except Exception:
         return []
@@ -96,11 +117,7 @@ def select_context_files(repo: str, base_commit: str, diff: str, max_files: int 
         if path in fetched:
             continue
         try:
-            result = subprocess.run(
-                ["gh", "api", f"repos/{repo}/contents/{path}?ref={base_commit}"],
-                capture_output=True, text=True, check=True,
-            )
-            data = json.loads(result.stdout)
+            data = gh_api(f"repos/{repo}/contents/{path}?ref={base_commit}")
             content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
             context_files.append({"path": path, "content": content})
             fetched.add(path)
@@ -110,28 +127,16 @@ def select_context_files(repo: str, base_commit: str, diff: str, max_files: int 
     return context_files
 
 
-def make_problem_id(repo: str, pr_number: int) -> str:
-    """Generate a globally unique problem ID across all registered repos."""
-    owner, name = repo.split("/", 1)
-    slug = f"{owner}_{name}"
-    # Legacy compat: entrius/gittensor keeps the bare PR number format
-    if repo == "entrius/gittensor":
-        return f"{pr_number:04d}"
-    return f"{slug}_{pr_number}"
-
-
 def infer_test_cmd(repo: str, diff: str) -> list[str]:
-    """Guess the right test command based on repo language/structure."""
-    # Look for changed test files in the diff
     test_files = re.findall(
-        r"^diff --git a/((?:[^/]+/)*test[^/\s]*|(?:[^/]+/)*/test_[^/\s]*)", diff, re.MULTILINE
+        r"^diff --git a/((?:[^/\s]*/)*(test_[^/\s]*\.py|[^/\s]*_test\.py))",
+        diff, re.MULTILINE,
     )
-    specific_files = [f for f in test_files if f.endswith(".py")][:5]
+    specific = [m[0] for m in test_files if m[0].endswith(".py")][:5]
 
-    if specific_files:
-        return ["python", "-m", "pytest", "--tb=short", "-q"] + specific_files
+    if specific:
+        return ["python", "-m", "pytest", "--tb=short", "-q"] + specific
 
-    # Language heuristics
     if re.search(r"\.(rs)\b", diff):
         return ["cargo", "test"]
     if re.search(r"\.(ts|tsx|js|jsx)\b", diff):
@@ -144,57 +149,76 @@ def infer_test_cmd(repo: str, diff: str) -> list[str]:
     return ["python", "-m", "pytest", "--tb=short", "-q"]
 
 
+def make_problem_id(repo: str, pr_number: int) -> str:
+    owner, name = repo.split("/", 1)
+    # Legacy compat: entrius/gittensor keeps the bare PR number
+    if repo == "entrius/gittensor":
+        return f"{pr_number:04d}"
+    return f"{owner}_{name}_{pr_number}"
+
+
 def curate_pr(
-    repo: str,
-    pr_number: int,
+    pr: dict,
     output_dir: Path,
     cutoff_date: str,
-    dry_run: bool = False,
+    dry_run: bool,
 ) -> bool:
+    repo = pr["repository"]
+    pr_number = pr["pullRequestNumber"]
     problem_id = make_problem_id(repo, pr_number)
     problem_out = output_dir / problem_id
 
     if (problem_out / "meta.json").exists():
-        print(f"  Skip #{pr_number} ({repo}): already in pool")
-        return False  # Not new, but not an error
+        return False  # already in pool
 
+    # Time-segmentation guard
+    merged_at = pr.get("mergedAt", "")
+    if not merged_at or merged_at < cutoff_date:
+        print(f"  Skip {repo}#{pr_number}: before cutoff ({merged_at[:10] if merged_at else 'null'})")
+        return False
+
+    # Fetch PR body from DAS to extract linked issue
     try:
-        pr_data = gh_get(f"repos/{repo}/pulls/{pr_number}")
-    except subprocess.CalledProcessError:
-        print(f"  Skip #{pr_number} ({repo}): PR fetch failed")
+        time.sleep(DAS_RATE_DELAY)
+        details = das_get(f"/prs/details?repo={repo}&number={pr_number}")
+    except Exception as exc:
+        print(f"  Skip {repo}#{pr_number}: DAS details failed ({exc})")
         return False
 
-    if pr_data.get("state") != "closed" or not pr_data.get("merged_at"):
-        print(f"  Skip #{pr_number} ({repo}): not merged")
-        return False
-
-    merged_at = pr_data["merged_at"]
-    if merged_at < cutoff_date:
-        print(f"  Skip #{pr_number} ({repo}): merged before cutoff ({merged_at[:10]})")
-        return False
-
-    issue_numbers = extract_issue_numbers(pr_data.get("body", ""))
+    body = details.get("description", "") or ""
+    issue_numbers = extract_issue_numbers(body)
     if not issue_numbers:
-        print(f"  Skip #{pr_number} ({repo}): no linked issue")
+        print(f"  Skip {repo}#{pr_number}: no linked issue")
         return False
 
+    # Fetch full issue from GitHub
+    issue_number = issue_numbers[0]
     try:
-        issue_data = gh_get(f"repos/{repo}/issues/{issue_numbers[0]}")
+        issue_data = gh_api(f"repos/{repo}/issues/{issue_number}")
     except subprocess.CalledProcessError:
-        print(f"  Skip #{pr_number} ({repo}): issue fetch failed")
+        print(f"  Skip {repo}#{pr_number}: issue #{issue_number} fetch failed")
         return False
 
-    if issue_data.get("created_at", "") >= pr_data.get("created_at", ""):
-        print(f"  Skip #{pr_number} ({repo}): issue created after PR")
+    # Fetch PR from GitHub for base_commit
+    try:
+        pr_data = gh_api(f"repos/{repo}/pulls/{pr_number}")
+    except subprocess.CalledProcessError:
+        print(f"  Skip {repo}#{pr_number}: PR fetch failed")
         return False
 
-    diff = get_pr_diff(repo, pr_number)
+    # Fetch diff from GitHub (not in DAS)
+    try:
+        diff = gh_diff(repo, pr_number)
+    except subprocess.CalledProcessError:
+        print(f"  Skip {repo}#{pr_number}: diff fetch failed")
+        return False
+
     if not has_test_files(diff):
-        print(f"  Skip #{pr_number} ({repo}): no test files in diff")
+        print(f"  Skip {repo}#{pr_number}: no test files in diff")
         return False
 
     if dry_run:
-        print(f"  [DRY RUN] Would curate #{pr_number} ({repo}): {issue_data['title'][:60]}")
+        print(f"  [DRY RUN] {repo}#{pr_number}: {issue_data['title'][:60]}")
         return True
 
     base_commit = pr_data["base"]["sha"]
@@ -212,14 +236,20 @@ def curate_pr(
         "repo_url": f"https://github.com/{repo}",
         "base_commit": base_commit,
         "pr_number": pr_number,
-        "issue_number": issue_numbers[0],
+        "issue_number": issue_number,
         "issue_title": issue_data["title"],
-        "issue_body": issue_data["body"] or "",
+        "issue_body": issue_data.get("body") or "",
         "merged_at": merged_at,
         "test_cmd": test_cmd,
         "time_limit_seconds": 120,
         "output_token_budget": 50_000,
         "file_tree": file_tree[:500],
+        # Reference scores from DAS — used as labels, not re-computed
+        "das_score": pr.get("score"),
+        "das_base_score": pr.get("baseScore"),
+        "das_token_score": pr.get("tokenScore"),
+        "das_structural_score": pr.get("structuralScore"),
+        "das_total_nodes": pr.get("totalNodesScored"),
     }
     (problem_out / "meta.json").write_text(json.dumps(meta, indent=2))
 
@@ -230,41 +260,45 @@ def curate_pr(
 
     (problem_out / "reference.diff").write_text(diff)
 
-    print(f"  + #{pr_number} ({repo}): {issue_data['title'][:60]}")
+    print(f"  + {repo}#{pr_number}: {issue_data['title'][:60]}")
     return True
+
+
+def fetch_das_pool(target_repo: str | None = None) -> list[dict]:
+    """Fetch all merged, substantively-scored PRs from the DAS API."""
+    print("Fetching scored PRs from DAS API...")
+    prs = das_get("/prs")
+    print(f"  {len(prs)} total PRs in DAS")
+
+    candidates = [
+        pr for pr in prs
+        if pr.get("prState") == "MERGED"
+        and is_substantive(pr)
+        and (target_repo is None or pr["repository"].lower() == target_repo.lower())
+    ]
+    print(f"  {len(candidates)} merged+scored candidates")
+    return candidates
 
 
 def build_repo(
     repo: str,
+    prs: list[dict],
     output_dir: Path,
     cutoff_date: str,
     limit_per_repo: int,
     dry_run: bool,
 ) -> int:
-    print(f"\n--- {repo} ---")
+    repo_prs = [pr for pr in prs if pr["repository"].lower() == repo.lower()]
+    if not repo_prs:
+        return 0
+
+    print(f"\n--- {repo} ({len(repo_prs)} candidates) ---")
     added = 0
-    for page in range(1, 11):  # up to 1000 PRs
-        try:
-            prs = gh_get(
-                f"repos/{repo}/pulls?state=closed&per_page=100&page={page}"
-                f"&sort=updated&direction=desc"
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"  API error: {e}")
+    for pr in repo_prs:
+        if added >= limit_per_repo:
             break
-
-        if not prs:
-            break
-
-        merged = [pr for pr in prs if pr.get("merged_at")]
-        for pr in merged:
-            if added >= limit_per_repo:
-                return added
-            if curate_pr(repo, pr["number"], output_dir, cutoff_date, dry_run):
-                added += 1
-
-        if len(prs) < 100:
-            break  # last page
+        if curate_pr(pr, output_dir, cutoff_date, dry_run):
+            added += 1
 
     return added
 
@@ -272,11 +306,11 @@ def build_repo(
 def main() -> None:
     cfg = load_pool_config()
 
-    parser = argparse.ArgumentParser(description="Build/refresh the benchmark problem pool")
-    parser.add_argument("--repo", help="Curate a single repo (default: all registered repos)")
+    parser = argparse.ArgumentParser(description="Build/refresh the benchmark problem pool from DAS API")
+    parser.add_argument("--repo", help="Curate a single repo (default: all)")
     parser.add_argument("--output", default=cfg["pool_dir"], help="Pool output directory")
     parser.add_argument("--limit-per-repo", type=int, default=50,
-                        help="Max new problems to add per repo (default: 50)")
+                        help="Max new problems per repo (default: 50)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be added without writing files")
     args = parser.parse_args()
@@ -285,10 +319,23 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     cutoff = cfg["model_cutoff_date"]
 
-    repos = [args.repo] if args.repo else cfg["registered_repos"]
+    candidates = fetch_das_pool(target_repo=args.repo)
+
+    if args.repo:
+        repos = [args.repo]
+    else:
+        # Deduplicate repo names preserving order from DAS response
+        seen: set[str] = set()
+        repos = []
+        for pr in candidates:
+            r = pr["repository"]
+            if r not in seen:
+                seen.add(r)
+                repos.append(r)
+
     total = 0
     for repo in repos:
-        added = build_repo(repo, output_dir, cutoff, args.limit_per_repo, args.dry_run)
+        added = build_repo(repo, candidates, output_dir, cutoff, args.limit_per_repo, args.dry_run)
         total += added
 
     existing = len(list(output_dir.glob("*/meta.json")))

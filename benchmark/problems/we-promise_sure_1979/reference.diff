@@ -1,0 +1,325 @@
+diff --git a/app/models/security.rb b/app/models/security.rb
+index b4268fc5eb..40ae6b969d 100644
+--- a/app/models/security.rb
++++ b/app/models/security.rb
+@@ -49,11 +49,16 @@ def self.parse_combobox_id(value)
+   end
+ 
+   # Lazily finds or creates a synthetic cash security for an account.
+-  # Used as fallback when creating an interest Trade without a user-selected security.
+-  def self.cash_for(account)
+-    ticker = "CASH-#{account.id}".upcase
++  # Used as fallback when creating an interest Trade without a user-selected
++  # security, and to represent non-primary-currency cash positions as holdings
++  # (issue #1809). When a currency that differs from the account's primary
++  # currency is given, a distinct per-currency security is created so balances
++  # in different currencies don't collide.
++  def self.cash_for(account, currency: nil)
++    distinct = currency.present? && currency.to_s.upcase != account.currency.to_s.upcase
++    ticker = (distinct ? "CASH-#{account.id}-#{currency}" : "CASH-#{account.id}").upcase
+     find_or_create_by!(ticker: ticker, kind: "cash") do |s|
+-      s.name = "Cash"
++      s.name = distinct ? "Cash (#{currency.to_s.upcase})" : "Cash"
+       s.offline = true
+     end
+   end
+diff --git a/app/models/snaptrade_account.rb b/app/models/snaptrade_account.rb
+index ddb7a4b63e..54d6f2822f 100644
+--- a/app/models/snaptrade_account.rb
++++ b/app/models/snaptrade_account.rb
+@@ -8,6 +8,7 @@ class SnaptradeAccount < ApplicationRecord
+     encrypts :raw_transactions_payload
+     encrypts :raw_holdings_payload
+     encrypts :raw_activities_payload
++    encrypts :raw_balances_payload
+   end
+ 
+   belongs_to :snaptrade_item
+@@ -132,17 +133,36 @@ def upsert_balances!(balances_data)
+ 
+     Rails.logger.info "SnaptradeAccount##{id} upsert_balances! - raw data: #{data.inspect}"
+ 
+-    # Find cash balance (usually in USD or account currency)
+-    cash_entry = data.find { |b| b.dig(:currency, :code) == currency } ||
+-                 data.find { |b| b.dig(:currency, :code) == "USD" } ||
+-                 data.first
++    # The primary entry (account currency → USD → first) stays in cash_balance;
++    # the full set is persisted so the processor can surface non-primary-currency
++    # cash as holdings (issue #1809).
++    cash_entry = primary_cash_entry(data)
+ 
+-    if cash_entry
+-      cash_value = cash_entry[:cash]
+-      Rails.logger.info "SnaptradeAccount##{id} upsert_balances! - setting cash_balance=#{cash_value}"
++    cash_value = cash_entry ? cash_entry[:cash] : cash_balance
++    Rails.logger.info "SnaptradeAccount##{id} upsert_balances! - setting cash_balance=#{cash_value}, persisting #{data.size} entrie(s)"
+ 
+-      # Only update cash_balance, preserve current_balance (total account value)
+-      update!(cash_balance: cash_value)
++    # Only update cash_balance, preserve current_balance (total account value)
++    update!(cash_balance: cash_value, raw_balances_payload: data)
++  end
++
++  # Cash entries from the last balances snapshot that are NOT the one stored in
++  # cash_balance. The primary entry (account currency → USD → first) lives in
++  # cash_balance; the rest are surfaced as synthetic cash holdings so
++  # multi-currency cash isn't discarded (issue #1809). Excludes the actual
++  # primary currency — including the USD fallback — to avoid double-counting.
++  def non_primary_cash_entries
++    entries = Array(raw_balances_payload).map do |entry|
++      entry.respond_to?(:with_indifferent_access) ? entry.with_indifferent_access : {}
++    end
++
++    primary_code = primary_cash_entry(entries)&.dig(:currency, :code)
++
++    entries.filter_map do |e|
++      code = e.dig(:currency, :code)
++      next if code.blank? || code == primary_code
++      amount = e[:cash]
++      next if amount.blank?
++      { currency: code, amount: amount }
+     end
+   end
+ 
+@@ -158,6 +178,15 @@ def snaptrade_credentials
+ 
+   private
+ 
++    # Selects the primary cash entry from a list of indifferent-access balance
++    # hashes: account currency first, then USD, then the first entry. Shared by
++    # upsert_balances! and non_primary_cash_entries so both stay in sync.
++    def primary_cash_entry(entries)
++      entries.find { |b| b.dig(:currency, :code) == currency } ||
++        entries.find { |b| b.dig(:currency, :code) == "USD" } ||
++        entries.first
++    end
++
+     # Enqueue a background job to clean up the SnapTrade connection
+     # This runs asynchronously after the record is destroyed to avoid
+     # blocking the DB transaction with an external API call
+diff --git a/app/models/snaptrade_account/holdings_processor.rb b/app/models/snaptrade_account/holdings_processor.rb
+index e9216a34fa..cb59932a0e 100644
+--- a/app/models/snaptrade_account/holdings_processor.rb
++++ b/app/models/snaptrade_account/holdings_processor.rb
+@@ -9,31 +9,66 @@ def process
+     return unless account.present?
+ 
+     holdings_data = @snaptrade_account.raw_holdings_payload
+-    return if holdings_data.blank?
+ 
+-    Rails.logger.info "SnaptradeAccount::HoldingsProcessor - Processing #{holdings_data.size} holdings"
++    if holdings_data.present?
++      Rails.logger.info "SnaptradeAccount::HoldingsProcessor - Processing #{holdings_data.size} holdings"
++
++      # Log sample of first holding to understand structure
++      if holdings_data.first
++        sample = holdings_data.first
++        Rails.logger.info "SnaptradeAccount::HoldingsProcessor - Sample holding keys: #{sample.keys.first(10).join(', ')}"
++        if sample["symbol"] || sample[:symbol]
++          symbol_sample = sample["symbol"] || sample[:symbol]
++          Rails.logger.info "SnaptradeAccount::HoldingsProcessor - Symbol data keys: #{symbol_sample.keys.first(10).join(', ')}" if symbol_sample.is_a?(Hash)
++        end
++      end
+ 
+-    # Log sample of first holding to understand structure
+-    if holdings_data.first
+-      sample = holdings_data.first
+-      Rails.logger.info "SnaptradeAccount::HoldingsProcessor - Sample holding keys: #{sample.keys.first(10).join(', ')}"
+-      if sample["symbol"] || sample[:symbol]
+-        symbol_sample = sample["symbol"] || sample[:symbol]
+-        Rails.logger.info "SnaptradeAccount::HoldingsProcessor - Symbol data keys: #{symbol_sample.keys.first(10).join(', ')}" if symbol_sample.is_a?(Hash)
++      holdings_data.each_with_index do |holding_data, idx|
++        Rails.logger.info "SnaptradeAccount::HoldingsProcessor - Processing holding #{idx + 1}/#{holdings_data.size}"
++        process_holding(holding_data.with_indifferent_access)
++      rescue => e
++        Rails.logger.error "SnaptradeAccount::HoldingsProcessor - Failed to process holding #{idx + 1}: #{e.class} - #{e.message}"
++        Rails.logger.error e.backtrace.first(5).join("\n") if e.backtrace
+       end
+     end
+ 
+-    holdings_data.each_with_index do |holding_data, idx|
+-      Rails.logger.info "SnaptradeAccount::HoldingsProcessor - Processing holding #{idx + 1}/#{holdings_data.size}"
+-      process_holding(holding_data.with_indifferent_access)
+-    rescue => e
+-      Rails.logger.error "SnaptradeAccount::HoldingsProcessor - Failed to process holding #{idx + 1}: #{e.class} - #{e.message}"
+-      Rails.logger.error e.backtrace.first(5).join("\n") if e.backtrace
+-    end
++    # Always run, even with no security holdings — secondary-currency cash
++    # should still be surfaced (issue #1809).
++    process_cash_holdings
+   end
+ 
+   private
+ 
++    # Surface cash held in currencies other than the account's primary currency
++    # as synthetic cash holdings (issue #1809). The primary currency stays in
++    # account.cash_balance; without this, SnapTrade's secondary-currency cash
++    # (e.g. USD cash in a CAD account) was silently discarded.
++    def process_cash_holdings
++      @snaptrade_account.non_primary_cash_entries.each do |entry|
++        amount = parse_decimal(entry[:amount])
++        next if amount.nil?
++
++        security = Security.cash_for(account, currency: entry[:currency])
++
++        Rails.logger.info "SnaptradeAccount::HoldingsProcessor - Importing #{entry[:currency]} cash holding"
++
++        import_adapter.import_holding(
++          security: security,
++          quantity: amount,
++          amount: amount,
++          currency: entry[:currency],
++          date: Date.current,
++          price: 1,
++          external_id: "snaptrade_cash_#{entry[:currency].to_s.downcase}",
++          account_provider_id: @snaptrade_account.account_provider&.id,
++          source: "snaptrade",
++          delete_future_holdings: false
++        )
++      rescue => e
++        Rails.logger.error "SnaptradeAccount::HoldingsProcessor - Failed to import #{entry[:currency]} cash holding: #{e.class} - #{e.message}"
++      end
++    end
++
+     def account
+       @snaptrade_account.current_account
+     end
+diff --git a/app/models/snaptrade_account/processor.rb b/app/models/snaptrade_account/processor.rb
+index a20893e633..5b9b578fd6 100644
+--- a/app/models/snaptrade_account/processor.rb
++++ b/app/models/snaptrade_account/processor.rb
+@@ -21,7 +21,9 @@ def process
+     holdings_count = snaptrade_account.raw_holdings_payload&.size || 0
+     Rails.logger.info "SnaptradeAccount::Processor - Holdings payload has #{holdings_count} items"
+ 
+-    if snaptrade_account.raw_holdings_payload.present?
++    # Run the holdings processor when there are security holdings OR
++    # non-primary-currency cash to surface as synthetic cash holdings (#1809).
++    if snaptrade_account.raw_holdings_payload.present? || snaptrade_account.non_primary_cash_entries.any?
+       Rails.logger.info "SnaptradeAccount::Processor - Processing holdings..."
+       SnaptradeAccount::HoldingsProcessor.new(snaptrade_account).process
+     else
+diff --git a/db/migrate/20260525121841_add_raw_balances_payload_to_snaptrade_accounts.rb b/db/migrate/20260525121841_add_raw_balances_payload_to_snaptrade_accounts.rb
+new file mode 100644
+index 0000000000..2a3426a7ae
+--- /dev/null
++++ b/db/migrate/20260525121841_add_raw_balances_payload_to_snaptrade_accounts.rb
+@@ -0,0 +1,5 @@
++class AddRawBalancesPayloadToSnaptradeAccounts < ActiveRecord::Migration[7.2]
++  def change
++    add_column :snaptrade_accounts, :raw_balances_payload, :jsonb, default: []
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index c7fcf54aea..f8bfc6035e 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[7.2].define(version: 2026_05_19_100000) do
++ActiveRecord::Schema[7.2].define(version: 2026_05_25_121841) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "pgcrypto"
+   enable_extension "plpgsql"
+@@ -498,7 +498,7 @@
+     t.index ["provider_key"], name: "index_debug_log_entries_on_provider_key"
+     t.index ["source"], name: "index_debug_log_entries_on_source"
+     t.index ["user_id"], name: "index_debug_log_entries_on_user_id"
+-    t.check_constraint "level::text = ANY (ARRAY['debug'::character varying, 'info'::character varying, 'warn'::character varying, 'error'::character varying]::text[])", name: "chk_debug_log_entries_level"
++    t.check_constraint "level::text = ANY (ARRAY['debug'::character varying::text, 'info'::character varying::text, 'warn'::character varying::text, 'error'::character varying::text])", name: "chk_debug_log_entries_level"
+   end
+ 
+   create_table "depositories", id: :uuid, default: -> { "gen_random_uuid()" }, force: :cascade do |t|
+@@ -1562,6 +1562,7 @@
+     t.datetime "updated_at", null: false
+     t.boolean "activities_fetch_pending", default: false
+     t.date "sync_start_date"
++    t.jsonb "raw_balances_payload", default: []
+     t.index ["snaptrade_item_id", "snaptrade_account_id"], name: "index_snaptrade_accounts_on_item_and_snaptrade_account_id", unique: true, where: "(snaptrade_account_id IS NOT NULL)"
+     t.index ["snaptrade_item_id"], name: "index_snaptrade_accounts_on_snaptrade_item_id"
+   end
+diff --git a/test/models/snaptrade_account_processor_test.rb b/test/models/snaptrade_account_processor_test.rb
+index afc90c7873..d6926d2503 100644
+--- a/test/models/snaptrade_account_processor_test.rb
++++ b/test/models/snaptrade_account_processor_test.rb
+@@ -320,4 +320,78 @@ class SnaptradeAccountProcessorTest < ActiveSupport::TestCase
+     entries = @account.entries.where(external_id: "activity_idempotent_1")
+     assert_equal 1, entries.count
+   end
++
++  # === Multi-currency cash (issue #1809) ===
++
++  test "upsert_balances! persists all entries and keeps the primary currency in cash_balance" do
++    @snaptrade_account.update!(currency: "USD")
++
++    # Primary (USD) is intentionally NOT first so this asserts the
++    # account-currency selection actually resolves it via dig(:currency, :code)
++    # on the string-keyed payload — not the `entries.first` fallback.
++    @snaptrade_account.upsert_balances!([
++      { "currency" => { "code" => "EUR" }, "cash" => "800.00" },
++      { "currency" => { "code" => "USD" }, "cash" => "1500.00" }
++    ])
++
++    @snaptrade_account.reload
++    assert_equal BigDecimal("1500.00"), @snaptrade_account.cash_balance, "primary (USD) cash stays in cash_balance"
++    assert_equal 2, @snaptrade_account.raw_balances_payload.size, "all balance entries are persisted, not just the primary"
++
++    non_primary = @snaptrade_account.non_primary_cash_entries
++    assert_equal 1, non_primary.size
++    assert_equal "EUR", non_primary.first[:currency]
++  end
++
++  test "holdings processor surfaces non-primary-currency cash as a synthetic holding" do
++    @snaptrade_account.update!(
++      currency: "USD",
++      cash_balance: BigDecimal("1500.00"),
++      raw_balances_payload: [
++        { "currency" => { "code" => "USD" }, "cash" => "1500.00" },
++        { "currency" => { "code" => "EUR" }, "cash" => "800.00" }
++      ]
++    )
++
++    SnaptradeAccount::HoldingsProcessor.new(@snaptrade_account).process
++
++    eur_cash = @account.holdings.joins(:security).where(securities: { kind: "cash" }, currency: "EUR").order(date: :desc).first
++    assert_not_nil eur_cash, "EUR cash must be imported as a synthetic cash holding"
++    assert_equal BigDecimal("800"), eur_cash.qty
++    assert eur_cash.security.cash?, "the holding's security is a synthetic cash security"
++
++    usd_cash = @account.holdings.joins(:security).where(securities: { kind: "cash" }, currency: "USD").exists?
++    assert_not usd_cash, "primary (USD) cash stays in cash_balance, not duplicated as a holding"
++  end
++
++  test "processor surfaces non-primary cash even when there are no security holdings" do
++    @snaptrade_account.update!(
++      currency: "USD",
++      raw_holdings_payload: [],
++      raw_balances_payload: [
++        { "currency" => { "code" => "USD" }, "cash" => "1500.00" },
++        { "currency" => { "code" => "EUR" }, "cash" => "800.00" }
++      ]
++    )
++
++    SnaptradeAccount::Processor.new(@snaptrade_account).process
++
++    eur_cash = @account.holdings.joins(:security).where(securities: { kind: "cash" }, currency: "EUR").exists?
++    assert eur_cash, "processor must run the holdings processor so secondary-currency cash is surfaced even with no stock holdings"
++  end
++
++  test "non-primary cash holding is not duplicated across repeated syncs" do
++    @snaptrade_account.update!(
++      currency: "USD",
++      raw_balances_payload: [
++        { "currency" => { "code" => "USD" }, "cash" => "1500.00" },
++        { "currency" => { "code" => "EUR" }, "cash" => "800.00" }
++      ]
++    )
++
++    2.times { SnaptradeAccount::HoldingsProcessor.new(@snaptrade_account).process }
++
++    eur_cash = @account.holdings.joins(:security).where(securities: { kind: "cash" }, currency: "EUR")
++    assert_equal 1, eur_cash.select(:external_id).distinct.count
++  end
+ end

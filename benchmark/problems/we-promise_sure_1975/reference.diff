@@ -1,0 +1,148 @@
+diff --git a/app/jobs/identify_recurring_transactions_job.rb b/app/jobs/identify_recurring_transactions_job.rb
+index 9bb2c41565..d6ca2dffac 100644
+--- a/app/jobs/identify_recurring_transactions_job.rb
++++ b/app/jobs/identify_recurring_transactions_job.rb
+@@ -42,21 +42,13 @@ def cache_key(family_id)
+       "recurring_transaction_identify:#{family_id}"
+     end
+ 
++    # Debounce gate: delegate to `Sync.any_incomplete_for?`, which polls every
++    # `Syncable` provider association on `Family` via reflection. The previous
++    # hand-rolled list covered only 5 of the 14 `*_items` associations on
++    # `Family`, so a Coinbase/Mercury/Brex/etc. sync in flight silently
++    # bypassed this gate and let the identifier run against a partial dataset.
+     def family_has_incomplete_syncs?(family)
+-      # Check family's own syncs
+-      return true if family.syncs.incomplete.exists?
+-
+-      # Check all provider items' syncs
+-      return true if family.plaid_items.joins(:syncs).merge(Sync.incomplete).exists? if family.respond_to?(:plaid_items)
+-      return true if family.simplefin_items.joins(:syncs).merge(Sync.incomplete).exists? if family.respond_to?(:simplefin_items)
+-      return true if family.lunchflow_items.joins(:syncs).merge(Sync.incomplete).exists? if family.respond_to?(:lunchflow_items)
+-      return true if family.enable_banking_items.joins(:syncs).merge(Sync.incomplete).exists? if family.respond_to?(:enable_banking_items)
+-      return true if family.sophtron_items.joins(:syncs).merge(Sync.incomplete).exists? if family.respond_to?(:sophtron_items)
+-
+-      # Check accounts' syncs
+-      return true if family.accounts.joins(:syncs).merge(Sync.incomplete).exists?
+-
+-      false
++      Sync.any_incomplete_for?(family)
+     end
+ 
+     def with_advisory_lock(family_id)
+diff --git a/app/models/sync.rb b/app/models/sync.rb
+index e2ec1f28a2..83cb439ce0 100644
+--- a/app/models/sync.rb
++++ b/app/models/sync.rb
+@@ -71,6 +71,14 @@ def for_family(family, resource_owner: nil)
+       query
+     end
+ 
++    # True iff the family has any pending/syncing Sync — across its own row,
++    # its accounts, and every Syncable provider `*_items` association. Built
++    # on `for_family` so new provider integrations are picked up automatically
++    # via `family_syncable_associations` reflection (no hand-rolled list).
++    def any_incomplete_for?(family)
++      for_family(family).incomplete.exists?
++    end
++
+     private
+       def account_syncable_ids(family, resource_owner)
+         (resource_owner ? resource_owner.accessible_accounts : family.accounts)
+diff --git a/test/jobs/identify_recurring_transactions_job_test.rb b/test/jobs/identify_recurring_transactions_job_test.rb
+new file mode 100644
+index 0000000000..22a07ef669
+--- /dev/null
++++ b/test/jobs/identify_recurring_transactions_job_test.rb
+@@ -0,0 +1,57 @@
++require "test_helper"
++
++class IdentifyRecurringTransactionsJobTest < ActiveJob::TestCase
++  setup do
++    @family = families(:dylan_family)
++    @scheduled_at = Time.current.to_f
++  end
++
++  test "skips identification while a Coinbase provider sync is in flight" do
++    coinbase_item = @family.coinbase_items.create!(
++      name: "Coinbase Pro",
++      api_key: "test-api-key-#{SecureRandom.hex(4)}",
++      api_secret: "test-api-secret-#{SecureRandom.hex(8)}"
++    )
++    Sync.create!(syncable: coinbase_item, status: :syncing)
++
++    RecurringTransaction::Identifier.any_instance.expects(:identify_recurring_patterns).never
++
++    IdentifyRecurringTransactionsJob.new.perform(@family.id, @scheduled_at)
++  end
++
++  test "skips identification while a Mercury provider sync is in flight" do
++    mercury_item = mercury_items(:one)
++    Sync.create!(syncable: mercury_item, status: :pending)
++
++    RecurringTransaction::Identifier.any_instance.expects(:identify_recurring_patterns).never
++
++    IdentifyRecurringTransactionsJob.new.perform(@family.id, @scheduled_at)
++  end
++
++  test "runs identification when no provider syncs are in flight" do
++    # Sanity: there are no incomplete syncs in the fixture set by default.
++    Sync.for_family(@family).incomplete.find_each(&:destroy)
++
++    RecurringTransaction::Identifier.any_instance.expects(:identify_recurring_patterns).once
++
++    IdentifyRecurringTransactionsJob.new.perform(@family.id, @scheduled_at)
++  end
++
++  test "skips when family is missing" do
++    RecurringTransaction::Identifier.any_instance.expects(:identify_recurring_patterns).never
++
++    IdentifyRecurringTransactionsJob.new.perform(SecureRandom.uuid, @scheduled_at)
++  end
++
++  test "skips when a newer scheduled run supersedes this one" do
++    # Rails.cache is NullStore in the test env (writes are no-ops), so we stub
++    # the read directly to simulate a newer scheduled-at landing in the cache
++    # between this job being enqueued and being picked up.
++    cache_key = "recurring_transaction_identify:#{@family.id}"
++    Rails.cache.stubs(:read).with(cache_key).returns(@scheduled_at + 10)
++
++    RecurringTransaction::Identifier.any_instance.expects(:identify_recurring_patterns).never
++
++    assert_nil IdentifyRecurringTransactionsJob.new.perform(@family.id, @scheduled_at)
++  end
++end
+diff --git a/test/models/sync_test.rb b/test/models/sync_test.rb
+index 6fa8be3c94..92dcba2893 100644
+--- a/test/models/sync_test.rb
++++ b/test/models/sync_test.rb
+@@ -234,6 +234,29 @@ class SyncTest < ActiveSupport::TestCase
+     assert_equal syncs.map(&:id).sort, Sync.for_family(family).where(id: syncs.map(&:id)).pluck(:id).sort
+   end
+ 
++  test "any_incomplete_for? fires on a Sync against any Syncable provider item association" do
++    family = families(:dylan_family)
++    Sync.for_family(family).incomplete.find_each(&:destroy)
++    assert_not Sync.any_incomplete_for?(family)
++
++    mercury_item = mercury_items(:one)
++    incomplete = Sync.create!(syncable: mercury_item, status: :pending)
++    assert Sync.any_incomplete_for?(family),
++           "any_incomplete_for? should report true for an in-flight Mercury sync"
++
++    incomplete.update!(status: :completed)
++    assert_not Sync.any_incomplete_for?(family)
++  end
++
++  test "any_incomplete_for? fires on a Sync against the family itself" do
++    family = families(:dylan_family)
++    Sync.for_family(family).incomplete.find_each(&:destroy)
++    assert_not Sync.any_incomplete_for?(family)
++
++    Sync.create!(syncable: family, status: :syncing)
++    assert Sync.any_incomplete_for?(family)
++  end
++
+   test "api error payload is present for failed syncs without raw error text" do
+     sync = Sync.create!(syncable: accounts(:depository), status: :failed)
+ 

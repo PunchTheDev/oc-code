@@ -1,0 +1,477 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ea7c3b8..e72d268 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,18 @@
+ 
+ ## Unreleased
+ 
++- **System-prompt SHA** (#110): the fully-assembled system prompt (persona,
++  tools, and hydrated household memory) is now fingerprinted with a real
++  SHA-256 at boot, satisfying the M1 exit criterion that the prompt stays
++  deterministic across a full-stack restart. New pure-Rust `prompt_sha`
++  module (no crypto dependency, pinned to the FIPS-180 known-answer vectors)
++  computes the digest; genie-core logs it during boot, exposes it as
++  `system_prompt_sha` on `/api/health`, and `genie-ctl status` prints it as
++  `Prompt:`. A new `prompt_sha_test` integration test boots the prompt
++  assembly twice from identical config + hydrated state and asserts an
++  identical SHA, plus asserts that a prompt-assembly or hydration change
++  shifts the digest — so silent prompt drift between runs becomes a visible
++  hash mismatch instead of an undetected behavior change.
+ - **Crash fix: non-ASCII backend error bodies** (#147): `truncate_body`
+   in `llm/openai_compat.rs` sliced the response body at a fixed 240-byte
+   offset (`&trimmed[..240]`). When that offset landed inside a multi-byte
+diff --git a/README.md b/README.md
+index 44864cf..23e2406 100644
+--- a/README.md
++++ b/README.md
+@@ -57,6 +57,8 @@ genie-ai-runtime   Home Assistant today
+ - optional `web_search` tool with DuckDuckGo or SearXNG
+ - cache-aware `genie-ai-runtime` requests with `conversation_id` and
+   `nvext.agent_hints` for session KV reuse
++- system-prompt SHA exposed in boot logs, `/api/health`, and `genie-ctl status`
++  to prove deterministic prompt assembly across restarts
+ - Jetson aarch64 cross-compile CI
+ 
+ Current workspace version: `v1.0.0-alpha.9`.
+diff --git a/crates/genie-core/src/lib.rs b/crates/genie-core/src/lib.rs
+index 83b3f40..9fce096 100644
+--- a/crates/genie-core/src/lib.rs
++++ b/crates/genie-core/src/lib.rs
+@@ -52,6 +52,7 @@ pub mod memory;
+ pub mod ota;
+ pub mod profile;
+ pub mod prompt;
++pub mod prompt_sha;
+ pub mod reasoning;
+ pub mod repl;
+ pub mod runtime_boundary;
+diff --git a/crates/genie-core/src/main.rs b/crates/genie-core/src/main.rs
+index 2cf6627..0fffe05 100644
+--- a/crates/genie-core/src/main.rs
++++ b/crates/genie-core/src/main.rs
+@@ -105,10 +105,17 @@ async fn main() -> Result<()> {
+     let model_family = prompt::ModelFamily::from_model_name(model_name);
+     let prompt_builder = prompt::PromptBuilder::from_model_name(model_name);
+     let system_prompt = prompt_builder.build(&tool_dispatcher.tool_defs(), &mem);
++    // M1 exit (issue #110): fingerprint the fully-assembled system prompt with a
++    // real SHA-256 so silent prompt drift between restarts is observable. The
++    // digest is logged here at boot and surfaced via /api/health and
++    // `genie-ctl status`.
++    let system_prompt_sha = genie_core::prompt_sha::sha256_hex(&system_prompt);
+     tracing::info!(
+         model = model_name,
+         family = ?model_family,
+-        "system prompt built"
++        prompt_bytes = system_prompt.len(),
++        system_prompt_sha = %system_prompt_sha,
++        "system prompt assembled"
+     );
+ 
+     // Check if stdin is a terminal (REPL mode) or pipe/systemd (server-only).
+@@ -275,6 +282,7 @@ async fn main() -> Result<()> {
+             mem,
+             conversations,
+             system_prompt,
++            system_prompt_sha,
+             config.core.max_history_turns,
+             model_family,
+             config.core.expected_runtime_contract_hash.clone(),
+diff --git a/crates/genie-core/src/prompt_sha.rs b/crates/genie-core/src/prompt_sha.rs
+new file mode 100644
+index 0000000..4158672
+--- /dev/null
++++ b/crates/genie-core/src/prompt_sha.rs
+@@ -0,0 +1,153 @@
++//! SHA-256 of the fully-assembled system prompt — the M1 prompt-determinism
++//! fingerprint (issue #110).
++//!
++//! The M1 exit criteria require that the assembled system prompt is
++//! byte-for-byte identical across a full-stack restart with matching config
++//! and hydrated state, so "silent prompt drift between runs" becomes a visible
++//! hash mismatch in `/api/health` and `genie-ctl status` instead of an
++//! undetected behavior change.
++//!
++//! This is intentionally a *real* SHA-256, distinct from the operational
++//! FNV-1a fingerprint in [`crate::runtime_contract`]: the README M1 checklist
++//! and the dashboard speak in terms of a "system prompt SHA", so we publish a
++//! genuine SHA-256 hex digest. It is implemented in pure Rust to honor the
++//! crate's no-crypto-dependency policy (see `runtime_contract`); the digest is
++//! a determinism fingerprint for operators, not a security primitive.
++//!
++//! Correctness is locked down with the NIST/FIPS-180 known-answer vectors in
++//! the test module below.
++
++const INITIAL_STATE: [u32; 8] = [
++    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
++];
++
++const ROUND_CONSTANTS: [u32; 64] = [
++    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++];
++
++/// Lowercase 64-character SHA-256 hex digest of `data`.
++///
++/// Used for the system-prompt determinism fingerprint; see the module docs.
++// The `a`..`h` working variables are the canonical SHA-256 register names from
++// FIPS-180; keeping them mirrors the spec and the reference test vectors.
++#[allow(clippy::many_single_char_names)]
++pub fn sha256_hex(data: &str) -> String {
++    let mut state = INITIAL_STATE;
++    let mut message = data.as_bytes().to_vec();
++    let bit_len = (message.len() as u64).wrapping_mul(8);
++
++    // Pad: append 0x80, zero-fill until 56 mod 64, then the 64-bit big-endian
++    // message length in bits.
++    message.push(0x80);
++    while message.len() % 64 != 56 {
++        message.push(0);
++    }
++    message.extend_from_slice(&bit_len.to_be_bytes());
++
++    for block in message.chunks_exact(64) {
++        let mut schedule = [0u32; 64];
++        for (i, word) in block.chunks_exact(4).enumerate() {
++            schedule[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
++        }
++        for i in 16..64 {
++            let s0 = schedule[i - 15].rotate_right(7)
++                ^ schedule[i - 15].rotate_right(18)
++                ^ (schedule[i - 15] >> 3);
++            let s1 = schedule[i - 2].rotate_right(17)
++                ^ schedule[i - 2].rotate_right(19)
++                ^ (schedule[i - 2] >> 10);
++            schedule[i] = schedule[i - 16]
++                .wrapping_add(s0)
++                .wrapping_add(schedule[i - 7])
++                .wrapping_add(s1);
++        }
++
++        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
++
++        for i in 0..64 {
++            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
++            let ch = (e & f) ^ ((!e) & g);
++            let t1 = h
++                .wrapping_add(s1)
++                .wrapping_add(ch)
++                .wrapping_add(ROUND_CONSTANTS[i])
++                .wrapping_add(schedule[i]);
++            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
++            let maj = (a & b) ^ (a & c) ^ (b & c);
++            let t2 = s0.wrapping_add(maj);
++
++            h = g;
++            g = f;
++            f = e;
++            e = d.wrapping_add(t1);
++            d = c;
++            c = b;
++            b = a;
++            a = t1.wrapping_add(t2);
++        }
++
++        state[0] = state[0].wrapping_add(a);
++        state[1] = state[1].wrapping_add(b);
++        state[2] = state[2].wrapping_add(c);
++        state[3] = state[3].wrapping_add(d);
++        state[4] = state[4].wrapping_add(e);
++        state[5] = state[5].wrapping_add(f);
++        state[6] = state[6].wrapping_add(g);
++        state[7] = state[7].wrapping_add(h);
++    }
++
++    let mut hex = String::with_capacity(64);
++    for word in state {
++        hex.push_str(&format!("{word:08x}"));
++    }
++    hex
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    // NIST/FIPS-180 known-answer vectors. These pin the implementation to a
++    // genuine SHA-256 — a hand-rolled hash that drifted from the standard would
++    // fail here, and the determinism guarantee in issue #110 leans on these
++    // being exact.
++    #[test]
++    fn matches_published_sha256_vectors() {
++        assert_eq!(
++            sha256_hex(""),
++            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
++        );
++        assert_eq!(
++            sha256_hex("abc"),
++            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
++        );
++        // Two-block message (exercises the schedule across block boundaries).
++        assert_eq!(
++            sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
++            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
++        );
++    }
++
++    #[test]
++    fn digest_is_64_hex_chars() {
++        let digest = sha256_hex("GeniePod Home");
++        assert_eq!(digest.len(), 64);
++        assert!(digest.chars().all(|c| c.is_ascii_hexdigit()));
++    }
++
++    #[test]
++    fn same_input_is_deterministic_and_differs_on_change() {
++        assert_eq!(
++            sha256_hex("identical prompt"),
++            sha256_hex("identical prompt")
++        );
++        assert_ne!(sha256_hex("prompt one"), sha256_hex("prompt two"));
++    }
++}
+diff --git a/crates/genie-core/src/server.rs b/crates/genie-core/src/server.rs
+index c7561ad..799e1d8 100644
+--- a/crates/genie-core/src/server.rs
++++ b/crates/genie-core/src/server.rs
+@@ -67,6 +67,9 @@ pub struct ChatServer {
+     current_conv_id: Mutex<String>,
+     chat_turn_lock: Mutex<()>,
+     system_prompt: String,
++    /// SHA-256 of the boot-assembled system prompt (issue #110). Computed once
++    /// at startup and served via /api/health for restart-determinism checks.
++    system_prompt_sha: String,
+     max_history: usize,
+     model_family: ModelFamily,
+     expected_runtime_contract_hash: String,
+@@ -86,6 +89,7 @@ impl ChatServer {
+         memory: Memory,
+         conversations: ConversationStore,
+         system_prompt: String,
++        system_prompt_sha: String,
+         max_history: usize,
+         model_family: ModelFamily,
+         expected_runtime_contract_hash: String,
+@@ -103,6 +107,7 @@ impl ChatServer {
+             current_conv_id: Mutex::new(conv_id),
+             chat_turn_lock: Mutex::new(()),
+             system_prompt,
++            system_prompt_sha,
+             max_history,
+             model_family,
+             expected_runtime_contract_hash,
+@@ -242,6 +247,7 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
+     let current_conv_id = &ctx.current_conv_id;
+     let chat_turn_lock = &ctx.chat_turn_lock;
+     let system_prompt = &ctx.system_prompt;
++    let system_prompt_sha = &ctx.system_prompt_sha;
+     let max_history = ctx.max_history;
+     let model_family = ctx.model_family;
+     let expected_runtime_contract_hash = &ctx.expected_runtime_contract_hash;
+@@ -359,6 +365,7 @@ async fn handle_request(stream: tokio::net::TcpStream, ctx: &ChatServer) -> Resu
+                 memory,
+                 conversations,
+                 system_prompt,
++                system_prompt_sha,
+                 max_history,
+                 model_family,
+                 expected_runtime_contract_hash,
+@@ -1091,6 +1098,7 @@ async fn handle_health(
+     memory: &Memory,
+     conversations: &ConversationStore,
+     system_prompt: &str,
++    system_prompt_sha: &str,
+     max_history: usize,
+     model_family: ModelFamily,
+     expected_runtime_contract_hash: &str,
+@@ -1123,6 +1131,7 @@ async fn handle_health(
+         "mem_available_mb": mem_avail,
+         "connectivity": connectivity_health,
+         "web_search": tools.web_search_status(),
++        "system_prompt_sha": system_prompt_sha,
+         "runtime_contract": runtime_contract,
+         "version": env!("CARGO_PKG_VERSION"),
+     });
+@@ -2065,6 +2074,7 @@ mod tests {
+         let memory = Memory::open(&memory_path).unwrap();
+         let conversations = ConversationStore::open(&conversations_path).unwrap();
+ 
++        let prompt_sha = crate::prompt_sha::sha256_hex("system prompt");
+         let (status, _, body) = handle_health(
+             &llm,
+             &tools,
+@@ -2072,6 +2082,7 @@ mod tests {
+             &memory,
+             &conversations,
+             "system prompt",
++            &prompt_sha,
+             12,
+             ModelFamily::Phi,
+             "",
+@@ -2082,6 +2093,8 @@ mod tests {
+         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+         assert_eq!(parsed["llm"], "offline");
+         assert_eq!(parsed["llm_backend"], "genie-ai-runtime");
++        assert_eq!(parsed["system_prompt_sha"], prompt_sha);
++        assert_eq!(parsed["system_prompt_sha"].as_str().unwrap().len(), 64);
+ 
+         let _ = std::fs::remove_file(&memory_path);
+         let _ = std::fs::remove_file(&conversations_path);
+@@ -2301,6 +2314,7 @@ mod tests {
+         let memory_path = tmp.join(format!("{uid}-memory.db"));
+         let conv_path = tmp.join(format!("{uid}-conv.db"));
+ 
++        let system_prompt = "You are a helpful assistant.";
+         let server = super::ChatServer::new(
+             LlmClient::from_backend(slow_backend),
+             ToolDispatcher::new(None),
+@@ -2309,7 +2323,8 @@ mod tests {
+             )),
+             Memory::open(&memory_path).unwrap(),
+             ConversationStore::open(&conv_path).unwrap(),
+-            "You are a helpful assistant.".into(),
++            system_prompt.into(),
++            crate::prompt_sha::sha256_hex(system_prompt),
+             10,
+             ModelFamily::Phi,
+             "".into(),
+diff --git a/crates/genie-core/tests/prompt_sha_test.rs b/crates/genie-core/tests/prompt_sha_test.rs
+new file mode 100644
+index 0000000..bd41849
+--- /dev/null
++++ b/crates/genie-core/tests/prompt_sha_test.rs
+@@ -0,0 +1,104 @@
++//! Integration test for the M1 system-prompt determinism fingerprint (issue #110).
++//!
++//! M1 exit criterion: "system prompt SHA is identical across full-stack
++//! restart." These tests assemble the system prompt the same way `genie-core`
++//! does at boot (model-aware [`PromptBuilder`] over the live tool defs and
++//! hydrated memory), then hash it with the real SHA-256 in [`prompt_sha`].
++//!
++//! Two independent assemblies stand in for two stack boots: each uses its own
++//! fresh SQLite memory file, mirroring a process restart that re-reads the same
++//! persisted configuration and household state.
++
++use std::sync::atomic::{AtomicU32, Ordering};
++
++use genie_core::Memory;
++use genie_core::prompt::PromptBuilder;
++use genie_core::prompt_sha::sha256_hex;
++use genie_core::tools::ToolDispatcher;
++
++static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
++
++/// Assemble the boot-time system prompt for `model_name` over a fresh memory
++/// file hydrated with `identity_facts`, then return its SHA-256 — the same
++/// digest genie-core logs at boot and serves on `/api/health`.
++fn assemble_system_prompt_sha(model_name: &str, identity_facts: &[&str]) -> String {
++    let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
++    let path = std::env::temp_dir().join(format!(
++        "geniepod-prompt-sha-test-{}-{}.db",
++        std::process::id(),
++        id
++    ));
++    let _ = std::fs::remove_file(&path);
++
++    let memory = Memory::open(&path).unwrap();
++    for &fact in identity_facts {
++        memory.store("identity", fact).unwrap();
++    }
++
++    let tools = ToolDispatcher::new(None);
++    let builder = PromptBuilder::from_model_name(model_name);
++    let system_prompt = builder.build(&tools.tool_defs(), &memory);
++    let sha = sha256_hex(&system_prompt);
++
++    let _ = std::fs::remove_file(&path);
++    sha
++}
++
++/// Core acceptance criterion: two stack boots from identical configuration and
++/// hydrated state produce an identical system-prompt SHA.
++#[test]
++fn identical_config_and_state_produce_identical_sha() {
++    let model = "Qwen3-4B-Q4_K_M.gguf";
++    let facts = ["Household member name is Jared"];
++
++    let boot_a = assemble_system_prompt_sha(model, &facts);
++    let boot_b = assemble_system_prompt_sha(model, &facts);
++
++    assert_eq!(
++        boot_a, boot_b,
++        "same config + hydrated state must hash identically across restarts"
++    );
++    assert_eq!(boot_a.len(), 64, "expected a 64-char SHA-256 hex digest");
++    assert!(boot_a.chars().all(|c| c.is_ascii_hexdigit()));
++}
++
++/// Empty-memory boots are deterministic too — the no-hydration baseline must
++/// not drift between restarts.
++#[test]
++fn identical_empty_boots_match() {
++    let model = "Qwen3-4B-Q4_K_M.gguf";
++    assert_eq!(
++        assemble_system_prompt_sha(model, &[]),
++        assemble_system_prompt_sha(model, &[]),
++    );
++}
++
++/// A change in prompt-assembly logic — here the model family selects a
++/// different prompt template — must be observable as a different SHA.
++#[test]
++fn prompt_assembly_change_is_observable_in_sha() {
++    // Qwen routes through the "capable model" template; TinyLlama routes
++    // through the simpler small-model template. Different assembly => different
++    // digest.
++    let capable = assemble_system_prompt_sha("Qwen3-4B-Q4_K_M.gguf", &[]);
++    let small = assemble_system_prompt_sha("tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf", &[]);
++
++    assert_ne!(
++        capable, small,
++        "different prompt-assembly logic must change the SHA"
++    );
++}
++
++/// Hydrated state is part of the fingerprint: adding household context changes
++/// the assembled prompt and therefore the SHA.
++#[test]
++fn hydrated_state_change_is_observable_in_sha() {
++    let model = "Qwen3-4B-Q4_K_M.gguf";
++    let empty = assemble_system_prompt_sha(model, &[]);
++    let hydrated = assemble_system_prompt_sha(model, &["Household member name is Jared"]);
++
++    assert_ne!(
++        empty, hydrated,
++        "changing hydrated household state must change the SHA"
++    );
++}
+diff --git a/crates/genie-ctl/src/main.rs b/crates/genie-ctl/src/main.rs
+index bc18364..4766c46 100644
+--- a/crates/genie-ctl/src/main.rs
++++ b/crates/genie-ctl/src/main.rs
+@@ -79,6 +79,7 @@ fn api_probe_addr(config: &Config) -> std::result::Result<String, String> {
+         ServiceProbeTarget::UnsupportedScheme { scheme } => Err(scheme),
+     }
+ }
++
+ const SKILL_RESTART_HINT: &str =
+     "Restart genie-core to load skill changes, or wait until the next startup.";
+ 
+@@ -853,6 +854,11 @@ async fn cmd_status() -> Result<()> {
+                     provider
+                 );
+             }
++            // System-prompt SHA (issue #110): same config + hydrated state must
++            // produce an identical digest across a full-stack restart.
++            if let Some(sha) = data.get("system_prompt_sha").and_then(|v| v.as_str()) {
++                println!("Prompt:    {}", sha);
++            }
+         }
+         Err(_) => println!("Core:      offline"),
+     }

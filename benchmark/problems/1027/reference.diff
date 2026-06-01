@@ -1,0 +1,877 @@
+diff --git a/gittensor/classes.py b/gittensor/classes.py
+index 1c500154..a0cfcc4e 100644
+--- a/gittensor/classes.py
++++ b/gittensor/classes.py
+@@ -15,7 +15,6 @@
+     from gittensor.validator.oss_contributions.mirror.scored_pr import ScoredMirrorPR
+ 
+ from gittensor.constants import (
+-    LABEL_MULTIPLIERS,
+     MAINTAINER_ASSOCIATIONS,
+     MAX_CODE_DENSITY_MULTIPLIER,
+     MIN_TOKEN_SCORE_FOR_BASE_SCORE,
+@@ -183,8 +182,10 @@ class PullRequest:
+     time_decay_multiplier: float = 1.0
+     credibility_multiplier: float = 1.0
+     review_quality_multiplier: float = 1.0  # Penalty for CHANGES_REQUESTED reviews from maintainers
+-    label_multiplier: float = 1.0  # Multiplier based on PR label (exact match against known labels)
+-    label: Optional[str] = None  # Last label set on the PR
++    label_multiplier: float = 1.0  # Multiplier resolved from repository label config
++    label: Optional[str] = None  # Resolved scoring label, set during scoring
++    current_labels: frozenset[str] = field(default_factory=frozenset)
++    label_timeline_order: tuple[str, ...] = field(default_factory=tuple)  # Newest current labels first
+     changes_requested_count: int = 0  # Number of maintainer CHANGES_REQUESTED reviews
+     earned_score: float = 0.0
+     collateral_score: float = 0.0  # For OPEN PRs: potential_score * collateral_percent
+@@ -310,18 +311,19 @@ def from_graphql_response(cls, pr_data: dict, uid: int, hotkey: str, github_id:
+         cr_reviews = (pr_data.get('changesRequestedReviews') or {}).get('nodes') or []
+         changes_requested_count = sum(1 for r in cr_reviews if r.get('authorAssociation') in MAINTAINER_ASSOCIATIONS)
+ 
+-        current = {(n.get('name') or '').lower() for n in (pr_data.get('labels') or {}).get('nodes') or [] if n}
+-        label: Optional[str] = None
+-        scoring_labels = current & LABEL_MULTIPLIERS.keys()
+-        if scoring_labels:
++        current = frozenset(
++            (n.get('name') or '').lower()
++            for n in (pr_data.get('labels') or {}).get('nodes') or []
++            if n and n.get('name')
++        )
++        timeline_ordered: list[str] = []
++        if current:
++            seen: set[str] = set()
+             for event in reversed((pr_data.get('timelineItems') or {}).get('nodes') or []):
+                 name = ((event or {}).get('label') or {}).get('name', '').lower()
+-                if name in scoring_labels:
+-                    label = name
+-                    break
+-            if label is None:
+-                # Timeline truncated — fall back to highest-multiplier currently-applied label
+-                label = max(scoring_labels, key=lambda n: (LABEL_MULTIPLIERS[n], n))
++                if name and name in current and name not in seen:
++                    seen.add(name)
++                    timeline_ordered.append(name)
+ 
+         return cls(
+             number=pr_data['number'],
+@@ -343,7 +345,8 @@ def from_graphql_response(cls, pr_data: dict, uid: int, hotkey: str, github_id:
+             last_edited_at=last_edited_at,
+             head_ref_oid=pr_data.get('headRefOid'),
+             base_ref_oid=pr_data.get('baseRefOid'),
+-            label=label,
++            current_labels=current,
++            label_timeline_order=tuple(timeline_ordered),
+             changes_requested_count=changes_requested_count,
+         )
+ 
+diff --git a/gittensor/constants.py b/gittensor/constants.py
+index b2acbadd..da2d699e 100644
+--- a/gittensor/constants.py
++++ b/gittensor/constants.py
+@@ -83,29 +83,6 @@
+ # Boosts
+ MAX_CODE_DENSITY_MULTIPLIER = 1.15
+ 
+-# Label multipliers - applied based on the last label set on the PR (requires triage+ access)
+-LABEL_MULTIPLIERS: dict[str, float] = {
+-    # features
+-    'feature': 1.50,
+-    'feat': 1.50,
+-    # bug fixes
+-    'bug': 1.25,
+-    'fix': 1.25,
+-    'crash': 1.25,
+-    'regression': 1.25,
+-    'security': 1.25,
+-    # enhancements
+-    'enhancement': 1.10,
+-    'improve': 1.10,
+-    'perf': 1.10,
+-    # refactors
+-    'refactor': 0.5,
+-    'cleanup': 0.5,
+-    'polish': 0.5,
+-    'debt': 0.5,
+-    'chore': 0.5,
+-}
+-
+ # Pioneer dividend — rewards the first quality contributor to each repository
+ # Rates applied per follower position (1st follower pays most, diminishing after)
+ # Dividend capped at PIONEER_DIVIDEND_MAX_RATIO × pioneer's own earned_score
+diff --git a/gittensor/validator/oss_contributions/label_resolution.py b/gittensor/validator/oss_contributions/label_resolution.py
+new file mode 100644
+index 00000000..bd02b870
+--- /dev/null
++++ b/gittensor/validator/oss_contributions/label_resolution.py
+@@ -0,0 +1,76 @@
++"""Repository-scoped PR label multiplier resolution."""
++
++from fnmatch import fnmatch
++from typing import Iterable, Optional
++
++from gittensor.validator.utils.load_weights import RepositoryConfig
++
++
++def get_default_label_multiplier(repo_config: Optional[RepositoryConfig]) -> float:
++    """Return the neutral/default label multiplier for a repository."""
++    return repo_config.default_label_multiplier if repo_config else 1.0
++
++
++def get_label_multiplier(label: str, repo_config: Optional[RepositoryConfig]) -> Optional[float]:
++    """Return the highest configured multiplier matching a label, or None."""
++    if repo_config is None or not repo_config.label_multipliers:
++        return None
++
++    label_lower = label.lower()
++    matches = [
++        multiplier
++        for pattern, multiplier in repo_config.label_multipliers.items()
++        if fnmatch(label_lower, pattern.lower())
++    ]
++    return max(matches) if matches else None
++
++
++def resolve_legacy_label_multiplier(
++    label_timeline_order: Iterable[str],
++    current_labels: Iterable[str],
++    repo_config: Optional[RepositoryConfig],
++) -> tuple[Optional[str], float]:
++    """Resolve the legacy PR label and multiplier from repo-specific config.
++
++    Timeline labels are ordered newest first, preserving the legacy "last applied
++    scoring label wins" behavior. If the relevant timeline event was truncated,
++    the fallback mirrors the current-label behavior by choosing the highest
++    multiplier, then the label name for deterministic ties.
++    """
++    default_multiplier = get_default_label_multiplier(repo_config)
++
++    for label in label_timeline_order:
++        multiplier = get_label_multiplier(label, repo_config)
++        if multiplier is not None:
++            return label, multiplier
++
++    candidates = []
++    for label in current_labels:
++        multiplier = get_label_multiplier(label, repo_config)
++        if multiplier is not None:
++            candidates.append((label, multiplier))
++
++    if not candidates:
++        return None, default_multiplier
++
++    label, multiplier = max(candidates, key=lambda candidate: (candidate[1], candidate[0]))
++    return label, multiplier
++
++
++def resolve_highest_label_multiplier(
++    labels: Iterable[str],
++    repo_config: Optional[RepositoryConfig],
++) -> tuple[Optional[str], float]:
++    """Resolve the highest-multiplier label from unordered candidate labels."""
++    default_multiplier = get_default_label_multiplier(repo_config)
++    candidates = []
++    for label in labels:
++        multiplier = get_label_multiplier(label, repo_config)
++        if multiplier is not None:
++            candidates.append((label, multiplier))
++
++    if not candidates:
++        return None, default_multiplier
++
++    label, multiplier = max(candidates, key=lambda candidate: (candidate[1], candidate[0]))
++    return label, multiplier
+diff --git a/gittensor/validator/oss_contributions/mirror/scoring.py b/gittensor/validator/oss_contributions/mirror/scoring.py
+index e6ca01d4..eb45cbfe 100644
+--- a/gittensor/validator/oss_contributions/mirror/scoring.py
++++ b/gittensor/validator/oss_contributions/mirror/scoring.py
+@@ -29,7 +29,6 @@
+ from gittensor.classes import FileChange, PrScoringResult, ScoringCategory
+ from gittensor.constants import (
+     CONTRIBUTION_SCORE_FOR_FULL_BONUS,
+-    LABEL_MULTIPLIERS,
+     MAINTAINER_ASSOCIATIONS,
+     MAINTAINER_ISSUE_MULTIPLIER,
+     MAX_CONTRIBUTION_BONUS,
+@@ -42,6 +41,7 @@
+ from gittensor.utils.github_api_tools import FileContentPair, branch_matches_pattern
+ from gittensor.utils.mirror.client import MirrorClient, MirrorRequestError
+ from gittensor.utils.mirror.models import MirrorLinkedIssue, MirrorPullRequest
++from gittensor.validator.oss_contributions.label_resolution import resolve_highest_label_multiplier
+ from gittensor.validator.oss_contributions.mirror.adapters import mirror_files_to_legacy
+ from gittensor.validator.oss_contributions.mirror.evaluation import MirrorMinerEvaluation
+ from gittensor.validator.oss_contributions.mirror.scored_pr import ScoredMirrorPR
+@@ -351,9 +351,9 @@ def _calculate_pr_multipliers(scored: ScoredMirrorPR, repo_config: RepositoryCon
+ 
+     scored.repo_weight_multiplier = resolve_repo_weight(repo_config)
+ 
+-    chosen_label = _resolve_trusted_scoring_label(pr, repo_config)
++    chosen_label, label_multiplier = _resolve_trusted_scoring_label(pr, repo_config)
+     scored.label = chosen_label
+-    scored.label_multiplier = LABEL_MULTIPLIERS.get(chosen_label, 1.0) if chosen_label else 1.0
++    scored.label_multiplier = label_multiplier
+ 
+     scored.issue_multiplier = round(_calculate_issue_multiplier(scored), 2)
+ 
+@@ -372,9 +372,12 @@ def _calculate_pr_multipliers(scored: ScoredMirrorPR, repo_config: RepositoryCon
+         scored.review_quality_multiplier = 1.0
+ 
+ 
+-def _resolve_trusted_scoring_label(pr: MirrorPullRequest, repo_config: RepositoryConfig) -> Optional[str]:
++def _resolve_trusted_scoring_label(pr: MirrorPullRequest, repo_config: RepositoryConfig) -> tuple[Optional[str], float]:
+     """Pick the highest-multiplier currently-applied scoring label whose actor is trusted.
+ 
++    Returns ``(label_name, multiplier)``. Returns ``(None, default_multiplier)``
++    when no trusted label matches this repository's label config.
++
+     By default the actor must be in ``MAINTAINER_ASSOCIATIONS``. Repos opted into
+     ``trusted_label_pipeline`` accept any actor — including GitHub-App actors that
+     surface as ``actor_association=NULL`` because they lack a row in
+@@ -383,17 +386,12 @@ def _resolve_trusted_scoring_label(pr: MirrorPullRequest, repo_config: Repositor
+     auto-labelers (release-drafter, actions/labeler) and must keep the gate.
+     """
+     trusted = repo_config.trusted_label_pipeline
+-    candidates = [
+-        label
++    candidate_names = [
++        (label.name or '').lower()
+         for label in pr.labels
+-        if (label.name or '').lower() in LABEL_MULTIPLIERS
+-        and (trusted or label.actor_association in MAINTAINER_ASSOCIATIONS)
++        if label.name and (trusted or label.actor_association in MAINTAINER_ASSOCIATIONS)
+     ]
+-    if not candidates:
+-        return None
+-    # Highest multiplier wins; tie-broken by label name for deterministic output
+-    best = max(candidates, key=lambda label: (LABEL_MULTIPLIERS[label.name.lower()], label.name.lower()))
+-    return best.name.lower()
++    return resolve_highest_label_multiplier(candidate_names, repo_config)
+ 
+ 
+ # ============================================================================
+diff --git a/gittensor/validator/oss_contributions/scoring.py b/gittensor/validator/oss_contributions/scoring.py
+index 2b7586fd..9ce9ff03 100644
+--- a/gittensor/validator/oss_contributions/scoring.py
++++ b/gittensor/validator/oss_contributions/scoring.py
+@@ -17,7 +17,6 @@
+     from gittensor.validator.oss_contributions.mirror.scored_pr import ScoredMirrorPR
+ from gittensor.constants import (
+     EXCESSIVE_PR_PENALTY_BASE_THRESHOLD,
+-    LABEL_MULTIPLIERS,
+     MAINTAINER_ASSOCIATIONS,
+     MAINTAINER_ISSUE_MULTIPLIER,
+     MAX_ISSUE_CLOSE_WINDOW_DAYS,
+@@ -40,6 +39,7 @@
+     get_pull_request_file_changes,
+ )
+ from gittensor.validator.oss_contributions.credibility import check_eligibility
++from gittensor.validator.oss_contributions.label_resolution import resolve_legacy_label_multiplier
+ from gittensor.validator.utils.datetime_utils import calculate_time_decay
+ from gittensor.validator.utils.load_weights import LanguageConfig, RepositoryConfig, TokenConfig, resolve_repo_weight
+ 
+@@ -211,7 +211,11 @@ def calculate_pr_multipliers(
+ 
+     pr.repo_weight_multiplier = resolve_repo_weight(repo_config)
+     pr.issue_multiplier = round(calculate_issue_multiplier(pr), 2)
+-    pr.label_multiplier = LABEL_MULTIPLIERS.get(pr.label, 1.0) if pr.label else 1.0
++    pr.label, pr.label_multiplier = resolve_legacy_label_multiplier(
++        pr.label_timeline_order,
++        pr.current_labels,
++        repo_config,
++    )
+ 
+     if is_merged:
+         # Spam multiplier is recalculated in finalize_miner_scores with total token score
+diff --git a/gittensor/validator/utils/load_weights.py b/gittensor/validator/utils/load_weights.py
+index 2bc25565..01fd4fc6 100644
+--- a/gittensor/validator/utils/load_weights.py
++++ b/gittensor/validator/utils/load_weights.py
+@@ -38,6 +38,10 @@ class RepositoryConfig:
+             actor — including GitHub Apps that surface as ``actor_association=NULL``.
+             Defaults to False; only enable on repos with an authoritative label
+             pipeline. See ``_resolve_trusted_scoring_label`` for the threat model.
++        label_multipliers: Per-repo label pattern multipliers. Keys support the
++            same fnmatch wildcard syntax as ``additional_acceptable_branches``.
++        default_label_multiplier: Multiplier used when no configured label
++            pattern matches. Defaults to neutral scoring.
+ 
+     """
+ 
+@@ -46,6 +50,8 @@ class RepositoryConfig:
+     additional_acceptable_branches: Optional[List[str]] = None
+     mirror_enabled: bool = False
+     trusted_label_pipeline: bool = False
++    label_multipliers: Optional[Dict[str, float]] = None
++    default_label_multiplier: float = 1.0
+ 
+ 
+ def resolve_repo_weight(repo_config: Optional[RepositoryConfig]) -> float:
+@@ -128,6 +134,12 @@ def load_master_repo_weights() -> Dict[str, RepositoryConfig]:
+                     additional_acceptable_branches=metadata.get('additional_acceptable_branches'),
+                     mirror_enabled=bool(metadata.get('mirror_enabled', False)),
+                     trusted_label_pipeline=bool(metadata.get('trusted_label_pipeline', False)),
++                    label_multipliers=(
++                        {str(label): float(multiplier) for label, multiplier in metadata['label_multipliers'].items()}
++                        if metadata.get('label_multipliers') is not None
++                        else None
++                    ),
++                    default_label_multiplier=float(metadata.get('default_label_multiplier', 1.0)),
+                 )
+                 normalized_data[repo_name.lower()] = config
+             except (ValueError, TypeError) as e:
+diff --git a/tests/validator/oss_contributions/mirror/test_scoring.py b/tests/validator/oss_contributions/mirror/test_scoring.py
+index 00d78420..007df2a0 100644
+--- a/tests/validator/oss_contributions/mirror/test_scoring.py
++++ b/tests/validator/oss_contributions/mirror/test_scoring.py
+@@ -105,12 +105,16 @@ def _config(
+     weight: float = 0.5,
+     additional_branches: list | None = None,
+     trusted_label_pipeline: bool = False,
++    label_multipliers: dict | None = None,
++    default_label_multiplier: float = 1.0,
+ ) -> RepositoryConfig:
+     return RepositoryConfig(
+         weight=weight,
+         mirror_enabled=True,
+         additional_acceptable_branches=additional_branches,
+         trusted_label_pipeline=trusted_label_pipeline,
++        label_multipliers=label_multipliers,
++        default_label_multiplier=default_label_multiplier,
+     )
+ 
+ 
+@@ -414,71 +418,102 @@ def test_renamed_file_carries_previous_filename(self):
+ class TestLabelResolution:
+     def test_no_labels_returns_none(self):
+         scored = ScoredMirrorPR(pr=_pr(labels=[]))
+-        assert _resolve_trusted_scoring_label(scored.pr, _config()) is None
++        label, multiplier = _resolve_trusted_scoring_label(
++            scored.pr,
++            _config(label_multipliers={'feature': 1.5}, default_label_multiplier=0.8),
++        )
++        assert label is None
++        assert multiplier == pytest.approx(0.8)
+ 
+     def test_non_scoring_labels_ignored(self):
+         labels = [{'name': 'random', 'actor_github_id': '1', 'actor_association': 'OWNER'}]
+         scored = ScoredMirrorPR(pr=_pr(labels=labels))
+-        assert _resolve_trusted_scoring_label(scored.pr, _config()) is None
++        label, multiplier = _resolve_trusted_scoring_label(
++            scored.pr,
++            _config(label_multipliers={'feature': 1.5}, default_label_multiplier=0.8),
++        )
++        assert label is None
++        assert multiplier == pytest.approx(0.8)
+ 
+     def test_non_maintainer_label_ignored(self):
+-        from gittensor.constants import LABEL_MULTIPLIERS
+-
+-        scoring_label = next(iter(LABEL_MULTIPLIERS.keys()))
+-        labels = [{'name': scoring_label, 'actor_github_id': '1', 'actor_association': 'CONTRIBUTOR'}]
++        labels = [{'name': 'feature', 'actor_github_id': '1', 'actor_association': 'CONTRIBUTOR'}]
+         scored = ScoredMirrorPR(pr=_pr(labels=labels))
+-        assert _resolve_trusted_scoring_label(scored.pr, _config()) is None
++        label, multiplier = _resolve_trusted_scoring_label(
++            scored.pr,
++            _config(label_multipliers={'feature': 1.5}),
++        )
++        assert label is None
++        assert multiplier == pytest.approx(1.0)
+ 
+     def test_null_actor_association_ignored_on_untrusted_repo(self):
+-        from gittensor.constants import LABEL_MULTIPLIERS
+-
+-        scoring_label = next(iter(LABEL_MULTIPLIERS.keys()))
+-        labels = [{'name': scoring_label, 'actor_github_id': None, 'actor_association': None}]
++        labels = [{'name': 'feature', 'actor_github_id': None, 'actor_association': None}]
+         scored = ScoredMirrorPR(pr=_pr(labels=labels))
+-        assert _resolve_trusted_scoring_label(scored.pr, _config()) is None
++        label, multiplier = _resolve_trusted_scoring_label(
++            scored.pr,
++            _config(label_multipliers={'feature': 1.5}),
++        )
++        assert label is None
++        assert multiplier == pytest.approx(1.0)
+ 
+     def test_maintainer_set_scoring_label_returned(self):
+-        from gittensor.constants import LABEL_MULTIPLIERS
+-
+-        scoring_label = next(iter(LABEL_MULTIPLIERS.keys()))
+-        labels = [{'name': scoring_label, 'actor_github_id': '1', 'actor_association': 'COLLABORATOR'}]
++        labels = [{'name': 'feature', 'actor_github_id': '1', 'actor_association': 'COLLABORATOR'}]
+         scored = ScoredMirrorPR(pr=_pr(labels=labels))
+-        assert _resolve_trusted_scoring_label(scored.pr, _config()) == scoring_label.lower()
++        label, multiplier = _resolve_trusted_scoring_label(
++            scored.pr,
++            _config(label_multipliers={'feature': 1.5}),
++        )
++        assert label == 'feature'
++        assert multiplier == pytest.approx(1.5)
+ 
+     def test_highest_multiplier_wins(self):
+-        from gittensor.constants import LABEL_MULTIPLIERS
+-
+-        scoring_labels = list(LABEL_MULTIPLIERS.keys())
+-        if len(scoring_labels) < 2:
+-            pytest.skip('Need at least 2 scoring labels for this test')
+-
+-        a, b = scoring_labels[0], scoring_labels[1]
+         labels = [
+-            {'name': a, 'actor_github_id': '1', 'actor_association': 'OWNER'},
+-            {'name': b, 'actor_github_id': '1', 'actor_association': 'OWNER'},
++            {'name': 'feature', 'actor_github_id': '1', 'actor_association': 'OWNER'},
++            {'name': 'bug', 'actor_github_id': '1', 'actor_association': 'OWNER'},
+         ]
+         scored = ScoredMirrorPR(pr=_pr(labels=labels))
+-        chosen = _resolve_trusted_scoring_label(scored.pr, _config())
+-        expected = max([a, b], key=lambda n: (LABEL_MULTIPLIERS[n], n)).lower()
+-        assert chosen == expected
++        label, multiplier = _resolve_trusted_scoring_label(
++            scored.pr,
++            _config(label_multipliers={'feature': 1.5, 'bug': 1.25}),
++        )
++        assert label == 'feature'
++        assert multiplier == pytest.approx(1.5)
+ 
+-    def test_calculate_multipliers_threads_trusted_flag(self):
+-        """End-to-end issue #911 path: _calculate_pr_multipliers honors trusted_label_pipeline."""
+-        from gittensor.constants import LABEL_MULTIPLIERS
++    def test_wildcard_label_pattern_matches(self):
++        labels = [{'name': 'kind/bug-fix', 'actor_github_id': '1', 'actor_association': 'OWNER'}]
++        scored = ScoredMirrorPR(pr=_pr(labels=labels))
++        label, multiplier = _resolve_trusted_scoring_label(
++            scored.pr,
++            _config(label_multipliers={'kind/*': 1.25}),
++        )
++        assert label == 'kind/bug-fix'
++        assert multiplier == pytest.approx(1.25)
+ 
+-        scoring_label = next((name for name, mult in LABEL_MULTIPLIERS.items() if mult != 1.0), None)
+-        if scoring_label is None:
+-            pytest.skip('Need at least one non-1.0x label for this test')
++    def test_old_global_label_ignored_without_repo_label_config(self):
++        labels = [{'name': 'feature', 'actor_github_id': '1', 'actor_association': 'OWNER'}]
++        scored = ScoredMirrorPR(pr=_pr(labels=labels))
++        _calculate_pr_multipliers(scored, _config(default_label_multiplier=0.8))
++        assert scored.label is None
++        assert scored.label_multiplier == pytest.approx(0.8)
+ 
+-        labels = [{'name': scoring_label, 'actor_github_id': '99', 'actor_association': None}]
++    def test_calculate_multipliers_threads_trusted_flag(self):
++        """End-to-end issue #911 path: _calculate_pr_multipliers honors trusted_label_pipeline."""
++        labels = [{'name': 'feature', 'actor_github_id': '99', 'actor_association': None}]
+ 
+         scored_trusted = ScoredMirrorPR(pr=_pr(labels=labels))
+-        _calculate_pr_multipliers(scored_trusted, _config(trusted_label_pipeline=True))
+-        assert scored_trusted.label_multiplier == LABEL_MULTIPLIERS[scoring_label]
++        _calculate_pr_multipliers(
++            scored_trusted,
++            _config(trusted_label_pipeline=True, label_multipliers={'feature': 1.5}),
++        )
++        assert scored_trusted.label == 'feature'
++        assert scored_trusted.label_multiplier == pytest.approx(1.5)
+ 
+         scored_untrusted = ScoredMirrorPR(pr=_pr(labels=labels))
+-        _calculate_pr_multipliers(scored_untrusted, _config(trusted_label_pipeline=False))
+-        assert scored_untrusted.label_multiplier == 1.0
++        _calculate_pr_multipliers(
++            scored_untrusted,
++            _config(trusted_label_pipeline=False, label_multipliers={'feature': 1.5}),
++        )
++        assert scored_untrusted.label is None
++        assert scored_untrusted.label_multiplier == pytest.approx(1.0)
+ 
+ 
+ # ============================================================================
+@@ -694,18 +729,18 @@ def test_open_mirror_pr_review_iterations_increase_collateral(self):
+ 
+ class TestPrMultipliers:
+     def test_merged_pr_populates_all_multipliers(self):
+-        from gittensor.constants import LABEL_MULTIPLIERS
+-
+-        scoring_label = next(iter(LABEL_MULTIPLIERS.keys()))
+-        labels = [{'name': scoring_label, 'actor_github_id': '1', 'actor_association': 'OWNER'}]
++        labels = [{'name': 'feature', 'actor_github_id': '1', 'actor_association': 'OWNER'}]
+ 
+         scored = ScoredMirrorPR(pr=_pr(labels=labels))
+         scored.token_score = 100.0  # for completeness
+-        _calculate_pr_multipliers(scored, _config(weight=0.7, additional_branches=['test']))
++        _calculate_pr_multipliers(
++            scored,
++            _config(weight=0.7, additional_branches=['test'], label_multipliers={'feature': 1.5}),
++        )
+ 
+         assert scored.repo_weight_multiplier == 0.7
+-        assert scored.label == scoring_label.lower()
+-        assert scored.label_multiplier == LABEL_MULTIPLIERS[scoring_label.lower()]
++        assert scored.label == 'feature'
++        assert scored.label_multiplier == pytest.approx(1.5)
+         assert 0.0 <= scored.time_decay_multiplier <= 1.0
+         assert scored.review_quality_multiplier == 1.0  # 0 maintainer changes_requested
+         assert scored.issue_multiplier == 1.0  # no linked_issues
+diff --git a/tests/validator/test_label_multiplier.py b/tests/validator/test_label_multiplier.py
+index b3898b79..a840861a 100644
+--- a/tests/validator/test_label_multiplier.py
++++ b/tests/validator/test_label_multiplier.py
+@@ -1,17 +1,13 @@
+ import pytest
+ 
+-from gittensor.classes import PullRequest
+-from gittensor.constants import LABEL_MULTIPLIERS
+-
+-
+-@pytest.mark.parametrize('label,expected', list(LABEL_MULTIPLIERS.items()))
+-def test_known_labels(label, expected):
+-    assert LABEL_MULTIPLIERS.get(label, 1.0) == expected
+-
+-
+-@pytest.mark.parametrize('label', ['docs', 'question', 'wontfix', 'kind/feature'])
+-def test_unknown_labels_return_default(label):
+-    assert LABEL_MULTIPLIERS.get(label, 1.0) == 1.0
++from gittensor.classes import MinerEvaluation, PullRequest
++from gittensor.validator.oss_contributions.label_resolution import (
++    get_label_multiplier,
++    resolve_highest_label_multiplier,
++    resolve_legacy_label_multiplier,
++)
++from gittensor.validator.oss_contributions.scoring import calculate_pr_multipliers
++from gittensor.validator.utils.load_weights import RepositoryConfig
+ 
+ 
+ def _pr_payload(current, timeline):
+@@ -40,58 +36,176 @@ def _pr_payload(current, timeline):
+ 
+ 
+ def _parse(current, timeline):
+-    return PullRequest.from_graphql_response(_pr_payload(current, timeline), uid=0, hotkey='hk', github_id='gh').label
++    return PullRequest.from_graphql_response(_pr_payload(current, timeline), uid=0, hotkey='hk', github_id='gh')
++
++
++def _score(current, timeline, repo_config):
++    pr = _parse(current, timeline)
++    calculate_pr_multipliers(pr, MinerEvaluation(uid=0, hotkey='hk', github_id='gh'), {'x/y': repo_config})
++    return pr
+ 
+ 
+ @pytest.mark.parametrize(
+-    'current,timeline,expected',
++    'pattern,label,expected',
+     [
+-        # Single scoring label — unchanged behavior
+-        (['feature'], ['feature'], 'feature'),
+-        # dify case: refactor masked by lgtm added after — fix picks refactor
+-        (['size:M', 'refactor', 'lgtm'], ['size:M', 'refactor', 'lgtm'], 'refactor'),
+-        # godot case: bug masked by topic:* added after — fix picks bug
+-        (['bug', 'topic:editor', 'topic:shaders'], ['bug', 'topic:editor', 'topic:shaders'], 'bug'),
+-        # Reclassification: feature then bug — last scoring label wins
+-        (['feature', 'bug'], ['feature', 'bug'], 'bug'),
+-        # Label added then removed — not in current, skipped
+-        ([], ['feature'], None),
+-        # No labels
+-        ([], [], None),
+-        # Only non-scoring labels
+-        (['size:M', 'lgtm', 'ci'], ['size:M', 'lgtm', 'ci'], None),
+-        # Case insensitive
+-        (['Bug'], ['Bug'], 'bug'),
+-        # Null label node (PR #553 — deleted repo label)
+-        (['feature'], [None, 'feature'], 'feature'),
+-        (['feature'], [None], 'feature'),
+-        # Remove-and-replace: feature removed, bug added
+-        (['bug'], ['feature', 'bug'], 'bug'),
+-        # Only scoring label was removed
+-        (['lgtm'], ['feature'], None),
+-        # Timeline truncated: scoring label in current but not in last-5 events (#646)
+-        (
+-            ['bug', 'size:s', 'area:test', 'priority:low', 'status:triaged'],
+-            ['size:s', 'area:test', 'priority:low', 'status:triaged', 'lgtm'],
+-            'bug',
+-        ),
+-        # Timeline truncated: penalty label still applied via fallback
+-        (['refactor', 'size:M', 'lgtm'], ['size:M', 'lgtm'], 'refactor'),
+-        # Timeline truncated: multiple scoring labels both truncated — highest multiplier wins
+-        (['feature', 'bug'], [], 'feature'),
+-        # Timeline partially truncated: one scoring label in timeline wins over truncated one
+-        (['feature', 'bug'], ['bug'], 'bug'),
+-        # Empty timeline with scoring label in current
+-        (['enhancement'], [], 'enhancement'),
++        ('kind/feature', 'kind/feature', 1.5),
++        ('kind/*', 'kind/bug', 1.25),
++        ('type:*', 'type:bug-fix', 1.1),
++        ('*-dev', 'backend-dev', 0.5),
++        ('3.*/feature', '3.0/feature', 1.5),
++        ('Bug', 'bug', 1.25),
+     ],
+ )
+-def test_label_extraction(current, timeline, expected):
+-    assert _parse(current, timeline) == expected
++def test_get_label_multiplier_matches_repo_patterns(pattern, label, expected):
++    config = RepositoryConfig(weight=1.0, label_multipliers={pattern: expected})
++
++    assert get_label_multiplier(label, config) == pytest.approx(expected)
++
++
++def test_get_label_multiplier_returns_highest_matching_pattern():
++    config = RepositoryConfig(
++        weight=1.0,
++        label_multipliers={
++            'kind/*': 1.1,
++            'kind/feature': 1.5,
++            '*/feature': 1.25,
++        },
++    )
++
++    assert get_label_multiplier('kind/feature', config) == pytest.approx(1.5)
++
++
++def test_get_label_multiplier_returns_none_without_repo_config_match():
++    config = RepositoryConfig(weight=1.0, label_multipliers={'kind/*': 1.5})
++
++    assert get_label_multiplier('feature', config) is None
++    assert get_label_multiplier('kind/feature', RepositoryConfig(weight=1.0)) is None
++    assert get_label_multiplier('kind/feature', None) is None
++
++
++def test_highest_label_resolution_uses_default_when_no_candidate_matches():
++    config = RepositoryConfig(weight=1.0, label_multipliers={'kind/*': 1.5}, default_label_multiplier=0.8)
++
++    label, multiplier = resolve_highest_label_multiplier(['feature', 'bug'], config)
++
++    assert label is None
++    assert multiplier == pytest.approx(0.8)
++
++
++def test_highest_label_resolution_tiebreaks_by_label_name():
++    config = RepositoryConfig(weight=1.0, label_multipliers={'a': 1.5, 'b': 1.5})
++
++    label, multiplier = resolve_highest_label_multiplier(['a', 'b'], config)
++
++    assert label == 'b'
++    assert multiplier == pytest.approx(1.5)
++
++
++@pytest.mark.parametrize(
++    'current,timeline,expected_label,expected_multiplier',
++    [
++        (['kind/feature'], ['kind/feature'], 'kind/feature', 1.5),
++        (['type:bug-fix'], ['type:bug-fix'], 'type:bug-fix', 1.1),
++        (['backend-dev'], ['backend-dev'], 'backend-dev', 0.5),
++        (['3.0/feature'], ['3.0/feature'], '3.0/feature', 2.0),
++    ],
++)
++def test_wildcard_label_resolves_through_legacy_scoring(current, timeline, expected_label, expected_multiplier):
++    config = RepositoryConfig(
++        weight=1.0,
++        label_multipliers={
++            'kind/*': 1.5,
++            'type:*': 1.1,
++            '*-dev': 0.5,
++            '3.0/*': 2.0,
++        },
++    )
++
++    pr = _score(current, timeline, config)
++
++    assert pr.label == expected_label
++    assert pr.label_multiplier == pytest.approx(expected_multiplier)
++
++
++def test_repo_without_label_multipliers_ignores_old_global_label():
++    pr = _score(['feature'], ['feature'], RepositoryConfig(weight=1.0))
++
++    assert pr.label is None
++    assert pr.label_multiplier == pytest.approx(1.0)
++
++
++def test_repo_default_label_multiplier_applies_without_label_map():
++    config = RepositoryConfig(weight=1.0, default_label_multiplier=0.8)
++
++    labeled = _score(['feature'], ['feature'], config)
++    unlabeled = _score([], [], config)
++
++    assert labeled.label is None
++    assert labeled.label_multiplier == pytest.approx(0.8)
++    assert unlabeled.label is None
++    assert unlabeled.label_multiplier == pytest.approx(0.8)
++
++
++def test_legacy_timeline_order_preserved_for_matching_labels():
++    config = RepositoryConfig(weight=1.0, label_multipliers={'feature': 1.5, 'bug': 1.25})
++
++    pr = _score(['feature', 'bug'], ['feature', 'bug'], config)
++
++    assert pr.label == 'bug'
++    assert pr.label_multiplier == pytest.approx(1.25)
++
++
++def test_legacy_timeline_skips_unmatched_labels():
++    config = RepositoryConfig(weight=1.0, label_multipliers={'bug': 1.25})
++
++    pr = _score(['lgtm', 'bug'], ['bug', 'lgtm'], config)
++
++    assert pr.label == 'bug'
++    assert pr.label_multiplier == pytest.approx(1.25)
++
++
++def test_legacy_truncated_timeline_uses_highest_current_match():
++    config = RepositoryConfig(weight=1.0, label_multipliers={'feature': 1.5, 'bug': 1.25})
++
++    pr = _score(['feature', 'bug'], [], config)
++
++    assert pr.label == 'feature'
++    assert pr.label_multiplier == pytest.approx(1.5)
++
++
++@pytest.mark.parametrize(
++    'current,timeline,expected_label,expected_multiplier',
++    [
++        ([], ['feature'], None, 1.0),
++        ([], [], None, 1.0),
++        (['size:M', 'lgtm', 'ci'], ['size:M', 'lgtm', 'ci'], None, 1.0),
++        (['Bug'], ['Bug'], 'bug', 1.25),
++        (['feature'], [None, 'feature'], 'feature', 1.5),
++        (['feature'], [None], 'feature', 1.5),
++        (['bug'], ['feature', 'bug'], 'bug', 1.25),
++        (['lgtm'], ['feature'], None, 1.0),
++        (['feature', 'bug'], ['bug'], 'bug', 1.25),
++    ],
++)
++def test_legacy_current_and_timeline_compatibility(current, timeline, expected_label, expected_multiplier):
++    config = RepositoryConfig(weight=1.0, label_multipliers={'feature': 1.5, 'bug': 1.25})
++
++    pr = _score(current, timeline, config)
++
++    assert pr.label == expected_label
++    assert pr.label_multiplier == pytest.approx(expected_multiplier)
+ 
+ 
+ def test_missing_labels_key_does_not_crash():
+-    """Backward-compat: payloads without the new 'labels' key yield None."""
+     payload = _pr_payload([], ['feature'])
+     del payload['labels']
++
+     pr = PullRequest.from_graphql_response(payload, uid=0, hotkey='hk', github_id='gh')
+-    assert pr.label is None
++    label, multiplier = resolve_legacy_label_multiplier(
++        pr.label_timeline_order, pr.current_labels, RepositoryConfig(1.0)
++    )
++
++    assert pr.current_labels == frozenset()
++    assert pr.label_timeline_order == ()
++    assert label is None
++    assert multiplier == pytest.approx(1.0)
+diff --git a/tests/validator/test_load_weights.py b/tests/validator/test_load_weights.py
+index 5a899bdc..49d2ad7a 100644
+--- a/tests/validator/test_load_weights.py
++++ b/tests/validator/test_load_weights.py
+@@ -8,6 +8,8 @@
+     pytest tests/validator/test_load_weights.py -v
+ """
+ 
++import json
++
+ import pytest
+ 
+ from gittensor.validator.utils.load_weights import (
+@@ -21,6 +23,13 @@
+ )
+ 
+ 
++def _live_master_repo_metadata():
++    from gittensor.validator.utils import load_weights as lw
++
++    with open(lw._get_weights_dir() / 'master_repositories.json', 'r') as f:
++        return sorted(json.load(f).items())
++
++
+ class TestLoadTokenWeights:
+     """Tests for loading token_weights.json via load_token_config()."""
+ 
+@@ -218,6 +227,67 @@ def test_loader_parses_trusted_label_pipeline_true(self, tmp_path, monkeypatch):
+         assert repos['foo/explicit-off'].trusted_label_pipeline is False
+ 
+ 
++class TestRepositoryConfigLabelMultipliers:
++    """Dataclass + JSON-parsing tests for per-repo label multiplier config."""
++
++    def test_label_multiplier_defaults(self):
++        config = RepositoryConfig(weight=0.5)
++
++        assert config.label_multipliers is None
++        assert config.default_label_multiplier == pytest.approx(1.0)
++
++    def test_loader_parses_label_multiplier_config(self, tmp_path, monkeypatch):
++        from gittensor.validator.utils import load_weights as lw
++
++        fake_weights_dir = tmp_path
++        (fake_weights_dir / 'master_repositories.json').write_text(
++            json.dumps(
++                {
++                    'foo/labeled': {
++                        'weight': 0.5,
++                        'label_multipliers': {'kind/*': 1.5, 'type:bug': 1.25},
++                        'default_label_multiplier': 0.8,
++                    },
++                    'foo/defaults': {'weight': 0.3},
++                }
++            )
++        )
++        monkeypatch.setattr(lw, '_get_weights_dir', lambda: fake_weights_dir)
++
++        repos = lw.load_master_repo_weights()
++
++        assert repos['foo/labeled'].label_multipliers == {'kind/*': 1.5, 'type:bug': 1.25}
++        assert repos['foo/labeled'].default_label_multiplier == pytest.approx(0.8)
++        assert repos['foo/defaults'].label_multipliers is None
++        assert repos['foo/defaults'].default_label_multiplier == pytest.approx(1.0)
++
++    @pytest.mark.parametrize('repo_name,metadata', _live_master_repo_metadata())
++    def test_live_label_multiplier_maps_are_bounded(self, repo_name, metadata):
++        label_multipliers = metadata.get('label_multipliers')
++        if label_multipliers is None:
++            return
++
++        assert isinstance(label_multipliers, dict), f'{repo_name} label_multipliers must be a dict'
++        assert len(label_multipliers) <= 10, f'{repo_name} label_multipliers has too many entries'
++
++    @pytest.mark.parametrize('repo_name,metadata', _live_master_repo_metadata())
++    def test_live_label_multiplier_values_are_in_range(self, repo_name, metadata):
++        for pattern, multiplier in (metadata.get('label_multipliers') or {}).items():
++            assert isinstance(pattern, str), f'{repo_name} label_multipliers keys must be strings'
++            assert 0.0 <= float(multiplier) <= 20.0, (
++                f'{repo_name} label_multipliers[{pattern!r}] must be within [0.0, 20.0]'
++            )
++
++    @pytest.mark.parametrize('repo_name,metadata', _live_master_repo_metadata())
++    def test_live_default_label_multiplier_values_are_in_range(self, repo_name, metadata):
++        if 'default_label_multiplier' not in metadata:
++            return
++
++        assert 0.0 <= float(metadata['default_label_multiplier']) <= 20.0, (
++            f'{repo_name} default_label_multiplier must be within [0.0, 20.0]'
++        )
++
++
+ class TestBannedOrganizations:
+     """Tests ensuring banned organizations are not active in the repository list.
+ 
+diff --git a/tests/validator/test_review_quality_multiplier.py b/tests/validator/test_review_quality_multiplier.py
+index 43d89b9e..d0270972 100644
+--- a/tests/validator/test_review_quality_multiplier.py
++++ b/tests/validator/test_review_quality_multiplier.py
+@@ -249,7 +249,7 @@ def test_open_pr_review_collateral_multiplier_caps_at_two(self, builder):
+ 
+ 
+ def _make_repo_config() -> dict:
+-    return {'test/repo': RepositoryConfig(weight=1.0)}
++    return {'test/repo': RepositoryConfig(weight=1.0, label_multipliers={'fix': 1.25})}
+ 
+ 
+ def _make_eval() -> MinerEvaluation:
+@@ -260,7 +260,8 @@ class TestReviewCollateralThroughScoringPipeline:
+     def test_open_pr_collateral_uses_collateral_review_multiplier(self, builder):
+         pr = builder.create(state=PRState.OPEN, repo='test/repo')
+         pr.base_score = 80.0
+-        pr.label = 'fix'
++        pr.current_labels = frozenset({'fix'})
++        pr.label_timeline_order = ('fix',)
+         pr.changes_requested_count = 3
+ 
+         calculate_pr_multipliers(pr, _make_eval(), _make_repo_config())

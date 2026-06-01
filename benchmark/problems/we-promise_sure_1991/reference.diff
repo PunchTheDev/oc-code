@@ -1,0 +1,290 @@
+diff --git a/app/controllers/plaid_items_controller.rb b/app/controllers/plaid_items_controller.rb
+index 08de7e0b4a..39a0e7226e 100644
+--- a/app/controllers/plaid_items_controller.rb
++++ b/app/controllers/plaid_items_controller.rb
+@@ -1,4 +1,6 @@
+ class PlaidItemsController < ApplicationController
++  include StreamExtensions
++
+   before_action :set_plaid_item, only: %i[edit destroy sync]
+   before_action :require_admin!, only: %i[new create select_existing_account link_existing_account edit destroy sync]
+ 
+@@ -12,6 +14,8 @@ def new
+       accountable_type: params[:accountable_type] || "Depository",
+       region: region
+     )
++  rescue Plaid::ApiError => e
++    handle_link_token_error(e)
+   end
+ 
+   def edit
+@@ -21,6 +25,8 @@ def edit
+       webhooks_url: webhooks_url,
+       redirect_url: accounts_url,
+     )
++  rescue Plaid::ApiError => e
++    handle_link_token_error(e)
+   end
+ 
+   def create
+@@ -104,6 +110,58 @@ def item_name
+       plaid_item_params.dig(:metadata, :institution, :name)
+     end
+ 
++    # When `link_token/create` (or the update equivalent) raises, surface a
++    # friendly alert to the user instead of letting the modal frame render
++    # blank. Plaid configuration/product-access errors are the common case for
++    # self-hosted users — without this, the Link modal simply never opens and
++    # the only signal lives in server logs.
++    def handle_link_token_error(error)
++      error_body = safe_parse_plaid_error(error)
++      error_code = error_body["error_code"].to_s
++
++      Rails.logger.warn(
++        "Plaid link_token request failed: #{error_code} - #{error_body['error_message']}"
++      )
++      Sentry.capture_exception(error) if defined?(Sentry)
++
++      alert = friendly_link_token_alert(error_code, error_body["error_message"])
++
++      respond_to do |format|
++        format.html { redirect_to accounts_path, alert: alert }
++        format.turbo_stream { stream_redirect_to(accounts_path, alert: alert) }
++      end
++    end
++
++    def safe_parse_plaid_error(error)
++      JSON.parse(error.response_body.to_s)
++    rescue JSON::ParserError
++      {}
++    end
++
++    # Plaid surfaces its own actionable copy on configuration / product-access
++    # failures (e.g. "Your account is not enabled for the following products
++    # [...]. To request access, visit dashboard.plaid.com..."). Those messages
++    # are safe to show verbatim — they describe a Plaid-side config issue,
++    # not user data. For everything else we fall back to a generic message
++    # and rely on the log + Sentry trail.
++    SHOWABLE_PLAID_ERROR_CODES = %w[
++      INVALID_PRODUCT
++      PRODUCTS_NOT_SUPPORTED
++      NO_PRODUCTS_PERMISSION
++      ADDITION_LIMIT
++      INVALID_INSTITUTION
++      INSTITUTION_NOT_ENABLED_IN_REGION
++      INSTITUTION_NOT_SUPPORTED
++    ].freeze
++
++    def friendly_link_token_alert(error_code, error_message)
++      if SHOWABLE_PLAID_ERROR_CODES.include?(error_code) && error_message.present?
++        t("plaid_items.errors.link_token_with_message", message: error_message)
++      else
++        t("plaid_items.errors.link_token_generic")
++      end
++    end
++
+     def plaid_us_webhooks_url
+       return webhooks_plaid_url if Rails.env.production?
+ 
+diff --git a/app/javascript/controllers/plaid_controller.js b/app/javascript/controllers/plaid_controller.js
+index e24031f776..735c6f4200 100644
+--- a/app/javascript/controllers/plaid_controller.js
++++ b/app/javascript/controllers/plaid_controller.js
+@@ -128,9 +128,32 @@ export default class extends Controller {
+   };
+ 
+   handleExit = (err, metadata) => {
+-    // If there was an error during update mode, refresh the page to show latest status
+-    if (err && metadata.status === "requires_credentials") {
++    // If there was an error during update mode, refresh the page to show
++    // latest status. Guard `metadata` (Plaid can fire onExit with it
++    // undefined when Link aborts very early) and gate the redirect on
++    // `isUpdateValue` so first-time link failures don't bounce the user
++    // away from whatever page they were on.
++    if (
++      err &&
++      metadata &&
++      metadata.status === "requires_credentials" &&
++      this.isUpdateValue
++    ) {
+       window.location.href = "/accounts";
++      return;
++    }
++
++    // Promote Plaid's own error payload to the console so a silent modal
++    // close still leaves a breadcrumb (issue #1792). Plaid Link's own UI
++    // is responsible for showing a message inside the modal when this
++    // fires; backend link-token failures are handled server-side via the
++    // PlaidItemsController rescue + flash.
++    if (err?.error_code) {
++      console.error(
++        "Plaid Link exited with error",
++        err.error_code,
++        err.display_message || err.error_message
++      );
+     }
+   };
+ 
+diff --git a/app/models/plaid_item.rb b/app/models/plaid_item.rb
+index 58e39bae24..deef9039e5 100644
+--- a/app/models/plaid_item.rb
++++ b/app/models/plaid_item.rb
+@@ -45,15 +45,24 @@ def get_update_link_token(webhooks_url:, redirect_url:)
+       access_token: access_token
+     )
+   rescue Plaid::ApiError => e
+-    error_body = JSON.parse(e.response_body)
++    error_body = begin
++      JSON.parse(e.response_body.to_s)
++    rescue JSON::ParserError
++      {}
++    end
+ 
+     if error_body["error_code"] == "ITEM_NOT_FOUND"
+-      # Mark the connection as invalid but don't auto-delete
++      # Mark the connection as invalid but don't auto-delete. The caller
++      # gets nil so the calling controller can decide what to render.
+       update!(status: :requires_update)
++      Sentry.capture_exception(e) if defined?(Sentry)
++      nil
++    else
++      # Re-raise so the controller can surface a friendly alert to the user
++      # (issue #1792). Swallowing here previously left the Plaid modal frame
++      # blank with no actionable signal.
++      raise
+     end
+-
+-    Sentry.capture_exception(e)
+-    nil
+   end
+ 
+   def destroy_later
+diff --git a/config/locales/views/plaid_items/en.yml b/config/locales/views/plaid_items/en.yml
+index 25e87511ce..d6fa512f74 100644
+--- a/config/locales/views/plaid_items/en.yml
++++ b/config/locales/views/plaid_items/en.yml
+@@ -5,6 +5,10 @@ en:
+       success: Account linked successfully.  Please wait for accounts to sync.
+     destroy:
+       success: Accounts scheduled for deletion.
++    errors:
++      link_token_generic: We couldn't open Plaid right now. Please try again, and
++        if the problem persists check the server logs for details.
++      link_token_with_message: "Plaid couldn't open the connection: %{message}"
+     plaid_item:
+       add_new: Add new connection
+       confirm_accept: Delete institution
+diff --git a/test/controllers/plaid_items_controller_test.rb b/test/controllers/plaid_items_controller_test.rb
+index e21c4ebf67..9e171014ec 100644
+--- a/test/controllers/plaid_items_controller_test.rb
++++ b/test/controllers/plaid_items_controller_test.rb
+@@ -6,6 +6,58 @@ class PlaidItemsControllerTest < ActionDispatch::IntegrationTest
+     sign_in @user = users(:family_admin)
+   end
+ 
++  test "new redirects with friendly alert when Plaid rejects link_token request for unauthorized products" do
++    # Reproduces issue #1792: the Plaid client account isn't enabled for the
++    # requested products, so Plaid returns an actionable error message. We
++    # should surface that message instead of letting the modal frame render
++    # blank.
++    plaid_provider = mock
++    Provider::Registry.stubs(:plaid_provider_for_region).with(:us).returns(plaid_provider)
++
++    error_body = {
++      "error_code" => "INVALID_PRODUCT",
++      "error_message" => "Your account is not enabled for the following products: [\"investments\" \"liabilities\" \"transactions\"]. To request access, visit https://dashboard.plaid.com/overview/request-products or contact Sales or your Account Manager."
++    }.to_json
++    plaid_provider.expects(:get_link_token).raises(
++      Plaid::ApiError.new(code: 400, response_body: error_body)
++    )
++
++    get new_plaid_item_url(accountable_type: "Investment")
++
++    assert_redirected_to accounts_path
++    assert_match(/not enabled for the following products/, flash[:alert])
++  end
++
++  test "new redirects with generic alert when Plaid raises an unclassified error" do
++    plaid_provider = mock
++    Provider::Registry.stubs(:plaid_provider_for_region).with(:us).returns(plaid_provider)
++
++    plaid_provider.expects(:get_link_token).raises(
++      Plaid::ApiError.new(code: 500, response_body: { "error_code" => "INTERNAL_SERVER_ERROR" }.to_json)
++    )
++
++    get new_plaid_item_url
++
++    assert_redirected_to accounts_path
++    assert_equal I18n.t("plaid_items.errors.link_token_generic"), flash[:alert]
++  end
++
++  test "edit redirects with friendly alert when Plaid rejects update link_token request" do
++    plaid_item = plaid_items(:one)
++    error_body = {
++      "error_code" => "INVALID_PRODUCT",
++      "error_message" => "Your account is not enabled for the following products: [\"transactions\"]."
++    }.to_json
++    PlaidItem.any_instance.expects(:get_update_link_token).raises(
++      Plaid::ApiError.new(code: 400, response_body: error_body)
++    )
++
++    get edit_plaid_item_url(plaid_item)
++
++    assert_redirected_to accounts_path
++    assert_match(/not enabled for the following products/, flash[:alert])
++  end
++
+   test "create" do
+     @plaid_provider = mock
+     Provider::Registry.expects(:plaid_provider_for_region).with("us").returns(@plaid_provider)
+diff --git a/test/models/plaid_item_test.rb b/test/models/plaid_item_test.rb
+index b0d55bb5d0..214a5a1dc3 100644
+--- a/test/models/plaid_item_test.rb
++++ b/test/models/plaid_item_test.rb
+@@ -44,4 +44,46 @@ class PlaidItemTest < ActiveSupport::TestCase
+       @plaid_item.destroy
+     end
+   end
++
++  test "get_update_link_token marks item as requires_update and returns nil on ITEM_NOT_FOUND" do
++    error_response = { "error_code" => "ITEM_NOT_FOUND", "error_message" => "not found" }.to_json
++    Family.any_instance.expects(:get_link_token).raises(
++      Plaid::ApiError.new(code: 400, response_body: error_response)
++    )
++
++    result = @plaid_item.get_update_link_token(webhooks_url: "https://x", redirect_url: "https://x")
++
++    assert_nil result
++    assert_predicate @plaid_item.reload, :requires_update?
++  end
++
++  test "get_update_link_token re-raises other Plaid errors so the controller can surface them" do
++    # Issue #1792: silently swallowing all Plaid errors here is what made the
++    # "modal closes with nothing happening" experience so opaque.
++    error_response = { "error_code" => "INVALID_PRODUCT", "error_message" => "Your account is not enabled..." }.to_json
++    Family.any_instance.expects(:get_link_token).raises(
++      Plaid::ApiError.new(code: 400, response_body: error_response)
++    )
++
++    assert_raises(Plaid::ApiError) do
++      @plaid_item.get_update_link_token(webhooks_url: "https://x", redirect_url: "https://x")
++    end
++    assert_predicate @plaid_item.reload, :good?
++  end
++
++  test "get_update_link_token tolerates a Plaid::ApiError with a nil/blank response_body" do
++    # Plaid clients have been observed raising ApiError without a response
++    # body (network-layer failures, early aborts). The old JSON.parse would
++    # blow up with TypeError before the rescue could fire; we now coerce
++    # to String so the parse falls back to {} and the error re-raises
++    # cleanly for the controller to handle.
++    Family.any_instance.expects(:get_link_token).raises(
++      Plaid::ApiError.new(code: 500, response_body: nil)
++    )
++
++    assert_raises(Plaid::ApiError) do
++      @plaid_item.get_update_link_token(webhooks_url: "https://x", redirect_url: "https://x")
++    end
++    assert_predicate @plaid_item.reload, :good?
++  end
+ end

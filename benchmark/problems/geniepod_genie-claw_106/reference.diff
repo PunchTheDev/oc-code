@@ -1,0 +1,504 @@
+diff --git a/README.md b/README.md
+index 6be4633..2090902 100644
+--- a/README.md
++++ b/README.md
+@@ -175,9 +175,10 @@ GenieClaw is intentionally narrower than a broad general-agent stack.
+ That is a hardware decision as much as a product decision. In practical Jetson
+ Orin Nano 8 GB testing, heavier agent shells can require very large context
+ windows just to stay coherent, which drives up KV cache size, first-token
+-latency, and overall memory pressure. Even `8192` context can already be tight
+-on this class of device, and the result is often slower replies and worse
+-appliance behavior.
++latency, and overall memory pressure. GenieClaw defaults to a 4096-token
++runtime context on this class of device because larger contexts can be too
++tight across full-stack restarts, causing slower replies or worse appliance
++behavior.
+ 
+ For GenieClaw, that means:
+ 
+diff --git a/crates/genie-core/src/llm/openai_compat.rs b/crates/genie-core/src/llm/openai_compat.rs
+index c82de15..6261c03 100644
+--- a/crates/genie-core/src/llm/openai_compat.rs
++++ b/crates/genie-core/src/llm/openai_compat.rs
+@@ -172,10 +172,12 @@ impl RequestProfile {
+     }
+ }
+ 
+-const GENIE_RUNTIME_MAX_BODY_BYTES: usize = 24 * 1024;
+-const GENIE_RUNTIME_BODY_OVERHEAD_BYTES: usize = 768;
++const GENIE_RUNTIME_MAX_BODY_BYTES: usize = 4 * 1024;
++const GENIE_RUNTIME_BODY_OVERHEAD_BYTES: usize = 512;
++const GENIE_RUNTIME_CONTEXT_MAX_BYTES: usize = 900;
+ const GENIE_RUNTIME_COMPACT_SYSTEM: &str =
+     "You are GeniePod Home. Answer the user's latest request directly and concisely.";
++const GENIE_RUNTIME_COMPACT_SYSTEM_PREFIX: &str = "You are GeniePod Home. Reply briefly for voice. Use a tool only when required. Tool calls must be ONLY JSON: {\"tool\":\"tool_name\",\"arguments\":{}}. No markdown.";
+ 
+ impl OpenAiCompatClient {
+     pub fn new(backend_name: &'static str, host: &str, port: u16) -> Self {
+@@ -509,19 +511,29 @@ fn parse_status_line(line: &str) -> u16 {
+ }
+ 
+ fn compact_genie_runtime_messages(messages: &[Message], max_body_bytes: usize) -> Vec<Message> {
+-    let system_messages = messages
++    let system_text = messages
+         .iter()
+         .filter(|m| m.role == "system")
+-        .cloned()
+-        .collect::<Vec<_>>();
+-    let has_system_context = !system_messages.is_empty();
++        .map(|m| m.content.trim())
++        .filter(|m| !m.is_empty())
++        .collect::<Vec<_>>()
++        .join("\n\n");
++    let mut compacted = if system_text.is_empty() {
++        Vec::new()
++    } else {
++        vec![Message {
++            role: "system".into(),
++            content: compact_genie_runtime_system(&system_text),
++        }]
++    };
++    let has_system_context = !compacted.is_empty();
+ 
+     let Some(latest_idx) = messages
+         .iter()
+         .rposition(|m| m.role == "user")
+         .or_else(|| messages.iter().rposition(|m| m.role != "system"))
+     else {
+-        return system_messages;
++        return compacted;
+     };
+ 
+     let latest_source = &messages[latest_idx];
+@@ -537,7 +549,6 @@ fn compact_genie_runtime_messages(messages: &[Message], max_body_bytes: usize) -
+         },
+     };
+ 
+-    let mut compacted = system_messages;
+     let body_budget = max_body_bytes.saturating_sub(GENIE_RUNTIME_BODY_OVERHEAD_BYTES);
+     let mut estimated_bytes = estimate_messages_bytes(&compacted) + estimate_message_bytes(&latest);
+     let mut retained_history = Vec::new();
+@@ -561,6 +572,125 @@ fn compact_genie_runtime_messages(messages: &[Message], max_body_bytes: usize) -
+     compacted
+ }
+ 
++fn compact_genie_runtime_system(system_text: &str) -> String {
++    let mut sections = vec![GENIE_RUNTIME_COMPACT_SYSTEM_PREFIX.to_string()];
++    let tool_lines = compact_genie_runtime_tool_lines(system_text);
++    if !tool_lines.is_empty() {
++        sections.push(format!("Tools:\n{}", tool_lines.join("\n")));
++    }
++
++    sections.push(compact_genie_runtime_rules(system_text));
++
++    if let Some(context) = compact_household_context(system_text) {
++        sections.push(format!("Household context:\n{context}"));
++    }
++
++    sections.join("\n\n")
++}
++
++fn compact_genie_runtime_tool_lines(system_text: &str) -> Vec<String> {
++    let specs = [
++        (
++            "home_control",
++            "home_control {entity, action, value?} - control safe home devices/scenes",
++        ),
++        (
++            "home_status",
++            "home_status {entity} - query Home Assistant state",
++        ),
++        (
++            "home_undo",
++            "home_undo {} - undo last reversible home action",
++        ),
++        (
++            "action_history",
++            "action_history {} - recent actions/pending confirmations",
++        ),
++        ("set_timer", "set_timer {seconds, label?}"),
++        ("get_time", "get_time {}"),
++        ("get_weather", "get_weather {location, forecast?}"),
++        ("web_search", "web_search {query, limit?, fresh?}"),
++        ("system_info", "system_info {}"),
++        ("calculate", "calculate {expression}"),
++        ("play_media", "play_media {query}"),
++        ("memory_recall", "memory_recall {query}"),
++        ("memory_status", "memory_status {}"),
++        ("memory_forget", "memory_forget {query}"),
++        ("memory_store", "memory_store {content, category?}"),
++        ("hello_world", "hello_world {name?} - demo greeting only"),
++    ];
++
++    specs
++        .iter()
++        .filter(|(name, _)| system_text.contains(name))
++        .map(|(_, line)| format!("- {line}"))
++        .collect()
++}
++
++fn compact_genie_runtime_rules(system_text: &str) -> String {
++    let mut rules = vec![
++        "If no tool is needed, answer naturally in 1-3 short sentences.",
++        "Use calculate for math, get_weather for weather, get_time for time, and system_info for system/Home Assistant/memory diagnostics.",
++        "Use memory_recall when the user asks what you remember, what you know about them, or asks for their name.",
++        "Use memory_store only when the user explicitly asks you to remember/save something; never store secrets.",
++    ];
++
++    if system_text.contains("web_search") {
++        rules.push("Use web_search only for current/recent public facts or explicit web lookup; never send private secrets.");
++    }
++    if system_text.contains("home_control") {
++        rules.push("Use home_control/home_status for smart-home requests; risky actions may require local confirmation.");
++    } else if system_text.contains("Home control is currently unavailable") {
++        rules.push("Home control is unavailable; say Home Assistant is not connected if asked to control a device.");
++    }
++    if system_text.contains("hello_world") {
++        rules.push("Use hello_world only for explicit hello_world demo requests.");
++    }
++
++    format!("Rules:\n- {}", rules.join("\n- "))
++}
++
++fn compact_household_context(system_text: &str) -> Option<String> {
++    let markers = ["Relevant household context:\n", "## Household Context\n"];
++    let (marker_pos, marker_len) = markers
++        .iter()
++        .filter_map(|marker| system_text.rfind(marker).map(|pos| (pos, marker.len())))
++        .max_by_key(|(pos, _)| *pos)?;
++
++    let tail = &system_text[marker_pos + marker_len..];
++    let context = tail
++        .split("\n## ")
++        .next()
++        .unwrap_or(tail)
++        .lines()
++        .map(str::trim)
++        .filter(|line| {
++            !line.is_empty()
++                && *line != "(no household context yet)"
++                && *line != "Relevant household context:"
++        })
++        .collect::<Vec<_>>()
++        .join("\n");
++
++    if context.is_empty() {
++        None
++    } else {
++        Some(truncate_utf8(&context, GENIE_RUNTIME_CONTEXT_MAX_BYTES).to_string())
++    }
++}
++
++fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
++    if text.len() <= max_bytes {
++        return text;
++    }
++
++    let mut end = max_bytes;
++    while end > 0 && !text.is_char_boundary(end) {
++        end -= 1;
++    }
++    text[..end].trim_end()
++}
++
+ fn estimate_messages_bytes(messages: &[Message]) -> usize {
+     messages.iter().map(estimate_message_bytes).sum()
+ }
+@@ -710,7 +840,10 @@ mod tests {
+         let messages = vec![
+             Message {
+                 role: "system".into(),
+-                content: "tool manifest memory_recall household context ".repeat(128),
++                content: format!(
++                    "{}\n\nRelevant household context:\nJared lives here.\n",
++                    "tool manifest memory_recall household context ".repeat(128)
++                ),
+             },
+             Message {
+                 role: "assistant".into(),
+@@ -734,15 +867,15 @@ mod tests {
+         assert_eq!(json["messages"].as_array().unwrap().len(), 2);
+         assert_eq!(json["messages"][0]["role"], "system");
+         assert!(serialized_messages.contains("memory_recall"));
+-        assert!(serialized_messages.contains("household context"));
++        assert!(serialized_messages.contains("Jared lives here"));
+         assert!(serialized_messages.contains("Say hello from the GeniePod web UI."));
+-        assert!(!serialized_messages.contains("GeniePod Home"));
++        assert!(serialized_messages.contains("GeniePod Home"));
+         assert!(!serialized_messages.contains("older assistant turn"));
+         assert!(prepared.body.len() < GENIE_RUNTIME_MAX_BODY_BYTES);
+     }
+ 
+     #[test]
+-    fn genie_runtime_profile_keeps_runtime_prompt_under_expanded_budget() {
++    fn genie_runtime_profile_compacts_runtime_prompt_under_4k_budget() {
+         let profile = RequestProfile::genie_ai_runtime();
+         let messages = vec![
+             Message {
+@@ -761,11 +894,12 @@ mod tests {
+         let json: serde_json::Value = serde_json::from_str(&prepared.body).unwrap();
+         let serialized_messages = json["messages"].to_string();
+ 
+-        assert!(!prepared.compacted);
+-        assert!(prepared.body.len() > 4 * 1024);
++        assert!(prepared.compacted);
+         assert!(prepared.body.len() < GENIE_RUNTIME_MAX_BODY_BYTES);
+         assert!(serialized_messages.contains("memory_recall"));
+         assert!(serialized_messages.contains("What is my name?"));
++        assert!(serialized_messages.contains("GeniePod Home"));
++        assert!(!serialized_messages.contains("tool manifest tool manifest"));
+     }
+ 
+     #[test]
+diff --git a/crates/genie-core/src/tools/quick.rs b/crates/genie-core/src/tools/quick.rs
+index c0158ba..1c3d1bd 100644
+--- a/crates/genie-core/src/tools/quick.rs
++++ b/crates/genie-core/src/tools/quick.rs
+@@ -24,6 +24,10 @@ pub fn route(text: &str) -> Option<ToolCall> {
+         return Some(tool("memory_status", serde_json::json!({})));
+     }
+ 
++    if let Some(query) = memory_recall_query(&normalized) {
++        return Some(tool("memory_recall", serde_json::json!({ "query": query })));
++    }
++
+     if asks_system_status(&normalized) || asks_home_assistant_status(&normalized) {
+         return Some(tool("system_info", serde_json::json!({})));
+     }
+@@ -115,6 +119,53 @@ fn asks_memory_status(text: &str) -> bool {
+     )
+ }
+ 
++fn memory_recall_query(text: &str) -> Option<String> {
++    if contains_any(
++        text,
++        &[
++            "what is my name",
++            "whats my name",
++            "what s my name",
++            "do you know my name",
++            "do you remember my name",
++            "remember my name",
++            "who am i",
++        ],
++    ) {
++        return Some("name".into());
++    }
++
++    for prefix in [
++        "what do you remember about ",
++        "what do you know about ",
++        "do you remember ",
++        "search memory for ",
++        "search memories for ",
++        "recall memory for ",
++        "recall memories for ",
++    ] {
++        if let Some(query) = text.strip_prefix(prefix).map(str::trim)
++            && !query.is_empty()
++            && query != "that"
++        {
++            return Some(query.to_string());
++        }
++    }
++
++    if matches!(
++        text,
++        "what do you remember"
++            | "what do you know about me"
++            | "what do you remember about me"
++            | "what do you know about us"
++            | "what do you remember about us"
++    ) {
++        return Some("me".into());
++    }
++
++    None
++}
++
+ fn asks_home_undo(text: &str) -> bool {
+     matches!(
+         text,
+@@ -543,6 +594,24 @@ mod tests {
+         assert_eq!(call.name, "memory_status");
+     }
+ 
++    #[test]
++    fn routes_identity_memory_questions_to_memory_recall() {
++        let call = route("What is my name?").unwrap();
++        assert_eq!(call.name, "memory_recall");
++        assert_eq!(call.arguments["query"], "name");
++
++        let call = route("do you remember my name").unwrap();
++        assert_eq!(call.name, "memory_recall");
++        assert_eq!(call.arguments["query"], "name");
++    }
++
++    #[test]
++    fn routes_explicit_memory_search_to_memory_recall() {
++        let call = route("search memory for Jared").unwrap();
++        assert_eq!(call.name, "memory_recall");
++        assert_eq!(call.arguments["query"], "jared");
++    }
++
+     #[test]
+     fn routes_undo_to_home_undo() {
+         let call = route("undo that").unwrap();
+@@ -607,11 +676,6 @@ mod tests {
+         assert_eq!(call.arguments["query"], "esp32 c6 thread support");
+     }
+ 
+-    #[test]
+-    fn does_not_route_memory_search_to_web() {
+-        assert!(route("search memory for Jared").is_none());
+-    }
+-
+     #[test]
+     fn routes_simple_arithmetic() {
+         let call = route("what is 12 plus 30").unwrap();
+diff --git a/crates/genie-core/tests/tool_dispatch_test.rs b/crates/genie-core/tests/tool_dispatch_test.rs
+index ceaae51..d7385ba 100644
+--- a/crates/genie-core/tests/tool_dispatch_test.rs
++++ b/crates/genie-core/tests/tool_dispatch_test.rs
+@@ -267,6 +267,12 @@ fn start_all_uses_configured_llm_backend() {
+         contents.contains("read_llm_unit"),
+         "start_all should read [services.llm].systemd_unit"
+     );
++    assert!(
++        contents.contains("read_llm_url")
++            && contents.contains("wait_for_http_health")
++            && contents.contains("Configured LLM health"),
++        "start_all should wait for the configured LLM health endpoint before memory-heavy services"
++    );
+     assert!(
+         contents.contains("read_wakeword_script")
+             && contents.contains("wakeword_script is empty; push-to-talk mode"),
+@@ -388,8 +394,8 @@ fn genie_ai_runtime_service_preserves_model_page_cache() {
+         "genie-ai-runtime.service should use INT8 KV to fit enough context under memory pressure"
+     );
+     assert!(
+-        contents.contains("GENIEPOD_AI_RUNTIME_CONTEXT=8192"),
+-        "genie-ai-runtime.service should request the Jetson-tested 8k context size"
++        contents.contains("GENIEPOD_AI_RUNTIME_CONTEXT=4096"),
++        "genie-ai-runtime.service should default to the Jetson-stable 4k context size"
+     );
+     assert!(
+         contents.contains(
+diff --git a/deploy/scripts/start_all.sh b/deploy/scripts/start_all.sh
+index 7079c18..2217332 100644
+--- a/deploy/scripts/start_all.sh
++++ b/deploy/scripts/start_all.sh
+@@ -21,6 +21,14 @@ read_llm_unit() {
+     ' "$CONFIG_FILE" 2>/dev/null || true
+ }
+ 
++read_llm_url() {
++    "${AWK[@]}" -F'"' '
++        /^\[services\.llm\]/ { in_llm = 1; next }
++        /^\[/ && !/^\[services\.llm\]/ { in_llm = 0 }
++        in_llm && /^url = / { print $2; exit }
++    ' "$CONFIG_FILE" 2>/dev/null || true
++}
++
+ read_wakeword_script() {
+     "${AWK[@]}" -F'"' '
+         /^\[core\]/ { in_core = 1; next }
+@@ -138,9 +146,40 @@ start_unit() {
+     echo "OK"
+ }
+ 
++wait_for_http_health() {
++    local label="$1"
++    local url="$2"
++    local attempts="${3:-180}"
++
++    if [ -z "$url" ]; then
++        echo "  FAILED: no health URL configured for $label"
++        return 1
++    fi
++    if ! command -v curl > /dev/null 2>&1; then
++        echo "  FAILED: curl is required to wait for $label health"
++        return 1
++    fi
++
++    printf "  Waiting for %s health (%s) ... " "$label" "$url"
++    for _ in $(seq 1 "$attempts"); do
++        if curl -fsS --max-time 2 "$url" > /dev/null 2>&1; then
++            echo "OK"
++            return 0
++        fi
++        sleep 1
++    done
++
++    echo "FAILED"
++    return 1
++}
++
+ raw_llm_unit="$(read_llm_unit)"
+ configured_llm_unit="$(normalize_unit "$raw_llm_unit")"
+ configured_warmup_unit="$(warmup_unit_for "$configured_llm_unit")"
++configured_llm_url="$(read_llm_url)"
++if [ -z "$configured_llm_url" ]; then
++    configured_llm_url="http://127.0.0.1:8080/health"
++fi
+ wakeword_script="$(read_wakeword_script)"
+ wakeword_enabled=1
+ if [ -z "$wakeword_script" ]; then
+@@ -168,6 +207,7 @@ UNITS=(
+ echo "=== GeniePod start all ==="
+ echo ""
+ echo "Configured LLM unit: $configured_llm_unit"
++echo "Configured LLM health: $configured_llm_url"
+ if [ "$wakeword_enabled" = "1" ]; then
+     echo "Wake word script: $wakeword_script"
+ else
+@@ -187,6 +227,14 @@ failed=()
+ for unit in "${UNITS[@]}"; do
+     if ! start_unit "$unit"; then
+         failed+=("$unit")
++        continue
++    fi
++
++    if [ "$unit" = "$configured_llm_unit" ]; then
++        if ! wait_for_http_health "$configured_llm_unit" "$configured_llm_url"; then
++            failed+=("$configured_llm_unit health")
++            break
++        fi
+     fi
+ done
+ 
+diff --git a/deploy/systemd/genie-ai-runtime.service b/deploy/systemd/genie-ai-runtime.service
+index b3c3691..54d567f 100644
+--- a/deploy/systemd/genie-ai-runtime.service
++++ b/deploy/systemd/genie-ai-runtime.service
+@@ -5,7 +5,8 @@ After=network.target
+ # Claim the LLM KV cache before memory-heavy voice/container services start.
+ # Jetson testing for issue #75 showed the same `-c 4096` request fitting only
+ # ~1.7k ctx after the full stack was resident, but fitting 4k/6k/8k ctx when
+-# genie-ai-runtime loaded first.
++# genie-ai-runtime loaded first. Keep the default at 4k because 8k can still
++# fail to start on memory-fragmented full-stack restarts.
+ Before=genie-whisper.service genie-whisper-warmup.service homeassistant.service genie-core.service
+ ConditionPathExists=/opt/geniepod/bin/jetson-llm-server
+ # Conflicts with genie-llm.service: both bind :8080. systemd will refuse
+@@ -17,16 +18,16 @@ Conflicts=genie-llm.service
+ Type=simple
+ # Keep the GGUF in page cache across restarts when the kernel can. Clearing
+ # VM caches here made every runtime restart cold-load Qwen3 again (issue #69).
+-# Use INT8 KV so the Jetson service can reserve an 8k context on Orin Nano
+-# when systemd starts it before memory-heavy services. `-c` is still clamped
+-# by runtime memory budget, so boot/start ordering matters.
++# Use INT8 KV so the Jetson service can reserve a 4k context reliably on Orin
++# Nano. `-c` is still clamped by runtime memory budget, so boot/start ordering
++# matters.
+ ExecStart=/opt/geniepod/bin/jetson-llm-server \
+     -m ${GENIEPOD_LLM_MODEL} \
+     -p 8080 \
+     -c ${GENIEPOD_AI_RUNTIME_CONTEXT} \
+     --int8-kv
+ Environment=GENIEPOD_LLM_MODEL=/opt/geniepod/models/Qwen3-4B-Q4_K_M.gguf
+-Environment=GENIEPOD_AI_RUNTIME_CONTEXT=8192
++Environment=GENIEPOD_AI_RUNTIME_CONTEXT=4096
+ Restart=on-failure
+ RestartSec=5
+ TimeoutStartSec=120

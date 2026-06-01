@@ -1,0 +1,1213 @@
+diff --git a/crates/genie-core/src/memory/recall.rs b/crates/genie-core/src/memory/recall.rs
+index 6fa1b57..6b5f34d 100644
+--- a/crates/genie-core/src/memory/recall.rs
++++ b/crates/genie-core/src/memory/recall.rs
+@@ -161,7 +161,33 @@ pub fn recall_with_context(
+     context: policy::MemoryReadContext,
+ ) -> Result<Vec<RecallableMemory>> {
+     let results = memory.search(query, limit)?;
+-    Ok(filter_recall_results(results, context))
++    let raw_hits = results.len();
++    let recalled = filter_recall_results(results, context);
++
++    if !query.trim().is_empty() && recalled.is_empty() {
++        // Distinguish "FTS/LIKE returned nothing" from "results were dropped by
++        // shared-room / scope / sensitivity policy". Both produce an empty
++        // recall context, but they need different remediation, so we emit a
++        // labeled event instead of letting the miss vanish into a silent
++        // empty prompt context (M1 exit criterion, issue #111).
++        let cause = if raw_hits == 0 {
++            "no_match"
++        } else {
++            "policy_filtered"
++        };
++        tracing::warn!(
++            target: "memory.recall.miss",
++            cause,
++            raw_hits = raw_hits as u64,
++            query_len = query.len() as u64,
++            identity_confidence = ?context.identity_confidence,
++            explicit_named_person = context.explicit_named_person,
++            shared_space_voice = context.shared_space_voice,
++            "memory recall miss"
++        );
++    }
++
++    Ok(recalled)
+ }
+ 
+ pub fn filter_recall_results(
+diff --git a/crates/genie-core/tests/memory_recall.rs b/crates/genie-core/tests/memory_recall.rs
+new file mode 100644
+index 0000000..dd4ca0d
+--- /dev/null
++++ b/crates/genie-core/tests/memory_recall.rs
+@@ -0,0 +1,592 @@
++// Memory recall test set — M1 exit criterion (issue #111).
++//
++// Loads `tests/memory/cases.toml` from the workspace root, exercises each
++// case against `genie_core::memory::Memory` + `recall::recall_with_context`,
++// and asserts the test set passes >= 95%.
++//
++// The committed `tests/memory/expected/ledger.json` is a **golden fixture**.
++// The runner serializes the in-memory ledger and compares it against the
++// fixture; a drift means either a real regression or an intentional change
++// that needs the fixture regenerated. The runner never writes into the
++// tracked tree — the generated ledger goes to `target/memory-recall-ledger.json`
++// (Cargo's standard build directory) so a contributor can `cp` it over the
++// fixture when the drift is intentional.
++//
++// Two narrower tests at the bottom of this file pin the structured-log
++// behaviour: a no_match recall and a policy_filtered recall must each emit
++// a tracing event on target `memory.recall.miss` with the right `cause`.
++
++use std::path::PathBuf;
++use std::sync::{Arc, Mutex};
++
++use genie_core::memory::{
++    Memory,
++    policy::{IdentityConfidence, MemoryReadContext},
++    recall::recall_with_context,
++};
++use serde::{Deserialize, Serialize};
++use tracing::field::{Field, Visit};
++use tracing::{Level, Subscriber};
++use tracing_subscriber::layer::{Context as LayerContext, Layer, SubscriberExt};
++use tracing_subscriber::registry::Registry;
++
++const PASS_RATE_FLOOR: f64 = 0.95;
++const RECALL_LIMIT: usize = 8;
++
++// ---------------------------------------------------------------------------
++// TOML schema.
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Deserialize)]
++struct CaseFile {
++    case: Vec<Case>,
++}
++
++#[derive(Debug, Deserialize)]
++struct Case {
++    id: String,
++    description: String,
++    #[serde(default)]
++    restart: bool,
++    #[serde(default)]
++    seed: Vec<SeedEntry>,
++    query: String,
++    context: ContextSpec,
++    expect: ExpectSpec,
++}
++
++#[derive(Debug, Deserialize)]
++struct SeedEntry {
++    kind: String,
++    content: String,
++}
++
++#[derive(Debug, Deserialize)]
++struct ContextSpec {
++    identity_confidence: String,
++    explicit_named_person: bool,
++    explicit_private_intent: bool,
++    shared_space_voice: bool,
++}
++
++#[derive(Debug, Deserialize)]
++struct ExpectSpec {
++    outcome: String,
++    #[serde(default)]
++    contains: Option<String>,
++}
++
++impl ContextSpec {
++    fn to_read_context(&self) -> MemoryReadContext {
++        let identity_confidence = match self.identity_confidence.to_ascii_lowercase().as_str() {
++            "high" => IdentityConfidence::High,
++            "medium" => IdentityConfidence::Medium,
++            "low" => IdentityConfidence::Low,
++            _ => IdentityConfidence::Unknown,
++        };
++        MemoryReadContext {
++            identity_confidence,
++            explicit_named_person: self.explicit_named_person,
++            explicit_private_intent: self.explicit_private_intent,
++            shared_space_voice: self.shared_space_voice,
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Ledger schema (what we write under tests/memory/expected/).
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Serialize)]
++struct LedgerEntry {
++    id: String,
++    description: String,
++    expected_outcome: String,
++    actual_outcome: String,
++    raw_hits: usize,
++    recalled_hits: usize,
++    pass: bool,
++    note: String,
++}
++
++#[derive(Debug, Serialize)]
++struct Ledger {
++    total: usize,
++    passed: usize,
++    pass_rate: f64,
++    floor: f64,
++    entries: Vec<LedgerEntry>,
++}
++
++// ---------------------------------------------------------------------------
++// Main test: run every case and write the ledger.
++// ---------------------------------------------------------------------------
++
++#[test]
++fn memory_recall_test_set_meets_95_percent_floor() {
++    let cases_path = workspace_root()
++        .join("tests")
++        .join("memory")
++        .join("cases.toml");
++    let raw = std::fs::read_to_string(&cases_path)
++        .unwrap_or_else(|e| panic!("read {}: {}", cases_path.display(), e));
++    let file: CaseFile = toml::from_str(&raw).expect("parse cases.toml");
++    assert!(
++        file.case.len() >= 20,
++        "memory recall test set must have at least 20 cases (have {})",
++        file.case.len()
++    );
++
++    let mut entries = Vec::with_capacity(file.case.len());
++    let mut passed = 0usize;
++
++    for case in &file.case {
++        let entry = run_case(case);
++        if entry.pass {
++            passed += 1;
++        }
++        entries.push(entry);
++    }
++
++    let total = file.case.len();
++    let pass_rate = passed as f64 / total as f64;
++    let ledger = Ledger {
++        total,
++        passed,
++        pass_rate,
++        floor: PASS_RATE_FLOOR,
++        entries,
++    };
++
++    // Write the generated ledger to Cargo's ignored build directory so a
++    // contributor can inspect it without re-running and `cp` it onto the
++    // golden fixture when a drift is intentional. This is the only place
++    // the runner writes — never into the tracked tree.
++    let actual_path = write_debug_ledger(&ledger);
++    let actual_text = serde_json::to_string_pretty(&ledger).expect("serialize ledger");
++
++    // Echo failures so the test output points at the right case without
++    // requiring a separate cargo invocation.
++    let failures: Vec<&LedgerEntry> = ledger.entries.iter().filter(|e| !e.pass).collect();
++    if !failures.is_empty() {
++        eprintln!("memory recall failures ({}):", failures.len());
++        for f in &failures {
++            eprintln!(
++                "  - {}: expected {}, got {} ({})",
++                f.id, f.expected_outcome, f.actual_outcome, f.note
++            );
++        }
++    }
++
++    assert!(
++        pass_rate >= PASS_RATE_FLOOR,
++        "memory recall pass rate {:.1}% is below the {:.0}% M1 exit floor (passed {}/{})",
++        pass_rate * 100.0,
++        PASS_RATE_FLOOR * 100.0,
++        passed,
++        total
++    );
++
++    // Integrity check: the in-memory ledger must match the committed
++    // golden fixture verbatim. A drift here means either a recall
++    // regression that snuck past the pass-rate floor (e.g. a case moved
++    // from `hit` -> `filtered`, raw_hits changed), or an intentional
++    // change (new case added, description edited) that needs the fixture
++    // regenerated.
++    let golden_path = workspace_root()
++        .join("tests")
++        .join("memory")
++        .join("expected")
++        .join("ledger.json");
++    let golden_text = std::fs::read_to_string(&golden_path).unwrap_or_else(|e| {
++        panic!(
++            "golden fixture {} missing or unreadable ({}). The committed file is the expected ledger; regenerate by copying {} on top of it.",
++            golden_path.display(),
++            e,
++            actual_path.display(),
++        )
++    });
++
++    if normalize_ledger(&actual_text) != normalize_ledger(&golden_text) {
++        panic!(
++            "memory recall ledger drifted from {}.\n\
++             Generated ledger written to {}.\n\
++             If the drift is intentional (e.g. you added a case, edited a description, or changed expected outcomes), regenerate the fixture:\n\
++             \n    cp {} {}\n\
++             \nand commit the result.",
++            golden_path.display(),
++            actual_path.display(),
++            actual_path.display(),
++            golden_path.display(),
++        );
++    }
++}
++
++fn normalize_ledger(text: &str) -> String {
++    // Tolerate CRLF in case a Windows checkout normalized line endings,
++    // and strip trailing whitespace so an editor-added final newline
++    // does not register as a drift.
++    text.replace("\r\n", "\n").trim_end().to_string()
++}
++
++fn run_case(case: &Case) -> LedgerEntry {
++    let db_dir = tempdir(&format!("genie-recall-{}", case.id));
++    let db_path = db_dir.join("memory.db");
++
++    {
++        let memory = Memory::open(&db_path).expect("open memory");
++        for seed in &case.seed {
++            memory.store(&seed.kind, &seed.content).expect("seed store");
++        }
++    } // drop seed-side handle so WAL is flushed before reopen.
++
++    let read_context = case.context.to_read_context();
++
++    let (raw_hits, recalled_hits, has_contains): (usize, usize, bool) = {
++        let memory = if case.restart {
++            // Reopen the same SQLite file. Proves recall survives a
++            // process restart at the storage layer (the M1 "next session"
++            // path) without spinning a full binary.
++            Memory::open(&db_path).expect("reopen memory")
++        } else {
++            Memory::open(&db_path).expect("open memory")
++        };
++
++        // Capture raw FTS hits separately from policy-filtered recall so
++        // we can tell `miss` from `filtered` in the ledger. Both Memory
++        // calls touch recall_count, which is fine for these throwaway DBs.
++        let raw = memory
++            .search(&case.query, RECALL_LIMIT)
++            .expect("raw search");
++        let raw_hits = raw.len();
++        let recalled = recall_with_context(&memory, &case.query, RECALL_LIMIT, read_context)
++            .expect("recall_with_context");
++        let has_contains = match case.expect.contains.as_deref() {
++            Some(needle) => recalled.iter().any(|r| r.entry.content.contains(needle)),
++            None => true,
++        };
++        (raw_hits, recalled.len(), has_contains)
++    };
++
++    let actual_outcome = match (raw_hits, recalled_hits) {
++        (0, 0) => "miss",
++        (_, 0) => "filtered",
++        _ => "hit",
++    };
++
++    let pass = actual_outcome == case.expect.outcome && has_contains;
++    let note = if !pass {
++        if actual_outcome != case.expect.outcome {
++            format!(
++                "outcome mismatch: raw={}, recalled={}",
++                raw_hits, recalled_hits
++            )
++        } else {
++            format!(
++                "missing expected substring `{}`",
++                case.expect.contains.as_deref().unwrap_or("")
++            )
++        }
++    } else {
++        case.description.clone()
++    };
++
++    LedgerEntry {
++        id: case.id.clone(),
++        description: case.description.clone(),
++        expected_outcome: case.expect.outcome.clone(),
++        actual_outcome: actual_outcome.to_string(),
++        raw_hits,
++        recalled_hits,
++        pass,
++        note,
++    }
++}
++
++/// Write the generated ledger to Cargo's `target/` directory for local
++/// inspection. `target/` is the standard Cargo build output and is
++/// gitignored, so this never mutates the tracked tree. Returns the path
++/// so the main test can include it in a drift error message.
++fn write_debug_ledger(ledger: &Ledger) -> PathBuf {
++    let path = workspace_root()
++        .join("target")
++        .join("memory-recall-ledger.json");
++    if let Some(parent) = path.parent() {
++        let _ = std::fs::create_dir_all(parent);
++    }
++    match serde_json::to_string_pretty(ledger) {
++        Ok(text) => {
++            if let Err(e) = std::fs::write(&path, text) {
++                eprintln!("debug ledger write {}: {}", path.display(), e);
++            }
++        }
++        Err(e) => eprintln!("debug ledger serialize: {e}"),
++    }
++    path
++}
++
++// ---------------------------------------------------------------------------
++// Narrow tests for AC #3: "Recall miss emits a labeled log line
++// distinguishable from a hit." Capture tracing events in-process and
++// assert the right target+fields fire for each cause.
++// ---------------------------------------------------------------------------
++
++#[test]
++fn recall_no_match_emits_labeled_miss_log() {
++    let captured = capture_miss_events(|memory| {
++        let _ = recall_with_context(
++            memory,
++            "submarine maintenance schedule",
++            RECALL_LIMIT,
++            MemoryReadContext::shared_room_voice(),
++        );
++    });
++
++    let no_match = captured
++        .iter()
++        .find(|e| e.cause.as_deref() == Some("no_match"));
++    assert!(
++        no_match.is_some(),
++        "expected a memory.recall.miss event with cause=no_match, got {:?}",
++        captured
++    );
++    let event = no_match.unwrap();
++    assert_eq!(event.raw_hits, Some(0));
++    assert_eq!(event.level, Level::WARN);
++}
++
++#[test]
++fn recall_policy_filtered_emits_labeled_miss_log() {
++    let captured = capture_miss_events(|memory| {
++        memory
++            .store("fact", "user's password is swordfish")
++            .expect("store restricted");
++        let _ = recall_with_context(
++            memory,
++            "password",
++            RECALL_LIMIT,
++            MemoryReadContext::shared_room_voice(),
++        );
++    });
++
++    let filtered = captured
++        .iter()
++        .find(|e| e.cause.as_deref() == Some("policy_filtered"));
++    assert!(
++        filtered.is_some(),
++        "expected a memory.recall.miss event with cause=policy_filtered, got {:?}",
++        captured
++    );
++    let event = filtered.unwrap();
++    assert!(
++        event.raw_hits.unwrap_or(0) >= 1,
++        "policy_filtered miss should carry raw_hits >= 1, got {:?}",
++        event.raw_hits
++    );
++    assert_eq!(event.level, Level::WARN);
++}
++
++// ---------------------------------------------------------------------------
++// AC #4: promoted-durable filtering. The MEMORY.md root file must only
++// surface shared-safe entries; person / private / restricted promotions
++// must redact in the namespace projection and stay out of the root file.
++// This complements the in-crate tests by exercising the projection end to
++// end through the public Memory API from an integration crate boundary.
++// ---------------------------------------------------------------------------
++
++#[test]
++fn promoted_durable_filter_keeps_only_shared_safe_in_root() {
++    let db_dir = tempdir("genie-recall-promote");
++    let db_path = db_dir.join("memory.db");
++    let memory = Memory::open(&db_path).expect("open memory");
++
++    let safe_id = memory
++        .store("preference", "User likes ginger tea")
++        .expect("seed safe");
++    let person_id = memory
++        .store("person_preference", "Maya likes oat milk")
++        .expect("seed person");
++    let restricted_id = memory
++        .store("fact", "user's password is swordfish")
++        .expect("seed restricted");
++    let private_id = memory
++        .store(
++            "fact",
++            "remember this privately: meeting with the lawyer Thursday",
++        )
++        .expect("seed private");
++
++    for id in [safe_id, person_id, restricted_id, private_id] {
++        memory.mark_promoted(id).expect("promote");
++    }
++
++    let canonical_dir = db_dir.join("memory");
++    let root = canonical_dir.join("MEMORY.md");
++    let root_text =
++        std::fs::read_to_string(&root).unwrap_or_else(|e| panic!("read {}: {}", root.display(), e));
++
++    assert!(
++        root_text.contains("User likes ginger tea"),
++        "shared-safe preference missing from MEMORY.md root: {}",
++        root_text
++    );
++    assert!(
++        !root_text.contains("Maya likes oat milk"),
++        "person memory leaked into MEMORY.md root: {}",
++        root_text
++    );
++    assert!(
++        !root_text.contains("swordfish"),
++        "restricted memory leaked into MEMORY.md root: {}",
++        root_text
++    );
++    assert!(
++        !root_text.contains("lawyer Thursday"),
++        "private memory leaked into MEMORY.md root: {}",
++        root_text
++    );
++
++    let person_note = canonical_dir.join("namespaces/person/preference.md");
++    let person_text = std::fs::read_to_string(&person_note).expect("read person note");
++    assert!(
++        person_text.contains("redacted"),
++        "person namespace projection should be redacted, got: {}",
++        person_text
++    );
++    assert!(
++        !person_text.contains("Maya likes oat milk"),
++        "person namespace projection leaked content: {}",
++        person_text
++    );
++}
++
++#[test]
++fn recall_hit_does_not_emit_miss_log() {
++    let captured = capture_miss_events(|memory| {
++        memory
++            .store("preference", "User likes jazz music")
++            .expect("store");
++        let _ = recall_with_context(
++            memory,
++            "music",
++            RECALL_LIMIT,
++            MemoryReadContext::shared_room_voice(),
++        );
++    });
++
++    assert!(
++        captured.is_empty(),
++        "hit path must not emit memory.recall.miss, but got {:?}",
++        captured
++    );
++}
++
++// ---------------------------------------------------------------------------
++// Tracing capture helper.
++// ---------------------------------------------------------------------------
++
++#[derive(Debug, Clone)]
++struct MissEvent {
++    level: Level,
++    cause: Option<String>,
++    raw_hits: Option<usize>,
++}
++
++struct MissCapture {
++    sink: Arc<Mutex<Vec<MissEvent>>>,
++}
++
++impl<S: Subscriber> Layer<S> for MissCapture {
++    fn on_event(&self, event: &tracing::Event<'_>, _ctx: LayerContext<'_, S>) {
++        if event.metadata().target() != "memory.recall.miss" {
++            return;
++        }
++        let mut visitor = MissVisitor {
++            cause: None,
++            raw_hits: None,
++        };
++        event.record(&mut visitor);
++        self.sink.lock().unwrap().push(MissEvent {
++            level: *event.metadata().level(),
++            cause: visitor.cause,
++            raw_hits: visitor.raw_hits,
++        });
++    }
++}
++
++struct MissVisitor {
++    cause: Option<String>,
++    raw_hits: Option<usize>,
++}
++
++impl Visit for MissVisitor {
++    fn record_str(&mut self, field: &Field, value: &str) {
++        if field.name() == "cause" {
++            self.cause = Some(value.to_string());
++        }
++    }
++
++    fn record_u64(&mut self, field: &Field, value: u64) {
++        if field.name() == "raw_hits" {
++            self.raw_hits = Some(value as usize);
++        }
++    }
++
++    fn record_i64(&mut self, field: &Field, value: i64) {
++        if field.name() == "raw_hits" && value >= 0 {
++            self.raw_hits = Some(value as usize);
++        }
++    }
++
++    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
++        // Fallback for fields recorded via Debug (e.g. ?identity_confidence).
++        // Only fill `cause` if record_str hasn't already set it.
++        if field.name() == "cause" && self.cause.is_none() {
++            self.cause = Some(format!("{:?}", value).trim_matches('"').to_string());
++        }
++    }
++}
++
++fn capture_miss_events<F: FnOnce(&Memory)>(body: F) -> Vec<MissEvent> {
++    let sink = Arc::new(Mutex::new(Vec::new()));
++    let layer = MissCapture { sink: sink.clone() };
++    let subscriber = Registry::default().with(layer);
++
++    let db_dir = tempdir("genie-recall-log");
++    let memory = Memory::open(&db_dir.join("memory.db")).expect("open memory");
++
++    tracing::subscriber::with_default(subscriber, || {
++        body(&memory);
++    });
++
++    let guard = sink.lock().unwrap();
++    guard.clone()
++}
++
++// ---------------------------------------------------------------------------
++// Paths.
++// ---------------------------------------------------------------------------
++
++fn workspace_root() -> PathBuf {
++    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
++    manifest.parent().unwrap().parent().unwrap().to_path_buf()
++}
++
++fn tempdir(prefix: &str) -> PathBuf {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    static COUNTER: AtomicU64 = AtomicU64::new(0);
++    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
++    let path = std::env::temp_dir().join(format!(
++        "{}-{}-{}-{}",
++        prefix,
++        std::process::id(),
++        n,
++        std::time::SystemTime::now()
++            .duration_since(std::time::UNIX_EPOCH)
++            .map(|d| d.as_nanos())
++            .unwrap_or(0)
++    ));
++    let _ = std::fs::remove_dir_all(&path);
++    std::fs::create_dir_all(&path).expect("create tempdir");
++    path
++}
+diff --git a/tests/memory/README.md b/tests/memory/README.md
+new file mode 100644
+index 0000000..023d9cb
+--- /dev/null
++++ b/tests/memory/README.md
+@@ -0,0 +1,57 @@
++# Memory recall test set
++
++Curated cases that prove household memory recall is reliable and that recall
++failures are observable, not silent. Tracks M1 exit criterion from
++[issue #111](https://github.com/GeniePod/genie-claw/issues/111).
++
++## Layout
++
++- `cases.toml` — the case definitions. One `[[case]]` table per scenario.
++- `expected/ledger.json` — **golden fixture**. The committed file is the
++  expected ledger; the runner serializes the in-memory ledger and
++  compares it against this file (with CRLF normalised). The runner does
++  **not** write into the tracked tree.
++
++The runner lives at `crates/genie-core/tests/memory_recall.rs` and is exercised
++by `cargo test -p genie-core --test memory_recall`. Its only filesystem
++output is `target/memory-recall-ledger.json`, in Cargo's gitignored build
++directory.
++
++## Regenerating the golden ledger
++
++When you intentionally change anything that affects the ledger output —
++adding a case, editing a description, changing an `expect.outcome` —
++the runner fails with a drift error pointing at the freshly generated
++ledger under `target/`. To accept the new ledger:
++
++```sh
++cargo test -p genie-core --test memory_recall   # fails with drift hint
++cp target/memory-recall-ledger.json tests/memory/expected/ledger.json
++cargo test -p genie-core --test memory_recall   # now green
++git add tests/memory/expected/ledger.json
++```
++
++The two-step ensures every fixture change appears as a reviewable diff
++in the PR.
++
++## What a case proves
++
++Each case has a `seed`, a `query`, a `context`, and an `expect`:
++
++| `expect.outcome` | Meaning |
++| --- | --- |
++| `hit`      | Recall returned at least one entry. If `contains` is set, one entry must contain that substring. |
++| `filtered` | The underlying search **did** match rows, but every match was dropped by `assess_memory_read` (scope / sensitivity / spoken_policy). The user gets an empty context, but the miss is logged with `cause="policy_filtered"`. |
++| `miss`     | The underlying search returned nothing. The miss is logged with `cause="no_match"`. |
++
++`restart = true` drops and reopens `Memory` against the same SQLite file
++between seed and query. That proves the recall path survives a process
++restart — the M1 "next session" requirement — without spinning a binary.
++
++## Acceptance gate
++
++The runner asserts ≥ 95 % pass across all cases and then compares the
++in-memory ledger against `expected/ledger.json`. The first assertion
++catches recall regressions; the second catches subtler ledger drift
++(e.g. a case that moved from `hit` to `filtered` while keeping the
++overall pass rate above the floor).
+diff --git a/tests/memory/cases.toml b/tests/memory/cases.toml
+new file mode 100644
+index 0000000..38ed7e9
+--- /dev/null
++++ b/tests/memory/cases.toml
+@@ -0,0 +1,282 @@
++# Memory recall test set — tracks issue #111 (M1 exit criterion).
++#
++# Each [[case]] table is one scenario. The runner is
++# crates/genie-core/tests/memory_recall.rs; the README in this directory
++# explains the schema.
++#
++# Convention: case ids are kebab-case and group by the policy axis under
++# test (household / cautious / person / private / restricted / no-match /
++# restart / query-shape).
++
++# ---------------------------------------------------------------------------
++# Shared-room household, normal sensitivity, spoken_policy = allow.
++# This is the default "memory just works" path.
++# ---------------------------------------------------------------------------
++
++[[case]]
++id = "household-jazz-basic"
++description = "Shared-room preference recalled by topic keyword"
++restart = false
++seed = [
++  { kind = "preference", content = "User likes jazz music" },
++]
++query = "music"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "hit", contains = "jazz" }
++
++[[case]]
++id = "household-identity-name"
++description = "Household identity recalled from a direct question"
++restart = false
++seed = [
++  { kind = "identity", content = "Household member name is Jared" },
++]
++query = "what is my name"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "hit", contains = "Jared" }
++
++[[case]]
++id = "household-pet-name"
++description = "Multi-token recall picks the relevant fact among several"
++restart = false
++seed = [
++  { kind = "fact", content = "The dog is named Mochi" },
++  { kind = "fact", content = "The cat is named Pip" },
++  { kind = "preference", content = "User drinks coffee black" },
++]
++query = "dog name"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "hit", contains = "Mochi" }
++
++[[case]]
++id = "household-tea-short-query"
++description = "Single-token short query still hits via FTS"
++restart = false
++seed = [
++  { kind = "preference", content = "User drinks tea every morning" },
++]
++query = "tea"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "hit", contains = "tea" }
++
++[[case]]
++id = "household-multi-fact-disambiguation"
++description = "Recall scores the right fact even when several share a topic"
++restart = false
++seed = [
++  { kind = "preference", content = "User likes spicy Thai food" },
++  { kind = "preference", content = "User dislikes raw onions" },
++  { kind = "preference", content = "User is vegetarian on weekdays" },
++]
++query = "vegetarian"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "hit", contains = "vegetarian" }
++
++# ---------------------------------------------------------------------------
++# Household, cautious sensitivity. Content is shared-room but the inferred
++# spoken_policy = confirm, so recall_with_context drops the entry — we want
++# this to surface as a logged miss, not a silent empty context.
++# ---------------------------------------------------------------------------
++
++[[case]]
++id = "household-cautious-medical-diagnosis"
++description = "Medical-diagnosis content is cautious -> confirm -> filtered"
++restart = false
++seed = [
++  { kind = "fact", content = "User has a recent medical diagnosis of mild asthma" },
++]
++query = "diagnosis"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "filtered" }
++
++[[case]]
++id = "household-cautious-therapy"
++description = "Therapy-session content is cautious -> confirm -> filtered"
++restart = false
++seed = [
++  { kind = "fact", content = "User mentioned a therapy session next Tuesday" },
++]
++query = "therapy"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "filtered" }
++
++# ---------------------------------------------------------------------------
++# Person scope. kind="person_*" infers MemoryScope::Person, which needs
++# either explicit_named_person or identity_confidence >= Medium to disclose.
++# ---------------------------------------------------------------------------
++
++[[case]]
++id = "person-shared-room-filtered"
++description = "Person memory is dropped in unidentified shared-room voice"
++restart = false
++seed = [
++  { kind = "person_preference", content = "Maya likes oat milk" },
++]
++query = "oat milk"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "filtered" }
++
++[[case]]
++id = "person-medium-identity-hits"
++description = "Person memory speaks once identity_confidence reaches medium"
++restart = false
++seed = [
++  { kind = "person_preference", content = "Maya likes oat milk" },
++]
++query = "oat milk"
++context = { identity_confidence = "medium", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "hit", contains = "Maya" }
++
++[[case]]
++id = "person-explicit-name-hits"
++description = "Explicit naming unlocks person memory even at low identity confidence"
++restart = false
++seed = [
++  { kind = "person_preference", content = "Maya likes oat milk" },
++]
++query = "what does Maya drink"
++context = { identity_confidence = "low", explicit_named_person = true, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "hit", contains = "Maya" }
++
++# ---------------------------------------------------------------------------
++# Private scope. Content phrasing triggers has_private_intent() ->
++# MemoryScope::Private. Private + shared_space_voice = deny; private +
++# explicit_private_intent + not-shared = AppOnly (still allowed=false).
++# Either way, recall_with_context must filter.
++# ---------------------------------------------------------------------------
++
++[[case]]
++id = "private-shared-room-denied"
++description = "Private content is denied in shared-room voice"
++restart = false
++seed = [
++  { kind = "fact", content = "remember this privately: user is interviewing at Acme" },
++]
++query = "interview"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "filtered" }
++
++[[case]]
++id = "private-named-still-denied-in-shared-voice"
++description = "Even explicit private intent stays denied while shared_space_voice is true"
++restart = false
++seed = [
++  { kind = "fact", content = "remember this privately: user is interviewing at Acme" },
++]
++query = "interview"
++context = { identity_confidence = "high", explicit_named_person = false, explicit_private_intent = true, shared_space_voice = true }
++expect = { outcome = "filtered" }
++
++[[case]]
++id = "private-app-only-still-not-spoken"
++description = "Private + private intent off-shared-voice resolves to AppOnly, still not in recall context"
++restart = false
++seed = [
++  { kind = "fact", content = "private note: user is interviewing at Acme" },
++]
++query = "interview"
++context = { identity_confidence = "high", explicit_named_person = false, explicit_private_intent = true, shared_space_voice = false }
++expect = { outcome = "filtered" }
++
++# ---------------------------------------------------------------------------
++# Restricted content. infer_metadata flags passwords / cards / keys as
++# Restricted -> spoken_policy = Deny. Even if the user explicitly asks for
++# them, recall must not surface them.
++# ---------------------------------------------------------------------------
++
++[[case]]
++id = "restricted-password-deny"
++description = "Password content is restricted -> deny -> filtered"
++restart = false
++seed = [
++  { kind = "fact", content = "user's password is swordfish" },
++]
++query = "password"
++context = { identity_confidence = "high", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "filtered" }
++
++[[case]]
++id = "restricted-credit-card-deny"
++description = "Card number content is restricted -> deny -> filtered"
++restart = false
++seed = [
++  { kind = "fact", content = "user's credit card is 4111 1111 1111 1111" },
++]
++query = "credit card"
++context = { identity_confidence = "high", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "filtered" }
++
++[[case]]
++id = "restricted-api-key-deny"
++description = "API key content is restricted -> deny -> filtered"
++restart = false
++seed = [
++  { kind = "fact", content = "the deploy api key is abc123xyz" },
++]
++query = "deploy key"
++context = { identity_confidence = "high", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "filtered" }
++
++# ---------------------------------------------------------------------------
++# True misses. The runner asserts that the miss log fires with
++# cause="no_match" for these (verified inside the runner via tracing
++# capture, not in the TOML).
++# ---------------------------------------------------------------------------
++
++[[case]]
++id = "miss-empty-database"
++description = "Empty Memory + non-empty query is a no_match miss"
++restart = false
++seed = []
++query = "what did I tell you about pickles"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "miss" }
++
++[[case]]
++id = "miss-unrelated-query"
++description = "Seeded memory, unrelated query is a no_match miss"
++restart = false
++seed = [
++  { kind = "preference", content = "User likes jazz music" },
++]
++query = "submarine maintenance schedule"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "miss" }
++
++# ---------------------------------------------------------------------------
++# Persistence across "stack restart" — drop the Memory handle, reopen the
++# same SQLite file, then query. This is the M1 "next session" semantics.
++# ---------------------------------------------------------------------------
++
++[[case]]
++id = "restart-household-survives"
++description = "Household fact survives drop + reopen of Memory"
++restart = true
++seed = [
++  { kind = "preference", content = "User likes jazz music" },
++]
++query = "music"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "hit", contains = "jazz" }
++
++[[case]]
++id = "restart-identity-survives"
++description = "Identity fact survives drop + reopen of Memory"
++restart = true
++seed = [
++  { kind = "identity", content = "Household member name is Jared" },
++]
++query = "name"
++context = { identity_confidence = "unknown", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "hit", contains = "Jared" }
++
++[[case]]
++id = "restart-policy-survives"
++description = "Inferred policy survives restart: restricted content is still filtered after reopen"
++restart = true
++seed = [
++  { kind = "fact", content = "user's password is swordfish" },
++]
++query = "password"
++context = { identity_confidence = "high", explicit_named_person = false, explicit_private_intent = false, shared_space_voice = true }
++expect = { outcome = "filtered" }
+diff --git a/tests/memory/expected/ledger.json b/tests/memory/expected/ledger.json
+new file mode 100644
+index 0000000..9abb16f
+--- /dev/null
++++ b/tests/memory/expected/ledger.json
+@@ -0,0 +1,218 @@
++{
++  "total": 21,
++  "passed": 21,
++  "pass_rate": 1.0,
++  "floor": 0.95,
++  "entries": [
++    {
++      "id": "household-jazz-basic",
++      "description": "Shared-room preference recalled by topic keyword",
++      "expected_outcome": "hit",
++      "actual_outcome": "hit",
++      "raw_hits": 1,
++      "recalled_hits": 1,
++      "pass": true,
++      "note": "Shared-room preference recalled by topic keyword"
++    },
++    {
++      "id": "household-identity-name",
++      "description": "Household identity recalled from a direct question",
++      "expected_outcome": "hit",
++      "actual_outcome": "hit",
++      "raw_hits": 1,
++      "recalled_hits": 1,
++      "pass": true,
++      "note": "Household identity recalled from a direct question"
++    },
++    {
++      "id": "household-pet-name",
++      "description": "Multi-token recall picks the relevant fact among several",
++      "expected_outcome": "hit",
++      "actual_outcome": "hit",
++      "raw_hits": 1,
++      "recalled_hits": 1,
++      "pass": true,
++      "note": "Multi-token recall picks the relevant fact among several"
++    },
++    {
++      "id": "household-tea-short-query",
++      "description": "Single-token short query still hits via FTS",
++      "expected_outcome": "hit",
++      "actual_outcome": "hit",
++      "raw_hits": 1,
++      "recalled_hits": 1,
++      "pass": true,
++      "note": "Single-token short query still hits via FTS"
++    },
++    {
++      "id": "household-multi-fact-disambiguation",
++      "description": "Recall scores the right fact even when several share a topic",
++      "expected_outcome": "hit",
++      "actual_outcome": "hit",
++      "raw_hits": 1,
++      "recalled_hits": 1,
++      "pass": true,
++      "note": "Recall scores the right fact even when several share a topic"
++    },
++    {
++      "id": "household-cautious-medical-diagnosis",
++      "description": "Medical-diagnosis content is cautious -> confirm -> filtered",
++      "expected_outcome": "filtered",
++      "actual_outcome": "filtered",
++      "raw_hits": 1,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Medical-diagnosis content is cautious -> confirm -> filtered"
++    },
++    {
++      "id": "household-cautious-therapy",
++      "description": "Therapy-session content is cautious -> confirm -> filtered",
++      "expected_outcome": "filtered",
++      "actual_outcome": "filtered",
++      "raw_hits": 1,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Therapy-session content is cautious -> confirm -> filtered"
++    },
++    {
++      "id": "person-shared-room-filtered",
++      "description": "Person memory is dropped in unidentified shared-room voice",
++      "expected_outcome": "filtered",
++      "actual_outcome": "filtered",
++      "raw_hits": 1,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Person memory is dropped in unidentified shared-room voice"
++    },
++    {
++      "id": "person-medium-identity-hits",
++      "description": "Person memory speaks once identity_confidence reaches medium",
++      "expected_outcome": "hit",
++      "actual_outcome": "hit",
++      "raw_hits": 1,
++      "recalled_hits": 1,
++      "pass": true,
++      "note": "Person memory speaks once identity_confidence reaches medium"
++    },
++    {
++      "id": "person-explicit-name-hits",
++      "description": "Explicit naming unlocks person memory even at low identity confidence",
++      "expected_outcome": "hit",
++      "actual_outcome": "hit",
++      "raw_hits": 1,
++      "recalled_hits": 1,
++      "pass": true,
++      "note": "Explicit naming unlocks person memory even at low identity confidence"
++    },
++    {
++      "id": "private-shared-room-denied",
++      "description": "Private content is denied in shared-room voice",
++      "expected_outcome": "filtered",
++      "actual_outcome": "filtered",
++      "raw_hits": 1,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Private content is denied in shared-room voice"
++    },
++    {
++      "id": "private-named-still-denied-in-shared-voice",
++      "description": "Even explicit private intent stays denied while shared_space_voice is true",
++      "expected_outcome": "filtered",
++      "actual_outcome": "filtered",
++      "raw_hits": 1,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Even explicit private intent stays denied while shared_space_voice is true"
++    },
++    {
++      "id": "private-app-only-still-not-spoken",
++      "description": "Private + private intent off-shared-voice resolves to AppOnly, still not in recall context",
++      "expected_outcome": "filtered",
++      "actual_outcome": "filtered",
++      "raw_hits": 1,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Private + private intent off-shared-voice resolves to AppOnly, still not in recall context"
++    },
++    {
++      "id": "restricted-password-deny",
++      "description": "Password content is restricted -> deny -> filtered",
++      "expected_outcome": "filtered",
++      "actual_outcome": "filtered",
++      "raw_hits": 1,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Password content is restricted -> deny -> filtered"
++    },
++    {
++      "id": "restricted-credit-card-deny",
++      "description": "Card number content is restricted -> deny -> filtered",
++      "expected_outcome": "filtered",
++      "actual_outcome": "filtered",
++      "raw_hits": 1,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Card number content is restricted -> deny -> filtered"
++    },
++    {
++      "id": "restricted-api-key-deny",
++      "description": "API key content is restricted -> deny -> filtered",
++      "expected_outcome": "filtered",
++      "actual_outcome": "filtered",
++      "raw_hits": 1,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "API key content is restricted -> deny -> filtered"
++    },
++    {
++      "id": "miss-empty-database",
++      "description": "Empty Memory + non-empty query is a no_match miss",
++      "expected_outcome": "miss",
++      "actual_outcome": "miss",
++      "raw_hits": 0,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Empty Memory + non-empty query is a no_match miss"
++    },
++    {
++      "id": "miss-unrelated-query",
++      "description": "Seeded memory, unrelated query is a no_match miss",
++      "expected_outcome": "miss",
++      "actual_outcome": "miss",
++      "raw_hits": 0,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Seeded memory, unrelated query is a no_match miss"
++    },
++    {
++      "id": "restart-household-survives",
++      "description": "Household fact survives drop + reopen of Memory",
++      "expected_outcome": "hit",
++      "actual_outcome": "hit",
++      "raw_hits": 1,
++      "recalled_hits": 1,
++      "pass": true,
++      "note": "Household fact survives drop + reopen of Memory"
++    },
++    {
++      "id": "restart-identity-survives",
++      "description": "Identity fact survives drop + reopen of Memory",
++      "expected_outcome": "hit",
++      "actual_outcome": "hit",
++      "raw_hits": 1,
++      "recalled_hits": 1,
++      "pass": true,
++      "note": "Identity fact survives drop + reopen of Memory"
++    },
++    {
++      "id": "restart-policy-survives",
++      "description": "Inferred policy survives restart: restricted content is still filtered after reopen",
++      "expected_outcome": "filtered",
++      "actual_outcome": "filtered",
++      "raw_hits": 1,
++      "recalled_hits": 0,
++      "pass": true,
++      "note": "Inferred policy survives restart: restricted content is still filtered after reopen"
++    }
++  ]
++}
+\ No newline at end of file

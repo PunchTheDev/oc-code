@@ -1,0 +1,757 @@
+diff --git a/crates/genie-core/src/lib.rs b/crates/genie-core/src/lib.rs
+index 9fce096..072570e 100644
+--- a/crates/genie-core/src/lib.rs
++++ b/crates/genie-core/src/lib.rs
+@@ -77,6 +77,6 @@ pub use connectivity::{
+ pub use conversation::ConversationStore;
+ pub use ha::{HaClient, HomeAssistantProvider, HomeAutomationProvider};
+ pub use llm::{LlmClient, Message};
+-pub use memory::Memory;
++pub use memory::{Memory, SharedMemory};
+ pub use prompt::PromptBuilder;
+ pub use tools::{ToolCall, ToolDispatcher, ToolResult};
+diff --git a/crates/genie-core/src/main.rs b/crates/genie-core/src/main.rs
+index eca82e1..e518e8f 100644
+--- a/crates/genie-core/src/main.rs
++++ b/crates/genie-core/src/main.rs
+@@ -49,10 +49,12 @@ async fn main() -> Result<()> {
+     let ha = ha::provider_from_config(&config);
+ 
+     let mem_path = config.data_dir.join("memory.db");
+-    let mem = memory::Memory::open(&mem_path)?;
+-    tracing::info!(memories = mem.count()?, "memory loaded");
++    let memory = Arc::new(std::sync::Mutex::new(memory::Memory::open(&mem_path)?));
++    memory::with_shared_memory(&memory, |mem| {
++        tracing::info!(memories = mem.count()?, "memory loaded");
++        Ok::<(), anyhow::Error>(())
++    })?;
+ 
+-    let mem_arc = Arc::new(std::sync::Mutex::new(memory::Memory::open(&mem_path)?));
+     let skill_loader =
+         skills::load_all_with_policy(skills::SkillLoadPolicy::from(&config.core.skill_policy));
+     let connectivity = Arc::new(connectivity::NullConnectivityController::from_config(
+@@ -65,7 +67,7 @@ async fn main() -> Result<()> {
+         .with_actuation_safety_config(config.core.actuation_safety.clone())
+         .with_actuation_audit_path(config.data_dir.join("safety/actuation-audit.jsonl"))
+         .with_tool_audit_path(config.data_dir.join("runtime/tool-audit.jsonl"))
+-        .with_memory(Arc::clone(&mem_arc))
++        .with_memory(Arc::clone(&memory))
+         .with_skill_loader(skill_loader);
+ 
+     let connectivity_health = connectivity.health().await;
+@@ -79,7 +81,9 @@ async fn main() -> Result<()> {
+ 
+     // Load user profile from /opt/geniepod/data/profile/.
+     let profile_dir = config.data_dir.join("profile");
+-    match genie_core::profile::load_profile(&profile_dir, &mem) {
++    match memory::with_shared_memory(&memory, |mem| {
++        genie_core::profile::load_profile(&profile_dir, mem)
++    }) {
+         Ok(report) if report.total() > 0 => {
+             tracing::info!(
+                 toml = report.toml_facts,
+@@ -104,7 +108,9 @@ async fn main() -> Result<()> {
+     let model_name = &config.core.llm_model_name;
+     let model_family = prompt::ModelFamily::from_model_name(model_name);
+     let prompt_builder = prompt::PromptBuilder::from_model_name(model_name);
+-    let system_prompt = prompt_builder.build(&tool_dispatcher.tool_defs(), &mem);
++    let system_prompt = memory::with_shared_memory(&memory, |mem| {
++        prompt_builder.build(&tool_dispatcher.tool_defs(), mem)
++    });
+     // M1 exit (issue #110): fingerprint the fully-assembled system prompt with a
+     // real SHA-256 so silent prompt drift between restarts is observable. The
+     // digest is logged here at boot and surfaced via /api/health and
+@@ -127,15 +133,17 @@ async fn main() -> Result<()> {
+     let conv_list = conversations.list()?;
+     tracing::info!(conversations = conv_list.len(), "conversation store loaded");
+ 
+-    let boot_contract = genie_core::server::build_runtime_contract_snapshot(
+-        &tool_dispatcher,
+-        &mem,
+-        &conversations,
+-        &system_prompt,
+-        config.core.max_history_turns,
+-        model_family,
+-        &connectivity_health,
+-    );
++    let boot_contract = memory::with_shared_memory(&memory, |mem| {
++        genie_core::server::build_runtime_contract_snapshot(
++            &tool_dispatcher,
++            mem,
++            &conversations,
++            &system_prompt,
++            config.core.max_history_turns,
++            model_family,
++            &connectivity_health,
++        )
++    });
+     let contract_hash = boot_contract.contract_hash.clone();
+     let contract_validation = genie_core::runtime_contract::validate_runtime_contract(
+         &contract_hash,
+@@ -248,7 +256,7 @@ async fn main() -> Result<()> {
+                 voice_cfg,
+                 &llm,
+                 &tool_dispatcher,
+-                &mem,
++                &memory,
+                 &conversations,
+                 &system_prompt,
+                 config.core.max_history_turns,
+@@ -266,7 +274,7 @@ async fn main() -> Result<()> {
+         genie_core::repl::run(
+             &llm,
+             &tool_dispatcher,
+-            &mem,
++            &memory,
+             &conversations,
+             &system_prompt,
+             config.core.max_history_turns,
+@@ -279,7 +287,7 @@ async fn main() -> Result<()> {
+             llm,
+             tool_dispatcher,
+             connectivity,
+-            mem,
++            memory,
+             conversations,
+             system_prompt,
+             system_prompt_sha,
+diff --git a/crates/genie-core/src/memory/mod.rs b/crates/genie-core/src/memory/mod.rs
+index 1a7b76c..abf5151 100644
+--- a/crates/genie-core/src/memory/mod.rs
++++ b/crates/genie-core/src/memory/mod.rs
+@@ -9,6 +9,7 @@ use rusqlite::{Connection, OpenFlags, params_from_iter};
+ use serde::Serialize;
+ use std::path::Path;
+ use std::path::PathBuf;
++use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
+ const MAX_QUERY_HASHES: usize = 16;
+@@ -40,6 +41,17 @@ pub struct Memory {
+     migration_degraded: bool,
+ }
+ 
++/// Process-wide handle to the single memory store opened at startup.
++pub type SharedMemory = Arc<Mutex<Memory>>;
++
++/// Run a closure against the shared memory store.
++pub fn with_shared_memory<R>(memory: &SharedMemory, f: impl FnOnce(&Memory) -> R) -> R {
++    let guard = memory
++        .lock()
++        .unwrap_or_else(|poisoned| poisoned.into_inner());
++    f(&guard)
++}
++
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub struct MemoryHealth {
+     pub quick_check_ok: bool,
+diff --git a/crates/genie-core/src/repl.rs b/crates/genie-core/src/repl.rs
+index 81ecb3b..6961e4f 100644
+--- a/crates/genie-core/src/repl.rs
++++ b/crates/genie-core/src/repl.rs
+@@ -3,7 +3,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
+ 
+ use crate::conversation::ConversationStore;
+ use crate::llm::{LlmClient, LlmRequestHints, Message};
+-use crate::memory::{self, Memory};
++use crate::memory::{self, SharedMemory, with_shared_memory};
+ use crate::prompt::ModelFamily;
+ use crate::reasoning::InteractionKind;
+ use crate::tools;
+@@ -15,7 +15,7 @@ use crate::tools;
+ pub async fn run(
+     llm: &LlmClient,
+     tools_dispatch: &tools::ToolDispatcher,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     conversations: &ConversationStore,
+     system_prompt: &str,
+     max_history: usize,
+@@ -100,7 +100,9 @@ pub async fn run(
+             );
+             conversations.append_or_log(&conv_id, "assistant", &response, None);
+ 
+-            let stored = memory::extract::extract_and_store(memory, text);
++            let stored = with_shared_memory(memory, |memory| {
++                memory::extract::extract_and_store(memory, text)
++            });
+             if stored > 0 {
+                 eprintln!(
+                     "(remembered {} fact{})",
+@@ -112,7 +114,9 @@ pub async fn run(
+         }
+ 
+         // Build context with per-query memory injection.
+-        let memory_context = memory::inject::build_memory_context(memory, text);
++        let memory_context = with_shared_memory(memory, |memory| {
++            memory::inject::build_memory_context(memory, text)
++        });
+         let full_prompt = format!(
+             "{}\n\nRelevant household context:\n{}",
+             system_prompt, memory_context
+@@ -228,7 +232,9 @@ pub async fn run(
+         }
+ 
+         // Auto-capture facts.
+-        let stored = memory::extract::extract_and_store(memory, text);
++        let stored = with_shared_memory(memory, |memory| {
++            memory::extract::extract_and_store(memory, text)
++        });
+         if stored > 0 {
+             eprintln!(
+                 "(remembered {} fact{})",
+diff --git a/crates/genie-core/src/server.rs b/crates/genie-core/src/server.rs
+index 325d2ee..e2dd391 100644
+--- a/crates/genie-core/src/server.rs
++++ b/crates/genie-core/src/server.rs
+@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, Semaphore};
+ use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
+ use crate::conversation::ConversationStore;
+ use crate::llm::{LlmClient, LlmRequestHints, Message};
+-use crate::memory::Memory;
++use crate::memory::{Memory, SharedMemory, with_shared_memory};
+ use crate::prompt::ModelFamily;
+ use crate::reasoning::InteractionKind;
+ use crate::tools::ToolDispatcher;
+@@ -69,7 +69,7 @@ pub struct ChatServer {
+     llm: LlmClient,
+     tools: ToolDispatcher,
+     connectivity: std::sync::Arc<dyn ConnectivityController>,
+-    memory: Memory,
++    memory: SharedMemory,
+     conversations: ConversationStore,
+     current_conv_id: Mutex<String>,
+     chat_turn_lock: Mutex<()>,
+@@ -95,7 +95,7 @@ impl ChatServer {
+         llm: LlmClient,
+         tools: ToolDispatcher,
+         connectivity: std::sync::Arc<dyn ConnectivityController>,
+-        memory: Memory,
++        memory: SharedMemory,
+         conversations: ConversationStore,
+         system_prompt: String,
+         system_prompt_sha: String,
+@@ -488,7 +488,7 @@ async fn handle_chat_stream(
+     body: Option<&str>,
+     llm: &LlmClient,
+     tools: &ToolDispatcher,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     conversations: &ConversationStore,
+     current_conv_id: &Mutex<String>,
+     system_prompt: &str,
+@@ -579,7 +579,9 @@ async fn handle_chat_stream(
+             &serde_json::json!({"type":"replace","content": final_response.clone(), "tool": tool_result.tool.clone()}),
+         )
+         .await?;
+-        crate::memory::extract::extract_and_store(memory, user_text);
++        with_shared_memory(memory, |memory| {
++            crate::memory::extract::extract_and_store(memory, user_text);
++        });
+         write_stream_event(
+             writer,
+             &serde_json::json!({
+@@ -593,7 +595,9 @@ async fn handle_chat_stream(
+         return Ok(());
+     }
+ 
+-    let memory_context = crate::memory::inject::build_memory_context(memory, user_text);
++    let memory_context = with_shared_memory(memory, |memory| {
++        crate::memory::inject::build_memory_context(memory, user_text)
++    });
+     let full_prompt = format!(
+         "{}\n\nRelevant household context:\n{}",
+         system_prompt, memory_context
+@@ -743,7 +747,9 @@ async fn handle_chat_stream(
+         sanitized
+     };
+ 
+-    crate::memory::extract::extract_and_store(memory, user_text);
++    with_shared_memory(memory, |memory| {
++        crate::memory::extract::extract_and_store(memory, user_text);
++    });
+ 
+     write_stream_event(
+         writer,
+@@ -763,7 +769,7 @@ async fn handle_chat_stream(
+ pub async fn process_chat_turn(
+     llm: &LlmClient,
+     tools: &ToolDispatcher,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     conversations: &ConversationStore,
+     conv_id: &str,
+     user_text: &str,
+@@ -790,7 +796,9 @@ pub async fn process_chat_turn(
+             )
+             .await;
+         let final_response = finalize_direct_tool_turn(conversations, conv_id, &call, &tool_result);
+-        crate::memory::extract::extract_and_store(memory, user_text);
++        with_shared_memory(memory, |memory| {
++            crate::memory::extract::extract_and_store(memory, user_text);
++        });
+         return Ok(ChatTurnResult {
+             response: final_response,
+             tool: Some(tool_result.tool),
+@@ -798,7 +806,9 @@ pub async fn process_chat_turn(
+         });
+     }
+ 
+-    let memory_context = crate::memory::inject::build_memory_context(memory, user_text);
++    let memory_context = with_shared_memory(memory, |memory| {
++        crate::memory::inject::build_memory_context(memory, user_text)
++    });
+     let full_prompt = format!(
+         "{}\n\nRelevant household context:\n{}",
+         system_prompt, memory_context
+@@ -854,7 +864,9 @@ pub async fn process_chat_turn(
+         sanitized
+     };
+ 
+-    crate::memory::extract::extract_and_store(memory, user_text);
++    with_shared_memory(memory, |memory| {
++        crate::memory::extract::extract_and_store(memory, user_text);
++    });
+ 
+     Ok(ChatTurnResult {
+         response: final_response,
+@@ -1030,7 +1042,7 @@ async fn handle_chat(
+     body: Option<&str>,
+     llm: &LlmClient,
+     tools: &ToolDispatcher,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     conversations: &ConversationStore,
+     current_conv_id: &Mutex<String>,
+     system_prompt: &str,
+@@ -1142,7 +1154,7 @@ async fn handle_health(
+     llm: &LlmClient,
+     tools: &ToolDispatcher,
+     connectivity: &dyn ConnectivityController,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     conversations: &ConversationStore,
+     system_prompt: &str,
+     system_prompt_sha: &str,
+@@ -1152,19 +1164,22 @@ async fn handle_health(
+ ) -> (u16, &'static str, String) {
+     let llm_ok = llm.health().await;
+     let connectivity_health = connectivity.health().await;
+-    let mem_count = memory.count().unwrap_or(0);
+-    let memory_health = memory.health().ok();
++    let (mem_count, memory_health) = with_shared_memory(memory, |memory| {
++        (memory.count().unwrap_or(0), memory.health().ok())
++    });
+     let conv_count = conversations.list().map(|l| l.len()).unwrap_or(0);
+     let mem_avail = genie_common::tegrastats::mem_available_mb().unwrap_or(0);
+-    let runtime_contract = build_runtime_contract_snapshot(
+-        tools,
+-        memory,
+-        conversations,
+-        system_prompt,
+-        max_history,
+-        model_family,
+-        &connectivity_health,
+-    );
++    let runtime_contract = with_shared_memory(memory, |memory| {
++        build_runtime_contract_snapshot(
++            tools,
++            memory,
++            conversations,
++            system_prompt,
++            max_history,
++            model_family,
++            &connectivity_health,
++        )
++    });
+     let runtime_contract =
+         runtime_contract_summary_json(&runtime_contract, expected_runtime_contract_hash);
+ 
+@@ -1251,7 +1266,7 @@ fn handle_list_tools(tools: &ToolDispatcher) -> (u16, &'static str, String) {
+ async fn handle_runtime_contract(
+     tools: &ToolDispatcher,
+     connectivity: &dyn ConnectivityController,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     conversations: &ConversationStore,
+     system_prompt: &str,
+     max_history: usize,
+@@ -1259,15 +1274,17 @@ async fn handle_runtime_contract(
+     expected_runtime_contract_hash: &str,
+ ) -> (u16, &'static str, String) {
+     let connectivity_health = connectivity.health().await;
+-    let contract = build_runtime_contract_snapshot(
+-        tools,
+-        memory,
+-        conversations,
+-        system_prompt,
+-        max_history,
+-        model_family,
+-        &connectivity_health,
+-    );
++    let contract = with_shared_memory(memory, |memory| {
++        build_runtime_contract_snapshot(
++            tools,
++            memory,
++            conversations,
++            system_prompt,
++            max_history,
++            model_family,
++            &connectivity_health,
++        )
++    });
+     let body = runtime_contract_json(&contract, expected_runtime_contract_hash);
+     let body = serde_json::to_string(&body).unwrap_or_else(|e| {
+         serde_json::json!({ "error": format!("runtime contract serialization failed: {e}") })
+@@ -1376,8 +1393,8 @@ fn handle_actuation_actions(tools: &ToolDispatcher) -> (u16, &'static str, Strin
+     (200, "application/json", body.to_string())
+ }
+ 
+-fn handle_memories_list(memory: &Memory) -> (u16, &'static str, String) {
+-    match memory.list_managed(500) {
++fn handle_memories_list(memory: &SharedMemory) -> (u16, &'static str, String) {
++    match with_shared_memory(memory, |memory| memory.list_managed(500)) {
+         Ok(entries) => (
+             200,
+             "application/json",
+@@ -1391,7 +1408,10 @@ fn handle_memories_list(memory: &Memory) -> (u16, &'static str, String) {
+     }
+ }
+ 
+-fn handle_memories_update(body: Option<&str>, memory: &Memory) -> (u16, &'static str, String) {
++fn handle_memories_update(
++    body: Option<&str>,
++    memory: &SharedMemory,
++) -> (u16, &'static str, String) {
+     let Some(body) = body else {
+         return (
+             400,
+@@ -1411,7 +1431,9 @@ fn handle_memories_update(body: Option<&str>, memory: &Memory) -> (u16, &'static
+         }
+     };
+ 
+-    match memory.update_managed(req.id, &req.content, req.kind.as_deref()) {
++    match with_shared_memory(memory, |memory| {
++        memory.update_managed(req.id, &req.content, req.kind.as_deref())
++    }) {
+         Ok(true) => (
+             200,
+             "application/json",
+@@ -1430,7 +1452,10 @@ fn handle_memories_update(body: Option<&str>, memory: &Memory) -> (u16, &'static
+     }
+ }
+ 
+-fn handle_memories_delete(body: Option<&str>, memory: &Memory) -> (u16, &'static str, String) {
++fn handle_memories_delete(
++    body: Option<&str>,
++    memory: &SharedMemory,
++) -> (u16, &'static str, String) {
+     let Some(body) = body else {
+         return (
+             400,
+@@ -1450,7 +1475,7 @@ fn handle_memories_delete(body: Option<&str>, memory: &Memory) -> (u16, &'static
+         }
+     };
+ 
+-    match memory.delete_by_id(req.id) {
++    match with_shared_memory(memory, |memory| memory.delete_by_id(req.id)) {
+         Ok(true) => (
+             200,
+             "application/json",
+@@ -1469,7 +1494,10 @@ fn handle_memories_delete(body: Option<&str>, memory: &Memory) -> (u16, &'static
+     }
+ }
+ 
+-fn handle_memories_reorder(body: Option<&str>, memory: &Memory) -> (u16, &'static str, String) {
++fn handle_memories_reorder(
++    body: Option<&str>,
++    memory: &SharedMemory,
++) -> (u16, &'static str, String) {
+     let Some(body) = body else {
+         return (
+             400,
+@@ -1489,7 +1517,7 @@ fn handle_memories_reorder(body: Option<&str>, memory: &Memory) -> (u16, &'stati
+         }
+     };
+ 
+-    match memory.reorder_managed(&req.ids) {
++    match with_shared_memory(memory, |memory| memory.reorder_managed(&req.ids)) {
+         Ok(()) => (
+             200,
+             "application/json",
+@@ -1662,7 +1690,7 @@ async fn handle_openai_chat(
+     body: Option<&str>,
+     llm: &LlmClient,
+     tools: &ToolDispatcher,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     system_prompt: &str,
+     max_history: usize,
+     model_family: ModelFamily,
+@@ -1742,12 +1770,16 @@ async fn handle_openai_chat(
+             format!("{} failed: {}", tool_result.tool, tool_result.output)
+         };
+         let sanitized = crate::security::sandbox::sanitize_output(&response);
+-        crate::memory::extract::extract_and_store(memory, &user_text);
++        with_shared_memory(memory, |memory| {
++            crate::memory::extract::extract_and_store(memory, &user_text);
++        });
+         return openai_chat_response(model, &sanitized);
+     }
+ 
+     // Build context with per-query memory injection.
+-    let memory_context = crate::memory::inject::build_memory_context(memory, &user_text);
++    let memory_context = with_shared_memory(memory, |memory| {
++        crate::memory::inject::build_memory_context(memory, &user_text)
++    });
+     let full_prompt = format!(
+         "{}\n\nRelevant household context:\n{}",
+         system_prompt, memory_context
+@@ -1857,7 +1889,9 @@ async fn handle_openai_chat(
+     let sanitized = crate::security::sandbox::sanitize_output(&final_response);
+ 
+     // Auto-capture facts from user message.
+-    crate::memory::extract::extract_and_store(memory, &user_text);
++    with_shared_memory(memory, |memory| {
++        crate::memory::extract::extract_and_store(memory, &user_text);
++    });
+ 
+     openai_chat_response(model, &sanitized)
+ }
+@@ -2055,12 +2089,17 @@ mod tests {
+     };
+     use crate::connectivity::NullConnectivityController;
+     use crate::conversation::ConversationStore;
+-    use crate::memory::Memory;
++    use crate::memory::{Memory, SharedMemory};
+     use crate::prompt::ModelFamily;
+     use crate::tools::{RequestOrigin, ToolDispatcher};
+     use genie_common::config::ConnectivityConfig;
+     use genie_common::config::WebSearchConfig;
+     use std::sync::{Arc, Mutex as StdMutex};
++
++    fn shared_memory(path: &std::path::Path) -> SharedMemory {
++        Arc::new(StdMutex::new(Memory::open(path).unwrap()))
++    }
++
+     use tokio::sync::Mutex;
+     use tracing::subscriber::with_default;
+     use tracing::{Event, Subscriber};
+@@ -2151,7 +2190,7 @@ mod tests {
+             rt.block_on(async {
+                 let llm = crate::llm::LlmClient::mock(["ok".to_string()]);
+                 let tools = ToolDispatcher::new(None);
+-                let memory = Memory::open(&memory_path).unwrap();
++                let memory = shared_memory(&memory_path);
+                 let conversations = ConversationStore::open(&conversations_path).unwrap();
+                 let conv_id = conversations.create().unwrap();
+                 let current_conv_id = Mutex::new(conv_id);
+@@ -2275,7 +2314,7 @@ mod tests {
+         let llm = crate::llm::LlmClient::from_genie_ai_runtime_url("http://127.0.0.1:1/health");
+         let tools = ToolDispatcher::new(None);
+         let connectivity = NullConnectivityController::from_config(&ConnectivityConfig::default());
+-        let memory = Memory::open(&memory_path).unwrap();
++        let memory = shared_memory(&memory_path);
+         let conversations = ConversationStore::open(&conversations_path).unwrap();
+ 
+         let prompt_sha = crate::prompt_sha::sha256_hex("system prompt");
+@@ -2357,7 +2396,7 @@ mod tests {
+ 
+         let tools = ToolDispatcher::new(None);
+         let connectivity = NullConnectivityController::from_config(&ConnectivityConfig::default());
+-        let memory = Memory::open(&memory_path).unwrap();
++        let memory = shared_memory(&memory_path);
+         let conversations = ConversationStore::open(&conversations_path).unwrap();
+         conversations.create().unwrap();
+ 
+@@ -2487,7 +2526,6 @@ mod tests {
+         use crate::connectivity::NullConnectivityController;
+         use crate::conversation::ConversationStore;
+         use crate::llm::{LlmClient, MockLlmBackend};
+-        use crate::memory::Memory;
+         use crate::prompt::ModelFamily;
+         use crate::tools::ToolDispatcher;
+         use genie_common::config::ConnectivityConfig;
+@@ -2525,7 +2563,7 @@ mod tests {
+             std::sync::Arc::new(NullConnectivityController::from_config(
+                 &ConnectivityConfig::default(),
+             )),
+-            Memory::open(&memory_path).unwrap(),
++            shared_memory(&memory_path),
+             ConversationStore::open(&conv_path).unwrap(),
+             system_prompt.into(),
+             crate::prompt_sha::sha256_hex(system_prompt),
+@@ -2627,7 +2665,6 @@ mod tests {
+         use crate::connectivity::NullConnectivityController;
+         use crate::conversation::ConversationStore;
+         use crate::llm::LlmClient;
+-        use crate::memory::Memory;
+         use crate::tools::ToolDispatcher;
+ 
+         let system_prompt = "You are a helpful assistant.";
+@@ -2637,7 +2674,7 @@ mod tests {
+             std::sync::Arc::new(NullConnectivityController::from_config(
+                 &ConnectivityConfig::default(),
+             )),
+-            Memory::open(memory_path).unwrap(),
++            shared_memory(memory_path),
+             ConversationStore::open(conv_path).unwrap(),
+             system_prompt.into(),
+             crate::prompt_sha::sha256_hex(system_prompt),
+diff --git a/crates/genie-core/src/voice_loop.rs b/crates/genie-core/src/voice_loop.rs
+index 7979569..bfe3270 100644
+--- a/crates/genie-core/src/voice_loop.rs
++++ b/crates/genie-core/src/voice_loop.rs
+@@ -20,7 +20,7 @@ static FIRST_REPLY_BANNER_PRINTED: AtomicBool = AtomicBool::new(false);
+ 
+ use crate::conversation::ConversationStore;
+ use crate::llm::{LlmClient, LlmRequestHints};
+-use crate::memory::Memory;
++use crate::memory::{SharedMemory, with_shared_memory};
+ use crate::memory::{extract, inject};
+ use crate::prompt::ModelFamily;
+ use crate::reasoning::InteractionKind;
+@@ -74,7 +74,7 @@ pub async fn run(
+     voice_cfg: VoiceConfig,
+     llm: &LlmClient,
+     tools: &ToolDispatcher,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     conversations: &ConversationStore,
+     system_prompt: &str,
+     max_history: usize,
+@@ -208,7 +208,7 @@ async fn run_with_wakeword(
+     stt_engine: &stt::SttEngine,
+     llm: &LlmClient,
+     tools: &ToolDispatcher,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     conversations: &ConversationStore,
+     system_prompt: &str,
+     max_history: usize,
+@@ -401,11 +401,13 @@ async fn run_with_wakeword(
+                                 continue;
+                             }
+ 
+-                            let memory_context = inject::build_memory_context_with_read_context(
+-                                memory,
+-                                &text,
+-                                read_context,
+-                            );
++                            let memory_context = with_shared_memory(memory, |memory| {
++                                inject::build_memory_context_with_read_context(
++                                    memory,
++                                    &text,
++                                    read_context,
++                                )
++                            });
+                             let full_prompt = format!(
+                                 "{}\n\nRelevant household context:\n{}",
+                                 system_prompt, memory_context
+@@ -454,7 +456,9 @@ async fn run_with_wakeword(
+                             }
+ 
+                             // Auto-capture from follow-up.
+-                            extract::extract_and_store(memory, &text);
++                            with_shared_memory(memory, |memory| {
++                                extract::extract_and_store(memory, &text);
++                            });
+                         } else {
+                             let _ = tokio::fs::remove_file(&followup_path).await;
+                             eprintln!("[voice] No follow-up speech — returning to wake word.");
+@@ -500,7 +504,7 @@ async fn run_push_to_talk(
+     stt_engine: &stt::SttEngine,
+     llm: &LlmClient,
+     tools: &ToolDispatcher,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     conversations: &ConversationStore,
+     system_prompt: &str,
+     max_history: usize,
+@@ -846,7 +850,7 @@ async fn voice_cycle(
+     stt_engine: &stt::SttEngine,
+     llm: &LlmClient,
+     tools: &ToolDispatcher,
+-    memory: &Memory,
++    memory: &SharedMemory,
+     conversations: &ConversationStore,
+     system_prompt: &str,
+     max_history: usize,
+@@ -945,7 +949,7 @@ pub struct ProcessTranscriptInputs<'a> {
+     pub audio_device: &'a str,
+     pub llm: &'a LlmClient,
+     pub tools: &'a ToolDispatcher,
+-    pub memory: &'a Memory,
++    pub memory: &'a SharedMemory,
+     pub conversations: &'a ConversationStore,
+     pub system_prompt: &'a str,
+     pub max_history: usize,
+@@ -1058,7 +1062,7 @@ pub async fn process_transcript(
+             "[voice] GeniePod: {} (quick tool)",
+             format::for_voice(&final_response)
+         );
+-        let stored = extract::extract_and_store(memory, &text);
++        let stored = with_shared_memory(memory, |memory| extract::extract_and_store(memory, &text));
+         if stored > 0 {
+             eprintln!(
+                 "[voice] (remembered {} fact{})",
+@@ -1070,8 +1074,9 @@ pub async fn process_transcript(
+     }
+ 
+     // Step 3: Build LLM context with per-query memory injection.
+-    let memory_context =
+-        inject::build_memory_context_with_read_context(memory, &text, read_context);
++    let memory_context = with_shared_memory(memory, |memory| {
++        inject::build_memory_context_with_read_context(memory, &text, read_context)
++    });
+     let full_prompt = format!(
+         "{}\n\nRelevant household context:\n{}",
+         system_prompt, memory_context
+@@ -1276,7 +1281,7 @@ pub async fn process_transcript(
+     }
+ 
+     // Auto-capture facts from user's speech (runs after TTS, non-blocking).
+-    let stored = extract::extract_and_store(memory, &text);
++    let stored = with_shared_memory(memory, |memory| extract::extract_and_store(memory, &text));
+     if stored > 0 {
+         eprintln!(
+             "[voice] (remembered {} fact{})",
+diff --git a/crates/genie-core/tests/voice_loop_integration.rs b/crates/genie-core/tests/voice_loop_integration.rs
+index 5da010d..f060652 100644
+--- a/crates/genie-core/tests/voice_loop_integration.rs
++++ b/crates/genie-core/tests/voice_loop_integration.rs
+@@ -45,7 +45,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
+ 
+ use genie_core::conversation::ConversationStore;
+ use genie_core::llm::{LlmClient, Message};
+-use genie_core::memory::Memory;
++use genie_core::memory::{Memory, SharedMemory};
+ use genie_core::prompt::ModelFamily;
+ use genie_core::tools::{ToolDispatcher, ToolExecutionContext, try_tool_call_with_context};
+ use genie_core::voice::identity::SpeakerIdentityProvider;
+@@ -53,6 +53,7 @@ use genie_core::voice::streaming::stream_and_speak;
+ use genie_core::voice::stt::{MockTranscript, SttEngine, Transcript};
+ use genie_core::voice::tts::TtsEngine;
+ use genie_core::voice_loop::{ProcessTranscriptInputs, VoiceConfig, process_transcript};
++use std::sync::{Arc, Mutex};
+ 
+ /// Each test gets its own parent dir so SQLite WAL/SHM sidecars and
+ /// audit-log JSONLs cannot collide and ConversationStore::open's
+@@ -375,7 +376,7 @@ async fn process_transcript_drives_full_voice_cycle_with_mocks() {
+     // store, AND audit logs — the three observables #21 AC-B lists.
+ 
+     let dir = unique_dir("process-transcript");
+-    let memory = Memory::open(&dir.join("memory.db")).unwrap();
++    let memory: SharedMemory = Arc::new(Mutex::new(Memory::open(&dir.join("memory.db")).unwrap()));
+     let conversations = ConversationStore::open(&dir.join("conversations.db")).unwrap();
+     let conv_id = "voice-it-process";
+     conversations
+@@ -468,7 +469,7 @@ async fn process_transcript_ignores_empty_transcript() {
+     // Empty / whitespace transcripts must short-circuit cleanly without
+     // touching the LLM, the conversation store, or the audit log.
+     let dir = unique_dir("process-empty");
+-    let memory = Memory::open(&dir.join("memory.db")).unwrap();
++    let memory: SharedMemory = Arc::new(Mutex::new(Memory::open(&dir.join("memory.db")).unwrap()));
+     let conversations = ConversationStore::open(&dir.join("conversations.db")).unwrap();
+     let conv_id = "voice-it-empty";
+     conversations.ensure(conv_id, "empty transcript").unwrap();
