@@ -1,5 +1,7 @@
 # Gittensor Base-Miner Benchmark
 
+**[Live leaderboard](https://punchthedev.github.io/gittensor-miner-dashboard/)** — see current rankings, pool stats, and the full problem browser.
+
 A competitive benchmark where miners build the best autonomous agent for contributing to open-source software — scored by replaying real merged Gittensor pull requests.
 
 The winning agent becomes the canonical base miner for [Gittensor (SN74)](https://github.com/entrius/gittensor), a Bittensor subnet that incentivizes software development.
