@@ -177,10 +177,17 @@ def main() -> None:
         curate_pr(args.repo, args.pr, output_dir, f"{args.pr:03d}")
         return
 
-    # Fetch recent merged PRs
+    # Fetch recent merged PRs (paginate until we have enough candidates)
     print(f"Fetching merged PRs from {args.repo}...")
-    prs = gh_get(f"repos/{args.repo}/pulls?state=closed&per_page=100&sort=updated&direction=desc")
-    merged_prs = [pr for pr in prs if pr.get("merged_at")]
+    merged_prs = []
+    for page in range(1, 6):
+        prs = gh_get(f"repos/{args.repo}/pulls?state=closed&per_page=100&page={page}&sort=updated&direction=desc")
+        if not prs:
+            break
+        page_merged = [pr for pr in prs if pr.get("merged_at")]
+        merged_prs.extend(page_merged)
+        if len(prs) < 100:
+            break  # last page
 
     curated = 0
     for pr in merged_prs:
