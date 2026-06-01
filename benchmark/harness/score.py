@@ -20,7 +20,7 @@ on the unified diff. The approximation is accurate enough for development
 iteration; the authoritative score comes from CI.
 
 Usage:
-    python benchmark/harness/score.py --problem benchmark/problems/001/ --patch my.diff
+    python benchmark/harness/score.py --problem benchmark/problems/930/ --patch my.diff
 """
 
 from __future__ import annotations

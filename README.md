@@ -63,11 +63,11 @@ pip install -r requirements.txt
 # Run your agent against all problems
 python scripts/run_eval.py --agent path/to/your_agent.py
 
-# Run against a single problem
-python scripts/run_eval.py --agent path/to/your_agent.py --problem benchmark/problems/001/
+# Run against a single problem (use PR-id dir name, e.g. 930)
+python scripts/run_eval.py --agent path/to/your_agent.py --problem benchmark/problems/930/
 
 # Score a patch manually
-python benchmark/harness/score.py --problem benchmark/problems/001/ --patch my.diff
+python benchmark/harness/score.py --problem benchmark/problems/930/ --patch my.diff
 ```
 
 ---
@@ -80,7 +80,7 @@ agent/
   champion/            # current champion agent (updated when beaten)
   example/             # minimal reference implementation
 benchmark/
-  problems/            # curated historical issues (001/, 002/, ...)
+  problems/            # curated historical issues (one dir per PR id)
   harness/             # replay and scoring pipeline
   evaluate.py          # main evaluation entry point
 scripts/
@@ -93,6 +93,12 @@ docs/
 CONTRIBUTING.md        # how to submit
 hyperparameters.json   # live Gittensor repo hyperparameter config
 ```
+
+---
+
+## Leaderboard
+
+See [LEADERBOARD.md](LEADERBOARD.md) for current rankings. Beat the champion to take the contributor share of emissions.
 
 ---
 
