@@ -5,25 +5,18 @@ import pathlib
 import sys
 from datetime import date
 
-PROBLEMS_DIR = pathlib.Path(__file__).parent.parent / "benchmark" / "problems"
-LEADERBOARD_DATA = [
-    {
-        "rank": None,
-        "agent": "Oracle (accepted solution)",
-        "score": 21.60,
-        "model": "—",
-        "date": "—",
-        "note": "Upper bound",
-    },
-    {
-        "rank": 1,
-        "agent": "ExampleAgent",
-        "score": None,
-        "model": "claude-3-5-haiku",
-        "date": "—",
-        "note": "Reference observe→plan→act→verify loop",
-    },
-]
+REPO_ROOT = pathlib.Path(__file__).parent.parent
+PROBLEMS_DIR = REPO_ROOT / "benchmark" / "problems"
+RESULTS_DIR = REPO_ROOT / "results"
+
+ORACLE_ROW = {
+    "rank": None,
+    "agent": "Oracle (accepted solution)",
+    "score": 21.60,
+    "model": "—",
+    "date": "—",
+    "note": "Upper bound",
+}
 
 
 def load_problems():
@@ -59,21 +52,40 @@ def load_problems():
     return problems
 
 
+def load_leaderboard():
+    """Load leaderboard from results/leaderboard.json, fall back to oracle-only."""
+    lb_file = RESULTS_DIR / "leaderboard.json"
+    if lb_file.exists():
+        try:
+            rows = json.loads(lb_file.read_text())
+            # Ensure oracle row is always present at top
+            if not any(r.get("agent") == "Oracle (accepted solution)" for r in rows):
+                rows.insert(0, ORACLE_ROW)
+            return rows
+        except Exception:
+            pass
+    return [ORACLE_ROW]
+
+
+def load_history():
+    """Load SOTA score history for chart: list of {date, score, agent} records."""
+    history_file = RESULTS_DIR / "history.json"
+    if history_file.exists():
+        try:
+            return json.loads(history_file.read_text())
+        except Exception:
+            pass
+    return []
+
+
 def main(out_path: str | None = None):
     problems = load_problems()
+    leaderboard = load_leaderboard()
+    history = load_history()
 
     by_repo: dict[str, int] = {}
     for p in problems:
         by_repo[p["repo"]] = by_repo.get(p["repo"], 0) + 1
-
-    # Try to load real leaderboard results if they exist
-    results_file = pathlib.Path(__file__).parent.parent / "results" / "leaderboard.json"
-    leaderboard = LEADERBOARD_DATA
-    if results_file.exists():
-        try:
-            leaderboard = json.loads(results_file.read_text())
-        except Exception:
-            pass
 
     data = {
         "generated_at": date.today().isoformat(),
@@ -82,12 +94,14 @@ def main(out_path: str | None = None):
         "oracle_score": 21.60,
         "repos": by_repo,
         "leaderboard": leaderboard,
+        "history": history,
         "problems": problems,
     }
 
     dest = pathlib.Path(out_path) if out_path else pathlib.Path("dashboard_data.json")
     dest.write_text(json.dumps(data, indent=2))
-    print(f"Wrote {len(problems)} problems to {dest}")
+    print(f"Wrote {len(problems)} problems, {len(leaderboard)} leaderboard rows, "
+          f"{len(history)} history entries to {dest}")
 
 
 if __name__ == "__main__":
