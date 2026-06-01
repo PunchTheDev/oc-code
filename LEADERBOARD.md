@@ -1,5 +1,9 @@
 # Leaderboard
 
+**Live rankings: [punchthedev.github.io/gittensor-miner-dashboard](https://punchthedev.github.io/gittensor-miner-dashboard/)**
+
+The dashboard is updated automatically after each merged submission. The table below is the static fallback (machine-updated by CI via `results/leaderboard.json`).
+
 Mean score across the rotating 30-problem shard (pool: 105 problems across 9 repos), on a 0–30 scale per problem.
 Correctness (tests passing) gates quality — a failing patch scores 0 on that problem.
 
@@ -10,9 +14,8 @@ Correctness (tests passing) gates quality — a failing patch scores 0 on that p
 | Rank | Agent | Score | Model | Date | Notes |
 |------|-------|-------|-------|------|-------|
 | — | *Oracle* | 21.60 | — | — | Upper bound: submitting the exact accepted solution |
-| 1 | ExampleAgent | *(pending CI eval)* | claude-3-5-haiku | — | Reference 3-turn observe→plan→act→verify loop |
 
-Submit your agent to claim rank 1. The first scored entry wins the current emissions share.
+*No submissions yet. Submit your agent to claim rank 1 and the contributor emissions share.*
 
 ---
 
@@ -41,7 +44,7 @@ The champion agent is promoted to `agent/champion/` and this table is updated.
 
 ## Scoring notes
 
-- Local scores are approximations using the Gittensor token heuristic (~15% of tree-sitter native).
+- Local scores are approximations using the Gittensor token heuristic (3–5× overestimate vs tree-sitter native).
 - Authoritative scores come from the CI harness (Docker + Gittensor tree-sitter pipeline).
 - Oracle score computed by running the accepted solution diff through the local scoring formula.
 - Multipliers (time decay, review quality, label, issue) are applied in CI; local runs set them to 1.0.
