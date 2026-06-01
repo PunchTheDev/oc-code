@@ -1,0 +1,195 @@
+name: Evaluate Agent Submission
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  detect:
+    name: Detect agent submission
+    runs-on: ubuntu-latest
+    outputs:
+      agent_path: ${{ steps.find.outputs.agent_path }}
+      handle: ${{ steps.find.outputs.handle }}
+      is_agent_pr: ${{ steps.find.outputs.is_agent_pr }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find changed agent file
+        id: find
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" -- 'agent/submissions/*/agent.py')
+          if [ -z "$CHANGED" ]; then
+            echo "is_agent_pr=false" >> "$GITHUB_OUTPUT"
+            echo "No agent/submissions/*/agent.py changes found — skipping eval."
+            exit 0
+          fi
+          # Take the first changed agent (one submission per PR)
+          AGENT_PATH=$(echo "$CHANGED" | head -1)
+          HANDLE=$(echo "$AGENT_PATH" | cut -d/ -f3)
+          echo "is_agent_pr=true" >> "$GITHUB_OUTPUT"
+          echo "agent_path=$AGENT_PATH" >> "$GITHUB_OUTPUT"
+          echo "handle=$HANDLE" >> "$GITHUB_OUTPUT"
+          echo "Found agent: $AGENT_PATH (handle: $HANDLE)"
+
+  evaluate:
+    name: Score ${{ needs.detect.outputs.handle }}
+    needs: detect
+    if: needs.detect.outputs.is_agent_pr == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run evaluation (sandboxed)
+        id: eval
+        env:
+          OPENROUTER_KEY: ${{ secrets.OPENROUTER_KEY }}
+        run: |
+          python scripts/run_eval.py \
+            --agent "${{ needs.detect.outputs.agent_path }}" \
+            --output results.json
+        timeout-minutes: 60
+        continue-on-error: true
+
+      - name: Parse results
+        id: parse
+        if: always()
+        run: |
+          python - <<'PYEOF'
+          import json, os, sys
+          from pathlib import Path
+
+          results_path = Path("results.json")
+          if not results_path.exists():
+              summary = "Evaluation failed — results.json not produced."
+              mean = "N/A"
+              table = ""
+          else:
+              data = json.loads(results_path.read_text())
+              mean = data.get("mean_score", 0)
+              problems = data.get("problems", [])
+
+              rows = []
+              for p in problems:
+                  pid = p.get("problem_id", "?")
+                  score = p.get("final_score", 0)
+                  passed = "✓" if p.get("tests_passed") else "✗"
+                  err = p.get("error", "")
+                  note = f"`{err[:60]}`" if err else ""
+                  rows.append(f"| {pid} | {passed} | {score:.2f} | {note} |")
+
+              table = "\n".join(rows)
+              summary = f"**Mean score: {mean:.4f} / 1.0** across {len(problems)} problems"
+
+          env_file = os.environ.get("GITHUB_ENV", "/dev/null")
+          with open(env_file, "a") as f:
+              f.write(f"EVAL_SUMMARY={summary}\n")
+              f.write(f"EVAL_MEAN={mean}\n")
+
+          output_file = os.environ.get("GITHUB_OUTPUT", "/dev/null")
+          with open(output_file, "a") as f:
+              # Write table as multiline
+              f.write("table<<ENDTABLE\n")
+              f.write(table + "\n")
+              f.write("ENDTABLE\n")
+              f.write(f"mean={mean}\n")
+              f.write(f"summary={summary}\n")
+          PYEOF
+
+      - name: Post score comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const handle = '${{ needs.detect.outputs.handle }}';
+            const agentPath = '${{ needs.detect.outputs.agent_path }}';
+
+            let resultsJson = null;
+            try {
+              resultsJson = JSON.parse(fs.readFileSync('results.json', 'utf8'));
+            } catch (e) {}
+
+            let body;
+            if (!resultsJson) {
+              body = `## Benchmark Evaluation — ${handle}\n\n` +
+                `**Status:** Evaluation failed to produce results.\n\n` +
+                `Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`;
+            } else {
+              const mean = resultsJson.mean_score ?? 0;
+              const problems = resultsJson.problems ?? [];
+              const passed = problems.filter(p => p.tests_passed).length;
+
+              const rows = problems.map(p => {
+                const pid = p.problem_id ?? '?';
+                const score = (p.final_score ?? 0).toFixed(2);
+                const ok = p.tests_passed ? '✓' : '✗';
+                const err = p.error ? `\`${p.error.slice(0, 60)}\`` : '';
+                return `| ${pid} | ${ok} | ${score} | ${err} |`;
+              }).join('\n');
+
+              body = `## Benchmark Evaluation — ${handle}\n\n` +
+                `**Mean score: ${mean.toFixed(4)} / 1.0** &nbsp;|&nbsp; ` +
+                `**${passed}/${problems.length} problems passed**\n\n` +
+                `| Problem | Tests | Score | Note |\n` +
+                `|---------|-------|-------|------|\n` +
+                rows + '\n\n' +
+                `<details>\n<summary>Run details</summary>\n\n` +
+                `- Agent: \`${agentPath}\`\n` +
+                `- Workflow: [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n` +
+                `- Commit: \`${{ github.event.pull_request.head.sha }}\`\n` +
+                `</details>`;
+            }
+
+            // Find and update existing bot comment, or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const marker = '## Benchmark Evaluation';
+            const existing = comments.find(c =>
+              c.user.login === 'github-actions[bot]' && c.body.includes(marker)
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-${{ github.event.pull_request.number }}
+          path: results.json
+          retention-days: 30
