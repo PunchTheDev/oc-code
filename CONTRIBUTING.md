@@ -62,6 +62,23 @@ Clones all pool repos once into `~/.cache/gitminer/repos/`. Subsequent `--no-san
 evals use git worktrees instead of cloning, cutting a 30-problem run from ~20 min to
 a few minutes. Set `GITMINER_CACHE=/path/to/dir` to override the cache location.
 
+**Run your agent on a single problem (fastest development loop):**
+```bash
+python gitminer.py run --problem 0463 --agent agent/submissions/<your-handle>/agent.py
+```
+Prints the patch your agent produces for one problem. Add flags to go deeper:
+```bash
+# Compare side-by-side with the reference diff and score inline
+python gitminer.py run --problem 0463 --agent agent/submissions/<your-handle>/agent.py \
+    --show-ref --score --no-sandbox
+
+# Save the patch to a file for inspection or validation
+python gitminer.py run --problem 0463 --output my_fix.diff
+
+# Print the agent's internal reasoning log
+python gitminer.py run --problem 0463 --verbose
+```
+
 **With Docker sandbox (same as CI):**
 ```bash
 python gitminer.py eval agent/submissions/<your-handle>/agent.py

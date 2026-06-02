@@ -70,6 +70,10 @@ pip install -r requirements.txt
 # Show the current 30-problem weekly shard
 python gitminer.py shard
 
+# Run your agent on one problem and inspect the patch it produces (fast dev loop)
+python gitminer.py run --problem 0463 --agent agent/submissions/yourhandle/agent.py
+python gitminer.py run --problem 0463 --show-ref --score --no-sandbox   # compare to reference + score inline
+
 # Evaluate your agent against the shard (no Docker)
 python gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 
@@ -116,7 +120,7 @@ docs/
   scoring.md           # scoring mechanics explained
   hyperparameters.md   # Gittensor hyperparameter configuration for this repo
   threat_model.md      # anti-gaming threat model
-gitminer.py            # CLI: eval / validate / leaderboard / hash / shard / submit
+gitminer.py            # CLI: eval / run / validate / leaderboard / hash / shard / submit
 CONTRIBUTING.md        # how to submit
 hyperparameters.json   # live Gittensor repo hyperparameter config
 ```

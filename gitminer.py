@@ -4,6 +4,7 @@ gitminer — CLI for the Gittensor Base-Miner Benchmark.
 
 Subcommands:
     eval        Score an agent against the current shard (or all problems)
+    run         Run an agent on one problem and print its patch (fast dev loop)
     validate    Check that a patch applies cleanly to a problem's base commit
     leaderboard Show current leaderboard in the terminal
     problems    List benchmark problems with optional filters
@@ -18,6 +19,9 @@ Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py --all
     python gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
     python gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected mean ~22.77
+    python gitminer.py run --problem 0463
+    python gitminer.py run --problem 0463 --agent agent/submissions/myhandle/agent.py
+    python gitminer.py run --problem 0463 --show-ref --score --no-sandbox
     python gitminer.py validate --problem 0463 --patch my_fix.diff
     python gitminer.py validate --problem 0463 --patch my_fix.diff --run-tests
     python gitminer.py problems
@@ -582,6 +586,160 @@ def cmd_validate(args: argparse.Namespace) -> None:
             )
 
 
+def _print_diff(diff: str) -> None:
+    """Print a unified diff with ANSI colors when the terminal supports it."""
+    use_color = sys.stdout.isatty()
+    RED   = "\033[31m" if use_color else ""
+    GREEN = "\033[32m" if use_color else ""
+    CYAN  = "\033[36m" if use_color else ""
+    RESET = "\033[0m"  if use_color else ""
+
+    for line in diff.splitlines():
+        if line.startswith(("---", "+++")):
+            print(f"{CYAN}{line}{RESET}")
+        elif line.startswith("+"):
+            print(f"{GREEN}{line}{RESET}")
+        elif line.startswith("-"):
+            print(f"{RED}{line}{RESET}")
+        elif line.startswith("@@"):
+            print(f"{CYAN}{line}{RESET}")
+        else:
+            print(line)
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """
+    Run an agent on a single problem and print its output patch.
+
+    The fastest development loop: iterate on your agent without running
+    the full 30-problem eval.  Uses the same evaluate.load_problem path as
+    eval so the problem is identical to CI.
+
+    Examples:
+        python gitminer.py run --problem 0463
+        python gitminer.py run --problem 0463 --agent agent/submissions/alice/agent.py
+        python gitminer.py run --problem 0463 --show-ref --score --no-sandbox
+        python gitminer.py run --problem 0463 --output my_fix.diff --verbose
+    """
+    import tempfile
+    import time
+
+    from benchmark.evaluate import POOL_DIR, load_agent, load_problem
+
+    problem_dir = REPO_ROOT / "benchmark" / "problems" / args.problem
+    if not (problem_dir / "meta.json").exists():
+        print(f"Problem {args.problem!r} not found in benchmark/problems/", file=sys.stderr)
+        sys.exit(1)
+
+    problem = load_problem(problem_dir)
+
+    # Friendly lang label
+    _lang_map = {"python": "py", "pytest": "py", "npm": "js",
+                 "cargo": "rs", "./gradlew": "java"}
+    lang = _lang_map.get(problem.test_cmd[0] if problem.test_cmd else "", "?")
+    test_str = " ".join(problem.test_cmd) if problem.test_cmd else "(none)"
+
+    print(f"Problem  : {args.problem}  [{lang}]  {problem.repo_name}")
+    print(f"Issue    : {problem.issue_title[:72]}")
+    print(f"Test cmd : {test_str}")
+    print()
+
+    agent_path = args.agent or str(REPO_ROOT / "agent" / "example" / "agent.py")
+    if not Path(agent_path).exists():
+        print(f"Agent not found: {agent_path}", file=sys.stderr)
+        sys.exit(1)
+
+    agent = load_agent(agent_path)
+    print(f"Agent    : {Path(agent_path).name}", flush=True)
+    print("Running  ...", flush=True)
+
+    t0 = time.time()
+    try:
+        patch = agent.solve(problem)
+    except Exception as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    elapsed = time.time() - t0
+
+    diff = patch.diff or ""
+    print(f"Elapsed  : {elapsed:.1f}s")
+    print()
+
+    # Agent patch
+    print("─" * 72)
+    print("Agent patch")
+    print("─" * 72)
+    if diff:
+        _print_diff(diff)
+    else:
+        print("(empty patch)")
+    print()
+
+    # Reference diff
+    if args.show_ref:
+        ref_path = problem_dir / "reference.diff"
+        print("─" * 72)
+        print("Reference diff")
+        print("─" * 72)
+        if ref_path.exists():
+            _print_diff(ref_path.read_text())
+        else:
+            print("(no reference.diff)")
+        print()
+
+    # Reasoning log
+    if args.verbose and patch.reasoning:
+        print("─" * 72)
+        print("Reasoning log")
+        print("─" * 72)
+        print(patch.reasoning)
+        print()
+
+    # Save to file
+    if args.output:
+        out = Path(args.output)
+        out.write_text(diff)
+        print(f"Saved    : {out}")
+        print()
+
+    # Score
+    if args.score and diff:
+        with tempfile.NamedTemporaryFile(suffix=".diff", mode="w", delete=False) as tmp:
+            tmp.write(diff)
+            tmp_path = Path(tmp.name)
+        try:
+            if args.no_sandbox:
+                from benchmark.harness.score import score_patch
+                result = score_patch(problem_dir, tmp_path)
+            else:
+                from benchmark.harness.runner import run_in_sandbox
+                result = run_in_sandbox(problem_dir, tmp_path)
+
+            tests_ok = result.get("tests_passed", False)
+            score = result.get("final_score", 0.0)
+            status = "PASS" if tests_ok else "FAIL"
+            print("─" * 72)
+            print(f"Score    : {score:.2f} / 30.00  ({status})")
+
+            baselines_path = REPO_ROOT / "results" / "baselines.json"
+            if baselines_path.exists():
+                baselines = json.loads(baselines_path.read_text())
+                ref_score = next(
+                    (b["score"] for b in baselines if b["problem_id"] == args.problem),
+                    None,
+                )
+                if ref_score is not None:
+                    delta = score - ref_score
+                    sign = "+" if delta >= 0 else ""
+                    print(f"Baseline : {ref_score:.2f}  (delta {sign}{delta:.2f})")
+            if args.no_sandbox:
+                print("Note: --no-sandbox scores run ~3–5× above Docker CI.")
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    elif args.score:
+        print("Nothing to score — agent produced an empty patch.")
+
+
 def cmd_cache(args: argparse.Namespace) -> None:
     """Pre-warm the local repo cache used by --no-sandbox eval."""
     import json as _json
@@ -637,6 +795,27 @@ def main() -> None:
     p_eval.add_argument("--output", metavar="FILE",
                         help="Save full results JSON to FILE")
     p_eval.set_defaults(func=cmd_eval)
+
+    # run
+    p_run = sub.add_parser(
+        "run",
+        help="Run an agent on a single problem and print its patch (fast dev loop)",
+    )
+    p_run.add_argument("--problem", required=True, metavar="ID",
+                       help="Problem ID to run (e.g. 0463)")
+    p_run.add_argument("--agent", metavar="PATH",
+                       help="Path to agent.py (default: example agent)")
+    p_run.add_argument("--show-ref", action="store_true",
+                       help="Also print the reference diff for comparison")
+    p_run.add_argument("--score", action="store_true",
+                       help="Score the generated patch inline")
+    p_run.add_argument("--no-sandbox", action="store_true",
+                       help="Score without Docker sandbox (faster, ~3-5x higher scores)")
+    p_run.add_argument("--output", metavar="FILE",
+                       help="Save the generated patch to FILE")
+    p_run.add_argument("--verbose", action="store_true",
+                       help="Print the agent's internal reasoning log")
+    p_run.set_defaults(func=cmd_run)
 
     # validate
     p_validate = sub.add_parser(
