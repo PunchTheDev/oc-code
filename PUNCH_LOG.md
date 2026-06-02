@@ -4,6 +4,34 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: test file windowing + new-file format example; Go lang fix (commits e9f22c1–0a2354e)
+
+### gitminer.py: Go language classification fix (commit e9f22c1)
+- `_LANG` mapping now includes `"go": "go"` — 19 Go problems were previously labelled as `py`
+- `--lang` choices updated to include `"go"` so `gitminer problems --lang go` works
+
+### Agent: explicit new-file diff format example (commit e9f22c1)
+- `NEW_IMPL_FILES_TEMPLATE` now shows the exact `diff --git` / `new file mode 100644` / `--- /dev/null` / `@@ -0,0 +1,N @@` format the agent must use
+- Reduces formatting failures for the 33% of problems (132/400) with new implementation files
+
+### Agent: test file windowing (commits 273b668, 0f4a2fa)
+- Large test files (> 200 lines) are now windowed with ±80-line context around keyword hits
+- Previously: test files always shown in full — a single 20 KB test suite consumed half the 40 KB context budget
+- Threshold 200 (lower than impl files 300): test files are read-only so we lose nothing by windowing them earlier
+- Window 80 lines (wider than impl files 40): preserves complete test function bodies
+- Line numbers (`N | content`) are **omitted** from test file windows — the agent does not write diffs against test files, and numbers would confuse hunk offset calculations for impl files
+- `_window_file` and `_format_files` now accept `threshold`, `context_lines`, `show_line_numbers` parameters for full configurability
+
+### Agent: ACT_PROMPT clarification (commit 0a2354e)
+- Line number note updated: "windowed **source** files show lines as `N | content`" — explicitly notes test files are windowed without line numbers
+
+### Status
+- Benchmark: 400 problems, oracle 23.08, 20 repos (commit 0a2354e)
+- Pool: all 16 DAS repos saturated; next refresh check ~2026-06-09
+- Pending: registration (operator), nginx hookup (operator)
+
+---
+
 ## 2026-06-02 — Agent: hunk count fixer + file tree pruning (commits 470c201, 6049035)
 
 ### Agent: deterministic hunk count fixer (commit 470c201)
