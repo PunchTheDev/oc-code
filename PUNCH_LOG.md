@@ -4,6 +4,28 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: Rails + Kotlin assert patterns, fix docstring escape warning (benchmark commit 4269b94)
+
+### What shipped
+
+**Rails integration test assertions (5 new patterns)**
+- Root cause: `we-promise/sure` (37 pool problems) uses Ruby on Rails integration tests with `ActionDispatch::IntegrationTest`. Assert patterns specific to Rails were invisible to verify's cross-check.
+- Added: `assert_not_equal ` / `assert_not_equal(`, `assert_difference(`, `assert_no_difference(`, `assert_response `, `assert_redirected_to `
+- Pool coverage: 227 `assert_response` + 154 `assert_redirected_to` + 24 `assert_no_difference` + 23 `assert_difference` = **428 occurrences** previously invisible
+
+**Kotlin `kotlin.test` assertions (2 new patterns)**
+- Root cause: `touchpilot/touchpilot` (37 pool problems) uses `kotlin.test` framework with `assertIs<Type>(value)` (type-checking assertion) and `assertContains(collection, item)`. Neither matched any existing prefix.
+- Added: `assertIs<` (Kotlin type assertion), `assertContains(` (collection/string)
+- Pool coverage: 209 `assertIs<` + 102 `assertContains(` = **311 occurrences** previously invisible
+
+**SyntaxWarning fix**
+- Two invalid escape sequences (`\`\`\`\w*` and `\`\`\`` patterns) in the module docstring caused Python 3.12 `SyntaxWarning` on every import. Replaced with prose descriptions.
+- The warning was benign but cluttered `gitminer run` output with noise before the first line of agent output.
+
+**Total new assertion coverage: 739 occurrences** across 74 problems (37 Rails + 37 Kotlin)
+
+---
+
 ## 2026-06-02 — Agent: repair source context + Ruby refute assertions (benchmark commit df24da2)
 
 ### What shipped
