@@ -4,6 +4,41 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — API resilience, cascade-timeout hardening, JS support (commits d039717–2716186)
+
+### API error resilience in `_call` (commit d039717)
+
+Discovered via sample eval: OpenRouter sometimes returns 200 with `{"error": {...}}` body instead of `choices`. Previously caused `KeyError: 'choices'` propagating as an exception (problem score = 0). Fix:
+- Check `"choices" in data` before access; retry once on missing choices with 5s backoff
+- Add 400 responses to the retry set (covers content policy / transient routing errors)
+- Final fallback: `return ""` so `_diagnose_diff` handles it as empty-diff gracefully
+
+### Verify prose-critique feedback loop (commit 653e8e4)
+
+When verify returns a textual critique without a corrected diff, the loop previously broke and accepted the unverified diff. Now: store the critique in history and continue — the model can self-correct on the next verify iteration by producing a diff based on its own critique. Only breaks on the last attempt.
+
+### JS/JSX language notes added (commit 84f6004)
+
+12 JS problems (gittensor-ui, product-data-extractor, ragflow JS issues) previously got no language-specific guidance. Added `LANG_NOTES["js"]` and `LANG_NOTES["jsx"]` covering: ES module exports, null-safety, async/await style, `const`/`let` over `var`, no TypeScript syntax.
+
+### CommonJS `require()` import resolution (commit 11eb3a4)
+
+Extended `_resolve_test_imports` and `_expand_sibling_imports` for JS/TS to also parse `require('./foo')` patterns (CommonJS style). Previously only `from '...'` ES module syntax was handled.
+
+### Conditional history compaction + empty-act retry (commit 2716186)
+
+Root cause found via sample eval: when the API is slow (calls near-timeout), the act step times out and returns "". Previously history was compacted unconditionally, leaving repair iterations with only a 150-char summary (issue title, file names) — insufficient context to produce code.
+
+**Fix 1**: Only compact `history[1]` (source files, 20-30k chars) if the act step produced a valid diff. If act returned empty/invalid, keep the full source context so repair iterations can generate a real diff.
+
+**Fix 2**: When the repair loop detects "empty output — no diff produced", resend `ACT_PROMPT` directly instead of the useless `REPAIR_FORMAT_PROMPT` with an empty diff. The model retries the act step with full source context still available. On success, compaction happens then.
+
+### Status
+- Benchmark: 423 problems, oracle 23.36, 20 repos (commit 2716186)
+- Sample eval: discovered `patch_applied: False` on gittensor problems when API slow — root cause was cascade timeout + premature history compaction, now fixed
+- Pool: fully saturated; check ~2026-06-09 for new DAS registrations
+- Pending: Gittensor registration, nginx hookup
+
 ## 2026-06-02 — Context line whitespace repair (commit 870de98)
 
 ### Agent: `_fix_context_lines` — 6th post-processing stage
