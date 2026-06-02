@@ -95,6 +95,14 @@ def has_test_files(diff: str) -> bool:
         or re.search(r"^diff --git .*/test_", diff, re.MULTILINE)
         or re.search(r"^diff --git .*/tests?/", diff, re.MULTILINE)
         or re.search(r"^diff --git .*/spec/", diff, re.MULTILINE)
+        # Go: *_test.go
+        or re.search(r"^diff --git .+_test\.go\b", diff, re.MULTILINE)
+        # JS/TS: *.test.{ts,tsx,js,jsx} and *.spec.{ts,tsx,js,jsx}
+        or re.search(r"^diff --git .+\.(test|spec)\.[jt]sx?", diff, re.MULTILINE)
+        # Java: *Test.java, *Tests.java, *TestCase.java
+        or re.search(r"^diff --git .+Tests?(?:Case)?\.java\b", diff, re.MULTILINE)
+        # Ruby: *_spec.rb
+        or re.search(r"^diff --git .+_spec\.rb\b", diff, re.MULTILINE)
     )
 
 
