@@ -4,6 +4,26 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Dashboard refresh + scoring transparency (dashboard commit f062012)
+
+### Lando check-in response: scoring is fully deterministic
+
+Addressed Lando's question about whether benchmarks use an LLM judge:
+
+**No LLM at any point in the scoring pipeline.** Evaluation is:
+1. `git apply` the patch to the repo at `base_commit`
+2. Run the test suite — all tests must pass or score = 0
+3. Gittensor's tree-sitter pipeline computes `src_tokens` from the diff
+4. Formula: `25 × (1 − exp(−src_tokens / 58)) + bonus` → 0–30
+
+This is now documented as a "How Scoring Works" section in the dashboard with the 4-step pipeline displayed visually — no ambiguity for miners about how they're being graded.
+
+**Dashboard data refreshed**: 423 → 430 problems, oracle 23.36 → 23.46. Fixed stale "342" in meta description and step text. Generated fresh `data.json` from benchmark pool via `scripts/generate_dashboard_data.py`.
+
+**Closed PR idea (Lando's suggestion)**: PRs rejected with explanation vs the actual merged solution would be gold standard negative examples. Valid idea but deferred to backlog — Gittensor is young, volume of clearly-explained closed PRs is likely small, and the current 430-problem pool is the immediate priority. Worth revisiting after first miner wave.
+
+---
+
 ## 2026-06-02 — Marginal-gain mechanics + difficulty weighting (commits 882686f, 8963281, ca98c25, f8cb706)
 
 ### Core mechanics gap closed per Lando check-in
