@@ -4,6 +4,34 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent improvements + pool refresh (commits 2e8e54d–b609751)
+
+### Agent: verify loop hardening (commits 2e8e54d, e0a8312)
+
+**LGTM detection** (commit 2e8e54d): was `startswith("LGTM")` — missed "The diff looks correct. LGTM." Now also checks if no valid diff was extracted AND "lgtm" appears in verdict → treats as approval. Avoids spurious repair iterations.
+
+**Clean verify history** (commit 2e8e54d): when verify produces a repaired diff, we now store the cleaned `repaired` in history (not the raw `verdict` which may contain prose). Subsequent verify/repair calls see the same clean artifact-free version.
+
+**Temperature=0 for verify** (commit 2e8e54d): verification is a precision task — using default 0.2 allowed hallucinated corrections. Now deterministic.
+
+**CRLF normalization** (commit 2e8e54d): `_extract_diff` now strips `\r\n` → `\n` before processing. Prevents hunk-count mismatches on Windows line endings from OpenRouter.
+
+**5xx retry** (commit e0a8312): `_call` previously only retried on 429. Now retries on 500/502/503 (transient server errors) too.
+
+**Stale N| reference in VERIFY_PROMPT** (commit e0a8312): criterion 2 referenced "N| line markers in the context" — but context is compacted before verify runs. Updated to "check hunk offsets are plausible" instead.
+
+### Agent: context budget fix (commit 600ed86)
+
+**Per-file budget cap** (commit 600ed86): `_truncate_context` was counting raw file sizes for budget allocation — but 270/400 problems have raw context > 40 KB, meaning file 1 alone could exhaust the budget and drop files 2-N. Fixed to count `min(raw_size, 10_000)` per file (capped to approximate windowed size). More files pass through to windowing, which then controls actual prompt size.
+
+### Pool refresh: 400 → 423 (commit b609751)
+
+**23 new ragflow problems** (Go/TS): AWS Bedrock, OCR for ZhipuAI, OpenAI Go driver ASR/TTS fix, PPIO/Groq/TokenPony/Hunyuan providers, streaming timeout bug (15380, 15382), password reset OAuth (15293), and 12 more Go provider implementations. DAS API user-agent fix also shipped (was 403-blocking pool rebuilds).
+
+### Status
+- Benchmark: 423 problems (oracle mean TBD for new problems — Go needs Docker CI)
+- Agent: verify hardening, context budget fix, 5xx retry
+
 ## 2026-06-02 — Agent: verify/repair hardening (commits 013ab2c–991f281)
 
 ### Four targeted fixes to the verify + repair loop
