@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import re
 import textwrap
+import time
 
 import httpx
 
@@ -28,6 +29,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 REFERER = "https://github.com/PunchTheDev/gittensor-base-miner"
 
 MAX_REPAIR_ATTEMPTS = 2
+# Number of LLM calls in worst case: plan + act + verify + repair × MAX_REPAIR_ATTEMPTS
+MAX_CALLS = 3 + MAX_REPAIR_ATTEMPTS
 
 
 # ---------------------------------------------------------------------------
@@ -145,23 +148,32 @@ def _call(
     max_tokens: int,
     timeout: float,
 ) -> str:
-    resp = httpx.post(
-        OPENROUTER_URL,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": REFERER,
-        },
-        json={
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0.2,
-        },
-        timeout=timeout,
-    )
+    """Call the OpenRouter API. Retries once on 429 (rate limit) after a brief wait."""
+    for attempt in range(2):
+        resp = httpx.post(
+            OPENROUTER_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": REFERER,
+            },
+            json={
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.2,
+            },
+            timeout=timeout,
+        )
+        if resp.status_code == 429 and attempt == 0:
+            retry_after = int(resp.headers.get("retry-after", "5"))
+            time.sleep(min(retry_after, 10))
+            continue
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    # Should not reach here, but satisfy type checker
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +203,9 @@ class ExampleAgent(BaseAgent):
                 f"Model '{self.model}' is not in the allowed list: {problem.allowed_models}"
             )
 
-        timeout = float(problem.time_limit_seconds)
+        # Distribute the wall-clock budget across all LLM calls so we can't
+        # exceed time_limit_seconds even in the worst case (all calls slow).
+        timeout = float(problem.time_limit_seconds) / MAX_CALLS
         token_budget = problem.output_token_budget
         plan_tokens = token_budget // 3
         act_tokens = token_budget // 2
