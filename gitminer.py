@@ -3,17 +3,20 @@
 gitminer — CLI for the Gittensor Base-Miner Benchmark.
 
 Subcommands:
-    eval     Score an agent against the current shard (or all problems)
-    cache    Pre-warm the local repo cache (speeds up --no-sandbox evals)
-    hash     Compute the commit-reveal SHA-256 hash for a patch file
-    shard    Print the current week's 30-problem shard IDs
-    submit   Validate an agent, generate its commit-reveal hash, and print (or open) a PR
+    eval      Score an agent against the current shard (or all problems)
+    problems  List benchmark problems with optional filters
+    cache     Pre-warm the local repo cache (speeds up --no-sandbox evals)
+    hash      Compute the commit-reveal SHA-256 hash for a patch file
+    shard     Print the current week's 30-problem shard IDs
+    submit    Validate an agent, generate its commit-reveal hash, and print (or open) a PR
 
 Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py
     python gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
     python gitminer.py eval agent/submissions/myhandle/agent.py --all
     python gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
+    python gitminer.py problems
+    python gitminer.py problems --lang py --difficulty hard --limit 10
     python gitminer.py cache
     python gitminer.py hash my_patch.diff
     python gitminer.py shard
@@ -314,6 +317,80 @@ def cmd_submit(args: argparse.Namespace) -> None:
     print("─" * 60)
 
 
+def cmd_problems(args: argparse.Namespace) -> None:
+    """List benchmark problems with filtering and sorting."""
+    import json as _json
+
+    pool_dir = REPO_ROOT / "benchmark" / "problems"
+    baselines_path = REPO_ROOT / "results" / "baselines.json"
+    baseline_lookup: dict[str, float] = {}
+    if baselines_path.exists():
+        raw = _json.loads(baselines_path.read_text())
+        for entry in raw.get("problems", []):
+            pid_key = entry.get("id", "")
+            if pid_key:
+                baseline_lookup[pid_key] = entry.get("base_score", 0.0)
+
+    _LANG = {"npm": "js", "cargo": "rs", "./gradlew": "java"}
+
+    rows = []
+    for meta_path in sorted(pool_dir.glob("*/meta.json")):
+        meta = _json.loads(meta_path.read_text())
+        pid = meta.get("id", "")
+        runner = meta.get("test_cmd", ["python"])[0]
+        lang = _LANG.get(runner, "py")
+        baseline = baseline_lookup.get(pid)
+
+        difficulty = "?"
+        if baseline is not None:
+            if baseline >= 25:
+                difficulty = "easy"
+            elif baseline >= 18:
+                difficulty = "medium"
+            else:
+                difficulty = "hard"
+
+        rows.append({
+            "id": pid,
+            "repo": meta.get("repo_name", ""),
+            "lang": lang,
+            "difficulty": difficulty,
+            "baseline": baseline,
+            "title": meta.get("issue_title", "")[:60],
+        })
+
+    # Filter
+    if args.lang:
+        rows = [r for r in rows if r["lang"] == args.lang]
+    if args.difficulty:
+        rows = [r for r in rows if r["difficulty"] == args.difficulty]
+    if args.repo:
+        rows = [r for r in rows if args.repo.lower() in r["repo"].lower()]
+    if args.search:
+        q = args.search.lower()
+        rows = [r for r in rows if q in r["title"].lower() or q in r["id"].lower()]
+
+    # Sort
+    reverse = args.sort in ("baseline",)
+    if args.sort == "baseline":
+        rows.sort(key=lambda r: (r["baseline"] or 0), reverse=True)
+    elif args.sort == "difficulty":
+        order = {"hard": 0, "medium": 1, "easy": 2, "?": 3}
+        rows.sort(key=lambda r: order.get(r["difficulty"], 3))
+    else:
+        rows.sort(key=lambda r: r["id"])
+
+    # Display
+    limit = args.limit or len(rows)
+    print(f"\n{'ID':<42} {'Repo':<30} {'Lang':<6} {'Diff':<8} {'Baseline':>9}")
+    print("─" * 100)
+    for r in rows[:limit]:
+        b = f"{r['baseline']:.2f}" if r["baseline"] is not None else "n/a"
+        print(f"{r['id']:<42} {r['repo']:<30} {r['lang']:<6} {r['difficulty']:<8} {b:>9}  {r['title']}")
+
+    print(f"\n{len(rows[:limit])} of {len(rows)} problems shown.")
+
+
 def cmd_cache(args: argparse.Namespace) -> None:
     """Pre-warm the local repo cache used by --no-sandbox eval."""
     import json as _json
@@ -367,6 +444,17 @@ def main() -> None:
     p_eval.add_argument("--output", metavar="FILE",
                         help="Save full results JSON to FILE")
     p_eval.set_defaults(func=cmd_eval)
+
+    # problems
+    p_problems = sub.add_parser("problems", help="List benchmark problems with optional filters")
+    p_problems.add_argument("--lang", choices=["py", "js", "rs", "java"], help="Filter by language")
+    p_problems.add_argument("--difficulty", choices=["easy", "medium", "hard"], help="Filter by difficulty")
+    p_problems.add_argument("--repo", metavar="PATTERN", help="Filter by repo name substring")
+    p_problems.add_argument("--search", metavar="TEXT", help="Search title or problem ID")
+    p_problems.add_argument("--sort", choices=["id", "baseline", "difficulty"], default="id",
+                            help="Sort order (default: id)")
+    p_problems.add_argument("--limit", type=int, metavar="N", help="Show at most N problems")
+    p_problems.set_defaults(func=cmd_problems)
 
     # cache
     p_cache = sub.add_parser(
