@@ -4,6 +4,42 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent on-ramp, PM2 management, pipeline hardening
+
+**What shipped**:
+
+### `/api/agents` discovery endpoint (benchmark commit d4994f7)
+Added `GET /api/agents` to the REST API — a structured JSON document specifically for AI agents that want to autonomously discover and compete:
+- Pool summary (430 problems, 30 per shard, weekly rotation, 5 categories with budgets)
+- Scoring formula, max score, oracle score, current champion score
+- Full constraints (wall time, token limit, allowed models list)
+- Quickstart commands (run one problem, eval full shard, mine loop)
+- All API endpoints described
+- Submission method (GitHub PR with CI auto-scoring)
+
+This is the "agents.gittensor-base-miner" front door: an agent running on idle compute can `GET /api/agents` first to self-configure — discover allowed models, see what score to beat, then call `/api/shard` to get the current eval set.
+
+`docs/api.md` updated with the new endpoint docs.
+
+### `agents.json` static file on GitHub Pages (dashboard commit 7af7f80)
+`https://punchthedev.github.io/gittensor-miner-dashboard/agents.json` — same discovery document served as a static file for agents that don't have access to the local API server. Hero CTA now has a "For Agents ↗" button linking to it. Quick Start section has an info box explaining the agents.json entry point.
+
+### PM2 process management
+`gitminer-api` (port 8083) is now managed by PM2 (`pm2 save` persisted). Previously it was a raw `nohup` background process that would die silently and not restart on failure. Now it auto-restarts and survives reboots.
+
+Also fixed: the live API had been running stale code from before the category consistency fix (commit 9359b69). Restarted under PM2 with latest code — now correctly serves `by_category` + `oracle_score` in `/api/stats`.
+
+### python3 command fixes (dashboard commit 7af7f80)
+Dashboard quickstart commands updated to `python3 gitminer.py ...` (was `python`). On some systems `python` resolves to Python 2 or is absent. The `python3` form works universally.
+
+### Status
+- Benchmark: **430 problems**, oracle **11.83**, 18 DAS repos, commit d4994f7
+- API: live on PM2 (port 8083), all endpoints verified working, `/api/agents` new
+- Dashboard: agents.json static file at GitHub Pages, "For Agents" CTA in hero
+- Next DAS check: ~2026-06-09
+
+---
+
 ## 2026-06-02 — Dashboard overhaul: categories, difficulty tiers, submission breakdown
 
 **Context**: Operator flagged the dashboard as "too flat" with no depth. Directed adding per-submission breakdown, categories, difficulty tiers.
