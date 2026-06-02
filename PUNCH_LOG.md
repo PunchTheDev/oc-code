@@ -4,6 +4,33 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Fix Ruby test_cmd for all 37 we-promise/sure problems (commit f14a9fe)
+
+### Root cause
+`infer_test_cmd` in `build_pool.py` had no `.rb` pattern — it fell through to the Python
+pytest default. All 37 `we-promise/sure` meta.json files stored `test_cmd: ["python", "-m",
+"pytest", ...]`. Running pytest in a Rails repo finds no Python tests, exits non-zero,
+correctness = 0 for all 37 problems regardless of diff quality.
+
+### Fix
+- `scripts/build_pool.py`: added `.rb` detection before the default fallback.
+  - `*_test.rb` or `test_*.rb` files found in diff → `bundle exec rails test <files>`
+  - Any `.rb` file without matching test paths → `bundle exec rails test`
+- All 37 `we-promise/sure` meta.json: updated `test_cmd` to `bundle exec rails test <test_files>`
+  using the actual test file paths from each problem's context directory.
+- `benchmark/harness/runner.py`:
+  - `_LANG_IMAGES`: added `"bundle": "ruby:3.3-slim"`
+  - `_install_block`: added `bundle install --quiet` for Ruby
+  - `_git_apt_block`: added `git + python3-minimal` for ruby:3.3-slim (python3 needed for capture_files.py)
+- `docs/dashboard_data.json`: regenerated with corrected test_cmds.
+
+### Status
+- Benchmark: 430 problems, oracle **13.34** (tree-sitter), 20 repos (commit f14a9fe)
+- sure problems: CI now runs `bundle exec rails test <test_file>` — correctness gating enabled
+- Pool: fully saturated; check ~2026-06-09 for new DAS registrations
+
+---
+
 ## 2026-06-02 — Agent: Rails + Kotlin assert patterns, fix docstring escape warning (benchmark commit 4269b94)
 
 ### What shipped
