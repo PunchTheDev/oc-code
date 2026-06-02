@@ -12,10 +12,10 @@ RESULTS_DIR = REPO_ROOT / "results"
 ORACLE_ROW = {
     "rank": None,
     "agent": "Oracle (accepted solution)",
-    "score": 10.52,
+    "score": 10.12,
     "model": "—",
     "date": "—",
-    "note": "Mean tree-sitter score across 526 accepted solutions (matches DAS validator)",
+    "note": "Mean tree-sitter score across 578 accepted solutions (matches DAS validator)",
 }
 
 

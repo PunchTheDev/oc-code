@@ -1,0 +1,212 @@
+diff --git a/docs/concepts/experimental.md b/docs/concepts/experimental.md
+index a898f6afdb8..211631fc45c 100644
+--- a/docs/concepts/experimental.md
++++ b/docs/concepts/experimental.md
+@@ -536,3 +536,7 @@ As such, the following limitations currently apply:
+   or greater, and the `enableExperimentalFeatures` type evaluation setting
+   should be enabled.
+ * Pickling of models containing `MISSING` as a value is not supported.
++
++!!! note
++    When [applying constraints](./fields.md#field-constraints) to a union containing the `MISSING` sentinel,
++    such constraints are automatically applied to the remaining type(s) of the union.
+diff --git a/docs/concepts/fields.md b/docs/concepts/fields.md
+index 240a6c3d029..a7798af52c0 100644
+--- a/docs/concepts/fields.md
++++ b/docs/concepts/fields.md
+@@ -448,6 +448,22 @@ class Model(BaseModel):
+ The available constraints for each type (and the way they affect the JSON Schema) are described
+ in the [standard library types](../api/standard_library_types.md) documentation.
+ 
++!!! note
++    When adding constraints to a union type, if a member of the union is `None` or the [`MISSING` sentinel](./experimental.md#missing-sentinel),
++    the constraints will be automatically applied to the remaining type(s) of the union:
++
++    ```python
++    from typing import Annotated, Union
++
++    from pydantic import BaseModel, Field
++
++
++    class Model(BaseModel):
++        positive: Union[int, None] = Field(gt=0)
++        # Also works with the annotated pattern:
++        negative: Annotated[Union[int, None], Field(lt=0)]
++    ```
++
+ <!-- old anchor added for backwards compatibility -->
+ <!-- markdownlint-disable-next-line no-empty-links -->
+ [](){#strict-mode}
+diff --git a/pydantic-core/python/pydantic_core/core_schema.py b/pydantic-core/python/pydantic_core/core_schema.py
+index 9b3db0531b5..c75819163bc 100644
+--- a/pydantic-core/python/pydantic_core/core_schema.py
++++ b/pydantic-core/python/pydantic_core/core_schema.py
+@@ -7,7 +7,7 @@
+ 
+ import sys
+ import warnings
+-from collections.abc import Hashable, Mapping
++from collections.abc import Generator, Hashable, Mapping
+ from datetime import date, datetime, time, timedelta
+ from decimal import Decimal
+ from re import Pattern
+@@ -4338,6 +4338,15 @@ def _dict_not_none(**kwargs: Any) -> Any:
+     return {k: v for k, v in kwargs.items() if v is not None}
+ 
+ 
++def iter_union_choices(union_schema: UnionSchema) -> Generator[CoreSchema]:
++    """Iterate over the choices of a `'union'` schema."""
++    for choice in union_schema['choices']:
++        if isinstance(choice, tuple):
++            yield choice[0]
++        else:
++            yield choice
++
++
+ ###############################################################################
+ # All this stuff is deprecated by #980 and will be removed eventually
+ # They're kept because some code external code will be using them
+diff --git a/pydantic/_internal/_generate_schema.py b/pydantic/_internal/_generate_schema.py
+index f46fcb128f0..88c3913c02b 100644
+--- a/pydantic/_internal/_generate_schema.py
++++ b/pydantic/_internal/_generate_schema.py
+@@ -2288,6 +2288,48 @@ def _apply_single_annotation(
+                 schema['schema'] = inner
+             return schema
+ 
++        if schema['type'] == 'union' and any(
++            choice['type'] == 'missing-sentinel' for choice in core_schema.iter_union_choices(schema)
++        ):
++            # Same behavior as for nullable schemas. This is a bit gross, but we have to support the same pattern
++            filtered_choices = [
++                choice
++                for choice in schema['choices']
++                if (choice[0] if isinstance(choice, tuple) else choice)['type'] != 'missing-sentinel'
++            ]
++            if len(filtered_choices) >= 2:
++                # e.g. `Annotated[int | str | MISSING, Constraint(...)]`. We apply `Constraint(...)` to `int | str`,
++                # and create a new union semantically equivalent to `Annotated[int | str, Constraint(...)] | MISSING`:
++                filtered_union = core_schema.union_schema(filtered_choices)
++                filtered_union = self._apply_single_annotation(filtered_union, metadata)
++                new_union = schema.copy()
++                new_union['choices'] = [
++                    filtered_union,
++                    next(
++                        choice
++                        for choice in schema['choices']
++                        if (choice[0] if isinstance(choice, tuple) else choice)['type'] == 'missing-sentinel'
++                    ),
++                ]
++                return new_union
++            elif len(filtered_choices) == 1:
++                # e.g. `Annotated[int | MISSING, Constraint(...)]`. We apply `Constraint(...)` to `int`, and reconstruct
++                # a new union preserving the order.
++                inner = filtered_choices[0][0] if isinstance(filtered_choices[0], tuple) else filtered_choices[0]
++                inner = self._apply_single_annotation(inner, metadata)
++
++                # Create a new union schema, preserving the order of the union:
++                new_union = schema.copy()
++                new_union['choices'] = [
++                    (inner, choice[1])
++                    if isinstance(choice, tuple) and choice[0]['type'] != 'missing-sentinel'
++                    else inner
++                    if not isinstance(choice, tuple) and choice['type'] != 'missing-sentinel'
++                    else choice
++                    for choice in schema['choices']
++                ]
++                return new_union
++
+         original_schema = schema
+         ref = schema.get('ref')
+         if ref is not None:
+diff --git a/pydantic/_internal/_schema_gather.py b/pydantic/_internal/_schema_gather.py
+index fc2d806ead6..8e07b20e709 100644
+--- a/pydantic/_internal/_schema_gather.py
++++ b/pydantic/_internal/_schema_gather.py
+@@ -4,7 +4,13 @@
+ from dataclasses import dataclass, field
+ from typing import TypedDict
+ 
+-from pydantic_core.core_schema import ComputedField, CoreSchema, DefinitionReferenceSchema, SerSchema
++from pydantic_core.core_schema import (
++    ComputedField,
++    CoreSchema,
++    DefinitionReferenceSchema,
++    SerSchema,
++    iter_union_choices,
++)
+ from typing_extensions import TypeAlias
+ 
+ AllSchemas: TypeAlias = 'CoreSchema | SerSchema | ComputedField'
+@@ -114,11 +120,8 @@ def traverse_schema(schema: AllSchemas, context: GatherContext) -> None:
+         if 'values_schema' in schema:
+             traverse_schema(schema['values_schema'], context)
+     elif schema_type == 'union':
+-        for choice in schema['choices']:
+-            if isinstance(choice, tuple):
+-                traverse_schema(choice[0], context)
+-            else:
+-                traverse_schema(choice, context)
++        for choice in iter_union_choices(schema):
++            traverse_schema(choice, context)
+     elif schema_type == 'tagged-union':
+         for v in schema['choices'].values():
+             traverse_schema(v, context)
+diff --git a/pydantic/json_schema.py b/pydantic/json_schema.py
+index 10d2f972ea7..b6da482ea19 100644
+--- a/pydantic/json_schema.py
++++ b/pydantic/json_schema.py
+@@ -1276,13 +1276,10 @@ def union_schema(self, schema: core_schema.UnionSchema) -> JsonSchemaValue:
+         """
+         generated: list[JsonSchemaValue] = []
+ 
+-        choices = schema['choices']
+-        for choice in choices:
+-            # choice will be a tuple if an explicit label was provided
+-            choice_schema = choice[0] if isinstance(choice, tuple) else choice
++        for choice in core_schema.iter_union_choices(schema):
+             try:
+-                generated.append(self.generate_inner(choice_schema))
+-            except PydanticOmit:
++                generated.append(self.generate_inner(choice))
++            except PydanticOmit:  # noqa: PERF203
+                 continue
+             except PydanticInvalidForJsonSchema as exc:
+                 self.emit_warning('skipped-choice', exc.message)
+diff --git a/tests/test_missing_sentinel.py b/tests/test_missing_sentinel.py
+index 23c8dcb242d..2c4d8c6af3a 100644
+--- a/tests/test_missing_sentinel.py
++++ b/tests/test_missing_sentinel.py
+@@ -1,7 +1,8 @@
+ import pickle
+-from typing import Union
++from typing import Annotated, Union
+ 
+ import pytest
++from annotated_types import Ge
+ from pydantic_core import MISSING, PydanticSerializationUnexpectedValue
+ 
+ from pydantic import BaseModel, TypeAdapter, ValidationError
+@@ -98,3 +99,22 @@ class Outer(BaseModel):
+ 
+     # Shouldn't raise a serialization warning about missing fields:
+     assert s.model_dump() == {'inner': {'f1': 1}}
++
++
++def test_missing_sentinel_constraints_pushdown() -> None:
++    class Model(BaseModel):
++        f1: Annotated[Union[int, MISSING], Ge(1)] = MISSING
++        f2: Annotated[Union[MISSING, int], Ge(1)] = MISSING
++        f3: Annotated[Union[int, str, MISSING], Ge(1)] = MISSING
++        f4: Annotated[Union[int, str, None, MISSING], Ge(1)] = MISSING
++
++    js_schema = Model.model_json_schema()
++
++    assert js_schema['properties']['f1'] == {'minimum': 1, 'title': 'F1', 'type': 'integer'}
++    assert js_schema['properties']['f2'] == {'minimum': 1, 'title': 'F2', 'type': 'integer'}
++    # Note: 'ge' is still wrong (see https://github.com/pydantic/pydantic/issues/11576)
++    assert js_schema['properties']['f3'] == {'anyOf': [{'type': 'integer'}, {'type': 'string'}], 'ge': 1, 'title': 'F3'}
++    assert js_schema['properties']['f4'] == {
++        'anyOf': [{'anyOf': [{'type': 'integer'}, {'type': 'string'}], 'ge': 1}, {'type': 'null'}],
++        'title': 'F4',
++    }
