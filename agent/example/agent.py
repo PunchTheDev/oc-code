@@ -50,6 +50,10 @@ Improvements over a naive single-shot approach:
   TypeScript relative imports, same-dir Go files) and adds those sibling modules to
   context (up to 6 KB). Prevents the agent from hallucinating helper functions that
   already exist in the package.
+- New test file detection: compares context test files against file_tree (repo state
+  at base_commit). Files that are in context but NOT in file_tree are new files added
+  by the PR — they don't exist yet and must be created in the diff.  The agent is
+  shown pre-formatted diff blocks to copy verbatim. Affects ~60% of pool problems.
 """
 
 from __future__ import annotations
@@ -109,7 +113,7 @@ The harness runs this command to determine correctness. Your patch must make it 
 ```
 {tree}
 ```
-{init_hint}{test_section}
+{init_hint}{test_section}{new_test_section}
 ## Source files (ranked by relevance)
 {impl_files}
 
@@ -122,7 +126,8 @@ Analyse this test-first, then plan. Answer in order:
    This is the ground truth your implementation must satisfy.
 2. **Root cause** — given the test contract, what is currently missing or wrong in \
    the source files?
-3. **Hypothesis** — which specific file(s) and line range(s) need to change? Be exact.
+3. **Hypothesis** — which specific file(s) and line range(s) need to change? Be exact. \
+   If "New test files" are listed above, your diff must also add them.
 4. **Implementation plan** — starting from the test contract, describe what you will \
    add/change: function signatures, return types, helper logic, error handling, \
    edge cases. Every assertion in the test must map to something in your plan.
@@ -138,6 +143,21 @@ edge cases scores higher than a minimal stub.
 TEST_SECTION_TEMPLATE = """\
 ## Test files (read first — these define the contract your implementation must satisfy)
 {test_files}
+
+"""
+
+NEW_TEST_FILES_TEMPLATE = """\
+## New test files — MUST be added to your diff
+
+These test files were added by the PR and do NOT exist in the repo at base commit. \
+The harness runs `{test_cmd}` after applying your diff — if these files are missing \
+from the diff, the test command fails immediately with a "file not found" error and \
+correctness score is 0.
+
+Copy the diff blocks below verbatim into your output (after your implementation \
+changes) — do not modify their content:
+
+{new_test_diffs}
 
 """
 
@@ -159,6 +179,8 @@ Requirements:
   change — this is required for `git apply` to locate the change correctly
 - Every test assertion from your plan must be satisfied by your diff
 - Include helper functions, proper error handling, and secondary file changes
+- **New test files**: if the prompt shows "New test files", include them verbatim \
+  as new-file additions (see format in that section)
 - Do NOT change unrelated logic, but do implement the full fix as described
 - Higher-quality, complete implementations score better than minimal stubs
 - Output ONLY the diff — no markdown fences, no prose
@@ -307,6 +329,63 @@ def _detect_lang(test_files: list) -> str | None:
 # ---------------------------------------------------------------------------
 # Context ranking
 # ---------------------------------------------------------------------------
+
+
+def _new_test_files(
+    test_files: list[FileContext],
+    file_tree: list[str] | None,
+) -> list[FileContext]:
+    """Return test files that are NOT present in the file tree at base commit.
+
+    These are files added by the PR itself — they don't exist when the harness
+    checks out base_commit, so the agent's diff must create them.  The test
+    command will fail with "file not found" if they are absent.
+    """
+    if not file_tree:
+        return []
+    tree_set = set(file_tree)
+    return [f for f in test_files if f.path not in tree_set]
+
+
+def _format_new_test_files(files: list[FileContext]) -> str:
+    """Render new test files in a format that makes it easy to copy into a diff."""
+    parts = []
+    for f in files:
+        lang = f.language or ""
+        parts.append(f"### {f.path}\n```{lang}\n{f.content}\n```")
+    return "\n\n".join(parts)
+
+
+def _new_test_diff(files: list[FileContext]) -> str:
+    """Build the diff hunks for new test files so the model can copy them exactly.
+
+    Generating the diff here (rather than asking the model to reconstruct it)
+    eliminates a whole class of formatting errors when the model tries to
+    re-encode the file line-by-line in diff format.
+    """
+    parts = []
+    for f in files:
+        lines = f.content.splitlines()
+        n = len(lines)
+        hunk_lines = [f"+{ln}" for ln in lines]
+        if lines and not lines[-1].endswith("\n"):
+            no_newline = "\\ No newline at end of file"
+        else:
+            no_newline = None
+        body = "\n".join(hunk_lines)
+        block = (
+            f"diff --git a/{f.path} b/{f.path}\n"
+            f"new file mode 100644\n"
+            f"index 0000000..0000000\n"
+            f"--- /dev/null\n"
+            f"+++ b/{f.path}\n"
+            f"@@ -0,0 +1,{n} @@\n"
+            f"{body}"
+        )
+        if no_newline:
+            block += f"\n{no_newline}"
+        parts.append(block)
+    return "\n".join(parts)
 
 
 def _is_test_file(f: FileContext) -> bool:
@@ -927,15 +1006,30 @@ class ExampleAgent(BaseAgent):
         raw_tokens = re.findall(r"\b([a-z_][a-z0-9_]{3,}|[A-Z][A-Za-z0-9]{3,})\b", problem.issue_title + " " + problem.issue_body)
         keywords = {t.lower() for t in raw_tokens} | _test_keywords(test_files)
 
+        # Identify new test files: present in context but not in the file tree at base_commit.
+        # These files don't exist yet — the agent's diff must add them, or the test harness
+        # cannot find the test file and the correctness score is 0.
+        new_tests = _new_test_files(test_files, problem.file_tree)
+        if new_tests:
+            log.append(f"[context] new test files (must be created in diff): {[f.path for f in new_tests]}")
+
         # Build test section — always shown in full (usually small)
+        test_cmd_str = " ".join(problem.test_cmd) if problem.test_cmd else "pytest"
+        test_cmd_short = problem.test_cmd[-1] if problem.test_cmd else "pytest"
+
         test_section = (
             TEST_SECTION_TEMPLATE.format(test_files=_format_files(test_files))
             if test_files else ""
         )
+        new_test_section = (
+            NEW_TEST_FILES_TEMPLATE.format(
+                test_cmd=test_cmd_str,
+                new_test_diffs=_new_test_diff(new_tests),
+            )
+            if new_tests else ""
+        )
 
         # --- Turn 1: Observe + Plan ---
-        test_cmd_str = " ".join(problem.test_cmd) if problem.test_cmd else "pytest"
-        test_cmd_short = problem.test_cmd[-1] if problem.test_cmd else "pytest"
         init_hint = _index_hint(selected_impl, problem.file_tree)
         if init_hint:
             log.append(f"[context] index-file hint: {init_hint.strip()}")
@@ -956,6 +1050,7 @@ class ExampleAgent(BaseAgent):
             tree="\n".join(problem.file_tree),
             init_hint=init_hint,
             test_section=test_section,
+            new_test_section=new_test_section,
             impl_files=_format_files(selected_impl, keywords),
         )
         history: list[dict[str, str]] = [
