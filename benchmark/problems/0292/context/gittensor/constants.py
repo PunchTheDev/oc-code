@@ -1,0 +1,163 @@
+# Entrius 2025
+from datetime import datetime, timezone
+
+# =============================================================================
+# General
+# =============================================================================
+SECONDS_PER_DAY = 86400
+SECONDS_PER_HOUR = 3600
+
+# =============================================================================
+# GitHub API
+# =============================================================================
+BASE_GITHUB_API_URL = 'https://api.github.com'
+MIN_GITHUB_ACCOUNT_AGE = 180  # days
+# 1MB max file size for github api file fetches. Files exceeding this get no score.
+MAX_FILE_SIZE_BYTES = 1_000_000
+
+# =============================================================================
+# Language & File Scoring
+# =============================================================================
+DEFAULT_PROGRAMMING_LANGUAGE_WEIGHT = 0.12
+TEST_FILE_CONTRIBUTION_WEIGHT = 0.05
+# Extensions that use line-count scoring (capped at MAX_LINES_SCORED_FOR_NON_CODE_EXT)
+# These are documentation, config, data files, or template languages without tree-sitter support
+NON_CODE_EXTENSIONS = [
+    'md',
+    'mdx',
+    'markdown',
+    'txt',
+    'text',
+    'rst',
+    'adoc',
+    'asciidoc',
+    'json',
+    'jsonc',
+    'yaml',
+    'yml',
+    'toml',
+    'xml',
+    'csv',
+    'tsv',
+    'ini',
+    'cfg',
+    'conf',
+    'config',
+    'properties',
+    'plist',
+    'erb',
+]
+MAX_LINES_SCORED_FOR_NON_CODE_EXT = 300
+
+# =============================================================================
+# Repository & PR Scoring
+# =============================================================================
+PR_LOOKBACK_DAYS = 90  # how many days a merged pr will count for scoring
+DEFAULT_MERGED_PR_BASE_SCORE = 30
+MIN_TOKEN_SCORE_FOR_BASE_SCORE = 5  # PRs below this get 0 base score (can still earn contribution bonus)
+MAX_CONTRIBUTION_BONUS = 30
+DEFAULT_MAX_CONTRIBUTION_SCORE_FOR_FULL_BONUS = 2000
+
+# Boosts
+MAX_CODE_DENSITY_MULTIPLIER = 3.0
+
+# Pioneer dividend — rewards the first quality contributor to each repository
+# Rates applied per follower position (1st follower pays most, diminishing after)
+# Dividend capped at PIONEER_DIVIDEND_MAX_RATIO × pioneer's own earned_score
+PIONEER_DIVIDEND_RATE_1ST = 0.30  # 1st follower: 30% of their earned_score
+PIONEER_DIVIDEND_RATE_2ND = 0.20  # 2nd follower: 20% of their earned_score
+PIONEER_DIVIDEND_RATE_REST = 0.10  # 3rd+ followers: 10% of their earned_score
+PIONEER_DIVIDEND_MAX_RATIO = 1.0  # Cap dividend at 1× pioneer's own earned_score (max 2× total)
+
+# Issue boosts
+MAX_ISSUE_CLOSE_WINDOW_DAYS = 1
+MAX_ISSUE_AGE_FOR_MAX_SCORE = 40  # days
+
+# Time decay (sigmoid curve)
+TIME_DECAY_GRACE_PERIOD_HOURS = 12  # hours before time decay begins
+TIME_DECAY_SIGMOID_MIDPOINT = 10  # days until 50% score loss
+TIME_DECAY_SIGMOID_STEEPNESS_SCALAR = 0.4
+TIME_DECAY_MIN_MULTIPLIER = 0.05  # 5% of score will retain through lookback days (90D)
+
+# comment nodes for token scoring
+COMMENT_NODE_TYPES = frozenset(
+    {
+        'comment',
+        'line_comment',
+        'block_comment',
+        'documentation_comment',
+        'doc_comment',
+    }
+)
+
+# =============================================================================
+# Tiers & Collateral System
+# =============================================================================
+TIER_BASED_INCENTIVE_MECHANISM_START_DATE = datetime(2025, 12, 31, 3, 45, 00, tzinfo=timezone.utc)
+DEFAULT_COLLATERAL_PERCENT = 0.20
+
+# Tier-based emission allocation splits
+TIER_EMISSION_SPLITS = {
+    'Bronze': 0.15,  # 15% of emissions
+    'Silver': 0.35,  # 35% of emissions
+    'Gold': 0.50,  # 50% of emissions
+}
+
+# =============================================================================
+# Rewards & Emissions
+# =============================================================================
+RECYCLE_UID = 0
+
+# Network emission scaling (unique repos)
+UNIQUE_REPOS_MAX_RECYCLE = 0.8
+UNIQUE_REPOS_RECYCLE_DECAY_RATE = 0.005
+
+# Network emission scaling (total token score from tiered miners)
+TOKEN_SCORE_MAX_RECYCLE = 0.8
+TOKEN_SCORE_RECYCLE_DECAY_RATE = 0.000012
+
+# =============================================================================
+# Spam & Gaming Mitigation
+# =============================================================================
+MAINTAINER_ASSOCIATIONS = ['OWNER', 'COLLABORATOR']
+
+# Issue multiplier bonuses
+MAX_ISSUE_AGE_BONUS = 0.75  # Max bonus for issue age (scales with sqrt of days open)
+MAINTAINER_ISSUE_BONUS = 0.25  # Extra bonus when issue was created by a maintainer
+# Excessive open PRs penalty
+# Multiplier = 1.0 if open PRs <= threshold, 0.0 otherwise
+EXCESSIVE_PR_PENALTY_BASE_THRESHOLD = 10
+
+# Dynamic open PR threshold bonus for top contributors
+# Bonus = floor(total_unlocked_token_score / 500)
+# Example: 1500 token score across unlocked tiers / 500 = +3 bonus
+OPEN_PR_THRESHOLD_TOKEN_SCORE = 500.0  # Token score per +1 bonus (sum of all unlocked tiers)
+MAX_OPEN_PR_THRESHOLD = 30  # Maximum open PR threshold (base + bonus capped at this value)
+
+# =============================================================================
+# Issues Competition
+# =============================================================================
+CONTRACT_ADDRESS = '5FWNdk8YNtNcHKrAx2krqenFrFAZG7vmsd2XN2isJSew3MrD'
+ISSUES_TREASURY_UID = 111  # UID of the smart contract neuron, if set to RECYCLE_UID then it's disabled
+ISSUES_TREASURY_EMISSION_SHARE = 0.15  # % of emissions allocated to funding issues treasury
+
+# =============================================================================
+# Merge Predictions
+# =============================================================================
+PREDICTIONS_EMISSIONS_SHARE = 0.15  # % of emissions allocated to prediction competition
+
+PREDICTIONS_EMA_BETA = 0.1  # EMA decay rate for predictions record
+PREDICTIONS_CORRECTNESS_EXPONENT = 3  # exponent on correctness to harshly punish incorrect predictions
+PREDICTIONS_TIMELINESS_EXPONENT = 1.8  # curve for early prediction bonus. higher = sharper curve. 1.0 = linear
+PREDICTIONS_MAX_TIMELINESS_BONUS = 0.75  # max bonus for earliest predictions
+PREDICTIONS_MAX_CONSENSUS_BONUS = 0.25  # max bonus for pre-convergence predictions
+PREDICTIONS_MAX_ORDER_BONUS = 0.75  # max bonus for first correct predictor (applies to merged PR only)
+PREDICTIONS_ORDER_CORRECTNESS_THRESHOLD = 0.66  # min raw correctness to qualify for order bonus
+# variance threshold for full rewards
+# if variance across predictions never exceeds this threshold, the solution must be 'obvious'
+PREDICTIONS_CONSENSUS_VARIANCE_TARGET = 0.2
+
+# Cooldown & Limits
+PREDICTIONS_COOLDOWN_SECONDS = 900  # 15 min cooldown per miner per PR re-prediction
+PREDICTIONS_MIN_VALUE = 0.0
+PREDICTIONS_MAX_VALUE = 1.0

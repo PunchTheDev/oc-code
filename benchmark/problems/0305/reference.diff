@@ -1,0 +1,523 @@
+diff --git a/gittensor/classes.py b/gittensor/classes.py
+index bd4e5520..8790a1bd 100644
+--- a/gittensor/classes.py
++++ b/gittensor/classes.py
+@@ -161,6 +161,8 @@ class PullRequest:
+     pioneer_rank: int = 0  # 0 = not eligible, 1 = pioneer, 2+ = follower position
+     time_decay_multiplier: float = 1.0
+     credibility_multiplier: float = 1.0
++    review_quality_multiplier: float = 1.0  # Penalty for CHANGES_REQUESTED reviews from maintainers
++    changes_requested_count: int = 0  # Number of maintainer CHANGES_REQUESTED reviews
+     raw_credibility: float = 1.0  # Before applying ^k scalar
+     credibility_scalar: int = 1  # The k value from tier config
+     earned_score: float = 0.0
+@@ -210,6 +212,7 @@ def calculate_final_earned_score(self) -> float:
+             'spam': self.open_pr_spam_multiplier,
+             'decay': self.time_decay_multiplier,
+             'cred': self.credibility_multiplier,
++            'review': self.review_quality_multiplier,
+         }
+ 
+         self.earned_score = self.base_score * prod(multipliers.values())
+diff --git a/gittensor/constants.py b/gittensor/constants.py
+index d49735f7..5b766f86 100644
+--- a/gittensor/constants.py
++++ b/gittensor/constants.py
+@@ -121,6 +121,9 @@
+ # =============================================================================
+ MAINTAINER_ASSOCIATIONS = ['OWNER', 'COLLABORATOR']
+ 
++# PR Review Quality Multiplier
++REVIEW_PENALTY_RATE = 0.12  # 12% deduction per CHANGES_REQUESTED review from a maintainer
++
+ # Issue multiplier bonuses
+ MAX_ISSUE_AGE_BONUS = 0.75  # Max bonus for issue age (scales with sqrt of days open)
+ MAINTAINER_ISSUE_BONUS = 0.25  # Extra bonus when issue was created by a maintainer
+diff --git a/gittensor/utils/github_api_tools.py b/gittensor/utils/github_api_tools.py
+index ab24da6e..82649be5 100644
+--- a/gittensor/utils/github_api_tools.py
++++ b/gittensor/utils/github_api_tools.py
+@@ -335,6 +335,88 @@ def get_pull_request_file_changes(repository: str, pr_number: int, token: str) -
+     return []
+ 
+ 
++def get_pull_request_maintainer_changes_requested_count(repository: str, pr_number: int, token: str) -> int:
++    """
++    Count CHANGES_REQUESTED reviews from maintainers for a PR.
++
++    Paginates with per_page=100 (GitHub max) to fetch ALL reviews.
++    Uses retry logic with exponential backoff for transient failures.
++    On error, returns 0 (fail-safe: no penalty applied).
++
++    Args:
++        repository (str): Repository in format 'owner/repo'
++        pr_number (int): PR number
++        token (str): Github pat
++    Returns:
++        int: Number of CHANGES_REQUESTED reviews from maintainers
++    """
++    max_attempts = 3
++    per_page = 100
++    headers = make_headers(token)
++
++    all_reviews: list = []
++    page = 1
++    attempt = 0
++    last_error = None
++
++    while attempt < max_attempts:
++        try:
++            response = requests.get(
++                f'{BASE_GITHUB_API_URL}/repos/{repository}/pulls/{pr_number}/reviews',
++                headers=headers,
++                params={'per_page': per_page, 'page': page},
++                timeout=15,
++            )
++            if response.status_code == 200:
++                reviews = response.json()
++                all_reviews.extend(reviews)
++
++                if len(reviews) < per_page:
++                    return sum(
++                        1
++                        for review in all_reviews
++                        if review.get('state') == 'CHANGES_REQUESTED'
++                        and review.get('author_association') in MAINTAINER_ASSOCIATIONS
++                    )
++
++                page += 1
++                continue
++
++            # Request failed — prepare retry
++            last_error = f'status {response.status_code}'
++            all_reviews = []
++            page = 1
++            attempt += 1
++
++            if attempt < max_attempts:
++                backoff_delay = min(5 * (2 ** (attempt - 1)), 30)
++                bt.logging.warning(
++                    f'Reviews request for PR #{pr_number} in {repository} failed with status {response.status_code} '
++                    f'(attempt {attempt}/{max_attempts}), retrying in {backoff_delay}s...'
++                )
++                time.sleep(backoff_delay)
++
++        except requests.exceptions.RequestException as e:
++            last_error = str(e)
++            all_reviews = []
++            page = 1
++            attempt += 1
++
++            if attempt < max_attempts:
++                backoff_delay = min(5 * (2 ** (attempt - 1)), 30)
++                bt.logging.warning(
++                    f'Reviews request error for PR #{pr_number} in {repository} '
++                    f'(attempt {attempt}/{max_attempts}): {e}, retrying in {backoff_delay}s...'
++                )
++                time.sleep(backoff_delay)
++
++    bt.logging.error(
++        f'Reviews request for PR #{pr_number} in {repository} failed after {max_attempts} attempts: {last_error}. '
++        f'Defaulting to 0 (no penalty).'
++    )
++    return 0
++
++
+ # GraphQL fragment used by both issue submissions and solver detection.
+ _PR_TIMELINE_QUERY = """
+ query($owner: String!, $name: String!, $issueNumber: Int!) {
+diff --git a/gittensor/validator/oss_contributions/scoring.py b/gittensor/validator/oss_contributions/scoring.py
+index 09d57888..be9471e4 100644
+--- a/gittensor/validator/oss_contributions/scoring.py
++++ b/gittensor/validator/oss_contributions/scoring.py
+@@ -24,6 +24,7 @@
+     PIONEER_DIVIDEND_RATE_1ST,
+     PIONEER_DIVIDEND_RATE_2ND,
+     PIONEER_DIVIDEND_RATE_REST,
++    REVIEW_PENALTY_RATE,
+     SECONDS_PER_DAY,
+     SECONDS_PER_HOUR,
+     TIME_DECAY_GRACE_PERIOD_HOURS,
+@@ -35,6 +36,7 @@
+     FileContentPair,
+     fetch_file_contents_with_base,
+     get_pull_request_file_changes,
++    get_pull_request_maintainer_changes_requested_count,
+ )
+ from gittensor.validator.oss_contributions.credibility import (
+     calculate_credibility_per_tier,
+@@ -106,6 +108,13 @@ def score_pull_request(
+     file_contents = fetch_file_contents_for_pr(pr, miner_eval.github_pat)
+ 
+     pr.base_score = calculate_base_score(pr, programming_languages, token_config, file_contents)
++
++    # Fetch review data before multiplier calculation (only for merged PRs)
++    if pr.pr_state == PRState.MERGED:
++        pr.changes_requested_count = get_pull_request_maintainer_changes_requested_count(
++            pr.repository_full_name, pr.number, miner_eval.github_pat
++        )
++
+     calculate_pr_multipliers(pr, miner_eval, master_repositories)
+ 
+     if pr.pr_state == PRState.MERGED:
+@@ -207,6 +216,29 @@ def calculate_base_score(
+     return base_score
+ 
+ 
++def calculate_review_quality_multiplier(changes_requested_count: int) -> float:
++    """Calculate the review quality multiplier based on maintainer CHANGES_REQUESTED reviews.
++
++    Each CHANGES_REQUESTED review from a maintainer reduces the multiplier
++    by REVIEW_PENALTY_RATE cumulatively, floored at 0.0.
++
++    Formula: max(0.0, 1.0 - REVIEW_PENALTY_RATE × N)
++
++    Args:
++        changes_requested_count: Number of CHANGES_REQUESTED reviews from maintainers
++
++    Returns:
++        float: Multiplier in [0.0, 1.0]
++    """
++    multiplier = max(0.0, 1.0 - REVIEW_PENALTY_RATE * changes_requested_count)
++    if changes_requested_count > 0:
++        bt.logging.info(
++            f'{changes_requested_count} maintainer CHANGES_REQUESTED review(s) → '
++            f'review_quality_multiplier={multiplier:.2f}'
++        )
++    return multiplier
++
++
+ def calculate_pr_multipliers(
+     pr: PullRequest, miner_eval: MinerEvaluation, master_repositories: Dict[str, RepositoryConfig]
+ ) -> None:
+@@ -223,10 +255,13 @@ def calculate_pr_multipliers(
+         pr.open_pr_spam_multiplier = 1.0
+         pr.time_decay_multiplier = round(calculate_time_decay_multiplier(pr), 2)
+ 
++        pr.review_quality_multiplier = round(calculate_review_quality_multiplier(pr.changes_requested_count), 2)
++
+     else:
+         pr.open_pr_spam_multiplier = 1.0
+         pr.time_decay_multiplier = 1.0
+         pr.credibility_multiplier = 1.0
++        pr.review_quality_multiplier = 1.0
+ 
+ 
+ def calculate_open_pr_threshold(
+diff --git a/gittensor/validator/storage/queries.py b/gittensor/validator/storage/queries.py
+index 8fb4c75c..4fa1d79e 100644
+--- a/gittensor/validator/storage/queries.py
++++ b/gittensor/validator/storage/queries.py
+@@ -38,7 +38,7 @@
+     merged_at, pr_created_at, pr_state,
+     repo_weight_multiplier, base_score, issue_multiplier,
+     open_pr_spam_multiplier, pioneer_dividend, pioneer_rank, time_decay_multiplier,
+-    credibility_multiplier, raw_credibility, credibility_scalar,
++    credibility_multiplier, review_quality_multiplier, raw_credibility, credibility_scalar,
+     earned_score, collateral_score,
+     additions, deletions, commits, total_nodes_scored,
+     merged_by_login, description, last_edited_at,
+@@ -60,6 +60,7 @@
+     pioneer_rank = EXCLUDED.pioneer_rank,
+     time_decay_multiplier = EXCLUDED.time_decay_multiplier,
+     credibility_multiplier = EXCLUDED.credibility_multiplier,
++    review_quality_multiplier = EXCLUDED.review_quality_multiplier,
+     raw_credibility = EXCLUDED.raw_credibility,
+     credibility_scalar = EXCLUDED.credibility_scalar,
+     earned_score = EXCLUDED.earned_score,
+diff --git a/gittensor/validator/storage/repository.py b/gittensor/validator/storage/repository.py
+index ca498679..bd5b8e65 100644
+--- a/gittensor/validator/storage/repository.py
++++ b/gittensor/validator/storage/repository.py
+@@ -174,6 +174,7 @@ def store_pull_requests_bulk(self, pull_requests: List[PullRequest]) -> int:
+                     pr.pioneer_rank,
+                     pr.time_decay_multiplier,
+                     pr.credibility_multiplier,
++                    pr.review_quality_multiplier,
+                     pr.raw_credibility,
+                     pr.credibility_scalar,
+                     pr.earned_score,
+diff --git a/tests/validator/test_review_quality_multiplier.py b/tests/validator/test_review_quality_multiplier.py
+new file mode 100644
+index 00000000..620f1978
+--- /dev/null
++++ b/tests/validator/test_review_quality_multiplier.py
+@@ -0,0 +1,278 @@
++#!/usr/bin/env python3
++# The MIT License (MIT)
++# Copyright © 2025 Entrius
++
++"""
++Tests for PR review quality multiplier (issue #303).
++
++Covers:
++- calculate_review_quality_multiplier standalone function
++- review_quality_multiplier field on PullRequest and its effect on earned_score
++- get_pull_request_maintainer_changes_requested_count GitHub API function
++"""
++
++from unittest.mock import Mock, patch
++
++import pytest
++import requests
++
++from gittensor.classes import PRState
++from gittensor.constants import MAINTAINER_ASSOCIATIONS, REVIEW_PENALTY_RATE
++from gittensor.utils.github_api_tools import get_pull_request_maintainer_changes_requested_count
++from gittensor.validator.oss_contributions.scoring import calculate_review_quality_multiplier
++from gittensor.validator.oss_contributions.tier_config import TIERS, Tier
++from tests.validator.conftest import PRBuilder
++
++# ============================================================================
++# Fixtures
++# ============================================================================
++
++
++@pytest.fixture
++def builder():
++    return PRBuilder()
++
++
++@pytest.fixture
++def bronze():
++    return TIERS[Tier.BRONZE]
++
++
++# ============================================================================
++# Helpers
++# ============================================================================
++
++
++def _make_review(state: str, association: str) -> dict:
++    return {'state': state, 'author_association': association}
++
++
++# ============================================================================
++# TestCalculateReviewQualityMultiplier
++# ============================================================================
++
++
++class TestCalculateReviewQualityMultiplier:
++    """Tests for the standalone calculate_review_quality_multiplier function."""
++
++    def test_no_reviews_returns_one(self):
++        assert calculate_review_quality_multiplier(0) == 1.0
++
++    def test_one_review_applies_single_penalty(self):
++        result = calculate_review_quality_multiplier(1)
++        assert result == pytest.approx(1.0 - REVIEW_PENALTY_RATE)
++
++    def test_two_reviews_cumulative(self):
++        result = calculate_review_quality_multiplier(2)
++        assert result == pytest.approx(1.0 - 2 * REVIEW_PENALTY_RATE)
++
++    def test_table_values(self):
++        """Verify expected values across the penalty range."""
++        expected = {
++            0: 1.00,
++            1: 0.88,
++            2: 0.76,
++            3: 0.64,
++            4: 0.52,
++            5: 0.40,
++            6: 0.28,
++            7: 0.16,
++            8: 0.04,
++        }
++        for n, mult in expected.items():
++            assert calculate_review_quality_multiplier(n) == pytest.approx(mult, abs=1e-9), f'n={n}'
++
++    def test_floor_at_zero(self):
++        """Multiplier must not go below 0.0 for extreme counts."""
++        assert calculate_review_quality_multiplier(9) == 0.0
++
++    def test_large_count_stays_at_zero(self):
++        assert calculate_review_quality_multiplier(100) == 0.0
++
++    def test_returns_float(self):
++        assert isinstance(calculate_review_quality_multiplier(0), float)
++
++
++# ============================================================================
++# TestReviewQualityMultiplierOnPullRequest
++# ============================================================================
++
++
++class TestReviewQualityMultiplierOnPullRequest:
++    """Tests for review_quality_multiplier field on PullRequest and its effect on earned_score."""
++
++    def test_default_multiplier_is_one(self, builder, bronze):
++        pr = builder.create(state=PRState.MERGED, tier=bronze)
++        assert pr.review_quality_multiplier == 1.0
++
++    def test_default_changes_requested_count_is_zero(self, builder, bronze):
++        pr = builder.create(state=PRState.MERGED, tier=bronze)
++        assert pr.changes_requested_count == 0
++
++    def test_review_multiplier_reduces_earned_score(self, builder, bronze):
++        pr = builder.create(state=PRState.MERGED, tier=bronze)
++        pr.base_score = 100.0
++        pr.repo_weight_multiplier = 1.0
++        pr.issue_multiplier = 1.0
++        pr.open_pr_spam_multiplier = 1.0
++        pr.time_decay_multiplier = 1.0
++        pr.credibility_multiplier = 1.0
++
++        pr.review_quality_multiplier = 1.0
++        score_no_penalty = pr.calculate_final_earned_score()
++
++        pr.review_quality_multiplier = calculate_review_quality_multiplier(1)
++        score_one_review = pr.calculate_final_earned_score()
++
++        assert score_one_review == pytest.approx(score_no_penalty * 0.88)
++
++    def test_zero_multiplier_zeroes_earned_score(self, builder, bronze):
++        pr = builder.create(state=PRState.MERGED, tier=bronze)
++        pr.base_score = 50.0
++        pr.repo_weight_multiplier = 1.0
++        pr.issue_multiplier = 1.0
++        pr.open_pr_spam_multiplier = 1.0
++        pr.time_decay_multiplier = 1.0
++        pr.credibility_multiplier = 1.0
++        pr.review_quality_multiplier = 0.0
++
++        assert pr.calculate_final_earned_score() == 0.0
++
++    def test_multiplier_participates_in_product(self, builder, bronze):
++        """review_quality_multiplier participates in the product of all multipliers."""
++        pr = builder.create(state=PRState.MERGED, tier=bronze)
++        pr.base_score = 80.0
++        pr.repo_weight_multiplier = 1.0
++        pr.issue_multiplier = 1.0
++        pr.open_pr_spam_multiplier = 1.0
++        pr.time_decay_multiplier = 1.0
++        pr.credibility_multiplier = 1.0
++        pr.review_quality_multiplier = calculate_review_quality_multiplier(3)  # 0.64
++
++        earned = pr.calculate_final_earned_score()
++        assert earned == pytest.approx(80.0 * 0.64)
++
++
++# ============================================================================
++# TestGetPullRequestMaintainerChangesRequestedCount
++# ============================================================================
++
++
++class TestGetPullRequestMaintainerChangesRequestedCount:
++    """Tests for the GitHub API function that counts CHANGES_REQUESTED reviews from maintainers."""
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    def test_no_reviews_returns_zero(self, mock_get):
++        mock_get.return_value = Mock(status_code=200, **{'json.return_value': []})
++        assert get_pull_request_maintainer_changes_requested_count('owner/repo', 1, 'token') == 0
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    def test_counts_changes_requested_from_maintainers(self, mock_get):
++        reviews = [_make_review('CHANGES_REQUESTED', assoc) for assoc in MAINTAINER_ASSOCIATIONS]
++        mock_get.return_value = Mock(status_code=200, **{'json.return_value': reviews})
++        assert get_pull_request_maintainer_changes_requested_count('owner/repo', 1, 'token') == len(
++            MAINTAINER_ASSOCIATIONS
++        )
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    def test_ignores_non_maintainer_changes_requested(self, mock_get):
++        reviews = [
++            _make_review('CHANGES_REQUESTED', 'CONTRIBUTOR'),
++            _make_review('CHANGES_REQUESTED', 'NONE'),
++            _make_review('CHANGES_REQUESTED', 'OWNER'),  # only this counts
++        ]
++        mock_get.return_value = Mock(status_code=200, **{'json.return_value': reviews})
++        assert get_pull_request_maintainer_changes_requested_count('owner/repo', 1, 'token') == 1
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    def test_ignores_non_changes_requested_states(self, mock_get):
++        reviews = [
++            _make_review('APPROVED', 'OWNER'),
++            _make_review('COMMENTED', 'COLLABORATOR'),
++            _make_review('DISMISSED', 'OWNER'),
++            _make_review('CHANGES_REQUESTED', 'OWNER'),  # only this counts
++        ]
++        mock_get.return_value = Mock(status_code=200, **{'json.return_value': reviews})
++        assert get_pull_request_maintainer_changes_requested_count('owner/repo', 1, 'token') == 1
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    def test_multiple_reviews_from_same_maintainer_count_separately(self, mock_get):
++        reviews = [
++            _make_review('CHANGES_REQUESTED', 'OWNER'),
++            _make_review('CHANGES_REQUESTED', 'OWNER'),
++            _make_review('CHANGES_REQUESTED', 'OWNER'),
++        ]
++        mock_get.return_value = Mock(status_code=200, **{'json.return_value': reviews})
++        assert get_pull_request_maintainer_changes_requested_count('owner/repo', 1, 'token') == 3
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    @patch('gittensor.utils.github_api_tools.time.sleep')
++    @patch('gittensor.utils.github_api_tools.bt.logging')
++    def test_api_error_returns_zero(self, mock_logging, mock_sleep, mock_get):
++        """Fail-safe: any non-200 response returns 0 (no penalty applied)."""
++        mock_get.return_value = Mock(status_code=500)
++        assert get_pull_request_maintainer_changes_requested_count('owner/repo', 1, 'token') == 0
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    @patch('gittensor.utils.github_api_tools.time.sleep')
++    @patch('gittensor.utils.github_api_tools.bt.logging')
++    def test_request_exception_returns_zero(self, mock_logging, mock_sleep, mock_get):
++        """Fail-safe: network errors return 0 (no penalty applied)."""
++        mock_get.side_effect = requests.exceptions.RequestException('timeout')
++        assert get_pull_request_maintainer_changes_requested_count('owner/repo', 1, 'token') == 0
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    def test_uses_per_page_100_and_page_param(self, mock_get):
++        """Ensures pagination parameters are sent on each request."""
++        mock_get.return_value = Mock(status_code=200, **{'json.return_value': []})
++        get_pull_request_maintainer_changes_requested_count('owner/repo', 42, 'token')
++        _, kwargs = mock_get.call_args
++        assert kwargs.get('params', {}).get('per_page') == 100
++        assert kwargs.get('params', {}).get('page') == 1
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    def test_paginates_across_multiple_pages(self, mock_get):
++        """Fetches all pages when reviews exceed per_page and accumulates counts."""
++        page1 = [_make_review('CHANGES_REQUESTED', 'OWNER')] * 100  # full page
++        page2 = [
++            _make_review('CHANGES_REQUESTED', 'COLLABORATOR'),
++            _make_review('APPROVED', 'OWNER'),
++        ]
++        mock_get.side_effect = [
++            Mock(status_code=200, **{'json.return_value': page1}),
++            Mock(status_code=200, **{'json.return_value': page2}),
++        ]
++        result = get_pull_request_maintainer_changes_requested_count('owner/repo', 1, 'token')
++        assert result == 101  # 100 from page1 + 1 from page2
++        assert mock_get.call_count == 2
++        # Verify page param increments
++        assert mock_get.call_args_list[0][1]['params']['page'] == 1
++        assert mock_get.call_args_list[1][1]['params']['page'] == 2
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    @patch('gittensor.utils.github_api_tools.time.sleep')
++    @patch('gittensor.utils.github_api_tools.bt.logging')
++    def test_pagination_resets_on_retry(self, mock_logging, mock_sleep, mock_get):
++        """On failure mid-pagination, retries from page 1."""
++        page1 = [_make_review('CHANGES_REQUESTED', 'OWNER')] * 100
++        mock_get.side_effect = [
++            Mock(status_code=200, **{'json.return_value': page1}),  # page 1 OK
++            Mock(status_code=500),  # page 2 fails
++            Mock(status_code=200, **{'json.return_value': page1}),  # retry page 1
++            Mock(status_code=200, **{'json.return_value': [_make_review('CHANGES_REQUESTED', 'OWNER')]}),  # retry page 2
++        ]
++        result = get_pull_request_maintainer_changes_requested_count('owner/repo', 1, 'token')
++        assert result == 101
++
++    @patch('gittensor.utils.github_api_tools.requests.get')
++    def test_member_association_not_counted(self, mock_get):
++        """MEMBER is not in MAINTAINER_ASSOCIATIONS and should not be counted."""
++        reviews = [
++            _make_review('CHANGES_REQUESTED', 'MEMBER'),
++        ]
++        mock_get.return_value = Mock(status_code=200, **{'json.return_value': reviews})
++        assert get_pull_request_maintainer_changes_requested_count('owner/repo', 1, 'token') == 0
++
++
++if __name__ == '__main__':
++    pytest.main([__file__, '-v'])

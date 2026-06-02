@@ -12,7 +12,7 @@ RESULTS_DIR = REPO_ROOT / "results"
 ORACLE_ROW = {
     "rank": None,
     "agent": "Oracle (accepted solution)",
-    "score": 22.77,
+    "score": 22.76,
     "model": "—",
     "date": "—",
     "note": "Mean baseline (local heuristic)",
@@ -122,7 +122,7 @@ def main(out_path: str | None = None):
         "generated_at": date.today().isoformat(),
         "pool_size": len(problems),
         "shard_size": 30,
-        "oracle_score": 22.77,
+        "oracle_score": 22.76,
         "repos": by_repo,
         "leaderboard": leaderboard,
         "history": history,
