@@ -162,11 +162,12 @@ You produced this diff:
 ```
 
 Check it against these criteria:
-1. Does the diff address the root cause described in the issue above?
-2. Is every `@@` hunk header syntactically correct (line numbers make sense)?
-3. Are there missing changes or accidental deletions?
-4. Will running `{test_cmd}` pass after applying this diff?
-5. Is the implementation complete — does it handle edge cases, or is it a bare stub?
+1. Does the diff address every assertion in the test file, not just the surface symptom?
+2. Are `@@ -N` line numbers accurate? Cross-check with `N |` line markers in the context.
+3. Are there missing changes or accidental deletions that would break unrelated tests?
+4. Are all new symbols, functions, or classes properly imported in every file that uses them?
+5. Is the implementation complete — does it handle edge cases, or is it a bare stub that \
+   only handles the happy path?
 
 If the diff is correct and complete, respond with exactly: LGTM
 
