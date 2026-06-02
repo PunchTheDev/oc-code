@@ -1634,3 +1634,31 @@ Fix: added `_ASSERT_CONTAINS` tuple with `in` check (not `startswith`): `.assert
 - Benchmark: 430 problems, oracle 13.34, 20 repos (commit `6a66944`)
 - Agent: full Python test coverage for assertions (pytest, unittest.TestCase, mock/spy)
 - Pool: fully saturated; check ~2026-06-09 for new DAS registrations
+
+---
+
+## 2026-06-02 — Async Jest, Node.js assert, Go t.Error assertion patterns
+
+### Summary
+Added 8 new assertion patterns to `_extract_assertions` covering 1,627+ previously invisible occurrences across 52 problems in `jsonbored/gittensory` and `jsonbored/awesome-claude`.
+
+### Root cause
+Three gaps, all structural:
+1. **`await expect(` — 1,627 occurrences**: async Jest/Vitest assertions start with `await`, not `expect`. The `"expect("` prefix only matched synchronous calls. Every async assertion in gittensory (1,544) and awesome-claude (81) was invisible to the verify cross-check.
+2. **Node.js `assert.*` — 164+ occurrences**: Node.js built-in `assert` module uses lowercase (`assert.equal`, `assert.deepEqual`) — structurally different from Go testify's `assert.Equal` (uppercase). `assert.equal(` was not in the prefix list.
+3. **Go `t.Error(` — 27 occurrences**: The non-fatal counterpart to `t.Fatal(`. `t.Fatal` was already covered; `t.Error` was not.
+
+### Patterns added (commit `a8991c4`)
+- `await expect(` — async Jest/Vitest (1,627 pool occurrences, 52 problems)
+- `assert.equal(` — Node.js strict equality (164 occurrences)
+- `assert.deepEqual(` — Node.js deep equality (49 occurrences)
+- `assert.notEqual(` — Node.js inequality (4 occurrences)
+- `assert.throws(` — Node.js throw check (4 occurrences)
+- `assert.match(` — Node.js regex match (41 occurrences)
+- `assert.doesNotMatch(` — Node.js regex non-match (22 occurrences)
+- `t.Error(` — Go standard testing non-fatal (27 occurrences)
+
+### Status
+- Benchmark: 430 problems, oracle 13.34, 20 repos (commit `a8991c4`)
+- Agent: async Jest + Node.js assert + Go t.Error coverage added to verify
+- Pool: fully saturated; check ~2026-06-09 for new DAS registrations
