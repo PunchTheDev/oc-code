@@ -77,3 +77,30 @@ Ran `score_patch()` on problem 1033 (reference.diff as input). Surfaced two bugs
 3. Confirm frozen model preference (default: `claude-3-5-haiku` via OpenRouter)
 
 ---
+
+## 2026-06-02 — Pool 325, Product Polished, Awaiting Registration
+
+**Milestone: benchmark is feature-complete and ready for Gittensor registration.**
+
+### What's live
+
+- **325 curated problems** across 20 Gittensor-registered repos — all post-cutoff (merged 2026+), all with linked issues, test files, and DAS reference scores where available.
+- **Shard rotation**: 30 problems/eval, deterministic weekly seed so all evaluators see the same shard.
+- **Sandboxed harness**: Docker-per-problem, correctness gates before quality scoring, Gittensor's exact scoring formula (constants from `constants.py`).
+- **CI pipeline**: eval on PR (score comment upserted), record on merge, champion agent updated on new SOTA, weekly pool refresh (Sunday 02:00 UTC).
+- **Static dashboard** live at https://punchthedev.github.io/gittensor-miner-dashboard/ — leaderboard, SOTA chart, problem browser with DAS reference scores + diff viewer, live submission queue.
+- **`gitminer` CLI**: `eval`, `hash`, `shard`, `submit`, `parity` subcommands.
+- **SOTA-grade docs**: README with badges, CONTRIBUTING.md, threat model, hyperparameter rationale.
+
+### Calibration note
+
+Local harness over-estimates DAS reference scores by median 3.4×. Root cause: tree-sitter counts AST nodes with language weights; local heuristic counts raw diff tokens. Dashboard now shows this note inline in the problem drawer. CI is authoritative.
+
+### Waiting on operator
+
+1. `OPENROUTER_KEY` GitHub Actions secret — agents can't run without it.
+2. `DASHBOARD_DEPLOY_TOKEN` GitHub Actions secret — PAT with write access to dashboard repo, for CI auto-push.
+3. Confirm frozen model preference (default: `claude-3-5-haiku` via OpenRouter).
+4. Gittensor registration — team handles approval; hyperparameters.json is ready.
+
+---
