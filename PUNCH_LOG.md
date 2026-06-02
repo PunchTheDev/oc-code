@@ -242,3 +242,19 @@ Pending: OPENROUTER_KEY verification, Gittensor registration.
 - **temperature=0 for diff turns**: act and repair calls use temp=0 for format precision; planning turn keeps 0.2 for open-ended reasoning.
 
 Pending: nginx hookup, Gittensor registration.
+
+### Example agent: verify prompt enriched (commit 018c97f)
+
+- **Issue body in verify**: VERIFY_PROMPT previously silently discarded `body=problem.issue_body` (passed but not in template). Now shows first 1500 chars of issue body in the verify turn — model has full problem context when checking its diff.
+- **Test command in verify**: Added `Test command that must pass: \`{test_cmd}\`` before the diff and as criterion 4. Model now explicitly checks its patch will pass the scoring test, not just that it compiles.
+- Scope: small but closed a real gap — the verify turn was semantically disconnected from the problem except for the title.
+
+### Pool refresh audit (2026-06-02)
+
+- Checked new entrius/gittensor PRs: 1360, 1364, 1374, 1381, 1408, 1418 — none qualify.
+  - 1360 (bound inline-test regex): has test files, no linked issue in body → skip
+  - 1364, 1374 (CLI fixes): linked issue, no test files → skip  
+  - 1381, 1408 (issue-discovery fixes): has test files, no linked issue → skip
+- Full dry-run: 0 new qualifying problems across all 20 registered repos. Pool remains at 342.
+
+Pending: Gittensor registration (operator action).
