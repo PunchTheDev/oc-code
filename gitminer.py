@@ -21,7 +21,7 @@ Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
     python gitminer.py eval agent/submissions/myhandle/agent.py --all
     python gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
-    python gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected mean ~22.79
+    python gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected mean ~22.73
     python gitminer.py run --problem 0463
     python gitminer.py run --problem 0463 --agent agent/submissions/myhandle/agent.py
     python gitminer.py run --problem 0463 --show-ref --score --no-sandbox
@@ -60,10 +60,10 @@ def _oracle_mean() -> float:
         lb = json.loads((REPO_ROOT / "results" / "leaderboard.json").read_text())
         oracle = next((r for r in lb if "Oracle" in r.get("agent", "")), None)
         if oracle:
-            return float(oracle.get("score", 22.79))
+            return float(oracle.get("score", 22.73))
     except Exception:
         pass
-    return 22.79  # fallback
+    return 22.73  # fallback
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
