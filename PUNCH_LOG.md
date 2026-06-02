@@ -4,6 +4,22 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Pool refresh 343→347, score breakdown (commit cdb7b4c)
+
+### Pool expansion (+4 ragflow problems)
+- Added `infiniflow_ragflow_15116`, `15118`, `15266`, `15359` — all real API bug fixes with unit tests.
+- Pool: 343 → 347 problems. Oracle mean: 22.84 → 22.85.
+- Checked entrius/gittensor: 0 new qualifying PRs (saturated at #1407).
+
+### `gitminer run --score` — detailed scoring breakdown
+- **Test failure**: now shows last 20 lines of test output so miners know exactly what broke.
+- **Test pass**: shows source-token score with ASCII progress bar `[████████░░░░░░░░░░░░]` alongside the final score.
+- **Oracle delta**: comparison against this problem's oracle (reference diff score) with ± color.
+- **Mean oracle**: comparison against the pool-wide oracle mean (22.85).
+- Color-coded: green = beating reference, red = below, cyan = informational.
+
+---
+
 ## 2026-06-02 — Context file tree, gitminer info (commits 7238f6e, 0b2e016)
 
 ### Context file tree in dashboard drawer
