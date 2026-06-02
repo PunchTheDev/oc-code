@@ -1,16 +1,18 @@
 """
-Reference agent: observe → plan → act → verify loop.
+Reference agent: ranked-context observe → plan → act → verify loop.
 
 Demonstrates the scaffolding pattern — same frozen model, better wrapper.
 Miners compete to outperform this baseline.
 
 Improvements over a naive single-shot approach:
-- Explicit planning turn before generating a diff
-- Self-critique pass that catches obvious diff errors and triggers a repair
+- Context files ranked by keyword relevance to the issue — most relevant first,
+  over-long context truncated rather than blindly dumped into the prompt
+- Explicit file-and-line hypothesis required in the planning turn so the act
+  turn has a precise target
+- Structural diff validation beyond the basic `@@` presence check — catches
+  malformed hunk headers before committing to the result
+- Wider repair window (3 attempts, up from 2) with targeted feedback per failure mode
 - Structured reasoning log for transparency
-
-The loop is intentionally shallow (max 2 repair attempts) so miners have
-room to build richer loops with tool use, test feedback, and memory.
 """
 
 from __future__ import annotations
@@ -28,9 +30,13 @@ DEFAULT_MODEL = os.environ.get("BENCHMARK_MODEL", "deepseek/deepseek-chat")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 REFERER = "https://github.com/PunchTheDev/gittensor-base-miner"
 
-MAX_REPAIR_ATTEMPTS = 2
-# Number of LLM calls in worst case: plan + act + verify + repair × MAX_REPAIR_ATTEMPTS
+MAX_REPAIR_ATTEMPTS = 3
+# Worst-case call count: plan + act + verify + repair × MAX_REPAIR_ATTEMPTS
 MAX_CALLS = 3 + MAX_REPAIR_ATTEMPTS
+
+# Context window guards: never send more than this many files or chars of context.
+MAX_CONTEXT_FILES = 20
+MAX_CONTEXT_CHARS = 40_000
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +45,8 @@ MAX_CALLS = 3 + MAX_REPAIR_ATTEMPTS
 
 SYSTEM_PROMPT = """\
 You are an expert software engineer. You receive a GitHub issue and the \
-relevant source files, and your job is to produce a correct, minimal fix.
+relevant source files, and your job is to produce a correct, minimal fix \
+as a valid unified diff.
 """
 
 OBSERVE_PROMPT = """\
@@ -53,69 +60,111 @@ OBSERVE_PROMPT = """\
 ```
 {test_cmd}
 ```
-The scoring harness will run this command on your patched repo. Your fix must make it pass.
+The scoring harness runs this command on your patched repo. Your fix must make it pass.
 
 ## File tree
 ```
 {tree}
 ```
 
-## Context files
+## Context files (ranked by relevance)
 {files}
 
 ---
 
-Analyse the issue carefully. Answer these questions in order:
+Analyse the issue carefully. Answer in order:
 
-1. What is the root cause?
-2. Which files and lines need to change?
-3. What is the minimal correct change — no refactors, no style fixes?
-4. Will the test command above pass with this change?
+1. **Root cause** — one or two sentences.
+2. **Hypothesis** — which specific file(s) and line range(s) need to change?
+3. **Minimal change** — describe what the change is, no code yet.
+4. **Test check** — will `{test_cmd_short}` pass with this change? Why?
 
-Be concise and precise. Do not write any code yet.
+Be concise and precise.
 """
 
 ACT_PROMPT = """\
-Based on your analysis:
+Based on your analysis above, produce the unified diff.
 
-{plan}
-
-Now produce the unified diff that fixes the issue.
-
-Rules:
-- Output ONLY the unified diff, starting with `diff --git`.
-- No prose, no markdown code fences.
-- Smallest correct change only — no refactors or unrelated fixes.
-- The patch must apply cleanly and all tests must pass.
+Requirements:
+- Start with `diff --git a/<path> b/<path>`
+- Include `--- a/<path>` and `+++ b/<path>` headers
+- Each hunk starts with `@@ -<start>,<count> +<start>,<count> @@`
+- Only touch the lines identified in your hypothesis
+- No refactors, no style fixes, no unrelated changes
+- Output ONLY the diff — no markdown fences, no prose
 """
 
 VERIFY_PROMPT = """\
-You just produced this diff:
+You produced this diff:
 
 ```diff
 {diff}
 ```
 
-The issue was:
+Check it against these criteria:
+1. Does it address the root cause you identified?
+2. Is every `@@` hunk header syntactically correct (line numbers make sense)?
+3. Are there missing changes or accidental deletions?
 
-{title}
+If the diff is correct and complete, respond with exactly: LGTM
 
-{body}
+If it needs fixing, respond with the corrected diff only (no prose, starts with `diff --git`).
+"""
 
-Review the diff carefully. Answer:
-1. Does it address the root cause identified in your plan?
-2. Are the `---` / `+++` headers and hunk offsets syntactically correct?
-3. Are there any obviously wrong or missing changes?
+REPAIR_FORMAT_PROMPT = """\
+The diff you produced is not a valid unified diff.
 
-If the diff is correct, respond with exactly: LGTM
+Problem: {problem}
 
-If not, respond with a corrected diff starting with `diff --git` and nothing else.
+Please output a valid unified diff starting with `diff --git` and containing \
+at least one `@@` hunk. Nothing else.
 """
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Context ranking
 # ---------------------------------------------------------------------------
+
+
+def _rank_files(files: list[FileContext], issue_title: str, issue_body: str) -> list[FileContext]:
+    """Return files sorted by keyword relevance to the issue, most relevant first."""
+    issue_text = (issue_title + " " + issue_body).lower()
+
+    # Explicit file paths mentioned in the issue — strong relevance signal
+    mentioned_paths = set(re.findall(r"[\w/.-]+\.(?:py|ts|js|rs|go|java|kt|rb|cpp|c|h)", issue_text))
+
+    # Identifier tokens from the issue (snake_case, camelCase, UPPER_CASE)
+    raw_tokens = re.findall(r"\b([a-z_][a-z0-9_]{3,}|[A-Z][A-Za-z0-9]{3,})\b", issue_title + " " + issue_body)
+    keywords = {t.lower() for t in raw_tokens}
+
+    def score(f: FileContext) -> float:
+        path_lower = f.path.lower()
+        # High bonus if the file is explicitly mentioned
+        path_score = 20.0 * sum(1 for mp in mentioned_paths if mp in path_lower)
+        # Test files get a small boost — the issue often relates to what they assert
+        test_bonus = 3.0 if ("/test" in path_lower or "_test." in path_lower or "test_" in path_lower.split("/")[-1]) else 0.0
+        # Keyword density in file content (identifiers > 4 chars to reduce noise)
+        content_lower = f.content.lower()
+        keyword_hits = sum(1 for kw in keywords if len(kw) > 4 and kw in content_lower)
+        return path_score + test_bonus + keyword_hits
+
+    return sorted(files, key=score, reverse=True)
+
+
+def _truncate_context(files: list[FileContext]) -> list[FileContext]:
+    """Limit files sent to the LLM: at most MAX_CONTEXT_FILES files,
+    or until cumulative character count hits MAX_CONTEXT_CHARS."""
+    selected: list[FileContext] = []
+    total_chars = 0
+    for f in files:
+        if len(selected) >= MAX_CONTEXT_FILES:
+            break
+        file_chars = len(f.path) + len(f.content)
+        if total_chars + file_chars > MAX_CONTEXT_CHARS and selected:
+            break
+        selected.append(f)
+        total_chars += file_chars
+    return selected
 
 
 def _format_files(files: list[FileContext]) -> str:
@@ -126,21 +175,30 @@ def _format_files(files: list[FileContext]) -> str:
     return "\n\n".join(parts)
 
 
-def _extract_diff(text: str) -> str:
-    """Pull the unified diff out of LLM output, stripping markdown fences."""
-    text = text.strip()
-    fence = re.search(r"```(?:diff)?\s*\n(diff --git.+?)```", text, re.DOTALL)
-    if fence:
-        return fence.group(1).strip()
-    idx = text.find("diff --git")
-    if idx != -1:
-        return text[idx:].strip()
-    return text
+# ---------------------------------------------------------------------------
+# Diff validation
+# ---------------------------------------------------------------------------
 
 
 def _looks_valid(diff: str) -> bool:
-    """Basic sanity: must start with `diff --git` and have at least one hunk."""
+    """Must start with `diff --git` and contain at least one hunk."""
     return diff.startswith("diff --git") and "@@" in diff
+
+
+def _diagnose_diff(diff: str) -> str:
+    """Return a short description of the first structural problem found."""
+    if not diff.strip():
+        return "empty output — no diff produced"
+    if not diff.startswith("diff --git"):
+        return "does not start with `diff --git a/... b/...`"
+    if "@@" not in diff:
+        return "missing hunk header — no `@@ -N,N +N,N @@` line found"
+    # Check that every `@@` line has the expected format
+    for line in diff.splitlines():
+        if line.startswith("@@"):
+            if not re.match(r"@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", line):
+                return f"malformed hunk header: {line!r}"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +213,7 @@ def _call(
     max_tokens: int,
     timeout: float,
 ) -> str:
-    """Call the OpenRouter API. Retries once on 429 (rate limit) after a brief wait."""
+    """Call the OpenRouter API. Retries once on 429 (rate limit)."""
     for attempt in range(2):
         resp = httpx.post(
             OPENROUTER_URL,
@@ -178,9 +236,20 @@ def _call(
             continue
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
-    # Should not reach here, but satisfy type checker
     resp.raise_for_status()
     return ""
+
+
+def _extract_diff(text: str) -> str:
+    """Pull the unified diff out of LLM output, stripping markdown fences."""
+    text = text.strip()
+    fence = re.search(r"```(?:diff)?\s*\n(diff --git.+?)```", text, re.DOTALL)
+    if fence:
+        return fence.group(1).strip()
+    idx = text.find("diff --git")
+    if idx != -1:
+        return text[idx:].strip()
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -190,11 +259,13 @@ def _call(
 
 class ExampleAgent(BaseAgent):
     """
-    Observe → plan → act → verify agent.
+    Ranked-context observe → plan → act → verify agent.
 
-    Turn 1: analyse the issue and identify the root cause and required changes.
-    Turn 2: produce the unified diff.
-    Turn 3+: self-critique; repair if the diff looks wrong (up to MAX_REPAIR_ATTEMPTS).
+    Turn 1: rank context files by relevance, then analyse the issue to produce
+            an explicit file-and-line hypothesis.
+    Turn 2: produce the unified diff targeting the hypothesis.
+    Turn 3+: verify structural correctness; repair with targeted feedback if wrong
+             (up to MAX_REPAIR_ATTEMPTS).
     """
 
     def __init__(self, model: str = DEFAULT_MODEL) -> None:
@@ -210,8 +281,8 @@ class ExampleAgent(BaseAgent):
                 f"Model '{self.model}' is not in the allowed list: {problem.allowed_models}"
             )
 
-        # Distribute the wall-clock budget across all LLM calls so we can't
-        # exceed time_limit_seconds even in the worst case (all calls slow).
+        # Distribute wall-clock budget across all calls so we never exceed the limit
+        # even in the worst case.
         timeout = float(problem.time_limit_seconds) / MAX_CALLS
         token_budget = problem.output_token_budget
         plan_tokens = token_budget // 3
@@ -220,15 +291,24 @@ class ExampleAgent(BaseAgent):
 
         log: list[str] = []
 
+        # --- Rank and truncate context files ---
+        ranked = _rank_files(problem.context_files, problem.issue_title, problem.issue_body)
+        selected = _truncate_context(ranked)
+        dropped = len(problem.context_files) - len(selected)
+        if dropped > 0:
+            log.append(f"[context] {len(selected)}/{len(problem.context_files)} files selected (dropped {dropped} low-relevance files)")
+
         # --- Turn 1: Observe + Plan ---
         test_cmd_str = " ".join(problem.test_cmd) if problem.test_cmd else "pytest"
+        test_cmd_short = problem.test_cmd[-1] if problem.test_cmd else "pytest"
         observe_user = OBSERVE_PROMPT.format(
             title=problem.issue_title,
             body=problem.issue_body,
             repo=problem.repo_name,
             test_cmd=test_cmd_str,
+            test_cmd_short=test_cmd_short,
             tree="\n".join(problem.file_tree),
-            files=_format_files(problem.context_files),
+            files=_format_files(selected),
         )
         history: list[dict[str, str]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -239,8 +319,7 @@ class ExampleAgent(BaseAgent):
         history.append({"role": "assistant", "content": plan})
 
         # --- Turn 2: Act ---
-        act_user = ACT_PROMPT.format(plan=textwrap.shorten(plan, width=2000))
-        history.append({"role": "user", "content": act_user})
+        history.append({"role": "user", "content": ACT_PROMPT})
         raw_diff = _call(history, self.model, api_key, act_tokens, timeout)
         diff = _extract_diff(raw_diff)
         log.append(f"[diff v0]\n{diff}")
@@ -248,40 +327,39 @@ class ExampleAgent(BaseAgent):
 
         # --- Turn 3+: Verify + Repair ---
         for attempt in range(MAX_REPAIR_ATTEMPTS):
-            if _looks_valid(diff):
-                verify_user = VERIFY_PROMPT.format(
-                    diff=diff,
-                    title=problem.issue_title,
-                    body=problem.issue_body,
-                )
-                history.append({"role": "user", "content": verify_user})
-                verdict = _call(history, self.model, api_key, verify_tokens, timeout)
-                log.append(f"[verify {attempt}]\n{verdict}")
+            problem_desc = _diagnose_diff(diff)
 
-                if verdict.strip().upper().startswith("LGTM"):
-                    break
-
-                repaired = _extract_diff(verdict)
-                if _looks_valid(repaired):
-                    diff = repaired
-                    log.append(f"[diff v{attempt + 1}]\n{diff}")
-                    history.append({"role": "assistant", "content": verdict})
-                else:
-                    # Verdict was prose criticism, not a diff — accept what we have
-                    break
-            else:
-                history.append({
-                    "role": "user",
-                    "content": (
-                        "The diff you produced does not look like a valid unified diff "
-                        "(must start with `diff --git` and contain at least one `@@` hunk). "
-                        "Please output only the corrected unified diff."
-                    ),
-                })
+            if problem_desc:
+                # Structural problem — give targeted feedback before asking for repair
+                repair_msg = REPAIR_FORMAT_PROMPT.format(problem=problem_desc)
+                history.append({"role": "user", "content": repair_msg})
                 raw_diff = _call(history, self.model, api_key, act_tokens, timeout)
                 diff = _extract_diff(raw_diff)
-                log.append(f"[repair {attempt}]\n{diff}")
+                log.append(f"[repair {attempt} (format)]\n{diff}")
                 history.append({"role": "assistant", "content": raw_diff})
+                continue
+
+            # Diff looks structurally valid — ask for semantic verification
+            verify_user = VERIFY_PROMPT.format(
+                diff=diff,
+                title=problem.issue_title,
+                body=problem.issue_body,
+            )
+            history.append({"role": "user", "content": verify_user})
+            verdict = _call(history, self.model, api_key, verify_tokens, timeout)
+            log.append(f"[verify {attempt}]\n{verdict}")
+
+            if verdict.strip().upper().startswith("LGTM"):
+                break
+
+            repaired = _extract_diff(verdict)
+            if _looks_valid(repaired):
+                diff = repaired
+                log.append(f"[diff v{attempt + 1}]\n{diff}")
+                history.append({"role": "assistant", "content": verdict})
+            else:
+                # Prose critique without a new diff — accept current result
+                break
 
         reasoning = f"model={self.model}\n\n" + "\n\n".join(log)
         return Patch(diff=diff, reasoning=reasoning)

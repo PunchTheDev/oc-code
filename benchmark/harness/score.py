@@ -16,10 +16,10 @@ Final score is the base_score (0–30 scale, same as Gittensor native).
 
 Full precision scoring uses Gittensor's tree-sitter pipeline in Docker CI.
 This local implementation approximates src_tok via a token-counting heuristic
-on the unified diff. Local scores typically run 3–5× higher than DAS reference
-scores because tree-sitter parses AST nodes with language-specific weights, while
-this heuristic counts tokens on raw diff lines. Use local scores for relative
-comparison only; the authoritative score comes from Docker CI.
+on the unified diff. Local scores typically run ~2× higher than Gittensor's
+DAS validator scores (measured against 289 reference diffs with known DAS
+scores: local mean 23.47 vs DAS mean 10.78). Use local scores for relative
+iteration only; Docker CI gives the authoritative benchmark score.
 
 Usage:
     python benchmark/harness/score.py --problem benchmark/problems/930/ --patch my.diff
@@ -152,9 +152,9 @@ def approximate_src_token_score(diff_text: str, saturation_scale: float = SRC_TO
     higher weight (≈2–3x leaf identifiers), matching tree-sitter's structural
     node bonus weights.
 
-    Accuracy: rough estimate only. Local scores typically run 3–5× higher than
-    DAS reference scores due to the token-counting heuristic vs tree-sitter AST
-    parsing. Use for relative iteration only; CI gives authoritative scores.
+    Accuracy: rough estimate only. Local scores typically run ~2× higher than
+    DAS reference scores (measured: local mean 23.47 vs DAS mean 10.78 across
+    289 reference diffs). Use for relative iteration only; CI gives authoritative scores.
     """
     lines = diff_text.splitlines()
     src_score = 0.0
@@ -288,7 +288,7 @@ def _score_in_worktree(
     base_score = compute_base_score(src_tok, total_tok, saturation_scale)
 
     scoring_note = (
-        "local approximation (typically 3–5× above DAS) — "
+        "local approximation (~2× above DAS on average) — "
         "CI uses Gittensor tree-sitter pipeline for authoritative score"
     )
     if all_skipped:

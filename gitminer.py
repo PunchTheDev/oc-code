@@ -149,7 +149,7 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
     if args.no_sandbox:
         print(f"\n  Note: --no-sandbox scores use a local heuristic that typically")
-        print(f"  runs 3–5× above Docker CI scores. Use these for relative comparison")
+        print(f"  runs ~2× above Docker CI scores. Use these for relative comparison")
         print(f"  only — the authoritative score comes from CI (git push + open PR).")
 
     print(f"{'─'*54}")
@@ -733,7 +733,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                     sign = "+" if delta >= 0 else ""
                     print(f"Baseline : {ref_score:.2f}  (delta {sign}{delta:.2f})")
             if args.no_sandbox:
-                print("Note: --no-sandbox scores run ~3–5× above Docker CI.")
+                print("Note: --no-sandbox scores run ~2× above Docker CI.")
         finally:
             tmp_path.unlink(missing_ok=True)
     elif args.score:
