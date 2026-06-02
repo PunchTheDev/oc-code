@@ -4,7 +4,9 @@ Docker-sandboxed problem runner.
 Executes scoring for a single benchmark problem inside an isolated container:
   - Hard time limit enforced via subprocess timeout + docker kill
   - Memory cap via --memory
-  - Network blocked (--network none) — no exfiltration, no model cheating
+  - Setup phase: network allowed for git clone / apt-get / pip install
+  - Score phase: network blocked (--network none) — scorer only reads staging files
+  - Secrets (OPENROUTER_KEY etc.) never passed to containers — no model cheating
   - Ephemeral: container is removed after each run (--rm)
 
 Usage:
@@ -159,12 +161,14 @@ def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
     host_timeout = time_limit + KILL_GRACE + 60
 
     # Phase 1: setup + test
+    # Network is allowed here so git clone, apt-get, and pip install succeed.
+    # OPENROUTER_KEY and other secrets are not passed to the container, so the
+    # agent's patch cannot call external model APIs even with network access.
     setup_cmd = [
         "docker", "run", "--rm",
         "--name", container_name,
         "--memory", MEMORY_LIMIT,
         "--cpus", CPU_LIMIT,
-        "--network", "none",
         "--stop-timeout", str(KILL_GRACE),
         "-v", f"{staging}:/staging",
         EVAL_IMAGE,
