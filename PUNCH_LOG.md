@@ -107,3 +107,10 @@ Local harness over-estimates DAS reference scores by median 3.4×. Root cause: t
 2. Gittensor registration — team handles approval; hyperparameters.json is ready.
 
 ---
+
+## 2026-06-02 — CLI DX improvements
+
+- **Repo cache for local eval** (commit 7da8450): `score.py` now maintains `~/.cache/gitminer/repos/` — one clone per unique repo, then git worktrees per problem. Cuts 30-problem `--no-sandbox` eval time dramatically after first run.
+- **`gitminer cache`** (commit 7da8450): pre-warms the cache across all 325 problems' repos with progress output.
+- **`gitminer problems`** (commit dd41305): list/filter/sort all 325 problems by language, difficulty, repo, or text search. Reads baselines.json for difficulty tier.
+- **Better eval summary** (commit b796e28): shows pass rate, language breakdown (Python/JS/Rust/Java pass counts), and failed problem list with test failure hint.
