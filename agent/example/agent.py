@@ -69,6 +69,18 @@ Improvements over a naive single-shot approach:
   LLMs frequently miscalculate these counts; incorrect counts cause `git apply` to
   reject otherwise correct diffs. This is a deterministic post-processor — no API
   calls, no model changes.
+- Line-number prefix stripping: `_strip_line_number_prefixes()` removes `N | `
+  display artifacts from diff content lines. When source files show `  42 | def foo():`,
+  models sometimes copy that prefix into the diff context lines, causing git apply to
+  fail because ` 42 | def foo():` doesn't exist in any real file. Applied before hunk
+  count recomputation so counts reflect the final content.
+- Trailing prose trimming: `_trim_trailing_prose()` removes non-diff text after the
+  last hunk line. Models sometimes append an explanation like "This patch fixes the
+  issue." after the final hunk; git apply rejects that trailing text. Applied after
+  extraction, before hunk count fix.
+- Sibling import budget raised to 12 KB (from 6 KB): Go same-package files average
+  2-4 KB each; the old limit cut off after 1-2 files, leaving the agent without
+  factory or interface definitions it needs.
 """
 
 from __future__ import annotations
@@ -630,7 +642,7 @@ def _expand_sibling_imports(
     selected: list[FileContext],
     all_impl: list[FileContext],
     file_tree: list[str],
-    char_budget: int = 6_000,
+    char_budget: int = 12_000,
 ) -> list[FileContext]:
     """Add sibling modules that top-ranked files locally import from.
 
@@ -642,7 +654,10 @@ def _expand_sibling_imports(
     ``helpers.py``, so it either hallucinates a definition or omits the import.
 
     Adds at most ``char_budget`` additional characters of sibling content so
-    the overall context budget isn't blown.
+    the overall context budget isn't blown.  Budget is 12 KB (raised from 6 KB)
+    because Go same-package files average 2-4 KB each, so 6 KB only allowed
+    one or two siblings before cutting off — insufficient for packages with
+    multiple factory/interface files.
     """
     all_by_path = {f.path: f for f in all_impl}
     already = {f.path for f in selected}
@@ -1027,6 +1042,52 @@ def _trim_test_output(output: str, head: int = 30, tail: int = 50) -> str:
     return f"{top}\n... [{omitted} lines omitted] ...\n{bottom}"
 
 
+_LINE_NUM_PREFIX = re.compile(r"^([+ -])\s*\d+\s+\|\s?")
+
+
+def _strip_line_number_prefixes(diff: str) -> str:
+    """Remove `N | ` display artifacts from diff content lines.
+
+    When source files are shown with `  N | content` line numbers, LLMs
+    sometimes copy those prefixes into the diff despite the instruction not to.
+    git apply then rejects the hunk because ` 42 | def foo():` doesn't appear
+    in any real file.
+
+    This strips the `N | ` portion while keeping the leading ` `/`+`/`-` marker,
+    so the actual file content is preserved.  Only touches diff content lines —
+    `diff --git`, `--- `, `+++ `, `@@ `, and `\\ ` lines are left untouched.
+    """
+    skip_prefixes = ("diff --git", "--- ", "+++ ", "@@ ", "\\ ")
+    result = []
+    for line in diff.splitlines():
+        if any(line.startswith(p) for p in skip_prefixes):
+            result.append(line)
+            continue
+        m = _LINE_NUM_PREFIX.match(line)
+        result.append(m.group(1) + line[m.end():] if m else line)
+    return "\n".join(result)
+
+
+def _trim_trailing_prose(diff: str) -> str:
+    """Remove non-diff text that appears after the last hunk line.
+
+    `_extract_diff` grabs everything from the first `diff --git` to the end
+    of the string.  If the model appended an explanation like "This patch
+    makes the tests pass." after the final hunk, git apply fails on that
+    trailing text.  Walk backwards to the last real diff line and truncate.
+    """
+    lines = diff.splitlines()
+    diff_starts = ("diff --git", "--- ", "+++ ", "@@ ", "\\ No newline")
+    for i in range(len(lines) - 1, -1, -1):
+        line = lines[i]
+        if line and (
+            line[0] in (" ", "+", "-")
+            or any(line.startswith(p) for p in diff_starts)
+        ):
+            return "\n".join(lines[: i + 1])
+    return diff
+
+
 def _looks_valid(diff: str) -> bool:
     """Must start with `diff --git` and contain at least one hunk."""
     return diff.startswith("diff --git") and "@@" in diff
@@ -1342,8 +1403,10 @@ class ExampleAgent(BaseAgent):
                 # Prose critique without a new diff — accept current result
                 break
 
-        # Post-process: recompute hunk line counts — LLMs frequently miscalculate
-        # b/d in @@ -a,b +c,d @@, causing git apply to reject otherwise correct diffs.
+        # Post-process in order: strip display artifacts, trim trailing prose,
+        # then recompute hunk counts (must come last — counts depend on final line set).
+        diff = _strip_line_number_prefixes(diff)
+        diff = _trim_trailing_prose(diff)
         diff = _fix_hunk_counts(diff)
 
         reasoning = f"model={self.model}\n\n" + "\n\n".join(log)
@@ -1391,6 +1454,8 @@ class ExampleAgent(BaseAgent):
             diff = _extract_diff(raw_diff)
             log.append(f"[repair format fix]\n{diff}")
 
+        diff = _strip_line_number_prefixes(diff)
+        diff = _trim_trailing_prose(diff)
         diff = _fix_hunk_counts(diff)
         reasoning = (failed_patch.reasoning or "") + "\n\n" + f"model={self.model}\n\n" + "\n\n".join(log)
         return Patch(diff=diff, reasoning=reasoning)
