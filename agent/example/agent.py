@@ -300,10 +300,15 @@ Improvements over a naive single-shot approach:
   `self.assertNotEqual(`, `self.assertTrue(`, `self.assertFalse(`, `self.assertIsNone(`,
   `self.assertIsNotNone(`, `self.assertIn(`, `self.assertNotIn(`, `self.assertRaises(`,
   `self.assertAlmostEqual(`, `self.assertGreater(`, `self.assertGreaterEqual(`,
-  `self.assertLess(`, `self.assertLessEqual(`, plus `pytest.raises(`.
+  `self.assertLess(`, `self.assertLessEqual(`, plus `pytest.raises(` (both direct and `with` forms).
   Root cause: `self.assert*` does not start with `assert ` (has `self.` prefix), so every
   Python test that uses `unittest.TestCase` subclass methods was silently skipped, leaving
-  the verify step blind to the actual test requirements.
+  the verify step blind to the actual test requirements.  521 occurrences in pool.
+- `_extract_assertions` mock/spy assertion contains-check: added secondary `_ASSERT_CONTAINS`
+  tuple checked via `in` (not `startswith`), covering `mock_obj.assert_called_once_with(...)`,
+  `.assert_not_called()`, `.assert_any_call()`, `.assert_has_calls()`.  Root cause: mock
+  assertions appear as `variable.method.assert_*()` — the variable name is not fixed, so prefix
+  matching is impossible.  452 occurrences in pool; now visible to the verify cross-check.
 """
 
 from __future__ import annotations
@@ -1463,7 +1468,8 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
 
     Caps at `limit` lines to keep the verify prompt compact.  Recognises
     assert styles for Python (pytest + unittest.TestCase self.assert*), Rust,
-    Go (testify), TypeScript/Jest, Kotlin, Java, and Ruby Minitest.
+    Go (testify), TypeScript/Jest, Kotlin, Java, Ruby Minitest, and Python
+    mock/spy assertions (mock_obj.assert_called_once_with(...) — contains check).
     Limit raised from 30 to 50: large test suites put the most specific
     edge-case assertions near the end, which the old cap would drop.
     """
@@ -1549,12 +1555,26 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
         "refute_match ",   "refute_match(",
         "refute_empty ",   "refute_empty(",
     )
+    # Mock/spy assertions: `mock_obj.assert_called_once_with(...)` — variable name varies
+    # so we can't match by prefix.  Check if the stripped line contains these substrings.
+    _ASSERT_CONTAINS = (
+        ".assert_called(",
+        ".assert_called_once(",
+        ".assert_called_once_with(",
+        ".assert_not_called(",
+        ".assert_any_call(",
+        ".assert_called_with(",
+        ".assert_has_calls(",
+    )
     lines: list[str] = []
     seen: set[str] = set()
     for f in test_files:
         for raw in f.content.splitlines():
             stripped = raw.strip()
-            if stripped not in seen and any(stripped.startswith(p) for p in _ASSERT_PREFIXES):
+            if stripped not in seen and (
+                any(stripped.startswith(p) for p in _ASSERT_PREFIXES)
+                or any(p in stripped for p in _ASSERT_CONTAINS)
+            ):
                 lines.append(stripped)
                 seen.add(stripped)
             if len(lines) >= limit:
