@@ -2093,3 +2093,27 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - Benchmark: **430 problems**, oracle **11.83**, commits `6d4deb0`, `31c7a18`, `d957b22`
 - All three fixes are in production (pushed to main)
 - Next DAS pool check: ~2026-06-16
+
+---
+
+## 2026-06-02 — Difficulty tier alignment
+
+**Problem**: `generate_dashboard_data.py` defined difficulty based on oracle AST score (higher score = easier), while `evaluate.py` defines difficulty by reference diff added-line count for scoring weights. The two systems were completely inconsistent — a problem with 1397 added lines showed "easy" in the dashboard but would be "hard" (2× weight) in actual scoring.
+
+**Fix**: Aligned `generate_dashboard_data.py` with `evaluate.py`'s DIFFICULTY_TIERS:
+- easy: < 30 added lines (×1 scoring weight)
+- medium: 30–149 added lines (×1.5 weight)
+- hard: ≥150 added lines (×2 weight)
+
+**Dashboard updates**:
+- Difficulty badges now show scoring weight label inline: "hard ×2", "medium ×1.5", "easy ×1"
+- Tier column tooltip explains the line-count-based system
+- New info box in Categories & Sampling explains how difficulty weights affect the final score
+- `data.json` regenerated with corrected difficulty (now: easy:27, medium:143, hard:260)
+
+**New pool distribution by difficulty**: 27 easy (< 30 lines), 143 medium, 260 hard — accurately reflects that DAS benchmark problems are mostly substantial changes.
+
+### Status
+- Benchmark: **430 problems**, oracle **11.83**, commit `3a68b53`
+- Dashboard: difficulty badges aligned with scoring weights, commit `19cca40`
+- Both pushed to main
