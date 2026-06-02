@@ -162,6 +162,10 @@ Improvements over a naive single-shot approach:
   this caused a `KeyError: 'choices'` that propagated as an exception, scoring the problem 0.
   Now `_call` checks for `choices` presence and retries once; on a second failure returns `""`.
   Also retries 400 responses (content policy, transient routing errors) once before giving up.
+- Verify prose-critique feedback loop: when the verify step returns a textual critique but no
+  corrected diff, previously the loop broke immediately — accepting the unverified diff. Now the
+  critique is stored in history and the loop continues, letting the model self-correct by
+  producing a diff on the next iteration (still within the budgeted MAX_REPAIR_ATTEMPTS calls).
 """
 
 from __future__ import annotations
@@ -2050,8 +2054,16 @@ class ExampleAgent(BaseAgent):
                         ),
                     })
             else:
-                # Prose critique without a new diff — accept current result
-                break
+                # Prose critique without a corrected diff.
+                # Store the critique in history so the next verify iteration
+                # sees it and can self-correct by producing a diff this time.
+                # Only continue if we have iterations remaining — on the last
+                # attempt, break and keep the current diff.
+                if attempt < MAX_REPAIR_ATTEMPTS - 1:
+                    history.append({"role": "assistant", "content": verdict})
+                    log.append(f"[verify {attempt}] prose critique — retrying with feedback")
+                else:
+                    break
 
         # Final post-process pass to catch any artifacts introduced after the last
         # repair step (e.g. by the prose-critique branch above).
