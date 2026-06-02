@@ -1285,3 +1285,21 @@ This closes the loop: the structural summary (added two steps ago) now has a cri
 - Benchmark: 430 problems, oracle 23.46 (unchanged)
 - Pool: all repos saturated — next check 2026-06-09
 - Pending: Gittensor registration, nginx hookup
+
+## 2026-06-02 — Agent: _fix_new_starts (commit 0508f3b)
+
+### +c new-start recalculation (commit 0508f3b)
+
+Root cause: `_fix_hunk_offsets` corrects `-N` (old-start) values and `_fix_hunk_counts` corrects `b`/`d` (line counts). But `+c` (new-start) was never recalculated — whatever the LLM wrote was kept verbatim even after `-N` was moved.
+
+For a valid diff, `+c` must equal `old_start + cumulative_delta` where `cumulative_delta = sum(new_count - old_count)` for all prior hunks in the same file. A stale `+c` causes `git apply` to fail on multi-hunk diffs where offset correction moved any `-N`.
+
+Fix: `_fix_new_starts()` as stage 7 of `_post_process` — runs after `_fix_hunk_counts` so it sees final counts. Resets delta to 0 at each `diff --git` boundary. Skips new-file hunks (`@@ -0,0`). Verified with smoke tests:
+- Single file, 2 hunks: hunk 1 adds 3 lines → hunk 2 `+c` correctly becomes `30 + 3 = 33`
+- Multi-file: delta resets at file boundary
+- New-file hunk: `@@ -0,0 +1,N @@` left unchanged
+
+### Status
+- Benchmark: 430 problems, oracle 23.46 (unchanged)
+- Pool: all repos saturated — next check 2026-06-09
+- Pending: Gittensor registration, nginx hookup
