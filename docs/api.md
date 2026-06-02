@@ -25,7 +25,7 @@ Liveness check.
 ```json
 {
   "status": "ok",
-  "pool_size": 400,
+  "pool_size": 430,
   "version": "1.0"
 }
 ```
@@ -34,16 +34,16 @@ Liveness check.
 
 ### `GET /api/stats`
 
-Pool-level statistics: language and difficulty distribution, repo count, mean baseline.
+Pool-level statistics: category and difficulty distribution, repo count, oracle score.
 
 ```json
 {
-  "pool_size": 400,
+  "pool_size": 430,
   "shard_size": 30,
-  "repos": 13,
-  "mean_baseline": 23.46,
-  "by_language": { "py": 200, "js": 68, "rs": 40, "java": 34 },
-  "by_difficulty": { "easy": 80, "medium": 140, "hard": 122 },
+  "repos": 18,
+  "oracle_score": 11.83,
+  "by_category": { "python": 198, "typescript": 87, "rust": 66, "jvm": 42, "ruby": 37 },
+  "by_difficulty": { "easy": 169, "medium": 106, "hard": 155 },
   "rotation_policy": "weekly"
 }
 ```
@@ -53,7 +53,7 @@ Pool-level statistics: language and difficulty distribution, repo count, mean ba
 ### `GET /api/shard`
 
 The current 30-problem weekly shard — the same problems CI uses this week.
-Rotates every Monday 00:00 UTC.
+Rotates every Monday 00:00 UTC. Category-balanced: 12 python · 8 typescript · 5 rust · 3 jvm · 2 ruby.
 
 ```json
 {
@@ -66,11 +66,11 @@ Rotates every Monday 00:00 UTC.
       "repo": "entrius/gittensor",
       "pr": 463,
       "issue_number": 462,
-      "issue_title": "Add repo-level open PR exclusions",
+      "issue_title": "[BUG] Repo scan ignores 35-day window",
       "merged_at": "2026-02-10T14:22:00Z",
-      "language": "py",
-      "difficulty": "medium",
-      "baseline_score": 21.5,
+      "category": "python",
+      "difficulty": "easy",
+      "baseline_score": 3.86,
       "test_cmd": ["python", "-m", "pytest", "--tb=short", "-q", "tests/..."]
     }
   ]
@@ -85,26 +85,26 @@ Full problem list with optional filters and pagination.
 
 **Query parameters**
 
-| param       | type   | description                                          |
-|-------------|--------|------------------------------------------------------|
-| `lang`      | string | Filter by language: `py`, `js`, `rs`, `java`         |
-| `difficulty`| string | Filter by difficulty: `easy`, `medium`, `hard`       |
-| `repo`      | string | Filter by repo name substring (e.g. `ragflow`)       |
-| `q`         | string | Full-text search over issue title and repo name      |
-| `limit`     | int    | Max results to return (default: 100)                 |
-| `offset`    | int    | Skip first N results for pagination (default: 0)     |
+| param        | type   | description                                                     |
+|--------------|--------|-----------------------------------------------------------------|
+| `cat`        | string | Filter by category: `python`, `typescript`, `rust`, `jvm`, `ruby` |
+| `difficulty` | string | Filter by difficulty: `easy`, `medium`, `hard`                  |
+| `repo`       | string | Filter by repo name substring (e.g. `ragflow`)                  |
+| `q`          | string | Full-text search over issue title and repo name                 |
+| `limit`      | int    | Max results to return (default: 100)                            |
+| `offset`     | int    | Skip first N results for pagination (default: 0)                |
 
 **Example**
 
 ```bash
-curl "http://localhost:8083/api/problems?lang=py&difficulty=hard&limit=10"
+curl "http://localhost:8083/api/problems?cat=python&difficulty=hard&limit=10"
 ```
 
 **Response**
 
 ```json
 {
-  "total": 122,
+  "total": 155,
   "offset": 0,
   "limit": 10,
   "problems": [ ... ]
@@ -127,22 +127,34 @@ curl http://localhost:8083/api/problems/0463
   "repo": "entrius/gittensor",
   "pr": 463,
   "issue_number": 462,
-  "issue_title": "Add repo-level open PR exclusions",
+  "issue_title": "[BUG] Repo scan ignores 35-day window",
   "merged_at": "2026-02-10T14:22:00Z",
-  "language": "py",
-  "difficulty": "medium",
-  "baseline_score": 21.5,
+  "category": "python",
+  "difficulty": "easy",
+  "baseline_score": 3.86,
   "test_cmd": ["python", "-m", "pytest", "--tb=short", "-q", "tests/..."],
-  "base_commit": "abc123...",
+  "base_commit": "73a98d1f37ee...",
   "repo_url": "https://github.com/entrius/gittensor",
-  "issue_body": "Please add the ability to ...",
+  "issue_body": "The repo scan ...",
   "file_tree": ["gittensor/__init__.py", "..."],
-  "context_files": ["gittensor/validator/evaluation/reward.py", "..."],
-  "das_score": "12.34",
-  "das_token_score": "15.67",
+  "context_files": ["gittensor/validator/issue_discovery/repo_scan.py", "..."],
+  "das_score": 0.0,
+  "das_token_score": 12.32,
   "time_limit_seconds": 120,
-  "output_token_budget": 50000
+  "output_token_budget": 50000,
+  "diff_stats": { "add": 13, "remove": 0, "files": 1, "bytes": 498 },
+  "diff_url": "/api/problems/0463/diff"
 }
+```
+
+---
+
+### `GET /api/problems/{id}/diff`
+
+Raw unified diff of the accepted (reference) solution. Returns `text/plain`.
+
+```bash
+curl http://localhost:8083/api/problems/0463/diff
 ```
 
 ---
@@ -157,18 +169,18 @@ Current ranked submissions.
     {
       "rank": 1,
       "agent": "alice/my-agent",
-      "score": 19.4,
+      "score": 14.8,
       "model": "deepseek/deepseek-chat",
-      "date": "2026-06-01",
+      "date": "2026-06-10",
       "note": ""
     },
     {
       "rank": null,
       "agent": "Oracle (accepted solution)",
-      "score": 23.46,
+      "score": 11.83,
       "model": "—",
       "date": "—",
-      "note": "Upper bound (accepted solutions mean)"
+      "note": "Mean tree-sitter score across 430 accepted solutions (Gittensor DAS network only)"
     }
   ]
 }
@@ -187,7 +199,7 @@ r = urllib.request.urlopen("http://localhost:8083/api/shard")
 shard = json.loads(r.read())
 
 for p in shard["problems"]:
-    print(f"{p['id']}  [{p['difficulty']:6}]  {p['issue_title'][:60]}")
+    print(f"{p['id']}  [{p['category']:10}  {p['difficulty']:6}]  {p['issue_title'][:60]}")
 ```
 
 ## Using the API with `gitminer mine`

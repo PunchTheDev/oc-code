@@ -44,6 +44,30 @@ CORS_HEADERS = {
     "Access-Control-Allow-Headers": "Content-Type",
 }
 
+# Mirrors benchmark/evaluate.py — repo → language category used everywhere else.
+REPO_CATEGORY: dict[str, str] = {
+    "entrius/gittensor": "python",
+    "entrius/allways": "python",
+    "entrius/das-github-mirror": "python",
+    "entrius/allways-ui": "typescript",
+    "entrius/gittensor-ui": "typescript",
+    "entrius/oc-1": "typescript",
+    "aglover1221/product-data-extractor": "python",
+    "cogniax/tao-pulse-app": "typescript",
+    "e35ventura/taopedia": "python",
+    "e35ventura/taopedia-articles": "python",
+    "geniepod/genie-claw": "rust",
+    "infiniflow/ragflow": "python",
+    "jsonbored/awesome-claude": "typescript",
+    "jsonbored/gittensory": "typescript",
+    "mkdev11/gittensor-hub": "typescript",
+    "vouchdev/vouch": "typescript",
+    "phase-rs/phase": "rust",
+    "seroperson/jvm-live-reload": "jvm",
+    "touchpilot/touchpilot": "jvm",
+    "we-promise/sure": "ruby",
+}
+
 
 # ---------------------------------------------------------------------------
 # Data loading helpers
@@ -105,16 +129,22 @@ def _shard_ids(all_ids: list[str], config: dict) -> list[str]:
 
 
 def _difficulty(base_score: float) -> str:
-    if base_score >= 26:
+    if base_score >= 15:
         return "easy"
-    if base_score >= 18:
+    if base_score >= 5:
         return "medium"
     return "hard"
+
+
+def _category(meta: dict) -> str:
+    repo = meta.get("repo_name", "").lower()
+    return REPO_CATEGORY.get(repo, "python")
 
 
 def _problem_summary(meta: dict, baselines: dict[str, float]) -> dict:
     pid = meta["id"]
     score = baselines.get(pid, 0.0)
+    cat = _category(meta)
     return {
         "id": pid,
         "repo": meta.get("repo_name", ""),
@@ -122,7 +152,7 @@ def _problem_summary(meta: dict, baselines: dict[str, float]) -> dict:
         "issue_number": meta.get("issue_number"),
         "issue_title": meta.get("issue_title", ""),
         "merged_at": meta.get("merged_at", ""),
-        "language": _infer_language(meta.get("test_cmd", [])),
+        "category": cat,
         "difficulty": _difficulty(score),
         "baseline_score": round(score, 2),
         "test_cmd": meta.get("test_cmd", []),
@@ -140,23 +170,6 @@ def _diff_stats(problem_id: str) -> dict:
     remove = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
     files = sum(1 for l in lines if l.startswith("diff --git "))
     return {"add": add, "remove": remove, "files": files, "bytes": len(content.encode())}
-
-
-def _infer_language(test_cmd: list[str]) -> str:
-    cmd = " ".join(test_cmd).lower()
-    if "pytest" in cmd or "python" in cmd:
-        return "py"
-    if "npm" in cmd or "jest" in cmd or "node" in cmd:
-        return "js"
-    if "cargo" in cmd:
-        return "rs"
-    if "gradle" in cmd or "mvn" in cmd or "java" in cmd:
-        return "java"
-    if "go test" in cmd:
-        return "go"
-    if "ruby" in cmd or "rspec" in cmd:
-        return "rb"
-    return "other"
 
 
 # ---------------------------------------------------------------------------
@@ -220,15 +233,15 @@ class Handler(BaseHTTPRequestHandler):
         all_ids = _all_problem_ids()
         shard = _shard_ids(all_ids, config)
 
-        by_lang: dict[str, int] = {}
+        by_category: dict[str, int] = {}
         by_difficulty: dict[str, int] = {}
         repos: set[str] = set()
         for pid in all_ids:
             meta = _load_meta(pid)
             if not meta:
                 continue
-            lang = _infer_language(meta.get("test_cmd", []))
-            by_lang[lang] = by_lang.get(lang, 0) + 1
+            cat = _category(meta)
+            by_category[cat] = by_category.get(cat, 0) + 1
             diff = _difficulty(baselines.get(pid, 0.0))
             by_difficulty[diff] = by_difficulty.get(diff, 0) + 1
             repos.add(meta.get("repo_name", ""))
@@ -237,8 +250,8 @@ class Handler(BaseHTTPRequestHandler):
             "pool_size": len(all_ids),
             "shard_size": len(shard),
             "repos": len(repos),
-            "mean_baseline": round(sum(scores) / len(scores), 2) if scores else 0,
-            "by_language": by_lang,
+            "oracle_score": round(sum(scores) / len(scores), 2) if scores else 0,
+            "by_category": by_category,
             "by_difficulty": by_difficulty,
             "rotation_policy": config.get("rotation_policy", "weekly"),
         }
@@ -270,7 +283,8 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     def _problems(self, qs: dict) -> dict:
-        lang_filter = qs.get("lang", [None])[0]
+        # Accept both `cat` (preferred) and `lang` (deprecated alias)
+        cat_filter = qs.get("cat", qs.get("lang", [None]))[0]
         diff_filter = qs.get("difficulty", [None])[0]
         repo_filter = qs.get("repo", [None])[0]
         search = qs.get("q", [None])[0]
@@ -289,7 +303,7 @@ class Handler(BaseHTTPRequestHandler):
             if not meta:
                 continue
             s = _problem_summary(meta, baselines)
-            if lang_filter and s["language"] != lang_filter:
+            if cat_filter and s["category"] != cat_filter:
                 continue
             if diff_filter and s["difficulty"] != diff_filter:
                 continue
