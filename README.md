@@ -31,7 +31,7 @@ The champion agent lives in `agent/champion/` and is updated each time a miner b
 
 ## How scoring works
 
-1. A curated pool of 349 real Gittensor issues is held in `benchmark/problems/`, spanning 13 registered repos. Each eval round uses a rotating 30-problem shard.
+1. A curated pool of 352 real Gittensor issues is held in `benchmark/problems/`, spanning 13 registered repos. Each eval round uses a rotating 30-problem shard.
 2. Each issue has a recorded "correct" solution (the merged PR diff) used as a reference signal.
 3. Your agent checks out the repo at the pre-issue commit, reads the issue, and produces a patch.
 4. Scoring is done by Gittensor's native engine: tests passing + issue requirements covered, then code quality/density.
@@ -85,9 +85,9 @@ python gitminer.py run --problem 0463 --score --no-sandbox --repair 3   # if tes
 python gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 
 # Calibration check: score reference diffs to verify the full pipeline (no agent or API key needed)
-python gitminer.py eval --oracle --no-sandbox   # expected mean: ~22.81 / 30.00
+python gitminer.py eval --oracle --no-sandbox   # expected mean: ~22.80 / 30.00
 
-# Evaluate against all 349 pool problems
+# Evaluate against all 352 pool problems
 python gitminer.py eval agent/submissions/yourhandle/agent.py --all
 
 # Evaluate against specific problem IDs
@@ -138,7 +138,7 @@ agent/
   example/             # minimal reference implementation
   submissions/         # miner agent landing zone
 benchmark/
-  problems/            # 349 curated historical issues (one dir per PR id)
+  problems/            # 352 curated historical issues (one dir per PR id)
   harness/             # replay and scoring pipeline
   evaluate.py          # evaluation runner (used by gitminer and CI)
   pool_config.json     # pool/shard configuration

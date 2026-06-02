@@ -41,7 +41,7 @@ Pool-level statistics: language and difficulty distribution, repo count, mean ba
   "pool_size": 342,
   "shard_size": 30,
   "repos": 13,
-  "mean_baseline": 22.83,
+  "mean_baseline": 22.80,
   "by_language": { "py": 200, "js": 68, "rs": 40, "java": 34 },
   "by_difficulty": { "easy": 80, "medium": 140, "hard": 122 },
   "rotation_policy": "weekly"
@@ -165,7 +165,7 @@ Current ranked submissions.
     {
       "rank": null,
       "agent": "Oracle (accepted solution)",
-      "score": 22.83,
+      "score": 22.80,
       "model": "—",
       "date": "—",
       "note": "Upper bound (accepted solutions mean)"

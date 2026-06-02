@@ -159,10 +159,10 @@ def run_evaluation(
         selected = select_shard(all_problem_dirs, config)
 
     # Oracle mode: score reference diffs directly — no agent call needed.
-    # Used for pipeline calibration; expected mean is ~22.81 (the stored oracle baseline).
+    # Used for pipeline calibration; expected mean is ~22.80 (the stored oracle baseline).
     if use_oracle:
         print("Oracle mode: scoring reference diffs to verify pipeline calibration.")
-        print(f"Expected mean: ~22.81 / 30.00 (stored oracle baseline)\n")
+        print(f"Expected mean: ~22.80 / 30.00 (stored oracle baseline)\n")
         results = []
         for problem_dir in selected:
             ref_diff = problem_dir / "reference.diff"

@@ -27,7 +27,7 @@ Each eval run tests your agent against the current **30-problem weekly shard** d
 
 **Your benchmark score** = mean score across all 30 shard problems.
 
-**Oracle (upper bound)** = 22.83 — the accepted reference solution's mean score. Beat this and you've improved on the actual human patch.
+**Oracle (upper bound)** = 22.80 — the accepted reference solution's mean score. Beat this and you've improved on the actual human patch.
 
 ## Labels and multipliers
 
@@ -84,7 +84,7 @@ To earn on this repo, a miner account must:
 
 ## Maximizing earnings
 
-1. **Beat the oracle (22.83)**. Submissions above this score are rarer and earn the top of the contributor pool.
+1. **Beat the oracle (22.80)**. Submissions above this score are rarer and earn the top of the contributor pool.
 2. **Submit early in the week**. The shard rotates Monday 00:00 UTC. A champion submission on Monday earns across the full 45-day decay window vs one filed Friday.
 3. **Fix the hardest problems**. Hard problems (baseline 0–10) have high upside. An agent that solves them while competitors fail on them contributes disproportionately.
 4. **Minimize diffs**. The scoring engine rewards token efficiency. Tighter, correct diffs outperform sprawling but technically-passing ones.

@@ -79,8 +79,14 @@ def gh_diff(repo: str, pr_number: int) -> str:
 
 
 def extract_issue_numbers(body: str) -> list[int]:
-    pattern = r"(?:fixes|closes|resolves)\s+#(\d+)"
-    return [int(m) for m in re.findall(pattern, body or "", re.IGNORECASE)]
+    # Match standard GitHub close keywords (with/without trailing s/d/ed)
+    # and "PR #N" references (maintainer PRs often say "PR #N fixed the bug")
+    pattern = r"(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?|closes?)\s+#(\d+)"
+    found = [int(m) for m in re.findall(pattern, body or "", re.IGNORECASE)]
+    if not found:
+        # Fallback: bare "PR #N" reference — maintainers often say "PR #N added..."
+        found = [int(m) for m in re.findall(r"\bPR\s+#(\d+)\b", body or "")]
+    return found
 
 
 def has_test_files(diff: str) -> bool:
@@ -281,6 +287,18 @@ def curate_pr(
 
     body = details.get("description", "") or ""
     issue_numbers = extract_issue_numbers(body)
+
+    # Fetch PR from GitHub for base_commit + fallback issue extraction
+    try:
+        pr_data = gh_api(f"repos/{repo}/pulls/{pr_number}")
+    except subprocess.CalledProcessError:
+        print(f"  Skip {repo}#{pr_number}: PR fetch failed")
+        return False
+
+    # If DAS body has no linked issue, fall back to GitHub PR body
+    if not issue_numbers:
+        gh_body = pr_data.get("body", "") or ""
+        issue_numbers = extract_issue_numbers(gh_body)
     if not issue_numbers:
         print(f"  Skip {repo}#{pr_number}: no linked issue")
         return False
@@ -297,13 +315,6 @@ def curate_pr(
     issue_body = issue_data.get("body") or ""
     if len(issue_body.strip()) < 50:
         print(f"  Skip {repo}#{pr_number}: issue body too short ({len(issue_body)} chars)")
-        return False
-
-    # Fetch PR from GitHub for base_commit
-    try:
-        pr_data = gh_api(f"repos/{repo}/pulls/{pr_number}")
-    except subprocess.CalledProcessError:
-        print(f"  Skip {repo}#{pr_number}: PR fetch failed")
         return False
 
     # Fetch diff from GitHub (not in DAS)
@@ -412,6 +423,8 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Build/refresh the benchmark problem pool from DAS API")
     parser.add_argument("--repo", help="Curate a single repo (default: all)")
+    parser.add_argument("--pr-numbers", metavar="N,N,...",
+                        help="Comma-separated PR numbers to curate (requires --repo)")
     parser.add_argument("--output", default=cfg["pool_dir"], help="Pool output directory")
     parser.add_argument("--limit-per-repo", type=int, default=50,
                         help="Max new problems per repo (default: 50)")
@@ -419,11 +432,23 @@ def main() -> None:
                         help="Show what would be added without writing files")
     args = parser.parse_args()
 
+    if args.pr_numbers and not args.repo:
+        parser.error("--pr-numbers requires --repo")
+
     output_dir = REPO_ROOT / args.output
     output_dir.mkdir(parents=True, exist_ok=True)
     cutoff = cfg["model_cutoff_date"]
 
+    target_pr_numbers: set[int] | None = None
+    if args.pr_numbers:
+        target_pr_numbers = {int(n.strip()) for n in args.pr_numbers.split(",")}
+
     candidates = fetch_das_pool(target_repo=args.repo)
+
+    # Filter to specific PR numbers if requested
+    if target_pr_numbers is not None:
+        candidates = [pr for pr in candidates if pr.get("pullRequestNumber") in target_pr_numbers]
+        print(f"  Filtered to {len(candidates)} specific PRs: {sorted(target_pr_numbers)}")
 
     if args.repo:
         repos = [args.repo]
