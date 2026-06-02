@@ -4,6 +4,7 @@ gitminer — CLI for the Gittensor Base-Miner Benchmark.
 
 Subcommands:
     eval     Score an agent against the current shard (or all problems)
+    cache    Pre-warm the local repo cache (speeds up --no-sandbox evals)
     hash     Compute the commit-reveal SHA-256 hash for a patch file
     shard    Print the current week's 30-problem shard IDs
     submit   Validate an agent, generate its commit-reveal hash, and print (or open) a PR
@@ -13,6 +14,7 @@ Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
     python gitminer.py eval agent/submissions/myhandle/agent.py --all
     python gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
+    python gitminer.py cache
     python gitminer.py hash my_patch.diff
     python gitminer.py shard
     python gitminer.py submit agent/submissions/myhandle/agent.py
@@ -240,6 +242,40 @@ def cmd_submit(args: argparse.Namespace) -> None:
     print("─" * 60)
 
 
+def cmd_cache(args: argparse.Namespace) -> None:
+    """Pre-warm the local repo cache used by --no-sandbox eval."""
+    import json as _json
+    from benchmark.harness.score import _cached_repo, _repo_cache_dir
+
+    pool_dir = REPO_ROOT / "benchmark" / "problems"
+    meta_files = sorted(pool_dir.glob("*/meta.json"))
+    if not meta_files:
+        print("No problems found. Run scripts/build_pool.py first.")
+        return
+
+    urls: dict[str, int] = {}
+    for mf in meta_files:
+        meta = _json.loads(mf.read_text())
+        url = meta.get("repo_url", "")
+        if url:
+            urls[url] = urls.get(url, 0) + 1
+
+    cache_dir = _repo_cache_dir()
+    print(f"Cache location: {cache_dir}")
+    print(f"Repos to cache: {len(urls)} ({len(meta_files)} problems)\n")
+
+    for i, (url, count) in enumerate(sorted(urls.items()), 1):
+        repo_name = "/".join(url.rstrip("/").split("/")[-2:])
+        print(f"[{i}/{len(urls)}] {repo_name} ({count} problems)...", end=" ", flush=True)
+        try:
+            _cached_repo(url)
+            print("ok")
+        except Exception as e:
+            print(f"FAILED: {e}")
+
+    print(f"\nDone. Future --no-sandbox evals skip clone for cached repos.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="gitminer",
@@ -259,6 +295,13 @@ def main() -> None:
     p_eval.add_argument("--output", metavar="FILE",
                         help="Save full results JSON to FILE")
     p_eval.set_defaults(func=cmd_eval)
+
+    # cache
+    p_cache = sub.add_parser(
+        "cache",
+        help="Pre-warm local repo cache — clone all pool repos once so --no-sandbox eval is fast",
+    )
+    p_cache.set_defaults(func=cmd_cache)
 
     # hash
     p_hash = sub.add_parser("hash", help="Compute commit-reveal SHA-256 for a patch file")

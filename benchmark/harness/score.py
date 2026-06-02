@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -42,6 +43,40 @@ MERGED_PR_BASE_SCORE = 25
 SRC_TOK_SATURATION_SCALE = 58.0
 MAX_CONTRIBUTION_BONUS = 5
 CONTRIBUTION_SCORE_FOR_FULL_BONUS = 1500
+
+
+def _repo_cache_dir() -> Path:
+    """Return (and create) the gitminer repo cache directory."""
+    cache = Path(os.environ.get("GITMINER_CACHE", Path.home() / ".cache" / "gitminer" / "repos"))
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
+
+
+def _cached_repo(repo_url: str) -> Path:
+    """
+    Return a path to a local bare-ish clone of repo_url.
+
+    On first call: git clone into ~/.cache/gitminer/repos/{owner}_{repo}.
+    On subsequent calls: git fetch to pull in new commits (best-effort).
+    This eliminates repeated full clones when evaluating multiple problems
+    from the same repository.
+    """
+    parts = repo_url.rstrip("/").split("/")
+    key = "_".join(parts[-2:])  # owner_repo
+    cached = _repo_cache_dir() / key
+
+    if not cached.exists():
+        subprocess.run(
+            ["git", "clone", "--quiet", repo_url, str(cached)],
+            check=True, capture_output=True,
+        )
+    else:
+        subprocess.run(
+            ["git", "-C", str(cached), "fetch", "--quiet", "--all"],
+            capture_output=True,  # best-effort — don't fail when offline
+        )
+
+    return cached
 
 
 def load_problem_meta(problem_dir: Path) -> dict:
@@ -193,76 +228,89 @@ def score_patch(problem_dir: Path, patch_path: Path) -> dict:
     meta = load_problem_meta(problem_dir)
     saturation_scale = float(meta.get("src_tok_saturation_scale", SRC_TOK_SATURATION_SCALE))
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        repo_dir = Path(tmpdir) / "repo"
+    # Use a cached clone so repeated evals on the same repo skip the network round-trip.
+    # Each problem gets an isolated git worktree checked out at the exact base commit.
+    cached = _cached_repo(meta["repo_url"])
 
-        # Clone repo at base commit
+    with tempfile.TemporaryDirectory(prefix="bminer_") as tmpdir:
+        worktree = Path(tmpdir) / "repo"
+
         subprocess.run(
-            ["git", "clone", meta["repo_url"], str(repo_dir)],
+            ["git", "-C", str(cached), "worktree", "add",
+             "--detach", "--force", str(worktree), meta["base_commit"]],
             check=True, capture_output=True,
         )
-        subprocess.run(
-            ["git", "checkout", meta["base_commit"]],
-            cwd=repo_dir, check=True, capture_output=True,
-        )
-
-        # Apply patch
-        patch_applied = apply_patch(repo_dir, patch_path)
-        if not patch_applied:
-            return {
-                "problem_id": meta["id"],
-                "patch_applied": False,
-                "tests_passed": False,
-                "source_token_score": 0.0,
-                "base_score": 0.0,
-                "final_score": 0.0,
-            }
-
-        # Run tests — correctness gates everything
-        raw_cmd = meta.get("test_cmd", ["python3", "-m", "pytest", "--tb=short", "-q"])
-        test_cmd = [
-            ("python3" if c == "python" and not shutil.which("python") else c)
-            for c in raw_cmd
-        ]
-        tests_passed, test_output, all_skipped = run_tests(repo_dir, test_cmd)
-
-        if not tests_passed:
-            return {
-                "problem_id": meta["id"],
-                "patch_applied": True,
-                "tests_passed": False,
-                "test_output": test_output[-2000:],
-                "source_token_score": 0.0,
-                "base_score": 0.0,
-                "final_score": 0.0,
-            }
-
-        # Quality scoring (tests passed)
-        diff_text = patch_path.read_text()
-        src_tok, total_tok = approximate_src_token_score(diff_text, saturation_scale)
-        base_score = compute_base_score(src_tok, total_tok, saturation_scale)
-
-        scoring_note = "local approximation (typically 3–5× above DAS) — CI uses Gittensor tree-sitter pipeline for authoritative score"
-        if all_skipped:
-            scoring_note = (
-                "tests skipped locally (missing heavy deps e.g. bittensor) — "
-                "quality score estimated from diff; Docker CI runs full correctness check"
+        try:
+            return _score_in_worktree(worktree, meta, patch_path, saturation_scale)
+        finally:
+            subprocess.run(
+                ["git", "-C", str(cached), "worktree", "remove", "--force", str(worktree)],
+                capture_output=True,
             )
 
+
+def _score_in_worktree(
+    repo_dir: Path, meta: dict, patch_path: Path, saturation_scale: float
+) -> dict:
+    problem_id = meta["id"]
+
+    patch_applied = apply_patch(repo_dir, patch_path)
+    if not patch_applied:
         return {
-            "problem_id": meta["id"],
-            "patch_applied": True,
-            "tests_passed": True,
-            "tests_skipped_locally": all_skipped,
-            "source_token_score": round(src_tok, 2),
-            "total_token_score": round(total_tok, 2),
-            "base_score": base_score,
-            # final_score = base_score * (time_decay * review_quality * label * issue)
-            # Multipliers require GitHub API data; local scoring sets them to 1.0
-            "multipliers": {"time_decay": 1.0, "review_quality": 1.0, "label": 1.0, "issue": 1.0},
-            "final_score": base_score,
-            "scoring_note": scoring_note,
+            "problem_id": problem_id,
+            "patch_applied": False,
+            "tests_passed": False,
+            "source_token_score": 0.0,
+            "base_score": 0.0,
+            "final_score": 0.0,
         }
+
+    raw_cmd = meta.get("test_cmd", ["python3", "-m", "pytest", "--tb=short", "-q"])
+    test_cmd = [
+        ("python3" if c == "python" and not shutil.which("python") else c)
+        for c in raw_cmd
+    ]
+    tests_passed, test_output, all_skipped = run_tests(repo_dir, test_cmd)
+
+    if not tests_passed:
+        return {
+            "problem_id": problem_id,
+            "patch_applied": True,
+            "tests_passed": False,
+            "test_output": test_output[-2000:],
+            "source_token_score": 0.0,
+            "base_score": 0.0,
+            "final_score": 0.0,
+        }
+
+    diff_text = patch_path.read_text()
+    src_tok, total_tok = approximate_src_token_score(diff_text, saturation_scale)
+    base_score = compute_base_score(src_tok, total_tok, saturation_scale)
+
+    scoring_note = (
+        "local approximation (typically 3–5× above DAS) — "
+        "CI uses Gittensor tree-sitter pipeline for authoritative score"
+    )
+    if all_skipped:
+        scoring_note = (
+            "tests skipped locally (missing heavy deps e.g. bittensor) — "
+            "quality score estimated from diff; Docker CI runs full correctness check"
+        )
+
+    return {
+        "problem_id": problem_id,
+        "patch_applied": True,
+        "tests_passed": True,
+        "tests_skipped_locally": all_skipped,
+        "source_token_score": round(src_tok, 2),
+        "total_token_score": round(total_tok, 2),
+        "base_score": base_score,
+        # Multipliers (time_decay, review_quality, label, issue) require GitHub
+        # API data — local scoring sets them to 1.0 as a conservative estimate.
+        "multipliers": {"time_decay": 1.0, "review_quality": 1.0, "label": 1.0, "issue": 1.0},
+        "final_score": base_score,
+        "scoring_note": scoring_note,
+    }
 
 
 def main() -> None:
