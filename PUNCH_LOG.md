@@ -4,6 +4,31 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Pool 353→354, output behavior fingerprinting (commits e4b623d, 05d05ba)
+
+### Pool expansion (+1 problem)
+- Added `infiniflow_ragflow_13217`: "API endpoints for auto-metadata configuration" — SDK API test
+- Oracle mean: 22.76 → 22.77 (recomputed across 354 problems)
+- Updated across: leaderboard.json, baselines.json, pool_config.json, gitminer.py, generate_dashboard_data.py, record_result.py, docs/rewards.md, docs/api.md, README badge
+- entrius/gittensor: saturated (no new qualifying PRs); phase-rs/phase: 0 new qualifying PRs
+
+### Anti-gaming: output behavior fingerprinting (commit 05d05ba)
+**Problem**: Source-level similarity (AST bigrams + token Jaccard) can be evaded by agents that forward another agent's output through reformatted wrapper code. The outputs look the same; only the scaffolding code differs.
+
+**Solution**: Per-problem diff hashes stored as behavior fingerprints.
+- `evaluate.py` now captures a `diff_hash` per problem (SHA-256 of normalized diff); `--save-behaviors FILE` flag writes `{handle, eval_date, shard, diffs}` fingerprint JSON
+- `scripts/check_output_similarity.py`: compares new agent's fingerprint against all stored fingerprints in `results/behaviors/`; flags if ≥ 70% of overlapping problems produce identical diff hashes (min 5-problem overlap)
+- `eval.yml`: runs output similarity check after evaluation; artifacts include `behaviors_new.json`
+- `record-champion.yml`: commits `results/behaviors/{handle}.json` to repo on merge
+- `docs/threat_model.md`: Threat 7 (behavioral cloning) documented with mitigations and residual risk
+
+Three-layer anti-gaming stack now:
+1. Source code: token Jaccard + AST structural bigrams
+2. Output behavior: per-problem diff hash matching
+3. Rate limiting: 5 submissions/handle/week
+
+---
+
 ## 2026-06-02 — Pool 352→353, test-symbol ranking (commits 755bd6f, 2ef869b)
 
 ### Pool expansion (+1 problem)
