@@ -86,7 +86,7 @@ The harness runs this command to determine correctness. Your patch must make it 
 ```
 {tree}
 ```
-{test_section}
+{init_hint}{test_section}
 ## Source files (ranked by relevance)
 {impl_files}
 
@@ -104,7 +104,9 @@ Analyse this test-first, then plan. Answer in order:
    add/change: function signatures, return types, helper logic, error handling, \
    edge cases. Every assertion in the test must map to something in your plan.
 5. **Completeness check** — what secondary files or side effects (imports, exports, \
-   constants, type annotations) also need updating?
+   constants, type annotations) also need updating? If you add a new public symbol, \
+   check whether any `__init__.py` or `index.ts`/`index.js` in the hint below \
+   needs a new export line.
 
 Be precise and thorough — a complete implementation that handles all test cases and \
 edge cases scores higher than a minimal stub.
@@ -225,6 +227,41 @@ def _test_keywords(test_files: list[FileContext]) -> set[str]:
     return {t.lower() for t in raw}
 
 
+def _index_hint(top_files: list[FileContext], file_tree: list[str]) -> str:
+    """Return a prompt hint listing __init__.py / index.ts|js files in the same
+    directories as the top implementation files.
+
+    When a new public symbol is added to a Python module, callers typically
+    import from the package `__init__.py`. Similarly for TypeScript `index.ts`.
+    This hint reminds the agent to check whether those files need a new export.
+    """
+    # Collect directory paths of the top-ranked files (up to first 5)
+    dirs: list[str] = []
+    seen: set[str] = set()
+    for f in top_files[:5]:
+        d = f.path.rsplit("/", 1)[0] if "/" in f.path else ""
+        if d not in seen:
+            dirs.append(d)
+            seen.add(d)
+
+    index_names = {"__init__.py", "index.ts", "index.js", "index.tsx"}
+    found: list[str] = []
+    tree_set = set(file_tree)
+    for d in dirs:
+        for name in index_names:
+            path = f"{d}/{name}" if d else name
+            if path in tree_set:
+                found.append(path)
+
+    if not found:
+        return ""
+    paths = ", ".join(f"`{p}`" for p in found)
+    return (
+        f"\n**Module export files** (may need a new export if you add a public symbol): "
+        f"{paths}\n\n"
+    )
+
+
 def _rank_files(
     files: list[FileContext],
     issue_title: str,
@@ -279,12 +316,19 @@ def _truncate_context(files: list[FileContext]) -> list[FileContext]:
     return selected
 
 
+HEADER_LINES = 20  # always shown at top of a windowed file (imports, class defs, etc.)
+
+
 def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> str:
     """Return only the sections of a file that contain issue-relevant keywords.
 
     For files over 300 lines, finds all lines containing keyword hits and
     emits a ±context_lines window around each hit cluster. Unshown regions
     are replaced with an omission marker. Full content is returned for small files.
+
+    The first HEADER_LINES lines are always included — they contain imports,
+    module-level declarations, and class definitions the model needs to produce
+    correct code (e.g. to know what's imported, what class a method belongs to).
     """
     lines = content.splitlines(keepends=True)
     if len(lines) <= 300:
@@ -298,23 +342,28 @@ def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> s
             hit[i] = True
 
     if not any(hit):
-        # No hits — return first N lines as a peek
+        # No hits — return first N lines as a peek (includes header naturally)
         peek = min(80, len(lines))
         suffix = f"\n... [{len(lines) - peek} more lines omitted — no keyword hits]"
         return "".join(lines[:peek]) + suffix
 
+    # Force the header section into the window set so imports/class defs are visible
+    header_end = min(HEADER_LINES, len(lines))
+
     # Expand each hit into a window and merge overlapping windows
     windows: list[tuple[int, int]] = []
-    i = 0
-    while i < len(lines):
-        if hit[i]:
+
+    # Seed with the header window
+    windows.append((0, header_end))
+
+    for i, is_hit in enumerate(hit):
+        if is_hit:
             start = max(0, i - context_lines)
             end = min(len(lines), i + context_lines + 1)
             if windows and start <= windows[-1][1]:
-                windows[-1] = (windows[-1][0], end)
+                windows[-1] = (windows[-1][0], max(windows[-1][1], end))
             else:
                 windows.append((start, end))
-        i += 1
 
     parts = []
     prev_end = 0
@@ -480,6 +529,9 @@ class ExampleAgent(BaseAgent):
         # --- Turn 1: Observe + Plan ---
         test_cmd_str = " ".join(problem.test_cmd) if problem.test_cmd else "pytest"
         test_cmd_short = problem.test_cmd[-1] if problem.test_cmd else "pytest"
+        init_hint = _index_hint(selected_impl, problem.file_tree)
+        if init_hint:
+            log.append(f"[context] index-file hint: {init_hint.strip()}")
         observe_user = OBSERVE_PROMPT.format(
             title=problem.issue_title,
             body=problem.issue_body,
@@ -487,6 +539,7 @@ class ExampleAgent(BaseAgent):
             test_cmd=test_cmd_str,
             test_cmd_short=test_cmd_short,
             tree="\n".join(problem.file_tree),
+            init_hint=init_hint,
             test_section=test_section,
             impl_files=_format_files(selected_impl, keywords),
         )
