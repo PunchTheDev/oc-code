@@ -141,6 +141,8 @@ Requirements:
   numbers directly for `@@ -N` offsets. The numbers are display-only — do NOT \
   include ` N | ` in your diff's context or change lines; they must match the \
   actual file content
+- **Context lines**: include exactly 3 unchanged lines before and after each \
+  change — this is required for `git apply` to locate the change correctly
 - Every test assertion from your plan must be satisfied by your diff
 - Include helper functions, proper error handling, and secondary file changes
 - Do NOT change unrelated logic, but do implement the full fix as described
