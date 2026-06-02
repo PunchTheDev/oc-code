@@ -85,6 +85,12 @@ Improvements over a naive single-shot approach:
   lines (up to 30) from test files and injects them directly into the verify prompt. The
   model no longer relies on conversation context to recall what assertions must pass —
   they're explicitly listed so the model can check each one against the diff.
+- Non-uniform timeout allocation: plan gets 15% of wall-clock budget (~18s), act gets 40%
+  (~48s), each verify/repair gets 15% (~18s). Previously uniform budget (120s/6=20s) was
+  too tight for act (large multi-file diffs) and wasted time on plan (short analysis output).
+- Multi-fence diff extraction: `_extract_diff()` now collects ALL fenced diff blocks and
+  joins them. When models split each changed file into its own ` ```diff ` block, the
+  previous `re.search` only captured the first block and silently dropped the rest.
 """
 
 from __future__ import annotations
@@ -1255,11 +1261,18 @@ def _call(
 
 
 def _extract_diff(text: str) -> str:
-    """Pull the unified diff out of LLM output, stripping markdown fences."""
+    """Pull the unified diff out of LLM output, stripping markdown fences.
+
+    Handles two common model failure modes:
+    1. Single fenced block: ` ```diff\\ndiff --git ...\\n``` `
+    2. Multiple fenced blocks: model puts each changed file in its own block.
+       `re.search` would only capture the first block — we join all of them.
+    Also matches ` ```patch ` fences (less common but valid).
+    """
     text = text.strip()
-    fence = re.search(r"```(?:diff)?\s*\n(diff --git.+?)```", text, re.DOTALL)
-    if fence:
-        return fence.group(1).strip()
+    fences = list(re.finditer(r"```(?:diff|patch)?\s*\n(diff --git.+?)```", text, re.DOTALL))
+    if fences:
+        return "\n".join(m.group(1).strip() for m in fences)
     idx = text.find("diff --git")
     if idx != -1:
         return text[idx:].strip()
@@ -1295,11 +1308,17 @@ class ExampleAgent(BaseAgent):
                 f"Model '{self.model}' is not in the allowed list: {problem.allowed_models}"
             )
 
-        # Distribute wall-clock budget across all calls so we never exceed the limit
-        # even in the worst case.
-        timeout = float(problem.time_limit_seconds) / MAX_CALLS
+        # Allocate wall-clock budget non-uniformly:
+        #   plan  15% — analysis output is moderate length (500-2000 tokens)
+        #   act   40% — diff output can be large (many hunks across many files)
+        #   each verify/repair  15% — LGTM acknowledgement or corrected diff
+        # With default 120s: plan=18s, act=48s, each verify=18s (×3 = 54s) → 120s total.
+        total_time = float(problem.time_limit_seconds)
+        plan_timeout = total_time * 0.15
+        act_timeout = total_time * 0.40
+        verify_timeout = total_time * 0.15
         token_budget = problem.output_token_budget
-        plan_tokens = token_budget // 3
+        plan_tokens = token_budget // 4    # analysis rarely exceeds 12k tokens
         act_tokens = token_budget // 2
         verify_tokens = token_budget // 4
 
@@ -1413,14 +1432,14 @@ class ExampleAgent(BaseAgent):
             {"role": "system", "content": system_content},
             {"role": "user", "content": observe_user},
         ]
-        plan = _call(history, self.model, api_key, plan_tokens, timeout)
+        plan = _call(history, self.model, api_key, plan_tokens, plan_timeout)
         log.append(f"[plan]\n{plan}")
         history.append({"role": "assistant", "content": plan})
 
         # --- Turn 2: Act ---
         # temperature=0 for diff generation: format precision matters more than creativity
         history.append({"role": "user", "content": ACT_PROMPT})
-        raw_diff = _call(history, self.model, api_key, act_tokens, timeout, temperature=0)
+        raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
         diff = _extract_diff(raw_diff)
         log.append(f"[diff v0]\n{diff}")
         history.append({"role": "assistant", "content": raw_diff})
@@ -1433,7 +1452,7 @@ class ExampleAgent(BaseAgent):
                 # Structural problem — give targeted feedback before asking for repair
                 repair_msg = REPAIR_FORMAT_PROMPT.format(problem=problem_desc)
                 history.append({"role": "user", "content": repair_msg})
-                raw_diff = _call(history, self.model, api_key, act_tokens, timeout, temperature=0)
+                raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
                 diff = _extract_diff(raw_diff)
                 log.append(f"[repair {attempt} (format)]\n{diff}")
                 history.append({"role": "assistant", "content": raw_diff})
@@ -1456,7 +1475,7 @@ class ExampleAgent(BaseAgent):
                 assertions_section=assertions_section,
             )
             history.append({"role": "user", "content": verify_user})
-            verdict = _call(history, self.model, api_key, verify_tokens, timeout)
+            verdict = _call(history, self.model, api_key, verify_tokens, verify_timeout)
             log.append(f"[verify {attempt}]\n{verdict}")
 
             if verdict.strip().upper().startswith("LGTM"):
@@ -1493,7 +1512,7 @@ class ExampleAgent(BaseAgent):
             raise RuntimeError("OPENROUTER_KEY environment variable not set")
 
         test_cmd_str = " ".join(problem.test_cmd) if problem.test_cmd else "pytest"
-        timeout = float(problem.time_limit_seconds) / MAX_CALLS
+        act_timeout = float(problem.time_limit_seconds) * 0.40
         act_tokens = problem.output_token_budget // 2
 
         log: list[str] = [f"[repair] test failure detected, starting targeted repair"]
@@ -1509,7 +1528,7 @@ class ExampleAgent(BaseAgent):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": repair_user},
         ]
-        raw_diff = _call(history, self.model, api_key, act_tokens, timeout, temperature=0)
+        raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
         diff = _extract_diff(raw_diff)
         log.append(f"[repair diff]\n{diff}")
 
@@ -1518,7 +1537,7 @@ class ExampleAgent(BaseAgent):
             problem_desc = _diagnose_diff(diff)
             history.append({"role": "assistant", "content": raw_diff})
             history.append({"role": "user", "content": REPAIR_FORMAT_PROMPT.format(problem=problem_desc)})
-            raw_diff = _call(history, self.model, api_key, act_tokens, timeout, temperature=0)
+            raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
             diff = _extract_diff(raw_diff)
             log.append(f"[repair format fix]\n{diff}")
 
