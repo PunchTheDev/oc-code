@@ -4,6 +4,19 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: file-header preservation + index-file hint (commit 8ac6b9d)
+
+### Agent improvements
+
+- **File header preservation in windowing**: `_window_file()` now always includes the first `HEADER_LINES=20` lines of any windowed file, regardless of where keyword hits occur. Previously, if the relevant function was at line 300+ in a 400-line file, the agent saw no imports or class definitions — it couldn't know what was imported, what class a method belonged to, or what other symbols were available. Now imports and top-level declarations are always visible.
+
+- **Index/export file hint**: New `_index_hint()` — checks `__init__.py` (Python) and `index.ts`/`index.js` (TypeScript) files in the directories of the top-ranked implementation files. If any are found, a "Module export files" hint is added to the OBSERVE prompt. The completeness check in step 5 explicitly references this hint, reminding the agent to add new exports when adding public symbols. Previously the agent might fix the implementation file but forget to export the new symbol, causing import failures at test time.
+
+### Pool refresh
+- All repos saturated: 0 new qualifying PRs across phase-rs/phase (132 new in DAS but all fail test-file/issue-link criteria), infiniflow/ragflow (303 new, Go-only without tests or linked issues), vouch, sure, gittensory, allways. Pool holds at 360.
+
+---
+
 ## 2026-06-02 — Agent: test-first reasoning (commit dea0933)
 
 ### Agent improvement
