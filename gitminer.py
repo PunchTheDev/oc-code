@@ -184,7 +184,7 @@ def cmd_hash(args: argparse.Namespace) -> None:
 
 
 def cmd_shard(args: argparse.Namespace) -> None:
-    from benchmark.evaluate import select_shard, load_pool_config, POOL_DIR
+    from benchmark.evaluate import select_shard, load_pool_config, POOL_DIR, _problem_category
 
     config = load_pool_config()
     all_problem_dirs = sorted(p.parent for p in POOL_DIR.glob("*/meta.json"))
@@ -193,11 +193,17 @@ def cmd_shard(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     shard = select_shard(all_problem_dirs, config)
-    print(f"Current weekly shard ({len(shard)} problems):")
+    by_cat: dict[str, int] = {}
+    for d in shard:
+        cat = _problem_category(d)
+        by_cat[cat] = by_cat.get(cat, 0) + 1
+    cat_summary = "  ".join(f"{c}:{n}" for c, n in sorted(by_cat.items()))
+    print(f"Current weekly shard ({len(shard)} problems)  [{cat_summary}]:")
     for d in shard:
         import json as _json
         meta = _json.loads((d / "meta.json").read_text())
-        print(f"  {meta['id']:<32}  {meta['repo_name']}  —  {meta['issue_title'][:55]}")
+        cat = _problem_category(d)
+        print(f"  {meta['id']:<32}  [{cat:<10}]  {meta['repo_name']}  —  {meta['issue_title'][:45]}")
 
 
 def _derive_handle(agent_path: Path) -> str:
