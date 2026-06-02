@@ -4,6 +4,24 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Context file tree, gitminer info (commits 7238f6e, 0b2e016)
+
+### Context file tree in dashboard drawer
+- `generate_dashboard_data.py` now enumerates each problem's `context/` directory and includes `context_files` and `test_files` lists in `data.json`.
+- Problem drawer now shows a "Context files — what your agent sees" section: every file listed with 📄 (source) or 🧪 (test) icons. Test files are highlighted in green.
+- Summary line: "3 source · 1 test" — miners immediately know what they're working with before cloning anything.
+- data.json regenerated and pushed (dashboard commit `0b2e016`).
+
+### `gitminer info ID`
+- New CLI command: rich terminal view of a single problem.
+- Shows: issue title, repo/PR/issue links, merged date, issue body (truncated), test command, per-problem scores (baseline + DAS), context file tree (source vs test), quick-copy run commands.
+- Example: `python gitminer.py info 0463`
+
+### Pool refresh
+- Dry-run confirms pool still at 342 problems, 0 new qualifying PRs.
+
+---
+
 ## 2026-06-02 — Reward loop closed, docs/rewards.md (commit b6a314f)
 
 ### Auto-labeling in CI (`eval.yml`)
