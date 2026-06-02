@@ -256,6 +256,15 @@ LANG_NOTES: dict[str, str] = {
         "include modules where methods are defined; use `attr_accessor`/`attr_reader` "
         "for new fields; ensure `require` or `require_relative` for any new file."
     ),
+    "go": (
+        "This is a Go codebase. Key reminders: implement every method required by the "
+        "interface the test calls (check *_test.go files for the full signature set); "
+        "register the new driver in the factory function (often in factory.go) if the "
+        "test uses a factory or enum lookup; export names start with a capital letter; "
+        "add necessary imports with the exact package path shown in existing imports; "
+        "return named error types, not bare strings; zero-value structs must satisfy "
+        "interface constraints — all methods must be implemented, no `panic(\"TODO\")`."
+    ),
 }
 
 
@@ -396,6 +405,21 @@ def _resolve_test_imports(
                     if candidate in tree_set:
                         resolved.add(candidate)
                         break
+
+        elif ext == "go":
+            # `import "github.com/org/repo/internal/foo"` → files in internal/foo/
+            # Extract the part after the module root (trim github.com/org/repo/ prefix)
+            for m in re.finditer(r'"([^"]+)"', content):
+                raw = m.group(1)
+                if raw.startswith("github.com/") or raw.startswith("golang.org/"):
+                    # Drop up to the 3rd path segment (org/repo), keep the rest
+                    parts = raw.split("/")
+                    if len(parts) > 3:
+                        local_path = "/".join(parts[3:])
+                        # Match any .go file in that directory
+                        for f in tree_set:
+                            if f.startswith(local_path + "/") and f.endswith(".go"):
+                                resolved.add(f)
 
     return resolved
 

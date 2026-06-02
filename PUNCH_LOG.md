@@ -4,6 +4,25 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Pool 367→397 + Go/TS language support (commits b882b42, a277f65)
+
+### has_test_files fix: Go, TypeScript, Java, Ruby patterns (commit b882b42)
+- **Root cause**: `*_test.go` (Go convention), `*.test.ts/tsx` (TypeScript), `*.spec.ts`, `*Test.java`, `*_spec.rb` all failed our `has_test_files` check
+- **Impact**: ~20+ ragflow Go problems + ~12+ phase-rs TypeScript problems were being silently filtered
+- Added 4 new regexes to cover all major language test file patterns
+
+### Pool refresh: 367 → 397 (+30 new problems) (commit a277f65)
+- **infiniflow/ragflow** (Go): +19 new problems — Go API driver implementations (NVIDIA, LocalAI, Voyage, Xinference, Jina, vLLM, Novita, OpenRouter, Hunyuan, VolcEngine, TokenHub, 302.ai, etc.)
+- **phase-rs/phase** (TypeScript): +11 new problems — React/TypeScript component bugs with Vitest tests
+- Oracle mean: 22.73 → **23.05** (new problems have strong Go/TS implementation diffs)
+- Updated everywhere: pool_config.json, baselines.json, leaderboard.json, dashboard_data.json, README badge, docs/rewards.md, docs/api.md, gitminer.py, evaluate.py, record_result.py
+
+### Agent: Go language support
+- New `LANG_NOTES["go"]`: explains Go interface implementation, factory registration, export naming, error types
+- New Go import resolution in `_import_pinned_files`: parses `"github.com/org/repo/internal/foo"` → pins all `.go` files in `internal/foo/` to rank #1
+
+---
+
 ## 2026-06-02 — Pool 366→367 + agent improvements (commits 82faf35–91004c9)
 
 ### Pool refresh (+1 problem)
