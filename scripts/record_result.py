@@ -21,7 +21,7 @@ RESULTS_DIR = REPO_ROOT / "results"
 ORACLE_ROW = {
     "rank": None,
     "agent": "Oracle (accepted solution)",
-    "score": 23.36,
+    "score": 23.46,
     "model": "—",
     "date": "—",
     "note": "Upper bound",

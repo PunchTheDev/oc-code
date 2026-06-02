@@ -33,8 +33,24 @@ Root cause found via sample eval: when the API is slow (calls near-timeout), the
 
 **Fix 2**: When the repair loop detects "empty output — no diff produced", resend `ACT_PROMPT` directly instead of the useless `REPAIR_FORMAT_PROMPT` with an empty diff. The model retries the act step with full source context still available. On success, compaction happens then.
 
+### Pool refresh: 423 → 430 (+7 new problems) (benchmark commit 07f6504)
+
+DAS dry-run returned "7 newly added"; actual build added 7 problems across 4 repos:
+
+- `phase-rs_phase_1858` (Rust, `cargo test`) — Liliana, Dreadhorde General trigger bug
+- `phase-rs_phase_1900` (Rust, `cargo test`) — Rebound Mechanic implementation
+- `jsonbored_gittensory_266` (TypeScript, `npm test`) — offline decision-pack caching
+- `geniepod_genie-claw_365` (Rust, `cargo test`) — tool-call gate enforcement
+- `touchpilot_touchpilot_133` (Kotlin, `./gradlew test`) — running agent state controls
+- `touchpilot_touchpilot_145` (Kotlin, `./gradlew test`) — task completion summary card
+- `touchpilot_touchpilot_150` (Kotlin, `./gradlew test`) — long_press tool
+
+Oracle mean: 23.36 → 23.46. Updated: pool_config.json, results/baselines.json, results/leaderboard.json, dashboard_data.json, gitminer.py, evaluate.py, record_result.py, docs/rewards.md, docs/api.md, README.md (all 4 count refs).
+
+All new problem languages covered: `rs` (Rust), `ts` (TypeScript), `kt` (Kotlin) — LANG_NOTES + import resolution already present.
+
 ### Status
-- Benchmark: 423 problems, oracle 23.36, 20 repos (commit 2716186)
+- Benchmark: 430 problems, oracle 23.46, 20 repos (commit 07f6504)
 - Sample eval: discovered `patch_applied: False` on gittensor problems when API slow — root cause was cascade timeout + premature history compaction, now fixed
 - Pool: fully saturated; check ~2026-06-09 for new DAS registrations
 - Pending: Gittensor registration, nginx hookup
