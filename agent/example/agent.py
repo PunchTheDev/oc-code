@@ -218,6 +218,13 @@ at least one `@@` hunk. Nothing else.
 
 # Language-specific notes appended to SYSTEM_PROMPT when detected
 LANG_NOTES: dict[str, str] = {
+    "py": (
+        "This is a Python codebase. Key reminders: add type annotations "
+        "(parameters and return types) to new or modified functions — they improve "
+        "readability and score; add docstrings to new public functions/classes; "
+        "ensure all new imports appear at the top of the file; handle edge cases "
+        "with explicit guard clauses rather than silent fallbacks."
+    ),
     "rs": (
         "This is a Rust codebase. Key reminders: trait bounds must be satisfied; "
         "match all enum variants; do not leave `todo!()` or `unimplemented!()` stubs; "
