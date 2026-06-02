@@ -17,7 +17,9 @@ Improvements over a naive single-shot approach:
   (names the tests import/call are 2× weighted — they pinpoint the module under test)
   over-long context truncated rather than blindly dumped into the prompt
 - Large files windowed to relevant sections only (±40 lines around keyword hits)
-  so more files fit in the context budget without blowing the token limit
+  so more files fit in the context budget without blowing the token limit;
+  omission markers show exact line ranges (e.g. "lines 21-260 omitted — next
+  visible line is 261") so the model can write accurate @@ -N hunk offsets
 - Explicit file-and-line hypothesis required plus secondary-file completeness
   check so the implementation is thorough, not minimal
 - Score-aware prompting: system prompt and act prompt explain that complete
@@ -128,6 +130,10 @@ Requirements:
 - Start with `diff --git a/<path> b/<path>`
 - Include `--- a/<path>` and `+++ b/<path>` headers
 - Each hunk starts with `@@ -<start>,<count> +<start>,<count> @@`
+- **Line numbers**: if a file was windowed, the omission markers show the exact \
+  line range (e.g. `... [lines 21-260 omitted — next visible line is 261]`). Use \
+  these markers to compute accurate `@@ -N` offsets — wrong line numbers prevent \
+  the patch from applying
 - Every test assertion from your plan must be satisfied by your diff
 - Include helper functions, proper error handling, and secondary file changes
 - Do NOT change unrelated logic, but do implement the full fix as described
@@ -319,20 +325,26 @@ def _truncate_context(files: list[FileContext]) -> list[FileContext]:
 HEADER_LINES = 20  # always shown at top of a windowed file (imports, class defs, etc.)
 
 
-def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> str:
-    """Return only the sections of a file that contain issue-relevant keywords.
+def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> tuple[str, bool]:
+    """Return the relevant sections of a file and whether windowing was applied.
 
     For files over 300 lines, finds all lines containing keyword hits and
-    emits a ±context_lines window around each hit cluster. Unshown regions
-    are replaced with an omission marker. Full content is returned for small files.
+    emits a ±context_lines window around each hit cluster. Omitted regions
+    are replaced with markers showing the exact line range, e.g.:
+        ... [lines 21-260 omitted — next visible line is 261]
+
+    This lets the model write accurate @@ -261,N +261,N @@ hunk headers without
+    guessing offsets.
 
     The first HEADER_LINES lines are always included — they contain imports,
     module-level declarations, and class definitions the model needs to produce
     correct code (e.g. to know what's imported, what class a method belongs to).
+
+    Returns (windowed_content, was_windowed).
     """
     lines = content.splitlines(keepends=True)
     if len(lines) <= 300:
-        return content
+        return content, False
 
     # Mark which lines contain a keyword hit
     hit = [False] * len(lines)
@@ -344,8 +356,8 @@ def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> s
     if not any(hit):
         # No hits — return first N lines as a peek (includes header naturally)
         peek = min(80, len(lines))
-        suffix = f"\n... [{len(lines) - peek} more lines omitted — no keyword hits]"
-        return "".join(lines[:peek]) + suffix
+        suffix = f"\n... [lines {peek + 1}-{len(lines)} omitted — no keyword hits in this file]"
+        return "".join(lines[:peek]) + suffix, True
 
     # Force the header section into the window set so imports/class defs are visible
     header_end = min(HEADER_LINES, len(lines))
@@ -369,22 +381,38 @@ def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> s
     prev_end = 0
     for start, end in windows:
         if start > prev_end:
-            omitted = start - prev_end
-            parts.append(f"... [{omitted} lines omitted]\n")
+            # Show exact line range so model can calculate accurate hunk offsets
+            parts.append(
+                f"... [lines {prev_end + 1}-{start} omitted"
+                f" — next visible line is {start + 1}]\n"
+            )
         parts.append("".join(lines[start:end]))
         prev_end = end
     if prev_end < len(lines):
-        parts.append(f"... [{len(lines) - prev_end} lines omitted]\n")
+        parts.append(
+            f"... [lines {prev_end + 1}-{len(lines)} omitted"
+            f" — end of file ({len(lines)} lines total)]\n"
+        )
 
-    return "".join(parts)
+    return "".join(parts), True
 
 
 def _format_files(files: list[FileContext], keywords: set[str] | None = None) -> str:
     parts = []
     for f in files:
         lang = f.language or ""
-        content = _window_file(f.content, keywords or set()) if keywords else f.content
-        parts.append(f"### {f.path}\n```{lang}\n{content}\n```")
+        if keywords:
+            content, windowed = _window_file(f.content, keywords)
+            total_lines = f.content.count("\n") + 1
+            header = (
+                f"### {f.path} ({total_lines} lines total — relevant sections shown)"
+                if windowed
+                else f"### {f.path}"
+            )
+        else:
+            content = f.content
+            header = f"### {f.path}"
+        parts.append(f"{header}\n```{lang}\n{content}\n```")
     return "\n\n".join(parts)
 
 
