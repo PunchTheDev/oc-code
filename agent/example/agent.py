@@ -153,6 +153,10 @@ Improvements over a naive single-shot approach:
   multi-file original silently. Now it sends targeted feedback ("your fix only covered N/M
   files, include all M") and continues the verify loop — giving the model a chance to produce
   a complete multi-file correction.
+- Timeout retry in `_call`: previously an `httpx.TimeoutException` propagated as an unhandled
+  exception, causing the entire problem to fail with 0. Now the call is retried once on timeout;
+  on a second timeout the function returns `""`, which `_diagnose_diff` catches as an empty diff
+  and the format-repair loop handles gracefully rather than aborting.
 """
 
 from __future__ import annotations
@@ -1696,23 +1700,29 @@ def _call(
     timeout: float,
     temperature: float = 0.2,
 ) -> str:
-    """Call the OpenRouter API. Retries once on 429 or 5xx (transient errors)."""
+    """Call the OpenRouter API. Retries once on 429, 5xx, or timeout."""
     for attempt in range(2):
-        resp = httpx.post(
-            OPENROUTER_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": REFERER,
-            },
-            json={
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-            },
-            timeout=timeout,
-        )
+        try:
+            resp = httpx.post(
+                OPENROUTER_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": REFERER,
+                },
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                },
+                timeout=timeout,
+            )
+        except httpx.TimeoutException:
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            return ""  # second timeout — caller handles empty string gracefully
         if attempt == 0 and resp.status_code in (429, 500, 502, 503):
             retry_after = int(resp.headers.get("retry-after", "5"))
             time.sleep(min(retry_after, 10))
