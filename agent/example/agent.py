@@ -26,6 +26,9 @@ Improvements over a naive single-shot approach:
   visible line is 261") so the model can write accurate @@ -N hunk offsets
 - Explicit file-and-line hypothesis required plus secondary-file completeness
   check so the implementation is thorough, not minimal
+- Language-specific notes: Rust/TypeScript/Ruby system-prompt additions remind
+  the model of language conventions (trait bounds, exports, require statements)
+  that generic instructions miss
 - Score-aware prompting: system prompt and act prompt explain that complete
   implementations score higher than stubs
 - Structural diff validation beyond the basic `@@` presence check — catches
@@ -206,6 +209,45 @@ Problem: {problem}
 Please output a valid unified diff starting with `diff --git` and containing \
 at least one `@@` hunk. Nothing else.
 """
+
+# Language-specific notes appended to SYSTEM_PROMPT when detected
+LANG_NOTES: dict[str, str] = {
+    "rs": (
+        "This is a Rust codebase. Key reminders: trait bounds must be satisfied; "
+        "match all enum variants; do not leave `todo!()` or `unimplemented!()` stubs; "
+        "add `pub` to functions/structs that must be reachable from tests; "
+        "import new symbols with `use` in every file that references them."
+    ),
+    "ts": (
+        "This is a TypeScript codebase. Key reminders: update type definitions and "
+        "interfaces when you add or change fields; add named exports for new symbols; "
+        "check `index.ts` files for re-exports; strict null checks are on — "
+        "handle undefined/null at every call site."
+    ),
+    "tsx": (
+        "This is a TypeScript/React codebase. Key reminders: update prop types; "
+        "add exports for new components; handle null/undefined in JSX expressions."
+    ),
+    "rb": (
+        "This is a Ruby codebase. Key reminders: follow snake_case naming; "
+        "include modules where methods are defined; use `attr_accessor`/`attr_reader` "
+        "for new fields; ensure `require` or `require_relative` for any new file."
+    ),
+}
+
+
+def _detect_lang(test_files: list) -> str | None:
+    """Return the dominant file extension from test files, or None."""
+    from collections import Counter
+    exts = Counter(
+        f.path.rsplit(".", 1)[-1].lower()
+        for f in test_files
+        if "." in f.path
+    )
+    if not exts:
+        return None
+    top, _ = exts.most_common(1)[0]
+    return top
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +693,14 @@ class ExampleAgent(BaseAgent):
         init_hint = _index_hint(selected_impl, problem.file_tree)
         if init_hint:
             log.append(f"[context] index-file hint: {init_hint.strip()}")
+
+        # Build language-specific system prompt suffix
+        lang = _detect_lang(test_files) or _detect_lang(selected_impl)
+        lang_note = LANG_NOTES.get(lang or "", "")
+        system_content = SYSTEM_PROMPT + ("\n\n" + lang_note if lang_note else "")
+        if lang_note:
+            log.append(f"[context] language detected: {lang}")
+
         observe_user = OBSERVE_PROMPT.format(
             title=problem.issue_title,
             body=problem.issue_body,
@@ -663,7 +713,7 @@ class ExampleAgent(BaseAgent):
             impl_files=_format_files(selected_impl, keywords),
         )
         history: list[dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": observe_user},
         ]
         plan = _call(history, self.model, api_key, plan_tokens, timeout)
