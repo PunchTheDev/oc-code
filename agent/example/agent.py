@@ -102,6 +102,10 @@ Improvements over a naive single-shot approach:
   plan and diff; re-sending it on every verify/repair call wastes token budget the model
   could use to reason about the diff. The compact version preserves essential metadata:
   repo name, issue title, files in scope, and test command.
+- Partial-repair guard in verify: when the verify step produces a corrected diff that covers
+  fewer files than the current diff, the replacement is rejected and the current diff is kept.
+  Without this guard, a partial correction (e.g. the model fixes only fileA out of a
+  fileA+fileB diff) would silently drop fileB's changes, producing a worse patch than before.
 """
 
 from __future__ import annotations
@@ -1170,6 +1174,11 @@ def _looks_valid(diff: str) -> bool:
     return diff.startswith("diff --git") and "@@" in diff
 
 
+def _count_diff_files(diff: str) -> int:
+    """Return the number of distinct files in a unified diff."""
+    return len(re.findall(r"^diff --git ", diff, re.MULTILINE))
+
+
 def _post_process(diff: str) -> str:
     """Strip display artifacts, trim trailing prose, fix hunk counts.
 
@@ -1467,7 +1476,10 @@ class ExampleAgent(BaseAgent):
         raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
         diff = _post_process(_extract_diff(raw_diff))
         log.append(f"[diff v0]\n{diff}")
-        history.append({"role": "assistant", "content": raw_diff})
+        # Store the cleaned diff in history so the model's "memory" of its own output
+        # matches the version shown in the verify prompt — avoids confusion from N|
+        # artifacts or trailing prose that _post_process removed.
+        history.append({"role": "assistant", "content": diff})
 
         # --- Compact history before verify ---
         # The observe_user message (history[1]) contains all source files and the
@@ -1495,7 +1507,7 @@ class ExampleAgent(BaseAgent):
                 raw_diff = _call(history, self.model, api_key, act_tokens, act_timeout, temperature=0)
                 diff = _post_process(_extract_diff(raw_diff))
                 log.append(f"[repair {attempt} (format)]\n{diff}")
-                history.append({"role": "assistant", "content": raw_diff})
+                history.append({"role": "assistant", "content": diff})
                 continue
 
             # Diff looks structurally valid — ask for semantic verification.
@@ -1523,9 +1535,20 @@ class ExampleAgent(BaseAgent):
 
             repaired = _post_process(_extract_diff(verdict))
             if _looks_valid(repaired):
-                diff = repaired
-                log.append(f"[diff v{attempt + 1}]\n{diff}")
-                history.append({"role": "assistant", "content": verdict})
+                # Only replace if repaired diff covers at least as many files as the
+                # current diff.  If it covers fewer, the model returned a partial
+                # correction (e.g. only the one file it fixed) and replacing would
+                # silently drop changes to the other files.
+                if _count_diff_files(repaired) >= _count_diff_files(diff):
+                    diff = repaired
+                    log.append(f"[diff v{attempt + 1}]\n{diff}")
+                    history.append({"role": "assistant", "content": verdict})
+                else:
+                    log.append(
+                        f"[verify {attempt}] partial repair ({_count_diff_files(repaired)} < "
+                        f"{_count_diff_files(diff)} files) — keeping current diff"
+                    )
+                    break
             else:
                 # Prose critique without a new diff — accept current result
                 break
