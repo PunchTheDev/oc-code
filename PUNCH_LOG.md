@@ -1495,3 +1495,41 @@ Fix: `_fix_new_starts()` as stage 7 of `_post_process` — runs after `_fix_hunk
 - Scoring: tree-sitter AST scorer active for **both** local eval and Docker CI
 - Pool: all repos saturated — next check 2026-06-09
 - Pending: Gittensor registration, nginx hookup
+
+---
+
+## Step: Ruby Minitest assertion coverage + deduplication
+
+**Commit**: `0293629`
+
+### Root cause
+Two separate gaps in `_extract_assertions`:
+
+1. **Ruby Minitest `assert_*` patterns were entirely missing.** The existing `"assert "` prefix
+   only matched bare Python-style `assert condition` lines. Ruby Minitest uses `assert_equal`,
+   `assert_nil`, `assert_includes`, etc. — all starting with `assert_` (underscore), which
+   the space-only prefix never matched. The 37 `we-promise/sure` pool problems are Ruby/Minitest;
+   their assertion checks in verify were essentially blind.
+
+2. **Previous step added `refute_equal ` (space suffix) when parens form also needed.**
+   The docstring described `refute_equal(` (parens) being added, but the implementation
+   used `refute_equal ` (space). Ruby allows both calling conventions; only the space form
+   was covered.
+
+3. **No deduplication.** The same assertion line appearing in multiple test files (shared
+   helpers, parameterised setup blocks) counted multiple times against the 50-line limit,
+   displacing unique edge-case assertions.
+
+### Fix
+- Added 9 Ruby Minitest `assert_*` patterns: `assert_equal`, `assert_nil`, `assert_includes`,
+  `assert_match`, `assert_raises`, `assert_empty`, `assert_respond_to`, `assert_kind_of`,
+  `assert_instance_of` — both space and parens forms (18 new prefix strings total).
+- Added parenthesized `refute_*` variants: `refute_equal(`, `refute_nil(`, `refute_includes(`,
+  `refute_match(`, `refute_empty(` alongside the existing space forms.
+- Added `seen: set[str]` deduplication: the same assertion line only counts once toward
+  the 50-line limit, regardless of how many test files contain it.
+
+### Status
+- Benchmark: 430 problems, oracle 13.34, 20 repos (commit `0293629`)
+- Agent: Ruby Minitest assertions, deduplication + all prior improvements
+- Pool: fully saturated; check ~2026-06-09 for new DAS registrations
