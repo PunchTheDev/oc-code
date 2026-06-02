@@ -4,6 +4,32 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Reference diff API endpoint + diff_stats (commit b58180d)
+
+### API: `GET /api/problems/{id}/diff` (text/plain)
+
+Added reference diff serving to the API. Miners studying the benchmark can now fetch the accepted solution directly:
+
+```
+GET /api/problems/0160/diff  →  unified diff (text/plain)
+```
+
+The `_problem_diff()` handler reads `benchmark/problems/{id}/reference.diff` and returns it as `text/plain; charset=utf-8`. New-file hunks, multi-file diffs, all diff content served verbatim.
+
+### API + Dashboard: `diff_stats` field
+
+Both `GET /api/problems/{id}` and `dashboard_data.json` problems now include:
+
+```json
+"diff_stats": {"add": 275, "remove": 14, "files": 4, "bytes": 15374}
+```
+
+Added `_diff_stats()` helper to `api/server.py` and `diff_stats_for()` to `scripts/generate_dashboard_data.py`. Dashboard data regenerated (430 problems, all with stats). Dashboard can now show `+N/-M across F files` on problem cards — visual difficulty signal without serving the full diff inline.
+
+The `_problem()` endpoint response also includes `"diff_url": "/api/problems/{id}/diff"` so dashboard doesn't need to construct the URL.
+
+---
+
 ## 2026-06-02 — Dashboard refresh + scoring transparency (dashboard commit f062012)
 
 ### Lando check-in response: scoring is fully deterministic
