@@ -162,8 +162,8 @@ def select_context_files(
                 context_files.append({"path": path, "content": content})
             fetched.add(path)
 
-    # Include test files referenced in test_cmd so agents know what they must satisfy.
-    # Only applicable for Python pytest commands where test files are explicit arguments.
+    # Include test files so agents know what they must satisfy.
+    # First: explicit test file args in Python pytest commands.
     if test_cmd and test_cmd[0] == "python" and len(test_cmd) > 4:
         test_paths = [arg for arg in test_cmd[4:] if arg.endswith(".py") and not arg.startswith("-")]
         for path in test_paths[:3]:
@@ -178,6 +178,32 @@ def select_context_files(
                 if content is not None:
                     context_files.append({"path": path, "content": content})
             fetched.add(path)
+
+    # Second: test files found in the diff (all languages).
+    # Agents benefit from seeing what test assertions they need to pass.
+    test_paths_in_diff = [
+        p for p in changed_paths
+        if (
+            "test" in p.rsplit("/", 1)[-1].lower()
+            or "spec" in p.rsplit("/", 1)[-1].lower()
+            or "/tests/" in p
+            or "/test/" in p
+            or p.startswith("tests/")
+            or p.startswith("test/")
+        )
+    ]
+    for path in test_paths_in_diff[:3]:
+        if path in fetched:
+            continue
+        try:
+            data = gh_api(f"repos/{repo}/contents/{path}?ref={base_commit}")
+            content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+            context_files.append({"path": path, "content": content})
+        except Exception:
+            content = extract_added_file(diff, path)
+            if content is not None:
+                context_files.append({"path": path, "content": content})
+        fetched.add(path)
 
     return context_files
 
