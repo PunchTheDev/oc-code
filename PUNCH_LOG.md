@@ -1943,3 +1943,28 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - Benchmark: **430 problems**, oracle **11.83**, commit `111abff`
 - Shard: category-balanced (python:12/ts:8/rust:5/jvm:3/ruby:2) — well-roundedness guaranteed
 - Next DAS check: ~2026-06-09 for new repo registrations
+
+---
+
+## 2026-06-02 — API server consistency + docs accuracy
+
+**Issues fixed**:
+- `api/server.py` used `_infer_language()` (guessing language from test_cmd) instead of the canonical `REPO_CATEGORY` map used everywhere else. This caused `category` fields to mismatch between CLI, dashboard, and API.
+- API difficulty thresholds were wrong: easy≥26, medium≥18, hard<18 vs. the correct easy≥15, medium 5–15, hard<5.
+- `docs/api.md` had stale example data: pool_size=400, repos=13, oracle=23.46.
+
+**Fixes**:
+- Added `REPO_CATEGORY` map directly to `api/server.py` (mirrors `benchmark/evaluate.py`)
+- Replaced `_infer_language` with `_category(meta)` using `REPO_CATEGORY`
+- Problem summaries now return `category` (python/typescript/rust/jvm/ruby) instead of `language` (py/js/rs/java)
+- `_problems` filter now uses `cat=` param (also accepts `lang=` as deprecated alias)
+- `_stats` now returns `by_category` and `oracle_score` (was `by_language` and `mean_baseline`)
+- Difficulty thresholds aligned with dashboard: easy≥15, medium 5–15, hard<5
+- `docs/api.md` updated with accurate data, category-based filtering docs
+
+**Dashboard quickstart**: fixed misleading comment "no API key needed for --oracle" — there's no --oracle flag; example agent always requires `OPENROUTER_KEY`.
+
+### Status
+- Benchmark: **430 problems**, oracle **11.83**, 18 DAS repos, commit 9359b69
+- API: `category` field consistent across CLI/dashboard/API
+- Dashboard: quickstart comment fixed (commit 5536863 in gittensor-miner-dashboard)
