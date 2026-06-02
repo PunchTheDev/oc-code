@@ -54,6 +54,11 @@ Improvements over a naive single-shot approach:
   at base_commit). Files that are in context but NOT in file_tree are new files added
   by the PR — they don't exist yet and must be created in the diff. The agent is
   shown pre-formatted diff blocks to copy verbatim. Affects ~60% of pool problems.
+- Test file windowing: large test files (> 200 lines) are windowed with a ±80-line
+  context window around keyword hits, preventing a single large test suite from
+  consuming most of the 40 KB context budget. The threshold is lower than for impl
+  files (200 vs 300) and the window wider (80 vs 40) to preserve complete test
+  function bodies. Files that fit in 200 lines are shown in full.
 - New implementation file detection: same logic applied to non-test source files.
   When a PR adds a new implementation file (e.g. a new Go driver or Python module),
   the agent is explicitly notified to create it, with a concrete format example
@@ -883,10 +888,15 @@ def _truncate_context(files: list[FileContext]) -> list[FileContext]:
 HEADER_LINES = 20  # always shown at top of a windowed file (imports, class defs, etc.)
 
 
-def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> tuple[str, bool]:
+def _window_file(
+    content: str,
+    keywords: set[str],
+    context_lines: int = 40,
+    threshold: int = 300,
+) -> tuple[str, bool]:
     """Return the relevant sections of a file and whether windowing was applied.
 
-    For files over 300 lines, finds all lines containing keyword hits and
+    For files over `threshold` lines, finds all lines containing keyword hits and
     emits a ±context_lines window around each hit cluster. Omitted regions
     are replaced with markers showing the exact line range, e.g.:
         ... [lines 21-260 omitted — next visible line is 261]
@@ -901,7 +911,7 @@ def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> t
     Returns (windowed_content, was_windowed).
     """
     lines = content.splitlines(keepends=True)
-    if len(lines) <= 300:
+    if len(lines) <= threshold:
         return content, False
 
     # Mark which lines contain a keyword hit
@@ -960,12 +970,17 @@ def _window_file(content: str, keywords: set[str], context_lines: int = 40) -> t
     return "".join(parts), True
 
 
-def _format_files(files: list[FileContext], keywords: set[str] | None = None) -> str:
+def _format_files(
+    files: list[FileContext],
+    keywords: set[str] | None = None,
+    context_lines: int = 40,
+    threshold: int = 300,
+) -> str:
     parts = []
     for f in files:
         lang = f.language or ""
         if keywords:
-            content, windowed = _window_file(f.content, keywords)
+            content, windowed = _window_file(f.content, keywords, context_lines=context_lines, threshold=threshold)
             total_lines = f.content.count("\n") + 1
             header = (
                 f"### {f.path} ({total_lines} lines total — relevant sections shown)"
@@ -1194,12 +1209,16 @@ class ExampleAgent(BaseAgent):
         if new_impls:
             log.append(f"[context] new impl files (must be created in diff): {[f.path for f in new_impls]}")
 
-        # Build test section — always shown in full (usually small)
+        # Build test section. Large test files are windowed (threshold=200 lines,
+        # context_lines=80) to avoid consuming most of the context budget on
+        # boilerplate; the wider window ensures complete test functions are visible.
         test_cmd_str = " ".join(problem.test_cmd) if problem.test_cmd else "pytest"
         test_cmd_short = problem.test_cmd[-1] if problem.test_cmd else "pytest"
 
         test_section = (
-            TEST_SECTION_TEMPLATE.format(test_files=_format_files(test_files))
+            TEST_SECTION_TEMPLATE.format(
+                test_files=_format_files(test_files, keywords, context_lines=80, threshold=200)
+            )
             if test_files else ""
         )
         new_test_section = (
