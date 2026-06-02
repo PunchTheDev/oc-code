@@ -33,7 +33,7 @@ See `REGISTRATION.md` for the full step-by-step checklist.
 - [ ] One-click "reproduce" button: runs harness against champion agent for a specific problem
 
 ### Anti-Gaming (hardening)
-- [ ] Patch similarity check: cosine similarity between submitted patch and prior submissions to catch near-copies
+- [x] Patch similarity check: Jaccard similarity check in eval CI (`scripts/check_similarity.py`, commit cafaec0)
 - [ ] Rate limiting: enforce max N submissions per handle per week in `record_submission.yml`
 
 ### Hyperparameters
