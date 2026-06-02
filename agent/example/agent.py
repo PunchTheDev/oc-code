@@ -215,10 +215,10 @@ Requirements:
 - Start with `diff --git a/<path> b/<path>`
 - Include `--- a/<path>` and `+++ b/<path>` headers
 - Each hunk starts with `@@ -<start>,<count> +<start>,<count> @@`
-- **Line numbers**: windowed files show lines as `  N | content`. Use these \
-  numbers directly for `@@ -N` offsets. The numbers are display-only — do NOT \
-  include ` N | ` in your diff's context or change lines; they must match the \
-  actual file content
+- **Line numbers**: windowed **source** files show lines as `  N | content`. Use \
+  these numbers directly for `@@ -N` offsets. The numbers are display-only — do \
+  NOT include ` N | ` in your diff; write the actual file content only. Test files \
+  are windowed without line numbers since you do not write diffs against them.
 - **Context lines**: include exactly 3 unchanged lines before and after each \
   change — this is required for `git apply` to locate the change correctly
 - Every test assertion from your plan must be satisfied by your diff
