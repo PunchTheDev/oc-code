@@ -4,6 +4,35 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: import resolution + language notes + line numbers (commits 82faf35, 69fd49c, 2f3e8cd)
+
+### Agent improvements (3 commits)
+
+**Import-path resolution** (commit `82faf35`)
+- New `_resolve_test_imports()`: parses import statements in test files to identify exact implementation files under test
+  - Python: `from foo.bar.baz import X` → `foo/bar/baz.py`
+  - TypeScript: `import { X } from './utils/helpers'` → resolves relative path with extension probing
+  - Ruby: `require_relative '../lib/foo'` → resolved relative path
+- Pinned files score +100 in `_rank_files()` — they rise to the top over any keyword-matched file
+- `_rank_files()` now accepts `file_tree` parameter; pinned files computed by checking against tree
+- Tested on Python (gittensor#160) and TypeScript (gittensory) problems — correctly pins scoring.py, model.ts, etc.
+
+**Language-specific system prompt notes** (commit `69fd49c`)
+- New `LANG_NOTES` dict: per-language caveats for Rust, TypeScript, Ruby
+  - Rust: trait bounds, match arms, `pub` visibility, `use` imports
+  - TypeScript: type definitions, named exports, null checks
+  - Ruby: snake_case, module includes, `require`
+- `_detect_lang()` infers language from test file extensions
+- Note appended to system prompt only when language is detected (Python uses default prompt)
+
+**Line numbers in windowed files** (commit `2f3e8cd`)
+- `_window_file()` now prefixes each visible line with its 1-based number: `  42 | def my_function():`
+- Digit width consistent with total line count for clean alignment
+- `ACT_PROMPT` updated: "use `N |` numbers directly for `@@ -N` offsets; do NOT include them in diff content"
+- Impact: model no longer needs to count from omission markers — can read line number directly
+
+---
+
 ## 2026-06-02 — Agent: exact line-range omission markers (commit a232d96)
 
 ### Agent improvement
