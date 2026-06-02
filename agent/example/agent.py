@@ -95,6 +95,8 @@ Requirements:
 """
 
 VERIFY_PROMPT = """\
+Issue: {title}
+
 You produced this diff:
 
 ```diff
@@ -102,7 +104,7 @@ You produced this diff:
 ```
 
 Check it against these criteria:
-1. Does it address the root cause you identified?
+1. Does the diff address the root cause described in the issue above?
 2. Is every `@@` hunk header syntactically correct (line numbers make sense)?
 3. Are there missing changes or accidental deletions?
 
@@ -212,6 +214,7 @@ def _call(
     api_key: str,
     max_tokens: int,
     timeout: float,
+    temperature: float = 0.2,
 ) -> str:
     """Call the OpenRouter API. Retries once on 429 (rate limit)."""
     for attempt in range(2):
@@ -226,7 +229,7 @@ def _call(
                 "model": model,
                 "messages": messages,
                 "max_tokens": max_tokens,
-                "temperature": 0.2,
+                "temperature": temperature,
             },
             timeout=timeout,
         )
@@ -319,8 +322,9 @@ class ExampleAgent(BaseAgent):
         history.append({"role": "assistant", "content": plan})
 
         # --- Turn 2: Act ---
+        # temperature=0 for diff generation: format precision matters more than creativity
         history.append({"role": "user", "content": ACT_PROMPT})
-        raw_diff = _call(history, self.model, api_key, act_tokens, timeout)
+        raw_diff = _call(history, self.model, api_key, act_tokens, timeout, temperature=0)
         diff = _extract_diff(raw_diff)
         log.append(f"[diff v0]\n{diff}")
         history.append({"role": "assistant", "content": raw_diff})
@@ -333,7 +337,7 @@ class ExampleAgent(BaseAgent):
                 # Structural problem — give targeted feedback before asking for repair
                 repair_msg = REPAIR_FORMAT_PROMPT.format(problem=problem_desc)
                 history.append({"role": "user", "content": repair_msg})
-                raw_diff = _call(history, self.model, api_key, act_tokens, timeout)
+                raw_diff = _call(history, self.model, api_key, act_tokens, timeout, temperature=0)
                 diff = _extract_diff(raw_diff)
                 log.append(f"[repair {attempt} (format)]\n{diff}")
                 history.append({"role": "assistant", "content": raw_diff})
