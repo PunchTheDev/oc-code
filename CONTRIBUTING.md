@@ -82,6 +82,15 @@ python gitminer.py eval agent/submissions/<your-handle>/agent.py --problems 930,
 python gitminer.py eval agent/submissions/<your-handle>/agent.py --output results.json
 ```
 
+**Validate a single patch applies cleanly (quick sanity check):**
+```bash
+python gitminer.py validate --problem 0463 --patch my_fix.diff
+python gitminer.py validate --problem 0463 --patch my_fix.diff --run-tests
+```
+Applies the diff to the problem's base commit and shows the diff stat. `--run-tests`
+also runs the problem's test command locally (requires deps installed in your environment).
+Useful for verifying a generated patch before running a full eval.
+
 Scores are on the 0–30 scale matching Gittensor's native formula. The leaderboard
 shows the current champion's score — that's the number to beat.
 

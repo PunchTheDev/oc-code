@@ -4,6 +4,7 @@ gitminer — CLI for the Gittensor Base-Miner Benchmark.
 
 Subcommands:
     eval      Score an agent against the current shard (or all problems)
+    validate  Check that a patch applies cleanly to a problem's base commit
     problems  List benchmark problems with optional filters
     cache     Pre-warm the local repo cache (speeds up --no-sandbox evals)
     hash      Compute the commit-reveal SHA-256 hash for a patch file
@@ -15,6 +16,8 @@ Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
     python gitminer.py eval agent/submissions/myhandle/agent.py --all
     python gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
+    python gitminer.py validate --problem 0463 --patch my_fix.diff
+    python gitminer.py validate --problem 0463 --patch my_fix.diff --run-tests
     python gitminer.py problems
     python gitminer.py problems --lang py --difficulty hard --limit 10
     python gitminer.py cache
@@ -391,6 +394,132 @@ def cmd_problems(args: argparse.Namespace) -> None:
     print(f"\n{len(rows[:limit])} of {len(rows)} problems shown.")
 
 
+def cmd_validate(args: argparse.Namespace) -> None:
+    """
+    Check that a patch applies cleanly to a problem's base commit.
+
+    Useful for quick local sanity checks before running a full eval.
+    Uses the repo cache (run `gitminer cache` first for fastest results).
+    """
+    import subprocess
+    import tempfile
+    from benchmark.harness.score import _cached_repo, apply_patch, run_tests
+
+    pool_dir = REPO_ROOT / "benchmark" / "problems"
+    problem_dir = pool_dir / args.problem
+    meta_path = problem_dir / "meta.json"
+
+    if not meta_path.exists():
+        print(f"Problem {args.problem!r} not found in {pool_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    meta = json.loads(meta_path.read_text())
+
+    # Read patch
+    patch_path = Path(args.patch)
+    if not patch_path.exists():
+        print(f"Patch file not found: {args.patch}", file=sys.stderr)
+        sys.exit(1)
+
+    patch_text = patch_path.read_text().strip()
+    if not patch_text:
+        print("Patch file is empty.", file=sys.stderr)
+        sys.exit(1)
+
+    repo_url = meta["repo_url"]
+    base_commit = meta["base_commit"]
+    repo_name = meta["repo_name"]
+
+    print(f"Problem : {args.problem}  —  {meta.get('issue_title', '')[:60]}")
+    print(f"Repo    : {repo_name}")
+    print(f"Commit  : {base_commit[:12]}")
+    print()
+
+    # Ensure cached clone exists
+    print("Checking repo cache...", end=" ", flush=True)
+    try:
+        cached = _cached_repo(repo_url)
+        print("ok")
+    except Exception as e:
+        print(f"FAILED\n{e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Create an isolated worktree at base_commit
+    with tempfile.TemporaryDirectory(prefix="gmval_") as tmpdir:
+        worktree = Path(tmpdir) / "repo"
+        try:
+            subprocess.run(
+                ["git", "-C", str(cached), "worktree", "add",
+                 "--detach", "--force", str(worktree), base_commit],
+                check=True, capture_output=True,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to create worktree: {e.stderr.decode()}", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            # Copy patch into the worktree dir so git apply can resolve paths
+            import shutil
+            patch_copy = Path(tmpdir) / "candidate.patch"
+            shutil.copy(patch_path, patch_copy)
+
+            # Check apply
+            check = subprocess.run(
+                ["git", "apply", "--check", "--verbose", str(patch_copy)],
+                cwd=worktree, capture_output=True, text=True,
+            )
+            if check.returncode != 0:
+                print("FAIL  patch does not apply cleanly")
+                print()
+                stderr = check.stderr.strip()
+                if stderr:
+                    print(stderr)
+                sys.exit(1)
+
+            # Apply
+            subprocess.run(
+                ["git", "apply", str(patch_copy)],
+                cwd=worktree, check=True, capture_output=True,
+            )
+
+            # Diff stat
+            stat = subprocess.run(
+                ["git", "diff", "--stat", "HEAD"],
+                cwd=worktree, capture_output=True, text=True,
+            )
+            print("PASS  patch applies cleanly")
+            print()
+            if stat.stdout.strip():
+                print(stat.stdout.rstrip())
+            print()
+
+            # Optional: run tests
+            if args.run_tests:
+                test_cmd = meta.get("test_cmd")
+                if not test_cmd:
+                    print("No test_cmd defined for this problem — skipping tests.")
+                else:
+                    print(f"Running: {' '.join(test_cmd)}")
+                    passed, output, all_skipped = run_tests(worktree, test_cmd)
+                    if passed or all_skipped:
+                        status = "PASS" if passed else "SKIP (no tests collected)"
+                        print(f"{status}  tests")
+                    else:
+                        print("FAIL  tests")
+                    # Show last 40 lines of test output
+                    lines = output.strip().splitlines()
+                    if lines:
+                        print()
+                        print("\n".join(lines[-40:]))
+                    if not passed and not all_skipped:
+                        sys.exit(1)
+        finally:
+            subprocess.run(
+                ["git", "-C", str(cached), "worktree", "remove", "--force", str(worktree)],
+                capture_output=True,
+            )
+
+
 def cmd_cache(args: argparse.Namespace) -> None:
     """Pre-warm the local repo cache used by --no-sandbox eval."""
     import json as _json
@@ -444,6 +573,19 @@ def main() -> None:
     p_eval.add_argument("--output", metavar="FILE",
                         help="Save full results JSON to FILE")
     p_eval.set_defaults(func=cmd_eval)
+
+    # validate
+    p_validate = sub.add_parser(
+        "validate",
+        help="Check that a patch applies cleanly to a problem's base commit",
+    )
+    p_validate.add_argument("--problem", required=True, metavar="ID",
+                            help="Problem ID (e.g. 0463)")
+    p_validate.add_argument("--patch", required=True, metavar="FILE",
+                            help="Path to the unified diff file")
+    p_validate.add_argument("--run-tests", action="store_true",
+                            help="Also run the problem's test command after applying the patch")
+    p_validate.set_defaults(func=cmd_validate)
 
     # problems
     p_problems = sub.add_parser("problems", help="List benchmark problems with optional filters")
