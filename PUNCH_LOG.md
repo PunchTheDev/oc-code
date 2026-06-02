@@ -4,6 +4,20 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Pool 360→366 + oracle 22.79 (commit ba1f53b)
+
+### Pool refresh (+6 new problems)
+- `phase-rs_phase_1440` — Emissary Green not triggering (Rust integration test)
+- `jsonbored_gittensory_218` — feat(agent): contributor evidence graph (TypeScript unit tests)
+- `jsonbored_gittensory_222` — Pending-PR projection double-counts merge-ready PRs (TS test)
+- `jsonbored_gittensory_225` — buildRoleContext maintainer association bug (TS test)
+- `jsonbored_gittensory_226` — add recommendation confidence and provenance (TS integration test)
+- `jsonbored_gittensory_228` — buildObservedPullRequestScenarios classifies open PRs wrong (TS test)
+- Oracle mean recomputed: 22.83 → **22.79** across all 366 problems
+- Updated: pool_config.json, leaderboard.json, baselines.json, dashboard_data.json, README badge, docs/rewards.md, docs/api.md, evaluate.py, gitminer.py, generate_dashboard_data.py, record_result.py
+
+---
+
 ## 2026-06-02 — Agent: file-header preservation + index-file hint (commit 8ac6b9d)
 
 ### Agent improvements
