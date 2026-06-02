@@ -230,7 +230,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
     print(f"\n{'─'*60}")
     print("Run these commands to open your submission PR:\n")
     print(f"  git checkout -b {branch}")
-    print(f"  git add {agent_path} {meta_path.name}")
+    print(f"  git add {agent_path} {meta_path}")
     print(f'  git commit -m "Submit {handle} agent\n\nagent-sha256: {sha}"')
     print(f"  git push -u origin {branch}")
     print()
