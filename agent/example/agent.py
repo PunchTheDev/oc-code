@@ -57,6 +57,11 @@ Improvements over a naive single-shot approach:
 - New implementation file detection: same logic applied to non-test source files.
   When a PR adds a new implementation file (e.g. a new Go driver or Python module),
   the agent is explicitly notified to create it. Affects ~33% of pool problems.
+- Hunk count auto-fix: after every diff generation, `_fix_hunk_counts()` recomputes
+  the b/d fields in each `@@ -a,b +c,d @@` header from the actual content lines.
+  LLMs frequently miscalculate these counts; incorrect counts cause `git apply` to
+  reject otherwise correct diffs. This is a deterministic post-processor — no API
+  calls, no model changes.
 """
 
 from __future__ import annotations
@@ -925,6 +930,51 @@ def _looks_valid(diff: str) -> bool:
     return diff.startswith("diff --git") and "@@" in diff
 
 
+def _fix_hunk_counts(diff: str) -> str:
+    """Rewrite @@ -a,b +c,d @@ headers with accurate line counts.
+
+    LLMs frequently miscalculate b (old-hunk line count) and d (new-hunk line
+    count).  This post-processor counts the actual ` `, `-`, `+` lines in each
+    hunk and rewrites the header, increasing the probability that `git apply`
+    succeeds without changing any of the actual content.
+    """
+    lines = diff.split("\n")
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)", line)
+        if not m:
+            result.append(line)
+            i += 1
+            continue
+        old_start = m.group(1)
+        new_start = m.group(2)
+        suffix = m.group(3)
+
+        # Count context/remove/add lines that belong to this hunk
+        old_count = 0
+        new_count = 0
+        j = i + 1
+        while j < len(lines):
+            hl = lines[j]
+            if hl.startswith("diff --git") or re.match(r"^@@ ", hl):
+                break
+            if hl.startswith("-") and not hl.startswith("---"):
+                old_count += 1
+            elif hl.startswith("+") and not hl.startswith("+++"):
+                new_count += 1
+            elif hl.startswith(" "):
+                old_count += 1
+                new_count += 1
+            # backslash no-newline markers and blank lines: not content
+            j += 1
+
+        result.append(f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}")
+        i += 1  # consume only the @@ line; hunk content processed normally
+    return "\n".join(result)
+
+
 def _diagnose_diff(diff: str) -> str:
     """Return a short description of the first structural problem found."""
     if not diff.strip():
@@ -1169,6 +1219,10 @@ class ExampleAgent(BaseAgent):
                 # Prose critique without a new diff — accept current result
                 break
 
+        # Post-process: recompute hunk line counts — LLMs frequently miscalculate
+        # b/d in @@ -a,b +c,d @@, causing git apply to reject otherwise correct diffs.
+        diff = _fix_hunk_counts(diff)
+
         reasoning = f"model={self.model}\n\n" + "\n\n".join(log)
         return Patch(diff=diff, reasoning=reasoning)
 
@@ -1214,5 +1268,6 @@ class ExampleAgent(BaseAgent):
             diff = _extract_diff(raw_diff)
             log.append(f"[repair format fix]\n{diff}")
 
+        diff = _fix_hunk_counts(diff)
         reasoning = (failed_patch.reasoning or "") + "\n\n" + f"model={self.model}\n\n" + "\n\n".join(log)
         return Patch(diff=diff, reasoning=reasoning)
