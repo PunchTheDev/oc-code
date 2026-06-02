@@ -50,6 +50,39 @@ DIFFICULTY_TIERS = [
     ("hard",   None, 2.0),  # 150+ → weight 2.0×
 ]
 
+# Repo → language category (mirrors generate_dashboard_data.py)
+REPO_CATEGORY: dict[str, str] = {
+    "entrius/gittensor": "python",
+    "entrius/allways": "python",
+    "entrius/das-github-mirror": "python",
+    "entrius/allways-ui": "typescript",
+    "entrius/gittensor-ui": "typescript",
+    "entrius/oc-1": "typescript",
+    "aglover1221/product-data-extractor": "python",
+    "cogniax/tao-pulse-app": "typescript",
+    "e35ventura/taopedia": "python",
+    "e35ventura/taopedia-articles": "python",
+    "geniepod/genie-claw": "rust",
+    "infiniflow/ragflow": "python",
+    "jsonbored/awesome-claude": "typescript",
+    "jsonbored/gittensory": "typescript",
+    "mkdev11/gittensor-hub": "typescript",
+    "vouchdev/vouch": "typescript",
+    "phase-rs/phase": "rust",
+    "seroperson/jvm-live-reload": "jvm",
+    "touchpilot/touchpilot": "jvm",
+    "we-promise/sure": "ruby",
+}
+
+# Default per-category shard budget (sums to 30) — overridable via pool_config.json
+DEFAULT_SHARD_BUDGET: dict[str, int] = {
+    "python": 12,
+    "typescript": 8,
+    "rust": 5,
+    "jvm": 3,
+    "ruby": 2,
+}
+
 
 def problem_difficulty(problem_dir: Path) -> tuple[str, float]:
     """Return (tier_name, weight) for a problem based on reference diff size."""
@@ -65,6 +98,16 @@ def problem_difficulty(problem_dir: Path) -> tuple[str, float]:
         if threshold is None or added < threshold:
             return name, weight
     return "hard", 2.0
+
+
+def _problem_category(problem_dir: Path) -> str:
+    """Return the language category for a problem, based on its repo."""
+    try:
+        meta = json.loads((problem_dir / "meta.json").read_text())
+        repo = meta.get("repo_name", "").lower()
+        return REPO_CATEGORY.get(repo, "python")
+    except Exception:
+        return "python"
 
 
 def _diff_hash(diff_text: str) -> str:
@@ -86,10 +129,19 @@ def load_pool_config() -> dict:
 
 
 def select_shard(all_problem_dirs: list[Path], config: dict) -> list[Path]:
-    """Pick a deterministic shard from the pool according to rotation policy."""
+    """Pick a deterministic, category-balanced shard from the pool.
+
+    Problems are grouped by language category and sampled according to
+    shard_budget (from pool_config.json, or DEFAULT_SHARD_BUDGET). This
+    ensures well-roundedness: no single language can dominate a round.
+
+    If a category has fewer problems than its budget, the remainder is
+    redistributed to other categories proportionally.
+    """
     shard_size = config.get("shard_size", 30)
     policy = config.get("rotation_policy", "weekly")
     base_seed = config.get("rotation_seed", 42)
+    budget = config.get("shard_budget", DEFAULT_SHARD_BUDGET)
 
     if shard_size >= len(all_problem_dirs):
         return all_problem_dirs
@@ -97,7 +149,6 @@ def select_shard(all_problem_dirs: list[Path], config: dict) -> list[Path]:
     if policy == "fixed":
         seed = base_seed
     elif policy == "weekly":
-        # Week number since epoch — changes every 7 days
         epoch = date(2024, 1, 1)
         week_number = (date.today() - epoch).days // 7
         seed = base_seed ^ week_number
@@ -112,9 +163,47 @@ def select_shard(all_problem_dirs: list[Path], config: dict) -> list[Path]:
         seed ^= secret_int
 
     rng = random.Random(seed)
-    pool = list(all_problem_dirs)
-    rng.shuffle(pool)
-    return sorted(pool[:shard_size])
+
+    # Group and shuffle each category bucket independently
+    by_category: dict[str, list[Path]] = {}
+    for d in all_problem_dirs:
+        cat = _problem_category(d)
+        by_category.setdefault(cat, []).append(d)
+    for cat in by_category:
+        rng.shuffle(by_category[cat])
+
+    # First pass: take up to budget from each budgeted category
+    selected: list[Path] = []
+    cats = list(budget.keys())
+    taken: dict[str, int] = {}
+    shortfall = 0
+    for cat in cats:
+        pool = by_category.get(cat, [])
+        want = budget.get(cat, 0)
+        take = min(want, len(pool))
+        selected.extend(pool[:take])
+        taken[cat] = take
+        shortfall += want - take
+
+    # Second pass: fill any shortfall from remaining problems in over-budget cats
+    if shortfall > 0:
+        for cat in cats:
+            pool = by_category.get(cat, [])
+            extras = pool[taken[cat]:]
+            if extras:
+                give = min(shortfall, len(extras))
+                selected.extend(extras[:give])
+                shortfall -= give
+                if shortfall == 0:
+                    break
+
+    # Final pass: pick up any "other" category problems if still short
+    if shortfall > 0:
+        others = by_category.get("other", [])
+        if others:
+            selected.extend(others[:shortfall])
+
+    return sorted(selected[:shard_size])
 
 
 def load_agent(agent_path: str):
@@ -238,9 +327,10 @@ def run_evaluation(
 
         weighted_total = weighted_count = 0.0
         for r, d in zip(results, selected):
-            _, w = problem_difficulty(d)
-            r["difficulty"] = problem_difficulty(d)[0]
+            tier, w = problem_difficulty(d)
+            r["difficulty"] = tier
             r["difficulty_weight"] = w
+            r["category"] = _problem_category(d)
             weighted_total += r["final_score"] * w
             weighted_count += w
         weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
@@ -311,6 +401,7 @@ def run_evaluation(
         tier, w = problem_difficulty(d)
         r["difficulty"] = tier
         r["difficulty_weight"] = w
+        r["category"] = _problem_category(d)
         weighted_total += r["final_score"] * w
         weighted_count += w
     weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
@@ -346,11 +437,17 @@ def main() -> None:
     if args.list_shard:
         all_dirs = sorted(POOL_DIR.glob("*/meta.json"))
         shard = select_shard([p.parent for p in all_dirs], config)
+        by_cat: dict[str, int] = {}
+        for d in shard:
+            cat = _problem_category(d)
+            by_cat[cat] = by_cat.get(cat, 0) + 1
+        cat_summary = "  ".join(f"{c}:{n}" for c, n in sorted(by_cat.items()))
         print(f"Current shard ({config.get('rotation_policy', 'weekly')}, "
-              f"{len(shard)}/{len(all_dirs)} problems):")
+              f"{len(shard)}/{len(all_dirs)} problems)  [{cat_summary}]:")
         for d in shard:
             meta = json.loads((d / "meta.json").read_text())
-            print(f"  {d.name:30s}  {meta['repo_name']}  #{meta['pr_number']}")
+            cat = _problem_category(d)
+            print(f"  {d.name:30s}  [{cat:12s}]  {meta['repo_name']}  #{meta['pr_number']}")
         return
 
     if not args.oracle and not args.agent:
