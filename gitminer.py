@@ -34,6 +34,18 @@ REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(REPO_ROOT))
 
 
+def _oracle_mean() -> float:
+    """Read the oracle (reference-diff baseline) mean from leaderboard.json."""
+    try:
+        lb = json.loads((REPO_ROOT / "results" / "leaderboard.json").read_text())
+        oracle = next((r for r in lb if r.get("handle") == "oracle"), None)
+        if oracle:
+            return float(oracle.get("mean_score", 22.79))
+    except Exception:
+        pass
+    return 22.79  # fallback
+
+
 def cmd_eval(args: argparse.Namespace) -> None:
     from benchmark.evaluate import run_evaluation
 
@@ -45,18 +57,78 @@ def cmd_eval(args: argparse.Namespace) -> None:
         use_all=args.all,
     )
 
-    scores = [r["final_score"] for r in results.get("problems", []) if "final_score" in r]
-    if not scores:
+    problems = results.get("problems", [])
+    if not problems:
         print("\nNo scores recorded.")
         return
 
+    # Gather stats
+    scores = [r.get("final_score", 0.0) for r in problems]
+    passed = [r for r in problems if r.get("tests_passed")]
+    failed = [r for r in problems if not r.get("tests_passed") and not r.get("error")]
+    errored = [r for r in problems if r.get("error")]
+
     mean = sum(scores) / len(scores)
-    print(f"\n{'─'*50}")
-    print(f"  Problems evaluated : {len(scores)}")
+    oracle = _oracle_mean()
+
+    # Read language info from meta.json for each problem
+    pool_dir = REPO_ROOT / "benchmark" / "problems"
+    lang_map: dict[str, str] = {}
+    for r in problems:
+        pid = r.get("problem_id", "")
+        meta_path = pool_dir / str(pid) / "meta.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text())
+                runner = meta.get("test_cmd", ["python"])[0]
+                lang = {"npm": "JS", "cargo": "Rust", "./gradlew": "Java"}.get(runner, "Python")
+                lang_map[pid] = lang
+            except Exception:
+                lang_map[pid] = "?"
+
+    # Per-language pass rates
+    lang_stats: dict[str, list] = {}
+    for r in problems:
+        pid = r.get("problem_id", "")
+        lang = lang_map.get(pid, "?")
+        if lang not in lang_stats:
+            lang_stats[lang] = []
+        lang_stats[lang].append(r.get("tests_passed", False))
+
+    print(f"\n{'─'*54}")
+    print(f"  Problems evaluated : {len(problems)} ({len(passed)} passed, {len(failed)} failed, {len(errored)} errors)")
     print(f"  Mean score         : {mean:.2f} / 30.00")
-    print(f"  Oracle mean        : 21.60 / 30.00")
-    print(f"  Gap to oracle      : {21.60 - mean:.2f}")
-    print(f"{'─'*50}")
+    print(f"  Oracle mean        : {oracle:.2f} / 30.00  (reference diffs)")
+    delta = mean - oracle
+    arrow = "▲" if delta >= 0 else "▼"
+    print(f"  vs oracle          : {arrow} {abs(delta):.2f}")
+
+    if len(lang_stats) > 1:
+        print(f"\n  Pass rate by language:")
+        for lang in sorted(lang_stats):
+            bits = lang_stats[lang]
+            n_pass = sum(bits)
+            print(f"    {lang:8s}: {n_pass}/{len(bits)}")
+
+    if failed or errored:
+        print(f"\n  Failed problems:")
+        for r in failed[:10]:
+            pid = r.get("problem_id", "?")
+            test_out = r.get("test_output", "")
+            # Show first failing line from test output
+            hint = ""
+            for line in test_out.splitlines():
+                if "FAILED" in line or "Error" in line or "assert" in line.lower():
+                    hint = f"  → {line.strip()[:60]}"
+                    break
+            print(f"    [{pid}]{hint}")
+        for r in errored[:5]:
+            pid = r.get("problem_id", "?")
+            print(f"    [{pid}] ERROR: {r.get('error', '')[:60]}")
+        if len(failed) + len(errored) > 15:
+            print(f"    ... and {len(failed) + len(errored) - 15} more (see --output for full details)")
+
+    print(f"{'─'*54}")
 
     if args.output:
         out = Path(args.output)
