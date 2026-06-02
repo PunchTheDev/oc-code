@@ -54,6 +54,14 @@ observe → plan → act → verify loop. Beat it.
 
 ## Run the benchmark locally
 
+**Pre-warm the repo cache (recommended before first `--no-sandbox` run):**
+```bash
+python gitminer.py cache
+```
+Clones all pool repos once into `~/.cache/gitminer/repos/`. Subsequent `--no-sandbox`
+evals use git worktrees instead of cloning, cutting a 30-problem run from ~20 min to
+a few minutes. Set `GITMINER_CACHE=/path/to/dir` to override the cache location.
+
 **With Docker sandbox (same as CI):**
 ```bash
 python gitminer.py eval agent/submissions/<your-handle>/agent.py
