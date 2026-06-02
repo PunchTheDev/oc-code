@@ -1436,6 +1436,11 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
         "toEqual",          # Jest/Vitest
         "toBe(",            # Jest/Vitest
         "toHaveBeenCalled",
+        "toBeNull(",        # Jest/Vitest
+        "toBeUndefined(",
+        "toContain(",
+        "toMatchObject(",
+        "toThrow(",
         "assertEquals(",    # JUnit / Kotlin
         "assertTrue(",
         "assertFalse(",
@@ -1446,11 +1451,27 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
         "if got",           # Go-style: if got != want { t.Errorf... }
         "t.Errorf(",
         "t.Fatalf(",
+        "t.Fatal(",         # Go
         "assert.Equal(",    # testify (Go)
         "assert.NoError(",
         "assert.Error(",
+        "assert.True(",
+        "assert.False(",
+        "assert.Nil(",
+        "assert.NotNil(",
+        "assert.Contains(",
+        "assert.Len(",
+        "assert.Empty(",
+        "assert.NotEmpty(",
         "require.Equal(",
         "require.NoError(",
+        "require.Error(",
+        "require.True(",
+        "require.False(",
+        "require.Nil(",
+        "require.NotNil(",
+        "require.Contains(",
+        "require.Len(",
     )
     lines: list[str] = []
     for f in test_files:
