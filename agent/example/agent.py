@@ -277,10 +277,20 @@ Improvements over a naive single-shot approach:
   can spot off-by-one logic errors, missing branches, and wrong type annotations. Capped at
   3 files × 4 KB each (12 KB max) to keep the repair prompt compact. Files not in the problem
   context (e.g. generated or vendored files) are silently skipped.
-- `_extract_assertions` Ruby Minitest `refute` patterns: added `refute `, `refute_equal(`,
-  `refute_nil(`, `refute_includes(`, `refute_match(`, `refute_empty(`. The 37 `we-promise/sure`
-  pool problems use Minitest, which has symmetrical `assert`/`refute` negation assertions.
-  Previously `refute` lines were invisible to the verify step's assertion cross-check.
+- `_extract_assertions` Ruby Minitest `refute` patterns: added `refute `, `refute_equal `,
+  `refute_nil `, `refute_includes `, `refute_match `, `refute_empty `, plus parenthesized
+  `refute_equal(`, `refute_nil(`, `refute_includes(`, `refute_match(`, `refute_empty(`.
+  The 37 `we-promise/sure` pool problems use Minitest, which has symmetrical
+  `assert`/`refute` negation assertions.
+- `_extract_assertions` Ruby Minitest `assert_*` patterns: added `assert_equal`,
+  `assert_nil`, `assert_includes`, `assert_match`, `assert_raises`, `assert_empty`,
+  `assert_respond_to`, `assert_kind_of`, `assert_instance_of` — both space and parens forms.
+  Previously `assert ` only matched bare `assert condition`; Minitest's `assert_equal expected,
+  actual` starts with `assert_` (underscore), so was silently skipped. All 37 `we-promise/sure`
+  pool problems are now covered for both `assert_*` and `refute_*` patterns.
+- `_extract_assertions` deduplication: the same assertion line appearing in multiple test files
+  now counts only once toward the 50-line limit. Cross-file duplicate assertions (shared helpers,
+  parameterised test setup blocks) no longer waste lines that could show unique edge cases.
 """
 
 from __future__ import annotations
@@ -1482,19 +1492,32 @@ def _extract_assertions(test_files: list[FileContext], limit: int = 50) -> str:
         "require.NotNil(",
         "require.Contains(",
         "require.Len(",
-        "refute ",             # Ruby Minitest: `refute value`, `refute obj.nil?`
-        "refute_equal ",       # `refute_equal expected, actual`
-        "refute_nil ",
-        "refute_includes ",
-        "refute_match ",
-        "refute_empty ",
+        # Ruby Minitest assert_* (assert_ prefix — NOT matched by bare "assert ")
+        "assert_equal ",    "assert_equal(",
+        "assert_nil ",      "assert_nil(",
+        "assert_includes ", "assert_includes(",
+        "assert_match ",    "assert_match(",
+        "assert_raises ",   "assert_raises(",
+        "assert_empty ",    "assert_empty(",
+        "assert_respond_to ", "assert_respond_to(",
+        "assert_kind_of ",  "assert_kind_of(",
+        "assert_instance_of ", "assert_instance_of(",
+        # Ruby Minitest refute_* — both space and parens calling conventions
+        "refute ",             # bare: `refute value`, `refute obj.nil?`
+        "refute_equal ",   "refute_equal(",
+        "refute_nil ",     "refute_nil(",
+        "refute_includes ","refute_includes(",
+        "refute_match ",   "refute_match(",
+        "refute_empty ",   "refute_empty(",
     )
     lines: list[str] = []
+    seen: set[str] = set()
     for f in test_files:
         for raw in f.content.splitlines():
             stripped = raw.strip()
-            if any(stripped.startswith(p) for p in _ASSERT_PREFIXES):
+            if stripped not in seen and any(stripped.startswith(p) for p in _ASSERT_PREFIXES):
                 lines.append(stripped)
+                seen.add(stripped)
             if len(lines) >= limit:
                 break
         if len(lines) >= limit:
