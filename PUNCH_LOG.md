@@ -4,6 +4,33 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Hunk source context injected into verify (commit 13a1bde)
+
+### Verify: real hunk-offset check via source context injection
+
+**Problem**: The verify step's criterion 2 ("are `@@ -N` hunk offsets correct?") was previously a plausibility guess. After history compaction, the verify model has no access to source files — it can only ask "do the context lines look like surrounding code?" but cannot check if they match the *actual* source at line N.
+
+**Fix**: `_hunk_source_snippets(diff, file_lookup)` extracts actual source lines at each hunk's `@@ -N` offset and injects them into the verify prompt. Format:
+
+```
+[src/drivers/mistral.go @@ -45]
+    43: // Embed implements the Embedder interface
+    44: func (e *MistralEmbedder) Embed(...) {
+  → 45: 	return nil, fmt.Errorf("not implemented")
+    46: }
+    47: 
+```
+
+The arrow marks the hunk start line; 2 lines above and below give context. The verify model can now check: do the context lines in my diff match what's shown here?
+
+Criterion 2 updated to reference the new section: "The source context section above shows the actual file lines at each hunk offset — verify that the context lines in your diff match exactly (same content, same whitespace)."
+
+**Cost**: limited to 6 hunks per problem (~1 KB added to verify prompt). No API calls — purely local lookup from `file_lookup` which is already built in `solve()`.
+
+**Impact**: enables the verify model to catch wrong `@@ -N` offsets that `_fix_hunk_offsets` didn't correct (e.g., offset > ±50 from stated value, or ambiguous fingerprint) and context-line whitespace mismatches that `_fix_context_lines` missed (e.g., trailing spaces, CRLF).
+
+---
+
 ## 2026-06-02 — Verify prose-critique followup, long-body head+tail (commits a1b4584, 9e40ddc)
 
 ### Verify prose-critique follow-up prompt
