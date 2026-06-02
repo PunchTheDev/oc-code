@@ -320,3 +320,24 @@ Pending: nginx hookup, Gittensor registration.
 - Full dry-run: 0 new qualifying problems across all 20 registered repos. Pool remains at 342.
 
 Pending: Gittensor registration (operator action).
+
+## 2026-06-02 — Dashboard hero redesign + agent file windowing
+
+### Dashboard (commit 26a6b76)
+- **Hero section**: "Ship code. Earn TAO. Improve the network." — big headline, 2-line pitch, live stats bar (pool size, oracle score, SOTA), 3 CTAs
+- **How it works**: 4-step visual (Browse → Build → Submit → Earn) as connected panel grid
+- **Quick start terminal block**: 3 commands with syntax coloring, no copy confusion
+- **REST API info box**: one-liner explaining the API is available, links to docs/api.md
+- **Model pills**: now show short name (e.g. `deepseek-chat`) with full ID in tooltip — was showing verbose `deepseek/deepseek-chat`
+- **Leaderboard section**: count badge + "no submissions yet" CTA box when empty
+- **Meta**: better title + description tag for SEO/share previews
+
+### Benchmark (commit b5f613b)
+- **File content windowing**: `_window_file()` in example agent — for files >300 lines, shows only ±40-line windows around keyword hits with `... [N lines omitted]` markers; lets more files fit in the 40k-char context budget
+- **README stale counts fixed**: 324 → 342 in 3 places
+
+### Status
+- Dashboard: http://localhost:8082 (serving, commit 26a6b76)
+- API: http://localhost:8083 (serving)
+- Pool: 342 problems, oracle 22.83
+- Pending: Gittensor registration, nginx hookup
