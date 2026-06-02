@@ -263,6 +263,14 @@ Improvements over a naive single-shot approach:
   (exactly one match required) applies to both passes. If the exact pass was ambiguous (multiple
   matches), the stripped fallback is skipped to avoid false positives. Empty-stripped fingerprints
   are also rejected to prevent trivial matches on blank lines.
+- `_fix_new_starts`: recalculates the `+c` (new-file start line) for every hunk after
+  `_fix_hunk_offsets` and `_fix_hunk_counts` have corrected `-N` and counts. The `+c` field
+  was previously never touched — whatever the LLM wrote was kept verbatim. But `+c` must equal
+  `old_start + cumulative_delta` where cumulative_delta = sum(new_count - old_count) for all
+  prior hunks in the same file. A stale `+c` causes `git apply` to fail on multi-hunk diffs
+  where the LLM wrote offsets before or after offset correction moved them. Stage 7 of
+  `_post_process`; runs after `_fix_hunk_counts` so it sees the final corrected counts.
+  New-file hunks (`@@ -0,0`) are skipped.
 """
 
 from __future__ import annotations
@@ -1977,6 +1985,7 @@ def _post_process(diff: str, file_lookup: dict[str, str] | None = None) -> str:
       4. Correct wrong @@ -N start offsets via context-line matching (needs headers)
       5. Fix context lines that differ from source only in whitespace (safe: strip-match guard)
       6. Recompute @@ -a,b +c,d counts from actual hunk content
+      7. Recalculate +c new-start from corrected -N + cumulative per-file delta
     """
     diff = _strip_line_number_prefixes(diff)
     diff = _trim_trailing_prose(diff)
@@ -1985,6 +1994,7 @@ def _post_process(diff: str, file_lookup: dict[str, str] | None = None) -> str:
         diff = _fix_hunk_offsets(diff, file_lookup)
         diff = _fix_context_lines(diff, file_lookup)
     diff = _fix_hunk_counts(diff)
+    diff = _fix_new_starts(diff)
     return diff
 
 
@@ -2030,6 +2040,49 @@ def _fix_hunk_counts(diff: str) -> str:
 
         result.append(f"@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}")
         i += 1  # consume only the @@ line; hunk content processed normally
+    return "\n".join(result)
+
+
+def _fix_new_starts(diff: str) -> str:
+    """Recalculate +c (new-file start line) for each hunk from corrected -N + cumulative delta.
+
+    After _fix_hunk_offsets corrects -N and _fix_hunk_counts corrects b/d counts, the +c
+    values may still be stale — they reflect whatever the LLM wrote, not the mathematically
+    correct position.  Wrong +c values cause `git apply` to reject valid hunks.
+
+    The correct +c for each hunk is: old_start + sum(new_count - old_count) for all
+    previous hunks in the same file.  New-file hunks (@@ -0,0 ...) are skipped since
+    they have no old file to count from.
+    """
+    lines = diff.split("\n")
+    result: list[str] = []
+    cumulative_delta = 0
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r"^diff --git", line):
+            cumulative_delta = 0  # reset per file
+            result.append(line)
+            i += 1
+            continue
+        m = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)", line)
+        if m:
+            old_start = int(m.group(1))
+            old_count = int(m.group(2)) if m.group(2) else 1
+            new_count = int(m.group(4)) if m.group(4) else 1
+            suffix = m.group(5)
+            if old_start == 0:
+                # New-file hunk: +c is always 1 when adding a whole file; skip recalc
+                result.append(line)
+                i += 1
+                continue
+            correct_new = old_start + cumulative_delta
+            result.append(f"@@ -{old_start},{old_count} +{correct_new},{new_count} @@{suffix}")
+            cumulative_delta += new_count - old_count
+            i += 1
+            continue
+        result.append(line)
+        i += 1
     return "\n".join(result)
 
 
