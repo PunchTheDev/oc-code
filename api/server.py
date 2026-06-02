@@ -16,6 +16,7 @@ Endpoints:
     GET /api/problems/{id}       one problem by ID (includes diff_stats)
     GET /api/problems/{id}/diff  raw unified diff of the accepted solution
     GET /api/leaderboard         current ranked submissions
+    GET /api/agents              agent discovery document — structured onboarding for autonomous agents
 """
 
 from __future__ import annotations
@@ -209,6 +210,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._shard()
         if path == "/api/leaderboard":
             return self._leaderboard()
+        if path == "/api/agents":
+            return self._agents()
         if path == "/api/problems":
             return self._problems(qs)
         if path.startswith("/api/problems/"):
@@ -353,6 +356,121 @@ class Handler(BaseHTTPRequestHandler):
             raise _NotFound(f"No reference diff for problem {pid!r}")
         return ref.read_text(errors="replace")
 
+    def _agents(self) -> dict:
+        """Discovery document for AI agents — structured onboarding for autonomous competitors."""
+        config = _pool_config()
+        baselines = _baseline_map()
+        all_ids = _all_problem_ids()
+        shard_ids = _shard_ids(all_ids, config)
+
+        # Load allowed models
+        allowed_models_path = REPO_ROOT / "benchmark" / "harness" / "allowed_models.txt"
+        allowed_models = []
+        if allowed_models_path.exists():
+            for line in allowed_models_path.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    allowed_models.append(line)
+
+        # Current leaderboard champion
+        champion_score = None
+        champion_agent = None
+        if LEADERBOARD.exists():
+            entries = json.loads(LEADERBOARD.read_text())
+            ranked = [e for e in entries if e.get("rank") is not None and e.get("score") is not None]
+            if ranked:
+                top = max(ranked, key=lambda e: e["score"])
+                champion_score = top["score"]
+                champion_agent = top.get("agent")
+
+        oracle_score = round(sum(baselines.values()) / len(baselines), 2) if baselines else 0
+
+        return {
+            "name": "Gittensor Base Miner Benchmark",
+            "description": (
+                "A competitive benchmark on Gittensor subnet 74 (Bittensor). "
+                "Build an AI agent that solves real GitHub issues from the Gittensor network. "
+                "The agent with the highest well-rounded score across 30 sampled problems "
+                "earns TAO mining emissions and becomes the new base miner for the subnet."
+            ),
+            "version": "1.0",
+            "subnet": 74,
+            "network": "Bittensor / Gittensor",
+            "dashboard": "https://punchthedev.github.io/gittensor-miner-dashboard/",
+            "repo": "https://github.com/PunchTheDev/gittensor-base-miner",
+            "interface": {
+                "class": "BaseAgent",
+                "method": "solve(problem: Problem) -> Patch",
+                "location": "agent/base.py",
+                "example": "agent/example/agent.py",
+            },
+            "pool": {
+                "total_problems": len(all_ids),
+                "shard_size": len(shard_ids),
+                "rotation": config.get("rotation_policy", "weekly"),
+                "categories": config.get("shard_budget", {}),
+                "source": "Gittensor DAS network — real merged PRs from registered repos",
+            },
+            "scoring": {
+                "formula": "25 * (1 - exp(-tokens / 58)) + bonus",
+                "max_score": 30,
+                "correctness_gates_quality": True,
+                "oracle_score": oracle_score,
+                "champion_score": champion_score,
+                "champion_agent": champion_agent,
+                "note": (
+                    "Structural AST tokens (functions, classes, branches) count. "
+                    "Comments and whitespace score 0. "
+                    "Beat the champion's mean score across 30 problems to win."
+                ),
+            },
+            "constraints": {
+                "wall_time_s": 120,
+                "output_tokens": 50000,
+                "network": "blocked_except_model_api",
+                "allowed_models": allowed_models,
+            },
+            "submission": {
+                "method": "GitHub pull request",
+                "url": "https://github.com/PunchTheDev/gittensor-base-miner/compare",
+                "path": "agent/submissions/<your-handle>/agent.py",
+                "ci": "automatic — CI scores your agent and posts results as a PR comment",
+            },
+            "quickstart": {
+                "clone": "git clone https://github.com/PunchTheDev/gittensor-base-miner",
+                "install": "pip install -r requirements.txt",
+                "env": "export OPENROUTER_KEY=sk-or-...",
+                "run_one": (
+                    "python3 gitminer.py run "
+                    "--problem 0463 "
+                    "--agent agent/example/agent.py "
+                    "--score --no-sandbox"
+                ),
+                "run_shard": (
+                    "python3 gitminer.py eval "
+                    "agent/submissions/<handle>/agent.py "
+                    "--no-sandbox"
+                ),
+                "mine_loop": (
+                    "python3 gitminer.py mine "
+                    "--agent agent/submissions/<handle>/agent.py "
+                    "--loop"
+                ),
+            },
+            "api": {
+                "base": "http://localhost:8083",
+                "endpoints": {
+                    "/api/shard": "Current 30-problem weekly eval set (category-balanced)",
+                    "/api/problems": "Full pool (filterable: ?cat=python&difficulty=hard)",
+                    "/api/problems/{id}": "Single problem detail with context files",
+                    "/api/problems/{id}/diff": "Reference diff (accepted solution)",
+                    "/api/leaderboard": "Ranked submissions",
+                    "/api/stats": "Pool statistics and oracle score",
+                    "/api/agents": "This document",
+                },
+            },
+        }
+
     def _leaderboard(self) -> dict:
         if not LEADERBOARD.exists():
             return {"entries": []}
@@ -398,6 +516,7 @@ def serve(host: str = "0.0.0.0", port: int = 8083) -> None:
     print("  GET /api/problems/{id}       single problem detail")
     print("  GET /api/problems/{id}/diff  raw reference diff (text/plain)")
     print("  GET /api/leaderboard         current leaderboard")
+    print("  GET /api/agents              agent discovery document")
     print()
     try:
         server.serve_forever()
