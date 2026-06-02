@@ -255,6 +255,16 @@ def infer_test_cmd(repo: str, diff: str) -> list[str]:
     if re.search(r"\.(go)\b", diff):
         return ["go", "test", "./..."]
 
+    # Ruby / Rails — detect *_test.rb or test_*.rb files in diff
+    rb_tests = re.findall(
+        r"^diff --git a/((?:[^/\s]*/)*(?:test_[^/\s]*\.rb|[^/\s]*_test\.rb))",
+        diff, re.MULTILINE,
+    )
+    if rb_tests:
+        return ["bundle", "exec", "rails", "test"] + rb_tests[:5]
+    if re.search(r"\.rb\b", diff):
+        return ["bundle", "exec", "rails", "test"]
+
     return ["python", "-m", "pytest", "--tb=short", "-q"]
 
 

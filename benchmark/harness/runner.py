@@ -52,6 +52,7 @@ _LANG_IMAGES: dict[str, str] = {
     "npm":    "node:20-slim",
     "cargo":  "rust:1.82-slim",
     "./gradlew": "eclipse-temurin:21-jdk-jammy",
+    "bundle": "ruby:3.3-slim",
 }
 
 # Scorer assets bundled with the harness — copied to staging for Phase 2.
@@ -319,6 +320,11 @@ def _install_block(test_cmd: list[str]) -> str:
             ./gradlew dependencies --quiet 2>/dev/null || true
         """)
 
+    if runner == "bundle":
+        return textwrap.dedent("""\
+            bundle install --quiet 2>/dev/null || true
+        """)
+
     return ""
 
 
@@ -337,6 +343,12 @@ def _git_apt_block(runner: str) -> str:
         return (
             "git --version >/dev/null 2>&1 || "
             "(apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null)"
+        )
+    if runner == "bundle":
+        # ruby:3.3-slim — has ruby+bundler, needs git + python3 for capture_files.py
+        return (
+            "apt-get update -qq >/dev/null && "
+            "apt-get install -y -qq git python3-minimal >/dev/null"
         )
     # python:3.12-slim — has python3, needs git
     return "apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null"
