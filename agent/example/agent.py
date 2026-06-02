@@ -13,6 +13,10 @@ a thorough fix that passes tests scores significantly higher than a bare stub.
 Improvements over a naive single-shot approach:
 - Test-first reasoning: plan step analyzes what each test assertion requires before
   deciding what to implement — anchors the implementation to the ground truth
+- Import-path resolution: test file import statements are parsed to identify the
+  exact implementation files under test; those files are pinned to the top of the
+  ranked list (Python ``from foo.bar import X``, TypeScript relative imports, Ruby
+  require_relative) — more reliable than keyword matching alone
 - Context files ranked by keyword relevance: issue tokens + test-file symbols
   (names the tests import/call are 2× weighted — they pinpoint the module under test)
   over-long context truncated rather than blindly dumped into the prompt
@@ -233,6 +237,77 @@ def _test_keywords(test_files: list[FileContext]) -> set[str]:
     return {t.lower() for t in raw}
 
 
+def _resolve_test_imports(
+    test_files: list[FileContext],
+    file_tree: list[str],
+) -> set[str]:
+    """Return file paths that test files directly import, confirmed against the file tree.
+
+    Tests import exactly what they test — resolving those imports gives a near-certain
+    list of the implementation files that need changing.
+
+    Handles:
+    - Python: ``from foo.bar.baz import X`` → ``foo/bar/baz.py``
+    - TypeScript/JS: ``import { X } from './utils/helpers'`` → resolved relative path
+    - Ruby: ``require_relative '../lib/foo'`` → resolved relative path
+    """
+    tree_set = set(file_tree)
+    resolved: set[str] = set()
+
+    for tf in test_files:
+        path = tf.path
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        test_dir = path.rsplit("/", 1)[0] if "/" in path else ""
+        content = tf.content
+
+        if ext == "py":
+            for m in re.finditer(r"^(?:from|import)\s+([\w.]+)", content, re.MULTILINE):
+                candidate = m.group(1).replace(".", "/") + ".py"
+                if candidate in tree_set:
+                    resolved.add(candidate)
+
+        elif ext in ("ts", "tsx", "js", "jsx"):
+            for m in re.finditer(r"""from\s+['"]([^'"]+)['"]""", content):
+                raw = m.group(1)
+                if not raw.startswith("."):
+                    continue
+                parts = (test_dir + "/" + raw).split("/")
+                norm: list[str] = []
+                for seg in parts:
+                    if seg == "..":
+                        if norm:
+                            norm.pop()
+                    elif seg and seg != ".":
+                        norm.append(seg)
+                base = "/".join(norm)
+                for suffix in (".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js"):
+                    candidate = base + suffix
+                    if candidate in tree_set:
+                        resolved.add(candidate)
+                        break
+
+        elif ext == "rb":
+            for m in re.finditer(r"""require(?:_relative)?\s+['"]([^'"]+)['"]""", content):
+                raw = m.group(1)
+                base_raw = (test_dir + "/" + raw) if not raw.startswith("/") else raw.lstrip("/")
+                parts = base_raw.split("/")
+                norm = []
+                for seg in parts:
+                    if seg == "..":
+                        if norm:
+                            norm.pop()
+                    elif seg and seg != ".":
+                        norm.append(seg)
+                base = "/".join(norm)
+                for suffix in ("", ".rb"):
+                    candidate = base + suffix
+                    if candidate in tree_set:
+                        resolved.add(candidate)
+                        break
+
+    return resolved
+
+
 def _index_hint(top_files: list[FileContext], file_tree: list[str]) -> str:
     """Return a prompt hint listing __init__.py / index.ts|js files in the same
     directories as the top implementation files.
@@ -273,11 +348,15 @@ def _rank_files(
     issue_title: str,
     issue_body: str,
     test_files: list[FileContext] | None = None,
+    file_tree: list[str] | None = None,
 ) -> list[FileContext]:
     """Return files sorted by keyword relevance to the issue, most relevant first.
 
     Test files are excluded here — they're shown in a separate section.
-    Identifiers extracted from test_files are included as weighted keywords.
+    Files directly imported by test files receive the highest boost (they are
+    almost certainly the files that need changing). Secondary signals: file
+    paths mentioned in the issue text, and keyword density from both issue
+    tokens and identifier tokens extracted from test files.
     """
     issue_text = (issue_title + " " + issue_body).lower()
 
@@ -291,9 +370,17 @@ def _rank_files(
     # Additional keywords from test files — tested symbols are in the impl files
     test_kws = _test_keywords(test_files) if test_files else set()
 
+    # Direct imports from test files: near-certain signal for which file needs changing
+    import_pinned = (
+        _resolve_test_imports(test_files, file_tree)
+        if test_files and file_tree else set()
+    )
+
     def score(f: FileContext) -> float:
+        # Pin directly-imported files to the top of the list
+        import_bonus = 100.0 if f.path in import_pinned else 0.0
         path_lower = f.path.lower()
-        # High bonus if the file is explicitly mentioned
+        # High bonus if the file is explicitly mentioned in the issue text
         path_score = 20.0 * sum(1 for mp in mentioned_paths if mp in path_lower)
         content_lower = f.content.lower()
         # Keyword density in file content (identifiers > 4 chars to reduce noise)
@@ -301,7 +388,7 @@ def _rank_files(
         # Test-derived symbols: paths/names from test imports/calls — weighted higher
         # because they pinpoint exactly which module is under test
         test_hits = sum(1 for kw in test_kws if len(kw) > 4 and kw in content_lower)
-        return path_score + keyword_hits + 2.0 * test_hits
+        return import_bonus + path_score + keyword_hits + 2.0 * test_hits
 
     return sorted(files, key=score, reverse=True)
 
@@ -536,13 +623,17 @@ class ExampleAgent(BaseAgent):
         # --- Split and rank context files ---
         test_files = [f for f in problem.context_files if _is_test_file(f)]
         impl_files = [f for f in problem.context_files if not _is_test_file(f)]
-        ranked_impl = _rank_files(impl_files, problem.issue_title, problem.issue_body, test_files)
+        ranked_impl = _rank_files(impl_files, problem.issue_title, problem.issue_body, test_files, problem.file_tree)
         selected_impl = _truncate_context(ranked_impl)
         dropped = len(impl_files) - len(selected_impl)
         if dropped > 0:
             log.append(f"[context] {len(selected_impl)}/{len(impl_files)} impl files selected (dropped {dropped} low-relevance)")
         if test_files:
             log.append(f"[context] {len(test_files)} test file(s) shown separately")
+        if problem.file_tree and test_files:
+            pinned = _resolve_test_imports(test_files, problem.file_tree)
+            if pinned:
+                log.append(f"[context] import-pinned: {sorted(pinned)}")
 
         # Build keyword set for windowing large files — union of issue tokens + test symbols
         raw_tokens = re.findall(r"\b([a-z_][a-z0-9_]{3,}|[A-Z][A-Za-z0-9]{3,})\b", problem.issue_title + " " + problem.issue_body)
