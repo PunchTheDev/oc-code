@@ -4,6 +4,45 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Dashboard overhaul: categories, difficulty tiers, submission breakdown
+
+**Context**: Operator flagged the dashboard as "too flat" with no depth. Directed adding per-submission breakdown, categories, difficulty tiers.
+
+**What shipped**:
+
+**generate_dashboard_data.py**: Now exports `category` and `difficulty` per problem, plus top-level `categories`, `difficulty_counts`, `shard_budget` aggregates.
+
+**Category mapping** (5 language categories, all DAS repos):
+- Python: entrius/gittensor, infiniflow/ragflow + others → **198 problems**
+- TypeScript: gittensory, awesome-claude, vouch, gittensor-ui → **87 problems**
+- Rust: phase-rs/phase, genie-claw → **66 problems**
+- JVM: touchpilot (Kotlin), jvm-live-reload (Java) → **42 problems**
+- Ruby: we-promise/sure → **37 problems**
+
+**Difficulty tiers** (based on oracle baseline score):
+- Easy (≥15): 169 problems — rich diffs with many AST changes
+- Medium (5–15): 106 problems — moderate fixes
+- Hard (<5): 155 problems — surgical/targeted changes
+
+**Shard sampling budget**: 12 Python · 8 TypeScript · 5 Rust · 3 JVM · 2 Ruby = **30 per eval round**
+
+**Dashboard (gittensor-miner-dashboard)** (commit d028837):
+- Filter chips now show language categories (Python/TypeScript/Rust/JVM/Ruby) with counts from data
+- Problem table now has a separate "Tier" column with easy/medium/hard badges
+- Category cards section: 5 clickable cards showing pool size per category + shard budget, filter problems on click
+- Category-balanced sampling info box explaining the 30-problem eval round composition
+- **Per-submission breakdown**: clicking the oracle row opens a full per-problem table (430 problems sorted by score, with category + tier columns, click-through to problem drawer)
+- **Miner submission breakdown**: leaderboard rows with `breakdown` array show per-problem results (score, pass/fail, tier) with click-through to problem drawer
+- Submission detail drawer uses a wider 860px panel
+
+### Status
+- Dashboard: categories and difficulty tiers live
+- All 430 problems classified (198 Python, 87 TS, 66 Rust, 42 JVM, 37 Ruby)
+- Difficulty: 169 easy, 106 medium, 155 hard
+- Benchmark commits: 76b2493 (data generator), d028837 (dashboard)
+
+---
+
 ## 2026-06-02 — Verify-loop partial-repair bug fix + Kotlin sibling expansion (commits d9e6edb, a1819de)
 
 ### Bug fix: back-to-back user messages on partial repair (commit d9e6edb)
