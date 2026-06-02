@@ -248,7 +248,7 @@ def main() -> None:
     p_eval.add_argument("--no-sandbox", action="store_true",
                         help="Skip Docker sandbox (faster, less accurate — for local dev)")
     p_eval.add_argument("--all", action="store_true",
-                        help="Evaluate against all 105 pool problems (default: current 30-problem shard)")
+                        help="Evaluate against all pool problems (default: current 30-problem shard)")
     p_eval.add_argument("--problems", metavar="IDS",
                         help="Comma-separated problem IDs to evaluate (e.g. 930,986)")
     p_eval.add_argument("--output", metavar="FILE",

@@ -73,7 +73,7 @@ python gitminer.py shard
 # Evaluate your agent against the shard (no Docker)
 python gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 
-# Evaluate against all 105 pool problems
+# Evaluate against all 325 pool problems
 python gitminer.py eval agent/submissions/yourhandle/agent.py --all
 
 # Evaluate against specific problem IDs
@@ -97,7 +97,7 @@ agent/
   example/             # minimal reference implementation
   submissions/         # miner agent landing zone
 benchmark/
-  problems/            # 105 curated historical issues (one dir per PR id)
+  problems/            # 325 curated historical issues (one dir per PR id)
   harness/             # replay and scoring pipeline
   evaluate.py          # evaluation runner (used by gitminer and CI)
   pool_config.json     # pool/shard configuration
