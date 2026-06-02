@@ -96,11 +96,14 @@ Ran `score_patch()` on problem 1033 (reference.diff as input). Surfaced two bugs
 
 Local harness over-estimates DAS reference scores by median 3.4×. Root cause: tree-sitter counts AST nodes with language weights; local heuristic counts raw diff tokens. Dashboard now shows this note inline in the problem drawer. CI is authoritative.
 
+### Dashboard improvements (dashboard commits c2fb53b, 2cc0f67)
+
+- Reference diff now **auto-loads** when the problem drawer opens — fetched from `raw.githubusercontent.com` (no GitHub API rate limit). Removed the "Load Reference Diff" button.
+- Issue bodies now **rendered as markdown** — fenced code blocks, inline code, bold/italic, headings, links, lists. Previously raw escaped text.
+
 ### Waiting on operator
 
-1. `OPENROUTER_KEY` GitHub Actions secret — agents can't run without it.
-2. `DASHBOARD_DEPLOY_TOKEN` GitHub Actions secret — PAT with write access to dashboard repo, for CI auto-push.
-3. Confirm frozen model preference (default: `claude-3-5-haiku` via OpenRouter).
-4. Gittensor registration — team handles approval; hyperparameters.json is ready.
+1. Verify `OPENROUTER_KEY` in GitHub Actions Environment is the correct production key.
+2. Gittensor registration — team handles approval; hyperparameters.json is ready.
 
 ---
