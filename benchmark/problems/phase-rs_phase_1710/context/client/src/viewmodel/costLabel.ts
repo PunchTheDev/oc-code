@@ -1,0 +1,519 @@
+import type {
+  AdditionalCost,
+  GameAction,
+  GameObject,
+  ManaCost,
+  ObjectId,
+  SerializedAbility,
+  SerializedAbilityCost,
+} from "../adapter/types.ts";
+import { getCrewPower, getSaddlePower } from "./keywordProps.ts";
+
+// Converts Rust ManaCostShard variant names to MTG abbreviations.
+// This is the canonical bridge between engine serialization and display—
+// ManaSymbol.tsx already works with these abbreviations ("W", "U", "W/U").
+export const SHARD_ABBREVIATION: Record<string, string> = {
+  White: "W", Blue: "U", Black: "B", Red: "R", Green: "G",
+  Colorless: "C", Snow: "S", X: "X", TwoOrMoreColorSource: "Z",
+  WhiteBlue: "W/U", WhiteBlack: "W/B", BlueBlack: "U/B", BlueRed: "U/R",
+  BlackRed: "B/R", BlackGreen: "B/G", RedWhite: "R/W", RedGreen: "R/G",
+  GreenWhite: "G/W", GreenBlue: "G/U",
+  // CR 107.4e: Monocolored hybrid {2/C}.
+  TwoWhite: "2/W", TwoBlue: "2/U", TwoBlack: "2/B", TwoRed: "2/R", TwoGreen: "2/G",
+  // CR 107.4e: Colorless hybrid {C/color}.
+  ColorlessWhite: "C/W", ColorlessBlue: "C/U", ColorlessBlack: "C/B",
+  ColorlessRed: "C/R", ColorlessGreen: "C/G",
+  // CR 107.4f: Phyrexian mana.
+  PhyrexianWhite: "W/P", PhyrexianBlue: "U/P", PhyrexianBlack: "B/P",
+  PhyrexianRed: "R/P", PhyrexianGreen: "G/P",
+  // CR 107.4f: Hybrid Phyrexian (10 variants).
+  PhyrexianWhiteBlue: "W/U/P", PhyrexianWhiteBlack: "W/B/P",
+  PhyrexianBlueBlack: "U/B/P", PhyrexianBlueRed: "U/R/P",
+  PhyrexianBlackRed: "B/R/P", PhyrexianBlackGreen: "B/G/P",
+  PhyrexianRedWhite: "R/W/P", PhyrexianRedGreen: "R/G/P",
+  PhyrexianGreenWhite: "G/W/P", PhyrexianGreenBlue: "G/U/P",
+};
+
+/** Convert a ManaCost to display-ready shard abbreviations (e.g., ["2", "U", "U"]). */
+export function manaCostToShards(cost: ManaCost): string[] {
+  if (cost.type !== "Cost") return [];
+  const shards: string[] = [];
+  if (cost.generic > 0) shards.push(String(cost.generic));
+  for (const s of cost.shards) {
+    shards.push(SHARD_ABBREVIATION[s] ?? s);
+  }
+  return shards;
+}
+
+// Mirrors Rust AbilityCost serialization shape (serde tag = "type").
+// `amount`/`count` on PayLife/Discard are `QuantityExpr` (a typed enum), not
+// raw numbers — the engine serializes `{ type: "Fixed", value: N }` etc.
+type QuantityExpr =
+  | { type: "Fixed"; value: number }
+  | { type: "Ref"; qty: { type: string; [key: string]: unknown } }
+  | { type: "HalfRounded"; inner: QuantityExpr; rounding: string }
+  | { type: "Offset"; inner: QuantityExpr; offset: number }
+  | { type: "Multiply"; factor: number; inner: QuantityExpr };
+
+type SerializedCost = {
+  type: string;
+  amount?: QuantityExpr | number;
+  count?: QuantityExpr | number;
+  costs?: SerializedCost[];
+  cost?: { type: string; shards?: string[]; generic?: number };
+};
+
+/** Render a QuantityExpr (or legacy raw number) for display in cost labels. */
+function formatQuantity(q: QuantityExpr | number | undefined, fallback = 1): string {
+  if (q == null) return String(fallback);
+  if (typeof q === "number") return String(q);
+  switch (q.type) {
+    case "Fixed":
+      return String(q.value);
+    case "Ref":
+      return formatQuantityRef(q.qty);
+    case "HalfRounded": {
+      const dir = q.rounding === "Down" ? "rounded down" : "rounded up";
+      return `half ${formatQuantity(q.inner)} (${dir})`;
+    }
+    case "Offset": {
+      const sign = q.offset >= 0 ? "+" : "−";
+      return `${formatQuantity(q.inner)} ${sign} ${Math.abs(q.offset)}`;
+    }
+    case "Multiply":
+      if (q.factor === -1) return `−${formatQuantity(q.inner)}`;
+      if (q.factor === 2) return `twice ${formatQuantity(q.inner)}`;
+      return `${q.factor}× ${formatQuantity(q.inner)}`;
+  }
+}
+
+// QuantityRef → English noun phrase for inline cost labels ("Pay <q> life",
+// "Discard <q> card(s)"). The engine's `QuantityRef` enum has 50+ variants;
+// only the ones that actually appear in resolved-cost contexts are listed
+// here. Variants not listed fall through to a humanized form of the variant
+// name (e.g. "TargetPower" → "target power") rather than literal "X" — that
+// keeps the UI debuggable when a new variant ships before this map is
+// updated, while still flagging it as a polish gap during review.
+//
+// The architecturally correct long-term fix is engine-side: have the engine
+// emit a `display_label` field on each `QuantityRef` payload so the frontend
+// stops curating this list. Tracked as a follow-up alongside the parser-side
+// `display_name` work.
+function formatQuantityRef(ref: { type: string; [key: string]: unknown }): string {
+  switch (ref.type) {
+    // Controller-relative scalar references
+    case "HandSize": return "cards in your hand";
+    case "LifeTotal": return "your life total";
+    case "GraveyardSize": return "cards in your graveyard";
+    case "StartingLifeTotal": return "starting life total";
+    case "LifeAboveStarting": return "life above your starting total";
+    case "LifeLostThisTurn": return "life you lost this turn";
+    case "LifeGainedThisTurn": return "life you gained this turn";
+    case "OpponentLifeLostThisTurn": return "life an opponent lost this turn";
+    // Source-object references
+    case "SelfPower": return "this creature's power";
+    case "SelfToughness": return "this creature's toughness";
+    // Target-object references
+    case "TargetPower": return "target's power";
+    case "TargetLifeTotal": return "target's life total";
+    case "AnyCountersOnTarget": return "counters on target";
+    // Per-turn aggregates
+    case "TurnsTaken": return "turns taken";
+    case "SpellsCastThisTurn": return "spells cast this turn";
+    case "SpellsCastLastTurn": return "spells cast last turn";
+    case "CreaturesDiedThisTurn": return "creatures that died this turn";
+    case "AttackedThisTurn": return "creatures that attacked this turn";
+    case "DescendedThisTurn": return "permanents that left the battlefield this turn";
+    case "PermanentsLeftBattlefieldThisTurn": return "permanents that left the battlefield this turn";
+    case "NonlandPermanentsLeftBattlefieldThisTurn": return "nonland permanents that left this turn";
+    case "CrimesCommittedThisTurn": return "crimes committed this turn";
+    // Counter / property references
+    case "BasicLandTypeCount": return "basic land types you control";
+    case "PartySize": return "your party's size";
+    case "TrackedSetSize": return "exiled cards";
+    case "CardsExiledBySource": return "cards exiled by this";
+    case "ExiledFromHandThisResolution": return "cards exiled from hand";
+    case "Speed": return "your speed";
+    case "ChosenNumber": return "the chosen number";
+    case "PreviousEffectAmount": return "the previous amount";
+    case "EventContextAmount": return "the amount";
+    case "EventContextSourcePower": return "the source's power";
+    case "EventContextSourceToughness": return "the source's toughness";
+    case "EventContextSourceManaValue": return "the source's mana value";
+    case "EventContextSourceCostX": return "the source's X";
+    case "Variable": return typeof ref.name === "string" ? ref.name : "X";
+    default:
+      // Humanize the variant name as a debug-grade fallback. PascalCase →
+      // lowercased space-separated form so a new variant looks like a sentence
+      // fragment rather than a code identifier.
+      return ref.type.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+  }
+}
+
+/** Numeric quantity check that works against either QuantityExpr or a raw number. */
+function quantityIsPlural(q: QuantityExpr | number | undefined): boolean {
+  if (q == null) return false;
+  if (typeof q === "number") return q > 1;
+  return q.type === "Fixed" ? q.value > 1 : true;
+}
+
+export function formatCost(cost: SerializedCost): string {
+  switch (cost.type) {
+    case "Loyalty": {
+      // CR 606.1: Loyalty cost is always a literal `i32` on the Rust side.
+      const amt = (typeof cost.amount === "number" ? cost.amount : 0);
+      return amt > 0 ? `+${amt}` : `${amt}`;
+    }
+    case "Tap": return "{T}";
+    case "Untap": return "{Q}";
+    case "Mana": {
+      const mc = cost.cost;
+      if (!mc || mc.type === "Free") return "{0}";
+      const parts: string[] = [];
+      if (mc.generic) parts.push(`{${mc.generic}}`);
+      for (const shard of mc.shards ?? []) {
+        parts.push(`{${SHARD_ABBREVIATION[shard] ?? shard}}`);
+      }
+      return parts.join("") || "{0}";
+    }
+    case "PayLife": return `Pay ${formatQuantity(cost.amount, 1)} life`;
+    case "Sacrifice": return "Sacrifice";
+    case "Discard": {
+      const label = formatQuantity(cost.count, 1);
+      return `Discard ${label} card${quantityIsPlural(cost.count) ? "s" : ""}`;
+    }
+    case "Blight": return `Blight ${cost.count ?? 1}`;
+    case "CollectEvidence":
+      return `Collect evidence ${cost.amount ?? 0}`;
+    case "ReturnToHand": {
+      const count = formatQuantity(cost.count, 1);
+      const noun = quantityIsPlural(cost.count) ? "permanents" : "permanent";
+      return `Return ${count} ${noun}`;
+    }
+    case "Composite":
+      return (cost.costs ?? []).map(formatCost).join(", ");
+    case "OneOf":
+      return (cost.costs ?? []).map(formatCost).join(" or ");
+    default:
+      return "Activate";
+  }
+}
+
+export function abilityLabel(ability: SerializedAbility | null | undefined): string {
+  if (!ability) return "0";
+  if (ability.description) {
+    const colon = ability.description.indexOf(":");
+    const costText = colon > 0 ? ability.description.slice(0, colon).trim() : ability.description;
+    if (costText) return costText;
+  }
+  const cost = ability.cost;
+  return cost ? formatCost(cost as SerializedCost) : "0";
+}
+
+// Maps ManaColor names to MTG mana symbol abbreviations.
+const MANA_COLOR_ABBREVIATION: Record<string, string> = {
+  White: "W", Blue: "U", Black: "B", Red: "R", Green: "G",
+};
+
+export function abilityChoiceLabel(
+  action: GameAction,
+  object: GameObject,
+  objects?: Record<ObjectId, GameObject>,
+  webSlingingCosts?: Record<string, ManaCost>,
+): { label: string; description?: string } {
+  // CR 702.190a: Sneak — label identifies which unblocked attacker is
+  // returned to pay the Sneak cost. Include the Sneak mana cost from the
+  // spell's keyword metadata when available.
+  if (action.type === "CastSpellAsSneak") {
+    const returnedId = action.data.creature_to_return;
+    const returnedName = objects?.[returnedId]?.name ?? `creature #${returnedId}`;
+    const sneakKeyword = object.keywords.find(
+      (k): k is { Sneak: ManaCost } => typeof k === "object" && "Sneak" in k,
+    );
+    const costSymbols = sneakKeyword ? manaCostToShards(sneakKeyword.Sneak).map((s) => `{${s}}`).join("") : "";
+    const costSuffix = costSymbols ? ` (${costSymbols})` : "";
+    return {
+      label: `Sneak — return ${returnedName}${costSuffix}`,
+      description: `Cast ${object.name} by paying its sneak cost and returning ${returnedName} to your hand (CR 702.190a).`,
+    };
+  }
+  if (action.type === "ActivateNinjutsu") {
+    const returnedId = action.data.creature_to_return;
+    const returnedName = objects?.[returnedId]?.name ?? `creature #${returnedId}`;
+    const keyword = object.keywords.find(
+      (
+        k,
+      ): k is { Ninjutsu?: ManaCost; CommanderNinjutsu?: ManaCost } =>
+        typeof k === "object" && ("Ninjutsu" in k || "CommanderNinjutsu" in k),
+    );
+    const cost = keyword?.Ninjutsu ?? keyword?.CommanderNinjutsu;
+    const costSymbols = cost ? manaCostToShards(cost).map((s) => `{${s}}`).join("") : "";
+    const costSuffix = costSymbols ? ` (${costSymbols})` : "";
+    return {
+      label: `Ninjutsu — return ${returnedName}${costSuffix}`,
+      description: `Activate ${object.name}'s ninjutsu ability and return ${returnedName} to your hand (CR 702.49a).`,
+    };
+  }
+  if (action.type === "CastSpellAsWebSlinging") {
+    const returnedId = action.data.creature_to_return;
+    const returnedName = objects?.[returnedId]?.name ?? `creature #${returnedId}`;
+    // Prefer the engine-derived cost (covers statically-GRANTED web-slinging,
+    // e.g. Amazing Spider-Man); fall back to the printed keyword. The engine
+    // decides which cards qualify — the frontend only formats the ManaCost.
+    const derivedCost = webSlingingCosts?.[String(object.id)];
+    const webSlingingKeyword = object.keywords.find(
+      (k): k is { WebSlinging: ManaCost } => typeof k === "object" && "WebSlinging" in k,
+    );
+    const cost = derivedCost ?? webSlingingKeyword?.WebSlinging;
+    const costSymbols = cost
+      ? manaCostToShards(cost).map((s) => `{${s}}`).join("")
+      : "";
+    const costSuffix = costSymbols ? ` (${costSymbols})` : "";
+    return {
+      label: `Web-Slinging — return ${returnedName}${costSuffix}`,
+      description: `Cast ${object.name} by paying its Web-slinging cost and returning ${returnedName} to your hand (CR 702.188a).`,
+    };
+  }
+  if (action.type === "TapForConvoke") {
+    const mana =
+      action.data.mana_type === "Colorless"
+        ? "1"
+        : MANA_COLOR_ABBREVIATION[action.data.mana_type] ?? action.data.mana_type;
+    return {
+      label: `Tap for {${mana}}`,
+      description: `Tap ${object.name} to help pay this spell's cost.`,
+    };
+  }
+  if (action.type === "ActivateAbility") {
+    const ability = object.abilities[action.data.ability_index];
+    // For mana abilities, show what they produce (e.g., "Add {U}") instead of just the cost
+    if (ability?.effect?.type === "Mana" && ability.effect.produced) {
+      const produced = ability.effect.produced;
+      if (produced.type === "Fixed" && produced.colors?.length) {
+        const symbols = produced.colors.map((c) => `{${MANA_COLOR_ABBREVIATION[c] ?? c}}`).join("");
+        return { label: `Add ${symbols}` };
+      }
+      if (produced.type === "Colorless") {
+        return { label: "Add {C}" };
+      }
+      if (produced.type === "AnyOneColor") {
+        const count = formatQuantity((produced as { count?: QuantityExpr | number }).count, 1);
+        return {
+          label: count === "1" ? "Add one mana of any color" : `Add ${count} mana of any one color`,
+        };
+      }
+    }
+    const label = abilityLabel(ability);
+    const description = ability?.description ? stripCostPrefix(ability.description) : undefined;
+    return { label, description };
+  }
+  if (action.type === "CastSpell") {
+    return { label: `Cast ${object.name}` };
+  }
+  if (action.type === "CastPreparedCopy") {
+    const spellName = object.back_face?.name ?? "prepared spell";
+    return {
+      label: `Cast ${spellName}`,
+      description: `Cast a copy of ${spellName}. ${object.name} becomes unprepared.`,
+    };
+  }
+  if (action.type === "Foretell") {
+    const foretellKeyword = object.keywords.find(
+      (k): k is { Foretell: ManaCost } => typeof k === "object" && "Foretell" in k,
+    );
+    const costSymbols = foretellKeyword
+      ? manaCostToShards(foretellKeyword.Foretell).map((s) => `{${s}}`).join("")
+      : "";
+    return {
+      label: "Foretell {2}",
+      description: costSymbols
+        ? `Pay {2} and exile this card. Cast it on a later turn for ${costSymbols}.`
+        : "Pay {2} and exile this card. Cast it on a later turn for its foretell cost.",
+    };
+  }
+  if (action.type === "PlayLand") {
+    const landFaceName = object.card_types.core_types.includes("Land")
+      ? object.name
+      : object.back_face?.name ?? object.name;
+    return { label: `Play ${landFaceName}`, description: "Play this card as a land" };
+  }
+  // CR 702.122a: Crew N — read N from the engine-provided keyword.
+  if (action.type === "CrewVehicle") {
+    const n = getCrewPower(object.keywords);
+    return {
+      label: n != null ? `Crew ${n}` : "Crew",
+      description: n != null
+        ? `Tap any number of other creatures you control with total power ${n} or greater.`
+        : "Tap creatures to crew this Vehicle.",
+    };
+  }
+  // CR 702.184a: Station — single-creature cost; per-creature counter count.
+  if (action.type === "ActivateStation") {
+    return {
+      label: "Station",
+      description:
+        "Tap another untapped creature you control; put charge counters equal to its power on this Spacecraft.",
+    };
+  }
+  // CR 702.171a: Saddle N.
+  if (action.type === "SaddleMount") {
+    const n = getSaddlePower(object.keywords);
+    return {
+      label: n != null ? `Saddle ${n}` : "Saddle",
+      description: n != null
+        ? `Tap any number of other untapped creatures you control with total power ${n} or greater.`
+        : "Tap creatures to saddle this Mount.",
+    };
+  }
+  // CR 702.6a: Equip — target a creature you control.
+  if (action.type === "Equip") {
+    return {
+      label: "Equip",
+      description: "Attach this Equipment to target creature you control.",
+    };
+  }
+  return { label: "Tap for Mana" };
+}
+
+/** Format a SerializedAbilityCost (same shape as SerializedCost but from the AdditionalCost type). */
+export function formatAbilityCost(cost: SerializedAbilityCost): string {
+  return formatCost(cost);
+}
+
+/**
+ * A single option in the OptionalCostChoice modal. `pay` maps to
+ * `DecideOptionalCost { pay: true }`, `decline` to `{ pay: false }`. The two
+ * `id`s are stable so `OptionalCostModal` can dispatch the right action.
+ */
+export interface AdditionalCostOption {
+  id: "pay" | "decline";
+  label: string;
+  description?: string;
+}
+
+/**
+ * Build the title + pay/decline options for the OptionalCostChoice modal.
+ *
+ * `timesKicked` is the engine-provided count of repeatable payments already
+ * paid for this spell (`WaitingFor::OptionalCostChoice::times_kicked`). It
+ * affects multikicker and repeatable optional additional-cost prompts.
+ * The decline copy never says "skip"/"cancel" — declining the kicker
+ * *completes* the cast (CR 601.2h), it does not abort it.
+ */
+export function additionalCostChoices(
+  cost: AdditionalCost,
+  timesKicked = 0,
+): { title: string; options: AdditionalCostOption[] } {
+  switch (cost.type) {
+    case "Optional": {
+      const label = formatAbilityCost(cost.data.cost);
+      if (cost.data.repeatable) {
+        if (timesKicked > 0) {
+          return {
+            title: `Additional cost — paid ${timesKicked}×. Pay ${label} again?`,
+            options: [
+              { id: "pay", label: `Pay ${label} again` },
+              {
+                id: "decline",
+                label: `Done — finish casting (paid ${timesKicked}×)`,
+                description: "Stop paying this additional cost and pay the total cost.",
+              },
+            ],
+          };
+        }
+        return {
+          title: `Pay additional cost: ${label}?`,
+          options: [
+            {
+              id: "pay",
+              label: `Pay ${label}`,
+              description: "You'll be asked again so you can pay it multiple times.",
+            },
+            {
+              id: "decline",
+              label: "Cast without paying",
+              description: "Finish casting now with 0 payments.",
+            },
+          ],
+        };
+      }
+      return {
+        title: `Pay additional cost: ${label}?`,
+        options: [
+          { id: "pay", label: `Pay ${label}` },
+          { id: "decline", label: "Skip" },
+        ],
+      };
+    }
+    case "Kicker": {
+      const first = cost.data.costs[0];
+      const label = first ? formatAbilityCost(first) : "kicker";
+      if (timesKicked > 0) {
+        // CR 702.33c/d: repeatable multikicker re-prompt — the spell has
+        // already been kicked `timesKicked` times.
+        return {
+          title: `Multikicker — kicked ${timesKicked}×. Pay ${label} again?`,
+          options: [
+            { id: "pay", label: `Pay ${label} — kick again` },
+            {
+              id: "decline",
+              label: `Done — finish casting (kicked ${timesKicked}×)`,
+              description: "Stop kicking and pay the total cost.",
+            },
+          ],
+        };
+      }
+      // First prompt (timesKicked === 0).
+      const repeatable = cost.data.repeatable;
+      return {
+        title: repeatable
+          ? `Multikicker — pay ${label} to kick this spell?`
+          : `Kicker — pay ${label} to kick this spell?`,
+        options: [
+          {
+            id: "pay",
+            label: `Pay ${label} — kick it`,
+            description: repeatable
+              ? "Adds a kicker. You'll be asked again so you can kick multiple times."
+              : "Adds a kicker to this spell.",
+          },
+          {
+            id: "decline",
+            label: "Cast without kicking",
+            description: "Finish casting now with 0 kickers — the spell still resolves.",
+          },
+        ],
+      };
+    }
+    case "Required":
+      return {
+        title: `Pay additional cost: ${formatAbilityCost(cost.data)}`,
+        options: [
+          { id: "pay", label: `Pay ${formatAbilityCost(cost.data)}` },
+          { id: "decline", label: "Cancel" },
+        ],
+      };
+    case "Choice":
+      return {
+        title: "Choose additional cost",
+        options: [
+          { id: "pay", label: formatAbilityCost(cost.data[0]) },
+          { id: "decline", label: formatAbilityCost(cost.data[1]) },
+        ],
+      };
+  }
+}
+
+/** Strip the leading cost prefix from Oracle text (e.g. "[+2]: Draw a card." → "Draw a card.") */
+function stripCostPrefix(text: string): string {
+  // Bracket format: [+2]: ..., [−1]: ..., [0]: ...
+  const bracketMatch = text.match(/^\[.*?\]:\s*/);
+  if (bracketMatch) return text.slice(bracketMatch[0].length);
+  // Bare format: +2: ..., −1: ..., 0: ...
+  const bareMatch = text.match(/^[+\-−–]?\d+:\s*/);
+  if (bareMatch) return text.slice(bareMatch[0].length);
+  // Mana/tap cost prefix: {T}, {2}{B}: ...
+  const costMatch = text.match(/^[^:]+:\s*/);
+  if (costMatch) return text.slice(costMatch[0].length);
+  return text;
+}
