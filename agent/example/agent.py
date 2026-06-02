@@ -84,6 +84,10 @@ Improvements over a naive single-shot approach:
 - Rust sibling import expansion: `_expand_sibling_imports` now handles `use super::module`
   patterns in `.rs` files, resolving to `module.rs` or `module/mod.rs` in the same
   directory. Previously Rust problems got no sibling expansion — 57 pool problems affected.
+- Kotlin/Java/Scala sibling expansion: `_expand_sibling_imports` now includes same-directory
+  `.kt`/`.java`/`.scala` files for JVM problems. JVM classes in the same Gradle source dir
+  share the same package and reference each other directly; the same-directory heuristic
+  mirrors the Go same-package approach. Affects 37 touchpilot/touchpilot Kotlin problems.
 - Assertion injection in verify: `_extract_assertions()` pulls the assert/expect/assertEquals
   lines (up to 50) from test files and injects them directly into the verify prompt. The
   model no longer relies on conversation context to recall what assertions must pass —
@@ -1071,6 +1075,20 @@ def _expand_sibling_imports(
                     if candidate in tree_set and candidate not in already:
                         siblings.append(candidate)
                         break
+
+        elif ext in ("kt", "java", "scala"):
+            # JVM languages: classes in the same source directory share the same
+            # package and reference each other directly without explicit import paths
+            # that resolve neatly to file paths (Gradle source sets, nested packages).
+            # Simplest and safest heuristic: include all same-extension files in
+            # the same directory — mirrors the Go same-package approach.
+            for path in tree_set:
+                if (
+                    path.startswith(file_dir + "/")
+                    and path.endswith(f".{ext}")
+                    and path not in already
+                ):
+                    siblings.append(path)
 
         for sib_path in siblings:
             sib = all_by_path.get(sib_path)
