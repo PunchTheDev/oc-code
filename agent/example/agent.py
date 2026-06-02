@@ -678,7 +678,8 @@ def _resolve_test_imports(
                     resolved.add(candidate)
 
         elif ext in ("ts", "tsx", "js", "jsx"):
-            for m in re.finditer(r"""from\s+['"]([^'"]+)['"]""", content):
+            # ES module: `from './foo'`; CommonJS: `require('./foo')`
+            for m in re.finditer(r"""(?:from|require\()\s*['"]([^'"]+)['"]""", content):
                 raw = m.group(1)
                 if not raw.startswith("."):
                     continue
@@ -836,8 +837,8 @@ def _expand_sibling_imports(
                         siblings.append(candidate)
 
         elif ext in ("ts", "tsx", "js", "jsx"):
-            # ``import { X } from './helpers'`` or ``from '../lib/utils'``
-            for m in re.finditer(r"""from\s+['"](\.[^'"]+)['"]""", content):
+            # ES module: `from './helpers'`; CommonJS: `require('./helpers')`
+            for m in re.finditer(r"""(?:from|require\()\s*['"](\.[^'"]+)['"]""", content):
                 raw = m.group(1)
                 parts = (file_dir + "/" + raw).split("/")
                 norm: list[str] = []
