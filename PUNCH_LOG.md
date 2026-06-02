@@ -4,6 +4,30 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent: partial-repair guard + clean history in act step (commit 013ab2c)
+
+### Partial-repair guard in verify loop
+
+Found a correctness bug: when the verify step produced a corrected diff covering fewer files than the current diff, the replacement was accepted unconditionally, silently dropping changes to the other files.
+
+Example: act produces `fileA + fileB` diff. Verify says "fileA is wrong, here is the fix" and returns a 1-file diff for fileA only. With the old code, `diff = repaired` would lose fileB's changes entirely.
+
+Fix: `_count_diff_files()` counts `diff --git` headers in both diffs. Replacement only accepted if repaired file count >= current file count. If fewer: log `"partial repair (N < M files) — keeping current diff"` and break.
+
+### Clean act history
+
+The act step was storing `raw_diff` (the model's literal output, including any `N |` artifacts and trailing prose) as the assistant turn in history. The verify prompt then showed the post-processed `diff`, creating two inconsistent versions the model could see. Now history stores the post-processed `diff` so the model's "memory" matches the verify prompt.
+
+Same fix applied to format-repair branches in the verify loop.
+
+### Status
+- Benchmark: 400 problems, oracle 23.08 (unchanged)
+- Agent: partial-repair guard, clean history
+- Pool: all repos saturated — next check 2026-06-09
+- Pending: Gittensor registration, nginx hookup
+
+---
+
 ## 2026-06-02 — Agent: intermediate diff post-processing + history compaction (commit 936a857)
 
 ### Post-process every intermediate diff
