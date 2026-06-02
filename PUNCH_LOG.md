@@ -4,6 +4,31 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Pool 366→367 + agent improvements (commits 82faf35–91004c9)
+
+### Pool refresh (+1 problem)
+- `phase-rs_phase_1863` — "pin multi-suspend upkeep tick fires per source" (Rust integration test)
+  - Issue #1502: multiple suspended cards scenario — upkeep triggers per suspend source, not once total
+  - Oracle mean: 22.79 → **22.73** (recomputed across all 367 problems)
+- All other repos dry-ran: phase, ragflow, gittensor, gittensory — all saturated (0 new qualifying PRs)
+
+### Agent improvements (8 commits, all pushed)
+1. **Import-path resolution** (`82faf35`) — parses test imports → pins exact impl files to top of ranking
+   - Python: `from foo.bar.baz import X` → `foo/bar/baz.py`
+   - TypeScript: relative `import { X } from './utils/foo'` → resolved path
+   - Ruby: `require_relative '../lib/foo'` → resolved path
+   - Rust: `use crate::foo::bar;` → `src/foo/bar.rs` / `src/foo/bar/mod.rs`
+   - Pinned files score +100 (dominates keyword ranking)
+2. **Language-specific system prompt notes** (`69fd49c`) — per-language caveats (Rust trait bounds, TS exports, Ruby requires, Python type annotations)
+3. **Line numbers in windowed files** (`2f3e8cd`) — `  N | content` so model writes accurate `@@ -N` offsets
+4. **Title token weighting** (`f5c17fe`) — issue title tokens 3× vs body (titles are precise; body is prose)
+5. **Smarter repair output** (`48e9f6a`) — shows first 30 + last 50 lines of test output; adds failure categorization hints
+6. **Sharper verify criteria** (`57949c5`) — checks import completeness, cross-checks `@@ -N` against line markers
+7. **Hunk context line requirement** (`c0a5995`) — requires 3 unchanged context lines per hunk for `git apply` robustness
+8. **Rust import + mod.rs hint** (`9fddfb0`) — Rust `use` import resolution + `mod.rs` in index-file hint
+
+---
+
 ## 2026-06-02 — Agent: import resolution + language notes + line numbers (commits 82faf35, 69fd49c, 2f3e8cd)
 
 ### Agent improvements (3 commits)
