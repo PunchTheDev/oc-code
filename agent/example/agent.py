@@ -52,8 +52,11 @@ Improvements over a naive single-shot approach:
   already exist in the package.
 - New test file detection: compares context test files against file_tree (repo state
   at base_commit). Files that are in context but NOT in file_tree are new files added
-  by the PR — they don't exist yet and must be created in the diff.  The agent is
+  by the PR — they don't exist yet and must be created in the diff. The agent is
   shown pre-formatted diff blocks to copy verbatim. Affects ~60% of pool problems.
+- New implementation file detection: same logic applied to non-test source files.
+  When a PR adds a new implementation file (e.g. a new Go driver or Python module),
+  the agent is explicitly notified to create it. Affects ~33% of pool problems.
 """
 
 from __future__ import annotations
@@ -127,7 +130,8 @@ Analyse this test-first, then plan. Answer in order:
 2. **Root cause** — given the test contract, what is currently missing or wrong in \
    the source files?
 3. **Hypothesis** — which specific file(s) and line range(s) need to change? Be exact. \
-   If "New test files" are listed above, your diff must also add them.
+   If "New test files" are listed above, your diff must also add them. \
+   If "New implementation files" are listed above, your diff must create each one.
 4. **Implementation plan** — starting from the test contract, describe what you will \
    add/change: function signatures, return types, helper logic, error handling, \
    edge cases. Every assertion in the test must map to something in your plan.
@@ -161,6 +165,21 @@ changes) — do not modify their content:
 
 """
 
+NEW_IMPL_FILES_TEMPLATE = """\
+## New implementation files — MUST be created in your diff
+
+These source files do NOT exist in the repo at base commit — they are new files \
+added by this PR. Your diff must add each one as a new file (use \
+`new file mode 100644`, `--- /dev/null`, `+++ b/<path>`, `@@ -0,0 +1,N @@` format). \
+If any are missing, the test command will fail with an import or "file not found" error.
+
+Files to create:
+{new_impl_paths}
+
+Implement each file fully based on the issue requirements and test contract — do \
+not leave stubs. The source files section above shows their expected structure.
+"""
+
 ACT_PROMPT = """\
 Based on your analysis above, produce the unified diff.
 
@@ -181,6 +200,9 @@ Requirements:
 - Include helper functions, proper error handling, and secondary file changes
 - **New test files**: if the prompt shows "New test files", include them verbatim \
   as new-file additions (see format in that section)
+- **New implementation files**: if the prompt shows "New implementation files", \
+  add each one as a new file (`new file mode 100644`, `--- /dev/null`, \
+  `+++ b/<path>`, `@@ -0,0 +1,N @@`) — implement fully, no stubs
 - Do NOT change unrelated logic, but do implement the full fix as described
 - Higher-quality, complete implementations score better than minimal stubs
 - Output ONLY the diff — no markdown fences, no prose
@@ -347,6 +369,26 @@ def _new_test_files(
     return [f for f in test_files if f.path not in tree_set]
 
 
+def _new_impl_files(
+    impl_files: list[FileContext],
+    file_tree: list[str] | None,
+) -> list[FileContext]:
+    """Return non-test source files that are NOT present in the file tree at base commit.
+
+    These are new files added by the PR — they must be created in the diff.
+    Only returns files with code extensions (not config or data files).
+    """
+    if not file_tree:
+        return []
+    CODE_EXTS = {".py", ".go", ".ts", ".tsx", ".js", ".jsx", ".kt", ".java", ".rb", ".rs"}
+    tree_set = set(file_tree)
+    return [
+        f for f in impl_files
+        if f.path not in tree_set
+        and any(f.path.endswith(ext) for ext in CODE_EXTS)
+    ]
+
+
 def _format_new_test_files(files: list[FileContext]) -> str:
     """Render new test files in a format that makes it easy to copy into a diff."""
     parts = []
@@ -368,7 +410,8 @@ def _new_test_diff(files: list[FileContext]) -> str:
         lines = f.content.splitlines()
         n = len(lines)
         hunk_lines = [f"+{ln}" for ln in lines]
-        if lines and not lines[-1].endswith("\n"):
+        # splitlines() strips newlines, so check the original content directly
+        if lines and not f.content.endswith("\n"):
             no_newline = "\\ No newline at end of file"
         else:
             no_newline = None
@@ -393,12 +436,21 @@ def _is_test_file(f: FileContext) -> bool:
     p = f.path.lower()
     name = p.rsplit("/", 1)[-1]
     return (
-        "/test/" in p or "/tests/" in p or "/spec/" in p or "/specs/" in p
+        # In a test directory (leading or mid-path)
+        p.startswith("test/") or p.startswith("tests/") or p.startswith("spec/") or p.startswith("specs/")
+        or "/test/" in p or "/tests/" in p or "/spec/" in p or "/specs/" in p
+        # Python: test_foo.py, foo_test.py
         or name.startswith("test_") or name.endswith("_test.py")
+        # Go: foo_test.go
+        or name.endswith("_test.go")
+        # TypeScript/JS: foo.test.ts, foo.spec.tsx
         or ".test." in name or ".spec." in name
+        # Ruby: foo_spec.rb
         or name.startswith("spec_") or name.endswith("_spec.rb")
-        # Kotlin/Java: classes ending in Test (e.g. AndroidToolRetryPolicyTest.kt)
+        # Kotlin/Java/Scala: FooTest.kt, FooTest.java
         or re.search(r"test\.(kt|java|scala)$", name) is not None
+        # pytest conftest
+        or name == "conftest.py"
     )
 
 
@@ -1013,6 +1065,10 @@ class ExampleAgent(BaseAgent):
         if new_tests:
             log.append(f"[context] new test files (must be created in diff): {[f.path for f in new_tests]}")
 
+        new_impls = _new_impl_files(selected_impl, problem.file_tree)
+        if new_impls:
+            log.append(f"[context] new impl files (must be created in diff): {[f.path for f in new_impls]}")
+
         # Build test section — always shown in full (usually small)
         test_cmd_str = " ".join(problem.test_cmd) if problem.test_cmd else "pytest"
         test_cmd_short = problem.test_cmd[-1] if problem.test_cmd else "pytest"
@@ -1027,6 +1083,12 @@ class ExampleAgent(BaseAgent):
                 new_test_diffs=_new_test_diff(new_tests),
             )
             if new_tests else ""
+        )
+        new_impl_section = (
+            NEW_IMPL_FILES_TEMPLATE.format(
+                new_impl_paths="\n".join(f"- {f.path}" for f in new_impls),
+            )
+            if new_impls else ""
         )
 
         # --- Turn 1: Observe + Plan ---
@@ -1050,7 +1112,7 @@ class ExampleAgent(BaseAgent):
             tree="\n".join(problem.file_tree),
             init_hint=init_hint,
             test_section=test_section,
-            new_test_section=new_test_section,
+            new_test_section=new_test_section + new_impl_section,
             impl_files=_format_files(selected_impl, keywords),
         )
         history: list[dict[str, str]] = [
