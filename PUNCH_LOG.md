@@ -4,6 +4,29 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Agent + Dashboard polish (benchmark commit e787074, dashboard commit 0e36edc)
+
+### What shipped
+
+**Agent: partial-repair missing files named explicitly** (benchmark commit `e787074`)
+- Root cause: when verify produces a diff covering fewer files than the current diff, the feedback only said "N files missing" — not which files
+- Fix: `_changed_paths_from_diff()` computes the difference between current and repaired path sets; missing file paths listed explicitly in the feedback message
+- Model on the next iteration now knows exactly which files to add, not just the count
+- E.g.: "The following file(s) are missing from your response:\n- src/scorer.py\n- tests/test_scorer.py"
+
+**Dashboard: queue status from PR labels** (dashboard commit `0e36edc`)
+- Open Submissions queue now shows "Evaluating / Scored / New champion" based on PR labels
+- `agent-improvement` label → green dot + "Scored" badge
+- `new-champion` label → blue dot + "new champion" badge
+- CSS: `.status-dot.scored`, `.status-dot.champion`, `.pr-label.champion`, `.pr-label.scored`
+- No extra API calls — labels are included in the PR list response
+
+### Status
+- Benchmark: 430 problems, oracle **13.34** (tree-sitter), 20 repos (commit e787074)
+- No new DAS repo registrations (master_repositories.json still 19 repos, same set as pool)
+- Pool: fully saturated — next check 2026-06-16 (was 2026-06-09; reset after no-change check)
+- Pending: Gittensor registration, nginx hookup
+
 ## 2026-06-02 — Dashboard: problem drawer enrichment (dashboard commit 54756f8)
 
 ### Drawer now shows formula breakdown, diff stats, and CLI run snippet
