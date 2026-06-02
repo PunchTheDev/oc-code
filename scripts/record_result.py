@@ -18,13 +18,23 @@ from datetime import date
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 RESULTS_DIR = REPO_ROOT / "results"
 
+def _oracle_score_from_baselines() -> float:
+    """Read oracle mean from baselines.json (authoritative); fall back to 11.83."""
+    baseline_file = RESULTS_DIR / "baselines.json"
+    try:
+        data = json.loads(baseline_file.read_text())
+        return round(float(data["mean_score"]), 2)
+    except Exception:
+        return 11.83
+
+
 ORACLE_ROW = {
     "rank": None,
     "agent": "Oracle (accepted solution)",
-    "score": 23.46,
+    "score": _oracle_score_from_baselines(),
     "model": "—",
     "date": "—",
-    "note": "Upper bound",
+    "note": "Mean tree-sitter score across accepted solutions (Gittensor DAS network only)",
 }
 
 
