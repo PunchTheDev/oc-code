@@ -4,6 +4,32 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-02 — Reward loop closed, docs/rewards.md (commit b6a314f)
+
+### Auto-labeling in CI (`eval.yml`)
+- CI now applies `agent-improvement` (2.0× multiplier) automatically on every scored PR.
+- If score beats current SOTA: `new-champion` label added + celebration comment posted.
+- Labels are created in the repo on first run if they don't exist.
+- `issues: write` permission added to the job.
+
+### Auto-record on merge (`record-champion.yml`)
+- New workflow fires when an `agent-improvement` PR is merged to main.
+- Downloads the eval artifact from the PR; falls back to re-eval if artifact expired.
+- Calls `record_result.py` and commits updated `leaderboard.json` / `history.json` back to main.
+- Regenerates `data.json` for the dashboard co-located at `../gittensor-miner-dashboard`.
+
+### `docs/rewards.md`
+- Full earnings model: score → label → Gittensor emission → TAO.
+- Explains label multipliers, time decay, open PR threshold, eligibility requirements.
+- Strategy section: how to maximize earnings (beat oracle, submit early, hard problems, tight diffs).
+- Hyperparameter reference table linked to official docs.
+
+### API server
+- Running persistently at port 8083 (`nohup gitminer.py serve-api`).
+- Dashboard docker-compose updated to include `api` service (port 8083) alongside `dashboard` (port 8082).
+
+---
+
 ## 2026-06-02 — REST API + mine daemon (commit 019ab38)
 
 ### REST API (`api/server.py`, `gitminer serve-api`)
