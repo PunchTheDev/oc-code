@@ -258,8 +258,7 @@ def _timeout_result(problem_id: str) -> dict:
         "problem_id": problem_id,
         "patch_applied": False,
         "tests_passed": False,
-        "correctness_score": 0.0,
-        "quality_score": 0.0,
+        "base_score": 0.0,
         "final_score": 0.0,
         "error": "timeout",
     }
@@ -270,8 +269,7 @@ def _error_result(problem_id: str, detail: str) -> dict:
         "problem_id": problem_id,
         "patch_applied": False,
         "tests_passed": False,
-        "correctness_score": 0.0,
-        "quality_score": 0.0,
+        "base_score": 0.0,
         "final_score": 0.0,
         "error": detail,
     }
