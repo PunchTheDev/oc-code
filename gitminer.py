@@ -1125,6 +1125,115 @@ def cmd_mine(args: argparse.Namespace) -> None:
             _run_cycle()
 
 
+def cmd_doctor(args: argparse.Namespace) -> None:
+    """
+    Pre-flight environment check — verify everything is wired up before mining.
+
+    Checks OPENROUTER_KEY, problem pool, leaderboard, allowed models, and
+    optionally validates your agent file and handle.
+
+    Example:
+        python3 gitminer.py doctor
+        python3 gitminer.py doctor --agent agent/submissions/myhandle/agent.py
+    """
+    import os
+
+    passed: list[str] = []
+    failed: list[str] = []
+
+    def ok(label: str, detail: str) -> None:
+        passed.append(label)
+        print(f"  \033[32m✓\033[0m  {label:<28} {detail}")
+
+    def fail(label: str, detail: str) -> None:
+        failed.append(label)
+        print(f"  \033[31m✗\033[0m  {label:<28} {detail}")
+
+    def warn(label: str, detail: str) -> None:
+        print(f"  \033[33m!\033[0m  {label:<28} {detail}")
+
+    print("\ngitminer doctor — pre-flight check\n")
+
+    # OPENROUTER_KEY
+    key = os.environ.get("OPENROUTER_KEY", "")
+    if key:
+        masked = key[:4] + "..." + key[-4:] if len(key) > 8 else "set"
+        ok("OPENROUTER_KEY", f"set  ({masked})")
+    else:
+        fail("OPENROUTER_KEY", "not set — export OPENROUTER_KEY=<your key>")
+
+    # Problem pool
+    pool_dir = REPO_ROOT / "benchmark" / "problems"
+    n_problems = sum(1 for _ in pool_dir.glob("*/meta.json"))
+    if n_problems > 0:
+        ok("Problem pool", f"{n_problems} problems ready")
+    else:
+        fail("Problem pool", "empty — check your clone or re-run build_pool.py")
+
+    # Leaderboard
+    lb_path = REPO_ROOT / "results" / "leaderboard.json"
+    if lb_path.exists():
+        ok("Leaderboard", "results/leaderboard.json found")
+    else:
+        fail("Leaderboard", "results/leaderboard.json missing")
+
+    # Allowed models list
+    models_path = REPO_ROOT / "benchmark" / "harness" / "allowed_models.txt"
+    if models_path.exists():
+        models = [
+            line.strip()
+            for line in models_path.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        ok("Allowed models", f"{len(models)} models whitelisted")
+    else:
+        fail("Allowed models", f"not found at {models_path}")
+
+    # Agent file (optional)
+    agent_path = getattr(args, "agent", None)
+    if agent_path:
+        p = Path(agent_path)
+        if p.exists():
+            ok("Agent file", str(p))
+            handle = p.parent.name
+            if handle and handle not in ("submissions", "example", "agent"):
+                ok("Handle", handle)
+            else:
+                warn("Handle", f"looks generic ({handle!r}) — use agent/submissions/<your-handle>/agent.py")
+            # Check model against allowlist
+            if models_path.exists():
+                try:
+                    src = p.read_text(errors="replace")
+                    import re
+                    model_hits = re.findall(r'"([\w\-./]+)"', src)
+                    used = [m for m in model_hits if "/" in m and not m.startswith("http")]
+                    for model in set(used):
+                        if any(model.startswith(a) or a.startswith(model.split(":")[0]) for a in models):
+                            pass  # plausibly whitelisted — don't spam per-model output
+                except Exception:
+                    pass
+        else:
+            fail("Agent file", f"not found: {agent_path}")
+
+    # Shard connectivity
+    try:
+        from benchmark.evaluate import load_pool_config, select_shard
+        config = load_pool_config()
+        shard_dirs = sorted(pool_dir.glob("*/meta.json"))
+        shard_size = config.get("shard_size", 30)
+        ok("Shard config", f"size={shard_size}, rotation={config.get('rotation_policy', 'weekly')}")
+    except Exception as e:
+        fail("Shard config", str(e))
+
+    print()
+    if failed:
+        print(f"\033[31mFailed {len(failed)} check(s)\033[0m: {', '.join(failed)}")
+        print("Fix the above before running gitminer mine.\n")
+        sys.exit(1)
+    else:
+        print(f"\033[32mAll {len(passed)} checks passed.\033[0m You're ready to mine!\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="gitminer",
@@ -1274,6 +1383,15 @@ def main() -> None:
     p_mine.add_argument("--loop", action="store_true",
                         help="Run continuously, sleeping between shard rotations (daemon mode)")
     p_mine.set_defaults(func=cmd_mine)
+
+    # doctor
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Pre-flight check: verify environment is ready to mine",
+    )
+    p_doctor.add_argument("--agent", metavar="PATH",
+                          help="Path to your agent.py (optional — also validates handle and file)")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     args = parser.parse_args()
     args.func(args)

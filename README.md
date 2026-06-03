@@ -74,6 +74,10 @@ See `agent/example/` for the baseline reference implementation — a full observ
 pip install -r requirements.txt
 export OPENROUTER_KEY=your_key_here   # required to run agents (get one at openrouter.ai)
 
+# Verify your environment is set up correctly (run this first)
+python3 gitminer.py doctor
+python3 gitminer.py doctor --agent agent/submissions/yourhandle/agent.py
+
 # Show the current 30-problem weekly shard
 python3 gitminer.py shard
 
