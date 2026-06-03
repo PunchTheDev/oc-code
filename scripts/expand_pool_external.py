@@ -74,6 +74,9 @@ EXTERNAL_REPOS = [
     # JVM external repos
     "FasterXML/jackson-databind",  # 10k stars — Java JSON library, Gradle, real deserialization bugs
     "square/okhttp",               # 45k stars — Kotlin/Java HTTP client, Gradle, real protocol bugs
+    # Go external repos
+    "gin-gonic/gin",               # 75k stars — Go HTTP web framework, go test ./..., active bug-fixes
+    "labstack/echo",               # 28k stars — Go HTTP framework, go test ./..., clean regressions
 ]
 
 
@@ -235,6 +238,10 @@ def infer_test_cmd(repo: str, diff: str) -> list[str]:
     # Rust: any .rs file → cargo test
     if any(p.endswith(".rs") for p in changed):
         return ["cargo", "test"]
+
+    # Go: any .go file → go test ./...
+    if any(p.endswith(".go") for p in changed):
+        return ["go", "test", "./..."]
 
     # JVM (Java/Kotlin/Scala): any .java or .kt or .scala file → gradlew test
     if any(p.endswith((".java", ".kt", ".scala")) for p in changed):

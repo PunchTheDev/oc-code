@@ -58,16 +58,20 @@ REPO_CATEGORY: dict[str, str] = {
     # JVM external repos
     "fasterxml/jackson-databind": "jvm",
     "square/okhttp": "jvm",
+    # Go external repos
+    "gin-gonic/gin": "go",
+    "labstack/echo": "go",
 }
 
 # Shard sampling budget per category (sums to 30)
-# Proportional to pool: python:43% rust:27% typescript:19% ruby:8% jvm:4%
+# Proportional to pool: python:41% rust:27% typescript:18% ruby:7% jvm:5% go:2%
 SHARD_BUDGET: dict[str, int] = {
-    "python": 12,
+    "python": 11,
     "rust": 8,
     "typescript": 6,
     "ruby": 2,
     "jvm": 2,
+    "go": 1,
 }
 
 

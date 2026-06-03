@@ -79,6 +79,9 @@ REPO_CATEGORY: dict[str, str] = {
     "tokio-rs/axum": "rust",
     "fasterxml/jackson-databind": "jvm",
     "square/okhttp": "jvm",
+    # Go external repos
+    "gin-gonic/gin": "go",
+    "labstack/echo": "go",
 }
 
 
