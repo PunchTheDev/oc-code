@@ -56,7 +56,7 @@ observe → plan → act → verify loop. Beat it.
 
 **Pre-warm the repo cache (recommended before first `--no-sandbox` run):**
 ```bash
-python gitminer.py cache
+python3 gitminer.py cache
 ```
 Clones all pool repos once into `~/.cache/gitminer/repos/`. Subsequent `--no-sandbox`
 evals use git worktrees instead of cloning, cutting a 30-problem run from ~20 min to
@@ -64,45 +64,45 @@ a few minutes. Set `GITMINER_CACHE=/path/to/dir` to override the cache location.
 
 **Run your agent on a single problem (fastest development loop):**
 ```bash
-python gitminer.py run --problem 0463 --agent agent/submissions/<your-handle>/agent.py
+python3 gitminer.py run --problem 0463 --agent agent/submissions/<your-handle>/agent.py
 ```
 Prints the patch your agent produces for one problem. Add flags to go deeper:
 ```bash
 # Compare side-by-side with the reference diff and score inline
-python gitminer.py run --problem 0463 --agent agent/submissions/<your-handle>/agent.py \
+python3 gitminer.py run --problem 0463 --agent agent/submissions/<your-handle>/agent.py \
     --show-ref --score --no-sandbox
 
 # Save the patch to a file for inspection or validation
-python gitminer.py run --problem 0463 --output my_fix.diff
+python3 gitminer.py run --problem 0463 --output my_fix.diff
 
 # Print the agent's internal reasoning log
-python gitminer.py run --problem 0463 --verbose
+python3 gitminer.py run --problem 0463 --verbose
 ```
 
 **With Docker sandbox (same as CI):**
 ```bash
-python gitminer.py eval agent/submissions/<your-handle>/agent.py
+python3 gitminer.py eval agent/submissions/<your-handle>/agent.py
 ```
 
 **Without Docker (faster, less isolated — development only):**
 ```bash
-python gitminer.py eval agent/submissions/<your-handle>/agent.py --no-sandbox
+python3 gitminer.py eval agent/submissions/<your-handle>/agent.py --no-sandbox
 ```
 
 **Subset of problems:**
 ```bash
-python gitminer.py eval agent/submissions/<your-handle>/agent.py --problems 930,986,1033
+python3 gitminer.py eval agent/submissions/<your-handle>/agent.py --problems 930,986,1033
 ```
 
 **Save results to a file:**
 ```bash
-python gitminer.py eval agent/submissions/<your-handle>/agent.py --output results.json
+python3 gitminer.py eval agent/submissions/<your-handle>/agent.py --output results.json
 ```
 
 **Validate a single patch applies cleanly (quick sanity check):**
 ```bash
-python gitminer.py validate --problem 0463 --patch my_fix.diff
-python gitminer.py validate --problem 0463 --patch my_fix.diff --run-tests
+python3 gitminer.py validate --problem 0463 --patch my_fix.diff
+python3 gitminer.py validate --problem 0463 --patch my_fix.diff --run-tests
 ```
 Applies the diff to the problem's base commit and shows the diff stat. `--run-tests`
 also runs the problem's test command locally (requires deps installed in your environment).
@@ -146,7 +146,7 @@ The reveal must happen within **7 days** of the score being posted.
 You can also use `gitminer hash` to generate the SHA-256 hash of your agent file before submitting:
 
 ```bash
-python gitminer.py hash agent/submissions/<your-handle>/agent.py
+python3 gitminer.py hash agent/submissions/<your-handle>/agent.py
 ```
 
 ## PR format
@@ -185,10 +185,10 @@ runs again automatically — your machine earns TAO whenever it's idle.
 
 ```bash
 # One-shot: run now and print result
-python gitminer.py mine --agent agent/submissions/<your-handle>/agent.py --no-sandbox
+python3 gitminer.py mine --agent agent/submissions/<your-handle>/agent.py --no-sandbox
 
 # Daemon mode: run every week when the shard rotates
-python gitminer.py mine --agent agent/submissions/<your-handle>/agent.py --loop
+python3 gitminer.py mine --agent agent/submissions/<your-handle>/agent.py --loop
 ```
 
 If you beat the champion, the daemon prints a commit-reveal hash and step-by-step
@@ -200,7 +200,7 @@ The benchmark exposes a JSON API for scripting, dashboards, and custom tooling.
 
 ```bash
 # Start the API server
-python gitminer.py serve-api          # http://localhost:8083
+python3 gitminer.py serve-api          # http://localhost:8083
 
 # Useful calls
 curl http://localhost:8083/api/shard
