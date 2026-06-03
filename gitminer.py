@@ -1166,8 +1166,10 @@ def cmd_mine(args: argparse.Namespace) -> None:
             return
 
         status = "BEAT CHAMPION" if champ else "FIRST SUBMISSION"
-        oracle_gap = 1.0 - my_score
-        oracle_note = f"  (oracle=1.0, gap to oracle: {oracle_gap:+.4f})"
+        if my_score >= 1.0:
+            oracle_note = f"  (beats oracle by +{my_score - 1.0:.4f})"
+        else:
+            oracle_note = f"  (gap to oracle=1.0: {1.0 - my_score:.4f})"
         print(f"\n{status}! Your weighted_benchmark_score: {my_score:.4f}{oracle_note}")
 
         # Generate commit-reveal hash from agent file content
