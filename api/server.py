@@ -243,6 +243,7 @@ class Handler(BaseHTTPRequestHandler):
             "oracle_score": _oracle_weighted_score(),
             "by_category": by_category,
             "by_difficulty": by_difficulty,
+            "shard_budget": config.get("shard_budget", {}),
             "rotation_policy": config.get("rotation_policy", "weekly"),
         }
 
