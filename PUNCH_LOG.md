@@ -3792,3 +3792,25 @@ These values show to static crawlers/social scrapers before JS loads. Dashboard 
 - Model whitelist: 28 models, all verified live on OpenRouter
 - Pool rotation: Sunday 2026-06-08 (automated, 5 days)
 - API: pool_size=1123, oracle=12.64 ✅
+
+## Step 208 — 2026-06-03
+
+**Bug fix: SERVER_TEST_PATTERNS filter missing from expand_pool_external.py**
+
+Pool quality audit revealed that `expand_pool_external.py` was missing the `SERVER_TEST_PATTERNS` filter added to `build_pool.py` in PR #83. Without this fix, the Sunday 2026-06-08 pool rotation would re-add ragflow server-required integration tests (`test_http_api/`, `test_web_api/`, `test_sdk_api/`) that were just removed.
+
+**PR #86:** Added identical filter to `curate_github_pr` in `expand_pool_external.py`:
+- Same `SERVER_TEST_PATTERNS = ("test_http_api/", "test_web_api/", "test_sdk_api/")` tuple
+- Same `re.findall` on diff paths
+- Exits early with same skip message as `build_pool.py`
+
+**Pool quality audit (no other issues found):**
+- All 56 "HTTP/API" flagged tests verified safe: gittensor tests use `unittest.mock`, tornado uses `AsyncHTTPTestCase` (local server), werkzeug uses `unittest.mock.patch`, vouch JSONL tests use fixtures only
+- 7 celery DB backend tests use `unittest.mock.Mock/patch` — no live DB required
+- 3 remaining ragflow `unit_test/api/db/services/` tests use `monkeypatch` — confirmed safe
+- 0 empty diffs, 0 sub-50-byte diffs in pool
+
+**System state post-step:**
+- base-miner main: 3251f0d2 (PR #86 merged)
+- Benchmark: 1123 problems, oracle 12.64 weighted / 11.49 arithmetic, 47 repos
+- Pool rotation: Sunday 2026-06-08 — now protected against server-required re-injection
