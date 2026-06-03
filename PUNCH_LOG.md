@@ -3732,3 +3732,23 @@ Net: 27 → 28 models. All 28 verified as live on OpenRouter. API restarted; `/a
 - Model whitelist: **28 models**, all verified live on OpenRouter 2026-06-03
 - Pool rotation: Sunday 2026-06-08 (automated, 5 days)
 - CI: all green
+
+---
+
+## Step 205 — Fix example sha256 + REGISTRATION.md stats
+
+**PR #81 merged** (d6181a2e)
+
+Two pre-launch accuracy fixes:
+
+1. `agent/example/meta.json` sha256 was stale — it referenced an older version of agent.py. CI validates sha256 on eval and would have thrown a mismatch error. Updated to `aebc1a47...` (current agent.py).
+
+2. `REGISTRATION.md` pool stats were stale at "1131 problems, 46 repos (13 DAS + 33 external)". Corrected to "1154 problems, 47 repos (13 DAS + 34 external)".
+
+### System state after step 205
+
+- base-miner main: d6181a2e (PR #81 merged)
+- Benchmark: 1154 problems, oracle **12.61** weighted / 11.48 arithmetic, 47 repos
+- Model whitelist: 28 models, all verified live on OpenRouter
+- Pool rotation: Sunday 2026-06-08 (automated, 3 days)
+- CI: all green
