@@ -4,6 +4,22 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — docs/rewards.md accuracy fixes (commit 33cf61b)
+
+Fixed three wrong values in `docs/rewards.md` that disagreed with `hyperparameters.json`:
+
+| Field | Was | Now |
+|---|---|---|
+| Contributor emission share | 59.5% | 55% |
+| Maintainer emission share | 10.5% | 15% |
+| Open PR base threshold | "default 10" | 3 |
+| Token score per +1 threshold | "every 500" | every 250, max 15 |
+| Hyperparameter reference block | truncated (missing eligibility) | matches full `hyperparameters.json` |
+
+Also fixed README: "minimal reference implementation" → "baseline reference implementation (observe → plan → act loop)" — the example agent is 3015 lines, not minimal.
+
+---
+
 ## 2026-06-03 — Oracle calibration message fix (commit 62c528e)
 
 `benchmark/evaluate.py` oracle mode was printing "Expected mean: ~23.46 / 30.00" — a very old hardcoded value from before tree-sitter recalibration. Fixed to read `weighted_mean_score` and `mean_score` from `results/baselines.json` at runtime, with a fallback of 13.03/12.08. Message now reads:
