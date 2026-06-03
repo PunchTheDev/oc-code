@@ -712,13 +712,15 @@ def _score_in_worktree(
     coverage = _file_coverage(problem_dir, diff_text)
     deletion_info = _detect_test_deletion(diff_text)
 
+    # Anti-gaming multiplier: halve benchmark_score when test deletion is detected.
+    # A submission that removes >3 test assertions to force a pass is penalized.
+    anti_gaming_multiplier = 0.5 if deletion_info["test_deletion_warning"] else 1.0
+
     # benchmark_score: composite primary leaderboard metric.
-    #   = test_pass_rate × relative_score
-    # This gives partial credit for partially-correct fixes while still
-    # weighting quality against the oracle. A fully-passing submission
-    # scoring 1.0 relative earns benchmark_score 1.0; a half-passing
-    # submission earns 0.5 × relative_score.
-    benchmark_score = round(test_pass_rate * (rel_score or 0.0), 4)
+    #   = test_pass_rate × relative_score × anti_gaming_multiplier
+    # Correctness depth (test_pass_rate) × quality alignment (relative_score) × integrity.
+    # A fully-passing oracle-quality submission earns 1.0; a gaming submission earns ≤0.5.
+    benchmark_score = round(test_pass_rate * (rel_score or 0.0) * anti_gaming_multiplier, 4)
 
     return {
         "problem_id": problem_id,
@@ -738,13 +740,15 @@ def _score_in_worktree(
         # 1.0 = matches accepted solution quality, >1.0 = better, <1.0 = lower quality.
         "relative_score": rel_score,
         "oracle_base_score": _load_baselines().get(meta.get("id", ""), 0.0),
-        # benchmark_score: PRIMARY leaderboard metric. test_pass_rate × relative_score.
-        # Captures both correctness (how many tests pass) and quality (vs oracle).
+        # benchmark_score: PRIMARY per-problem metric.
+        #   = test_pass_rate × relative_score × anti_gaming_multiplier
+        # Combined into weighted_benchmark_score at the shard level (hard×2 / medium×1.5 / easy×1).
         "benchmark_score": benchmark_score,
+        "anti_gaming_multiplier": anti_gaming_multiplier,
         # file_coverage: fraction of reference-diff source files the agent also touches.
         # Observational only — a different-but-correct fix needn't touch the same files.
         **coverage,
-        # Anti-gaming: flag suspicious test assertion removals.
+        # Anti-gaming: flag suspicious test assertion removals (reflected in anti_gaming_multiplier).
         **deletion_info,
         # Multipliers (time_decay, review_quality, label, issue) require GitHub
         # API data — local scoring sets them to 1.0 as a conservative estimate.

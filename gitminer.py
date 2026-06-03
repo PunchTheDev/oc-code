@@ -128,11 +128,15 @@ def cmd_eval(args: argparse.Namespace) -> None:
     weighted_mean = results.get("weighted_mean_score", mean)
     mean_relative = results.get("mean_relative_score")
     mean_benchmark = results.get("mean_benchmark_score")
+    weighted_benchmark = results.get("weighted_benchmark_score")
     print(f"\n{'─'*54}")
     print(f"  Problems evaluated : {len(problems)} ({len(passed)} passed, {len(failed)} failed, {len(errored)} errors)")
+    if weighted_benchmark is not None:
+        pct = round(weighted_benchmark * 100, 1)
+        print(f"  Weighted benchmark : {weighted_benchmark:.4f}  ({pct}% — PRIMARY: difficulty-weighted test_pass_rate × quality/oracle)")
     if mean_benchmark is not None:
         pct = round(mean_benchmark * 100, 1)
-        print(f"  Benchmark score    : {mean_benchmark:.4f}  ({pct}% — PRIMARY: test_pass_rate × quality/oracle)")
+        print(f"  Benchmark score    : {mean_benchmark:.4f}  ({pct}% — arithmetic benchmark mean)")
     print(f"  Mean score         : {mean:.2f} / 30.00")
     print(f"  Weighted mean      : {weighted_mean:.2f} / 30.00  (easy×1 / medium×1.5 / hard×2)")
     print(f"  Oracle weighted    : {oracle_weighted:.2f} / 30.00  (reference diffs, weighted)")
@@ -1105,6 +1109,8 @@ def cmd_mine(args: argparse.Namespace) -> None:
     handle = Path(agent_path).parent.name
 
     def _champion_score() -> float:
+        """Return the champion's weighted_benchmark_score (PRIMARY metric). Falls back
+        to weighted_score if the entry predates the benchmark_score schema."""
         lb_path = REPO_ROOT / "results" / "leaderboard.json"
         if not lb_path.exists():
             return 0.0
@@ -1113,16 +1119,22 @@ def cmd_mine(args: argparse.Namespace) -> None:
         if not human:
             return 0.0
         row = human[0]
-        return float(row.get("weighted_score") or row.get("score", 0.0))
+        # Prefer weighted_benchmark_score; fall back to older weighted_score field.
+        return float(
+            row.get("weighted_benchmark_score")
+            or row.get("benchmark_score")
+            or row.get("weighted_score")
+            or row.get("score", 0.0)
+        )
 
     def _run_cycle() -> None:
         champ = _champion_score()
         oracle = _oracle_weighted()
-        label = f"{champ:.2f}" if champ else "none yet"
+        label = f"{champ:.4f}" if champ else "none yet"
         print(f"\n{'═'*60}")
         print(f"  gitminer mine — {handle}")
         print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-        print(f"  Champion: {label}    Oracle weighted: {oracle:.2f}")
+        print(f"  Champion weighted_benchmark: {label}    Oracle: 1.0000")
         print(f"{'═'*60}\n")
 
         results = run_evaluation(
@@ -1134,25 +1146,29 @@ def cmd_mine(args: argparse.Namespace) -> None:
             print("No problems evaluated.")
             return
 
-        weighted_mean = results.get("weighted_mean_score") or (
-            sum(p.get("final_score", 0.0) for p in problems) / len(problems)
-        )
+        # PRIMARY metric: difficulty-weighted benchmark_score.
+        # Falls back to weighted_mean_score for backwards compat with older result dicts.
+        my_score = results.get("weighted_benchmark_score") or results.get("mean_benchmark_score")
+        if my_score is None:
+            my_score = results.get("weighted_mean_score") or (
+                sum(p.get("final_score", 0.0) for p in problems) / len(problems)
+            )
         passed = sum(1 for p in problems if p.get("tests_passed", False))
-        print(f"\nResult: {weighted_mean:.2f} / 30.00 (weighted)   ({passed}/{len(problems)} tests passing)")
+        print(f"\nResult: weighted_benchmark={my_score:.4f}   ({passed}/{len(problems)} tests passing)")
 
-        if weighted_mean <= 0:
+        if my_score <= 0:
             print("Score is 0 — no tests passed. Keep improving before submitting.")
             return
 
-        if champ and weighted_mean <= champ:
-            gap = champ - weighted_mean
-            print(f"Gap to champion: {gap:.2f} — keep improving!")
+        if champ and my_score <= champ:
+            gap = champ - my_score
+            print(f"Gap to champion: {gap:.4f} — keep improving!")
             return
 
         status = "BEAT CHAMPION" if champ else "FIRST SUBMISSION"
-        oracle_gap = oracle - weighted_mean
-        oracle_note = f"  (oracle: {oracle:.2f}, gap: {oracle_gap:+.2f})"
-        print(f"\n{status}! Your weighted score: {weighted_mean:.2f}{oracle_note}")
+        oracle_gap = 1.0 - my_score
+        oracle_note = f"  (oracle=1.0, gap to oracle: {oracle_gap:+.4f})"
+        print(f"\n{status}! Your weighted_benchmark_score: {my_score:.4f}{oracle_note}")
 
         # Generate commit-reveal hash from agent file content
         agent_bytes = Path(agent_path).read_bytes()

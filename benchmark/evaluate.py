@@ -429,6 +429,7 @@ def run_evaluation(
         weighted_total = weighted_count = 0.0
         rel_total = rel_count = 0
         bench_total = bench_count = 0
+        bench_weighted_total = bench_weighted_count = 0.0
         for r, d in zip(results, selected):
             tier, w = problem_difficulty(d)
             r["difficulty"] = tier
@@ -444,15 +445,22 @@ def run_evaluation(
             if bench is not None and isinstance(bench, (int, float)):
                 bench_total += bench
                 bench_count += 1
+                bench_weighted_total += bench * w
+                bench_weighted_count += w
         weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
         mean_relative = round(rel_total / rel_count, 4) if rel_count else None
         mean_benchmark = round(bench_total / bench_count, 4) if bench_count else None
+        weighted_benchmark = round(bench_weighted_total / bench_weighted_count, 4) if bench_weighted_count else None
 
         return {
             "mean_score": round(mean, 4),
             "weighted_mean_score": round(weighted_mean, 4),
             "mean_relative_score": mean_relative,
             "mean_benchmark_score": mean_benchmark,
+            # weighted_benchmark_score: PRIMARY ranking metric.
+            # Applies difficulty weights (hard×2 / medium×1.5 / easy×1) to benchmark_score.
+            # Hard fixes contribute twice as much as easy ones to the final rank.
+            "weighted_benchmark_score": weighted_benchmark,
             "problems_evaluated": len(results),
             "pool_size": len(all_problem_dirs),
             "shard_size": len(selected),
@@ -517,6 +525,7 @@ def run_evaluation(
     weighted_total = weighted_count = 0.0
     rel_total = rel_count = 0
     bench_total = bench_count = 0
+    bench_weighted_total = bench_weighted_count = 0.0
     for r, d in zip(results, selected):
         tier, w = problem_difficulty(d)
         r["difficulty"] = tier
@@ -532,18 +541,22 @@ def run_evaluation(
         if bench is not None and isinstance(bench, (int, float)):
             bench_total += bench
             bench_count += 1
+            bench_weighted_total += bench * w
+            bench_weighted_count += w
     weighted_mean = weighted_total / weighted_count if weighted_count else 0.0
     mean_relative = round(rel_total / rel_count, 4) if rel_count else None
     mean_benchmark = round(bench_total / bench_count, 4) if bench_count else None
+    weighted_benchmark = round(bench_weighted_total / bench_weighted_count, 4) if bench_weighted_count else None
 
     return {
         "mean_score": round(mean, 4),
         "weighted_mean_score": round(weighted_mean, 4),
         "mean_relative_score": mean_relative,
-        # mean_benchmark_score: PRIMARY leaderboard metric.
-        # = mean(test_pass_rate × relative_score) across all evaluated problems.
-        # Combines correctness (partial test pass) and quality (vs oracle).
         "mean_benchmark_score": mean_benchmark,
+        # weighted_benchmark_score: PRIMARY ranking metric.
+        # Applies difficulty weights (hard×2 / medium×1.5 / easy×1) to benchmark_score.
+        # Hard fixes contribute twice as much as easy ones. This is what the leaderboard ranks by.
+        "weighted_benchmark_score": weighted_benchmark,
         "problems_evaluated": len(results),
         "pool_size": len(all_problem_dirs),
         "shard_size": len(selected),
@@ -601,10 +614,14 @@ def main() -> None:
     )
 
     pool_info = f"{results['shard_size']}/{results['pool_size']} problems"
+    wbench = results.get("weighted_benchmark_score")
     bench = results.get("mean_benchmark_score")
+    if wbench is not None:
+        pct = round(wbench * 100, 1)
+        print(f"\nWeighted benchmark:  {wbench}  ({pct}% — PRIMARY: difficulty-weighted test_pass_rate × quality/oracle)")
     if bench is not None:
         pct = round(bench * 100, 1)
-        print(f"\nBenchmark score:     {bench}  ({pct}% — PRIMARY metric: test_pass_rate × quality/oracle)")
+        print(f"Benchmark score:     {bench}  ({pct}% — arithmetic mean benchmark_score)")
     print(f"Mean score:          {results['mean_score']} ({pool_info})")
     print(f"Weighted mean score: {results['weighted_mean_score']} (easy×1 / medium×1.5 / hard×2)")
     rel = results.get("mean_relative_score")
