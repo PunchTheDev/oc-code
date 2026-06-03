@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 # Ensure repo root is on sys.path so benchmark.harness imports work whether
@@ -58,24 +59,36 @@ def repo_cache_dir() -> Path:
     return cache
 
 
+# Per-repo locks prevent concurrent threads from racing on the initial clone.
+# The outer lock protects the lock-dictionary itself.
+_clone_locks: dict[str, threading.Lock] = {}
+_clone_locks_mutex = threading.Lock()
+
+
 def cached_repo(repo_url: str) -> Path:
     """
-    Return a path to a local bare-ish clone of repo_url.
+    Return a path to a local clone of repo_url.
 
     On first call: git clone into ~/.cache/gitminer/repos/{owner}_{repo}.
     On subsequent calls: git fetch to pull in new commits (best-effort).
-    This eliminates repeated full clones when evaluating multiple problems
-    from the same repository.
+    Thread-safe: a per-repo lock prevents concurrent threads from racing
+    on the initial clone when multiple workers evaluate problems from the
+    same repository simultaneously.
     """
     parts = repo_url.rstrip("/").split("/")
     key = "_".join(parts[-2:])  # owner_repo
     cached = repo_cache_dir() / key
 
     if not cached.exists():
-        subprocess.run(
-            ["git", "clone", "--quiet", repo_url, str(cached)],
-            check=True, capture_output=True,
-        )
+        with _clone_locks_mutex:
+            if key not in _clone_locks:
+                _clone_locks[key] = threading.Lock()
+        with _clone_locks[key]:
+            if not cached.exists():  # double-check after acquiring lock
+                subprocess.run(
+                    ["git", "clone", "--quiet", repo_url, str(cached)],
+                    check=True, capture_output=True,
+                )
     else:
         subprocess.run(
             ["git", "-C", str(cached), "fetch", "--quiet", "--all"],
