@@ -2651,3 +2651,22 @@ Updated: `results/baselines.json`, `results/leaderboard.json` (oracle row), `doc
 **Oracle**: 13.39 → **15.02** weighted / 12.43 → **13.91** arithmetic.
 
 **Parity note**: Fix revealed more phase-rs problems with DAS≈0 (test failures on DAS side). Median local/DAS ratio remains 1.00×; 340/412 within 10×. The new "high outliers" are DAS test-failure cases, not scorer bugs.
+
+## 2026-06-03 — Anti-gaming enforcement + threat model + pool expansion (step 161)
+
+**Anti-gaming: all copy-detection checks are now hard-blocking** (PRs #2, #3):
+
+| Before | After |
+|---|---|
+| Similarity check: `continue-on-error: true` (advisory) | Hard-blocking: exits 1 on copy detection, fails the CI job |
+| Output similarity: `continue-on-error: true` (advisory) | Hard-blocking: same |
+| Reference copy: not implemented | New `check_reference_copy.py` — hard-blocking, detects oracle-diff hardcoding |
+| No eval concurrency limit | Per-actor concurrency: one active eval per GitHub user, new pushes cancel in-flight |
+
+**Reference copy attack**: The most dangerous undetected attack — miner reads public `benchmark/problems/{id}/reference.diff` and hardcodes oracle answers. Now detected: script hashes each reference.diff (same normalization as scorer), compares against agent's behavior fingerprint. >40% match rate = blocked.
+
+**Threat model updated**: All 8 threats now have `[Implemented]` / `[Planned]` / `[Gittensor-native]` labels. Critical gaps documented: Daytona network enforcement (needed for model whitelist enforcement), shared OPENROUTER_KEY at scale, commit-reveal not yet live.
+
+**Pool expanded**: 441 → 446 (5 new phase-rs/phase problems from recent merged PRs). `pool_config.json` updated.
+
+**Commits**: f067f2b, a141dad, 6ac0c57, 93148a6, 0a50526, 2a2b2ea, e14fd8b, 0bfc4f2, 1ba3c18, 1481585
