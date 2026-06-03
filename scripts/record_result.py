@@ -204,9 +204,19 @@ def main():
 
     lb_file.write_text(json.dumps(leaderboard, indent=2))
 
+    # Append to per-agent submission history (all submissions, never replaced)
+    agent_dir = RESULTS_DIR / "agents" / args.handle
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    agent_hist_file = agent_dir / "history.json"
+    agent_history = load_json(agent_hist_file, [])
+    agent_entry = {k: v for k, v in entry.items() if k != "rank"}
+    agent_history.append(agent_entry)
+    agent_hist_file.write_text(json.dumps(agent_history, indent=2))
+
     wbs_str = f" / weighted_benchmark={weighted_benchmark:.4f}" if weighted_benchmark is not None else ""
     print(f"Leaderboard updated: {args.handle} scored weighted={weighted_mean:.4f}{wbs_str} / arithmetic={mean_score:.4f}")
     print(f"  SOTA at submission: {prev_sota:.4f}  |  marginal gain: {gain:.4f}  |  weight: {weight:.4f}")
+    print(f"  Agent history: {len(agent_history)} submission(s) saved to {agent_hist_file}")
 
     if new_sota >= prev_sota:
         hist_entry = {

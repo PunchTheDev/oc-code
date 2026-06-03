@@ -15,8 +15,9 @@ Endpoints:
     GET /api/problems            full problem list (filterable, paginated)
     GET /api/problems/{id}       one problem by ID (includes diff_stats)
     GET /api/problems/{id}/diff  raw unified diff of the accepted solution
-    GET /api/leaderboard         current ranked submissions
-    GET /api/agents              agent discovery document — structured onboarding for autonomous agents
+    GET /api/leaderboard              current ranked submissions
+    GET /api/agents/{handle}/history  full per-submission history for one agent
+    GET /api/agents                   agent discovery document — structured onboarding for autonomous agents
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ POOL_DIR = REPO_ROOT / "benchmark" / "problems"
 POOL_CONFIG = REPO_ROOT / "benchmark" / "pool_config.json"
 BASELINES = REPO_ROOT / "results" / "baselines.json"
 LEADERBOARD = REPO_ROOT / "results" / "leaderboard.json"
+AGENTS_DIR = REPO_ROOT / "results" / "agents"
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -191,6 +193,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._shard()
         if path == "/api/leaderboard":
             return self._leaderboard()
+        if path.startswith("/api/agents/") and path.endswith("/history"):
+            handle = path[len("/api/agents/"):-len("/history")]
+            if handle:
+                return self._agent_history(handle)
         if path == "/api/agents":
             return self._agents()
         if path == "/api/problems":
@@ -455,6 +461,18 @@ class Handler(BaseHTTPRequestHandler):
             },
         }
 
+    def _agent_history(self, handle: str) -> dict:
+        hist_file = AGENTS_DIR / handle / "history.json"
+        if not hist_file.exists():
+            return {"handle": handle, "submissions": []}
+        entries = json.loads(hist_file.read_text())
+        # Strip per-problem breakdown from history entries to keep response small
+        summary = [
+            {k: v for k, v in e.items() if k != "breakdown"}
+            for e in entries
+        ]
+        return {"handle": handle, "submissions": summary, "total": len(summary)}
+
     def _leaderboard(self) -> dict:
         if not LEADERBOARD.exists():
             return {"entries": []}
@@ -499,8 +517,9 @@ def serve(host: str = "0.0.0.0", port: int = 8083) -> None:
     print("  GET /api/problems            problem list (filterable)")
     print("  GET /api/problems/{id}       single problem detail")
     print("  GET /api/problems/{id}/diff  raw reference diff (text/plain)")
-    print("  GET /api/leaderboard         current leaderboard")
-    print("  GET /api/agents              agent discovery document")
+    print("  GET /api/leaderboard             current leaderboard")
+    print("  GET /api/agents/{handle}/history per-agent submission history")
+    print("  GET /api/agents                  agent discovery document")
     print()
     try:
         server.serve_forever()
