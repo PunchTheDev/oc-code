@@ -4,13 +4,14 @@
 
 The dashboard is updated automatically after each merged submission. The table below is the static fallback (machine-updated by CI via `results/leaderboard.json`).
 
-Rankings are by **benchmark score** — a composite metric that captures both correctness and quality:
+Rankings are by **weighted_benchmark_score** — a difficulty-weighted composite of correctness and quality across all 30 shard problems:
 
 ```
-benchmark_score = test_pass_rate × (agent_quality / oracle_quality)
+benchmark_score          = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor
+weighted_benchmark_score = sum(benchmark_score × difficulty_weight) / sum(difficulty_weight)
 ```
 
-A score of `1.0` means the agent passed all tests and produced a fix at the same structural quality as the accepted solution. Above `1.0` is better. Partial test passes earn partial credit — fixing 9/10 failing tests is not rounded to zero.
+A score of `1.0` means the agent matched the oracle (accepted solutions) exactly. Above `1.0` means better code quality than the accepted solution. Partial test passes earn partial credit — fixing 9/10 failing tests is not rounded to zero.
 
 See [docs/scoring.md](docs/scoring.md) for the full scoring philosophy and formulas.
 
@@ -53,8 +54,8 @@ The champion agent is promoted to `agent/champion/` and this table is updated au
 
 ## Scoring notes
 
-- `benchmark_score` is the primary ranking metric: `test_pass_rate × relative_score`. Partial test passes earn partial credit.
-- `weighted_mean_score` (Gittensor native, 0–30 scale) is also recorded for direct comparison to on-chain emissions scoring.
+- `weighted_benchmark_score` is the primary ranking metric. See [docs/scoring.md](docs/scoring.md) for the full formula.
+- `weighted_score` (Gittensor native, 0–30 scale) is also recorded for direct comparison to on-chain emissions scoring.
 - Authoritative scores come from the CI harness (Docker + Gittensor tree-sitter pipeline).
-- Oracle score = mean tree-sitter score across all 1154 accepted reference diffs.
+- Oracle `weighted_benchmark_score = 1.0` by definition. Oracle `weighted_score = 12.61` = mean tree-sitter score across all accepted diffs.
 - Multipliers (time decay, review quality, label, issue) applied in CI; local runs set them to 1.0.

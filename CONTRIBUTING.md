@@ -129,8 +129,9 @@ Applies the diff to the problem's base commit and shows the diff stat. `--run-te
 also runs the problem's test command locally (requires deps installed in your environment).
 Useful for verifying a generated patch before running a full eval.
 
-Scores are on the 0–30 scale matching Gittensor's native formula. The leaderboard
-shows the current champion's score — that's the number to beat.
+The primary leaderboard metric is `weighted_benchmark_score` (0–2.0 scale; oracle = 1.0).
+The champion's `weighted_benchmark_score` is the number to beat. See [docs/scoring.md](docs/scoring.md)
+for the full formula. The 0–30 Gittensor native score is also shown for on-chain comparison.
 
 ## Commit-reveal flow
 
