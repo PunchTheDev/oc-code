@@ -4,6 +4,21 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Difficulty tier consistency sweep (commits 2d5bab4, 13535cd)
+
+**Root cause**: Two places still used oracle score to classify problem difficulty (easy/medium/hard) instead of the canonical line-count system in `evaluate.py`. The eval.yml PR comment used `score ≥ 15 → easy`, and `gitminer.py problems` used the same score thresholds.
+
+**Fixes**:
+- `results/baselines.json`: each problem now includes `difficulty`, `weight`, and `added_lines` (computed from reference.diff). This makes the stored baselines self-describing.
+- `scripts/baseline_scores.py`: `score_reference()` now records these three fields; weighted mean computation simplified to use stored `weight` per problem.
+- `.github/workflows/eval.yml`: `difficulty()` function replaced — now reads `difficultyMap[pid]` from baselines instead of score-based heuristic. PR comment difficulty column now matches dashboard badges.
+- `gitminer.py` `cmd_problems`: removed score-based `_difficulty()` helper; now reads `difficulty` directly from `difficulty_lookup` (loaded from baselines.json). `problems --difficulty hard` now filters consistently with dashboard.
+- `REGISTRATION.md`: stale pool count updated (360 → 441, 20 repos → 13 active).
+
+**Effect**: difficulty classification is now line-count-based everywhere — `evaluate.py`, dashboard, eval CI comment, `gitminer problems` CLI. All four agree.
+
+---
+
 ## 2026-06-03 — CLI and docs consistency sweep (commits 3d6c793, 2d167a0, 1a40c37, cded40a, d38c0ae)
 
 **Fixes shipped** — all in `gitminer.py`, `README.md`, `docs/api.md`:
