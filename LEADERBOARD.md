@@ -23,7 +23,7 @@ Weighted mean score across the rotating 30-problem shard (pool: 1114 problems, s
 | Metric | Value |
 |--------|-------|
 | Pool size | 1114 problems |
-| Repos | 40 active repos (6 language categories) |
+| Repos | 43 active repos (6 language categories) |
 | Shard size | 30 (rotates weekly, category-balanced) |
 | Oracle weighted score | 12.64 / 30 |
 | Oracle arithmetic score | 11.41 / 30 |
