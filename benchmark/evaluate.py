@@ -67,7 +67,7 @@ REPO_CATEGORY: dict[str, str] = {
     "jsonbored/awesome-claude": "typescript",
     "jsonbored/gittensory": "typescript",
     "mkdev11/gittensor-hub": "typescript",
-    "vouchdev/vouch": "typescript",
+    "vouchdev/vouch": "python",
     "phase-rs/phase": "rust",
     "seroperson/jvm-live-reload": "jvm",
     "touchpilot/touchpilot": "jvm",
@@ -120,9 +120,9 @@ REPO_CATEGORY: dict[str, str] = {
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json
 # Proportional to pool composition: python:40% rust:25% typescript:18% ruby:7% jvm:5% go:9%
 DEFAULT_SHARD_BUDGET: dict[str, int] = {
-    "python": 10,
+    "python": 12,
     "rust": 7,
-    "typescript": 6,
+    "typescript": 4,
     "ruby": 2,
     "jvm": 2,
     "go": 3,

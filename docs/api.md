@@ -40,10 +40,10 @@ Pool-level statistics: category and difficulty distribution, repo count, oracle 
 {
   "pool_size": 1131,
   "shard_size": 30,
-  "repos": 36,
+  "repos": 46,
   "oracle_score": 12.64,
-  "by_category": { "python": 418, "rust": 200, "typescript": 186, "jvm": 41, "ruby": 75 },
-  "by_difficulty": { "easy": 111, "medium": 389, "hard": 420 },
+  "by_category": { "python": 442, "rust": 277, "typescript": 165, "jvm": 76, "go": 96, "ruby": 75 },
+  "by_difficulty": { "easy": 128, "medium": 492, "hard": 511 },
   "rotation_policy": "weekly"
 }
 ```
@@ -53,7 +53,7 @@ Pool-level statistics: category and difficulty distribution, repo count, oracle 
 ### `GET /api/shard`
 
 The current 30-problem weekly shard — the same problems CI uses this week.
-Rotates every Monday 00:00 UTC. Category-balanced: 10 python · 10 rust · 6 typescript · 2 jvm · 2 ruby.
+Rotates every Monday 00:00 UTC. Category-balanced: 12 python · 7 rust · 4 typescript · 3 go · 2 jvm · 2 ruby.
 
 ```json
 {

@@ -61,7 +61,7 @@ REPO_CATEGORY: dict[str, str] = {
     "jsonbored/awesome-claude": "typescript",
     "jsonbored/gittensory": "typescript",
     "mkdev11/gittensor-hub": "typescript",
-    "vouchdev/vouch": "typescript",
+    "vouchdev/vouch": "python",
     "phase-rs/phase": "rust",
     "seroperson/jvm-live-reload": "jvm",
     "touchpilot/touchpilot": "jvm",

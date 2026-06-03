@@ -22,7 +22,7 @@ REPO_CATEGORY: dict[str, str] = {
     "jsonbored/awesome-claude": "typescript",
     "jsonbored/gittensory": "typescript",
     "mkdev11/gittensor-hub": "typescript",
-    "vouchdev/vouch": "typescript",
+    "vouchdev/vouch": "python",
     "phase-rs/phase": "rust",
     "seroperson/jvm-live-reload": "jvm",
     "touchpilot/touchpilot": "jvm",
@@ -72,9 +72,9 @@ REPO_CATEGORY: dict[str, str] = {
 # Shard sampling budget per category (sums to 30)
 # Proportional to pool: python:40% rust:25% typescript:18% ruby:7% jvm:5% go:9%
 SHARD_BUDGET: dict[str, int] = {
-    "python": 10,
+    "python": 12,
     "rust": 7,
-    "typescript": 6,
+    "typescript": 4,
     "ruby": 2,
     "jvm": 2,
     "go": 3,
