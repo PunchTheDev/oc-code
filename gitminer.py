@@ -308,6 +308,8 @@ def cmd_parity(args: argparse.Namespace) -> None:
 
     ratios = [r[3] for r in rows]
     median_ratio = sorted(ratios)[len(ratios) // 2]
+    outlier_count = sum(1 for r in rows if r[3] > 10 or r[3] < 0.5)
+    aligned_count = len(rows) - outlier_count
     print("─" * 72)
     if scoring_method == "tree-sitter":
         print(f"Median local/DAS ratio: {median_ratio:.2f}×  "
@@ -315,6 +317,12 @@ def cmd_parity(args: argparse.Namespace) -> None:
     else:
         print(f"Median local/DAS ratio: {median_ratio:.1f}×  "
               f"(heuristic — run baseline_scores.py to get tree-sitter parity)")
+    high_outliers = sum(1 for r in rows if r[3] > 10)
+    low_outliers = sum(1 for r in rows if r[3] < 0.5)
+    print(f"{aligned_count}/{len(rows)} problems within 10× of DAS  |  "
+          f"{outlier_count} outliers ({high_outliers} local>DAS, {low_outliers} local<DAS)")
+    if outlier_count:
+        print("Note: local>DAS = DAS had test failures; local<DAS = local scorer gap (zero-score problems).")
 
 
 def cmd_submit(args: argparse.Namespace) -> None:

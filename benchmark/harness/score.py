@@ -263,10 +263,11 @@ def score_diff_quality(problem_dir: Path, patch_path: Path) -> tuple[float, floa
                  "--detach", "--force", str(worktree), base_commit],
                 check=True, capture_output=True,
             )
+        patch_applied = False
         try:
             file_pairs = _build_file_pairs(worktree, diff_text)
-            apply_patch(worktree, patch_path)
-            if file_pairs is not None:
+            patch_applied = apply_patch(worktree, patch_path)
+            if patch_applied and file_pairs is not None:
                 _fill_new_contents(worktree, file_pairs)
         finally:
             subprocess.run(
@@ -274,8 +275,8 @@ def score_diff_quality(problem_dir: Path, patch_path: Path) -> tuple[float, floa
                 capture_output=True,
             )
 
-    # Try tree-sitter
-    if file_pairs is not None:
+    # Try tree-sitter (only when patch applied — else new == old, delta is zero)
+    if patch_applied and file_pairs is not None:
         try:
             from benchmark.harness.tree_sitter_scorer import score_file_pairs, available
             if available():
