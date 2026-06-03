@@ -3840,3 +3840,21 @@ No open PRs at start. Performed a comprehensive pre-rotation audit of the codeba
 - base-miner main: ab8a0816 (PR #87 merged)
 - Benchmark: 1123 problems, oracle 12.64 weighted / 11.49 arithmetic, 47 repos
 - Pool rotation: Sunday 2026-06-08 (5 days, protected)
+
+## Step 210 — 2026-06-03
+
+**Stale model ID in CONTRIBUTING.md + dashboard oracle clarity**
+
+**Bug found:** `CONTRIBUTING.md` line 33 showed `"model": "deepseek/deepseek-v3"` as the example model in the meta.json template. PR #80 (step 204) removed `deepseek/deepseek-v3` from the whitelist (doesn't exist on OpenRouter) and replaced it with `deepseek/deepseek-v3.2`. Any miner copying the CONTRIBUTING.md example verbatim would fail CI validation with a non-whitelisted model error.
+
+**Dashboard clarity:** The problem drawer section labeled "Reference scores (accepted solution)" with a chip "Baseline (0–30)" and a formula ending in `final = X / 30` (styled green) was misleading — miners read it as their own final score, not the oracle quality denominator used in v5 `relative_score`. Updated to "Oracle quality signal" with chip "Oracle quality (0–30)", removed the green `final` styling, and added an explanatory footer showing how oracle quality feeds into `relative_score`.
+
+**PRs merged:**
+- **PR #88** (base-miner): Fix stale deepseek-v3 model ID in CONTRIBUTING.md meta.json example → `deepseek/deepseek-chat` (merged eb35ad9b)
+- **Dashboard PR #7**: Clarify oracle quality signal labels in problem drawer (merged 9cbb570)
+
+**System state post-step:**
+- base-miner main: eb35ad9b (PR #88 merged)
+- dashboard main: 9cbb570 (dashboard PR #7 merged)
+- Benchmark: 1123 problems, oracle 12.64 weighted / 11.49 arithmetic, 47 repos
+- Pool rotation: Sunday 2026-06-08 (5 days, protected)
