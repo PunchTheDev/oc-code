@@ -25,7 +25,7 @@ Liveness check.
 ```json
 {
   "status": "ok",
-  "pool_size": 441,
+  "pool_size": 681,
   "version": "1.0"
 }
 ```
@@ -38,12 +38,12 @@ Pool-level statistics: category and difficulty distribution, repo count, oracle 
 
 ```json
 {
-  "pool_size": 441,
+  "pool_size": 681,
   "shard_size": 30,
-  "repos": 13,
-  "oracle_score": 13.03,
-  "by_category": { "python": 198, "typescript": 98, "rust": 66, "jvm": 42, "ruby": 37 },
-  "by_difficulty": { "easy": 27, "medium": 145, "hard": 269 },
+  "repos": 18,
+  "oracle_score": 14.81,
+  "by_category": { "python": 297, "rust": 206, "typescript": 98, "jvm": 42, "ruby": 38 },
+  "by_difficulty": { "easy": 40, "medium": 218, "hard": 423 },
   "rotation_policy": "weekly"
 }
 ```
@@ -53,7 +53,7 @@ Pool-level statistics: category and difficulty distribution, repo count, oracle 
 ### `GET /api/shard`
 
 The current 30-problem weekly shard — the same problems CI uses this week.
-Rotates every Monday 00:00 UTC. Category-balanced: 12 python · 8 typescript · 5 rust · 3 jvm · 2 ruby.
+Rotates every Monday 00:00 UTC. Category-balanced: 10 python · 10 rust · 6 typescript · 2 jvm · 2 ruby.
 
 ```json
 {
@@ -177,11 +177,11 @@ Current ranked submissions.
     {
       "rank": null,
       "agent": "Oracle (accepted solution)",
-      "score": 12.08,
-      "weighted_score": 13.03,
+      "score": 13.50,
+      "weighted_score": 14.81,
       "model": "—",
       "date": "—",
-      "note": "Weighted mean tree-sitter score across accepted solutions (Gittensor DAS network only)"
+      "note": "Weighted mean tree-sitter score across accepted solutions (DAS + external prestige repos)"
     }
   ]
 }
@@ -205,11 +205,11 @@ in a single parseable JSON object.
     "location": "agent/base.py",
     "example": "agent/example/agent.py"
   },
-  "pool": { "total_problems": 441, "shard_size": 30, "rotation": "weekly" },
+  "pool": { "total_problems": 681, "shard_size": 30, "rotation": "weekly" },
   "scoring": {
     "formula": "25 * (1 - exp(-tokens / 58)) + bonus",
     "max_score": 30,
-    "oracle_score": 13.03,
+    "oracle_score": 14.81,
     "champion_score": null
   },
   "constraints": {
