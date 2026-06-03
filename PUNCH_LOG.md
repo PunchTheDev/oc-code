@@ -4,6 +4,12 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — info command difficulty fix (commit e88f422)
+
+Fixed `gitminer info` displaying wrong difficulty tier. It was using score-based thresholds (`score ≥ 15 → easy`) instead of the canonical line-count system. A problem like `infiniflow_ragflow_13650` (+598 lines, hard×2) was showing "easy" because its reference score (23.06) was high. Now reads `difficulty` and `weight` directly from `results/baselines.json` — consistent with `gitminer problems`, the dashboard, and `evaluate.py`.
+
+---
+
 ## 2026-06-03 — docs/rewards.md accuracy fixes (commit 33cf61b)
 
 Fixed three wrong values in `docs/rewards.md` that disagreed with `hyperparameters.json`:
