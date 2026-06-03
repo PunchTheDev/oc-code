@@ -645,6 +645,7 @@ def _enrich_result(
         file_coverage_stats,
         detect_test_deletion,
         test_assertion_delta,
+        compute_test_quality_factor,
     )
 
     if not result.get("patch_applied"):
@@ -696,9 +697,13 @@ def _enrich_result(
     # --- benchmark_score -------------------------------------------------------
     anti_gaming = 0.5 if deletion_info["test_deletion_warning"] else 1.0
     result["anti_gaming_multiplier"] = anti_gaming
-    result["benchmark_score"] = round(test_pass_rate * (rel_score or 0.0) * anti_gaming, 4)
 
-    # --- test_assertion_delta (observational) ----------------------------------
-    result.update(test_assertion_delta(problem_dir, diff_text))
+    # --- test_assertion_delta + test_quality_factor ----------------------------
+    assertion_info = test_assertion_delta(problem_dir, diff_text)
+    result.update(assertion_info)
+    tqf = compute_test_quality_factor(assertion_info["test_coverage_ratio"])
+    result["test_quality_factor"] = tqf
+
+    result["benchmark_score"] = round(test_pass_rate * (rel_score or 0.0) * anti_gaming * tqf, 4)
 
     return result

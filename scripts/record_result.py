@@ -45,8 +45,10 @@ ORACLE_ROW = {
     "weighted_score": _oracle_weighted,
     # benchmark_score and weighted_benchmark_score are always 1.0 for the oracle
     # — it defines the 1.0 baseline for the primary ranking metric.
+    # test_quality_factor = 1.0 by definition (oracle matches its own assertions).
     "benchmark_score": 1.0,
     "weighted_benchmark_score": 1.0,
+    "test_quality_factor": 1.0,
     "model": "—",
     "date": "—",
     "note": (

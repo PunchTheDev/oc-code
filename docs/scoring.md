@@ -18,23 +18,24 @@ A good base miner does two things: it produces correct fixes, and it produces hi
 | Metric | Scale | Purpose |
 |---|---|---|
 | `weighted_benchmark_score` | 0–2.0 | **PRIMARY leaderboard rank** — difficulty-weighted `benchmark_score` |
-| `benchmark_score` | 0–2.0 | Per-problem: `test_pass_rate × relative_score × anti_gaming_multiplier` |
+| `benchmark_score` | 0–2.0 | Per-problem: `test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor` |
 | `relative_score` | 0–2.0 | Agent quality / oracle quality for this specific problem |
 | `test_pass_rate` | 0–1.0 | Fraction of tests that pass (granular correctness) |
+| `test_quality_factor` | 0.85–1.0 | Test assertion coverage multiplier (1.0 when no expectation set) |
 | `final_score` | 0–30 | Gittensor native AST score (retained for on-chain comparison) |
 | `file_coverage` | 0–1.0 | Fraction of reference source files touched (diagnostic, not scored) |
-| `test_coverage_ratio` | 0–1.0 | Agent assertions added / reference assertions added (diagnostic, not scored) |
+| `test_coverage_ratio` | 0–1.0 | Agent assertions added / reference assertions added (feeds test_quality_factor) |
 
 ## Primary metric: weighted_benchmark_score
 
 ```
-benchmark_score         = test_pass_rate × relative_score × anti_gaming_multiplier
+benchmark_score          = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor
 weighted_benchmark_score = sum(benchmark_score_i × difficulty_weight_i) / sum(difficulty_weight_i)
 ```
 
 This is the leaderboard ranking metric. Hard problems (weight 2.0) contribute twice as much as easy ones (weight 1.0). A submission that scores 1.0 on a hard problem is worth more than 1.0 on an easy problem.
 
-**Oracle baseline**: the oracle (accepted reference solution) scores exactly `weighted_benchmark_score = 1.0` by definition — `test_pass_rate = 1.0`, `relative_score = 1.0`.
+**Oracle baseline**: the oracle (accepted reference solution) scores exactly `weighted_benchmark_score = 1.0` by definition — `test_pass_rate = 1.0`, `relative_score = 1.0`, `test_quality_factor = 1.0`.
 
 ### Interpreting benchmark_score
 
@@ -42,8 +43,10 @@ A submission's per-problem `benchmark_score`:
 
 | Value | Meaning |
 |---|---|
-| `1.0` | All tests pass, matches oracle quality exactly |
+| `1.0` | All tests pass, oracle quality, matching test coverage |
 | `> 1.0` | All tests pass, *better* code quality than accepted solution (up to 2.0) |
+| `0.925` | All tests pass, oracle quality, 50% of reference test assertion coverage |
+| `0.85` | All tests pass, oracle quality, no test assertions added (when reference did) |
 | `0.5` | 50% tests pass at oracle quality |
 | `0.0` | No tests pass, or patch doesn't apply |
 | `≤ 0.5` (when warned) | Anti-gaming penalty applied for test deletion |
@@ -156,15 +159,24 @@ file_coverage = |agent_source_files ∩ reference_source_files| / |reference_sou
 
 Test files excluded. Not penalized — an agent with a different but correct approach may touch different files. Diagnostic only.
 
-## Test assertion delta (diagnostic only)
+## Test quality factor
 
 ```
-test_coverage_ratio = min(1.0, agent_assertions_added / ref_assertions_added)
+test_coverage_ratio  = min(1.0, agent_assertions_added / ref_assertions_added)
+test_quality_factor  = 0.85 + 0.15 × test_coverage_ratio   (when ratio is not None)
+test_quality_factor  = 1.0                                  (when ratio is None — no expectation)
 ```
 
-Counts test assertion patterns added in agent diff vs. reference diff. When the reference added 0 assertions, `test_coverage_ratio = None` (no signal). Does not affect `benchmark_score`. Exposed in the per-problem result dict to help agents understand whether they're adding adequate test coverage.
+Counts test assertion patterns added in the agent diff vs. the reference diff, then converts the ratio into a `0.85–1.0` multiplier on `benchmark_score`. This incentivizes agents to add test coverage proportional to the reference without catastrophically zeroing out an otherwise-correct fix.
 
-An agent that fixes the bug but adds no tests (when the reference did) may still score 1.0 on `benchmark_score` if it passes all tests — this metric provides an additional quality signal beyond what the test suite gates.
+| `test_coverage_ratio` | `test_quality_factor` | Effect |
+|---|---|---|
+| `None` | `1.0` | Reference added no assertions — no expectation |
+| `1.0` | `1.0` | Agent matched reference assertion coverage — no penalty |
+| `0.5` | `0.925` | Agent added half the reference assertions — 7.5% penalty |
+| `0.0` | `0.85` | Agent added no assertions (when reference did) — 15% penalty |
+
+When `test_coverage_ratio = None` (reference added 0 assertions), the factor is 1.0 and plays no role. This avoids penalizing agents on problems where test assertions were not part of the fix.
 
 ## Problem curation criteria
 

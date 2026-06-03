@@ -695,6 +695,25 @@ def test_assertion_delta(problem_dir: Path, agent_diff_text: str) -> dict:
     }
 
 
+def compute_test_quality_factor(test_coverage_ratio: "float | None") -> float:
+    """
+    Convert test_coverage_ratio to a score multiplier (0.85–1.0).
+
+    When the reference diff added assertions, an agent that matches earns 1.0;
+    one that adds none earns 0.85 (15% penalty for not testing the fix).
+    When the reference added no assertions (ratio=None), factor is 1.0 — no signal.
+
+    Design: smooth linear floor so partial test coverage earns partial credit.
+      ratio=1.0 → 1.0  (agent matches reference test coverage)
+      ratio=0.5 → 0.925
+      ratio=0.0 → 0.85 (min penalty; does not zero-out benchmark_score)
+      ratio=None → 1.0 (no expectation set by reference)
+    """
+    if test_coverage_ratio is None:
+        return 1.0
+    return round(0.85 + 0.15 * min(test_coverage_ratio, 1.0), 4)
+
+
 def _score_in_worktree(
     problem_dir: Path, repo_dir: Path, meta: dict, patch_path: Path, saturation_scale: float
 ) -> dict:
@@ -780,11 +799,17 @@ def _score_in_worktree(
     # A submission that removes >3 test assertions to force a pass is penalized.
     anti_gaming_multiplier = 0.5 if deletion_info["test_deletion_warning"] else 1.0
 
+    # test_quality_factor: 0.85–1.0 multiplier based on test assertion coverage.
+    # Agents that add test assertions proportional to the reference earn 1.0;
+    # agents that add none (when the reference did) earn 0.85.
+    assertion_info = test_assertion_delta(problem_dir, diff_text)
+    tqf = compute_test_quality_factor(assertion_info["test_coverage_ratio"])
+
     # benchmark_score: composite primary leaderboard metric.
-    #   = test_pass_rate × relative_score × anti_gaming_multiplier
-    # Correctness depth (test_pass_rate) × quality alignment (relative_score) × integrity.
-    # A fully-passing oracle-quality submission earns 1.0; a gaming submission earns ≤0.5.
-    benchmark_score = round(test_pass_rate * (rel_score or 0.0) * anti_gaming_multiplier, 4)
+    #   = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor
+    # Correctness depth × quality alignment × integrity × test coverage incentive.
+    # Oracle earns 1.0 by definition; gaming submissions earn ≤0.5.
+    benchmark_score = round(test_pass_rate * (rel_score or 0.0) * anti_gaming_multiplier * tqf, 4)
 
     return {
         "problem_id": problem_id,
@@ -805,20 +830,20 @@ def _score_in_worktree(
         "relative_score": rel_score,
         "oracle_base_score": load_baselines().get(meta.get("id", ""), 0.0),
         # benchmark_score: PRIMARY per-problem metric.
-        #   = test_pass_rate × relative_score × anti_gaming_multiplier
+        #   = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor
         # Combined into weighted_benchmark_score at the shard level (hard×2 / medium×1.5 / easy×1).
         "benchmark_score": benchmark_score,
         "anti_gaming_multiplier": anti_gaming_multiplier,
+        # test_quality_factor: 0.85–1.0 multiplier — rewards agents that add test assertions
+        # proportional to the reference. 1.0 when reference added no assertions (no expectation).
+        "test_quality_factor": tqf,
         # file_coverage: fraction of reference-diff source files the agent also touches.
         # Observational only — a different-but-correct fix needn't touch the same files.
         **coverage,
         # Anti-gaming: flag suspicious test assertion removals (reflected in anti_gaming_multiplier).
         **deletion_info,
-        # test_coverage_ratio: observational signal for how many assertions agent added vs reference.
-        # 1.0 = agent added as many test assertions as the accepted solution.
-        # None = reference added no assertions (no expectation set).
-        # Not part of benchmark_score — informational only.
-        **test_assertion_delta(problem_dir, diff_text),
+        # test_coverage_ratio: agent/reference assertion ratio (None when reference added 0).
+        **assertion_info,
         # Multipliers (time_decay, review_quality, label, issue) require GitHub
         # API data — local scoring sets them to 1.0 as a conservative estimate.
         "multipliers": {"time_decay": 1.0, "review_quality": 1.0, "label": 1.0, "issue": 1.0},
