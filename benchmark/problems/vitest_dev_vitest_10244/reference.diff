@@ -1,0 +1,412 @@
+diff --git a/packages/vitest/src/node/reporters/junit.ts b/packages/vitest/src/node/reporters/junit.ts
+index 34817666a496..1b724307b5ca 100644
+--- a/packages/vitest/src/node/reporters/junit.ts
++++ b/packages/vitest/src/node/reporters/junit.ts
+@@ -1,5 +1,7 @@
+ import type { Task } from '@vitest/runner'
++import type { SerializedError } from '@vitest/utils'
+ import type { Vitest } from '../core'
++import type { ErrorOptions } from '../logger'
+ import type { Reporter } from '../types/reporter'
+ import type { TestModule } from './reported-tasks'
+ import { existsSync, promises as fs } from 'node:fs'
+@@ -138,6 +140,15 @@ type TaskWithMeta = Task & {
+   _suitename?: string
+ }
+ 
++/**
++ * Runtime additions on top of {@link SerializedError}: `type` is set by
++ * {@link state.catchError}, `VITEST_TEST_PATH` by the runtime error catcher.
++ */
++type UnhandledError = SerializedError & {
++  type?: string
++  VITEST_TEST_PATH?: string
++}
++
+ function flattenTasks(task: Task, baseName = '', suiteName = '', ancestorSeparator = ' > '): TaskWithMeta[] {
+   if (task.type === 'suite') {
+     const newBase = baseName ? `${baseName}${ancestorSeparator}${task.name}` : task.name
+@@ -384,25 +395,9 @@ export class JUnitReporter implements Reporter {
+           if (task.result?.state === 'fail') {
+             const errors = task.result.errors || []
+             for (const error of errors) {
+-              await this.writeElement(
+-                'failure',
+-                {
+-                  message: error?.message,
+-                  type: error?.name,
+-                },
+-                async () => {
+-                  if (!error || !this.options.stackTrace) {
+-                    return
+-                  }
+-
+-                  const result = this.ctx.logger.formatError(error, {
+-                    project: this.ctx.getProjectByName(task.file?.projectName ?? ''),
+-                  })
+-                  await this.baseLog(
+-                    escapeXML(stripVTControlCharacters(result.output.trim())),
+-                  )
+-                },
+-              )
++              await this.writeErrorElement('failure', error, {
++                project: this.ctx.getProjectByName(task.file?.projectName ?? ''),
++              })
+             }
+           }
+         },
+@@ -440,7 +435,86 @@ export class JUnitReporter implements Reporter {
+       .replace(/\{title\}/g, () => vars.title)
+   }
+ 
+-  async onTestRunEnd(testModules: ReadonlyArray<TestModule>): Promise<void> {
++  private async writeErrorElement(
++    elementName: 'failure' | 'error',
++    error: SerializedError | undefined,
++    errorOptions: ErrorOptions,
++  ): Promise<void> {
++    await this.writeElement(
++      elementName,
++      {
++        message: error?.message,
++        type: error?.name,
++      },
++      async () => {
++        if (!error || !this.options.stackTrace) {
++          return
++        }
++        const result = this.ctx.logger.formatError(error, errorOptions)
++        await this.baseLog(
++          escapeXML(stripVTControlCharacters(result.output.trim())),
++        )
++      },
++    )
++  }
++
++  private async writeUnhandledErrorsTestsuite(
++    unhandledErrors: ReadonlyArray<UnhandledError>,
++    testModules: ReadonlyArray<TestModule>,
++  ): Promise<void> {
++    await this.writeElement(
++      'testsuite',
++      {
++        name: 'vitest unhandled errors',
++        timestamp: new Date().toISOString(),
++        hostname: this.options.hostname || hostname(),
++        tests: unhandledErrors.length,
++        failures: 0,
++        errors: unhandledErrors.length,
++        skipped: 0,
++        time: '0',
++      },
++      async () => {
++        // Stable order across runs — workers/projects report errors concurrently.
++        const sortedErrors = [...unhandledErrors].sort((a, b) => {
++          const ka = `${a.VITEST_TEST_PATH ?? ''}\0${a.type ?? ''}\0${a.name ?? ''}\0${a.message ?? ''}`
++          const kb = `${b.VITEST_TEST_PATH ?? ''}\0${b.type ?? ''}\0${b.name ?? ''}\0${b.message ?? ''}`
++          return ka < kb ? -1 : ka > kb ? 1 : 0
++        })
++        for (const error of sortedErrors) {
++          const errorTitle = error.type || error.name || 'Unhandled Error'
++          // Only attribute when the path resolves to exactly one module — when
++          // multiple projects share a file, errors lack a project identifier and
++          // we can't disambiguate without one (tracked for follow-up).
++          const matches = error.VITEST_TEST_PATH
++            ? testModules.filter(m => m.task.filepath === error.VITEST_TEST_PATH)
++            : []
++          const owningModule = matches.length === 1 ? matches[0] : undefined
++          await this.writeElement(
++            'testcase',
++            {
++              classname: 'vitest unhandled errors',
++              file: this.options.addFileAttribute && error.VITEST_TEST_PATH
++                ? relative(this.ctx.config.root, error.VITEST_TEST_PATH)
++                : undefined,
++              name: error.message ? `${errorTitle}: ${error.message}` : errorTitle,
++              time: '0',
++            },
++            async () => {
++              await this.writeErrorElement('error', error, {
++                project: owningModule?.project,
++              })
++            },
++          )
++        }
++      },
++    )
++  }
++
++  async onTestRunEnd(
++    testModules: ReadonlyArray<TestModule>,
++    unhandledErrors: ReadonlyArray<UnhandledError> = [],
++  ): Promise<void> {
+     const files = testModules.map(testModule => testModule.task)
+     const separator = this.options.ancestorSeparator ?? ' > '
+ 
+@@ -516,18 +590,25 @@ export class JUnitReporter implements Reporter {
+         name: this.options.suiteName || 'vitest tests',
+         tests: 0,
+         failures: 0,
+-        errors: 0, // we cannot detect those
++        errors: unhandledErrors.length,
+         time: 0,
+       },
+     )
++    stats.tests += unhandledErrors.length
+ 
+-    await this.writeElement('testsuites', { ...stats, time: executionTime(stats.time) }, async () => {
+-      for (let i = 0; i < transformed.length; i++) {
+-        const file = transformed[i]
++    // Plain byte compare (not localeCompare) so output is identical across machines and ICU versions.
++    const orderedSuites = transformed
++      .map((file, i) => {
+         const filename = relative(this.ctx.config.root, file.filepath)
+         // resolveSuiteNameTemplate needs the original file (before task flattening) to
+         // search for top-level describe blocks, so pass files[i] directly.
+         const suiteName = this.resolveSuiteNameTemplate(files[i], filename)
++        return { file, filename, suiteName }
++      })
++      .sort((a, b) => a.suiteName < b.suiteName ? -1 : a.suiteName > b.suiteName ? 1 : 0)
++
++    await this.writeElement('testsuites', { ...stats, time: executionTime(stats.time) }, async () => {
++      for (const { file, filename, suiteName } of orderedSuites) {
+         await this.writeElement(
+           'testsuite',
+           {
+@@ -545,6 +626,10 @@ export class JUnitReporter implements Reporter {
+           },
+         )
+       }
++
++      if (unhandledErrors.length) {
++        await this.writeUnhandledErrorsTestsuite(unhandledErrors, testModules)
++      }
+     })
+ 
+     if (this.reportFile) {
+diff --git a/test/e2e/fixtures/reporters/unhandled-errors-multi-project/space-1/test/reject.test.ts b/test/e2e/fixtures/reporters/unhandled-errors-multi-project/space-1/test/reject.test.ts
+new file mode 100644
+index 000000000000..d879327a70d8
+--- /dev/null
++++ b/test/e2e/fixtures/reporters/unhandled-errors-multi-project/space-1/test/reject.test.ts
+@@ -0,0 +1,6 @@
++import { it } from 'vitest'
++
++it('triggers a rejection from project 1', async () => {
++  void Promise.reject(new Error('rejection from space-1'))
++  await new Promise(resolve => setTimeout(resolve, 50))
++})
+diff --git a/test/e2e/fixtures/reporters/unhandled-errors-multi-project/space-2/test/reject.test.ts b/test/e2e/fixtures/reporters/unhandled-errors-multi-project/space-2/test/reject.test.ts
+new file mode 100644
+index 000000000000..56eb250e41d8
+--- /dev/null
++++ b/test/e2e/fixtures/reporters/unhandled-errors-multi-project/space-2/test/reject.test.ts
+@@ -0,0 +1,6 @@
++import { it } from 'vitest'
++
++it('triggers a rejection from project 2', async () => {
++  void Promise.reject(new Error('rejection from space-2'))
++  await new Promise(resolve => setTimeout(resolve, 50))
++})
+diff --git a/test/e2e/fixtures/reporters/unhandled-errors-multi-project/vitest.config.ts b/test/e2e/fixtures/reporters/unhandled-errors-multi-project/vitest.config.ts
+new file mode 100644
+index 000000000000..07c483f5713a
+--- /dev/null
++++ b/test/e2e/fixtures/reporters/unhandled-errors-multi-project/vitest.config.ts
+@@ -0,0 +1,7 @@
++import { defineConfig } from 'vitest/config'
++
++export default defineConfig({
++  test: {
++    projects: ['space-1', 'space-2'],
++  },
++})
+diff --git a/test/e2e/fixtures/reporters/unhandled-errors-multi/multi.test.ts b/test/e2e/fixtures/reporters/unhandled-errors-multi/multi.test.ts
+new file mode 100644
+index 000000000000..4b321e658435
+--- /dev/null
++++ b/test/e2e/fixtures/reporters/unhandled-errors-multi/multi.test.ts
+@@ -0,0 +1,10 @@
++import { it } from 'vitest'
++
++it('triggers two rejections and one uncaught exception', async () => {
++  void Promise.reject(new Error('first rejection'))
++  void Promise.reject(new Error('second rejection'))
++  setTimeout(() => {
++    throw new Error('uncaught timer')
++  }, 0)
++  await new Promise(resolve => setTimeout(resolve, 50))
++})
+diff --git a/test/e2e/test/reporters/__snapshots__/junit.test.ts.snap b/test/e2e/test/reporters/__snapshots__/junit.test.ts.snap
+index 915f4a8b6590..b8e60be0cea9 100644
+--- a/test/e2e/test/reporters/__snapshots__/junit.test.ts.snap
++++ b/test/e2e/test/reporters/__snapshots__/junit.test.ts.snap
+@@ -59,9 +59,55 @@ Error: afterAll error
+ "
+ `;
+ 
++exports[`emits one <testcase> per unhandled error and titles them by error.type 1`] = `
++"<?xml version="1.0" encoding="UTF-8" ?>
++<testsuites name="vitest tests" tests="4" failures="0" errors="3" time="...">
++    <testsuite name="multi.test.ts" timestamp="..." hostname="..." tests="1" failures="0" errors="0" skipped="0" time="...">
++        <testcase classname="multi.test.ts" name="triggers two rejections and one uncaught exception" time="...">
++        </testcase>
++    </testsuite>
++    <testsuite name="vitest unhandled errors" timestamp="..." hostname="..." tests="3" failures="0" errors="3" skipped="0" time="...">
++        <testcase classname="vitest unhandled errors" name="Uncaught Exception: uncaught timer" time="...">
++            <error message="uncaught timer" type="Error">
++Error: uncaught timer
++ ❯ Timeout._onTimeout multi.test.ts:7:11
++
++This error originated in &quot;multi.test.ts&quot; test file. It doesn&apos;t mean the error was thrown inside the file itself, but while it was running.
++The latest test that might&apos;ve caused the error is &quot;triggers two rejections and one uncaught exception&quot;. It might mean one of the following:
++- The error was thrown, while Vitest was running this test.
++- If the error occurred after the test had been completed, this was the last documented test before it was thrown.
++            </error>
++        </testcase>
++        <testcase classname="vitest unhandled errors" name="Unhandled Rejection: first rejection" time="...">
++            <error message="first rejection" type="Error">
++Error: first rejection
++ ❯ multi.test.ts:4:23
++
++This error originated in &quot;multi.test.ts&quot; test file. It doesn&apos;t mean the error was thrown inside the file itself, but while it was running.
++The latest test that might&apos;ve caused the error is &quot;triggers two rejections and one uncaught exception&quot;. It might mean one of the following:
++- The error was thrown, while Vitest was running this test.
++- If the error occurred after the test had been completed, this was the last documented test before it was thrown.
++            </error>
++        </testcase>
++        <testcase classname="vitest unhandled errors" name="Unhandled Rejection: second rejection" time="...">
++            <error message="second rejection" type="Error">
++Error: second rejection
++ ❯ multi.test.ts:5:23
++
++This error originated in &quot;multi.test.ts&quot; test file. It doesn&apos;t mean the error was thrown inside the file itself, but while it was running.
++The latest test that might&apos;ve caused the error is &quot;triggers two rejections and one uncaught exception&quot;. It might mean one of the following:
++- The error was thrown, while Vitest was running this test.
++- If the error occurred after the test had been completed, this was the last documented test before it was thrown.
++            </error>
++        </testcase>
++    </testsuite>
++</testsuites>
++"
++`;
++
+ exports[`format error 1`] = `
+ "<?xml version="1.0" encoding="UTF-8" ?>
+-<testsuites name="vitest tests" tests="9" failures="8" errors="0" time="...">
++<testsuites name="vitest tests" tests="10" failures="8" errors="1" time="...">
+     <testsuite name="error.test.ts" timestamp="..." hostname="..." tests="9" failures="8" errors="0" skipped="0" time="...">
+         <testcase classname="error.test.ts" name="stack" time="...">
+             <failure message="throwSimple" type="Error">
+@@ -124,6 +170,18 @@ Error: throwSuite
+             </failure>
+         </testcase>
+     </testsuite>
++    <testsuite name="vitest unhandled errors" timestamp="..." hostname="..." tests="1" failures="0" errors="1" skipped="0" time="...">
++        <testcase classname="vitest unhandled errors" name="Unhandled Rejection: throwSimple" time="...">
++            <error message="throwSimple" type="Error">
++Error: throwSimple
++ ❯ throwSimple error.test.ts:44:9
++ ❯ error.test.ts:16:16
++ ❯ error.test.ts:16:28
++
++This error originated in &quot;error.test.ts&quot; test file. It doesn&apos;t mean the error was thrown inside the file itself, but while it was running.
++            </error>
++        </testcase>
++    </testsuite>
+ </testsuites>
+ "
+ `;
+@@ -157,3 +215,42 @@ __test_stderr__
+ </testsuites>
+ "
+ `;
++
++exports[`resolves unhandled errors to the owning project in a multi-project workspace 1`] = `
++"<?xml version="1.0" encoding="UTF-8" ?>
++<testsuites name="vitest tests" tests="4" failures="0" errors="2" time="...">
++    <testsuite name="space-1/test/reject.test.ts" timestamp="..." hostname="..." tests="1" failures="0" errors="0" skipped="0" time="...">
++        <testcase classname="space-1/test/reject.test.ts" file="space-1/test/reject.test.ts" name="triggers a rejection from project 1" time="...">
++        </testcase>
++    </testsuite>
++    <testsuite name="space-2/test/reject.test.ts" timestamp="..." hostname="..." tests="1" failures="0" errors="0" skipped="0" time="...">
++        <testcase classname="space-2/test/reject.test.ts" file="space-2/test/reject.test.ts" name="triggers a rejection from project 2" time="...">
++        </testcase>
++    </testsuite>
++    <testsuite name="vitest unhandled errors" timestamp="..." hostname="..." tests="2" failures="0" errors="2" skipped="0" time="...">
++        <testcase classname="vitest unhandled errors" file="space-1/test/reject.test.ts" name="Unhandled Rejection: rejection from space-1" time="...">
++            <error message="rejection from space-1" type="Error">
++Error: rejection from space-1
++ ❯ test/reject.test.ts:4:23
++
++This error originated in &quot;test/reject.test.ts&quot; test file. It doesn&apos;t mean the error was thrown inside the file itself, but while it was running.
++The latest test that might&apos;ve caused the error is &quot;triggers a rejection from project 1&quot;. It might mean one of the following:
++- The error was thrown, while Vitest was running this test.
++- If the error occurred after the test had been completed, this was the last documented test before it was thrown.
++            </error>
++        </testcase>
++        <testcase classname="vitest unhandled errors" file="space-2/test/reject.test.ts" name="Unhandled Rejection: rejection from space-2" time="...">
++            <error message="rejection from space-2" type="Error">
++Error: rejection from space-2
++ ❯ test/reject.test.ts:4:23
++
++This error originated in &quot;test/reject.test.ts&quot; test file. It doesn&apos;t mean the error was thrown inside the file itself, but while it was running.
++The latest test that might&apos;ve caused the error is &quot;triggers a rejection from project 2&quot;. It might mean one of the following:
++- The error was thrown, while Vitest was running this test.
++- If the error occurred after the test had been completed, this was the last documented test before it was thrown.
++            </error>
++        </testcase>
++    </testsuite>
++</testsuites>
++"
++`;
+diff --git a/test/e2e/test/reporters/junit.test.ts b/test/e2e/test/reporters/junit.test.ts
+index 6cc582e82959..03ea6d1d3fb7 100644
+--- a/test/e2e/test/reporters/junit.test.ts
++++ b/test/e2e/test/reporters/junit.test.ts
+@@ -4,6 +4,7 @@ import { runVitest, runVitestCli } from '#test-utils'
+ import { createFileTask } from '@vitest/runner/utils'
+ import { resolve } from 'pathe'
+ import { expect, test } from 'vitest'
++import { rolldownVersion } from 'vitest/node'
+ 
+ const root = resolve(import.meta.dirname, '../../fixtures/reporters')
+ 
+@@ -122,7 +123,13 @@ test('options.suiteName changes name property', async () => {
+ })
+ 
+ function stabilizeReport(report: string) {
+-  return report.replaceAll(/(timestamp|hostname|time)=".*?"/g, '$1="..."')
++  let normalized = report.replaceAll(/(timestamp|hostname|time)=".*?"/g, '$1="..."')
++  // rolldown's source map for the inline async IIFE on error.test.ts:16 anchors
++  // one column later than rollup's; align to rollup so the snapshot stays bundler-agnostic.
++  if (rolldownVersion) {
++    normalized = normalized.replaceAll(' ❯ error.test.ts:16:29', ' ❯ error.test.ts:16:28')
++  }
++  return normalized
+ }
+ 
+ function stabilizeReportWOTime(report: string) {
+@@ -333,6 +340,22 @@ test('stackTrace set to false omits stack trace content from failure', async ()
+   expect(xml).not.toContain('❯ error.test.ts')
+ })
+ 
++test('emits one <testcase> per unhandled error and titles them by error.type', async () => {
++  const { stdout } = await runVitest({
++    reporters: 'junit',
++    root: './fixtures/reporters/unhandled-errors-multi',
++  })
++  expect(stabilizeReport(stdout)).toMatchSnapshot()
++})
++
++test('resolves unhandled errors to the owning project in a multi-project workspace', async () => {
++  const { stdout } = await runVitest({
++    reporters: [['junit', { addFileAttribute: true }]],
++    root: './fixtures/reporters/unhandled-errors-multi-project',
++  })
++  expect(stabilizeReport(stdout)).toMatchSnapshot()
++})
++
+ function executionTime(durationMS: number) {
+   return (durationMS / 1000).toLocaleString('en-US', {
+     useGrouping: false,

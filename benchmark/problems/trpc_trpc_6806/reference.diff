@@ -1,0 +1,1108 @@
+diff --git a/packages/client/src/TRPCClientError.ts b/packages/client/src/TRPCClientError.ts
+index 86b82a55b24..3f5475a81e5 100644
+--- a/packages/client/src/TRPCClientError.ts
++++ b/packages/client/src/TRPCClientError.ts
+@@ -19,15 +19,10 @@ export interface TRPCClientErrorBase<TShape extends DefaultErrorShape> {
+ export type TRPCClientErrorLike<TInferrable extends InferrableClientTypes> =
+   TRPCClientErrorBase<inferErrorShape<TInferrable>>;
+ 
+-function isTRPCClientError(cause: unknown): cause is TRPCClientError<any> {
+-  return (
+-    cause instanceof TRPCClientError ||
+-    /**
+-     * @deprecated
+-     * Delete in next major
+-     */
+-    (cause instanceof Error && cause.name === 'TRPCClientError')
+-  );
++export function isTRPCClientError<TInferrable extends InferrableClientTypes>(
++  cause: unknown,
++): cause is TRPCClientError<TInferrable> {
++  return cause instanceof TRPCClientError;
+ }
+ 
+ function isTRPCErrorResponse(obj: unknown): obj is TRPCErrorResponse<any> {
+diff --git a/packages/client/src/internals/signals.ts b/packages/client/src/internals/signals.ts
+index fd001d18fc2..5e93016b9eb 100644
+--- a/packages/client/src/internals/signals.ts
++++ b/packages/client/src/internals/signals.ts
+@@ -52,3 +52,19 @@ export function raceAbortSignals(
+ 
+   return ac.signal;
+ }
++
++export function abortSignalToPromise(signal: AbortSignal): Promise<never> {
++  return new Promise((_, reject) => {
++    if (signal.aborted) {
++      reject(signal.reason);
++      return;
++    }
++    signal.addEventListener(
++      'abort',
++      () => {
++        reject(signal.reason);
++      },
++      { once: true },
++    );
++  });
++}
+diff --git a/packages/client/src/links.ts b/packages/client/src/links.ts
+index 1f6aa625e62..665b164a154 100644
+--- a/packages/client/src/links.ts
++++ b/packages/client/src/links.ts
+@@ -9,6 +9,7 @@ export * from './links/splitLink';
+ export * from './links/wsLink/wsLink';
+ export * from './links/httpSubscriptionLink';
+ export * from './links/retryLink';
++export * from './links/localLink';
+ 
+ // These are not public (yet) as we get this functionality from tanstack query
+ // export * from './links/internals/dedupeLink';
+diff --git a/packages/client/src/links/httpSubscriptionLink.ts b/packages/client/src/links/httpSubscriptionLink.ts
+index fedf408644b..fb0082e0681 100644
+--- a/packages/client/src/links/httpSubscriptionLink.ts
++++ b/packages/client/src/links/httpSubscriptionLink.ts
+@@ -1,10 +1,5 @@
+ import { behaviorSubject, observable } from '@trpc/server/observable';
+-import type {
+-  TRPC_ERROR_CODE_NUMBER,
+-  TRPCErrorShape,
+-  TRPCResult,
+-} from '@trpc/server/rpc';
+-import { TRPC_ERROR_CODES_BY_KEY } from '@trpc/server/rpc';
++import type { TRPCErrorShape, TRPCResult } from '@trpc/server/rpc';
+ import type {
+   AnyClientTypes,
+   EventSourceLike,
+@@ -12,6 +7,7 @@ import type {
+   InferrableClientTypes,
+ } from '@trpc/server/unstable-core-do-not-import';
+ import {
++  retryableRpcCodes,
+   run,
+   sseStreamConsumer,
+ } from '@trpc/server/unstable-core-do-not-import';
+@@ -63,17 +59,6 @@ type HTTPSubscriptionLinkOptions<
+ } & TransformerOptions<TRoot> &
+   UrlOptionsWithConnectionParams;
+ 
+-/**
+- * tRPC error codes that are considered retryable
+- * With out of the box SSE, the client will reconnect when these errors are encountered
+- */
+-const codes5xx: TRPC_ERROR_CODE_NUMBER[] = [
+-  TRPC_ERROR_CODES_BY_KEY.BAD_GATEWAY,
+-  TRPC_ERROR_CODES_BY_KEY.SERVICE_UNAVAILABLE,
+-  TRPC_ERROR_CODES_BY_KEY.GATEWAY_TIMEOUT,
+-  TRPC_ERROR_CODES_BY_KEY.INTERNAL_SERVER_ERROR,
+-];
+-
+ /**
+  * @see https://trpc.io/docs/client/links/httpSubscriptionLink
+  */
+@@ -190,7 +175,7 @@ export function httpSubscriptionLink<
+               case 'serialized-error': {
+                 const error = TRPCClientError.from({ error: chunk.error });
+ 
+-                if (codes5xx.includes(chunk.error.code)) {
++                if (retryableRpcCodes.includes(chunk.error.code)) {
+                   //
+                   connectionState.next({
+                     type: 'state',
+diff --git a/packages/client/src/links/localLink.test.ts b/packages/client/src/links/localLink.test.ts
+new file mode 100644
+index 00000000000..5c7c52e36a0
+--- /dev/null
++++ b/packages/client/src/links/localLink.test.ts
+@@ -0,0 +1,517 @@
++import { waitError } from '@trpc/server/__tests__/waitError';
++import type { AnyRouter } from '@trpc/server';
++import { initTRPC, tracked, TRPCError } from '@trpc/server';
++import { makeResource, run } from '@trpc/server/unstable-core-do-not-import';
++import superjson from 'superjson';
++import { z } from 'zod';
++import { createTRPCClient } from '../createTRPCClient';
++import { isTRPCClientError } from '../TRPCClientError';
++import type { LocalLinkOptions } from './localLink';
++import { experimental_localLink as localLink } from './localLink';
++
++async function aggregateAsyncIterable<TYield, TReturn>(
++  iterable: AsyncIterable<TYield, TReturn>,
++) {
++  const items: TYield[] = [];
++
++  try {
++    const iterator = iterable[Symbol.asyncIterator]();
++
++    while (true) {
++      const res = await iterator.next();
++      if (res.done) {
++        return {
++          items,
++          ok: true as const,
++          return: res.value,
++        };
++      }
++      items.push(res.value);
++    }
++  } catch (error: unknown) {
++    return {
++      error,
++      items,
++      ok: false as const,
++    };
++  }
++}
++
++function localLinkClient<TRouter extends AnyRouter>(
++  opts: LocalLinkOptions<TRouter>,
++) {
++  const onError = vi.fn<NonNullable<LocalLinkOptions<TRouter>['onError']>>();
++  const client = createTRPCClient<TRouter>({
++    links: [
++      localLink({
++        onError,
++        ...opts,
++      }),
++    ],
++  });
++
++  return {
++    client,
++    onError,
++  };
++}
++
++test('smoke', async () => {
++  const t = initTRPC.create();
++
++  const appRouter = t.router({
++    hello: t.procedure.query(() => 'hello'),
++  });
++
++  const client = createTRPCClient({
++    links: [
++      localLink({
++        router: appRouter,
++        createContext: async () => ({}),
++      }),
++    ],
++  });
++
++  const result = await client.hello.query();
++
++  expect(result).toBe('hello');
++});
++
++test('json serialization', async () => {
++  const t = initTRPC.create();
++
++  const date = new Date(2025, 1, 1);
++
++  const appRouter = t.router({
++    hello: t.procedure.query(() => date),
++    undef: t.procedure.query(() => undefined),
++  });
++
++  const client = createTRPCClient<typeof appRouter>({
++    links: [
++      localLink({
++        router: appRouter,
++        createContext: async () => ({}),
++      }),
++    ],
++  });
++
++  {
++    const result = await client.hello.query();
++
++    expect(typeof result).toBe('string');
++    expect(result).toBe(date.toJSON());
++  }
++  {
++    const result = await client.undef.query();
++
++    expect(result).toBeUndefined();
++  }
++});
++
++test('handles async generator', async () => {
++  const t = initTRPC.create();
++
++  const appRouter = t.router({
++    hello: t.procedure.query(async function* () {
++      yield 'hello';
++      yield 'world';
++
++      return 'ended';
++    }),
++  });
++
++  const client = createTRPCClient<typeof appRouter>({
++    links: [
++      localLink({
++        router: appRouter,
++        createContext: async () => ({}),
++      }),
++    ],
++  });
++
++  const result = await client.hello.query();
++
++  const aggregated = await aggregateAsyncIterable(result);
++
++  expect(aggregated.items).toEqual(['hello', 'world']);
++  expect(aggregated.return).toBe('ended');
++});
++
++test('handles async generator with abort', async () => {
++  const t = initTRPC.create();
++  const ac = new AbortController();
++
++  const cleanup = vi.fn();
++
++  const appRouter = t.router({
++    hello: t.procedure.query(async function* () {
++      using _finally = makeResource({}, cleanup);
++
++      yield 'hello';
++      ac.abort();
++      yield 'world';
++    }),
++  });
++
++  const client = createTRPCClient<typeof appRouter>({
++    links: [
++      localLink({
++        router: appRouter,
++        createContext: async () => ({}),
++      }),
++    ],
++  });
++
++  const result = await client.hello.query(undefined, {
++    signal: ac.signal,
++  });
++
++  const aggregated = await aggregateAsyncIterable(result);
++
++  expect(aggregated.items).toEqual(['hello']);
++  expect(aggregated.ok).toBe(false);
++
++  expect(cleanup).toHaveBeenCalled();
++});
++
++test('async generator with break', async () => {
++  const t = initTRPC.create();
++
++  const cleanup = vi.fn();
++
++  const appRouter = t.router({
++    hello: t.procedure.query(async function* () {
++      using _finally = makeResource({}, cleanup);
++
++      yield 'hello';
++      yield 'world';
++    }),
++  });
++
++  const client = createTRPCClient<typeof appRouter>({
++    links: [
++      localLink({
++        router: appRouter,
++        createContext: async () => ({}),
++      }),
++    ],
++  });
++
++  const result = await client.hello.query();
++
++  for await (const item of result) {
++    if (item === 'hello') {
++      break;
++    }
++  }
++
++  expect(cleanup).toHaveBeenCalled();
++});
++
++test('subscription', async () => {
++  const t = initTRPC.create();
++
++  const appRouter = t.router({
++    hello: t.procedure.subscription(async function* () {
++      yield 'hello';
++      yield 'world';
++    }),
++  });
++
++  const client = createTRPCClient<typeof appRouter>({
++    links: [
++      localLink({
++        router: appRouter,
++        createContext: async () => ({}),
++      }),
++    ],
++  });
++
++  const result = await new Promise<string[]>((resolve) => {
++    const aggregated: string[] = [];
++    client.hello.subscribe(undefined, {
++      onData: (data) => {
++        aggregated.push(data);
++      },
++      onComplete: () => {
++        resolve(aggregated);
++      },
++    });
++  });
++
++  expect(result).toEqual(['hello', 'world']);
++});
++
++test('subscription reconnects on errors', async () => {
++  const t = initTRPC.create();
++
++  let firstRun = true;
++
++  const appRouter = t.router({
++    hello: t.procedure.subscription(async function* () {
++      if (firstRun) {
++        yield 'hello';
++        firstRun = false;
++        throw new Error('test');
++      }
++      yield 'world';
++    }),
++  });
++
++  const ctx = localLinkClient<typeof appRouter>({
++    router: appRouter,
++    createContext: async () => ({}),
++  });
++  const { client } = ctx;
++
++  const result = await new Promise<string[]>((resolve) => {
++    const aggregated: string[] = [];
++    client.hello.subscribe(undefined, {
++      onData: (data) => {
++        aggregated.push(data);
++      },
++      onComplete: () => {
++        resolve(aggregated);
++      },
++    });
++  });
++
++  expect(ctx.onError).toHaveBeenCalledOnce();
++  expect(ctx.onError.mock.calls).toMatchInlineSnapshot(`
++    Array [
++      Array [
++        Object {
++          "ctx": Object {},
++          "error": [TRPCError: test],
++          "input": undefined,
++          "path": "hello",
++          "type": "subscription",
++        },
++      ],
++    ]
++  `);
++
++  expect(result).toEqual(['hello', 'world']);
++});
++
++test('subscription reconnects on errors with the last event id', async () => {
++  const t = initTRPC.create();
++
++  const events = Array.from({ length: 5 }, (_, i) => `event-${i}`);
++
++  const appRouter = t.router({
++    hello: t.procedure
++      .input(
++        z.object({
++          lastEventId: z.string().optional(),
++        }),
++      )
++      .subscription(async function* (opts) {
++        const start = opts.input.lastEventId
++          ? Number(opts.input.lastEventId) + 1
++          : 0;
++        for (let i = start; i < events.length; i++) {
++          const data = events[i]!;
++          yield tracked(String(i), data);
++          // throw an error every second event
++          if (i % 2 === 0) {
++            throw new Error(`Threw on event ${i}`);
++          }
++        }
++      }),
++  });
++
++  const ctx = localLinkClient<typeof appRouter>({
++    router: appRouter,
++    createContext: async () => ({}),
++  });
++  const { client } = ctx;
++
++  type Data = { id: string; data: string };
++  const result = await new Promise<Data[]>((resolve) => {
++    const aggregated: Data[] = [];
++    client.hello.subscribe(
++      {},
++      {
++        onData: (data) => {
++          aggregated.push(data);
++        },
++        onComplete: () => {
++          resolve(aggregated);
++        },
++      },
++    );
++  });
++
++  expect(result).toMatchInlineSnapshot(`
++    Array [
++      Object {
++        "data": "event-0",
++        "id": "0",
++      },
++      Object {
++        "data": "event-1",
++        "id": "1",
++      },
++      Object {
++        "data": "event-2",
++        "id": "2",
++      },
++      Object {
++        "data": "event-3",
++        "id": "3",
++      },
++      Object {
++        "data": "event-4",
++        "id": "4",
++      },
++    ]
++  `);
++  expect(ctx.onError).toHaveBeenCalledTimes(3);
++  expect(ctx.onError.mock.calls).toMatchInlineSnapshot(`
++    Array [
++      Array [
++        Object {
++          "ctx": Object {},
++          "error": [TRPCError: Threw on event 0],
++          "input": Object {},
++          "path": "hello",
++          "type": "subscription",
++        },
++      ],
++      Array [
++        Object {
++          "ctx": Object {},
++          "error": [TRPCError: Threw on event 2],
++          "input": Object {
++            "lastEventId": "0",
++          },
++          "path": "hello",
++          "type": "subscription",
++        },
++      ],
++      Array [
++        Object {
++          "ctx": Object {},
++          "error": [TRPCError: Threw on event 4],
++          "input": Object {
++            "lastEventId": "2",
++          },
++          "path": "hello",
++          "type": "subscription",
++        },
++      ],
++    ]
++  `);
++});
++
++test('error formatting', async () => {
++  const t = initTRPC.create({
++    errorFormatter: (opts) => {
++      return {
++        ...opts.shape,
++        data: {
++          ...opts.shape.data,
++          foo: 'bar' as const,
++          stack: 'redacted',
++        },
++      };
++    },
++  });
++
++  const appRouter = t.router({
++    hello: t.procedure.query(() => {
++      throw new Error('test');
++    }),
++    iterate: t.procedure.query(async function* () {
++      yield 'hello';
++      throw new TRPCError({
++        code: 'BAD_GATEWAY',
++      });
++    }),
++  });
++
++  const ctx = localLinkClient<typeof appRouter>({
++    router: appRouter,
++    createContext: async () => ({}),
++  });
++  const { client } = ctx;
++
++  {
++    const err = await waitError(client.hello.query());
++    assert(isTRPCClientError<typeof appRouter>(err));
++
++    expect(err.data).toMatchObject({
++      foo: 'bar',
++    });
++    expect(err.shape).toMatchInlineSnapshot(`
++      Object {
++        "code": -32603,
++        "data": Object {
++          "code": "INTERNAL_SERVER_ERROR",
++          "foo": "bar",
++          "httpStatus": 500,
++          "path": "hello",
++          "stack": "redacted",
++        },
++        "message": "test",
++      }
++    `);
++  }
++
++  {
++    const err = await waitError(
++      run(async function () {
++        for await (const _ of await client.iterate.query()) {
++          // ..
++        }
++      }),
++    );
++    assert(isTRPCClientError<typeof appRouter>(err));
++
++    expect(err.data).toMatchObject({
++      foo: 'bar',
++    });
++    expect(err.shape).toMatchInlineSnapshot(`
++      Object {
++        "code": -32603,
++        "data": Object {
++          "code": "BAD_GATEWAY",
++          "foo": "bar",
++          "httpStatus": 502,
++          "path": "iterate",
++          "stack": "redacted",
++        },
++        "message": "BAD_GATEWAY",
++      }
++    `);
++  }
++});
++
++test('with transformer', async () => {
++  const t = initTRPC.create({
++    transformer: superjson,
++  });
++
++  const appRouter = t.router({
++    greeting: t.procedure.query(() => {
++      return {
++        foo: Promise.resolve('bar'),
++      };
++    }),
++  });
++
++  const ctx = localLinkClient<typeof appRouter>({
++    router: appRouter,
++    createContext: async () => ({}),
++    transformer: superjson,
++  });
++  const { client } = ctx;
++
++  const result = await client.greeting.query();
++
++  expect(result.foo).toBeInstanceOf(Promise);
++
++  expect(await result.foo).toBe('bar');
++});
+diff --git a/packages/client/src/links/localLink.ts b/packages/client/src/links/localLink.ts
+new file mode 100644
+index 00000000000..98a7669b2cc
+--- /dev/null
++++ b/packages/client/src/links/localLink.ts
+@@ -0,0 +1,277 @@
++import {
++  getTRPCErrorFromUnknown,
++  getTRPCErrorShape,
++  isTrackedEnvelope,
++} from '@trpc/server';
++import { behaviorSubject, observable } from '@trpc/server/observable';
++import { TRPC_ERROR_CODES_BY_KEY, type TRPCResult } from '@trpc/server/rpc';
++import {
++  callProcedure,
++  isAbortError,
++  isAsyncIterable,
++  iteratorResource,
++  makeResource,
++  retryableRpcCodes,
++  run,
++  type AnyRouter,
++  type ErrorHandlerOptions,
++  type inferClientTypes,
++  type inferRouterContext,
++} from '@trpc/server/unstable-core-do-not-import';
++import { inputWithTrackedEventId } from '../internals/inputWithTrackedEventId';
++import { abortSignalToPromise, raceAbortSignals } from '../internals/signals';
++import { getTransformer } from '../internals/transformer';
++import type { TransformerOptions } from '../internals/transformer';
++import { isTRPCClientError, TRPCClientError } from '../TRPCClientError';
++import type { TRPCConnectionState } from './internals/subscriptions';
++import type { TRPCLink } from './types';
++
++export type LocalLinkOptions<TRouter extends AnyRouter> = {
++  router: TRouter;
++  createContext: () => Promise<inferRouterContext<TRouter>>;
++  onError?: (opts: ErrorHandlerOptions<inferRouterContext<TRouter>>) => void;
++} & TransformerOptions<inferClientTypes<TRouter>>;
++
++/**
++ * localLink is a terminating link that allows you to make tRPC procedure calls directly in your application without going through HTTP.
++ *
++ * @see https://trpc.io/docs/links/localLink
++ */
++export function experimental_localLink<TRouter extends AnyRouter>(
++  opts: LocalLinkOptions<TRouter>,
++): TRPCLink<TRouter> {
++  const transformer = getTransformer(opts.transformer);
++
++  const transformChunk = (chunk: unknown) => {
++    if (opts.transformer) {
++      // assume transformer will do the right thing
++      return chunk;
++    }
++    // Special case for undefined, because `JSON.stringify(undefined)` throws
++    if (chunk === undefined) {
++      return chunk;
++    }
++    const serialized = JSON.stringify(transformer.input.serialize(chunk));
++    const deserialized = JSON.parse(transformer.output.deserialize(serialized));
++    return deserialized;
++  };
++
++  return () =>
++    ({ op }) =>
++      observable((observer) => {
++        let ctx: inferRouterContext<TRouter> | undefined = undefined;
++        const ac = new AbortController();
++
++        const signal = raceAbortSignals(op.signal, ac.signal);
++        const signalPromise = abortSignalToPromise(signal);
++
++        signalPromise.catch(() => {
++          // prevent unhandled rejection
++        });
++
++        let input = op.input;
++        async function runProcedure(newInput: unknown): Promise<unknown> {
++          input = newInput;
++
++          ctx = await opts.createContext();
++
++          return callProcedure({
++            router: opts.router,
++            path: op.path,
++            getRawInput: async () => newInput,
++            ctx,
++            type: op.type,
++            signal,
++          });
++        }
++
++        function onErrorCallback(cause: unknown) {
++          if (isAbortError(cause)) {
++            return;
++          }
++          opts.onError?.({
++            error: getTRPCErrorFromUnknown(cause),
++            type: op.type,
++            path: op.path,
++            input,
++            ctx,
++          });
++        }
++
++        function coerceToTRPCClientError(cause: unknown) {
++          if (isTRPCClientError<TRouter>(cause)) {
++            return cause;
++          }
++          const error = getTRPCErrorFromUnknown(cause);
++
++          const shape = getTRPCErrorShape({
++            config: opts.router._def._config,
++            ctx,
++            error,
++            input,
++            path: op.path,
++            type: op.type,
++          });
++          return TRPCClientError.from({
++            error: transformChunk(shape),
++          });
++        }
++
++        run(async () => {
++          switch (op.type) {
++            case 'query':
++            case 'mutation': {
++              const result = await runProcedure(op.input);
++              if (!isAsyncIterable(result)) {
++                observer.next({
++                  result: { data: transformChunk(result) },
++                });
++                observer.complete();
++                break;
++              }
++
++              observer.next({
++                result: {
++                  data: (async function* () {
++                    await using iterator = iteratorResource(result);
++                    using _finally = makeResource({}, () => {
++                      observer.complete();
++                    });
++                    try {
++                      while (true) {
++                        const res = await Promise.race([
++                          iterator.next(),
++                          signalPromise,
++                        ]);
++                        if (res.done) {
++                          return transformChunk(res.value);
++                        }
++                        yield transformChunk(res.value);
++                      }
++                    } catch (cause) {
++                      onErrorCallback(cause);
++                      throw coerceToTRPCClientError(cause);
++                    }
++                  })(),
++                },
++              });
++              break;
++            }
++            case 'subscription': {
++              const connectionState = behaviorSubject<
++                TRPCConnectionState<TRPCClientError<any>>
++              >({
++                type: 'state',
++                state: 'connecting',
++                error: null,
++              });
++
++              const connectionSub = connectionState.subscribe({
++                next(state) {
++                  observer.next({
++                    result: state,
++                  });
++                },
++              });
++              let lastEventId: string | undefined = undefined;
++
++              using _finally = makeResource({}, async () => {
++                observer.complete();
++
++                connectionState.next({
++                  type: 'state',
++                  state: 'idle',
++                  error: null,
++                });
++                connectionSub.unsubscribe();
++              });
++              while (true) {
++                const result = await runProcedure(
++                  inputWithTrackedEventId(op.input, lastEventId),
++                );
++                if (!isAsyncIterable(result)) {
++                  throw new Error('Expected an async iterable');
++                }
++                await using iterator = iteratorResource(result);
++
++                observer.next({
++                  result: {
++                    type: 'started',
++                  },
++                });
++                connectionState.next({
++                  type: 'state',
++                  state: 'pending',
++                  error: null,
++                });
++
++                // Use a while loop to handle errors and reconnects
++                while (true) {
++                  let res;
++                  try {
++                    res = await Promise.race([iterator.next(), signalPromise]);
++                  } catch (cause) {
++                    if (isAbortError(cause)) {
++                      return;
++                    }
++                    const error = getTRPCErrorFromUnknown(cause);
++
++                    if (
++                      !retryableRpcCodes.includes(
++                        TRPC_ERROR_CODES_BY_KEY[error.code],
++                      )
++                    ) {
++                      throw coerceToTRPCClientError(error);
++                    }
++
++                    onErrorCallback(error);
++                    connectionState.next({
++                      type: 'state',
++                      state: 'connecting',
++                      error: coerceToTRPCClientError(error),
++                    });
++
++                    break;
++                  }
++
++                  if (res.done) {
++                    return;
++                  }
++                  let chunk: TRPCResult<unknown>;
++                  if (isTrackedEnvelope(res.value)) {
++                    lastEventId = res.value[0];
++
++                    chunk = {
++                      id: res.value[0],
++                      data: {
++                        id: res.value[0],
++                        data: res.value[1],
++                      },
++                    };
++                  } else {
++                    chunk = {
++                      data: res.value,
++                    };
++                  }
++
++                  observer.next({
++                    result: {
++                      ...chunk,
++                      data: transformChunk(chunk.data),
++                    },
++                  });
++                }
++              }
++              break;
++            }
++          }
++        }).catch((cause) => {
++          onErrorCallback(cause);
++          observer.error(coerceToTRPCClientError(cause));
++        });
++
++        return () => {
++          ac.abort();
++        };
++      });
++}
+diff --git a/packages/server/src/@trpc/server/index.ts b/packages/server/src/@trpc/server/index.ts
+index d4f9f4d42d9..b85a1e2833b 100644
+--- a/packages/server/src/@trpc/server/index.ts
++++ b/packages/server/src/@trpc/server/index.ts
+@@ -104,6 +104,7 @@ export {
+    * @deprecated use `getTRPCErrorShape` instead
+    */
+   getErrorShape,
++  getErrorShape as getTRPCErrorShape,
+ } from '../../unstable-core-do-not-import';
+ 
+ /**
+diff --git a/packages/server/src/unstable-core-do-not-import/rpc/codes.ts b/packages/server/src/unstable-core-do-not-import/rpc/codes.ts
+index 3eedd164c5c..9b512315455 100644
+--- a/packages/server/src/unstable-core-do-not-import/rpc/codes.ts
++++ b/packages/server/src/unstable-core-do-not-import/rpc/codes.ts
+@@ -66,3 +66,14 @@ export const TRPC_ERROR_CODES_BY_NUMBER: InvertKeyValue<
+ 
+ export type TRPC_ERROR_CODE_NUMBER = ValueOf<typeof TRPC_ERROR_CODES_BY_KEY>;
+ export type TRPC_ERROR_CODE_KEY = keyof typeof TRPC_ERROR_CODES_BY_KEY;
++
++/**
++ * tRPC error codes that are considered retryable
++ * With out of the box SSE, the client will reconnect when these errors are encountered
++ */
++export const retryableRpcCodes: TRPC_ERROR_CODE_NUMBER[] = [
++  TRPC_ERROR_CODES_BY_KEY.BAD_GATEWAY,
++  TRPC_ERROR_CODES_BY_KEY.SERVICE_UNAVAILABLE,
++  TRPC_ERROR_CODES_BY_KEY.GATEWAY_TIMEOUT,
++  TRPC_ERROR_CODES_BY_KEY.INTERNAL_SERVER_ERROR,
++];
+diff --git a/packages/server/src/unstable-core-do-not-import/rpc/index.ts b/packages/server/src/unstable-core-do-not-import/rpc/index.ts
+index 07c61508e3a..31743746800 100644
+--- a/packages/server/src/unstable-core-do-not-import/rpc/index.ts
++++ b/packages/server/src/unstable-core-do-not-import/rpc/index.ts
+@@ -1,4 +1,8 @@
+-export { TRPC_ERROR_CODES_BY_KEY, TRPC_ERROR_CODES_BY_NUMBER } from './codes';
++export {
++  TRPC_ERROR_CODES_BY_KEY,
++  TRPC_ERROR_CODES_BY_NUMBER,
++  retryableRpcCodes,
++} from './codes';
+ export type { TRPC_ERROR_CODE_KEY, TRPC_ERROR_CODE_NUMBER } from './codes';
+ export type {
+   JSONRPC2,
+diff --git a/packages/tests/server/errorFormatting.test.ts b/packages/tests/server/errorFormatting.test.ts
+index 7f7fa7fb914..fb7e6d04089 100644
+--- a/packages/tests/server/errorFormatting.test.ts
++++ b/packages/tests/server/errorFormatting.test.ts
+@@ -1,6 +1,6 @@
+ import { routerToServerAndClientNew } from './___testHelpers';
+ import { waitError } from '@trpc/server/__tests__/waitError';
+-import { TRPCClientError } from '@trpc/client';
++import { isTRPCClientError, TRPCClientError } from '@trpc/client';
+ import type { AnyRouter } from '@trpc/server';
+ import { initTRPC, StandardSchemaV1Error, TRPCError } from '@trpc/server';
+ import type {
+@@ -11,12 +11,6 @@ import { konn } from 'konn';
+ import * as v1 from 'valibot1';
+ import { z, ZodError } from 'zod';
+ 
+-function isTRPCClientError<TRouter extends AnyRouter>(
+-  cause: unknown,
+-): cause is TRPCClientError<TRouter> {
+-  return cause instanceof TRPCClientError;
+-}
+-
+ describe('no custom error formatter', () => {
+   const t = initTRPC.create();
+ 
+diff --git a/vitest.config.ts b/vitest.config.ts
+index cf024ef9ef9..1b3f4520b6a 100644
+--- a/vitest.config.ts
++++ b/vitest.config.ts
+@@ -63,7 +63,7 @@ export default defineConfig({
+         execArgv: ['--expose-gc'],
+       },
+     },
+-    retry: 2,
++    retry: process.env['CI'] ? 2 : 0,
+   },
+   resolve: {
+     alias: aliases,
+diff --git a/www/docs/client/links/localLink.mdx b/www/docs/client/links/localLink.mdx
+new file mode 100644
+index 00000000000..290c941fdc7
+--- /dev/null
++++ b/www/docs/client/links/localLink.mdx
+@@ -0,0 +1,77 @@
++---
++id: localLink
++title: Local Link
++description: A link for direct procedure calls without HTTP overhead
++---
++
++`localLink` is a [**terminating link**](./overview.md#the-terminating-link) that allows you to make tRPC procedure calls directly in your application without going through HTTP.
++
++:::info
++We have prefixed this as `experimental_` as it's a new API! [Read more](/docs/faq#experimental).
++:::
++
++## Usage
++
++```tsx
++import { createTRPCClient, experimental_localLink } from '@trpc/client';
++import type { AppRouter } from '../server';
++
++const client = createTRPCClient<AppRouter>({
++  links: [
++    experimental_localLink({
++      router: appRouter,
++      createContext: async () => {
++        // Create your context here
++        return {};
++      },
++      onError: (opts) => {
++        // Log errors here, similarly to how you would in an API route
++        console.error('Error:', opts.error);
++      },
++    }),
++  ],
++});
++```
++
++## Features
++
++- Direct procedure calls without HTTP overhead
++- Full support for queries, mutations, and subscriptions
++- Automatic error handling and transformation
++- Support for abort signals
++- Type-safe context creation
++
++## Options
++
++The `localLink` accepts the following options:
++
++```ts
++type LocalLinkOptions<TRouter extends AnyRouter> = {
++  router: TRouter;
++  createContext: () => Promise<inferRouterContext<TRouter>>;
++  onError?: (opts: ErrorHandlerOptions<inferRouterContext<TRouter>>) => void;
++} & TransformerOptions<inferClientTypes<TRouter>>;
++```
++
++### router
++
++The tRPC router instance to use for procedure calls.
++
++### createContext
++
++A function that creates the context for each procedure call. This is called for each request and should return a promise that resolves to the context object.
++
++### onError
++
++An optional error handler that is called when an error occurs during a procedure call. It receives the error, operation type, path, input, and context.
++
++### transformer
++
++Optional input/output transformers for serialization/deserialization of data.
++
++## Notes
++
++- It's recommended to use this link in scenarios where you need direct procedure calls without HTTP
++- For most client-side applications, you should use the `httpLink` or other HTTP-based links instead
++- The link supports all tRPC features including queries, mutations, and subscriptions
++- Error handling and transformation are handled automatically, just like with HTTP-based links
+diff --git a/www/docs/client/links/overview.md b/www/docs/client/links/overview.md
+index 2e3be90aa96..6f95b923843 100644
+--- a/www/docs/client/links/overview.md
++++ b/www/docs/client/links/overview.md
+@@ -94,7 +94,7 @@ The `links` array that you add to the tRPC client config should have at least on
+ 
+ [`httpBatchLink`](./httpBatchLink.md) is the recommended terminating link by tRPC.
+ 
+-[`httpLink`](./httpLink.md) and [`wsLink`](./wsLink.md) are other examples of terminating links.
++[`httpLink`](./httpLink.md), [`wsLink`](./wsLink.md), and [`localLink`](./localLink.mdx) are other examples of terminating links.
+ 
+ ## Managing context
+ 
+diff --git a/www/sidebars.ts b/www/sidebars.ts
+index 286e32edd25..6e67d4937a7 100644
+--- a/www/sidebars.ts
++++ b/www/sidebars.ts
+@@ -160,6 +160,7 @@ const config: SidebarsConfig = {
+             'client/links/httpBatchLink',
+             'client/links/httpBatchStreamLink',
+             'client/links/httpSubscriptionLink',
++            'client/links/localLink',
+             'client/links/wsLink',
+             'client/links/splitLink',
+             'client/links/loggerLink',

@@ -49,11 +49,20 @@ EXTERNAL_REPOS = [
     "pallets/werkzeug",       # 7k stars  — Python WSGI utils, no external deps
     "encode/starlette",       # 12k stars — Python ASGI framework, asyncio only
     "psf/requests",           # 54k stars — Python HTTP, mocked in tests
+    "aio-libs/aiohttp",       # 15k stars — Async HTTP client/server, self-contained tests
+    "pallets/flask",          # 68k stars — Python web framework, pytest suite
+    "tiangolo/fastapi",       # 80k stars — Python API framework, pytest suite
+    "tornadoweb/tornado",     # 22k stars — Python async web framework
+    "twisted/twisted",        # 5k stars  — Event-driven networking, trial tests
+    "python-trio/trio",       # 6k stars  — Structured async I/O, pytest suite
+    "celery/celery",          # 24k stars — Distributed tasks, pytest suite
     # Ruby
     "rubocop/rubocop",        # 13k stars — Ruby linter/formatter, RSpec tests, real cop bug-fixes
     "rubocop/rubocop-rails",  # 2k stars  — Rails-specific cops, same RSpec harness
     # TypeScript
     "colinhacks/zod",         # 38k stars — TypeScript schema validation, vitest tests, active bug-fixes
+    "vitest-dev/vitest",      # 14k stars — TypeScript testing framework, self-testing, active bug-fixes
+    "trpc/trpc",              # 36k stars — TypeScript RPC framework, vitest tests
 ]
 
 

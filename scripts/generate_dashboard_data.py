@@ -45,14 +45,16 @@ REPO_CATEGORY: dict[str, str] = {
     "rubocop/rubocop-rails": "ruby",
     # TypeScript external repos
     "colinhacks/zod": "typescript",
+    "vitest-dev/vitest": "typescript",
+    "trpc/trpc": "typescript",
 }
 
 # Shard sampling budget per category (sums to 30)
 # Proportional to pool: python:50% rust:25% typescript:12% jvm:5% ruby:8%
 SHARD_BUDGET: dict[str, int] = {
     "python": 12,
-    "rust": 9,
-    "typescript": 5,
+    "rust": 8,
+    "typescript": 6,
     "ruby": 2,
     "jvm": 2,
 }

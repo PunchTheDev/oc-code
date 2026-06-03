@@ -90,6 +90,8 @@ REPO_CATEGORY: dict[str, str] = {
     "rubocop/rubocop-rails": "ruby",
     # TypeScript external repos
     "colinhacks/zod": "typescript",
+    "vitest-dev/vitest": "typescript",
+    "trpc/trpc": "typescript",
 }
 
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json
@@ -350,8 +352,8 @@ def run_evaluation(
     # Oracle mode: score reference diffs directly — no agent call needed.
     # Used for pipeline calibration; expected weighted mean matches baselines.json.
     if use_oracle:
-        _oracle_weighted = 13.69
-        _oracle_arithmetic = 12.37
+        _oracle_weighted = 13.39
+        _oracle_arithmetic = 12.09
         _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
         if _baselines_path.exists():
             try:
