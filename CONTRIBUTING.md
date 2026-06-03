@@ -30,7 +30,7 @@ Create a directory under `agent/submissions/<your-handle>/` and add two files:
 ```json
 {
   "handle": "<your-handle>",
-  "model": "deepseek/deepseek-v3",
+  "model": "deepseek/deepseek-chat",
   "sha256": "<sha256 of your agent.py — run: python3 gitminer.py hash agent.py>"
 }
 ```
