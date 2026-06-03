@@ -165,6 +165,11 @@ def cmd_eval(args: argparse.Namespace) -> None:
         print(f"  runs ~2× above Docker CI scores. Use these for relative comparison")
         print(f"  only — the authoritative score comes from CI (git push + open PR).")
 
+    import os as _os
+    if not _os.environ.get("SHARD_SECRET") and not getattr(args, "all", False) and not args.problems:
+        print(f"\n  Note: local shard may differ from CI shard (server-side anti-gaming).")
+        print(f"  Use --all for a stable benchmark independent of shard selection.")
+
     print(f"{'─'*54}")
 
     if args.output:

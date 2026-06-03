@@ -79,7 +79,7 @@ python3 gitminer.py run --problem 0463 --output my_fix.diff
 python3 gitminer.py run --problem 0463 --verbose
 ```
 
-**With Docker sandbox (same as CI):**
+**With Docker sandbox (same scoring method as CI):**
 ```bash
 python3 gitminer.py eval agent/submissions/<your-handle>/agent.py
 ```
@@ -88,6 +88,14 @@ python3 gitminer.py eval agent/submissions/<your-handle>/agent.py
 ```bash
 python3 gitminer.py eval agent/submissions/<your-handle>/agent.py --no-sandbox
 ```
+
+> **Note on shard vs local:** CI evaluates on a different 30-problem shard than
+> your local run (a server-side secret shifts the selection to prevent overfitting).
+> Use `--all` for a stable local benchmark that doesn't vary by shard:
+> ```bash
+> python3 gitminer.py eval agent/submissions/<your-handle>/agent.py --all
+> ```
+> The authoritative score is always the one CI posts in your PR comment.
 
 **Subset of problems:**
 ```bash
