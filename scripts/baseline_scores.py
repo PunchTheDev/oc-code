@@ -76,15 +76,34 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Score all reference diffs")
     parser.add_argument("--out", default=str(RESULTS_DIR / "baselines.json"))
     parser.add_argument("--limit", type=int, default=0, help="Score only first N problems (0=all)")
+    parser.add_argument("--incremental", action="store_true",
+                        help="Only score problems not already in the output file; merge results")
     args = parser.parse_args()
 
     problems = sorted(p for p in PROBLEMS_DIR.iterdir() if p.is_dir())
     if args.limit:
         problems = problems[:args.limit]
 
-    baselines = []
+    # Incremental mode: load existing scores and skip already-scored problems
+    existing: dict[str, dict] = {}
+    if args.incremental:
+        dest_path = Path(args.out)
+        if dest_path.exists():
+            try:
+                loaded = json.loads(dest_path.read_text())
+                for entry in loaded.get("problems", []):
+                    existing[entry["id"]] = entry
+                print(f"Loaded {len(existing)} existing scores (incremental mode)")
+            except Exception:
+                pass
+
+    baselines = list(existing.values()) if existing else []
+    existing_ids = set(existing.keys())
     skipped = 0
+    new_count = 0
     for i, problem_dir in enumerate(problems, 1):
+        if problem_dir.name in existing_ids:
+            continue
         print(f"[{i}/{len(problems)}] {problem_dir.name}", end="", flush=True)
         result = score_reference(problem_dir)
         if result is None:
@@ -92,6 +111,7 @@ def main() -> None:
             print(" SKIP")
             continue
         baselines.append(result)
+        new_count += 1
         print(f" → {result['base_score']:.2f}")
 
     if not baselines:
@@ -126,7 +146,10 @@ def main() -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(out, indent=2))
 
-    print(f"\nScored {len(baselines)} problems (skipped {skipped})")
+    if args.incremental:
+        print(f"\nAdded {new_count} new scores, {len(existing_ids)} carried over, {skipped} skipped")
+    else:
+        print(f"\nScored {len(baselines)} problems (skipped {skipped})")
     print(f"Mean: {mean_score:.2f} | Weighted mean: {weighted_mean_score:.2f} | "
           f"Median: {median_score:.2f} | Max: {out['max_score']:.2f} | Min: {out['min_score']:.2f}")
     print(f"Written to {dest}")

@@ -1,0 +1,320 @@
+diff --git a/crates/lobby-broker/src/broker.rs b/crates/lobby-broker/src/broker.rs
+index 29acf207d1..221a41e7f2 100644
+--- a/crates/lobby-broker/src/broker.rs
++++ b/crates/lobby-broker/src/broker.rs
+@@ -514,6 +514,7 @@ impl Broker {
+         let mut out = Vec::new();
+         let mut reservation_token = None;
+         let mut reservation_expires_at_ms = None;
++        let mut reservation_counted_in_info = false;
+ 
+         if conn
+             .host_game
+@@ -539,7 +540,7 @@ impl Broker {
+             ))];
+         }
+ 
+-        let info = match self.lobby.verify_password(&game_code, password.as_deref()) {
++        let mut info = match self.lobby.verify_password(&game_code, password.as_deref()) {
+             Ok(()) => match self.lobby.join_target_info(&game_code) {
+                 Some(info) => info,
+                 None => return vec![error(&format!("Game not found in lobby: {game_code}"))],
+@@ -569,14 +570,21 @@ impl Broker {
+             }
+         }
+ 
+-        // --- seat-full short-circuit ---
+-        if info.max_players > 0 && info.current_players >= info.max_players {
+-            out.push(error(&format!("Game {game_code} is full")));
+-            return out;
+-        }
+-
+         // --- optional reservation ---
+         if reserve {
++            let mut has_active_reservation = false;
++            conn.reservations.retain(|(code, token)| {
++                if code != &game_code {
++                    return true;
++                }
++                let active = self.lobby.has_active_reservation(code, token, env);
++                has_active_reservation |= active;
++                active
++            });
++            if has_active_reservation {
++                out.push(error("You already hold a reservation for this game"));
++                return out;
++            }
+             match self.lobby.reserve_seat(
+                 &game_code,
+                 display_name.unwrap_or_else(|| "Player".to_string()),
+@@ -598,10 +606,19 @@ impl Broker {
+                     return out;
+                 }
+             }
++            if let Some(latest_info) = self.lobby.join_target_info(&game_code) {
++                info = latest_info;
++                reservation_counted_in_info = true;
++            }
++        } else if info.max_players > 0 && info.current_players >= info.max_players {
++            // --- seat-full short-circuit ---
++            out.push(error(&format!("Game {game_code} is full")));
++            return out;
+         }
+ 
+-        let filled_seats = (info.current_players + u32::from(reservation_token.is_some()))
+-            .min(info.max_players) as u8;
++        let filled_seats = (info.current_players
++            + u32::from(reservation_token.is_some() && !reservation_counted_in_info))
++        .min(info.max_players) as u8;
+         out.push(Outbound::ToSelf(LobbyServerMessage::JoinTargetInfo {
+             game_code: game_code.clone(),
+             is_p2p: info.is_p2p,
+@@ -866,6 +883,104 @@ mod tests {
+         assert!(conn.subscribed);
+     }
+ 
++    #[test]
++    fn second_reserve_on_same_game_from_same_conn_is_rejected() {
++        let env = FakeEnv::new();
++        let mut broker = Broker::new();
++
++        let mut host = ConnState::default();
++        hello(&mut host, &mut broker, &env);
++        let created = create(&mut host, &mut broker, &env);
++        let code = game_code_of(&created);
++
++        let mut guest = ConnState::default();
++        hello(&mut guest, &mut broker, &env);
++
++        let first = broker.handle(
++            &mut guest,
++            LobbyClientMessage::LookupJoinTarget {
++                game_code: code.clone(),
++                password: None,
++                reserve: true,
++                display_name: Some("Squatter".into()),
++                release_reservation_token: None,
++            },
++            &env,
++        );
++        assert!(matches!(
++            first.last(),
++            Some(Outbound::ToSelf(LobbyServerMessage::JoinTargetInfo { .. }))
++        ));
++
++        let second = broker.handle(
++            &mut guest,
++            LobbyClientMessage::LookupJoinTarget {
++                game_code: code.clone(),
++                password: None,
++                reserve: true,
++                display_name: Some("Squatter".into()),
++                release_reservation_token: None,
++            },
++            &env,
++        );
++        assert!(matches!(
++            second.as_slice(),
++            [Outbound::ToSelf(LobbyServerMessage::Error { .. })]
++        ));
++        assert_eq!(guest.reservations.len(), 1);
++    }
++
++    #[test]
++    fn expired_reservation_on_conn_does_not_block_new_reserve() {
++        let env = FakeEnv::new();
++        let mut broker = Broker::new();
++
++        let mut host = ConnState::default();
++        hello(&mut host, &mut broker, &env);
++        let created = create(&mut host, &mut broker, &env);
++        let code = game_code_of(&created);
++
++        let mut guest = ConnState::default();
++        hello(&mut guest, &mut broker, &env);
++
++        let first = broker.handle(
++            &mut guest,
++            LobbyClientMessage::LookupJoinTarget {
++                game_code: code.clone(),
++                password: None,
++                reserve: true,
++                display_name: Some("Guest".into()),
++                release_reservation_token: None,
++            },
++            &env,
++        );
++        assert!(matches!(
++            first.last(),
++            Some(Outbound::ToSelf(LobbyServerMessage::JoinTargetInfo { .. }))
++        ));
++        assert_eq!(guest.reservations.len(), 1);
++
++        env.now
++            .set(env.now.get() + crate::lobby::PUBLIC_SEAT_RESERVATION_MS + 1);
++
++        let second = broker.handle(
++            &mut guest,
++            LobbyClientMessage::LookupJoinTarget {
++                game_code: code.clone(),
++                password: None,
++                reserve: true,
++                display_name: Some("Guest".into()),
++                release_reservation_token: None,
++            },
++            &env,
++        );
++        assert!(matches!(
++            second.last(),
++            Some(Outbound::ToSelf(LobbyServerMessage::JoinTargetInfo { .. }))
++        ));
++        assert_eq!(guest.reservations.len(), 1);
++    }
++
+     #[test]
+     fn on_disconnect_emits_reservation_updates_then_host_removed() {
+         let env = FakeEnv::new();
+diff --git a/crates/lobby-broker/src/lobby.rs b/crates/lobby-broker/src/lobby.rs
+index c6cdbde037..be7f2b2ea3 100644
+--- a/crates/lobby-broker/src/lobby.rs
++++ b/crates/lobby-broker/src/lobby.rs
+@@ -196,6 +196,19 @@ impl LobbyManager {
+             .is_some()
+     }
+ 
++    pub fn has_active_reservation(
++        &mut self,
++        game_code: &str,
++        token: &str,
++        env: &impl BrokerEnv,
++    ) -> bool {
++        let Some(meta) = self.games.get_mut(game_code) else {
++            return false;
++        };
++        Self::cleanup_expired_for(meta, env.now_ms());
++        meta.reservations.contains_key(token)
++    }
++
+     pub fn release_reservations(&mut self, reservations: &[(String, String)]) -> bool {
+         let mut changed = false;
+         for (game_code, token) in reservations {
+diff --git a/crates/phase-server/src/main.rs b/crates/phase-server/src/main.rs
+index 93fc137c64..f13e08ebf0 100644
+--- a/crates/phase-server/src/main.rs
++++ b/crates/phase-server/src/main.rs
+@@ -2859,8 +2859,9 @@ async fn handle_client_message(
+ 
+             let mut reservation_token = None;
+             let mut reservation_expires_at_ms = None;
++            let mut reservation_counted_in_info = false;
+ 
+-            let info = {
++            let mut info = {
+                 let lob_guard = lobby.lock().await;
+                 let lob = lob_guard.lobby();
+ 
+@@ -2974,17 +2975,42 @@ async fn handle_client_message(
+                 }
+             }
+ 
+-            if info.max_players > 0 && info.current_players >= info.max_players {
+-                let msg = ServerMessage::Error {
+-                    message: format!("Game {game_code} is full"),
++            if reserve {
++                let already_reserved = if info.is_p2p {
++                    let mut lob = lobby.lock().await;
++                    identity.lobby_reservations.retain(|(code, token)| {
++                        if code != &game_code {
++                            return true;
++                        }
++                        lob.lobby_mut().has_active_reservation(code, token, &SysEnv)
++                    });
++                    identity
++                        .lobby_reservations
++                        .iter()
++                        .any(|(code, _)| code == &game_code)
++                } else {
++                    let mut mgr = state.lock().await;
++                    identity.seat_reservations.retain(|(code, token)| {
++                        if code != &game_code {
++                            return true;
++                        }
++                        mgr.has_active_reservation(code, token)
++                    });
++                    identity
++                        .seat_reservations
++                        .iter()
++                        .any(|(code, _)| code == &game_code)
+                 };
+-                if let Ok(json) = serde_json::to_string(&msg) {
+-                    let _ = socket.send(Message::text(json)).await;
++                if already_reserved {
++                    let msg = ServerMessage::Error {
++                        message: "You already hold a reservation for this game".to_string(),
++                    };
++                    if let Ok(json) = serde_json::to_string(&msg) {
++                        let _ = socket.send(Message::text(json)).await;
++                    }
++                    return;
+                 }
+-                return;
+-            }
+ 
+-            if reserve {
+                 if info.is_p2p {
+                     let reserve_result = {
+                         let mut lob = lobby.lock().await;
+@@ -3069,6 +3095,22 @@ async fn handle_client_message(
+                         }
+                     }
+                 }
++                let latest_info = {
++                    let lob = lobby.lock().await;
++                    lob.lobby().join_target_info(&game_code)
++                };
++                if let Some(latest_info) = latest_info {
++                    info = latest_info;
++                    reservation_counted_in_info = true;
++                }
++            } else if info.max_players > 0 && info.current_players >= info.max_players {
++                let msg = ServerMessage::Error {
++                    message: format!("Game {game_code} is full"),
++                };
++                if let Ok(json) = serde_json::to_string(&msg) {
++                    let _ = socket.send(Message::text(json)).await;
++                }
++                return;
+             }
+ 
+             let msg = ServerMessage::JoinTargetInfo {
+@@ -3077,8 +3119,9 @@ async fn handle_client_message(
+                 format_config: info.format_config,
+                 match_config: info.match_config,
+                 player_count: info.max_players as u8,
+-                filled_seats: (info.current_players + u32::from(reservation_token.is_some()))
+-                    .min(info.max_players) as u8,
++                filled_seats: (info.current_players
++                    + u32::from(reservation_token.is_some() && !reservation_counted_in_info))
++                .min(info.max_players) as u8,
+                 reservation_token,
+                 reservation_expires_at_ms,
+             };
+diff --git a/crates/server-core/src/session.rs b/crates/server-core/src/session.rs
+index 0c7af5b8b7..b9f660a386 100644
+--- a/crates/server-core/src/session.rs
++++ b/crates/server-core/src/session.rs
+@@ -753,6 +753,14 @@ impl SessionManager {
+             .is_some()
+     }
+ 
++    pub fn has_active_reservation(&mut self, game_code: &str, reservation_token: &str) -> bool {
++        let Some(session) = self.sessions.get_mut(game_code) else {
++            return false;
++        };
++        session.cleanup_expired_reservations();
++        session.reservations.contains_key(reservation_token)
++    }
++
+     pub fn release_reservations(&mut self, reservations: &[(String, String)]) -> bool {
+         let mut changed = false;
+         for (game_code, token) in reservations {

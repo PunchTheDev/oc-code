@@ -1,0 +1,356 @@
+diff --git a/crates/lobby-broker/src/broker.rs b/crates/lobby-broker/src/broker.rs
+index 34cabd1ef..3e2a369cc 100644
+--- a/crates/lobby-broker/src/broker.rs
++++ b/crates/lobby-broker/src/broker.rs
+@@ -17,6 +17,10 @@ use tracing::{debug, info, warn};
+ use crate::env::BrokerEnv;
+ use crate::lobby::{LobbyManager, RegisterGameRequest};
+ use crate::protocol::{LobbyClientMessage, LobbyServerMessage, ServerMode};
++use crate::reservation_auth::{
++    consume_owned_reservation, release_owned_reservation, ReservationConsume, ReservationRelease,
++    NOT_OWNED_RESERVATION,
++};
+ 
+ /// Capacity cap for the broker path. `LobbyManager` is otherwise unbounded —
+ /// without this gate an abusive client could pin arbitrary entries in memory
+@@ -470,12 +474,19 @@ impl Broker {
+         }
+ 
+         let consumed_reservation_token = if let Some(token) = reservation_token.as_deref() {
+-            if self.lobby.consume_reservation(&game_code, token) {
+-                conn.reservations
+-                    .retain(|(code, t)| code != &game_code || t != token);
+-                reservation_token
+-            } else {
+-                None
++            match consume_owned_reservation(
++                &mut self.lobby,
++                &mut conn.reservations,
++                &game_code,
++                token,
++            ) {
++                ReservationConsume::Consumed => reservation_token,
++                ReservationConsume::NotHeld => {
++                    return vec![error(NOT_OWNED_RESERVATION)];
++                }
++                ReservationConsume::NotFound => {
++                    return vec![error("Seat reservation expired or was released")];
++                }
+             }
+         } else {
+             None
+@@ -559,14 +570,24 @@ impl Broker {
+         // --- optional reservation release ---
+         if let Some(token) = release_reservation_token.as_deref() {
+             // Always the P2P path here (core is always-P2P).
+-            if self.lobby.release_reservation(&game_code, token) {
+-                conn.reservations
+-                    .retain(|(code, t)| code != &game_code || t != token);
+-                if let Some(game) = self.lobby.public_game(&game_code) {
+-                    out.push(Outbound::ToSubscribers(
+-                        LobbyServerMessage::LobbyGameUpdated { game },
+-                    ));
++            match release_owned_reservation(
++                &mut self.lobby,
++                &mut conn.reservations,
++                &game_code,
++                token,
++            ) {
++                ReservationRelease::Released => {
++                    if let Some(game) = self.lobby.public_game(&game_code) {
++                        out.push(Outbound::ToSubscribers(
++                            LobbyServerMessage::LobbyGameUpdated { game },
++                        ));
++                    }
++                }
++                ReservationRelease::NotHeld => {
++                    out.push(error(NOT_OWNED_RESERVATION));
++                    return out;
+                 }
++                ReservationRelease::NotFound => {}
+             }
+         }
+ 
+@@ -1346,6 +1367,116 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn foreign_release_reservation_token_is_rejected() {
++        let env = FakeEnv::new();
++        let mut broker = Broker::new();
++
++        let mut host = ConnState::default();
++        hello(&mut host, &mut broker, &env);
++        let created = create(&mut host, &mut broker, &env);
++        let code = game_code_of(&created);
++
++        let mut guest_a = ConnState::default();
++        hello(&mut guest_a, &mut broker, &env);
++        let reserve_out = broker.handle(
++            &mut guest_a,
++            LobbyClientMessage::LookupJoinTarget {
++                game_code: code.clone(),
++                password: None,
++                reserve: true,
++                display_name: Some("Guest A".into()),
++                release_reservation_token: None,
++            },
++            &env,
++        );
++        let token = reserve_out
++            .iter()
++            .find_map(|o| match o {
++                Outbound::ToSelf(LobbyServerMessage::JoinTargetInfo {
++                    reservation_token, ..
++                }) => reservation_token.clone(),
++                _ => None,
++            })
++            .expect("reservation token");
++
++        let mut guest_b = ConnState::default();
++        hello(&mut guest_b, &mut broker, &env);
++        let release_out = broker.handle(
++            &mut guest_b,
++            LobbyClientMessage::LookupJoinTarget {
++                game_code: code.clone(),
++                password: None,
++                reserve: false,
++                display_name: Some("Guest B".into()),
++                release_reservation_token: Some(token),
++            },
++            &env,
++        );
++        assert!(matches!(
++            release_out.as_slice(),
++            [Outbound::ToSelf(LobbyServerMessage::Error { .. })]
++        ));
++        assert!(guest_a.reservations.len() == 1);
++        assert!(broker
++            .lobby()
++            .join_target_info(&code)
++            .is_some_and(|info| info.current_players >= 2));
++    }
++
++    #[test]
++    fn foreign_join_with_reservation_token_is_rejected() {
++        let env = FakeEnv::new();
++        let mut broker = Broker::new();
++
++        let mut host = ConnState::default();
++        hello(&mut host, &mut broker, &env);
++        let created = create(&mut host, &mut broker, &env);
++        let code = game_code_of(&created);
++
++        let mut guest_a = ConnState::default();
++        hello(&mut guest_a, &mut broker, &env);
++        let reserve_out = broker.handle(
++            &mut guest_a,
++            LobbyClientMessage::LookupJoinTarget {
++                game_code: code.clone(),
++                password: None,
++                reserve: true,
++                display_name: Some("Guest A".into()),
++                release_reservation_token: None,
++            },
++            &env,
++        );
++        let token = reserve_out
++            .iter()
++            .find_map(|o| match o {
++                Outbound::ToSelf(LobbyServerMessage::JoinTargetInfo {
++                    reservation_token, ..
++                }) => reservation_token.clone(),
++                _ => None,
++            })
++            .expect("reservation token");
++
++        let mut guest_b = ConnState::default();
++        hello(&mut guest_b, &mut broker, &env);
++        let join_out = broker.handle(
++            &mut guest_b,
++            LobbyClientMessage::JoinGameWithPassword {
++                game_code: code.clone(),
++                deck: test_deck(),
++                display_name: "Guest B".into(),
++                password: None,
++                reservation_token: Some(token),
++            },
++            &env,
++        );
++        assert!(matches!(
++            join_out.as_slice(),
++            [Outbound::ToSelf(LobbyServerMessage::Error { .. })]
++        ));
++        assert!(guest_a.reservations.len() == 1);
++    }
++
+     #[test]
+     fn ping_returns_pong() {
+         let env = FakeEnv::new();
+diff --git a/crates/lobby-broker/src/lib.rs b/crates/lobby-broker/src/lib.rs
+index 1bfb2ef3b..beb8a9562 100644
+--- a/crates/lobby-broker/src/lib.rs
++++ b/crates/lobby-broker/src/lib.rs
+@@ -11,6 +11,7 @@ pub mod broker;
+ pub mod env;
+ pub mod lobby;
+ pub mod protocol;
++pub mod reservation_auth;
+ pub mod validation;
+ 
+ pub use broker::{
+@@ -25,4 +26,8 @@ pub use protocol::{
+     parse_lobby_client_message, DraftLobbyMetadata, LobbyClientMessage, LobbyGame,
+     LobbyServerMessage, ParsedFrame, ServerMode,
+ };
++pub use reservation_auth::{
++    conn_holds_reservation, consume_owned_reservation, release_owned_reservation,
++    ReservationConsume, ReservationRelease, NOT_OWNED_RESERVATION,
++};
+ pub use validation::validate_lobby_message;
+diff --git a/crates/lobby-broker/src/reservation_auth.rs b/crates/lobby-broker/src/reservation_auth.rs
+new file mode 100644
+index 000000000..74b27739b
+--- /dev/null
++++ b/crates/lobby-broker/src/reservation_auth.rs
+@@ -0,0 +1,82 @@
++//! Reservation token ownership checks.
++//!
++//! Tokens returned by `reserve_seat` are bound to the connection that received
++//! them. Other clients must not release or consume tokens they do not hold.
++
++use crate::lobby::LobbyManager;
++
++/// Error returned when a client attempts to operate on another connection's
++/// reservation token.
++pub const NOT_OWNED_RESERVATION: &str =
++    "You may only release or use a seat reservation issued to this connection";
++
++/// Whether `reservations` contains an entry for `(game_code, token)`.
++pub fn conn_holds_reservation(
++    reservations: &[(String, String)],
++    game_code: &str,
++    token: &str,
++) -> bool {
++    reservations
++        .iter()
++        .any(|(code, held)| code == game_code && held == token)
++}
++
++/// Outcome of attempting to release a reservation the caller claims to hold.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ReservationRelease {
++    /// Token was held and successfully released from the lobby.
++    Released,
++    /// Caller does not hold this token on their connection.
++    NotHeld,
++    /// Caller held the token but it was already gone from the lobby (expired).
++    NotFound,
++}
++
++/// Release `token` for `game_code` only when the caller holds it in
++/// `reservations`. Prunes the matching entry from `reservations` on success.
++pub fn release_owned_reservation(
++    lobby: &mut LobbyManager,
++    reservations: &mut Vec<(String, String)>,
++    game_code: &str,
++    token: &str,
++) -> ReservationRelease {
++    if !conn_holds_reservation(reservations, game_code, token) {
++        return ReservationRelease::NotHeld;
++    }
++    if lobby.release_reservation(game_code, token) {
++        reservations.retain(|(code, t)| code != game_code || t != token);
++        ReservationRelease::Released
++    } else {
++        ReservationRelease::NotFound
++    }
++}
++
++/// Outcome of attempting to consume a reservation the caller claims to hold.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ReservationConsume {
++    /// Token was held and consumed (seat counted toward occupancy).
++    Consumed,
++    /// Caller does not hold this token on their connection.
++    NotHeld,
++    /// Caller held the token but it was already gone from the lobby (expired).
++    NotFound,
++}
++
++/// Consume `token` for `game_code` only when the caller holds it in
++/// `reservations`. Prunes the matching entry from `reservations` on success.
++pub fn consume_owned_reservation(
++    lobby: &mut LobbyManager,
++    reservations: &mut Vec<(String, String)>,
++    game_code: &str,
++    token: &str,
++) -> ReservationConsume {
++    if !conn_holds_reservation(reservations, game_code, token) {
++        return ReservationConsume::NotHeld;
++    }
++    if lobby.consume_reservation(game_code, token) {
++        reservations.retain(|(code, t)| code != game_code || t != token);
++        ReservationConsume::Consumed
++    } else {
++        ReservationConsume::NotFound
++    }
++}
+diff --git a/crates/phase-server/src/main.rs b/crates/phase-server/src/main.rs
+index 248163b3f..88080e52e 100644
+--- a/crates/phase-server/src/main.rs
++++ b/crates/phase-server/src/main.rs
+@@ -25,7 +25,10 @@ use engine::types::events::GameEvent;
+ use engine::types::game_state::GameState;
+ use engine::types::player::PlayerId;
+ use http::HeaderValue;
+-use lobby_broker::{check_build_commit, Broker, BrokerEnv, BuildCommitCheck, ConnState, Outbound};
++use lobby_broker::{
++    check_build_commit, conn_holds_reservation, Broker, BrokerEnv, BuildCommitCheck, ConnState,
++    Outbound, NOT_OWNED_RESERVATION,
++};
+ use seat_reducer::types::{DeckChoice, DeckResolver, ReducerCtx};
+ use server_core::draft_session::DraftSessionManager;
+ use server_core::lobby::RegisterGameRequest;
+@@ -2956,6 +2959,21 @@ async fn handle_client_message(
+             };
+ 
+             if let Some(token) = release_reservation_token.as_deref() {
++                let held = if info.is_p2p {
++                    conn_holds_reservation(&identity.lobby_reservations, &game_code, token)
++                } else {
++                    conn_holds_reservation(&identity.seat_reservations, &game_code, token)
++                };
++                if !held {
++                    let msg = ServerMessage::Error {
++                        message: NOT_OWNED_RESERVATION.to_string(),
++                    };
++                    if let Ok(json) = serde_json::to_string(&msg) {
++                        let _ = socket.send(Message::text(json)).await;
++                    }
++                    return;
++                }
++
+                 if info.is_p2p {
+                     let released = {
+                         let mut lob = lobby.lock().await;
+@@ -3261,6 +3279,18 @@ async fn handle_client_message(
+                 }
+             }
+ 
++            if let Some(token) = reservation_token.as_deref() {
++                if !conn_holds_reservation(&identity.seat_reservations, &game_code, token) {
++                    let msg = ServerMessage::Error {
++                        message: NOT_OWNED_RESERVATION.to_string(),
++                    };
++                    if let Ok(json) = serde_json::to_string(&msg) {
++                        let _ = socket.send(Message::text(json)).await;
++                    }
++                    return;
++                }
++            }
++
+             let resolved = match resolve_deck(db, &deck) {
+                 Ok(entries) => entries,
+                 Err(e) => {

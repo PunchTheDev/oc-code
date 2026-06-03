@@ -1,0 +1,271 @@
+diff --git a/crates/engine/src/database/synthesis.rs b/crates/engine/src/database/synthesis.rs
+index 5c05c6d067..0757b6aa24 100644
+--- a/crates/engine/src/database/synthesis.rs
++++ b/crates/engine/src/database/synthesis.rs
+@@ -1222,6 +1222,14 @@ pub fn synthesize_cycling(face: &mut CardFace) {
+         })
+         .collect();
+ 
++    // CR 702.29a + CR 702.29c + CR 702.29e: Tag every synthesized cycling /
++    // typecycling ability with `AbilityTag::Cycling` so that activating it emits
++    // a `GameEvent::Cycled` ("When you cycle this card" triggers, CR 702.29c).
++    let mut cycling_abilities = cycling_abilities;
++    for def in &mut cycling_abilities {
++        def.ability_tag = Some(AbilityTag::Cycling);
++    }
++
+     face.abilities.extend(cycling_abilities);
+ }
+ 
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index 1093c99433..9ebb9ba5c7 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -27552,6 +27552,82 @@ mod tests {
+ 
+     /// CR 702.29e + CR 601.2b: Generous Ent ({5}{G}) with only 2 Forests in play.
+     ///
++    /// Issue #1579 — Complicate: "When you cycle this card, …" triggers fire on
++    /// cycling. CR 702.29c: activating a cycling ability now emits a dedicated
++    /// `GameEvent::Cycled` (alongside the `Discarded` cost event), so the
++    /// `TriggerMode::Cycled` trigger matches and goes on the stack.
++    #[test]
++    fn issue_1579_cycling_fires_when_you_cycle_trigger() {
++        use crate::game::scenario::{GameScenario, P0};
++        use crate::types::game_state::StackEntryKind;
++        use crate::types::mana::{ManaType, ManaUnit};
++
++        let mut scenario = GameScenario::new();
++        scenario.at_phase(Phase::PreCombatMain);
++        let card = scenario
++            .add_creature_to_hand_from_oracle(
++                P0,
++                "Test Cycler",
++                2,
++                2,
++                "Cycling {2}\nWhen you cycle this card, draw a card.",
++            )
++            .id();
++        scenario.with_library_top(P0, &["Card A", "Card B", "Card C"]);
++        scenario.with_mana_pool(
++            P0,
++            vec![ManaUnit::new(ManaType::Colorless, ObjectId(9_999), false, vec![]); 2],
++        );
++        let mut runner = scenario.build();
++        let state = runner.state_mut();
++        state.active_player = PlayerId(0);
++        state.priority_player = PlayerId(0);
++
++        let cyc_idx = state
++            .objects
++            .get(&card)
++            .unwrap()
++            .abilities
++            .iter()
++            .position(|a| matches!(a.kind, AbilityKind::Activated))
++            .expect("synthesized cycling activated ability");
++
++        let mut events = Vec::new();
++        handle_activate_ability(state, PlayerId(0), card, cyc_idx, &mut events).unwrap();
++
++        // Fix: cycling now emits a Cycled event for the cycled card …
++        assert!(
++            events
++                .iter()
++                .any(|e| matches!(e, GameEvent::Cycled { object_id, .. } if *object_id == card)),
++            "cycling must emit a Cycled event"
++        );
++        // … and STILL emits Discarded (so discard / cycle-or-discard triggers
++        // continue to fire exactly once via the Discarded event).
++        assert!(
++            events
++                .iter()
++                .any(|e| matches!(e, GameEvent::Discarded { object_id, .. } if *object_id == card)),
++            "cycling must still emit a Discarded event"
++        );
++
++        // The "When you cycle this card" trigger fires and is put on the stack.
++        let stack_before = state.stack.len();
++        crate::game::triggers::process_triggers(state, &events);
++        let trigger_on_stack = state.stack.iter().any(|entry| {
++            matches!(
++                entry.kind,
++                StackEntryKind::TriggeredAbility { source_id, .. } if source_id == card
++            )
++        });
++        assert!(
++            trigger_on_stack,
++            "issue #1579: the cycling trigger must fire and go on the stack; stack={:?}",
++            state.stack
++        );
++        assert!(state.stack.len() > stack_before);
++    }
++
+     /// The creature is uncastable (insufficient mana), but its Forestcycling {1}
+     /// activated ability is payable (costs {1} + discard self). Verifies that:
+     /// 1. `can_cast_object_now` returns false — the AI must not offer CastSpell.
+diff --git a/crates/engine/src/game/casting_targets.rs b/crates/engine/src/game/casting_targets.rs
+index 6b5c80bdc5..f09e1b645c 100644
+--- a/crates/engine/src/game/casting_targets.rs
++++ b/crates/engine/src/game/casting_targets.rs
+@@ -591,6 +591,20 @@ pub(crate) fn emit_keyword_ability_event_if_tagged(
+         return;
+     };
+     if let Some(ability_tag) = def.ability_tag {
++        // CR 702.29c: Cycling does not use the generic `KeywordAbilityActivated`
++        // path — activating it emits a dedicated `GameEvent::Cycled` so "When you
++        // cycle this card" triggers fire. The card has already been discarded to
++        // the graveyard as the cycling cost (the zone the trigger fires from).
++        // The cost also emitted a `Discarded` event, so "whenever you discard"
++        // and "cycle or discard" (CR 702.29d, matched on `Discarded`) still fire
++        // exactly once.
++        if ability_tag == AbilityTag::Cycling {
++            events.push(GameEvent::Cycled {
++                player_id: player,
++                object_id: source_id,
++            });
++            return;
++        }
+         let is_mana_ability =
+             ability_tag == AbilityTag::Exhaust && super::mana_abilities::is_mana_ability(def);
+         events.push(GameEvent::KeywordAbilityActivated {
+diff --git a/crates/engine/src/game/log.rs b/crates/engine/src/game/log.rs
+index d5716b11e1..d47208563f 100644
+--- a/crates/engine/src/game/log.rs
++++ b/crates/engine/src/game/log.rs
+@@ -287,6 +287,9 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
+                 AbilityTag::Evolve => " activates evolve: ",
+                 AbilityTag::Exhaust => " activates exhaust: ",
+                 AbilityTag::Outlast => " activates outlast: ",
++                // CR 702.29c: Cycling emits a dedicated `GameEvent::Cycled`, not a
++                // `KeywordAbilityActivated` event, so this arm is unreachable.
++                AbilityTag::Cycling => " activates cycling: ",
+             };
+             vec![
+                 player_seg(state, *player_id),
+diff --git a/crates/engine/src/game/restrictions.rs b/crates/engine/src/game/restrictions.rs
+index f55d3f80d4..83fcf9b0bb 100644
+--- a/crates/engine/src/game/restrictions.rs
++++ b/crates/engine/src/game/restrictions.rs
+@@ -542,6 +542,10 @@ fn effective_activation_limit(
+         AbilityTag::Evolve => "evolve",
+         AbilityTag::Exhaust => "exhaust",
+         AbilityTag::Outlast => "outlast",
++        // CR 702.29: Cycling has no per-turn activation limit. Unreachable here —
++        // this fn is only called for abilities carrying an `OnlyOnceEachTurn`
++        // restriction, which the synthesized cycling ability never has.
++        AbilityTag::Cycling => "cycling",
+     };
+     // Scan battlefield for ModifyActivationLimit statics that affect this keyword
+     let mut limit: u32 = 1;
+diff --git a/crates/engine/src/game/trigger_matchers.rs b/crates/engine/src/game/trigger_matchers.rs
+index ae4b55261e..f780b3cbc7 100644
+--- a/crates/engine/src/game/trigger_matchers.rs
++++ b/crates/engine/src/game/trigger_matchers.rs
+@@ -2178,29 +2178,30 @@ pub(super) fn match_cycled(
+     }
+ }
+ 
+-/// CR 702.29d: CycledOrDiscarded — fires on either Cycled or Discarded events.
+-/// Per CR 702.29d, triggers only once when a card is cycled (cycling is a form of discarding).
++/// CR 702.29d: CycledOrDiscarded — "Whenever a player cycles or discards a card."
++/// Matches ONLY the `Discarded` event, not `Cycled`: cycling always emits a
++/// `Discarded` event in addition to its `Cycled` event (CR 702.29a — cycling is
++/// "Discard this card …"), so matching `Discarded` alone fires the trigger
++/// exactly once for both plain discards and cycling. Also matching `Cycled`
++/// would double-fire on a cycle, violating CR 702.29d ("These abilities trigger
++/// only once when a card is cycled").
+ pub(super) fn match_cycled_or_discarded(
+     event: &GameEvent,
+     trigger: &TriggerDefinition,
+     source_id: ObjectId,
+     state: &GameState,
+ ) -> bool {
+-    match event {
+-        GameEvent::Cycled {
+-            player_id,
+-            object_id,
+-        }
+-        | GameEvent::Discarded {
+-            player_id,
+-            object_id,
+-        } => {
+-            if !valid_player_matches(trigger, state, *player_id, source_id) {
+-                return false;
+-            }
+-            valid_card_matches(trigger, state, *object_id, source_id)
++    if let GameEvent::Discarded {
++        player_id,
++        object_id,
++    } = event
++    {
++        if !valid_player_matches(trigger, state, *player_id, source_id) {
++            return false;
+         }
+-        _ => false,
++        valid_card_matches(trigger, state, *object_id, source_id)
++    } else {
++        false
+     }
+ }
+ 
+@@ -3589,16 +3590,21 @@ mod tests {
+             source,
+             &state,
+         ));
+-        assert!(!match_cycled_or_discarded(
++        assert!(match_cycled(
+             &GameEvent::Cycled {
+-                player_id: PlayerId(1),
++                player_id: PlayerId(0),
+                 object_id: card,
+             },
+             &trigger,
+             source,
+             &state,
+         ));
+-        assert!(match_cycled(
++
++        // CR 702.29d: `CycledOrDiscarded` matches the `Discarded` event (which
++        // cycling also emits), NOT the `Cycled` event — so it fires exactly once
++        // per cycle. Opponent-scoped `Discarded` is rejected; controller is
++        // matched; and the `Cycled` event is intentionally NOT matched.
++        assert!(!match_cycled_or_discarded(
+             &GameEvent::Cycled {
+                 player_id: PlayerId(0),
+                 object_id: card,
+@@ -3607,8 +3613,17 @@ mod tests {
+             source,
+             &state,
+         ));
++        assert!(!match_cycled_or_discarded(
++            &GameEvent::Discarded {
++                player_id: PlayerId(1),
++                object_id: card,
++            },
++            &trigger,
++            source,
++            &state,
++        ));
+         assert!(match_cycled_or_discarded(
+-            &GameEvent::Cycled {
++            &GameEvent::Discarded {
+                 player_id: PlayerId(0),
+                 object_id: card,
+             },
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index c294237048..703350a5f5 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -8444,6 +8444,11 @@ pub enum AbilityTag {
+     Exhaust,
+     /// CR 702.107a: This ability originated from an Outlast keyword definition.
+     Outlast,
++    /// CR 702.29a + CR 702.29e: This ability originated from a Cycling (or
++    /// Typecycling) keyword definition. Used so the activation pipeline can emit
++    /// a `GameEvent::Cycled` (CR 702.29c) that "When you cycle this card"
++    /// triggers match.
++    Cycling,
+ }
+ 
+ /// Structured activation-time restrictions parsed from Oracle text.

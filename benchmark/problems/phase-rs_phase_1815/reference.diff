@@ -1,0 +1,230 @@
+diff --git a/crates/lobby-broker/src/broker.rs b/crates/lobby-broker/src/broker.rs
+index 3e2a369cc..8b463ce88 100644
+--- a/crates/lobby-broker/src/broker.rs
++++ b/crates/lobby-broker/src/broker.rs
+@@ -139,6 +139,9 @@ impl Broker {
+         msg: LobbyClientMessage,
+         env: &impl BrokerEnv,
+     ) -> Vec<Outbound> {
++        if let Err(reason) = crate::inbound_guard::guard_inbound(&msg) {
++            return vec![error(&reason)];
++        }
+         match msg {
+             LobbyClientMessage::ClientHello {
+                 client_version,
+@@ -1260,6 +1263,37 @@ mod tests {
+         assert!(conn.host_game.is_none());
+     }
+ 
++    #[test]
++    fn handle_rejects_oversized_display_name_without_parse() {
++        let env = FakeEnv::new();
++        let mut broker = Broker::new();
++        let mut conn = ConnState::default();
++        hello(&mut conn, &mut broker, &env);
++        let out = broker.handle(
++            &mut conn,
++            LobbyClientMessage::CreateGameWithSettings {
++                deck: test_deck(),
++                display_name: "a".repeat(21),
++                public: true,
++                password: None,
++                timer_seconds: None,
++                player_count: 4,
++                match_config: Default::default(),
++                format_config: None,
++                room_name: None,
++                host_peer_id: Some("peer-host".into()),
++                draft_metadata: None,
++                start_when_full: true,
++            },
++            &env,
++        );
++        assert!(matches!(
++            out.as_slice(),
++            [Outbound::ToSelf(LobbyServerMessage::Error { .. })]
++        ));
++        assert!(conn.host_game.is_none());
++    }
++
+     #[test]
+     fn unregister_by_non_owner_is_rejected() {
+         let env = FakeEnv::new();
+diff --git a/crates/lobby-broker/src/inbound_guard.rs b/crates/lobby-broker/src/inbound_guard.rs
+new file mode 100644
+index 000000000..22264ad0e
+--- /dev/null
++++ b/crates/lobby-broker/src/inbound_guard.rs
+@@ -0,0 +1,89 @@
++//! Inbound lobby frame guard — shared validation at the broker dispatch boundary.
++//!
++//! The Cloudflare Worker shell validates through [`crate::protocol::parse_lobby_client_message`],
++//! which calls [`crate::validation::validate_lobby_message`]. The native `phase-server` shell
++//! deserializes the wider [`server_core::protocol::ClientMessage`] and projects lobby frames
++//! onto [`crate::protocol::LobbyClientMessage`] without re-parsing, so those frames must be
++//! checked here before any handler runs. Without this gate, oversized display names, passwords,
++//! and deck payloads can be stored, cloned, and broadcast to every lobby subscriber.
++
++use crate::protocol::LobbyClientMessage;
++use crate::validation::validate_lobby_message;
++use engine::starter_decks::DeckData;
++
++/// Generous ceiling on main-deck entries at the wire boundary. Engine deck
++/// validation enforces format legality later; this rejects multi-megabyte lists
++/// before they are cloned through the native projection path.
++pub const MAX_MAIN_DECK_ENTRIES: usize = 500;
++/// Max sideboard entries accepted on the wire.
++pub const MAX_SIDEBOARD_ENTRIES: usize = 100;
++/// Max commander slots accepted on the wire.
++pub const MAX_COMMANDER_ENTRIES: usize = 4;
++/// Max byte length of a single card name string inside a deck payload.
++pub const MAX_DECK_CARD_NAME_LEN: usize = 256;
++
++fn validate_card_name(field: &str, name: &str) -> Result<(), String> {
++    if name.is_empty() {
++        return Err(format!("{field} must not be empty"));
++    }
++    if name.len() > MAX_DECK_CARD_NAME_LEN {
++        return Err(format!(
++            "{field} must be at most {MAX_DECK_CARD_NAME_LEN} bytes"
++        ));
++    }
++    if name.chars().any(|c| c.is_control()) {
++        return Err(format!("{field} must not contain control characters"));
++    }
++    Ok(())
++}
++
++fn validate_deck_list(field: &str, cards: &[String], max_entries: usize) -> Result<(), String> {
++    if cards.len() > max_entries {
++        return Err(format!(
++            "{field} must contain at most {max_entries} entries"
++        ));
++    }
++    for (index, name) in cards.iter().enumerate() {
++        validate_card_name(&format!("{field}[{index}]"), name)?;
++    }
++    Ok(())
++}
++
++/// Bound the deck half of Create/Join lobby messages. Lobby-only mode ignores
++/// deck contents for matchmaking, but the native shell still deserializes and
++/// clones the full structure on every frame.
++pub fn validate_deck_payload(field: &str, deck: &DeckData) -> Result<(), String> {
++    validate_deck_list(
++        &format!("{field}.main_deck"),
++        &deck.main_deck,
++        MAX_MAIN_DECK_ENTRIES,
++    )?;
++    validate_deck_list(
++        &format!("{field}.sideboard"),
++        &deck.sideboard,
++        MAX_SIDEBOARD_ENTRIES,
++    )?;
++    validate_deck_list(
++        &format!("{field}.commander"),
++        &deck.commander,
++        MAX_COMMANDER_ENTRIES,
++    )?;
++    Ok(())
++}
++
++/// Validate every inbound lobby message before handler dispatch. Applies the
++/// string/shape bounds from [`validate_lobby_message`] plus deck payload limits
++/// on the two messages that carry a [`DeckData`] body.
++pub fn guard_inbound(msg: &LobbyClientMessage) -> Result<(), String> {
++    validate_lobby_message(msg)?;
++    match msg {
++        LobbyClientMessage::CreateGameWithSettings { deck, .. } => {
++            validate_deck_payload("deck", deck)?;
++        }
++        LobbyClientMessage::JoinGameWithPassword { deck, .. } => {
++            validate_deck_payload("deck", deck)?;
++        }
++        _ => {}
++    }
++    Ok(())
++}
+diff --git a/crates/lobby-broker/src/lib.rs b/crates/lobby-broker/src/lib.rs
+index beb8a9562..1871e1a5e 100644
+--- a/crates/lobby-broker/src/lib.rs
++++ b/crates/lobby-broker/src/lib.rs
+@@ -9,6 +9,7 @@
+ 
+ pub mod broker;
+ pub mod env;
++pub mod inbound_guard;
+ pub mod lobby;
+ pub mod protocol;
+ pub mod reservation_auth;
+@@ -19,6 +20,7 @@ pub use broker::{
+     MAX_LOBBY_ENTRIES,
+ };
+ pub use env::BrokerEnv;
++pub use inbound_guard::{guard_inbound, validate_deck_payload};
+ pub use lobby::{
+     JoinTargetInfo, LobbyManager, LobbyReservation, RegisterGameRequest, PUBLIC_SEAT_RESERVATION_MS,
+ };
+diff --git a/crates/lobby-broker/src/validation.rs b/crates/lobby-broker/src/validation.rs
+index 21b23fc13..10ce70aa1 100644
+--- a/crates/lobby-broker/src/validation.rs
++++ b/crates/lobby-broker/src/validation.rs
+@@ -222,6 +222,9 @@ pub fn validate_lobby_message(msg: &crate::protocol::LobbyClientMessage) -> Resu
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::inbound_guard::{
++        guard_inbound, MAX_DECK_CARD_NAME_LEN, MAX_MAIN_DECK_ENTRIES, MAX_SIDEBOARD_ENTRIES,
++    };
+     use crate::protocol::{DraftLobbyMetadata, LobbyClientMessage as M};
+     use engine::starter_decks::DeckData;
+ 
+@@ -246,6 +249,16 @@ mod tests {
+         }
+     }
+ 
++    fn join_with(display_name: &str) -> M {
++        M::JoinGameWithPassword {
++            game_code: "ABC123".into(),
++            deck: empty_deck(),
++            display_name: display_name.to_string(),
++            password: None,
++            reservation_token: None,
++        }
++    }
++
+     #[test]
+     fn required_label_bounds() {
+         assert!(validate_required_label("f", "Alice", MAX_DISPLAY_NAME_LEN).is_ok());
+@@ -390,4 +403,31 @@ mod tests {
+     fn ping_has_no_bounded_fields() {
+         assert!(validate_lobby_message(&M::Ping { timestamp: 1 }).is_ok());
+     }
++
++    #[test]
++    fn guard_rejects_oversized_main_deck() {
++        let mut msg = create_with("Alice");
++        if let M::CreateGameWithSettings { deck, .. } = &mut msg {
++            deck.main_deck = vec!["Card".to_string(); MAX_MAIN_DECK_ENTRIES + 1];
++        }
++        assert!(guard_inbound(&msg).is_err());
++    }
++
++    #[test]
++    fn guard_rejects_oversized_card_name_in_deck() {
++        let mut msg = create_with("Alice");
++        if let M::CreateGameWithSettings { deck, .. } = &mut msg {
++            deck.main_deck = vec!["x".repeat(MAX_DECK_CARD_NAME_LEN + 1)];
++        }
++        assert!(guard_inbound(&msg).is_err());
++    }
++
++    #[test]
++    fn guard_rejects_oversized_join_sideboard() {
++        let mut msg = join_with("Bob");
++        if let M::JoinGameWithPassword { deck, .. } = &mut msg {
++            deck.sideboard = vec!["Card".to_string(); MAX_SIDEBOARD_ENTRIES + 1];
++        }
++        assert!(guard_inbound(&msg).is_err());
++    }
+ }

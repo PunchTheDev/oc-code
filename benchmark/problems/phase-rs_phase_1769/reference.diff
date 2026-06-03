@@ -1,0 +1,257 @@
+diff --git a/crates/engine/src/game/effects/change_zone.rs b/crates/engine/src/game/effects/change_zone.rs
+index 78cdc9521..1278f7e57 100644
+--- a/crates/engine/src/game/effects/change_zone.rs
++++ b/crates/engine/src/game/effects/change_zone.rs
+@@ -3374,6 +3374,91 @@ mod tests {
+         assert_eq!(state.objects.get(&opponent_card).unwrap().zone, Zone::Hand);
+     }
+ 
++    #[test]
++    fn scoped_player_hand_change_zone_choice_uses_scoped_player() {
++        let mut state = GameState::new_two_player(42);
++        let controller_card = create_object(
++            &mut state,
++            CardId(20),
++            PlayerId(0),
++            "Controller Hand Creature".to_string(),
++            Zone::Hand,
++        );
++        state
++            .objects
++            .get_mut(&controller_card)
++            .unwrap()
++            .card_types
++            .core_types
++            .push(CoreType::Creature);
++        let opponent_a = create_object(
++            &mut state,
++            CardId(21),
++            PlayerId(1),
++            "Opponent Hand Creature A".to_string(),
++            Zone::Hand,
++        );
++        let opponent_b = create_object(
++            &mut state,
++            CardId(22),
++            PlayerId(1),
++            "Opponent Hand Creature B".to_string(),
++            Zone::Hand,
++        );
++        for id in [opponent_a, opponent_b] {
++            state
++                .objects
++                .get_mut(&id)
++                .unwrap()
++                .card_types
++                .core_types
++                .push(CoreType::Creature);
++        }
++
++        let mut ability = ResolvedAbility::new(
++            Effect::ChangeZone {
++                origin: Some(Zone::Hand),
++                destination: Zone::Battlefield,
++                target: TargetFilter::Typed(
++                    TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
++                ),
++                owner_library: false,
++                enter_transformed: false,
++                enters_under: None,
++                enter_tapped: false,
++                enters_attacking: false,
++                up_to: false,
++                enter_with_counters: vec![],
++            },
++            vec![],
++            ObjectId(200),
++            PlayerId(0),
++        );
++        ability.set_scoped_player_recursive(PlayerId(1));
++
++        let mut events = Vec::new();
++        resolve(&mut state, &ability, &mut events).unwrap();
++
++        match &state.waiting_for {
++            WaitingFor::EffectZoneChoice { player, cards, .. } => {
++                let mut actual = cards.clone();
++                actual.sort_by_key(|id| id.0);
++                let mut expected = vec![opponent_a, opponent_b];
++                expected.sort_by_key(|id| id.0);
++                assert_eq!(*player, PlayerId(1));
++                assert_eq!(
++                    actual, expected,
++                    "scoped-player hand choice must exclude controller hand cards"
++                );
++            }
++            other => panic!("expected EffectZoneChoice for scoped player, got {other:?}"),
++        }
++        assert_eq!(
++            state.objects.get(&controller_card).unwrap().zone,
++            Zone::Hand
++        );
++    }
++
+     #[test]
+     fn optional_targeting_with_zero_targets_resolves_as_noop() {
+         // CR 115.6: "up to one target" with 0 chosen should not fall through
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index a742c0403..1d0ad6f6f 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -2314,10 +2314,35 @@ fn filter_uses_relative_controller_you(filter: &TargetFilter) -> bool {
+     }
+ }
+ 
++/// CR 503.1a + CR 608.2d (issue #1535): True when the filter is scoped to the
++/// resolution's scoped player — e.g. "that player ... a card they control"
++/// bound by an "at the beginning of each player's upkeep, that player may ..."
++/// trigger (Braids, Conjurer Adept). Such a filter must resolve its acting
++/// player and candidate pool against the per-iteration scoped player, not the
++/// ability's controller.
++fn filter_uses_relative_controller_scoped(filter: &TargetFilter) -> bool {
++    match filter {
++        TargetFilter::Typed(tf) => tf.controller == Some(ControllerRef::ScopedPlayer),
++        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
++            filters.iter().any(filter_uses_relative_controller_scoped)
++        }
++        TargetFilter::Not { filter } => filter_uses_relative_controller_scoped(filter),
++        _ => false,
++    }
++}
++
+ pub(crate) fn controller_for_relative_filter(
+     ability: &ResolvedAbility,
+     target_filter: &TargetFilter,
+ ) -> PlayerId {
++    // CR 503.1a + CR 608.2d (issue #1535): a filter scoped to the per-iteration
++    // scoped player ("that player ... from their hand" under "each player's
++    // upkeep") resolves to that scoped player, not the ability's controller.
++    if let Some(scoped) = ability.scoped_player {
++        if filter_uses_relative_controller_scoped(target_filter) {
++            return scoped;
++        }
++    }
+     if filter_uses_relative_controller_you(target_filter)
+         && ability.scoped_player.is_none()
+         && ability
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index d5b27082e..01d95b705 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -10075,6 +10075,28 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
+                 }
+             }
+         }
++        // CR 608.2c + CR 608.2d (issue #1535): "that player may put a [typed]
++        // card from their hand onto the battlefield" (Braids, Conjurer Adept) /
++        // "each player puts a [typed] card from their graveyard ...". When the
++        // subject is a player reference and the `ChangeZone` target is a *typed*
++        // filter, the `Any`-guarded injection in the object-targeting group above
++        // was skipped, leaving the moved-object filter with no owner constraint —
++        // so at resolution it draws from every player's zone and the choice is
++        // mis-routed to the controller. Stamp the subject's controller onto the
++        // filter (mirroring the `Sacrifice` arm) so the card is taken from, and
++        // the choice presented to, the acting (per-iteration) player.
++        Effect::ChangeZone { target, .. }
++            if player_filter_as_controller_ref(&subject_filter).is_some() =>
++        {
++            if let Some(ctrl) = player_filter_as_controller_ref(&subject_filter) {
++                let effective_ctrl = if subject.target.is_some() {
++                    ControllerRef::TargetPlayer
++                } else {
++                    ctrl
++                };
++                force_controller(target, effective_ctrl);
++            }
++        }
+         // CR 115.1c / CR 602.2b + CR 601.2c / CR 119.3: "Target player gains
+         // N life" / "target opponent gains N life" announces a player target;
+         // the chosen player, not the source controller, gains the life.
+@@ -34432,6 +34454,36 @@ mod tests {
+         }
+     }
+ 
++    /// CR 503.1a + CR 608.2d (issue #1535): Braids, Conjurer Adept — "at the
++    /// beginning of each player's upkeep, that player may put a ... card from
++    /// their hand onto the battlefield." Under the scoped-player context the
++    /// trigger establishes, the moved-object filter must be scoped to the acting
++    /// (per-iteration) player, so the card is drawn from THEIR hand — not any
++    /// player's — and the choice is presented to them, not the ability's
++    /// controller. Before the fix the typed ChangeZone target kept no owner
++    /// constraint, so it drew from every hand.
++    #[test]
++    fn that_player_put_from_hand_scopes_change_zone_to_scoped_player() {
++        let mut ctx = ParseContext {
++            relative_player_scope: Some(ControllerRef::ScopedPlayer),
++            ..Default::default()
++        };
++        let clause = parse_effect_clause(
++            "that player may put a creature card from their hand onto the battlefield",
++            &mut ctx,
++        );
++        match &clause.effect {
++            Effect::ChangeZone { target, .. } => {
++                assert_eq!(
++                    target_filter_controller_ref(target),
++                    Some(ControllerRef::ScopedPlayer),
++                    "moved-object filter must be scoped to ScopedPlayer, got {target:?}",
++                );
++            }
++            other => panic!("expected ChangeZone, got: {other:?}"),
++        }
++    }
++
+     #[test]
+     fn mutilate_all_creatures_for_each_is_pump_all() {
+         // CR 609 + CR 611.2: "All creatures get -1/-1 until end of turn for each
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index c08de4cc4..7f5c8fd65 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -11599,12 +11599,44 @@ mod tests {
+         }
+     }
+ 
++    /// Issue #1499 — Arabella, Abandoned Doll: "Whenever Arabella attacks, it
++    /// deals X damage to each opponent and you gain X life, where X is the
++    /// number of creatures you control with power 2 or less." The attack trigger
++    /// must bind X to a dynamic creature count (a `QuantityRef::ObjectCount`),
++    /// not a `Variable("X")` placeholder that resolves to 0 at runtime.
++    #[test]
++    fn arabella_attack_trigger_binds_x_to_creature_count() {
++        let def = parse_trigger_line(
++            "Whenever Arabella, Abandoned Doll attacks, it deals X damage to each \
++             opponent and you gain X life, where X is the number of creatures you \
++             control with power 2 or less.",
++            "Arabella, Abandoned Doll",
++        );
++        assert_eq!(def.mode, TriggerMode::Attacks);
++        let execute = def
++            .execute
++            .as_ref()
++            .expect("Arabella attack trigger must have an execute");
++        match &*execute.effect {
++            Effect::DamageEachPlayer { amount, .. } => assert!(
++                matches!(
++                    amount,
++                    QuantityExpr::Ref {
++                        qty: crate::types::ability::QuantityRef::ObjectCount { .. }
++                    }
++                ),
++                "X must bind to a dynamic creature count, got {amount:?}"
++            ),
++            other => panic!("expected DamageEachPlayer top effect, got {other:?}"),
++        }
++    }
++
+     /// Issue #1585 — Pantlaza, Sun-Favored: "Whenever Pantlaza or another
+     /// Dinosaur you control enters, you may discover X, where X is that
+     /// creature's toughness. Do this only once each turn." The trigger must be
+-    /// an ETB (`ChangesZone` → Battlefield), constrained to once per turn, and
++    /// an ETB (`ChangesZone` -> Battlefield), constrained to once per turn, and
+     /// its execute must be a `Discover` whose limit binds to the *entering*
+-    /// creature's toughness — NOT a `Variable("X")` placeholder, which resolves
++    /// creature's toughness - NOT a `Variable("X")` placeholder, which resolves
+     /// to 0 at runtime and makes discover a silent no-op ("did not discover").
+     #[test]
+     fn trigger_pantlaza_etb_discover_x_is_entering_creature_toughness() {

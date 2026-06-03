@@ -1,0 +1,130 @@
+diff --git a/client/src/components/controls/LifeTotal.tsx b/client/src/components/controls/LifeTotal.tsx
+index 6671277d1f..f78a69f353 100644
+--- a/client/src/components/controls/LifeTotal.tsx
++++ b/client/src/components/controls/LifeTotal.tsx
+@@ -61,6 +61,14 @@ export function LifeTotal({ playerId, size = "default", hideLabel = false }: Lif
+       const newLife = prevLife.current + lifeEvent.data.amount;
+       const doAnimate = () => {
+         animate(motionLife, newLife, { duration: 0.3 });
++        // Issue #1560: advance `prevLife` only when the animation actually
++        // commits, not when it is merely scheduled. The damage-dealt branch
++        // below DEFERS `doAnimate` via a timer that the cleanup cancels when
++        // `activeStep` advances; if `prevLife` were pre-advanced, the authoritative
++        // `life` arriving in the store would equal `prevLife.current`, so the
++        // fallback effect's guard (`prevLife.current !== life`) would suppress the
++        // corrective animation and the displayed total would freeze at the old value.
++        prevLife.current = newLife;
+         // Record the value actually animated toward only when the animation
+         // runs, so a cancelled deferred animation leaves `animatedTo` stale and
+         // Effect 2 reconciles it.
+@@ -70,8 +78,6 @@ export function LifeTotal({ playerId, size = "default", hideLabel = false }: Lif
+         flashTimerRef.current = setTimeout(() => setFlashColor(null), 400);
+       };
+ 
+-      prevLife.current = newLife;
+-
+       if (hasDamageDealt) {
+         impactTimerRef.current = setTimeout(doAnimate, CARD_SLAM_FLIGHT_MS * speedMultiplier);
+       } else {
+diff --git a/client/src/pages/GamePage.tsx b/client/src/pages/GamePage.tsx
+index 4869576d8b..4c0ae0d0f3 100644
+--- a/client/src/pages/GamePage.tsx
++++ b/client/src/pages/GamePage.tsx
+@@ -1933,8 +1933,20 @@ function MulliganBottomCardsPrompt({
+   const objects = useGameStore((s) => s.gameState?.objects);
+   const selectedCardIds = useUiStore((s) => s.selectedCardIds);
+   const cycleSelectedCard = useUiStore((s) => s.cycleSelectedCard);
++  const clearSelectedCards = useUiStore((s) => s.clearSelectedCards);
+   const hoverProps = useInspectHoverProps();
+ 
++  // Issue #1546: `selectedCardIds` is a single store array shared with targeting,
++  // convoke, and tap-for-mana overlays. If a prior overlay left a stale selection
++  // (e.g. an Opening-Hand bottom prompt immediately followed by a Mulligan bottom
++  // prompt, or game 2+ of a match), the bottoming selection starts already at the
++  // cap and clicks appear unresponsive. Clear the shared selection on mount and
++  // unmount, mirroring `TargetingOverlay`, so bottoming always begins empty.
++  useEffect(() => {
++    clearSelectedCards();
++    return () => clearSelectedCards();
++  }, [clearSelectedCards]);
++
+   if (!player || !objects) return null;
+ 
+   const handObjects = player.hand.map((id) => objects[id]).filter(Boolean);
+diff --git a/crates/engine/src/game/visibility.rs b/crates/engine/src/game/visibility.rs
+index d68f89e32c..f8a52a377e 100644
+--- a/crates/engine/src/game/visibility.rs
++++ b/crates/engine/src/game/visibility.rs
+@@ -1242,6 +1242,43 @@ mod tests {
+         }
+     }
+ 
++    /// Issue #1518 (Pithing Needle): a permanent's chosen card name is public
++    /// information (CR 400.2) and MUST remain visible to opponents after the
++    /// per-viewer redaction. `filter_state_for_viewer` only redacts cards in
++    /// hidden zones; a face-up battlefield permanent keeps its
++    /// `chosen_attributes` for every viewer, so the opponent can see which name
++    /// was chosen.
++    #[test]
++    fn chosen_card_name_on_battlefield_permanent_is_visible_to_opponents() {
++        let mut state = GameState::new(FormatConfig::standard(), 2, 42);
++        let needle = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Pithing Needle".to_string(),
++            Zone::Battlefield,
++        );
++        state
++            .objects
++            .get_mut(&needle)
++            .unwrap()
++            .chosen_attributes
++            .push(crate::types::ability::ChosenAttribute::CardName(
++                "Goblin Guide".to_string(),
++            ));
++
++        // The opponent (PlayerId(1)) must still see the chosen name.
++        let filtered = filter_state_for_viewer(&state, PlayerId(1));
++        let seen = &filtered.objects[&needle].chosen_attributes;
++        assert!(
++            seen.iter().any(|a| matches!(
++                a,
++                crate::types::ability::ChosenAttribute::CardName(name) if name == "Goblin Guide"
++            )),
++            "opponent must see the chosen card name on a battlefield permanent, got {seen:?}"
++        );
++    }
++
+     #[test]
+     fn drawn_this_turn_choice_private_tracking_is_hidden_from_non_controller() {
+         let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+diff --git a/crates/phase-server/src/main.rs b/crates/phase-server/src/main.rs
+index f7d4543069..c03bbb22f3 100644
+--- a/crates/phase-server/src/main.rs
++++ b/crates/phase-server/src/main.rs
+@@ -3621,13 +3621,17 @@ async fn handle_client_message(
+                     .collect::<Vec<_>>();
+ 
+                 session.apply_seat_delta(seat_state, &delta, db.as_ref());
+-                // Match `seat_reducer::apply_start` — token occupancy alone can
+-                // disagree with seat kinds (reservations, mid-mutation slots).
+-                let seat_state_after = session.seat_state();
+-                let mut started = delta.now_started
+-                    || (seat_state_after.is_full()
+-                        && session.start_when_full
+-                        && session.is_pregame());
++                // Issue #1506: a `SeatMutate` is an *explicit* host edit (Start,
++                // Kick, Remove, add-AI). Only `SeatMutation::Start` — surfaced as
++                // `delta.now_started` — may begin the game here. Folding in an
++                // `is_full() && start_when_full` auto-start made every seat edit
++                // (e.g. kicking a player from a full room) silently start the game,
++                // while the real Start button appeared inert because the room had
++                // already auto-started on the join that filled it. Auto-start-when-
++                // full is handled in the `JoinGame` path (a guest filling the last
++                // seat), per the `GameSession` contract; it does not belong on the
++                // host's seat-editing path.
++                let mut started = delta.now_started;
+                 // Collect a bracket-violation message to broadcast after releasing the state lock.
+                 // start_game guarantees no mutation on Err, so session state is untouched.
+                 let bracket_error: Option<String> = if started {

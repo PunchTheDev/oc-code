@@ -1,0 +1,553 @@
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index dc7529037..105b9832f 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -4933,6 +4933,13 @@ fn resolve_unless_payer(
+         TargetFilter::Player => {
+             crate::game::targeting::resolve_effect_player_ref(state, ability, payer)
+         }
++        // CR 118.12a + CR 608.2f: "Each player/each opponent ... unless they pay" —
++        // the payer is the player_scope iteration's scoped player, not a chosen
++        // target. resolve_effect_player_ref maps ScopedPlayer -> ability.scoped_player
++        // (bound per-iteration by the fan-out at effects/mod.rs:3015-3069).
++        TargetFilter::ScopedPlayer => {
++            crate::game::targeting::resolve_effect_player_ref(state, ability, payer)
++        }
+         _ => None,
+     }
+ }
+@@ -5956,6 +5963,30 @@ mod tests {
+         );
+     }
+ 
++    // CR 118.12a + CR 608.2f: "each opponent ... unless they pay" — the payer
++    // is the per-iteration scoped player bound by the fan-out, read through
++    // `ScopedPlayer`, not a chosen target. Without this arm the resolver
++    // returns `None` and the punisher fires unconditionally.
++    #[test]
++    fn resolve_unless_payer_scoped_player_reads_ability_scoped_player() {
++        let state = GameState::new_two_player(42);
++        let mut ability = ResolvedAbility::new(
++            Effect::LoseLife {
++                amount: QuantityExpr::Fixed { value: 3 },
++                target: Some(TargetFilter::ScopedPlayer),
++            },
++            vec![],
++            ObjectId(1),
++            PlayerId(0),
++        );
++        // Simulate the fan-out binding the scoped opponent for this iteration.
++        ability.scoped_player = Some(PlayerId(1));
++        assert_eq!(
++            resolve_unless_payer(&state, &ability, &TargetFilter::ScopedPlayer),
++            Some(PlayerId(1))
++        );
++    }
++
+     #[test]
+     fn expand_per_counter_zero_returns_zero_mana() {
+         let base = AbilityCost::Mana {
+diff --git a/crates/engine/src/game/engine_payment_choices.rs b/crates/engine/src/game/engine_payment_choices.rs
+index ed0fac10a..721fcdf63 100644
+--- a/crates/engine/src/game/engine_payment_choices.rs
++++ b/crates/engine/src/game/engine_payment_choices.rs
+@@ -1043,9 +1043,13 @@ fn action_result(events: &mut Vec<GameEvent>, waiting_for: WaitingFor) -> Action
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::types::ability::{AbilityCondition, QuantityExpr, ResolvedAbility, SubAbilityLink};
++    use crate::game::zones::create_object;
++    use crate::types::ability::{
++        AbilityCondition, ControllerRef, QuantityExpr, ResolvedAbility, SubAbilityLink, TypedFilter,
++    };
++    use crate::types::card_type::CoreType;
+     use crate::types::game_state::{AutoMayChoice, MayTriggerAutoChoiceKey, MayTriggerOrigin};
+-    use crate::types::identifiers::ObjectId;
++    use crate::types::identifiers::{CardId, ObjectId};
+     use crate::types::player::PlayerId;
+ 
+     fn gain_life(value: i32) -> Effect {
+@@ -1309,6 +1313,55 @@ mod tests {
+         assert_eq!(state.players[0].life, 17);
+     }
+ 
++    /// CR 118.12a + CR 701.21: Unless-sacrifice costs are payer-relative.
++    /// A parser-emitted `ControllerRef::You` filter must resolve against the
++    /// player paying the cost, not against the ability controller or a chosen
++    /// target player.
++    #[test]
++    fn unless_sacrifice_cost_uses_payer_relative_filter() {
++        let mut state = GameState::new_two_player(42);
++        let creature = create_object(
++            &mut state,
++            CardId(10),
++            PlayerId(1),
++            "Payer Creature".to_string(),
++            Zone::Battlefield,
++        );
++        state
++            .objects
++            .get_mut(&creature)
++            .unwrap()
++            .card_types
++            .core_types = vec![CoreType::Creature];
++
++        let pending = ResolvedAbility::new(gain_life(4), vec![], ObjectId(100), PlayerId(0));
++        state.waiting_for = WaitingFor::UnlessPayment {
++            player: PlayerId(1),
++            cost: AbilityCost::Sacrifice {
++                target: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
++                count: 1,
++            },
++            pending_effect: Box::new(pending),
++            trigger_event: None,
++            effect_description: None,
++            remaining: Vec::new(),
++        };
++
++        let mut events = Vec::new();
++        let waiting_for = state.waiting_for.clone();
++        handle_unless_payment(&mut state, waiting_for, true, &mut events)
++            .expect("unless-sacrifice should surface choice");
++        match &state.waiting_for {
++            WaitingFor::WardSacrificeChoice {
++                player, permanents, ..
++            } => {
++                assert_eq!(*player, PlayerId(1));
++                assert_eq!(permanents, &vec![creature]);
++            }
++            other => panic!("expected WardSacrificeChoice, got {other:?}"),
++        }
++    }
++
+     /// CR 118.12a: "unless any player pays" poll — when the prompted player
+     /// declines and `remaining` is non-empty, the next player is prompted and
+     /// the pending effect is NOT yet resolved. When the last player declines,
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 6f5772cd9..5368ea125 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -14309,7 +14309,8 @@ pub(crate) fn parse_effect_chain_ir(
+         let is_decline_consequence = matches!(decline_dispatch, DeclineDispatch::Prepositional)
+             || decline_consequence_active;
+ 
+-        let (text, mut unless_pay) = extract_resolution_unless_pay_modifier(&text);
++        let (text, mut unless_pay) =
++            extract_resolution_unless_pay_modifier(&text, player_scope.as_ref());
+ 
+         // CR 701.21a + CR 608.2k: Derive the actor performing this chunk's effect
+         // from any actor prefix that was just stripped ("you (may) ", "an
+@@ -15706,7 +15707,10 @@ pub(super) fn parse_unless_payment(lower: &str) -> Option<AbilityCost> {
+     Some(AbilityCost::Mana { cost })
+ }
+ 
+-fn extract_resolution_unless_pay_modifier(text: &str) -> (String, Option<UnlessPayModifier>) {
++fn extract_resolution_unless_pay_modifier(
++    text: &str,
++    player_scope: Option<&PlayerFilter>,
++) -> (String, Option<UnlessPayModifier>) {
+     let lower = text.to_lowercase();
+     if tag::<_, _, OracleError<'_>>("counter ")
+         .parse(lower.trim_start())
+@@ -15734,13 +15738,21 @@ fn extract_resolution_unless_pay_modifier(text: &str) -> (String, Option<UnlessP
+             // just before " unless "; trim trailing whitespace there to
+             // produce the cleaned effect.
+             let cleaned = text[..before_unless.trim_end().len()].trim().to_string();
+-            return (
+-                cleaned,
+-                Some(UnlessPayModifier {
+-                    cost,
+-                    payer: TargetFilter::Player,
+-                }),
+-            );
++            // CR 118.12a + CR 608.2f: select the payer for "they X". A
++            // permanent's controller in the pre-"unless" text (Fade Away)
++            // takes precedence. Otherwise, when this chunk carries a
++            // `player_scope` ("each opponent/each player ... unless they X"),
++            // the payer is the per-iteration scoped player (`ScopedPlayer`,
++            // bound by the fan-out) rather than a chosen player target.
++            // Non-scoped punishers (Tergrid's Lantern) keep `Player`.
++            let payer = if nom_primitives::scan_contains(before_unless, "controller") {
++                TargetFilter::ParentTargetController
++            } else if player_scope.is_some() {
++                TargetFilter::ScopedPlayer
++            } else {
++                TargetFilter::Player
++            };
++            return (cleaned, Some(UnlessPayModifier { cost, payer }));
+         }
+     }
+ 
+@@ -15754,18 +15766,26 @@ fn extract_resolution_unless_pay_modifier(text: &str) -> (String, Option<UnlessP
+         return (text.to_string(), None);
+     };
+ 
+-    // CR 118.12a: "unless they pay ..." surfaces `they` as `TargetFilter::Player`
+-    // provisionally. When the effect text before "unless" taxes a permanent's
+-    // controller ("its controller", "that land's controller" — Fade Away, Stench
+-    // of Evil) rather than a player target (Flay), `they` resolves to that
+-    // controller. `Player` is unique to the "they pay" arm, so this rewrite is
+-    // unambiguous.
+-    let payer =
+-        if payer == TargetFilter::Player && nom_primitives::scan_contains(before, "controller") {
++    // CR 118.12a + CR 608.2f: "unless they pay ..." surfaces `they` as
++    // `TargetFilter::Player` provisionally. When the effect text before "unless"
++    // taxes a permanent's controller ("its controller", "that land's controller"
++    // — Fade Away, Stench of Evil) rather than a player target (Flay), `they`
++    // resolves to that controller. Otherwise, when this chunk carries a
++    // `player_scope` ("each opponent/each player ... unless they pay"), the payer
++    // is the per-iteration scoped player (`ScopedPlayer`) rather than a chosen
++    // player target. Non-scoped punishers keep `Player`. `Player` is unique to
++    // the "they pay" arm, so these rewrites are unambiguous.
++    let payer = if payer == TargetFilter::Player {
++        if nom_primitives::scan_contains(before, "controller") {
+             TargetFilter::ParentTargetController
++        } else if player_scope.is_some() {
++            TargetFilter::ScopedPlayer
+         } else {
+-            payer
+-        };
++            TargetFilter::Player
++        }
++    } else {
++        payer
++    };
+ 
+     let cleaned = text[..before.trim_end().len()].trim().to_string();
+     (cleaned, Some(UnlessPayModifier { cost, payer }))
+@@ -19520,7 +19540,13 @@ mod tests {
+         match &unless_pay.cost {
+             AbilityCost::OneOf { costs } => {
+                 assert_eq!(costs.len(), 2, "expected Sacrifice|Discard, got {costs:?}");
+-                assert!(matches!(costs[0], AbilityCost::Sacrifice { .. }));
++                let AbilityCost::Sacrifice { target, .. } = &costs[0] else {
++                    panic!("first branch should be Sacrifice, got {:?}", costs[0]);
++                };
++                let TargetFilter::Typed(tf) = target else {
++                    panic!("sacrifice target should be typed, got {target:?}");
++                };
++                assert_eq!(tf.controller, Some(ControllerRef::You));
+                 assert!(matches!(costs[1], AbilityCost::Discard { .. }));
+             }
+             other => panic!("expected OneOf disjunctive cost, got {other:?}"),
+@@ -19542,6 +19568,47 @@ mod tests {
+             &unless_pay.cost,
+             AbilityCost::OneOf { costs } if costs.len() == 2
+         ));
++        let AbilityCost::OneOf { costs } = &unless_pay.cost else {
++            unreachable!("checked OneOf cost above");
++        };
++        let AbilityCost::Sacrifice { target, .. } = &costs[0] else {
++            panic!("first branch should be Sacrifice, got {:?}", costs[0]);
++        };
++        let TargetFilter::Typed(tf) = target else {
++            panic!("sacrifice target should be typed, got {target:?}");
++        };
++        assert_eq!(tf.controller, Some(ControllerRef::You));
++        // CR 118.12a: non-scoped "target player" punisher keeps `Player`
++        // (the chosen player target), NOT `ScopedPlayer`. No regression.
++        assert_eq!(unless_pay.payer, TargetFilter::Player);
++    }
++
++    /// CR 608.2f: "Each opponent ... unless they sacrifice ... or discard a
++    /// card" — the `player_scope` makes the payer the per-iteration scoped
++    /// player (`ScopedPlayer`), resolved via `ability.scoped_player`, not a
++    /// chosen player target. This is the symmetric-payer fix.
++    #[test]
++    fn effect_unless_each_opponent_sacrifice_or_discard_binds_scoped_player() {
++        let def = parse_effect_chain(
++            "Each opponent loses 3 life unless they sacrifice a nonland permanent of their choice or discard a card",
++            AbilityKind::Activated,
++        );
++        let unless_pay = def.unless_pay.expect("should attach unless_pay");
++        assert_eq!(unless_pay.payer, TargetFilter::ScopedPlayer);
++        assert!(matches!(
++            &unless_pay.cost,
++            AbilityCost::OneOf { costs } if costs.len() == 2
++        ));
++        let AbilityCost::OneOf { costs } = &unless_pay.cost else {
++            unreachable!("checked OneOf cost above");
++        };
++        let AbilityCost::Sacrifice { target, .. } = &costs[0] else {
++            panic!("first branch should be Sacrifice, got {:?}", costs[0]);
++        };
++        let TargetFilter::Typed(tf) = target else {
++            panic!("sacrifice target should be typed, got {target:?}");
++        };
++        assert_eq!(tf.controller, Some(ControllerRef::You));
+     }
+ 
+     #[test]
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index 7f5c8fd65..26ef39c3a 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -1304,6 +1304,30 @@ fn extract_unless_pay_modifier(
+         return (cleaned, Some(UnlessPayModifier { cost, payer }));
+     }
+ 
++    // CR 118.12a: "[trigger] ... unless they/that player/that opponent
++    // {sacrifice|discard|pay life} [or ...]" — same disjunctive non-mana
++    // unless-cost shape the resolution-time path handles. Delegate to the
++    // single authority (`parse_unless_they_alt_cost_chain`) so trigger-side
++    // and resolution-side parse identically. The chain requires an explicit
++    // pronoun ("they"/"that player"/"that opponent"), so "you"/mana forms
++    // fall through to the existing blocks unchanged.
++    //
++    // GUARD: the chain's per-branch `unless_branch_boundary` stops at the
++    // first sentence terminator, so it would greedily strip the first
++    // unless-clause of a multi-sentence modal effect ("... unless they
++    // discard a card. If you're the monarch, instead ..." — Court of
++    // Ambition). A later "if"-sentence means the whole effect is not a single
++    // terminal unless-cost; defer to the gap path (mirrors the `unless`
++    // dispatch guard below at the `Unsupported unless clause` site).
++    if !has_later_sentence_if(&lower) {
++        if let Some(cost) = parse_unless_they_alt_cost_chain(after_unless) {
++            let payer = infer_pronoun_unless_payer(&lower[..unless_pos], condition_lower)
++                .unwrap_or(TargetFilter::TriggeringPlayer);
++            let cleaned = text[..unless_pos].trim().to_string();
++            return (cleaned, Some(UnlessPayModifier { cost, payer }));
++        }
++    }
++
+     // CR 118.12 + CR 608.2c + CR 119.4: Non-mana alternative costs ("you discard
+     // a card", "you sacrifice a [filter]", "you pay N life") map to existing
+     // `UnlessCost` variants — the runtime resolver in `engine_payment_choices.rs`
+@@ -1465,11 +1489,15 @@ fn infer_pronoun_unless_payer(
+     if effect_references_that_player(effect_before_unless) {
+         return Some(TargetFilter::TriggeringPlayer);
+     }
+-    // CR 608.2c: in "each opponent [does X] unless they pay", the lowered
+-    // ability has `player_scope = Opponent`; runtime binds `Controller` to
+-    // each scoped opponent before presenting the unless-payment choice.
++    // CR 608.2c + CR 608.2f: in "each opponent [does X] unless they pay", the
++    // lowered ability has `player_scope = Opponent`; the runtime fan-out binds
++    // `ability.scoped_player` to each scoped opponent per iteration. The payer
++    // must read that per-iteration binding via `ScopedPlayer` —
++    // `resolve_effect_player_ref` maps `ScopedPlayer -> ability.scoped_player`
++    // (targeting.rs). `Controller` would wrongly resolve to `state.active_player`
++    // (effects/mod.rs), which is not the scoped opponent on a non-active turn.
+     if scan_contains(effect_before_unless, "each opponent ") {
+-        return Some(TargetFilter::Controller);
++        return Some(TargetFilter::ScopedPlayer);
+     }
+     if scan_contains(effect_before_unless, "creature's controller ") {
+         return Some(TargetFilter::ParentTargetController);
+@@ -1810,16 +1838,12 @@ fn parse_unless_they_sacrifice_filter(input: &str) -> Option<(AbilityCost, &str)
+     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
+         return None;
+     }
+-    // CR 109.4 + CR 115.1 + CR 118.12a: "they sacrifice" pins the sacrificed
+-    // permanent to the *payer* — the targeted player on the enclosing
+-    // activated/triggered ability. `ControllerRef::TargetPlayer` reads the
+-    // first `TargetRef::Player` from `ability.targets` at resolution time,
+-    // which is exactly the payer the unless-cost surfaces to. Mirrors the
+-    // "you sacrifice" branch's controller treatment in
+-    // `parse_unless_sacrifice_filter` (which carries `ControllerRef::You`
+-    // via the actor dispatch upstream); for the "they" form the actor *is*
+-    // the target player and we stamp it explicitly here.
+-    let filter = add_controller(filter, ControllerRef::TargetPlayer);
++    // CR 109.5 + CR 118.12a: "they sacrifice" pins the sacrificed permanent
++    // to the player paying the unless-cost. Cost payment evaluates filters with
++    // the payer as the source controller (`FilterContext::from_source_with_controller`),
++    // so `ControllerRef::You` is the payer-relative scope for target-player,
++    // triggering-player, and scoped-player punishers alike.
++    let filter = add_controller(filter, ControllerRef::You);
+     Some((
+         AbilityCost::Sacrifice {
+             target: filter,
+@@ -16510,18 +16534,192 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn trigger_unless_they_pay_binds_each_opponent_to_scoped_controller() {
++    fn trigger_unless_they_pay_binds_each_opponent_to_scoped_player() {
+         let def = parse_trigger_line(
+             "When this creature enters, each opponent sacrifices a permanent of their choice unless they pay {2}.",
+             "Rishadan Footpad",
+         );
+ 
+         let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+-        assert_eq!(unless_pay.payer, TargetFilter::Controller);
++        // CR 608.2f: the per-iteration scoped opponent pays, resolved via
++        // `ability.scoped_player` (not `state.active_player` as `Controller`
++        // would yield on a non-active opponent's behalf).
++        assert_eq!(unless_pay.payer, TargetFilter::ScopedPlayer);
+         let execute = def.execute.as_ref().expect("should have execute");
+         assert_eq!(execute.player_scope, Some(PlayerFilter::Opponent));
+     }
+ 
++    // CR 118.12a: Trigger-side delegation to `parse_unless_they_alt_cost_chain`
++    // for the disjunctive non-mana unless-cost shape. The payer-pronoun axis
++    // {they, that player, that opponent} x cost {sacrifice <filter>, discard a
++    // card, pay N life}. Asserts the typed `UnlessPayModifier` and the cleaned
++    // effect text — never card names.
++    #[test]
++    fn trigger_unless_they_sacrifice_filter_binds_triggering_player() {
++        let def = parse_trigger_line(
++            "Whenever an opponent casts a spell, that player loses 3 life unless they sacrifice a creature.",
++            "Test Punisher",
++        );
++        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
++        assert_eq!(unless_pay.payer, TargetFilter::TriggeringPlayer);
++        assert!(
++            matches!(unless_pay.cost, AbilityCost::Sacrifice { count: 1, .. }),
++            "cost should be Sacrifice, got {:?}",
++            unless_pay.cost
++        );
++        let AbilityCost::Sacrifice { target, .. } = &unless_pay.cost else {
++            unreachable!("checked sacrifice cost above");
++        };
++        let TargetFilter::Typed(tf) = target else {
++            panic!("sacrifice target should be typed, got {target:?}");
++        };
++        assert_eq!(tf.controller, Some(ControllerRef::You));
++    }
++
++    #[test]
++    fn trigger_unless_that_player_discards_a_card() {
++        let def = parse_trigger_line(
++            "Whenever an opponent casts a spell, that player loses 3 life unless that player discards a card.",
++            "Test Punisher",
++        );
++        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
++        assert_eq!(unless_pay.payer, TargetFilter::TriggeringPlayer);
++        assert!(
++            matches!(
++                unless_pay.cost,
++                AbilityCost::Discard {
++                    count: QuantityExpr::Fixed { value: 1 },
++                    filter: None,
++                    random: false,
++                    self_ref: false
++                }
++            ),
++            "cost should be DiscardCard, got {:?}",
++            unless_pay.cost
++        );
++    }
++
++    #[test]
++    fn trigger_unless_that_opponent_pays_life() {
++        let def = parse_trigger_line(
++            "Whenever an opponent casts a spell, that opponent loses 3 life unless that opponent pays 4 life.",
++            "Test Punisher",
++        );
++        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
++        assert_eq!(unless_pay.payer, TargetFilter::TriggeringPlayer);
++        assert!(
++            matches!(
++                unless_pay.cost,
++                AbilityCost::PayLife {
++                    amount: QuantityExpr::Fixed { value: 4 }
++                }
++            ),
++            "cost should be PayLife(4), got {:?}",
++            unless_pay.cost
++        );
++    }
++
++    #[test]
++    fn trigger_unless_they_disjunctive_sacrifice_or_discard_builds_one_of() {
++        let def = parse_trigger_line(
++            "Whenever an opponent casts a spell, that player loses 3 life unless they sacrifice a nonland permanent or discard a card.",
++            "Test Punisher",
++        );
++        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
++        assert_eq!(unless_pay.payer, TargetFilter::TriggeringPlayer);
++        let AbilityCost::OneOf { costs } = &unless_pay.cost else {
++            panic!("cost should be OneOf, got {:?}", unless_pay.cost);
++        };
++        assert_eq!(costs.len(), 2, "OneOf should have two branches: {costs:?}");
++        assert!(
++            matches!(costs[0], AbilityCost::Sacrifice { .. }),
++            "first branch should be Sacrifice, got {:?}",
++            costs[0]
++        );
++        let AbilityCost::Sacrifice { target, .. } = &costs[0] else {
++            unreachable!("checked sacrifice branch above");
++        };
++        let TargetFilter::Typed(tf) = target else {
++            panic!("sacrifice target should be typed, got {target:?}");
++        };
++        assert_eq!(tf.controller, Some(ControllerRef::You));
++        assert!(
++            matches!(costs[1], AbilityCost::Discard { .. }),
++            "second branch should be Discard, got {:?}",
++            costs[1]
++        );
++    }
++
++    #[test]
++    fn trigger_unless_each_opponent_sacrifice_binds_scoped_player() {
++        let def = parse_trigger_line(
++            "When this creature enters, each opponent loses 3 life unless they sacrifice a creature.",
++            "Test Scoped Punisher",
++        );
++        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
++        // CR 608.2f: scoped opponent pays via per-iteration `scoped_player`.
++        assert_eq!(unless_pay.payer, TargetFilter::ScopedPlayer);
++        assert!(
++            matches!(unless_pay.cost, AbilityCost::Sacrifice { count: 1, .. }),
++            "cost should be Sacrifice, got {:?}",
++            unless_pay.cost
++        );
++        let AbilityCost::Sacrifice { target, .. } = &unless_pay.cost else {
++            unreachable!("checked sacrifice cost above");
++        };
++        let TargetFilter::Typed(tf) = target else {
++            panic!("sacrifice target should be typed, got {target:?}");
++        };
++        assert_eq!(tf.controller, Some(ControllerRef::You));
++        let execute = def.execute.as_ref().expect("should have execute");
++        assert_eq!(execute.player_scope, Some(PlayerFilter::Opponent));
++    }
++
++    // NEGATIVE: documented non-goals must NOT be swallowed as unless-pay.
++    #[test]
++    fn trigger_unless_you_mill_is_not_unless_pay() {
++        let def = parse_trigger_line(
++            "When this creature enters, draw a card unless you mill 3.",
++            "Test Card",
++        );
++        assert!(
++            def.unless_pay.is_none(),
++            "mill is an unpayable unless-cost — must not be extracted, got {:?}",
++            def.unless_pay
++        );
++    }
++
++    #[test]
++    fn trigger_unless_you_pay_mana_cost_is_not_unless_pay() {
++        let def = parse_trigger_line(
++            "When this creature enters, draw a card unless you pay its mana cost.",
++            "Test Card",
++        );
++        assert!(
++            def.unless_pay.is_none(),
++            "\"pay its mana cost\" is not a recognized unless-cost, got {:?}",
++            def.unless_pay
++        );
++    }
++
++    // NO-REGRESSION: bare "unless you pay {2}" still routes through the
++    // existing mana block (the "you" pronoun is excluded from the explicit-
++    // pronoun chain), not the new delegation.
++    #[test]
++    fn trigger_unless_you_pay_mana_still_routes_to_mana_block() {
++        let def = parse_trigger_line(
++            "When this creature enters, draw a card unless you pay {2}.",
++            "Test Card",
++        );
++        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
++        assert_eq!(unless_pay.payer, TargetFilter::Controller);
++        assert!(
++            matches!(unless_pay.cost, AbilityCost::Mana { .. }),
++            "cost should be Mana, got {:?}",
++            unless_pay.cost
++        );
++    }
++
+     #[test]
+     fn trigger_unless_they_pay_binds_creature_controller_to_parent_target_controller() {
+         let def = parse_trigger_line(

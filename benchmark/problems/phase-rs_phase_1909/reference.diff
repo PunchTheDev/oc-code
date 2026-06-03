@@ -1,0 +1,451 @@
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index fc88586c4..553050fb3 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -2365,6 +2365,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+         | Effect::Investigate
+         | Effect::BecomeMonarch
+         | Effect::Proliferate
++        | Effect::EndTheTurn
+         | Effect::SolveCase
+         | Effect::Cleanup { .. }
+         | Effect::AddRestriction { .. }
+diff --git a/crates/engine/src/game/effects/end_the_turn.rs b/crates/engine/src/game/effects/end_the_turn.rs
+new file mode 100644
+index 000000000..dbd40fbb4
+--- /dev/null
++++ b/crates/engine/src/game/effects/end_the_turn.rs
+@@ -0,0 +1,176 @@
++use crate::game::effects::change_zone::{self, ZoneMoveResult};
++use crate::types::ability::{EffectError, EffectKind, ResolvedAbility};
++use crate::types::events::GameEvent;
++use crate::types::game_state::{GameState, StackEntryKind};
++use crate::types::zones::Zone;
++
++/// CR 724.1: End the turn. Time Stop, Sundial of the Infinite, Obeka, Glorious
++/// End, Discontinuity, Day's Undoing.
++///
++/// The steps differ from normal spell/ability resolution:
++/// - CR 724.1a: triggered abilities that fired before this process but are not
++///   yet on the stack cease to exist.
++/// - CR 724.1b: exile every object on the stack.
++/// - CR 724.1c: check state-based actions (no priority, no new triggers stacked).
++/// - CR 724.1d: remove everything from combat and skip straight to the cleanup
++///   step.
++pub fn resolve(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    // CR 724.1a: Triggered abilities that triggered before this process began
++    // but haven't been put on the stack yet cease to exist. Abilities that
++    // trigger DURING this process (CR 724.1f) are created after this point and
++    // ride to the stack through the normal cleanup-step flow.
++    state.pending_trigger = None;
++    state.pending_trigger_entry = None;
++    state.pending_trigger_order = None;
++    state.pending_trigger_event_batch.clear();
++    state.deferred_triggers.clear();
++
++    // CR 724.1b: Exile every object on the stack. `resolve_top` already popped
++    // the end-the-turn source's own entry before invoking this resolver; its
++    // post-resolution routing also uses CR 724.1b and sends that resolving
++    // object to exile. Here we exile every OTHER object still on the stack.
++    // Spell entries are card-backed and move to exile through the shared
++    // zone-change pipeline; ability entries (activated / triggered / keyword)
++    // aren't represented by cards, so dropping the stack entry is sufficient
++    // (they cease to exist at the next state-based-action check, CR 724.1b).
++    while let Some(entry) = state.stack.pop_back() {
++        state.stack_paid_facts.remove(&entry.id);
++        if matches!(entry.kind, StackEntryKind::Spell { .. }) {
++            match change_zone::execute_zone_move(
++                state,
++                entry.id,
++                Zone::Stack,
++                Zone::Exile,
++                ability.source_id,
++                None,
++                false,
++                false,
++                None,
++                &[],
++                false,
++                events,
++            ) {
++                ZoneMoveResult::Done => {}
++                ZoneMoveResult::NeedsChoice(player) => {
++                    state.waiting_for =
++                        crate::game::replacement::replacement_choice_waiting_for(player, state);
++                    return Ok(());
++                }
++                ZoneMoveResult::NeedsAuraAttachmentChoice => return Ok(()),
++            }
++        }
++    }
++
++    // CR 724.1c: Check state-based actions. No player gets priority and no
++    // triggered abilities are put on the stack as part of this step.
++    crate::game::sba::check_state_based_actions(state, events);
++
++    // CR 724.1d: Remove all creatures and planeswalkers from combat. Clearing
++    // the combat state is the engine's idiom for ending combat (see the
++    // end-of-combat handling in `turns.rs`); attacking/blocking status is
++    // derived from `state.combat`.
++    state.combat = None;
++
++    // CR 724.1d: Skip straight to the cleanup step (skipping any intervening
++    // phases/steps, including the end step — CR 724.1e).
++    crate::game::turns::end_turn_to_cleanup(state, events);
++
++    events.push(GameEvent::EffectResolved {
++        kind: EffectKind::EndTheTurn,
++        source_id: ability.source_id,
++    });
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::game::combat::{AttackTarget, AttackerInfo, CombatState};
++    use crate::game::zones::create_object;
++    use crate::types::ability::Effect;
++    use crate::types::game_state::{CastingVariant, StackEntry};
++    use crate::types::identifiers::{CardId, ObjectId};
++    use crate::types::phase::Phase;
++    use crate::types::player::PlayerId;
++
++    #[test]
++    fn end_the_turn_exiles_stack_clears_combat_and_enters_cleanup() {
++        let mut state = GameState::new_two_player(42);
++        state.phase = Phase::DeclareAttackers;
++
++        // CR 724.1b: a non-source spell on the stack must be exiled.
++        let other_spell = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(1),
++            "Bolt".to_string(),
++            Zone::Stack,
++        );
++        state.stack.push_back(StackEntry {
++            id: other_spell,
++            source_id: other_spell,
++            controller: PlayerId(1),
++            kind: StackEntryKind::Spell {
++                card_id: CardId(1),
++                ability: None,
++                casting_variant: CastingVariant::Normal,
++                actual_mana_spent: 0,
++            },
++        });
++
++        // CR 724.1d: an attacking creature must be removed from combat.
++        let attacker = create_object(
++            &mut state,
++            CardId(2),
++            PlayerId(0),
++            "Bear".to_string(),
++            Zone::Battlefield,
++        );
++        state.combat = Some(CombatState {
++            attackers: vec![AttackerInfo {
++                object_id: attacker,
++                defending_player: PlayerId(1),
++                attack_target: AttackTarget::Player(PlayerId(1)),
++                blocked: false,
++            }],
++            ..Default::default()
++        });
++
++        // The end-the-turn source (e.g. Time Stop). resolve_top pops its own
++        // stack entry before invoking the resolver, so it is not on the stack
++        // here — only the other spell is.
++        let ability = ResolvedAbility::new(Effect::EndTheTurn, vec![], ObjectId(999), PlayerId(0));
++        let mut events = Vec::new();
++
++        resolve(&mut state, &ability, &mut events).unwrap();
++
++        // CR 724.1b: stack exiled/emptied.
++        assert!(state.stack.is_empty(), "stack should be emptied");
++        assert_eq!(
++            state.objects.get(&other_spell).map(|o| o.zone),
++            Some(Zone::Exile),
++            "the other spell should be exiled"
++        );
++        // CR 724.1d: combat removed and we skipped straight to the cleanup step.
++        assert!(state.combat.is_none(), "combat should be cleared");
++        assert_eq!(
++            state.phase,
++            Phase::Cleanup,
++            "should skip to the cleanup step"
++        );
++        assert!(
++            events.iter().any(|e| matches!(
++                e,
++                GameEvent::EffectResolved {
++                    kind: EffectKind::EndTheTurn,
++                    ..
++                }
++            )),
++            "should emit EffectResolved(EndTheTurn)"
++        );
++    }
++}
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index 617aeb94b..fe7e9d526 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -67,6 +67,7 @@ pub mod double;
+ pub mod draw;
+ pub mod drawn_this_turn_choice;
+ pub mod effect;
++pub mod end_the_turn;
+ pub mod endure;
+ pub mod energy;
+ pub mod exchange_control;
+@@ -1678,6 +1679,7 @@ pub fn resolve_effect(
+         Effect::TimeTravel => Ok(()),
+         Effect::BecomeMonarch => become_monarch::resolve(state, ability, events),
+         Effect::Proliferate => proliferate::resolve(state, ability, events),
++        Effect::EndTheTurn => end_the_turn::resolve(state, ability, events),
+         Effect::Populate => populate::resolve(state, ability, events),
+         Effect::Clash => clash::resolve(state, ability, events),
+         // CR 701.38: Council's-dilemma voting — see effects/vote.rs.
+diff --git a/crates/engine/src/game/printed_cards.rs b/crates/engine/src/game/printed_cards.rs
+index a2ef99eb2..d195bf198 100644
+--- a/crates/engine/src/game/printed_cards.rs
++++ b/crates/engine/src/game/printed_cards.rs
+@@ -694,6 +694,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
+         | Effect::TimeTravel
+         | Effect::BecomeMonarch
+         | Effect::Proliferate
++        | Effect::EndTheTurn
+         | Effect::Populate
+         | Effect::Clash
+         | Effect::SwitchPT { .. }
+diff --git a/crates/engine/src/game/stack.rs b/crates/engine/src/game/stack.rs
+index ee2033049..758cbd6e2 100644
+--- a/crates/engine/src/game/stack.rs
++++ b/crates/engine/src/game/stack.rs
+@@ -1,5 +1,5 @@
+ use crate::types::ability::{
+-    CastingPermission, ContinuousModification, Duration, EffectKind, KeywordAction,
++    CastingPermission, ContinuousModification, Duration, Effect, EffectKind, KeywordAction,
+     ResolvedAbility, TargetFilter, TargetRef,
+ };
+ use crate::types::card_type::CoreType;
+@@ -352,7 +352,15 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
+ 
+     // CR 608.3: Determine destination zone for spells.
+     if is_spell {
+-        let dest = if paradigm_armed {
++        let end_the_turn_resolving_object = ability
++            .as_ref()
++            .is_some_and(|ability| matches!(ability.effect, Effect::EndTheTurn));
++        let dest = if end_the_turn_resolving_object {
++            // CR 724.1b: The "end the turn" procedure exiles every object on
++            // the stack, including the resolving object that `resolve_top`
++            // already popped before executing its effect.
++            Zone::Exile
++        } else if paradigm_armed {
+             // CR 702.xxx: Paradigm-armed spell exiles instead of going to
+             // graveyard. The ExileLink is already created by arm_paradigm.
+             Zone::Exile
+@@ -1956,6 +1964,41 @@ mod tests {
+         );
+     }
+ 
++    /// CR 724.1b: "end the turn" exiles every object on the stack, including
++    /// the resolving spell itself. Discriminating against routing the source
++    /// through the normal CR 608.2n instant/sorcery graveyard path.
++    #[test]
++    fn end_the_turn_spell_exiles_resolving_object() {
++        let mut state = setup();
++        let spell_id = create_object(
++            &mut state,
++            CardId(724),
++            PlayerId(0),
++            "Time Stop".to_string(),
++            Zone::Stack,
++        );
++        let ability = ResolvedAbility::new(Effect::EndTheTurn, vec![], spell_id, PlayerId(0));
++
++        state.stack.push_back(StackEntry {
++            id: spell_id,
++            source_id: spell_id,
++            controller: PlayerId(0),
++            kind: StackEntryKind::Spell {
++                card_id: CardId(724),
++                ability: Some(ability),
++                casting_variant: CastingVariant::Normal,
++                actual_mana_spent: 0,
++            },
++        });
++
++        let mut events = Vec::new();
++        resolve_top(&mut state, &mut events);
++
++        assert_eq!(state.objects[&spell_id].zone, Zone::Exile);
++        assert!(state.exile.contains(&spell_id));
++        assert!(!state.players[0].graveyard.contains(&spell_id));
++    }
++
+     #[test]
+     fn trigger_event_context_becomes_target_controller() {
+         // Set up: triggered ability with BecomesTarget event in trigger_event.
+diff --git a/crates/engine/src/game/trigger_index.rs b/crates/engine/src/game/trigger_index.rs
+index fb42ad270..79a5fa072 100644
+--- a/crates/engine/src/game/trigger_index.rs
++++ b/crates/engine/src/game/trigger_index.rs
+@@ -665,6 +665,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
+         | EffectKind::TimeTravel
+         | EffectKind::BecomeMonarch
+         | EffectKind::Proliferate
++        | EffectKind::EndTheTurn
+         | EffectKind::Populate
+         | EffectKind::Clash
+         | EffectKind::Vote
+diff --git a/crates/engine/src/game/turns.rs b/crates/engine/src/game/turns.rs
+index 8c1c12ab7..5db349526 100644
+--- a/crates/engine/src/game/turns.rs
++++ b/crates/engine/src/game/turns.rs
+@@ -83,6 +83,18 @@ pub fn advance_phase(state: &mut GameState, events: &mut Vec<GameEvent>) {
+     enter_phase(state, next, events);
+ }
+ 
++/// CR 724.1d: End the current turn by skipping straight to the cleanup step.
++/// Discards any extra phases/steps scheduled for this turn (they are skipped)
++/// and enters a fresh cleanup step — per CR 724.1d, even if the turn is ended
++/// during the cleanup step, a new cleanup step begins. Drives `Effect::EndTheTurn`
++/// (Time Stop, Sundial of the Infinite, Obeka, Glorious End, Discontinuity).
++pub fn end_turn_to_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) {
++    // CR 724.1d: "skip any phases or steps between this phase or step and the
++    // cleanup step" — drop scheduled extra phases for this (now-ending) turn.
++    state.extra_phases.clear();
++    enter_phase(state, Phase::Cleanup, events);
++}
++
+ /// Enter a phase directly: set phase, run the CR 703.4q step-end empty
+ /// unspent mana event for each player in APNAP order through the replacement
+ /// pipeline, then (when the queue empties) reset priority (CR 117.3a),
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index 6959c610e..93d06335a 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -5027,6 +5027,20 @@ pub(super) fn parse_imperative_family_ast(
+ ) -> Option<ImperativeFamilyAst> {
+     let first_word = lower.split_whitespace().next().unwrap_or("");
+ 
++    // CR 724.1: "end the turn" (Time Stop, Sundial of the Infinite, Obeka,
++    // Glorious End, Discontinuity, Day's Undoing). Whole-phrase imperative
++    // with no target; parse it as an anchored nom production rather than a
++    // substring scan so unrelated clauses cannot accidentally match it.
++    if all_consuming(terminated(
++        tag::<_, _, OracleError<'_>>("end the turn"),
++        opt(tag(".")),
++    ))
++    .parse(lower.trim())
++    .is_ok()
++    {
++        return Some(ImperativeFamilyAst::GainKeyword(Effect::EndTheTurn));
++    }
++
+     // CR 500.8: Additional step/phase effects can appear in various sentence structures
+     // ("there is an additional combat phase", "after this phase, there is an additional...").
+     // Intercept early regardless of first_word.
+@@ -10354,6 +10368,22 @@ mod tests {
+         }
+     }
+ 
++    /// CR 724.1: "end the turn" parses to the no-target `Effect::EndTheTurn`
++    /// (Time Stop, Sundial of the Infinite, Obeka, Glorious End).
++    #[test]
++    fn end_the_turn_parses_to_end_the_turn_effect() {
++        let ast = parse_imperative_family_ast(
++            "end the turn",
++            "end the turn",
++            &mut ParseContext::default(),
++        )
++        .expect("'end the turn' should parse");
++        assert!(
++            matches!(ast, ImperativeFamilyAst::GainKeyword(Effect::EndTheTurn)),
++            "expected Effect::EndTheTurn"
++        );
++    }
++
+     /// Regression: a genuine life-gain clause must still reach the numeric
+     /// life-gain parser, not be captured by the keyword-grant branch.
+     #[test]
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index d0780d492..633ed453c 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -2851,6 +2851,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
+         | Effect::TimeTravel
+         | Effect::BecomeMonarch
+         | Effect::Proliferate
++        | Effect::EndTheTurn
+         | Effect::Populate
+         | Effect::Clash
+         | Effect::Vote { .. }
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 0973ec29d..6de509cb7 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -5689,6 +5689,11 @@ pub enum Effect {
+     Populate,
+     /// CR 701.30: Clash with an opponent — reveal top cards, compare mana values.
+     Clash,
++    /// CR 724.1: End the turn. Exile every object on the stack, check
++    /// state-based actions, remove everything from combat, then skip straight
++    /// to the cleanup step. Time Stop, Sundial of the Infinite, Obeka,
++    /// Glorious End, Discontinuity, Day's Undoing.
++    EndTheTurn,
+     /// CR 701.38: Vote — each player chooses one of the listed options, starting
+     /// with a specified player and proceeding in turn order. After all votes are
+     /// collected, the resolver runs `per_choice_effect[i]` once for each vote
+@@ -7811,6 +7816,7 @@ impl Effect {
+             | Effect::Proliferate
+             | Effect::Populate
+             | Effect::Clash
++            | Effect::EndTheTurn
+             | Effect::Vote { .. }
+             | Effect::Cleanup { .. }
+             | Effect::RevealTop { .. }
+@@ -7952,6 +7958,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
+         Effect::TimeTravel => "TimeTravel",
+         Effect::BecomeMonarch => "BecomeMonarch",
+         Effect::Proliferate => "Proliferate",
++        Effect::EndTheTurn => "EndTheTurn",
+         Effect::Populate => "Populate",
+         Effect::Clash => "Clash",
+         Effect::Vote { .. } => "Vote",
+@@ -8134,6 +8141,7 @@ pub enum EffectKind {
+     Proliferate,
+     Populate,
+     Clash,
++    EndTheTurn,
+     /// CR 701.38: Vote — interactive APNAP-ordered choice with per-choice tally effects.
+     Vote,
+     /// CR 700.3: SeparateIntoPiles — partition objects into two piles, another player chooses one, sub-effect applies.
+@@ -8314,6 +8322,7 @@ impl From<&Effect> for EffectKind {
+             Effect::TimeTravel => EffectKind::TimeTravel,
+             Effect::BecomeMonarch => EffectKind::BecomeMonarch,
+             Effect::Proliferate => EffectKind::Proliferate,
++            Effect::EndTheTurn => EffectKind::EndTheTurn,
+             Effect::Populate => EffectKind::Populate,
+             Effect::Clash => EffectKind::Clash,
+             Effect::Vote { .. } => EffectKind::Vote,
+diff --git a/crates/phase-ai/src/policies/redundancy_avoidance.rs b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+index 90d1f5bef..5d4549c42 100644
+--- a/crates/phase-ai/src/policies/redundancy_avoidance.rs
++++ b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+@@ -348,6 +348,7 @@ fn redundancy_delta(
+         | Effect::TimeTravel
+         | Effect::BecomeMonarch
+         | Effect::Proliferate
++        | Effect::EndTheTurn
+         | Effect::Populate
+         | Effect::Clash
+         | Effect::Vote { .. }
