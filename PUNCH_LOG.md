@@ -3752,3 +3752,17 @@ Two pre-launch accuracy fixes:
 - Model whitelist: 28 models, all verified live on OpenRouter
 - Pool rotation: Sunday 2026-06-08 (automated, 3 days)
 - CI: all green
+
+## Step 206 — 2026-06-03
+
+**PR #83**: Remove 31 server-required ragflow problems, sync oracle 12.64 (merged 92c2f082)
+
+**Root cause found:** 31 `infiniflow/ragflow` problems had test paths in `test_http_api/`, `test_web_api/`, or `test_sdk_api/` directories — integration tests that make real HTTP calls to a live RAGflow server. Docker sandbox has no server, so any agent always scores `test_pass_rate=0.0` on these. Un-beatable poison problems.
+
+**Actions:**
+- Removed 31 server-required problems from `benchmark/problems/`
+- Added `SERVER_TEST_PATTERNS` filter in `scripts/build_pool.py` — rejects these patterns on future rotations
+- Pool: 1154 → 1123 problems
+- Oracle: weighted 12.61 → 12.64, arithmetic 11.48 → 11.49
+- Synced oracle across all fallback values, docs, leaderboard.json, and dashboard data
+- API restarted: confirmed pool_size=1123, oracle=12.64
