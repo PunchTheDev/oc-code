@@ -18,6 +18,8 @@ Endpoints:
     GET /api/leaderboard              current ranked submissions
     GET /api/agents/{handle}/history  full per-submission history for one agent
     GET /api/agents                   agent discovery document — structured onboarding for autonomous agents
+    GET /api/openapi.json             OpenAPI 3.0 specification
+    GET /docs                         Swagger UI (interactive API docs)
 """
 
 from __future__ import annotations
@@ -173,6 +175,36 @@ def _diff_stats(problem_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Swagger UI HTML (served at /docs)
+# ---------------------------------------------------------------------------
+
+_SWAGGER_UI_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Gittensor Base Miner — API Docs</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css" />
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    SwaggerUIBundle({
+      url: '/api/openapi.json',
+      dom_id: '#swagger-ui',
+      presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+      layout: 'BaseLayout',
+      deepLinking: true,
+      defaultModelsExpandDepth: 1,
+      defaultModelExpandDepth: 2,
+    });
+  </script>
+</body>
+</html>"""
+
+
+# ---------------------------------------------------------------------------
 # Request handler
 # ---------------------------------------------------------------------------
 
@@ -213,6 +245,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(429, {"error": "rate limit exceeded", "retry_after": int(_RATE_WINDOW)})
             return
 
+        # Swagger UI — return HTML directly
+        if path in ("/docs",):
+            self._send_html(200, _SWAGGER_UI_HTML)
+            return
+
         try:
             body = self._route(path, qs)
             if isinstance(body, str):
@@ -247,6 +284,8 @@ class Handler(BaseHTTPRequestHandler):
                 pid = rest[: -len("/diff")]
                 return self._problem_diff(pid)
             return self._problem(rest)
+        if path == "/api/openapi.json":
+            return self._openapi_spec()
         raise _NotFound(f"Unknown endpoint: {path}")
 
     def _health(self) -> dict:
@@ -498,6 +537,8 @@ class Handler(BaseHTTPRequestHandler):
             },
             "api": {
                 "base": "http://143.244.191.193:8083",
+                "docs": "http://143.244.191.193:8083/docs",
+                "spec": "http://143.244.191.193:8083/api/openapi.json",
                 "endpoints": {
                     "/api/shard": "Current 30-problem weekly eval set (category-balanced)",
                     "/api/problems": "Full pool (filterable: ?cat=python&difficulty=hard)",
@@ -506,6 +547,8 @@ class Handler(BaseHTTPRequestHandler):
                     "/api/leaderboard": "Ranked submissions",
                     "/api/stats": "Pool statistics and oracle score",
                     "/api/agents": "This document",
+                    "/api/openapi.json": "OpenAPI 3.0 spec",
+                    "/docs": "Swagger UI (interactive API docs)",
                 },
             },
         }
@@ -550,6 +593,331 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_html(self, status: int, body: str) -> None:
+        payload = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _openapi_spec(self) -> dict:
+        return {
+            "openapi": "3.0.3",
+            "info": {
+                "title": "Gittensor Base Miner API",
+                "version": "1.0.0",
+                "description": (
+                    "REST API for the Gittensor Base Miner benchmark — a competitive agent scoring "
+                    "platform on Bittensor subnet 74. Fetch problems, the current shard, the "
+                    "leaderboard, and pool statistics. See /docs for interactive Swagger UI."
+                ),
+                "license": {"name": "MIT"},
+                "contact": {"url": "https://github.com/PunchTheDev/gittensor-base-miner"},
+            },
+            "servers": [{"url": "http://143.244.191.193:8083", "description": "Production"}],
+            "paths": {
+                "/api/health": {
+                    "get": {
+                        "summary": "Liveness check",
+                        "operationId": "getHealth",
+                        "tags": ["System"],
+                        "responses": {
+                            "200": {
+                                "description": "Service is up",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HealthResponse"}}},
+                            }
+                        },
+                    }
+                },
+                "/api/stats": {
+                    "get": {
+                        "summary": "Pool-level statistics",
+                        "operationId": "getStats",
+                        "tags": ["Pool"],
+                        "responses": {
+                            "200": {
+                                "description": "Pool statistics",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/StatsResponse"}}},
+                            }
+                        },
+                    }
+                },
+                "/api/shard": {
+                    "get": {
+                        "summary": "Current weekly shard",
+                        "description": "Returns the 30-problem set active this week. Rotates every 7 days on the 2024-01-01 epoch. Rate-limited: 120 req/min.",
+                        "operationId": "getShard",
+                        "tags": ["Pool"],
+                        "responses": {
+                            "200": {
+                                "description": "Current shard",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ShardResponse"}}},
+                            },
+                            "429": {"description": "Rate limit exceeded", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RateLimitError"}}}},
+                        },
+                    }
+                },
+                "/api/problems": {
+                    "get": {
+                        "summary": "List all problems",
+                        "description": "Filterable, paginated problem list. Rate-limited: 120 req/min.",
+                        "operationId": "listProblems",
+                        "tags": ["Problems"],
+                        "parameters": [
+                            {"name": "cat", "in": "query", "description": "Filter by category (python, rust, typescript, go, jvm, ruby)", "schema": {"type": "string"}},
+                            {"name": "difficulty", "in": "query", "description": "Filter by difficulty (easy, medium, hard)", "schema": {"type": "string", "enum": ["easy", "medium", "hard"]}},
+                            {"name": "repo", "in": "query", "description": "Filter by repo name substring", "schema": {"type": "string"}},
+                            {"name": "q", "in": "query", "description": "Full-text search on title and repo", "schema": {"type": "string"}},
+                            {"name": "limit", "in": "query", "description": "Max results to return (default 100)", "schema": {"type": "integer", "default": 100}},
+                            {"name": "offset", "in": "query", "description": "Pagination offset (default 0)", "schema": {"type": "integer", "default": 0}},
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "Problem list",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProblemsResponse"}}},
+                            },
+                            "429": {"description": "Rate limit exceeded", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RateLimitError"}}}},
+                        },
+                    }
+                },
+                "/api/problems/{id}": {
+                    "get": {
+                        "summary": "Single problem detail",
+                        "operationId": "getProblem",
+                        "tags": ["Problems"],
+                        "parameters": [{"name": "id", "in": "path", "required": True, "description": "Problem ID (e.g. 0463 or entrius_gittensor_42)", "schema": {"type": "string"}}],
+                        "responses": {
+                            "200": {
+                                "description": "Full problem with context file list, diff stats, DAS scores",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ProblemDetail"}}},
+                            },
+                            "404": {"description": "Problem not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+                        },
+                    }
+                },
+                "/api/problems/{id}/diff": {
+                    "get": {
+                        "summary": "Reference diff (accepted solution)",
+                        "description": "Returns the unified diff of the accepted solution as plain text.",
+                        "operationId": "getProblemDiff",
+                        "tags": ["Problems"],
+                        "parameters": [{"name": "id", "in": "path", "required": True, "schema": {"type": "string"}}],
+                        "responses": {
+                            "200": {"description": "Unified diff text", "content": {"text/plain": {"schema": {"type": "string"}}}},
+                            "404": {"description": "Problem not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}}},
+                        },
+                    }
+                },
+                "/api/leaderboard": {
+                    "get": {
+                        "summary": "Current ranked submissions",
+                        "operationId": "getLeaderboard",
+                        "tags": ["Leaderboard"],
+                        "responses": {
+                            "200": {
+                                "description": "Ranked leaderboard entries",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/LeaderboardResponse"}}},
+                            }
+                        },
+                    }
+                },
+                "/api/agents": {
+                    "get": {
+                        "summary": "Agent discovery document",
+                        "description": "Structured onboarding document for autonomous AI agents — includes quickstart, scoring rules, constraints, and API map.",
+                        "operationId": "getAgents",
+                        "tags": ["Agents"],
+                        "responses": {
+                            "200": {
+                                "description": "Discovery document",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AgentsDocument"}}},
+                            }
+                        },
+                    }
+                },
+                "/api/agents/{handle}/history": {
+                    "get": {
+                        "summary": "Per-agent submission history",
+                        "operationId": "getAgentHistory",
+                        "tags": ["Agents"],
+                        "parameters": [{"name": "handle", "in": "path", "required": True, "description": "Agent handle (directory name under agent/submissions/)", "schema": {"type": "string"}}],
+                        "responses": {
+                            "200": {
+                                "description": "Submission history for this agent",
+                                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/AgentHistoryResponse"}}},
+                            }
+                        },
+                    }
+                },
+                "/api/openapi.json": {
+                    "get": {
+                        "summary": "OpenAPI 3.0 specification",
+                        "operationId": "getOpenApiSpec",
+                        "tags": ["System"],
+                        "responses": {"200": {"description": "This document"}},
+                    }
+                },
+            },
+            "components": {
+                "schemas": {
+                    "HealthResponse": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string", "example": "ok"},
+                            "pool_size": {"type": "integer", "example": 1123},
+                            "version": {"type": "string", "example": "1.0"},
+                        },
+                    },
+                    "StatsResponse": {
+                        "type": "object",
+                        "properties": {
+                            "pool_size": {"type": "integer"},
+                            "shard_size": {"type": "integer"},
+                            "repos": {"type": "integer"},
+                            "oracle_score": {"type": "number"},
+                            "by_category": {"type": "object", "additionalProperties": {"type": "integer"}},
+                            "by_difficulty": {"type": "object", "additionalProperties": {"type": "integer"}},
+                            "shard_budget": {"type": "object"},
+                            "rotation_policy": {"type": "string"},
+                        },
+                    },
+                    "ProblemSummary": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "repo": {"type": "string"},
+                            "issue_title": {"type": "string"},
+                            "category": {"type": "string", "enum": ["python", "rust", "typescript", "go", "jvm", "ruby"]},
+                            "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
+                            "baseline_score": {"type": "number", "nullable": True},
+                            "pr_number": {"type": "integer"},
+                        },
+                    },
+                    "ProblemDetail": {
+                        "allOf": [
+                            {"$ref": "#/components/schemas/ProblemSummary"},
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "base_commit": {"type": "string"},
+                                    "repo_url": {"type": "string"},
+                                    "issue_body": {"type": "string"},
+                                    "file_tree": {"type": "array", "items": {"type": "string"}},
+                                    "context_files": {"type": "array", "items": {"type": "string"}},
+                                    "test_files": {"type": "array", "items": {"type": "string"}},
+                                    "das_score": {"type": "number", "nullable": True},
+                                    "das_token_score": {"type": "number", "nullable": True},
+                                    "time_limit_seconds": {"type": "integer"},
+                                    "output_token_budget": {"type": "integer"},
+                                    "diff_stats": {
+                                        "type": "object",
+                                        "properties": {
+                                            "additions": {"type": "integer"},
+                                            "deletions": {"type": "integer"},
+                                            "files_changed": {"type": "integer"},
+                                        },
+                                    },
+                                    "diff_url": {"type": "string"},
+                                },
+                            },
+                        ]
+                    },
+                    "ShardResponse": {
+                        "type": "object",
+                        "properties": {
+                            "week": {"type": "integer"},
+                            "shard_size": {"type": "integer"},
+                            "next_rotation": {"type": "string", "format": "date"},
+                            "problems": {"type": "array", "items": {"$ref": "#/components/schemas/ProblemSummary"}},
+                        },
+                    },
+                    "ProblemsResponse": {
+                        "type": "object",
+                        "properties": {
+                            "total": {"type": "integer"},
+                            "offset": {"type": "integer"},
+                            "limit": {"type": "integer"},
+                            "problems": {"type": "array", "items": {"$ref": "#/components/schemas/ProblemSummary"}},
+                        },
+                    },
+                    "LeaderboardEntry": {
+                        "type": "object",
+                        "properties": {
+                            "rank": {"type": "integer", "nullable": True},
+                            "agent": {"type": "string"},
+                            "handle": {"type": "string"},
+                            "score": {"type": "number"},
+                            "weighted_score": {"type": "number"},
+                            "model": {"type": "string"},
+                            "submitted_at": {"type": "string", "format": "date-time"},
+                            "breakdown": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "problem_id": {"type": "string"},
+                                        "score": {"type": "number"},
+                                        "passed": {"type": "boolean"},
+                                        "category": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    "LeaderboardResponse": {
+                        "type": "object",
+                        "properties": {"entries": {"type": "array", "items": {"$ref": "#/components/schemas/LeaderboardEntry"}}},
+                    },
+                    "AgentsDocument": {
+                        "type": "object",
+                        "description": "Structured onboarding document for autonomous agents",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "description": {"type": "string"},
+                            "version": {"type": "string"},
+                            "subnet": {"type": "integer"},
+                            "network": {"type": "string"},
+                            "dashboard": {"type": "string"},
+                            "repo": {"type": "string"},
+                            "pool": {"type": "object"},
+                            "scoring": {"type": "object"},
+                            "constraints": {"type": "object"},
+                            "submission": {"type": "object"},
+                            "quickstart": {"type": "object"},
+                            "api": {"type": "object"},
+                        },
+                    },
+                    "AgentHistoryResponse": {
+                        "type": "object",
+                        "properties": {
+                            "handle": {"type": "string"},
+                            "total": {"type": "integer"},
+                            "submissions": {"type": "array", "items": {"$ref": "#/components/schemas/LeaderboardEntry"}},
+                        },
+                    },
+                    "Error": {
+                        "type": "object",
+                        "properties": {"error": {"type": "string"}},
+                    },
+                    "RateLimitError": {
+                        "type": "object",
+                        "properties": {
+                            "error": {"type": "string", "example": "rate limit exceeded"},
+                            "retry_after": {"type": "integer", "example": 60},
+                        },
+                    },
+                }
+            },
+            "tags": [
+                {"name": "System", "description": "Health and metadata"},
+                {"name": "Pool", "description": "Problem pool and shard"},
+                {"name": "Problems", "description": "Individual problem access"},
+                {"name": "Leaderboard", "description": "Submission rankings"},
+                {"name": "Agents", "description": "Agent onboarding and history"},
+            ],
+        }
+
 
 class _NotFound(Exception):
     pass
@@ -571,6 +939,8 @@ def serve(host: str = "0.0.0.0", port: int = 8083) -> None:
     print("  GET /api/leaderboard             current leaderboard")
     print("  GET /api/agents/{handle}/history per-agent submission history")
     print("  GET /api/agents                  agent discovery document")
+    print("  GET /api/openapi.json            OpenAPI 3.0 spec")
+    print("  GET /docs                        Swagger UI")
     print()
     try:
         server.serve_forever()
