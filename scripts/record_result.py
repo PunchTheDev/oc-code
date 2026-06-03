@@ -166,6 +166,7 @@ def main():
             "score": round(float(p.get("final_score", 0.0)), 4),
             "benchmark_score": round(float(p.get("benchmark_score", 0.0)), 4) if p.get("benchmark_score") is not None else None,
             "test_pass_rate": round(float(p.get("test_pass_rate", 0.0)), 4) if p.get("test_pass_rate") is not None else None,
+            "test_quality_factor": round(float(p.get("test_quality_factor", 1.0)), 4) if p.get("test_quality_factor") is not None else None,
             "passed": bool(p.get("tests_passed", False)),
             "category": p.get("category", ""),
             "difficulty": p.get("difficulty", ""),
