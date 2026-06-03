@@ -13,6 +13,16 @@ Executes scoring for a single benchmark problem inside an isolated container:
   - Secrets (OPENROUTER_KEY etc.) never passed to containers — no model cheating
   - Ephemeral: container is removed after each run (--rm)
 
+Repo cache mount (Phase 1 speedup):
+  Before launching the Phase 1 container, run_in_sandbox() calls cached_repo()
+  to ensure a local clone exists in ~/.cache/gitminer/repos/{owner_repo}. When
+  it does, the clone is bind-mounted read-only at /gitminer_cache inside the
+  container. setup_and_test.sh then does a fast local clone from /gitminer_cache
+  instead of a network clone, eliminating a 10–90s round-trip per problem.
+  If the commit isn't in the local cache (stale clone), the script falls back to
+  fetching the exact commit from origin before checking out. Network-free fallback
+  if Docker is unavailable: score.score_patch() is called directly.
+
 Fallback chain:
   - If SCORE_IMAGE is unavailable, falls back to python:3.12-slim with heuristic
     token scoring (same as pre-tree-sitter behaviour).
@@ -273,6 +283,10 @@ def run_in_sandbox(problem_dir: Path, patch_path: Path) -> dict:
     Metric enrichment reads test_out.txt from the staging dir before cleanup,
     then computes the full metric set using the same functions as score.score_patch().
     This ensures sandbox and local scoring paths return identical result shapes.
+
+    Repo cache: before launching the container, warms the host repo cache so
+    the Phase 1 container can clone locally (10–90× faster than a network clone).
+    The cache path is bind-mounted read-only at /gitminer_cache inside the container.
     """
     if not _docker_available():
         from benchmark.harness.score import score_patch
@@ -281,10 +295,22 @@ def run_in_sandbox(problem_dir: Path, patch_path: Path) -> dict:
     meta = json.loads((problem_dir / "meta.json").read_text())
     time_limit: int = meta.get("time_limit_seconds", 120)
 
+    # Warm the host repo cache so Phase 1 can do a fast local clone.
+    # Best-effort: if the cache warm fails (no network, permission issue) we
+    # fall back to the normal in-container network clone.
+    cache_path: Path | None = None
+    repo_url = meta.get("repo_url", "")
+    if repo_url:
+        try:
+            from benchmark.harness.score import cached_repo
+            cache_path = cached_repo(repo_url)
+        except Exception:
+            pass  # network unavailable — container will clone directly
+
     with tempfile.TemporaryDirectory(prefix="bminer_") as staging:
         staging_path = Path(staging)
-        _prepare_staging(staging_path, meta, patch_path)
-        result = _run_container(staging_path, meta, time_limit)
+        _prepare_staging(staging_path, meta, patch_path, cache_path=cache_path)
+        result = _run_container(staging_path, meta, time_limit, cache_path=cache_path)
         # Enrich with full metrics before staging dir is cleaned up.
         result = _enrich_result(result, staging_path, problem_dir, patch_path, meta)
 
@@ -383,8 +409,18 @@ def _git_apt_block(runner: str) -> str:
     return "apt-get update -qq >/dev/null && apt-get install -y -qq git >/dev/null"
 
 
-def _prepare_staging(staging: Path, meta: dict, patch_path: Path) -> None:
-    """Write all files the container needs into the staging directory."""
+def _prepare_staging(
+    staging: Path,
+    meta: dict,
+    patch_path: Path,
+    cache_path: "Path | None" = None,
+) -> None:
+    """Write all files the container needs into the staging directory.
+
+    When cache_path is provided, setup_and_test.sh will clone from the
+    bind-mounted /gitminer_cache (fast local copy) instead of the network.
+    Falls back to a network clone if the required commit isn't in the cache.
+    """
     shutil.copy(patch_path, staging / "candidate.diff")
     (staging / "meta.json").write_text(json.dumps(meta))
 
@@ -407,6 +443,33 @@ def _prepare_staging(staging: Path, meta: dict, patch_path: Path) -> None:
     git_block = _git_apt_block(runner)
     install_block = _install_block(test_cmd)
 
+    repo_url = meta["repo_url"]
+    base_commit = meta["base_commit"]
+
+    # Clone block: use local cache mount when available (much faster), with
+    # automatic fallback for stale caches that don't have the target commit.
+    if cache_path is not None:
+        clone_block = textwrap.dedent(f"""\
+            if [ -d /gitminer_cache ]; then
+                git clone --quiet /gitminer_cache /repo
+                cd /repo
+                if ! git checkout --quiet {base_commit} 2>/dev/null; then
+                    # Commit not in local cache — fetch it from origin.
+                    git remote set-url origin {repo_url}
+                    git fetch --quiet --depth=1 origin {base_commit} || git fetch --quiet origin
+                    git checkout --quiet {base_commit}
+                fi
+            else
+                git clone --quiet {repo_url} /repo
+                cd /repo
+                git checkout --quiet {base_commit}
+            fi""")
+    else:
+        clone_block = textwrap.dedent(f"""\
+            git clone --quiet {repo_url} /repo
+            cd /repo
+            git checkout --quiet {base_commit}""")
+
     (staging / "setup_and_test.sh").write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
         set -euo pipefail
@@ -414,9 +477,7 @@ def _prepare_staging(staging: Path, meta: dict, patch_path: Path) -> None:
 
         {git_block}
 
-        git clone --quiet {meta["repo_url"]} /repo
-        cd /repo
-        git checkout --quiet {meta["base_commit"]}
+        {clone_block}
 
         # Install dependencies (best-effort)
         {install_block.rstrip()}
@@ -444,7 +505,12 @@ def _prepare_staging(staging: Path, meta: dict, patch_path: Path) -> None:
     (staging / "score_result.py").write_text(_SCORE_RESULT_SCRIPT)
 
 
-def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
+def _run_container(
+    staging: Path,
+    meta: dict,
+    time_limit: int,
+    cache_path: "Path | None" = None,
+) -> dict:
     problem_id = meta["id"]
     container_name = f"bminer_{problem_id}_{os.getpid()}"
     host_timeout = time_limit + KILL_GRACE + 60
@@ -453,6 +519,8 @@ def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
     setup_image = _lang_image(test_cmd)
 
     # Phase 1: setup + test + file content capture.
+    # Mount the host repo cache read-only when available so setup_and_test.sh
+    # can clone locally instead of over the network (10–90× faster).
     setup_cmd = [
         "docker", "run", "--rm",
         "--name", container_name,
@@ -460,6 +528,10 @@ def _run_container(staging: Path, meta: dict, time_limit: int) -> dict:
         "--cpus", CPU_LIMIT,
         "--stop-timeout", str(KILL_GRACE),
         "-v", f"{staging}:/staging",
+    ]
+    if cache_path is not None and cache_path.exists():
+        setup_cmd += ["-v", f"{cache_path}:/gitminer_cache:ro"]
+    setup_cmd += [
         setup_image,
         "/bin/bash", "/staging/setup_and_test.sh",
     ]
