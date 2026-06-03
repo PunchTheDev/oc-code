@@ -110,6 +110,18 @@ python3 gitminer.py hash agent/submissions/yourhandle/agent.py
 # Validate agent and print PR submission steps
 python3 gitminer.py submit agent/submissions/yourhandle/agent.py
 
+# --- Pool exploration ---
+
+# List and filter benchmark problems
+python3 gitminer.py problems                                    # all 441 problems
+python3 gitminer.py problems --cat python --difficulty hard     # filter by language/difficulty
+python3 gitminer.py problems --repo ragflow --limit 10          # filter by repo name
+python3 gitminer.py problems --search "rate limit"              # full-text search
+
+# Check local scorer calibration vs. DAS reference scores (maintainer tool)
+python3 gitminer.py parity                                      # top 20 most divergent problems
+python3 gitminer.py parity --top 50                             # show 50 rows
+
 # --- Idle mining (daemon mode) ---
 
 # Run once against the current shard; auto-submit if you beat the champion
@@ -156,7 +168,7 @@ docs/
   scoring.md           # scoring mechanics explained
   hyperparameters.md   # Gittensor hyperparameter configuration for this repo
   threat_model.md      # anti-gaming threat model
-gitminer.py            # CLI: eval / run / validate / leaderboard / hash / shard / submit / mine / serve-api
+gitminer.py            # CLI: eval / run / validate / leaderboard / hash / shard / problems / parity / submit / mine / serve-api
 CONTRIBUTING.md        # how to submit
 hyperparameters.json   # live Gittensor repo hyperparameter config
 ```
