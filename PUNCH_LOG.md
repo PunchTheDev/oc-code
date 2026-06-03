@@ -2908,3 +2908,191 @@ Dashboard: punchthedev.github.io/gittensor-miner-dashboard/ updated to 812 probl
 - All oracle fallbacks updated: evaluate.py, gitminer.py, eval.yml (14.26)
 - pool_config.json: pool_size=763
 - API restarted: confirmed pool=763, oracle=14.26
+
+---
+
+## Step 172 — 2026-06-03
+
+### Ruby pool expansion: 763→800 problems (PR #29, merged)
+
+- rubocop/rubocop: +22 problems (RSpec-backed linter cop bug fixes)
+- rubocop/rubocop-rails: +15 problems (Rails-specific cop bug fixes)
+- 13 pruned (base_score < 0.5)
+- Ruby: 38 → 75 problems (5.0% → 9.4% of pool)
+- Shard: ruby 1→2, python 13→12
+- `infer_test_cmd` extended: Ruby/RSpec → `bundle exec rspec <spec_files>`
+- Oracle: 14.26 → 13.73 weighted / 12.99 → 12.38 arithmetic
+
+### Pool state
+- Pool: 800 | Oracle: 13.73 weighted / 12.38 arithmetic | Repos: 26
+
+---
+
+## Step 173 — 2026-06-03
+
+### Bug fix + TypeScript expansion (PRs #30, #31, merged)
+
+**PR #30 — Fix refresh_pool.yml:**
+- Sunday rotation was running `build_pool.py` (DAS only) but never `expand_pool_external.py`
+- All 15 external repos were silently skipped on Sunday rotation — new merged PRs never picked up
+- Fix: added "Refresh external repos" step; oracle values now auto-synced to pool_config.json after each run
+
+**PR #31 — colinhacks/zod +21 problems (800→821):**
+- zod (38k stars): TypeScript type-system bug fixes with vitest tests
+- 30 ingested → 9 pruned (base_score < 0.5) → +21 net
+- `infer_test_cmd`: TypeScript .test.ts/.spec.ts → `npm test` (unlocks all future TypeScript repos)
+- TypeScript: 93 → 114 problems (11.6% → 13.9%)
+- Oracle: 13.73 → 13.69 weighted / 12.38 → 12.37 arithmetic
+
+### Pool state
+- Pool: 821 | Oracle: 13.69 weighted / 12.37 arithmetic | Repos: 28
+
+---
+
+## Step 174 — 2026-06-03
+
+### Bug fix + TypeScript expansion (PR #32, merged)
+
+**Bug fix — EXTERNAL_REPOS sync:**
+- 7 Python repos added in step 170 (aiohttp, flask, fastapi, tornado, twisted, trio, celery) were in pool_config.json but missing from expand_pool_external.py's EXTERNAL_REPOS constant
+- Sunday auto-rotation would have silently skipped all 7 repos forever — fixed
+
+**TypeScript expansion:**
+- vitest-dev/vitest: 30 ingested → 6 pruned → +24 net
+- trpc/trpc: 30 ingested → 9 pruned → +21 net
+- TypeScript: 114 → 159 problems (13.9% → 18.4%)
+- Shard: typescript 5→6, rust 9→8
+- Oracle: 13.69 → 13.39 weighted / 12.37 → 12.09 arithmetic
+
+### Pool state
+- Pool: 866 | Oracle: 13.39 weighted / 12.09 arithmetic | Repos: 30
+
+---
+
+## Step 175 — 2026-06-03
+
+### TypeScript + Python expansion (PR #33, merged)
+
+- vuejs/core (48k stars): Vue 3 compiler/reactivity bugs +27 problems
+- python/mypy (18k stars): Type checker regression bugs +27 problems
+- TypeScript: 159 → 186 (20.2%); Shard: rust 8→7, typescript 6→7
+- Oracle: 13.39 → 12.99 weighted / 12.09 → 11.68 arithmetic
+
+### Pool state
+- Pool: 920 | Oracle: 12.99 weighted / 11.68 arithmetic | Repos: 32
+
+---
+
+## Step 176 — 2026-06-03
+
+### Rust expansion + infer_test_cmd bug fix (PR #34, merged)
+
+**Bug fixed:** `infer_test_cmd` had no Rust handler — fell through to Python `pytest` default
+- Fix: detect any `.rs` file → `["cargo", "test"]`; patched all 60 new meta.json files retroactively
+
+**Expansion:**
+- tokio-rs/tokio (28k stars): Rust async runtime bugs +30
+- clap-rs/clap (14k stars): Rust CLI parser bugs +30
+- Rust: 200 → 260 (26.5%); Shard: rust 7→8, typescript 7→6
+- Oracle: 12.99 → 12.76 weighted / 11.68 → 11.46 arithmetic
+
+### Pool state
+- Pool: 980 | Oracle: 12.76 weighted / 11.46 arithmetic | Repos: 34
+
+---
+
+## Step 177 — 2026-06-03
+
+### Rust HTTP ecosystem: 1000-problem milestone (PR #35, merged)
+
+- hyperium/hyper (14k stars): Rust HTTP/1-2 library +12 (all base_score ≥ 1.69)
+- tokio-rs/axum (20k stars): Rust web framework +8 (all base_score ≥ 3.37)
+- Rust: 260 → 280 (28.0%); Oracle: 12.76 → 12.86 weighted / 11.46 → 11.57 arithmetic
+
+### Pool state
+- Pool: 1000 | Oracle: 12.86 weighted / 11.57 arithmetic | Repos: 36
+
+---
+
+## Step 178 — 2026-06-03
+
+### JVM pool expansion (PR #36, merged)
+
+- FasterXML/jackson-databind (10k stars): Java JSON bugs +24
+- square/okhttp (45k stars): Kotlin HTTP/2 bugs +4
+- `infer_test_cmd` now handles `.java`/`.kt`/`.scala` → `./gradlew test --no-daemon -q`
+- REPO_CATEGORY keys fixed to lowercase (API uses `.lower()` lookup)
+- JVM: 41 → 69 (6.7%); Oracle: 12.86 → 12.75 weighted / 11.57 → 11.49 arithmetic
+
+### Pool state
+- Pool: 1028 | Oracle: 12.75 weighted / 11.49 arithmetic | Repos: 38
+
+---
+
+## Step 179 — 2026-06-03
+
+### Go language added as 6th category (PR #37, merged)
+
+- gin-gonic/gin (75k stars): Go HTTP framework +13
+- labstack/echo (28k stars): Go HTTP framework +4 (1 pruned)
+- `infer_test_cmd` now handles `.go` → `go test ./...`
+- Shard: python 12→11, go:1 added (still 30 total)
+- Oracle: 12.75 → 12.66 weighted / 11.49 → 11.39 arithmetic
+
+### Pool state
+- Pool: 1045 | Oracle: 12.66 weighted / 11.39 arithmetic | Repos: 40 | Languages: 6
+
+---
+
+## Step 180 — 2026-06-03
+
+### Go pool expansion: 17→96 problems (PR #38, merged)
+
+- gofiber/fiber (31k stars): +58 problems
+- grpc/grpc-go (21k stars): +17 problems
+- spf13/cobra (35k stars): +4 problems
+- Retroactive quality prune: 13 sub-threshold problems removed
+- Shard rebalanced: go 1→3, python 11→10, rust 8→7
+- Oracle: 12.66 → 12.64 weighted / 11.39 → 11.41 arithmetic
+
+### Pool state
+- Pool: 1114 | Oracle: 12.64 weighted / 11.41 arithmetic | Repos: 43
+
+---
+
+## Step 181 — 2026-06-03
+
+### Cleanup + prestige repo expansion (PRs #39, #40, #41, all merged)
+
+**PR #39 — Sync 3 stale values:**
+- pool_config.json shard_budget: python 11→10, rust 8→7, go 1→3
+- results/leaderboard.json: oracle 13.69/12.37/821 → 12.64/11.41/1114
+- REGISTRATION.md: "441 problems, 13 repos" → "1114 problems, 43 repos"
+
+**PR #40 — Fix LEADERBOARD.md repo count: 40→43**
+
+**PR #41 — Pool expansion 1114→1131:**
+- google/guava (50k stars, Java): +7
+- serde-rs/serde (24k stars, Rust): +7
+- sindresorhus/got (14k stars, TypeScript): +3
+- JVM: 69→76 / Rust: 270→277 / TypeScript: 186→189 / Repos: 43→46
+
+### Pool state
+- Pool: 1131 | Oracle: 12.64 weighted / 11.41 arithmetic | Repos: 46 | Languages: 6
+- Composition: python:418 rust:277 typescript:189 go:96 jvm:76 ruby:75
+
+---
+
+## Step 182 — 2026-06-03
+
+### Health check + PUNCH_LOG sync
+
+- System health verified: API pool=1131, oracle=12.64, repos=46 ✅
+- DAS API checked: 3308 total PRs, 1800 merged — no high-value new problems found (recent additions are content-only or micro-fixes)
+- PUNCH_LOG.md updated: steps 172-181 now logged (was missing ~10 steps)
+- Pool is well-balanced; Sunday rotation (2026-06-08) will auto-expand all 33 external + 13 DAS repos
+- Critical blockers still awaiting operator: Daytona integration, per-miner OpenRouter key strategy
+
+### Pool state
+- Pool: 1131 | Oracle: 12.64 weighted / 11.41 arithmetic | Repos: 46 | Languages: 6
+- Next action: Operator input on Daytona credentials and per-miner OpenRouter key
