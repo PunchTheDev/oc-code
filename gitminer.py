@@ -1053,7 +1053,8 @@ def cmd_mine(args: argparse.Namespace) -> None:
         human = [e for e in entries if "Oracle" not in e.get("agent", "")]
         if not human:
             return 0.0
-        return float(human[0].get("score", 0.0))
+        row = human[0]
+        return float(row.get("weighted_score") or row.get("score", 0.0))
 
     def _run_cycle() -> None:
         champ = _champion_score()
@@ -1074,25 +1075,26 @@ def cmd_mine(args: argparse.Namespace) -> None:
             print("No problems evaluated.")
             return
 
-        total = sum(p.get("final_score", 0.0) for p in problems)
-        mean = total / len(problems)
+        weighted_mean = results.get("weighted_mean_score") or (
+            sum(p.get("final_score", 0.0) for p in problems) / len(problems)
+        )
         passed = sum(1 for p in problems if p.get("tests_passed", False))
-        print(f"\nResult: {mean:.2f} / 30.00   ({passed}/{len(problems)} tests passing)")
+        print(f"\nResult: {weighted_mean:.2f} / 30.00 (weighted)   ({passed}/{len(problems)} tests passing)")
 
-        if champ and mean <= champ:
-            gap = champ - mean
+        if champ and weighted_mean <= champ:
+            gap = champ - weighted_mean
             print(f"Gap to champion: {gap:.2f} — keep improving!")
             return
 
         status = "BEAT CHAMPION" if champ else "FIRST SUBMISSION"
-        print(f"\n🎯  {status}! Your score: {mean:.2f}")
+        print(f"\n🎯  {status}! Your weighted score: {weighted_mean:.2f}")
 
         # Generate commit-reveal hash from agent file content
         agent_bytes = Path(agent_path).read_bytes()
         reveal_hash = hashlib.sha256(agent_bytes).hexdigest()
         print(f"\nCommit-reveal hash: {reveal_hash}")
         print(f"\nNext steps:")
-        print(f"  1. Run: python gitminer.py submit {agent_path}")
+        print(f"  1. Run: python3 gitminer.py submit {agent_path}")
         print(f"  2. Open a PR — the CI will score your agent and publish results.")
         print(f"  3. Post the hash {reveal_hash[:16]}... in your PR body to claim credit.\n")
 
