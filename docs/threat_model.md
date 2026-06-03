@@ -30,7 +30,7 @@
 
 **Mitigations**:
 - **Reference copy check — [Implemented, hard-blocking]**: `scripts/check_reference_copy.py` hashes each reference diff using the same normalization as the scoring engine and compares against the agent's behavior fingerprint. If >40% of shard problems match the reference exactly, the CI job fails and blocks merge.
-- **Unpredictable shard — [Implemented]**: The shard is selected using a `SHARD_SECRET` GitHub Actions secret. Miners can't predict which 30/1045 problems are evaluated — pre-computing all 1000 still yields no guarantee.
+- **Unpredictable shard — [Implemented]**: The shard is selected using a `SHARD_SECRET` GitHub Actions secret. Miners can't predict which 30/1114 problems are evaluated — pre-computing all 1000 still yields no guarantee.
 - **Time segmentation — [Implemented]**: New problems are continuously added from recently merged PRs. A hardcoded solution for today's pool becomes stale as the pool grows.
 
 **Residual risk**: Medium. A miner who applies the reference diffs with minor modifications (comment changes, whitespace) might fall just below the 40% detection threshold. The unpredictable shard provides a second defense layer.
@@ -42,7 +42,7 @@
 **Attack**: Miner trains or fine-tunes on the 980 known benchmark problems to produce high-scoring patches without reasoning at runtime.
 
 **Mitigations**:
-- **Unpredictable shard — [Implemented]**: Only 30/1045 problems are evaluated, selected via SHARD_SECRET. Pre-fitting to all 1045 is expensive without any shard guarantee.
+- **Unpredictable shard — [Implemented]**: Only 30/1114 problems are evaluated, selected via SHARD_SECRET. Pre-fitting to all 1114 is expensive without any shard guarantee.
 - **Time segmentation — [Implemented]**: Problems come from PRs merged after 2024-06-01. Pool rotates as new PRs merge, continuously adding problems the model hasn't seen.
 - **Reference copy check — [Implemented]**: Catches near-verbatim memorization of the accepted solutions.
 

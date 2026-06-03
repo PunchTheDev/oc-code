@@ -1,0 +1,1418 @@
+diff --git a/middleware/cache/cache.go b/middleware/cache/cache.go
+index 4258142b571..74024cf9aae 100644
+--- a/middleware/cache/cache.go
++++ b/middleware/cache/cache.go
+@@ -4,6 +4,8 @@ package cache
+ 
+ import (
+ 	"context"
++	"errors"
++	"fmt"
+ 	"slices"
+ 	"strconv"
+ 	"strings"
+@@ -98,12 +100,17 @@ func New(config ...Config) fiber.Handler {
+ 	}()
+ 
+ 	// Delete key from both manager and storage
+-	deleteKey := func(dkey string) {
+-		manager.del(context.Background(), dkey)
++	deleteKey := func(dkey string) error {
++		if err := manager.del(context.Background(), dkey); err != nil {
++			return err
++		}
+ 		// External storage saves body data with different key
+ 		if cfg.Storage != nil {
+-			manager.del(context.Background(), dkey+"_body")
++			if err := manager.del(context.Background(), dkey+"_body"); err != nil {
++				return err
++			}
+ 		}
++		return nil
+ 	}
+ 
+ 	// Return new handler
+@@ -126,7 +133,10 @@ func New(config ...Config) fiber.Handler {
+ 		key := cfg.KeyGenerator(c) + "_" + requestMethod
+ 
+ 		// Get entry from pool
+-		e := manager.get(c, key)
++		e, err := manager.get(c, key)
++		if err != nil && !errors.Is(err, errCacheMiss) {
++			return err
++		}
+ 
+ 		// Lock entry
+ 		mux.Lock()
+@@ -143,7 +153,13 @@ func New(config ...Config) fiber.Handler {
+ 
+ 			// Check if entry is expired
+ 			if e.exp != 0 && ts >= e.exp {
+-				deleteKey(key)
++				if err := deleteKey(key); err != nil {
++					if e != nil {
++						manager.release(e)
++					}
++					mux.Unlock()
++					return fmt.Errorf("cache: failed to delete expired key %q: %w", key, err)
++				}
+ 				if cfg.MaxBytes > 0 {
+ 					_, size := heap.remove(e.heapidx)
+ 					storedBytes -= size
+@@ -152,7 +168,13 @@ func New(config ...Config) fiber.Handler {
+ 				// Separate body value to avoid msgp serialization
+ 				// We can store raw bytes with Storage 👍
+ 				if cfg.Storage != nil {
+-					e.body = manager.getRaw(c, key+"_body")
++					rawBody, err := manager.getRaw(c, key+"_body")
++					if err != nil {
++						manager.release(e)
++						mux.Unlock()
++						return cacheBodyFetchError(key, err)
++					}
++					e.body = rawBody
+ 				}
+ 				// Set response headers from cache
+ 				c.Response().SetBodyRaw(e.body)
+@@ -230,7 +252,9 @@ func New(config ...Config) fiber.Handler {
+ 		if cfg.MaxBytes > 0 {
+ 			for storedBytes+bodySize > cfg.MaxBytes {
+ 				keyToRemove, size := heap.removeFirst()
+-				deleteKey(keyToRemove)
++				if err := deleteKey(keyToRemove); err != nil {
++					return fmt.Errorf("cache: failed to delete key %q while evicting: %w", keyToRemove, err)
++				}
+ 				storedBytes -= size
+ 			}
+ 		}
+@@ -285,14 +309,22 @@ func New(config ...Config) fiber.Handler {
+ 
+ 		// For external Storage we store raw body separated
+ 		if cfg.Storage != nil {
+-			manager.setRaw(c, key+"_body", e.body, expiration)
++			if err := manager.setRaw(c, key+"_body", e.body, expiration); err != nil {
++				manager.release(e)
++				return err
++			}
+ 			// avoid body msgp encoding
+ 			e.body = nil
+-			manager.set(c, key, e, expiration)
++			if err := manager.set(c, key, e, expiration); err != nil {
++				manager.release(e)
++				return err
++			}
+ 			manager.release(e)
+ 		} else {
+ 			// Store entry in memory
+-			manager.set(c, key, e, expiration)
++			if err := manager.set(c, key, e, expiration); err != nil {
++				return err
++			}
+ 		}
+ 
+ 		c.Set(cfg.CacheHeader, cacheMiss)
+@@ -325,6 +357,13 @@ func hasRequestDirective(c fiber.Ctx, directive string) bool {
+ 	return false
+ }
+ 
++func cacheBodyFetchError(key string, err error) error {
++	if errors.Is(err, errCacheMiss) {
++		return fmt.Errorf("cache: no cached body for key %q: %w", key, err)
++	}
++	return err
++}
++
+ // parseMaxAge extracts the max-age directive from a Cache-Control header.
+ func parseMaxAge(cc string) (time.Duration, bool) {
+ 	for part := range strings.SplitSeq(cc, ",") {
+diff --git a/middleware/cache/cache_test.go b/middleware/cache/cache_test.go
+index a71c6bb4a17..c344191066a 100644
+--- a/middleware/cache/cache_test.go
++++ b/middleware/cache/cache_test.go
+@@ -4,6 +4,8 @@ package cache
+ 
+ import (
+ 	"bytes"
++	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"math"
+@@ -21,6 +23,153 @@ import (
+ 	"github.com/valyala/fasthttp"
+ )
+ 
++type failingCacheStorage struct {
++	data map[string][]byte
++	errs map[string]error
++}
++
++func newFailingCacheStorage() *failingCacheStorage {
++	return &failingCacheStorage{
++		data: make(map[string][]byte),
++		errs: make(map[string]error),
++	}
++}
++
++func (s *failingCacheStorage) GetWithContext(_ context.Context, key string) ([]byte, error) {
++	if err, ok := s.errs["get|"+key]; ok && err != nil {
++		return nil, err
++	}
++	if val, ok := s.data[key]; ok {
++		return append([]byte(nil), val...), nil
++	}
++	return nil, nil
++}
++
++func (s *failingCacheStorage) Get(key string) ([]byte, error) {
++	return s.GetWithContext(context.Background(), key)
++}
++
++func (s *failingCacheStorage) SetWithContext(_ context.Context, key string, val []byte, _ time.Duration) error {
++	if err, ok := s.errs["set|"+key]; ok && err != nil {
++		return err
++	}
++	s.data[key] = append([]byte(nil), val...)
++	return nil
++}
++
++func (s *failingCacheStorage) Set(key string, val []byte, exp time.Duration) error {
++	return s.SetWithContext(context.Background(), key, val, exp)
++}
++
++func (s *failingCacheStorage) DeleteWithContext(_ context.Context, key string) error {
++	if err, ok := s.errs["del|"+key]; ok && err != nil {
++		return err
++	}
++	delete(s.data, key)
++	return nil
++}
++
++func (s *failingCacheStorage) Delete(key string) error {
++	return s.DeleteWithContext(context.Background(), key)
++}
++
++func (s *failingCacheStorage) ResetWithContext(context.Context) error {
++	s.data = make(map[string][]byte)
++	s.errs = make(map[string]error)
++	return nil
++}
++
++func (s *failingCacheStorage) Reset() error {
++	return s.ResetWithContext(context.Background())
++}
++
++func (*failingCacheStorage) Close() error { return nil }
++
++func TestCacheStorageGetError(t *testing.T) {
++	t.Parallel()
++
++	storage := newFailingCacheStorage()
++	storage.errs["get|/_GET"] = errors.New("boom")
++
++	var captured error
++	app := fiber.New(fiber.Config{
++		ErrorHandler: func(c fiber.Ctx, err error) error {
++			captured = err
++			return c.Status(fiber.StatusInternalServerError).SendString("storage failure")
++		},
++	})
++
++	app.Use(New(Config{Storage: storage, Expiration: time.Second}))
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendString("ok")
++	})
++
++	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", nil))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
++	require.Error(t, captured)
++	require.ErrorContains(t, captured, "cache: failed to get key")
++}
++
++func TestCacheStorageSetError(t *testing.T) {
++	t.Parallel()
++
++	storage := newFailingCacheStorage()
++	storage.errs["set|/_GET_body"] = errors.New("boom")
++
++	var captured error
++	app := fiber.New(fiber.Config{
++		ErrorHandler: func(c fiber.Ctx, err error) error {
++			captured = err
++			return c.Status(fiber.StatusInternalServerError).SendString("storage failure")
++		},
++	})
++
++	app.Use(New(Config{Storage: storage, Expiration: time.Second}))
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendString("ok")
++	})
++
++	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", nil))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
++	require.Error(t, captured)
++	require.ErrorContains(t, captured, "cache: failed to store raw key")
++}
++
++func TestCacheStorageDeleteError(t *testing.T) {
++	t.Parallel()
++
++	storage := newFailingCacheStorage()
++	storage.errs["del|/_GET"] = errors.New("boom")
++
++	// Use an obviously expired timestamp without relying on time-based conversions
++	expired := &item{exp: 1}
++	raw, err := expired.MarshalMsg(nil)
++	require.NoError(t, err)
++
++	storage.data["/_GET"] = raw
++
++	var captured error
++	app := fiber.New(fiber.Config{
++		ErrorHandler: func(c fiber.Ctx, err error) error {
++			captured = err
++			return c.Status(fiber.StatusInternalServerError).SendString("storage failure")
++		},
++	})
++
++	app.Use(New(Config{Storage: storage, Expiration: time.Second}))
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendString("ok")
++	})
++
++	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", nil))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
++	require.Error(t, captured)
++	require.ErrorContains(t, captured, "cache: failed to delete expired key")
++}
++
+ func Test_Cache_CacheControl(t *testing.T) {
+ 	t.Parallel()
+ 
+diff --git a/middleware/cache/manager.go b/middleware/cache/manager.go
+index be24540074d..679046f5744 100644
+--- a/middleware/cache/manager.go
++++ b/middleware/cache/manager.go
+@@ -2,6 +2,8 @@ package cache
+ 
+ import (
+ 	"context"
++	"errors"
++	"fmt"
+ 	"sync"
+ 	"time"
+ 
+@@ -32,6 +34,8 @@ type manager struct {
+ 	storage fiber.Storage
+ }
+ 
++var errCacheMiss = errors.New("cache: miss")
++
+ func newManager(storage fiber.Storage) *manager {
+ 	// Create new storage handler
+ 	manager := &manager{
+@@ -73,67 +77,102 @@ func (m *manager) release(e *item) {
+ }
+ 
+ // get data from storage or memory
+-func (m *manager) get(ctx context.Context, key string) *item {
++func (m *manager) get(ctx context.Context, key string) (*item, error) {
+ 	if m.storage != nil {
+ 		raw, err := m.storage.GetWithContext(ctx, key)
+-		if err != nil || raw == nil {
+-			return nil
++		if err != nil {
++			return nil, fmt.Errorf("cache: failed to get key %q from storage: %w", key, err)
++		}
++		if raw == nil {
++			return nil, errCacheMiss
+ 		}
+ 
+ 		it := m.acquire()
+ 		if _, err := it.UnmarshalMsg(raw); err != nil {
+ 			m.release(it)
+-			return nil
++			return nil, fmt.Errorf("cache: failed to unmarshal key %q: %w", key, err)
+ 		}
+ 
+-		return it
++		return it, nil
+ 	}
+ 
+-	if it, _ := m.memory.Get(key).(*item); it != nil { //nolint:errcheck // We store nothing else in the pool
+-		return it
++	if value := m.memory.Get(key); value != nil {
++		it, ok := value.(*item)
++		if !ok {
++			return nil, fmt.Errorf("cache: unexpected entry type %T for key %q", value, key)
++		}
++		return it, nil
+ 	}
+ 
+-	return nil
++	return nil, errCacheMiss
+ }
+ 
+ // get raw data from storage or memory
+-func (m *manager) getRaw(ctx context.Context, key string) []byte {
+-	var raw []byte
++func (m *manager) getRaw(ctx context.Context, key string) ([]byte, error) {
+ 	if m.storage != nil {
+-		raw, _ = m.storage.GetWithContext(ctx, key) //nolint:errcheck // TODO: Handle error here
+-	} else {
+-		raw, _ = m.memory.Get(key).([]byte) //nolint:errcheck // TODO: Handle error here
++		raw, err := m.storage.GetWithContext(ctx, key)
++		if err != nil {
++			return nil, fmt.Errorf("cache: failed to get raw key %q from storage: %w", key, err)
++		}
++		if raw == nil {
++			return nil, errCacheMiss
++		}
++		return raw, nil
++	}
++
++	if value := m.memory.Get(key); value != nil {
++		raw, ok := value.([]byte)
++		if !ok {
++			return nil, fmt.Errorf("cache: unexpected raw entry type %T for key %q", value, key)
++		}
++		return raw, nil
+ 	}
+-	return raw
++
++	return nil, errCacheMiss
+ }
+ 
+ // set data to storage or memory
+-func (m *manager) set(ctx context.Context, key string, it *item, exp time.Duration) {
++func (m *manager) set(ctx context.Context, key string, it *item, exp time.Duration) error {
+ 	if m.storage != nil {
+-		if raw, err := it.MarshalMsg(nil); err == nil {
+-			_ = m.storage.SetWithContext(ctx, key, raw, exp) //nolint:errcheck // TODO: Handle error here
++		raw, err := it.MarshalMsg(nil)
++		if err != nil {
++			m.release(it)
++			return fmt.Errorf("cache: failed to marshal key %q: %w", key, err)
++		}
++		if err := m.storage.SetWithContext(ctx, key, raw, exp); err != nil {
++			m.release(it)
++			return fmt.Errorf("cache: failed to store key %q: %w", key, err)
+ 		}
+-		// we can release data because it's serialized to database
+ 		m.release(it)
+-	} else {
+-		m.memory.Set(key, it, exp)
++		return nil
+ 	}
++
++	m.memory.Set(key, it, exp)
++	return nil
+ }
+ 
+ // set data to storage or memory
+-func (m *manager) setRaw(ctx context.Context, key string, raw []byte, exp time.Duration) {
++func (m *manager) setRaw(ctx context.Context, key string, raw []byte, exp time.Duration) error {
+ 	if m.storage != nil {
+-		_ = m.storage.SetWithContext(ctx, key, raw, exp) //nolint:errcheck // TODO: Handle error here
+-	} else {
+-		m.memory.Set(key, raw, exp)
++		if err := m.storage.SetWithContext(ctx, key, raw, exp); err != nil {
++			return fmt.Errorf("cache: failed to store raw key %q: %w", key, err)
++		}
++		return nil
+ 	}
++
++	m.memory.Set(key, raw, exp)
++	return nil
+ }
+ 
+ // delete data from storage or memory
+-func (m *manager) del(ctx context.Context, key string) {
++func (m *manager) del(ctx context.Context, key string) error {
+ 	if m.storage != nil {
+-		_ = m.storage.DeleteWithContext(ctx, key) //nolint:errcheck // TODO: Handle error here
+-	} else {
+-		m.memory.Delete(key)
++		if err := m.storage.DeleteWithContext(ctx, key); err != nil {
++			return fmt.Errorf("cache: failed to delete key %q: %w", key, err)
++		}
++		return nil
+ 	}
++
++	m.memory.Delete(key)
++	return nil
+ }
+diff --git a/middleware/cache/manager_test.go b/middleware/cache/manager_test.go
+index e77bc4ed3cb..1adb5dda210 100644
+--- a/middleware/cache/manager_test.go
++++ b/middleware/cache/manager_test.go
+@@ -7,6 +7,7 @@ import (
+ 
+ 	utils "github.com/gofiber/utils/v2"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ )
+ 
+ func Test_manager_get(t *testing.T) {
+@@ -14,14 +15,18 @@ func Test_manager_get(t *testing.T) {
+ 	cacheManager := newManager(nil)
+ 	t.Run("Item not found in cache", func(t *testing.T) {
+ 		t.Parallel()
+-		assert.Nil(t, cacheManager.get(context.Background(), utils.UUID()))
++		it, err := cacheManager.get(context.Background(), utils.UUID())
++		require.ErrorIs(t, err, errCacheMiss)
++		assert.Nil(t, it)
+ 	})
+ 	t.Run("Item found in cache", func(t *testing.T) {
+ 		t.Parallel()
+ 		id := utils.UUID()
+ 		cacheItem := cacheManager.acquire()
+ 		cacheItem.body = []byte("test-body")
+-		cacheManager.set(context.Background(), id, cacheItem, 10*time.Second)
+-		assert.NotNil(t, cacheManager.get(context.Background(), id))
++		require.NoError(t, cacheManager.set(context.Background(), id, cacheItem, 10*time.Second))
++		it, err := cacheManager.get(context.Background(), id)
++		require.NoError(t, err)
++		assert.NotNil(t, it)
+ 	})
+ }
+diff --git a/middleware/csrf/csrf.go b/middleware/csrf/csrf.go
+index 2c3210c3c20..401528d6199 100644
+--- a/middleware/csrf/csrf.go
++++ b/middleware/csrf/csrf.go
+@@ -2,6 +2,7 @@ package csrf
+ 
+ import (
+ 	"errors"
++	"fmt"
+ 	"net/url"
+ 	"slices"
+ 	"strings"
+@@ -105,7 +106,10 @@ func New(config ...Config) fiber.Handler {
+ 			cookieToken := c.Cookies(cfg.CookieName)
+ 
+ 			if cookieToken != "" {
+-				raw := getRawFromStorage(c, cookieToken, cfg, sessionManager, storageManager)
++				raw, err := getRawFromStorage(c, cookieToken, cfg, sessionManager, storageManager)
++				if err != nil {
++					return cfg.ErrorHandler(c, err)
++				}
+ 
+ 				if raw != nil {
+ 					token = cookieToken // Token is valid, safe to set it
+@@ -154,7 +158,10 @@ func New(config ...Config) fiber.Handler {
+ 				return cfg.ErrorHandler(c, ErrTokenInvalid)
+ 			}
+ 
+-			raw := getRawFromStorage(c, extractedToken, cfg, sessionManager, storageManager)
++			raw, err := getRawFromStorage(c, extractedToken, cfg, sessionManager, storageManager)
++			if err != nil {
++				return cfg.ErrorHandler(c, err)
++			}
+ 
+ 			if raw == nil {
+ 				// If token is not in storage, expire the cookie
+@@ -164,7 +171,9 @@ func New(config ...Config) fiber.Handler {
+ 			}
+ 			if cfg.SingleUseToken {
+ 				// If token is single use, delete it from storage
+-				deleteTokenFromStorage(c, extractedToken, cfg, sessionManager, storageManager)
++				if err := deleteTokenFromStorage(c, extractedToken, cfg, sessionManager, storageManager); err != nil {
++					return cfg.ErrorHandler(c, err)
++				}
+ 			} else {
+ 				token = extractedToken // Token is valid, safe to set it
+ 			}
+@@ -177,7 +186,9 @@ func New(config ...Config) fiber.Handler {
+ 		}
+ 
+ 		// Create or extend the token in the storage
+-		createOrExtendTokenInStorage(c, token, cfg, sessionManager, storageManager)
++		if err := createOrExtendTokenInStorage(c, token, cfg, sessionManager, storageManager); err != nil {
++			return cfg.ErrorHandler(c, err)
++		}
+ 
+ 		// Update the CSRF cookie
+ 		updateCSRFCookie(c, cfg, token)
+@@ -215,28 +226,38 @@ func HandlerFromContext(c fiber.Ctx) *Handler {
+ 
+ // getRawFromStorage returns the raw value from the storage for the given token
+ // returns nil if the token does not exist, is expired or is invalid
+-func getRawFromStorage(c fiber.Ctx, token string, cfg Config, sessionManager *sessionManager, storageManager *storageManager) []byte {
++func getRawFromStorage(c fiber.Ctx, token string, cfg Config, sessionManager *sessionManager, storageManager *storageManager) ([]byte, error) {
+ 	if cfg.Session != nil {
+-		return sessionManager.getRaw(c, token, dummyValue)
++		return sessionManager.getRaw(c, token, dummyValue), nil
++	}
++	raw, err := storageManager.getRaw(c, token)
++	if err != nil {
++		return nil, fmt.Errorf("csrf: failed to fetch token from storage: %w", err)
+ 	}
+-	return storageManager.getRaw(c, token)
++	return raw, nil
+ }
+ 
+ // createOrExtendTokenInStorage creates or extends the token in the storage
+-func createOrExtendTokenInStorage(c fiber.Ctx, token string, cfg Config, sessionManager *sessionManager, storageManager *storageManager) {
++func createOrExtendTokenInStorage(c fiber.Ctx, token string, cfg Config, sessionManager *sessionManager, storageManager *storageManager) error {
+ 	if cfg.Session != nil {
+ 		sessionManager.setRaw(c, token, dummyValue, cfg.IdleTimeout)
+-	} else {
+-		storageManager.setRaw(c, token, dummyValue, cfg.IdleTimeout)
++		return nil
++	}
++	if err := storageManager.setRaw(c, token, dummyValue, cfg.IdleTimeout); err != nil {
++		return fmt.Errorf("csrf: failed to store token in storage: %w", err)
+ 	}
++	return nil
+ }
+ 
+-func deleteTokenFromStorage(c fiber.Ctx, token string, cfg Config, sessionManager *sessionManager, storageManager *storageManager) {
++func deleteTokenFromStorage(c fiber.Ctx, token string, cfg Config, sessionManager *sessionManager, storageManager *storageManager) error {
+ 	if cfg.Session != nil {
+ 		sessionManager.delRaw(c)
+-	} else {
+-		storageManager.delRaw(c, token)
++		return nil
++	}
++	if err := storageManager.delRaw(c, token); err != nil {
++		return fmt.Errorf("csrf: failed to delete token from storage: %w", err)
+ 	}
++	return nil
+ }
+ 
+ // Update CSRF cookie
+@@ -275,7 +296,9 @@ func (handler *Handler) DeleteToken(c fiber.Ctx) error {
+ 		return handler.config.ErrorHandler(c, ErrTokenNotFound)
+ 	}
+ 	// Remove the token from storage
+-	deleteTokenFromStorage(c, cookieToken, handler.config, handler.sessionManager, handler.storageManager)
++	if err := deleteTokenFromStorage(c, cookieToken, handler.config, handler.sessionManager, handler.storageManager); err != nil {
++		return handler.config.ErrorHandler(c, err)
++	}
+ 	// Expire the cookie
+ 	expireCSRFCookie(c, handler.config)
+ 	return nil
+diff --git a/middleware/csrf/csrf_test.go b/middleware/csrf/csrf_test.go
+index 9a1b16e2d80..ee2af18f599 100644
+--- a/middleware/csrf/csrf_test.go
++++ b/middleware/csrf/csrf_test.go
+@@ -2,6 +2,7 @@ package csrf
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+@@ -16,6 +17,164 @@ import (
+ 	"github.com/valyala/fasthttp"
+ )
+ 
++type failingCSRFStorage struct {
++	data map[string][]byte
++	errs map[string]error
++}
++
++func newFailingCSRFStorage() *failingCSRFStorage {
++	return &failingCSRFStorage{
++		data: make(map[string][]byte),
++		errs: make(map[string]error),
++	}
++}
++
++func (s *failingCSRFStorage) GetWithContext(_ context.Context, key string) ([]byte, error) {
++	if err, ok := s.errs["get|"+key]; ok && err != nil {
++		return nil, err
++	}
++	if val, ok := s.data[key]; ok {
++		return append([]byte(nil), val...), nil
++	}
++	return nil, nil
++}
++
++func (s *failingCSRFStorage) Get(key string) ([]byte, error) {
++	return s.GetWithContext(context.Background(), key)
++}
++
++func (s *failingCSRFStorage) SetWithContext(_ context.Context, key string, val []byte, _ time.Duration) error {
++	if err, ok := s.errs["set|"+key]; ok && err != nil {
++		return err
++	}
++	s.data[key] = append([]byte(nil), val...)
++	return nil
++}
++
++func (s *failingCSRFStorage) Set(key string, val []byte, exp time.Duration) error {
++	return s.SetWithContext(context.Background(), key, val, exp)
++}
++
++func (s *failingCSRFStorage) DeleteWithContext(_ context.Context, key string) error {
++	if err, ok := s.errs["del|"+key]; ok && err != nil {
++		return err
++	}
++	delete(s.data, key)
++	return nil
++}
++
++func (s *failingCSRFStorage) Delete(key string) error {
++	return s.DeleteWithContext(context.Background(), key)
++}
++
++func (s *failingCSRFStorage) ResetWithContext(context.Context) error {
++	s.data = make(map[string][]byte)
++	s.errs = make(map[string]error)
++	return nil
++}
++
++func (s *failingCSRFStorage) Reset() error {
++	return s.ResetWithContext(context.Background())
++}
++
++func (*failingCSRFStorage) Close() error { return nil }
++
++func TestCSRFStorageGetError(t *testing.T) {
++	t.Parallel()
++
++	storage := newFailingCSRFStorage()
++	storage.errs["get|token"] = errors.New("boom")
++
++	var captured error
++	app := fiber.New()
++
++	app.Use(New(Config{
++		Storage: storage,
++		ErrorHandler: func(_ fiber.Ctx, err error) error {
++			captured = err
++			return fiber.ErrTeapot
++		},
++	}))
++
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendStatus(fiber.StatusOK)
++	})
++
++	req := httptest.NewRequest(fiber.MethodGet, "/", nil)
++	req.AddCookie(&http.Cookie{Name: ConfigDefault.CookieName, Value: "token"})
++
++	resp, err := app.Test(req)
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusTeapot, resp.StatusCode)
++	require.Error(t, captured)
++	require.ErrorContains(t, captured, "csrf: failed to fetch token from storage")
++}
++
++func TestCSRFStorageSetError(t *testing.T) {
++	t.Parallel()
++
++	storage := newFailingCSRFStorage()
++	storage.errs["set|token"] = errors.New("boom")
++
++	var captured error
++	app := fiber.New()
++
++	app.Use(New(Config{
++		Storage: storage,
++		KeyGenerator: func() string {
++			return "token"
++		},
++		ErrorHandler: func(_ fiber.Ctx, err error) error {
++			captured = err
++			return fiber.ErrTeapot
++		},
++	}))
++
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendStatus(fiber.StatusOK)
++	})
++
++	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", nil))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusTeapot, resp.StatusCode)
++	require.Error(t, captured)
++	require.ErrorContains(t, captured, "csrf: failed to store token in storage")
++}
++
++func TestCSRFStorageDeleteError(t *testing.T) {
++	t.Parallel()
++
++	storage := newFailingCSRFStorage()
++	storage.data["token"] = []byte("value")
++	storage.errs["del|token"] = errors.New("boom")
++
++	var captured error
++	app := fiber.New()
++
++	app.Use(New(Config{
++		Storage:        storage,
++		SingleUseToken: true,
++		ErrorHandler: func(_ fiber.Ctx, err error) error {
++			captured = err
++			return fiber.ErrTeapot
++		},
++	}))
++
++	app.Post("/", func(c fiber.Ctx) error {
++		return c.SendStatus(fiber.StatusOK)
++	})
++
++	req := httptest.NewRequest(fiber.MethodPost, "/", nil)
++	req.Header.Set(HeaderName, "token")
++	req.AddCookie(&http.Cookie{Name: ConfigDefault.CookieName, Value: "token"})
++
++	resp, err := app.Test(req)
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusTeapot, resp.StatusCode)
++	require.Error(t, captured)
++	require.ErrorContains(t, captured, "csrf: failed to delete token from storage")
++}
++
+ func Test_CSRF(t *testing.T) {
+ 	t.Parallel()
+ 	app := fiber.New()
+@@ -1576,15 +1735,18 @@ func Test_deleteTokenFromStorage(t *testing.T) {
+ 	stm := newStorageManager(nil)
+ 
+ 	sm.setRaw(ctx, token, dummy, time.Minute)
+-	deleteTokenFromStorage(ctx, token, Config{Session: store}, sm, stm)
+-	require.Nil(t, sm.getRaw(ctx, token, dummy))
++	require.NoError(t, deleteTokenFromStorage(ctx, token, Config{Session: store}, sm, stm))
++	raw := sm.getRaw(ctx, token, dummy)
++	require.Nil(t, raw)
+ 
+ 	sm2 := newSessionManager(nil)
+ 	stm2 := newStorageManager(nil)
+ 
+-	stm2.setRaw(context.Background(), token, dummy, time.Minute)
+-	deleteTokenFromStorage(ctx, token, Config{}, sm2, stm2)
+-	require.Nil(t, stm2.getRaw(context.Background(), token))
++	require.NoError(t, stm2.setRaw(context.Background(), token, dummy, time.Minute))
++	require.NoError(t, deleteTokenFromStorage(ctx, token, Config{}, sm2, stm2))
++	raw, err := stm2.getRaw(context.Background(), token)
++	require.NoError(t, err)
++	require.Nil(t, raw)
+ }
+ 
+ func Test_CSRF_Chain_Extractor(t *testing.T) {
+diff --git a/middleware/csrf/storage_manager.go b/middleware/csrf/storage_manager.go
+index a6e07a530f0..e256df49966 100644
+--- a/middleware/csrf/storage_manager.go
++++ b/middleware/csrf/storage_manager.go
+@@ -2,6 +2,7 @@ package csrf
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"sync"
+ 	"time"
+ 
+@@ -42,31 +43,49 @@ func newStorageManager(storage fiber.Storage) *storageManager {
+ }
+ 
+ // get raw data from storage or memory
+-func (m *storageManager) getRaw(ctx context.Context, key string) []byte {
+-	var raw []byte
++func (m *storageManager) getRaw(ctx context.Context, key string) ([]byte, error) {
+ 	if m.storage != nil {
+-		raw, _ = m.storage.GetWithContext(ctx, key) //nolint:errcheck // TODO: Do not ignore error
+-	} else {
+-		raw, _ = m.memory.Get(key).([]byte) //nolint:errcheck // TODO: Do not ignore error
++		raw, err := m.storage.GetWithContext(ctx, key)
++		if err != nil {
++			return nil, fmt.Errorf("csrf: failed to get key %q from storage: %w", key, err)
++		}
++		return raw, nil
++	}
++
++	if value := m.memory.Get(key); value != nil {
++		raw, ok := value.([]byte)
++		if !ok {
++			return nil, fmt.Errorf("csrf: unexpected value type %T for key %q", value, key)
++		}
++		return raw, nil
+ 	}
+-	return raw
++
++	return nil, nil
+ }
+ 
+ // set data to storage or memory
+-func (m *storageManager) setRaw(ctx context.Context, key string, raw []byte, exp time.Duration) {
++func (m *storageManager) setRaw(ctx context.Context, key string, raw []byte, exp time.Duration) error {
+ 	if m.storage != nil {
+-		_ = m.storage.SetWithContext(ctx, key, raw, exp) //nolint:errcheck // TODO: Do not ignore error
+-	} else {
+-		// the key is crucial in crsf and sometimes a reference to another value which can be reused later(pool/unsafe values concept), so a copy is made here
+-		m.memory.Set(utils.CopyString(key), raw, exp)
++		if err := m.storage.SetWithContext(ctx, key, raw, exp); err != nil {
++			return fmt.Errorf("csrf: failed to store key %q: %w", key, err)
++		}
++		return nil
+ 	}
++
++	// the key is crucial in crsf and sometimes a reference to another value which can be reused later(pool/unsafe values concept), so a copy is made here
++	m.memory.Set(utils.CopyString(key), raw, exp)
++	return nil
+ }
+ 
+ // delete data from storage or memory
+-func (m *storageManager) delRaw(ctx context.Context, key string) {
++func (m *storageManager) delRaw(ctx context.Context, key string) error {
+ 	if m.storage != nil {
+-		_ = m.storage.DeleteWithContext(ctx, key) //nolint:errcheck // TODO: Do not ignore error
+-	} else {
+-		m.memory.Delete(key)
++		if err := m.storage.DeleteWithContext(ctx, key); err != nil {
++			return fmt.Errorf("csrf: failed to delete key %q: %w", key, err)
++		}
++		return nil
+ 	}
++
++	m.memory.Delete(key)
++	return nil
+ }
+diff --git a/middleware/csrf/storage_manager_msgp.go b/middleware/csrf/storage_manager_msgp.go
+index ef6b8fc2fa5..d8ff50ee824 100644
+--- a/middleware/csrf/storage_manager_msgp.go
++++ b/middleware/csrf/storage_manager_msgp.go
+@@ -14,21 +14,21 @@ func (z *item) DecodeMsg(dc *msgp.Reader) (err error) {
+ 	zb0001, err = dc.ReadMapHeader()
+ 	if err != nil {
+ 		err = msgp.WrapError(err)
+-		return err
++		return
+ 	}
+ 	for zb0001 > 0 {
+ 		zb0001--
+ 		field, err = dc.ReadMapKeyPtr()
+ 		if err != nil {
+ 			err = msgp.WrapError(err)
+-			return err
++			return
+ 		}
+ 		switch msgp.UnsafeString(field) {
+ 		default:
+ 			err = dc.Skip()
+ 			if err != nil {
+ 				err = msgp.WrapError(err)
+-				return err
++				return
+ 			}
+ 		}
+ 	}
+@@ -41,7 +41,7 @@ func (z item) EncodeMsg(en *msgp.Writer) (err error) {
+ 	_ = z
+ 	err = en.Append(0x80)
+ 	if err != nil {
+-		return err
++		return
+ 	}
+ 	return
+ }
+@@ -52,7 +52,7 @@ func (z item) MarshalMsg(b []byte) (o []byte, err error) {
+ 	// map header, size 0
+ 	_ = z
+ 	o = append(o, 0x80)
+-	return o, err
++	return
+ }
+ 
+ // UnmarshalMsg implements msgp.Unmarshaler
+@@ -63,32 +63,32 @@ func (z *item) UnmarshalMsg(bts []byte) (o []byte, err error) {
+ 	zb0001, bts, err = msgp.ReadMapHeaderBytes(bts)
+ 	if err != nil {
+ 		err = msgp.WrapError(err)
+-		return o, err
++		return
+ 	}
+ 	for zb0001 > 0 {
+ 		zb0001--
+ 		field, bts, err = msgp.ReadMapKeyZC(bts)
+ 		if err != nil {
+ 			err = msgp.WrapError(err)
+-			return o, err
++			return
+ 		}
+ 		switch msgp.UnsafeString(field) {
+ 		default:
+ 			bts, err = msgp.Skip(bts)
+ 			if err != nil {
+ 				err = msgp.WrapError(err)
+-				return o, err
++				return
+ 			}
+ 		}
+ 	}
+ 	o = bts
+-	return o, err
++	return
+ }
+ 
+ // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
+ func (z item) Msgsize() (s int) {
+ 	s = 1
+-	return s
++	return
+ }
+ 
+ // DecodeMsg implements msgp.Decodable
+@@ -99,21 +99,21 @@ func (z *storageManager) DecodeMsg(dc *msgp.Reader) (err error) {
+ 	zb0001, err = dc.ReadMapHeader()
+ 	if err != nil {
+ 		err = msgp.WrapError(err)
+-		return err
++		return
+ 	}
+ 	for zb0001 > 0 {
+ 		zb0001--
+ 		field, err = dc.ReadMapKeyPtr()
+ 		if err != nil {
+ 			err = msgp.WrapError(err)
+-			return err
++			return
+ 		}
+ 		switch msgp.UnsafeString(field) {
+ 		default:
+ 			err = dc.Skip()
+ 			if err != nil {
+ 				err = msgp.WrapError(err)
+-				return err
++				return
+ 			}
+ 		}
+ 	}
+@@ -121,23 +121,23 @@ func (z *storageManager) DecodeMsg(dc *msgp.Reader) (err error) {
+ }
+ 
+ // EncodeMsg implements msgp.Encodable
+-func (z storageManager) EncodeMsg(en *msgp.Writer) (err error) {
++func (z *storageManager) EncodeMsg(en *msgp.Writer) (err error) {
+ 	// map header, size 0
+ 	_ = z
+ 	err = en.Append(0x80)
+ 	if err != nil {
+-		return err
++		return
+ 	}
+ 	return
+ }
+ 
+ // MarshalMsg implements msgp.Marshaler
+-func (z storageManager) MarshalMsg(b []byte) (o []byte, err error) {
++func (z *storageManager) MarshalMsg(b []byte) (o []byte, err error) {
+ 	o = msgp.Require(b, z.Msgsize())
+ 	// map header, size 0
+ 	_ = z
+ 	o = append(o, 0x80)
+-	return o, err
++	return
+ }
+ 
+ // UnmarshalMsg implements msgp.Unmarshaler
+@@ -148,30 +148,30 @@ func (z *storageManager) UnmarshalMsg(bts []byte) (o []byte, err error) {
+ 	zb0001, bts, err = msgp.ReadMapHeaderBytes(bts)
+ 	if err != nil {
+ 		err = msgp.WrapError(err)
+-		return o, err
++		return
+ 	}
+ 	for zb0001 > 0 {
+ 		zb0001--
+ 		field, bts, err = msgp.ReadMapKeyZC(bts)
+ 		if err != nil {
+ 			err = msgp.WrapError(err)
+-			return o, err
++			return
+ 		}
+ 		switch msgp.UnsafeString(field) {
+ 		default:
+ 			bts, err = msgp.Skip(bts)
+ 			if err != nil {
+ 				err = msgp.WrapError(err)
+-				return o, err
++				return
+ 			}
+ 		}
+ 	}
+ 	o = bts
+-	return o, err
++	return
+ }
+ 
+ // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
+-func (z storageManager) Msgsize() (s int) {
++func (z *storageManager) Msgsize() (s int) {
+ 	s = 1
+-	return s
++	return
+ }
+diff --git a/middleware/limiter/limiter_fixed.go b/middleware/limiter/limiter_fixed.go
+index 3178025c64c..7388535f8af 100644
+--- a/middleware/limiter/limiter_fixed.go
++++ b/middleware/limiter/limiter_fixed.go
+@@ -1,6 +1,7 @@
+ package limiter
+ 
+ import (
++	"fmt"
+ 	"strconv"
+ 	"sync"
+ 
+@@ -41,7 +42,11 @@ func (FixedWindow) New(cfg Config) fiber.Handler {
+ 		mux.Lock()
+ 
+ 		// Get entry from pool and release when finished
+-		e := manager.get(c, key)
++		e, err := manager.get(c, key)
++		if err != nil {
++			mux.Unlock()
++			return err
++		}
+ 
+ 		// Get timestamp
+ 		ts := uint64(utils.Timestamp())
+@@ -65,7 +70,10 @@ func (FixedWindow) New(cfg Config) fiber.Handler {
+ 		remaining := maxRequests - e.currHits
+ 
+ 		// Update storage
+-		manager.set(c, key, e, cfg.Expiration)
++		if setErr := manager.set(c, key, e, cfg.Expiration); setErr != nil {
++			mux.Unlock()
++			return fmt.Errorf("limiter: failed to persist state: %w", setErr)
++		}
+ 
+ 		// Unlock entry
+ 		mux.Unlock()
+@@ -84,7 +92,7 @@ func (FixedWindow) New(cfg Config) fiber.Handler {
+ 
+ 		// Continue stack for reaching c.Response().StatusCode()
+ 		// Store err for returning
+-		err := c.Next()
++		err = c.Next()
+ 
+ 		// Get the effective status code from either the error or response
+ 		statusCode := getEffectiveStatusCode(c, err)
+@@ -94,10 +102,18 @@ func (FixedWindow) New(cfg Config) fiber.Handler {
+ 			(cfg.SkipFailedRequests && statusCode >= fiber.StatusBadRequest) {
+ 			// Lock entry
+ 			mux.Lock()
+-			e = manager.get(c, key)
++			entry, getErr := manager.get(c, key)
++			if getErr != nil {
++				mux.Unlock()
++				return getErr
++			}
++			e = entry
+ 			e.currHits--
+ 			remaining++
+-			manager.set(c, key, e, cfg.Expiration)
++			if setErr := manager.set(c, key, e, cfg.Expiration); setErr != nil {
++				mux.Unlock()
++				return fmt.Errorf("limiter: failed to persist state: %w", setErr)
++			}
+ 			// Unlock entry
+ 			mux.Unlock()
+ 		}
+diff --git a/middleware/limiter/limiter_sliding.go b/middleware/limiter/limiter_sliding.go
+index cd4c3fc77ba..4e73dd2bebb 100644
+--- a/middleware/limiter/limiter_sliding.go
++++ b/middleware/limiter/limiter_sliding.go
+@@ -1,6 +1,7 @@
+ package limiter
+ 
+ import (
++	"fmt"
+ 	"strconv"
+ 	"sync"
+ 	"time"
+@@ -42,7 +43,11 @@ func (SlidingWindow) New(cfg Config) fiber.Handler {
+ 		mux.Lock()
+ 
+ 		// Get entry from pool and release when finished
+-		e := manager.get(c, key)
++		e, err := manager.get(c, key)
++		if err != nil {
++			mux.Unlock()
++			return err
++		}
+ 
+ 		// Get timestamp
+ 		ts := uint64(utils.Timestamp())
+@@ -96,7 +101,10 @@ func (SlidingWindow) New(cfg Config) fiber.Handler {
+ 		// we add the expiration to the duration.
+ 		// Otherwise after the end of "sample window", attackers could launch
+ 		// a new request with the full window length.
+-		manager.set(c, key, e, time.Duration(resetInSec+expiration)*time.Second) //nolint:gosec // Not a concern
++		if setErr := manager.set(c, key, e, time.Duration(resetInSec+expiration)*time.Second); setErr != nil { //nolint:gosec // Not a concern
++			mux.Unlock()
++			return fmt.Errorf("limiter: failed to persist state: %w", setErr)
++		}
+ 
+ 		// Unlock entry
+ 		mux.Unlock()
+@@ -115,7 +123,7 @@ func (SlidingWindow) New(cfg Config) fiber.Handler {
+ 
+ 		// Continue stack for reaching c.Response().StatusCode()
+ 		// Store err for returning
+-		err := c.Next()
++		err = c.Next()
+ 
+ 		// Get the effective status code from either the error or response
+ 		statusCode := getEffectiveStatusCode(c, err)
+@@ -125,10 +133,18 @@ func (SlidingWindow) New(cfg Config) fiber.Handler {
+ 			(cfg.SkipFailedRequests && statusCode >= fiber.StatusBadRequest) {
+ 			// Lock entry
+ 			mux.Lock()
+-			e = manager.get(c, key)
++			entry, getErr := manager.get(c, key)
++			if getErr != nil {
++				mux.Unlock()
++				return getErr
++			}
++			e = entry
+ 			e.currHits--
+ 			remaining++
+-			manager.set(c, key, e, cfg.Expiration)
++			if setErr := manager.set(c, key, e, cfg.Expiration); setErr != nil {
++				mux.Unlock()
++				return fmt.Errorf("limiter: failed to persist state: %w", setErr)
++			}
+ 			// Unlock entry
+ 			mux.Unlock()
+ 		}
+diff --git a/middleware/limiter/limiter_test.go b/middleware/limiter/limiter_test.go
+index 9f60cb88af2..5f57a7f8968 100644
+--- a/middleware/limiter/limiter_test.go
++++ b/middleware/limiter/limiter_test.go
+@@ -1,6 +1,8 @@
+ package limiter
+ 
+ import (
++	"context"
++	"errors"
+ 	"io"
+ 	"net/http/httptest"
+ 	"sync"
+@@ -14,6 +16,107 @@ import (
+ 	"github.com/valyala/fasthttp"
+ )
+ 
++type failingLimiterStorage struct {
++	data map[string][]byte
++	errs map[string]error
++}
++
++func newFailingLimiterStorage() *failingLimiterStorage {
++	return &failingLimiterStorage{
++		data: make(map[string][]byte),
++		errs: make(map[string]error),
++	}
++}
++
++func (s *failingLimiterStorage) GetWithContext(_ context.Context, key string) ([]byte, error) {
++	if err, ok := s.errs["get|"+key]; ok && err != nil {
++		return nil, err
++	}
++	if val, ok := s.data[key]; ok {
++		return append([]byte(nil), val...), nil
++	}
++	return nil, nil
++}
++
++func (s *failingLimiterStorage) Get(key string) ([]byte, error) {
++	return s.GetWithContext(context.Background(), key)
++}
++
++func (s *failingLimiterStorage) SetWithContext(_ context.Context, key string, val []byte, _ time.Duration) error {
++	if err, ok := s.errs["set|"+key]; ok && err != nil {
++		return err
++	}
++	s.data[key] = append([]byte(nil), val...)
++	return nil
++}
++
++func (s *failingLimiterStorage) Set(key string, val []byte, exp time.Duration) error {
++	return s.SetWithContext(context.Background(), key, val, exp)
++}
++
++func (*failingLimiterStorage) DeleteWithContext(context.Context, string) error { return nil }
++
++func (*failingLimiterStorage) Delete(string) error { return nil }
++
++func (*failingLimiterStorage) ResetWithContext(context.Context) error { return nil }
++
++func (*failingLimiterStorage) Reset() error { return nil }
++
++func (*failingLimiterStorage) Close() error { return nil }
++
++func TestLimiterFixedStorageGetError(t *testing.T) {
++	t.Parallel()
++
++	storage := newFailingLimiterStorage()
++	storage.errs["get|client-key"] = errors.New("boom")
++
++	var captured error
++	app := fiber.New(fiber.Config{
++		ErrorHandler: func(c fiber.Ctx, err error) error {
++			captured = err
++			return c.Status(fiber.StatusInternalServerError).SendString("storage failure")
++		},
++	})
++
++	app.Use(New(Config{Storage: storage, Max: 1, Expiration: time.Second, KeyGenerator: func(fiber.Ctx) string { return "client-key" }}))
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendString("ok")
++	})
++
++	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", nil))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
++	require.Error(t, captured)
++	require.ErrorContains(t, captured, "limiter: failed to get key")
++}
++
++func TestLimiterFixedStorageSetError(t *testing.T) {
++	t.Parallel()
++
++	storage := newFailingLimiterStorage()
++	storage.errs["set|client-key"] = errors.New("boom")
++
++	var captured error
++	app := fiber.New(fiber.Config{
++		ErrorHandler: func(c fiber.Ctx, err error) error {
++			captured = err
++			return c.Status(fiber.StatusInternalServerError).SendString("storage failure")
++		},
++	})
++
++	app.Use(New(Config{Storage: storage, Max: 1, Expiration: time.Second, KeyGenerator: func(fiber.Ctx) string { return "client-key" }}))
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendString("ok")
++	})
++
++	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", nil))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusInternalServerError, resp.StatusCode)
++	require.Error(t, captured)
++	require.ErrorContains(t, captured, "limiter: failed to persist state")
++	require.ErrorContains(t, captured, "limiter: failed to store key")
++}
++
+ // go test -run Test_Limiter_With_Max_Func_With_Zero -race -v
+ func Test_Limiter_With_Max_Func_With_Zero_And_Limiter_Sliding(t *testing.T) {
+ 	t.Parallel()
+diff --git a/middleware/limiter/manager.go b/middleware/limiter/manager.go
+index ddd7128a879..b16e4aa94da 100644
+--- a/middleware/limiter/manager.go
++++ b/middleware/limiter/manager.go
+@@ -2,6 +2,7 @@ package limiter
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"sync"
+ 	"time"
+ 
+@@ -58,37 +59,52 @@ func (m *manager) release(e *item) {
+ }
+ 
+ // get data from storage or memory
+-func (m *manager) get(ctx context.Context, key string) *item {
+-	var it *item
++func (m *manager) get(ctx context.Context, key string) (*item, error) {
+ 	if m.storage != nil {
+-		it = m.acquire()
+ 		raw, err := m.storage.GetWithContext(ctx, key)
+ 		if err != nil {
+-			return it
++			return nil, fmt.Errorf("limiter: failed to get key %q from storage: %w", key, err)
+ 		}
+ 		if raw != nil {
++			it := m.acquire()
+ 			if _, err := it.UnmarshalMsg(raw); err != nil {
+-				return it
++				m.release(it)
++				return nil, fmt.Errorf("limiter: failed to unmarshal key %q: %w", key, err)
+ 			}
++			return it, nil
+ 		}
+-		return it
++		return m.acquire(), nil
+ 	}
+-	if it, _ = m.memory.Get(key).(*item); it == nil { //nolint:errcheck // We store nothing else in the pool
+-		it = m.acquire()
+-		return it
++
++	value := m.memory.Get(key)
++	if value == nil {
++		return m.acquire(), nil
++	}
++
++	it, ok := value.(*item)
++	if !ok {
++		return nil, fmt.Errorf("limiter: unexpected entry type %T for key %q", value, key)
+ 	}
+-	return it
++
++	return it, nil
+ }
+ 
+ // set data to storage or memory
+-func (m *manager) set(ctx context.Context, key string, it *item, exp time.Duration) {
++func (m *manager) set(ctx context.Context, key string, it *item, exp time.Duration) error {
+ 	if m.storage != nil {
+-		if raw, err := it.MarshalMsg(nil); err == nil {
+-			_ = m.storage.SetWithContext(ctx, key, raw, exp) //nolint:errcheck // TODO: Handle error here
++		raw, err := it.MarshalMsg(nil)
++		if err != nil {
++			m.release(it)
++			return fmt.Errorf("limiter: failed to marshal key %q: %w", key, err)
++		}
++		if err := m.storage.SetWithContext(ctx, key, raw, exp); err != nil {
++			m.release(it)
++			return fmt.Errorf("limiter: failed to store key %q: %w", key, err)
+ 		}
+-		// we can release data because it's serialized to database
+ 		m.release(it)
+-	} else {
+-		m.memory.Set(key, it, exp)
++		return nil
+ 	}
++
++	m.memory.Set(key, it, exp)
++	return nil
+ }
+diff --git a/middleware/session/data_msgp.go b/middleware/session/data_msgp.go
+index 614633eb8f6..ed06b20a7ec 100644
+--- a/middleware/session/data_msgp.go
++++ b/middleware/session/data_msgp.go
+@@ -36,7 +36,7 @@ func (z *data) DecodeMsg(dc *msgp.Reader) (err error) {
+ }
+ 
+ // EncodeMsg implements msgp.Encodable
+-func (z data) EncodeMsg(en *msgp.Writer) (err error) {
++func (z *data) EncodeMsg(en *msgp.Writer) (err error) {
+ 	// map header, size 0
+ 	_ = z
+ 	err = en.Append(0x80)
+@@ -47,7 +47,7 @@ func (z data) EncodeMsg(en *msgp.Writer) (err error) {
+ }
+ 
+ // MarshalMsg implements msgp.Marshaler
+-func (z data) MarshalMsg(b []byte) (o []byte, err error) {
++func (z *data) MarshalMsg(b []byte) (o []byte, err error) {
+ 	o = msgp.Require(b, z.Msgsize())
+ 	// map header, size 0
+ 	_ = z
+@@ -86,7 +86,7 @@ func (z *data) UnmarshalMsg(bts []byte) (o []byte, err error) {
+ }
+ 
+ // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
+-func (z data) Msgsize() (s int) {
++func (z *data) Msgsize() (s int) {
+ 	s = 1
+ 	return
+ }

@@ -77,6 +77,9 @@ EXTERNAL_REPOS = [
     # Go external repos
     "gin-gonic/gin",               # 75k stars — Go HTTP web framework, go test ./..., active bug-fixes
     "labstack/echo",               # 28k stars — Go HTTP framework, go test ./..., clean regressions
+    "gofiber/fiber",               # 31k stars — Go web framework, Express-style, active bug-fixes
+    "grpc/grpc-go",                # 21k stars — Go gRPC implementation, real protocol bugs
+    "spf13/cobra",                 # 35k stars — Go CLI library, well-tested edge cases
 ]
 
 

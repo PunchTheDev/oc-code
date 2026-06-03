@@ -106,17 +106,20 @@ REPO_CATEGORY: dict[str, str] = {
     # Go external repos
     "gin-gonic/gin": "go",
     "labstack/echo": "go",
+    "gofiber/fiber": "go",
+    "grpc/grpc-go": "go",
+    "spf13/cobra": "go",
 }
 
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json
-# Proportional to pool composition: python:41% rust:27% typescript:18% ruby:7% jvm:5% go:2%
+# Proportional to pool composition: python:40% rust:25% typescript:18% ruby:7% jvm:5% go:9%
 DEFAULT_SHARD_BUDGET: dict[str, int] = {
-    "python": 11,
-    "rust": 8,
+    "python": 10,
+    "rust": 7,
     "typescript": 6,
     "ruby": 2,
     "jvm": 2,
-    "go": 1,
+    "go": 3,
 }
 
 
@@ -367,8 +370,8 @@ def run_evaluation(
     # Oracle mode: score reference diffs directly — no agent call needed.
     # Used for pipeline calibration; expected weighted mean matches baselines.json.
     if use_oracle:
-        _oracle_weighted = 12.66
-        _oracle_arithmetic = 11.39
+        _oracle_weighted = 12.64
+        _oracle_arithmetic = 11.41
         _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
         if _baselines_path.exists():
             try:

@@ -1,0 +1,326 @@
+diff --git a/app.go b/app.go
+index dfadcac1272..42c94321b17 100644
+--- a/app.go
++++ b/app.go
+@@ -25,10 +25,11 @@ import (
+ 	"sync"
+ 	"time"
+ 
+-	"github.com/gofiber/fiber/v3/binder"
+-	"github.com/gofiber/fiber/v3/log"
+ 	"github.com/gofiber/utils/v2"
+ 	"github.com/valyala/fasthttp"
++
++	"github.com/gofiber/fiber/v3/binder"
++	"github.com/gofiber/fiber/v3/log"
+ )
+ 
+ // Version of current fiber package
+@@ -486,6 +487,9 @@ var DefaultMethods = []string{
+ 	methodPatch:   MethodPatch,
+ }
+ 
++// httpReadResponse - Used for test mocking http.ReadResponse
++var httpReadResponse = http.ReadResponse
++
+ // DefaultErrorHandler that process return errors from handlers
+ func DefaultErrorHandler(c Ctx, err error) error {
+ 	code := StatusInternalServerError
+@@ -1112,16 +1116,34 @@ func (app *App) Test(req *http.Request, config ...TestConfig) (*http.Response, e
+ 		return nil, err
+ 	}
+ 
+-	// Read response
++	// Read response(s)
+ 	buffer := bufio.NewReader(&conn.w)
+ 
+-	// Convert raw http response to *http.Response
+-	res, err := http.ReadResponse(buffer, req)
+-	if err != nil {
+-		if errors.Is(err, io.ErrUnexpectedEOF) {
+-			return nil, ErrTestGotEmptyResponse
++	var res *http.Response
++	for {
++		// Convert raw http response to *http.Response
++		res, err = httpReadResponse(buffer, req)
++		if err != nil {
++			if errors.Is(err, io.ErrUnexpectedEOF) {
++				return nil, ErrTestGotEmptyResponse
++			}
++			return nil, fmt.Errorf("failed to read response: %w", err)
++		}
++
++		// Break if this response is non-1xx or there are no more responses
++		if res.StatusCode >= http.StatusOK || buffer.Buffered() == 0 {
++			break
++		}
++
++		// Discard interim response body before reading the next one
++		if res.Body != nil {
++			if _, errCopy := io.Copy(io.Discard, res.Body); errCopy != nil {
++				return nil, fmt.Errorf("failed to discard interim response body: %w", errCopy)
++			}
++			if errClose := res.Body.Close(); errClose != nil {
++				return nil, fmt.Errorf("failed to close interim response body: %w", errClose)
++			}
+ 		}
+-		return nil, fmt.Errorf("failed to read response: %w", err)
+ 	}
+ 
+ 	return res, nil
+diff --git a/app_test.go b/app_test.go
+index c9961e2c0e2..7adf4a2116d 100644
+--- a/app_test.go
++++ b/app_test.go
+@@ -6,6 +6,7 @@
+ package fiber
+ 
+ import (
++	"bufio"
+ 	"bytes"
+ 	"context"
+ 	"crypto/tls"
+@@ -1851,6 +1852,133 @@ func Test_App_Test_drop_empty_response(t *testing.T) {
+ 	require.ErrorIs(t, err, ErrTestGotEmptyResponse)
+ }
+ 
++func Test_App_Test_response_error(t *testing.T) {
++	// Note: Test cannot run in parallel due to
++	// overriding the httpReadResponse global variable.
++	// t.Parallel()
++
++	// Override httpReadResponse temporarily
++	oldHTTPReadResponse := httpReadResponse
++	defer func() {
++		httpReadResponse = oldHTTPReadResponse
++	}()
++	httpReadResponse = func(_ *bufio.Reader, _ *http.Request) (*http.Response, error) {
++		return nil, errErrorReader
++	}
++
++	app := New()
++	app.Get("/", func(c Ctx) error {
++		return c.SendStatus(StatusOK)
++	})
++
++	_, err := app.Test(httptest.NewRequest(MethodGet, "/", nil), TestConfig{
++		Timeout:       0,
++		FailOnTimeout: false,
++	})
++	require.ErrorIs(t, err, errErrorReader)
++}
++
++type errorReadCloser int
++
++var errInvalidReadOnBody = errors.New("test: invalid Read on body")
++
++func (errorReadCloser) Read(_ []byte) (int, error) {
++	return 0, errInvalidReadOnBody
++}
++
++func (errorReadCloser) Close() error {
++	return nil
++}
++
++func Test_App_Test_ReadFail(t *testing.T) {
++	// Note: Test cannot run in parallel due to
++	// overriding the httpReadResponse global variable.
++	// t.Parallel()
++
++	// Override httpReadResponse temporarily
++	oldHTTPReadResponse := httpReadResponse
++	defer func() {
++		httpReadResponse = oldHTTPReadResponse
++	}()
++
++	httpReadResponse = func(r *bufio.Reader, req *http.Request) (*http.Response, error) {
++		resp, err := http.ReadResponse(r, req)
++		require.NoError(t, resp.Body.Close())
++		resp.Body = errorReadCloser(0)
++		return resp, err //nolint:wrapcheck // unnecessary to wrap it
++	}
++
++	app := New()
++	hints := []string{"<https://cdn.com>; rel=preload; as=script"}
++	app.Get("/early", func(c Ctx) error {
++		err := c.SendEarlyHints(hints)
++		require.NoError(t, err)
++		return c.SendStatus(StatusOK)
++	})
++
++	req := httptest.NewRequest(MethodGet, "/early", nil)
++	_, err := app.Test(req)
++
++	require.ErrorIs(t, err, errInvalidReadOnBody)
++}
++
++var errDoubleClose = errors.New("test: double close")
++
++type doubleCloseBody struct {
++	isClosed bool
++}
++
++func (b *doubleCloseBody) Read(_ []byte) (int, error) {
++	if b.isClosed {
++		return 0, errInvalidReadOnBody
++	}
++
++	// Close after reading EOF
++	_ = b.Close() //nolint:errcheck // It is fine to ignore the error here
++	return 0, io.EOF
++}
++
++func (b *doubleCloseBody) Close() error {
++	if b.isClosed {
++		return errDoubleClose
++	}
++
++	b.isClosed = true
++	return nil
++}
++
++func Test_App_Test_CloseFail(t *testing.T) {
++	// Note: Test cannot run in parallel due to
++	// overriding the httpReadResponse global variable.
++	// t.Parallel()
++
++	// Override httpReadResponse temporarily
++	oldHTTPReadResponse := httpReadResponse
++	defer func() {
++		httpReadResponse = oldHTTPReadResponse
++	}()
++
++	httpReadResponse = func(r *bufio.Reader, req *http.Request) (*http.Response, error) {
++		resp, err := http.ReadResponse(r, req)
++		_ = resp.Body.Close() //nolint:errcheck // It is fine to ignore the error here
++		resp.Body = &doubleCloseBody{}
++		return resp, err //nolint:wrapcheck // unnecessary to wrap it
++	}
++
++	app := New()
++	hints := []string{"<https://cdn.com>; rel=preload; as=script"}
++	app.Get("/early", func(c Ctx) error {
++		err := c.SendEarlyHints(hints)
++		require.NoError(t, err)
++		return c.Status(StatusOK).SendString("done")
++	})
++
++	req := httptest.NewRequest(MethodGet, "/early", nil)
++	_, err := app.Test(req)
++
++	require.ErrorIs(t, err, errDoubleClose)
++}
++
+ func Test_App_SetTLSHandler(t *testing.T) {
+ 	t.Parallel()
+ 	tlsHandler := &TLSHandler{clientHelloInfo: &tls.ClientHelloInfo{
+diff --git a/ctx_interface_gen.go b/ctx_interface_gen.go
+index 4f58c6d429d..dbed2052341 100644
+--- a/ctx_interface_gen.go
++++ b/ctx_interface_gen.go
+@@ -365,6 +365,17 @@ type Ctx interface {
+ 	// Send sets the HTTP response body without copying it.
+ 	// From this point onward the body argument must not be changed.
+ 	Send(body []byte) error
++	// SendEarlyHints allows the server to hint to the browser what resources a page would need
++	// so the browser can preload them while waiting for the server's full response. Only Link
++	// headers already written to the response will be transmitted as Early Hints.
++	//
++	// This is a HTTP/2+ feature but all browsers will either understand it or safely ignore it.
++	//
++	// NOTE: Older HTTP/1.1 non-browser clients may face compatibility issues.
++	//
++	// See: https://developer.chrome.com/docs/web-platform/early-hints and
++	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Link#syntax
++	SendEarlyHints(hints []string) error
+ 	// SendFile transfers the file from the specified path.
+ 	// By default, the file is not compressed. To enable compression, set SendFile.Compress to true.
+ 	// The Content-Type response HTTP header field is set based on the file's extension.
+diff --git a/ctx_test.go b/ctx_test.go
+index 0a62afb4daa..19067bebcb2 100644
+--- a/ctx_test.go
++++ b/ctx_test.go
+@@ -3853,6 +3853,30 @@ func Test_Ctx_Download(t *testing.T) {
+ 	require.Contains(t, header, `filename*=UTF-8''%D1%84%D0%B0%D0%B9%D0%BB.txt`)
+ }
+ 
++// go test -race -run Test_Ctx_SendEarlyHints
++func Test_Ctx_SendEarlyHints(t *testing.T) {
++	t.Parallel()
++	app := New()
++
++	hints := []string{"<https://cdn.com>; rel=preload; as=script"}
++	app.Get("/earlyhints", func(c Ctx) error {
++		err := c.SendEarlyHints(hints)
++		require.NoError(t, err, "SendEarlyHints")
++		c.Status(StatusBadRequest)
++		return c.SendString("fail")
++	})
++
++	req := httptest.NewRequest(MethodGet, "/earlyhints", nil)
++	resp, err := app.Test(req)
++
++	require.NoError(t, err, "app.Test(req)")
++	require.Equal(t, StatusBadRequest, resp.StatusCode, "Status code")
++	require.Equal(t, hints, resp.Header["Link"], "Link header")
++	body, err := io.ReadAll(resp.Body)
++	require.NoError(t, err)
++	require.Equal(t, "fail", string(body))
++}
++
+ // go test -race -run Test_Ctx_SendFile
+ func Test_Ctx_SendFile(t *testing.T) {
+ 	t.Parallel()
+diff --git a/res.go b/res.go
+index 71a9b29b87f..ff5e4cd97f4 100644
+--- a/res.go
++++ b/res.go
+@@ -681,6 +681,26 @@ func (r *DefaultRes) Send(body []byte) error {
+ 	return nil
+ }
+ 
++// SendEarlyHints allows the server to hint to the browser what resources a page would need
++// so the browser can preload them while waiting for the server's full response. Only Link
++// headers already written to the response will be transmitted as Early Hints.
++//
++// This is a HTTP/2+ feature but all browsers will either understand it or safely ignore it.
++//
++// NOTE: Older HTTP/1.1 non-browser clients may face compatibility issues.
++//
++// See: https://developer.chrome.com/docs/web-platform/early-hints and
++// https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Link#syntax
++func (r *DefaultRes) SendEarlyHints(hints []string) error {
++	if len(hints) == 0 {
++		return nil
++	}
++	for _, h := range hints {
++		r.c.fasthttp.Response.Header.Add("Link", h)
++	}
++	return r.c.fasthttp.EarlyHints()
++}
++
+ // SendFile transfers the file from the specified path.
+ // By default, the file is not compressed. To enable compression, set SendFile.Compress to true.
+ // The Content-Type response HTTP header field is set based on the file's extension.
+diff --git a/res_interface_gen.go b/res_interface_gen.go
+index 48877e375a9..b8c014e9a1a 100644
+--- a/res_interface_gen.go
++++ b/res_interface_gen.go
+@@ -109,6 +109,17 @@ type Res interface {
+ 	// Send sets the HTTP response body without copying it.
+ 	// From this point onward the body argument must not be changed.
+ 	Send(body []byte) error
++	// SendEarlyHints allows the server to hint to the browser what resources a page would need
++	// so the browser can preload them while waiting for the server's full response. Only Link
++	// headers already written to the response will be transmitted as Early Hints.
++	//
++	// This is a HTTP/2+ feature but all browsers will either understand it or safely ignore it.
++	//
++	// NOTE: Older HTTP/1.1 non-browser clients may face compatibility issues.
++	//
++	// See: https://developer.chrome.com/docs/web-platform/early-hints and
++	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Link#syntax
++	SendEarlyHints(hints []string) error
+ 	// SendFile transfers the file from the specified path.
+ 	// By default, the file is not compressed. To enable compression, set SendFile.Compress to true.
+ 	// The Content-Type response HTTP header field is set based on the file's extension.

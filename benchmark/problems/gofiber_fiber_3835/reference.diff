@@ -1,0 +1,311 @@
+diff --git a/client.go b/client.go
+index ee191a63772..92155376ab7 100644
+--- a/client.go
++++ b/client.go
+@@ -800,9 +800,7 @@ func printDebugInfo(req *Request, resp *Response, w io.Writer) {
+ func (a *Agent) String() (int, string, []error) {
+ 	defer a.release()
+ 	code, body, errs := a.bytes()
+-	// TODO: There might be a data race here on body. Maybe use utils.CopyBytes on it?
+-
+-	return code, utils.UnsafeString(body), errs
++	return code, string(body), errs
+ }
+ 
+ // Struct returns the status code, bytes body and errors of URL.
+diff --git a/client_test.go b/client_test.go
+index 580e2d35fae..c20ec6473b2 100644
+--- a/client_test.go
++++ b/client_test.go
+@@ -15,6 +15,7 @@ import (
+ 	"path/filepath"
+ 	"regexp"
+ 	"strings"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+@@ -989,6 +990,44 @@ func Test_Client_Agent_Reuse(t *testing.T) {
+ 	utils.AssertEqual(t, 0, len(errs))
+ }
+ 
++func Test_Client_Agent_StringCopiesBody(t *testing.T) {
++	t.Parallel()
++
++	ln := fasthttputil.NewInmemoryListener()
++
++	app := New(Config{DisableStartupMessage: true})
++
++	var hits int32
++	app.Get("/", func(c *Ctx) error {
++		current := atomic.AddInt32(&hits, 1)
++		return c.SendString(fmt.Sprintf("body-%d", current))
++	})
++
++	go func() { utils.AssertEqual(t, nil, app.Listener(ln)) }()
++
++	a := Get("http://example.com").
++		Reuse()
++
++	a.HostClient.Dial = func(addr string) (net.Conn, error) { return ln.Dial() }
++
++	code, firstBody, errs := a.String()
++
++	utils.AssertEqual(t, StatusOK, code)
++	utils.AssertEqual(t, "body-1", firstBody)
++	utils.AssertEqual(t, 0, len(errs))
++
++	code, secondBody, errs := a.String()
++
++	utils.AssertEqual(t, StatusOK, code)
++	utils.AssertEqual(t, "body-2", secondBody)
++	utils.AssertEqual(t, 0, len(errs))
++
++	utils.AssertEqual(t, "body-1", firstBody)
++	utils.AssertEqual(t, "body-2", secondBody)
++
++	ReleaseAgent(a)
++}
++
+ func Test_Client_Agent_InsecureSkipVerify(t *testing.T) {
+ 	t.Parallel()
+ 
+diff --git a/ctx.go b/ctx.go
+index c42e6e6668b..3e7cf0580a7 100644
+--- a/ctx.go
++++ b/ctx.go
+@@ -351,7 +351,7 @@ func (c *Ctx) Body() []byte {
+ 		c.fasthttp.Request.SetBodyRaw(originalBody)
+ 	}
+ 	if err != nil {
+-		return []byte(err.Error())
++		return c.app.getBytes(err.Error())
+ 	}
+ 
+ 	if c.app.config.Immutable {
+@@ -423,7 +423,20 @@ func (c *Ctx) BodyParser(out interface{}) error {
+ 
+ 		data := make(map[string][]string)
+ 		for key, values := range multipartForm.Value {
+-			err = formatParserData(out, data, bodyTag, key, values, c.app.config.EnableSplittingOnParsers, true)
++			processedKey := key
++			processedValues := values
++			if c.app.config.Immutable {
++				processedKey = c.app.getString([]byte(key))
++				if len(values) > 0 {
++					copied := make([]string, len(values))
++					for i, val := range values {
++						copied[i] = c.app.getString([]byte(val))
++					}
++					processedValues = copied
++				}
++			}
++
++			err = formatParserData(out, data, bodyTag, processedKey, processedValues, c.app.config.EnableSplittingOnParsers, true)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -714,17 +727,16 @@ func (c *Ctx) GetRespHeaders() map[string][]string {
+ }
+ 
+ // Hostname contains the hostname derived from the X-Forwarded-Host or Host HTTP header.
+-// Returned value is only valid within the handler. Do not store any references.
+-// Make copies or use the Immutable setting instead.
++// Returned value is only valid within the handler. Do not store any references unless
++// Config.Immutable is enabled, in which case the value is copied before it is returned.
+ // Please use Config.EnableTrustedProxyCheck to prevent header spoofing, in case when your app is behind the proxy.
+ func (c *Ctx) Hostname() string {
+ 	if c.IsProxyTrusted() {
+-		if host := c.Get(HeaderXForwardedHost); len(host) > 0 {
+-			commaPos := strings.Index(host, ",")
+-			if commaPos != -1 {
+-				return host[:commaPos]
++		if hostBytes := c.fasthttp.Request.Header.Peek(HeaderXForwardedHost); len(hostBytes) > 0 {
++			if commaPos := bytes.IndexByte(hostBytes, ','); commaPos != -1 {
++				hostBytes = hostBytes[:commaPos]
+ 			}
+-			return host
++			return c.app.getString(hostBytes)
+ 		}
+ 	}
+ 	return c.app.getString(c.fasthttp.Request.URI().Host())
+@@ -1050,8 +1062,8 @@ func (c *Ctx) OriginalURL() string {
+ // Params is used to get the route parameters.
+ // Defaults to empty string "" if the param doesn't exist.
+ // If a default value is given, it will return that value if the param doesn't exist.
+-// Returned value is only valid within the handler. Do not store any references.
+-// Make copies or use the Immutable setting to use the value outside the Handler.
++// Returned value is only valid within the handler. Do not store any references unless
++// Config.Immutable is enabled, in which case the value is copied before it is returned.
+ func (c *Ctx) Params(key string, defaultValue ...string) string {
+ 	if key == "*" || key == "+" {
+ 		key += "1"
+@@ -1065,7 +1077,11 @@ func (c *Ctx) Params(key string, defaultValue ...string) string {
+ 			if len(c.values) <= i || len(c.values[i]) == 0 {
+ 				break
+ 			}
+-			return c.values[i]
++			value := c.values[i]
++			if c.app.config.Immutable {
++				return c.app.getString([]byte(value))
++			}
++			return value
+ 		}
+ 	}
+ 	return defaultString("", defaultValue)
+@@ -1818,6 +1834,11 @@ func (c *Ctx) Subdomains(offset ...int) []string {
+ 		l = len(subdomains)
+ 	}
+ 	subdomains = subdomains[:l]
++	if c.app.config.Immutable {
++		for i, subdomain := range subdomains {
++			subdomains[i] = c.app.getString([]byte(subdomain))
++		}
++	}
+ 	return subdomains
+ }
+ 
+@@ -1859,9 +1880,9 @@ func (c *Ctx) String() string {
+ 	buf.WriteString(" - ")
+ 
+ 	// Add method and URI
+-	buf.Write(c.fasthttp.Request.Header.Method())
++	buf.WriteString(c.app.getString(c.fasthttp.Request.Header.Method()))
+ 	buf.WriteByte(' ')
+-	buf.Write(c.fasthttp.URI().FullURI())
++	buf.WriteString(c.app.getString(c.fasthttp.URI().FullURI()))
+ 
+ 	// Allocate string
+ 	str := buf.String()
+diff --git a/ctx_test.go b/ctx_test.go
+index af08c4eeaf9..34939d2beab 100644
+--- a/ctx_test.go
++++ b/ctx_test.go
+@@ -2959,6 +2959,127 @@ func Test_Ctx_Subdomains(t *testing.T) {
+ 	utils.AssertEqual(t, []string{"localhost:3000"}, c.Subdomains())
+ }
+ 
++// go test -run Test_Ctx_Immutable_AfterHandler
++func Test_Ctx_Immutable_AfterHandler(t *testing.T) {
++	t.Parallel()
++
++	app := New(Config{
++		Immutable:          true,
++		ProxyHeader:        HeaderXForwardedFor,
++		EnableIPValidation: true,
++	})
++
++	type ctxSnapshot struct {
++		method          string
++		path            string
++		originalURL     string
++		baseURL         string
++		protocol        string
++		hostname        string
++		paramName       string
++		queryFoo        string
++		cookieSession   string
++		headerUserAgent string
++		ip              string
++		ips             []string
++		subdomains      []string
++		body            []byte
++		routePath       string
++	}
++
++	snapshots := make([]ctxSnapshot, 0, 2)
++
++	app.All("/v1/:name", func(c *Ctx) error {
++		snapshots = append(snapshots, ctxSnapshot{
++			method:          c.Method(),
++			path:            c.Path(),
++			originalURL:     c.OriginalURL(),
++			baseURL:         c.BaseURL(),
++			protocol:        c.Protocol(),
++			hostname:        c.Hostname(),
++			paramName:       c.Params("name"),
++			queryFoo:        c.Query("foo"),
++			cookieSession:   c.Cookies("session"),
++			headerUserAgent: c.Get(HeaderUserAgent),
++			ip:              c.IP(),
++			ips:             c.IPs(),
++			subdomains:      c.Subdomains(),
++			body:            c.Body(),
++			routePath:       c.Route().Path,
++		})
++
++		return c.SendString("ok")
++	})
++
++	req := httptest.NewRequest(MethodPost, "https://initial.invalid/v1/alpha?foo=bar", strings.NewReader("body-one"))
++	req.Header.Set(HeaderXForwardedHost, "p1.api.example.com")
++	req.Header.Set(HeaderXForwardedProto, "https")
++	req.Header.Set(HeaderXForwardedFor, "10.0.0.1, 10.0.0.2")
++	req.Header.Set(HeaderUserAgent, "agent-one")
++	req.Header.Set(HeaderCookie, "session=alpha")
++
++	originalFirst := req.URL.String()
++
++	resp, err := app.Test(req)
++	utils.AssertEqual(t, nil, err)
++	utils.AssertEqual(t, StatusOK, resp.StatusCode)
++	utils.AssertEqual(t, nil, resp.Body.Close())
++
++	utils.AssertEqual(t, 1, len(snapshots))
++	first := snapshots[0]
++
++	follow := httptest.NewRequest(MethodPatch, "http://secondary.invalid/v1/beta?foo=qux", strings.NewReader("body-two"))
++	follow.Header.Set(HeaderXForwardedHost, "edge.stage.example.org")
++	follow.Header.Set(HeaderXForwardedProto, "http")
++	follow.Header.Set(HeaderXForwardedFor, "192.168.1.50")
++	follow.Header.Set(HeaderUserAgent, "agent-two")
++	follow.Header.Set(HeaderCookie, "session=beta")
++
++	originalSecond := follow.URL.String()
++
++	resp, err = app.Test(follow)
++	utils.AssertEqual(t, nil, err)
++	utils.AssertEqual(t, StatusOK, resp.StatusCode)
++	utils.AssertEqual(t, nil, resp.Body.Close())
++
++	utils.AssertEqual(t, 2, len(snapshots))
++	second := snapshots[1]
++
++	// Ensure the first request's state stays valid after the context is released.
++	utils.AssertEqual(t, MethodPost, first.method)
++	utils.AssertEqual(t, "/v1/alpha", first.path)
++	utils.AssertEqual(t, originalFirst, first.originalURL)
++	utils.AssertEqual(t, "https://p1.api.example.com", first.baseURL)
++	utils.AssertEqual(t, "https", first.protocol)
++	utils.AssertEqual(t, "p1.api.example.com", first.hostname)
++	utils.AssertEqual(t, "alpha", first.paramName)
++	utils.AssertEqual(t, "bar", first.queryFoo)
++	utils.AssertEqual(t, "alpha", first.cookieSession)
++	utils.AssertEqual(t, "agent-one", first.headerUserAgent)
++	utils.AssertEqual(t, "10.0.0.1", first.ip)
++	utils.AssertEqual(t, []string{"10.0.0.1", "10.0.0.2"}, first.ips)
++	utils.AssertEqual(t, []string{"p1", "api"}, first.subdomains)
++	utils.AssertEqual(t, "body-one", string(first.body))
++	utils.AssertEqual(t, "/v1/:name", first.routePath)
++
++	// Verify the second request collected distinct immutable copies.
++	utils.AssertEqual(t, MethodPatch, second.method)
++	utils.AssertEqual(t, "/v1/beta", second.path)
++	utils.AssertEqual(t, originalSecond, second.originalURL)
++	utils.AssertEqual(t, "http://edge.stage.example.org", second.baseURL)
++	utils.AssertEqual(t, "http", second.protocol)
++	utils.AssertEqual(t, "edge.stage.example.org", second.hostname)
++	utils.AssertEqual(t, "beta", second.paramName)
++	utils.AssertEqual(t, "qux", second.queryFoo)
++	utils.AssertEqual(t, "beta", second.cookieSession)
++	utils.AssertEqual(t, "agent-two", second.headerUserAgent)
++	utils.AssertEqual(t, "192.168.1.50", second.ip)
++	utils.AssertEqual(t, []string{"192.168.1.50"}, second.ips)
++	utils.AssertEqual(t, []string{"edge", "stage"}, second.subdomains)
++	utils.AssertEqual(t, "body-two", string(second.body))
++	utils.AssertEqual(t, "/v1/:name", second.routePath)
++}
++
+ // go test -v -run=^$ -bench=Benchmark_Ctx_Subdomains -benchmem -count=4
+ func Benchmark_Ctx_Subdomains(b *testing.B) {
+ 	app := New()

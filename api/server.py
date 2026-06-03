@@ -82,6 +82,9 @@ REPO_CATEGORY: dict[str, str] = {
     # Go external repos
     "gin-gonic/gin": "go",
     "labstack/echo": "go",
+    "gofiber/fiber": "go",
+    "grpc/grpc-go": "go",
+    "spf13/cobra": "go",
 }
 
 

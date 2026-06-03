@@ -1,0 +1,395 @@
+diff --git a/middleware/limiter/limiter_sliding.go b/middleware/limiter/limiter_sliding.go
+index 07e60e32fb6..98b3bf8cce5 100644
+--- a/middleware/limiter/limiter_sliding.go
++++ b/middleware/limiter/limiter_sliding.go
+@@ -2,6 +2,7 @@ package limiter
+ 
+ import (
+ 	"fmt"
++	"math"
+ 	"strconv"
+ 	"sync"
+ 	"time"
+@@ -60,42 +61,21 @@ func (SlidingWindow) New(cfg *Config) fiber.Handler {
+ 		// Get timestamp
+ 		ts := uint64(utils.Timestamp())
+ 
+-		// Set expiration if entry does not exist
+-		if e.exp == 0 {
+-			e.exp = ts + expiration
+-		} else if ts >= e.exp {
+-			// The entry has expired, handle the expiration.
+-			// Set the prevHits to the current hits and reset the hits to 0.
+-			e.prevHits = e.currHits
+-
+-			// Reset the current hits to 0.
+-			e.currHits = 0
+-
+-			// Check how much into the current window it currently is and sets the
+-			// expiry based on that; otherwise, this would only reset on
+-			// the next request and not show the correct expiry.
+-			elapsed := ts - e.exp
+-			if elapsed >= expiration {
+-				e.exp = ts + expiration
+-			} else {
+-				e.exp = ts + expiration - elapsed
+-			}
+-		}
++		// Rotate window
++		resetInSec := rotateWindow(e, ts, expiration)
++		windowExpiresAt := e.exp
+ 
+ 		// Increment hits
+ 		e.currHits++
+ 
+-		// Calculate when it resets in seconds
+-		resetInSec := e.exp - ts
+-
+ 		// weight = time until current window reset / total window length
+ 		weight := float64(resetInSec) / float64(expiration)
+ 
+ 		// rate = request count in previous window - weight + request count in current window
+-		rate := int(float64(e.prevHits)*weight) + e.currHits
++		rate := int(math.Ceil(float64(e.prevHits)*weight)) + e.currHits
+ 
+ 		// Calculate how many hits can be made based on the current rate
+-		remaining := cfg.Max - rate
++		remaining := maxRequests - rate
+ 
+ 		// Update storage. Garbage collect when the next window ends.
+ 		// |--------------------------|--------------------------|
+@@ -109,7 +89,7 @@ func (SlidingWindow) New(cfg *Config) fiber.Handler {
+ 		// we add the expiration to the duration.
+ 		// Otherwise, after the end of "sample window", attackers could launch
+ 		// a new request with the full window length.
+-		if setErr := manager.set(reqCtx, key, e, time.Duration(resetInSec+expiration)*time.Second); setErr != nil { //nolint:gosec // Not a concern
++		if setErr := manager.set(reqCtx, key, e, ttlDuration(resetInSec, expiration)); setErr != nil {
+ 			mux.Unlock()
+ 			return fmt.Errorf("limiter: failed to persist state: %w", setErr)
+ 		}
+@@ -117,7 +97,7 @@ func (SlidingWindow) New(cfg *Config) fiber.Handler {
+ 		// Unlock entry
+ 		mux.Unlock()
+ 
+-		// Check if hits exceed the cfg.Max
++		// Check if hits exceed the allowed maximum for this request
+ 		if remaining < 0 {
+ 			// Return response with Retry-After header
+ 			// https://tools.ietf.org/html/rfc6584
+@@ -136,9 +116,10 @@ func (SlidingWindow) New(cfg *Config) fiber.Handler {
+ 		// Get the effective status code from either the error or response
+ 		statusCode := getEffectiveStatusCode(c, err)
+ 
+-		// Check for SkipFailedRequests and SkipSuccessfulRequests
+-		if (cfg.SkipSuccessfulRequests && statusCode < fiber.StatusBadRequest) ||
+-			(cfg.SkipFailedRequests && statusCode >= fiber.StatusBadRequest) {
++		skipHit := (cfg.SkipSuccessfulRequests && statusCode < fiber.StatusBadRequest) ||
++			(cfg.SkipFailedRequests && statusCode >= fiber.StatusBadRequest)
++
++		if skipHit || !cfg.DisableHeaders {
+ 			// Lock entry
+ 			mux.Lock()
+ 			entry, getErr := manager.get(reqCtx, key)
+@@ -147,23 +128,98 @@ func (SlidingWindow) New(cfg *Config) fiber.Handler {
+ 				return getErr
+ 			}
+ 			e = entry
+-			e.currHits--
+-			remaining++
+-			if setErr := manager.set(reqCtx, key, e, cfg.Expiration); setErr != nil {
++
++			ts = uint64(utils.Timestamp())
++			resetInSec = rotateWindow(e, ts, expiration)
++			weight = float64(resetInSec) / float64(expiration)
++
++			if skipHit {
++				if counter := bucketForOriginalHit(e, windowExpiresAt, ts, expiration); counter != nil && *counter > 0 {
++					*counter--
++				}
++			}
++
++			rate = int(math.Ceil(float64(e.prevHits)*weight)) + e.currHits
++			remaining = maxRequests - rate
++			if setErr := manager.set(reqCtx, key, e, ttlDuration(resetInSec, expiration)); setErr != nil {
+ 				mux.Unlock()
+ 				return fmt.Errorf("limiter: failed to persist state: %w", setErr)
+ 			}
+ 			// Unlock entry
+ 			mux.Unlock()
+-		}
+ 
+-		// We can continue, update RateLimit headers
+-		if !cfg.DisableHeaders {
+-			c.Set(xRateLimitLimit, strconv.Itoa(maxRequests))
+-			c.Set(xRateLimitRemaining, strconv.Itoa(remaining))
+-			c.Set(xRateLimitReset, strconv.FormatUint(resetInSec, 10))
++			// We can continue, update RateLimit headers
++			if !cfg.DisableHeaders {
++				c.Set(xRateLimitLimit, strconv.Itoa(maxRequests))
++				c.Set(xRateLimitRemaining, strconv.Itoa(remaining))
++				c.Set(xRateLimitReset, strconv.FormatUint(resetInSec, 10))
++			}
+ 		}
+ 
+ 		return err
+ 	}
+ }
++
++func rotateWindow(e *item, ts, expiration uint64) uint64 {
++	// Set expiration if entry does not exist
++	if e.exp == 0 {
++		e.exp = ts + expiration
++	} else if ts >= e.exp {
++		// The entry has expired, handle the expiration.
++		// Reset the current hits to 0.
++		elapsed := ts - e.exp
++		if elapsed >= expiration {
++			e.prevHits = 0
++			e.currHits = 0
++			e.exp = ts + expiration
++		} else {
++			e.prevHits = e.currHits
++			e.currHits = 0
++
++			e.exp = ts + expiration - elapsed
++		}
++	}
++
++	// Calculate when it resets in seconds
++	return e.exp - ts
++}
++
++func bucketForOriginalHit(e *item, requestExpiration, ts, expiration uint64) *int {
++	if ts < requestExpiration {
++		return &e.currHits
++	}
++
++	if ts-requestExpiration < expiration {
++		return &e.prevHits
++	}
++
++	return nil
++}
++
++func ttlDuration(resetInSec, expiration uint64) time.Duration {
++	resetDuration, ok := secondsToDuration(resetInSec)
++	if !ok {
++		return time.Duration(math.MaxInt64)
++	}
++
++	expirationDuration, ok := secondsToDuration(expiration)
++	if !ok {
++		return time.Duration(math.MaxInt64)
++	}
++
++	if resetDuration > time.Duration(math.MaxInt64)-expirationDuration {
++		return time.Duration(math.MaxInt64)
++	}
++
++	return resetDuration + expirationDuration
++}
++
++func secondsToDuration(seconds uint64) (time.Duration, bool) {
++	const maxSeconds = math.MaxInt64 / int64(time.Second)
++
++	if seconds > uint64(maxSeconds) {
++		return time.Duration(math.MaxInt64), false
++	}
++
++	return time.Duration(seconds) * time.Second, true
++}
+diff --git a/middleware/limiter/limiter_test.go b/middleware/limiter/limiter_test.go
+index cdb9870c676..a65cb12ab06 100644
+--- a/middleware/limiter/limiter_test.go
++++ b/middleware/limiter/limiter_test.go
+@@ -6,6 +6,7 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
++	"strconv"
+ 	"sync"
+ 	"testing"
+ 	"time"
+@@ -371,6 +372,32 @@ func TestLimiterSlidingPropagatesRequestContextToStorage(t *testing.T) {
+ 	verifyRecords(t, sets, "/rollback", "sliding-rollback", true)
+ }
+ 
++func TestLimiterSlidingSkipsPostUpdateWhenHeadersDisabled(t *testing.T) {
++	t.Parallel()
++
++	storage := newContextRecorderLimiterStorage()
++	app := fiber.New()
++
++	app.Use(New(Config{
++		Max:               1,
++		Expiration:        time.Second,
++		Storage:           storage,
++		DisableHeaders:    true,
++		LimiterMiddleware: SlidingWindow{},
++	}))
++
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendStatus(fiber.StatusOK)
++	})
++
++	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusOK, resp.StatusCode)
++
++	require.Len(t, storage.recordedGets(), 1)
++	require.Len(t, storage.recordedSets(), 1)
++}
++
+ // go test -run Test_Limiter_With_Max_Func_With_Zero -race -v
+ func Test_Limiter_With_Max_Func_With_Zero_And_Limiter_Sliding(t *testing.T) {
+ 	t.Parallel()
+@@ -410,6 +437,41 @@ func Test_Limiter_With_Max_Func_With_Zero_And_Limiter_Sliding(t *testing.T) {
+ 	require.Equal(t, 200, resp.StatusCode)
+ }
+ 
++func Test_Limiter_Sliding_MaxFuncOverridesStaticMax(t *testing.T) {
++	t.Parallel()
++	app := fiber.New()
++	staticMax := 5
++	dynamicMax := 2
++
++	app.Use(New(Config{
++		Max:               staticMax,
++		MaxFunc:           func(fiber.Ctx) int { return dynamicMax },
++		Expiration:        2 * time.Second,
++		LimiterMiddleware: SlidingWindow{},
++	}))
++
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendStatus(fiber.StatusOK)
++	})
++
++	req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
++	resp, err := app.Test(req)
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusOK, resp.StatusCode)
++	require.Equal(t, strconv.Itoa(dynamicMax), resp.Header.Get("X-RateLimit-Limit"))
++	require.Equal(t, strconv.Itoa(dynamicMax-1), resp.Header.Get("X-RateLimit-Remaining"))
++
++	resp, err = app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusOK, resp.StatusCode)
++	require.Equal(t, strconv.Itoa(dynamicMax), resp.Header.Get("X-RateLimit-Limit"))
++	require.Equal(t, strconv.Itoa(dynamicMax-2), resp.Header.Get("X-RateLimit-Remaining"))
++
++	resp, err = app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusTooManyRequests, resp.StatusCode)
++}
++
+ // go test -run Test_Limiter_With_Max_Func_With_Zero -race -v
+ func Test_Limiter_With_Max_Func_With_Zero(t *testing.T) {
+ 	t.Parallel()
+@@ -734,6 +796,107 @@ func Test_Limiter_Sliding_Window_Custom_Storage_No_Skip_Choices(t *testing.T) {
+ 	require.Equal(t, 200, resp.StatusCode)
+ }
+ 
++func Test_Limiter_Sliding_Window_RecalculatesAfterHandlerDelay(t *testing.T) {
++	t.Parallel()
++	app := fiber.New()
++
++	app.Use(New(Config{
++		Max:               2,
++		Expiration:        time.Second,
++		LimiterMiddleware: SlidingWindow{},
++	}))
++
++	app.Get("/", func(c fiber.Ctx) error {
++		time.Sleep(600 * time.Millisecond)
++		return c.SendStatus(fiber.StatusOK)
++	})
++
++	for i := 0; i < 2; i++ {
++		resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
++		require.NoError(t, err)
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
++	}
++
++	time.Sleep(time.Second + 100*time.Millisecond)
++
++	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusOK, resp.StatusCode)
++	require.Equal(t, "2", resp.Header.Get(xRateLimitLimit))
++	require.Equal(t, "1", resp.Header.Get(xRateLimitRemaining))
++	require.NotEmpty(t, resp.Header.Get(xRateLimitReset))
++}
++
++func Test_Limiter_Sliding_Window_ExpiresStalePrevHits(t *testing.T) {
++	t.Parallel()
++	app := fiber.New()
++
++	app.Use(New(Config{
++		Max:               1,
++		Expiration:        time.Second,
++		LimiterMiddleware: SlidingWindow{},
++	}))
++
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendStatus(fiber.StatusOK)
++	})
++
++	resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusOK, resp.StatusCode)
++
++	time.Sleep(2500 * time.Millisecond)
++
++	resp, err = app.Test(httptest.NewRequest(fiber.MethodGet, "/", http.NoBody))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusOK, resp.StatusCode)
++	require.Equal(t, "0", resp.Header.Get(xRateLimitRemaining))
++}
++
++func Test_Limiter_Sliding_Window_SkipFailedRequests_DecrementsPreviousWindow(t *testing.T) {
++	t.Parallel()
++	app := fiber.New()
++
++	app.Use(New(Config{
++		Max:                2,
++		Expiration:         200 * time.Millisecond,
++		SkipFailedRequests: true,
++		LimiterMiddleware:  SlidingWindow{},
++	}))
++
++	app.Get("/:mode", func(c fiber.Ctx) error {
++		if c.Params("mode") == "fail" {
++			time.Sleep(300 * time.Millisecond)
++			return c.SendStatus(fiber.StatusInternalServerError)
++		}
++		return c.SendStatus(fiber.StatusOK)
++	})
++
++	type respErr struct {
++		resp *http.Response
++		err  error
++	}
++	failCh := make(chan respErr, 1)
++
++	go func() {
++		resp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/fail", http.NoBody))
++		failCh <- respErr{resp: resp, err: err}
++	}()
++
++	time.Sleep(220 * time.Millisecond)
++
++	successResp, err := app.Test(httptest.NewRequest(fiber.MethodGet, "/ok", http.NoBody))
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusOK, successResp.StatusCode)
++
++	result := <-failCh
++	require.NoError(t, result.err)
++	require.Equal(t, fiber.StatusInternalServerError, result.resp.StatusCode)
++	require.Equal(t, "2", result.resp.Header.Get(xRateLimitLimit))
++	require.Equal(t, "1", result.resp.Header.Get(xRateLimitRemaining))
++	assert.NotEmpty(t, result.resp.Header.Get(xRateLimitReset))
++}
++
+ // go test -run Test_Limiter_Fixed_Window_Skip_Failed_Requests -v
+ func Test_Limiter_Fixed_Window_Skip_Failed_Requests(t *testing.T) {
+ 	t.Parallel()

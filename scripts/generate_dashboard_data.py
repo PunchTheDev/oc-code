@@ -61,17 +61,20 @@ REPO_CATEGORY: dict[str, str] = {
     # Go external repos
     "gin-gonic/gin": "go",
     "labstack/echo": "go",
+    "gofiber/fiber": "go",
+    "grpc/grpc-go": "go",
+    "spf13/cobra": "go",
 }
 
 # Shard sampling budget per category (sums to 30)
-# Proportional to pool: python:41% rust:27% typescript:18% ruby:7% jvm:5% go:2%
+# Proportional to pool: python:40% rust:25% typescript:18% ruby:7% jvm:5% go:9%
 SHARD_BUDGET: dict[str, int] = {
-    "python": 11,
-    "rust": 8,
+    "python": 10,
+    "rust": 7,
     "typescript": 6,
     "ruby": 2,
     "jvm": 2,
-    "go": 1,
+    "go": 3,
 }
 
 
