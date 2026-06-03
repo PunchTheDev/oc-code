@@ -986,6 +986,13 @@ def cmd_run(args: argparse.Namespace) -> None:
                 print(f"Src tok  : {GREEN}{src_tok:5.2f}{RESET} / 25.00  [{src_bar}]")
                 bonus = score - base_score if score > base_score else 0.0
                 print(f"Score    : {GREEN}{score:.2f}{RESET} / 30.00")
+                # Normalized per-problem benchmark_score (oracle=1.0 means oracle quality)
+                bench_s = result.get("benchmark_score")
+                rel_s = result.get("relative_score")
+                if bench_s is not None:
+                    bench_color = GREEN if bench_s >= 1.0 else CYAN
+                    rel_str = f"  rel={rel_s:.3f}" if rel_s is not None else ""
+                    print(f"Bench    : {bench_color}{bench_s:.4f}{RESET}  (oracle=1.0{rel_str})")
 
             baselines_path = REPO_ROOT / "results" / "baselines.json"
             if baselines_path.exists():
