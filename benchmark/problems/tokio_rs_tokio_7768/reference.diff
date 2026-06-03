@@ -1,0 +1,337 @@
+diff --git a/tokio-util/src/io/mod.rs b/tokio-util/src/io/mod.rs
+index 15a3b4011ee..b3be15c4844 100644
+--- a/tokio-util/src/io/mod.rs
++++ b/tokio-util/src/io/mod.rs
+@@ -17,6 +17,7 @@ mod reader_stream;
+ pub mod simplex;
+ mod sink_writer;
+ mod stream_reader;
++mod write_all_vectored;
+ 
+ cfg_io_util! {
+     mod read_arc;
+@@ -32,4 +33,5 @@ pub use self::read_buf::read_buf;
+ pub use self::reader_stream::ReaderStream;
+ pub use self::sink_writer::SinkWriter;
+ pub use self::stream_reader::StreamReader;
++pub use self::write_all_vectored::{write_all_vectored, WriteAllVectored};
+ pub use crate::util::{poll_read_buf, poll_write_buf};
+diff --git a/tokio-util/src/io/write_all_vectored.rs b/tokio-util/src/io/write_all_vectored.rs
+new file mode 100644
+index 00000000000..dbc59a0b73a
+--- /dev/null
++++ b/tokio-util/src/io/write_all_vectored.rs
+@@ -0,0 +1,165 @@
++use tokio::io::AsyncWrite;
++
++use pin_project_lite::pin_project;
++use std::marker::PhantomPinned;
++use std::pin::Pin;
++use std::task::{ready, Context, Poll};
++use std::{future::Future, io::IoSlice};
++use std::{io, mem};
++
++pin_project! {
++    /// A future that writes all data from multiple buffers to a writer.
++    #[derive(Debug)]
++    #[must_use = "futures do nothing unless you `.await` or poll them"]
++    pub struct WriteAllVectored<'a, 'b, W: ?Sized> {
++        writer: &'a mut W,
++        bufs: &'a mut [IoSlice<'b>],
++        // Make this future `!Unpin` for compatibility with async trait methods.
++        #[pin]
++        _pin: PhantomPinned,
++    }
++}
++/// Like [`write_all`] but writes all data from multiple buffers into this writer.
++///
++/// This function writes multiple (possibly non-contiguous) buffers into the writer,
++/// using the `writev` syscall to potentially write in a single system call.
++///
++/// Equivalent to:
++///
++/// ```ignore
++/// async fn write_all_vectored<W: AsyncWrite + Unpin + ?Sized>(
++///     writer: &mut W,
++///     mut bufs: &mut [IoSlice<'_>]
++/// ) -> io::Result<()> {
++///     while !bufs.is_empty() {
++///         let n = write_vectored(writer, bufs).await?;
++///         if n == 0 {
++///             return Err(io::ErrorKind::WriteZero.into());
++///         }
++///         IoSlice::advance_slices(&mut bufs, n);
++///     }
++///     Ok(())
++/// }
++/// ```
++///
++/// # Cancel safety
++///
++/// This method is not cancellation safe. If it is used as the event
++/// in a `tokio::select!` statement and some other
++/// branch completes first, then the provided buffer may have been
++/// partially written, but future calls to `write_all_vectored` will
++/// have lost its place in the buffer.
++///
++/// # Examples
++///
++/// ```rust
++/// use tokio_util::io::write_all_vectored;
++/// use std::io::IoSlice;
++///
++/// #[tokio::main(flavor = "current_thread")]
++/// async fn main() -> std::io::Result<()> {
++///
++///     let mut writer = Vec::new();
++///     let bufs = &mut [
++///         IoSlice::new(&[1]),
++///         IoSlice::new(&[2, 3]),
++///         IoSlice::new(&[4, 5, 6]),
++///     ];
++///
++///     write_all_vectored(&mut writer, bufs).await?;
++///
++///     // Note: `bufs` has been modified by `IoSlice::advance_slices` and should not be reused.
++///     assert_eq!(writer, &[1, 2, 3, 4, 5, 6]);
++///     Ok(())
++/// }
++/// ```
++///
++/// # Notes
++///
++/// See the documentation for [`Write::write_all_vectored`] from std.
++/// After calling this function, the buffer slices may have
++/// been advanced and should not be reused.
++///
++/// [`Write::write_all_vectored`]: std::io::Write::write_all_vectored
++/// [`write_all`]: tokio::io::AsyncWriteExt::write_all
++/// [`writev`]: https://man7.org/linux/man-pages/man3/writev.3p.html
++pub fn write_all_vectored<'a, 'b, W>(
++    writer: &'a mut W,
++    bufs: &'a mut [IoSlice<'b>],
++) -> WriteAllVectored<'a, 'b, W>
++where
++    W: AsyncWrite + Unpin + ?Sized,
++{
++    WriteAllVectored {
++        writer,
++        bufs,
++        _pin: PhantomPinned,
++    }
++}
++
++impl<W> Future for WriteAllVectored<'_, '_, W>
++where
++    W: AsyncWrite + Unpin + ?Sized,
++{
++    type Output = io::Result<()>;
++
++    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        let me = self.project();
++        while !me.bufs.is_empty() {
++            // advance to first non-empty buffer
++            let non_empty = match me.bufs.iter().position(|b| !b.is_empty()) {
++                Some(pos) => pos,
++                None => return Poll::Ready(Ok(())),
++            };
++
++            // drop empty buffers at the start
++            *me.bufs = &mut mem::take(me.bufs)[non_empty..];
++
++            let n = ready!(Pin::new(&mut *me.writer).poll_write_vectored(cx, me.bufs))?;
++            if n == 0 {
++                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
++            }
++            self::advance_slices(me.bufs, n);
++        }
++
++        Poll::Ready(Ok(()))
++    }
++}
++
++// copied from `std::IoSlice::advance_slices`
++// replace with method when MSRV is 1.81.0
++fn advance_slices<'a>(bufs: &mut &mut [IoSlice<'a>], n: usize) {
++    // Number of buffers to remove.
++    let mut remove = 0;
++    // Remaining length before reaching n. This prevents overflow
++    // that could happen if the length of slices in `bufs` were instead
++    // accumulated. Those slice may be aliased and, if they are large
++    // enough, their added length may overflow a `usize`.
++    let mut left = n;
++    for buf in bufs.iter() {
++        if let Some(remainder) = left.checked_sub(buf.len()) {
++            left = remainder;
++            remove += 1;
++        } else {
++            break;
++        }
++    }
++
++    *bufs = &mut std::mem::take(bufs)[remove..];
++    if let Some(first) = bufs.first_mut() {
++        let buf = &first[..left];
++        // necessary due to limitating in the borrow checker,
++        // when tokio MSRV reaches 1.81.0 this entire function
++        // can be replaced with `IoSlice::advance_slices`
++        //
++        // SAFETY: transmute a sub-slice of an IoSlice<'a> back to
++        // the lifetime `'a`. This is safe because the underlying memory
++        // is guaranteed to live for 'a, we have shared access, and no
++        // underlying data is reinterpreted to a different type.
++        unsafe {
++            *first = IoSlice::new(std::mem::transmute::<&[u8], &'a [u8]>(buf));
++        }
++    } else {
++        assert!(left == 0, "advancing io slices beyond their length");
++    }
++}
+diff --git a/tokio-util/tests/io_write_all_vectored.rs b/tokio-util/tests/io_write_all_vectored.rs
+new file mode 100644
+index 00000000000..5ba0e62db96
+--- /dev/null
++++ b/tokio-util/tests/io_write_all_vectored.rs
+@@ -0,0 +1,142 @@
++#![warn(rust_2018_idioms)]
++#![cfg(feature = "full")]
++
++use tokio::io::AsyncWrite;
++use tokio_util::io::write_all_vectored;
++
++use bytes::BytesMut;
++use std::io;
++use std::io::IoSlice;
++use std::pin::Pin;
++use std::task::{Context, Poll};
++
++#[tokio::test]
++async fn test_write_all_vectored() {
++    struct Wr {
++        buf: BytesMut,
++    }
++    impl AsyncWrite for Wr {
++        fn poll_write(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            _buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            // When executing `write_all_buf` with this writer,
++            // `poll_write` is not called.
++            panic!("shouldn't be called")
++        }
++        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Ok(()).into()
++        }
++        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Ok(()).into()
++        }
++        fn poll_write_vectored(
++            mut self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            bufs: &[io::IoSlice<'_>],
++        ) -> Poll<Result<usize, io::Error>> {
++            for buf in bufs {
++                self.buf.extend_from_slice(buf);
++            }
++            let n = self.buf.len();
++            Ok(n).into()
++        }
++        fn is_write_vectored(&self) -> bool {
++            // Enable vectored write. (doesn't need to be enabled explicitly for `write_all_vectored`)
++            true
++        }
++    }
++
++    let mut wr = Wr {
++        buf: BytesMut::with_capacity(64),
++    };
++
++    let buf = &mut [
++        IoSlice::new(&b"hello"[..]),
++        IoSlice::new(&b" "[..]),
++        IoSlice::new(&b"world"[..]),
++    ];
++
++    write_all_vectored(&mut wr, buf).await.unwrap();
++    assert_eq!(&wr.buf[..], b"hello world");
++}
++
++#[tokio::test]
++async fn write_all_vectored_with_empty_slice() {
++    struct Wr {
++        buf: BytesMut,
++    }
++    impl AsyncWrite for Wr {
++        fn poll_write(
++            self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            _buf: &[u8],
++        ) -> Poll<io::Result<usize>> {
++            panic!("shouldn't be called")
++        }
++        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Ok(()).into()
++        }
++        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++            Ok(()).into()
++        }
++        fn poll_write_vectored(
++            mut self: Pin<&mut Self>,
++            _cx: &mut Context<'_>,
++            bufs: &[io::IoSlice<'_>],
++        ) -> Poll<Result<usize, io::Error>> {
++            for buf in bufs {
++                self.buf.extend_from_slice(buf);
++            }
++            let n = self.buf.len();
++            Ok(n).into()
++        }
++        fn is_write_vectored(&self) -> bool {
++            // Enable vectored write.
++            true
++        }
++    }
++
++    // case 1 middle empty slice
++    let mut wr = Wr {
++        buf: BytesMut::with_capacity(64),
++    };
++
++    let buf = &mut [
++        IoSlice::new(&b"hello"[..]),
++        IoSlice::new(&[]),
++        IoSlice::new(&b"world"[..]),
++    ];
++
++    write_all_vectored(&mut wr, buf).await.unwrap();
++    assert_eq!(&wr.buf[..], b"helloworld");
++
++    // case 2 no slices
++    let mut wr = Wr {
++        buf: BytesMut::with_capacity(64),
++    };
++
++    let buf = &mut [];
++
++    write_all_vectored(&mut wr, buf).await.unwrap();
++    assert_eq!(&wr.buf[..], b"");
++
++    // case 3 just an empty slice
++    let mut wr = Wr {
++        buf: BytesMut::with_capacity(64),
++    };
++    let buf = &mut [IoSlice::new(&[])];
++
++    write_all_vectored(&mut wr, buf).await.unwrap();
++    assert_eq!(&wr.buf[..], b"");
++
++    // case 4 ending with empty slice
++    let mut wr = Wr {
++        buf: BytesMut::with_capacity(64),
++    };
++    let buf = &mut [IoSlice::new(b"hello"), IoSlice::new(&[])];
++
++    write_all_vectored(&mut wr, buf).await.unwrap();
++    assert_eq!(&wr.buf[..], b"hello");
++}

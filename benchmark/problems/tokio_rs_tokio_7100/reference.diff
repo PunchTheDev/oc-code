@@ -1,0 +1,466 @@
+diff --git a/tokio/src/sync/broadcast.rs b/tokio/src/sync/broadcast.rs
+index e48925b497e..a261d2c4405 100644
+--- a/tokio/src/sync/broadcast.rs
++++ b/tokio/src/sync/broadcast.rs
+@@ -128,7 +128,7 @@ use std::future::Future;
+ use std::marker::PhantomPinned;
+ use std::pin::Pin;
+ use std::ptr::NonNull;
+-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
++use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+ use std::task::{ready, Context, Poll, Waker};
+ 
+ /// Sending-half of the [`broadcast`] channel.
+@@ -166,6 +166,40 @@ pub struct Sender<T> {
+     shared: Arc<Shared<T>>,
+ }
+ 
++/// A sender that does not prevent the channel from being closed.
++///
++/// If all [`Sender`] instances of a channel were dropped and only `WeakSender`
++/// instances remain, the channel is closed.
++///
++/// In order to send messages, the `WeakSender` needs to be upgraded using
++/// [`WeakSender::upgrade`], which returns `Option<Sender>`. It returns `None`
++/// if all `Sender`s have been dropped, and otherwise it returns a `Sender`.
++///
++/// [`Sender`]: Sender
++/// [`WeakSender::upgrade`]: WeakSender::upgrade
++///
++/// # Examples
++///
++/// ```
++/// use tokio::sync::broadcast::channel;
++///
++/// #[tokio::main]
++/// async fn main() {
++///     let (tx, _rx) = channel::<i32>(15);
++///     let tx_weak = tx.downgrade();
++///
++///     // Upgrading will succeed because `tx` still exists.
++///     assert!(tx_weak.upgrade().is_some());
++///
++///     // If we drop `tx`, then it will fail.
++///     drop(tx);
++///     assert!(tx_weak.clone().upgrade().is_none());
++/// }
++/// ```
++pub struct WeakSender<T> {
++    shared: Arc<Shared<T>>,
++}
++
+ /// Receiving-half of the [`broadcast`] channel.
+ ///
+ /// Must not be used concurrently. Messages may be retrieved using
+@@ -317,6 +351,9 @@ struct Shared<T> {
+     /// Number of outstanding Sender handles.
+     num_tx: AtomicUsize,
+ 
++    /// Number of outstanding weak Sender handles.
++    num_weak_tx: AtomicUsize,
++
+     /// Notify when the last subscribed [`Receiver`] drops.
+     notify_last_rx_drop: Notify,
+ }
+@@ -475,6 +512,9 @@ pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+ unsafe impl<T: Send> Send for Sender<T> {}
+ unsafe impl<T: Send> Sync for Sender<T> {}
+ 
++unsafe impl<T: Send> Send for WeakSender<T> {}
++unsafe impl<T: Send> Sync for WeakSender<T> {}
++
+ unsafe impl<T: Send> Send for Receiver<T> {}
+ unsafe impl<T: Send> Sync for Receiver<T> {}
+ 
+@@ -533,6 +573,7 @@ impl<T> Sender<T> {
+                 waiters: LinkedList::new(),
+             }),
+             num_tx: AtomicUsize::new(1),
++            num_weak_tx: AtomicUsize::new(0),
+             notify_last_rx_drop: Notify::new(),
+         });
+ 
+@@ -656,6 +697,18 @@ impl<T> Sender<T> {
+         new_receiver(shared)
+     }
+ 
++    /// Converts the `Sender` to a [`WeakSender`] that does not count
++    /// towards RAII semantics, i.e. if all `Sender` instances of the
++    /// channel were dropped and only `WeakSender` instances remain,
++    /// the channel is closed.
++    #[must_use = "Downgrade creates a WeakSender without destroying the original non-weak sender."]
++    pub fn downgrade(&self) -> WeakSender<T> {
++        self.shared.num_weak_tx.fetch_add(1, Relaxed);
++        WeakSender {
++            shared: self.shared.clone(),
++        }
++    }
++
+     /// Returns the number of queued values.
+     ///
+     /// A value is queued until it has either been seen by all receivers that were alive at the time
+@@ -858,6 +911,16 @@ impl<T> Sender<T> {
+ 
+         self.shared.notify_rx(tail);
+     }
++
++    /// Returns the number of [`Sender`] handles.
++    pub fn strong_count(&self) -> usize {
++        self.shared.num_tx.load(Acquire)
++    }
++
++    /// Returns the number of [`WeakSender`] handles.
++    pub fn weak_count(&self) -> usize {
++        self.shared.num_weak_tx.load(Acquire)
++    }
+ }
+ 
+ /// Create a new `Receiver` which reads starting from the tail.
+@@ -998,7 +1061,7 @@ impl<T> Shared<T> {
+ impl<T> Clone for Sender<T> {
+     fn clone(&self) -> Sender<T> {
+         let shared = self.shared.clone();
+-        shared.num_tx.fetch_add(1, SeqCst);
++        shared.num_tx.fetch_add(1, Relaxed);
+ 
+         Sender { shared }
+     }
+@@ -1006,12 +1069,68 @@ impl<T> Clone for Sender<T> {
+ 
+ impl<T> Drop for Sender<T> {
+     fn drop(&mut self) {
+-        if 1 == self.shared.num_tx.fetch_sub(1, SeqCst) {
++        if 1 == self.shared.num_tx.fetch_sub(1, AcqRel) {
+             self.close_channel();
+         }
+     }
+ }
+ 
++impl<T> WeakSender<T> {
++    /// Tries to convert a `WeakSender` into a [`Sender`].
++    ///
++    /// This will return `Some` if there are other `Sender` instances alive and
++    /// the channel wasn't previously dropped, otherwise `None` is returned.
++    #[must_use]
++    pub fn upgrade(&self) -> Option<Sender<T>> {
++        let mut tx_count = self.shared.num_tx.load(Acquire);
++
++        loop {
++            if tx_count == 0 {
++                // channel is closed so this WeakSender can not be upgraded
++                return None;
++            }
++
++            match self
++                .shared
++                .num_tx
++                .compare_exchange_weak(tx_count, tx_count + 1, Relaxed, Acquire)
++            {
++                Ok(_) => {
++                    return Some(Sender {
++                        shared: self.shared.clone(),
++                    })
++                }
++                Err(prev_count) => tx_count = prev_count,
++            }
++        }
++    }
++
++    /// Returns the number of [`Sender`] handles.
++    pub fn strong_count(&self) -> usize {
++        self.shared.num_tx.load(Acquire)
++    }
++
++    /// Returns the number of [`WeakSender`] handles.
++    pub fn weak_count(&self) -> usize {
++        self.shared.num_weak_tx.load(Acquire)
++    }
++}
++
++impl<T> Clone for WeakSender<T> {
++    fn clone(&self) -> WeakSender<T> {
++        let shared = self.shared.clone();
++        shared.num_weak_tx.fetch_add(1, Relaxed);
++
++        Self { shared }
++    }
++}
++
++impl<T> Drop for WeakSender<T> {
++    fn drop(&mut self) {
++        self.shared.num_weak_tx.fetch_sub(1, AcqRel);
++    }
++}
++
+ impl<T> Receiver<T> {
+     /// Returns the number of messages that were sent into the channel and that
+     /// this [`Receiver`] has yet to receive.
+@@ -1213,6 +1332,42 @@ impl<T> Receiver<T> {
+ 
+         Ok(RecvGuard { slot })
+     }
++
++    /// Returns the number of [`Sender`] handles.
++    pub fn sender_strong_count(&self) -> usize {
++        self.shared.num_tx.load(Acquire)
++    }
++
++    /// Returns the number of [`WeakSender`] handles.
++    pub fn sender_weak_count(&self) -> usize {
++        self.shared.num_weak_tx.load(Acquire)
++    }
++
++    /// Checks if a channel is closed.
++    ///
++    /// This method returns `true` if the channel has been closed. The channel is closed
++    /// when all [`Sender`] have been dropped.
++    ///
++    /// [`Sender`]: crate::sync::broadcast::Sender
++    ///
++    /// # Examples
++    /// ```
++    /// use tokio::sync::broadcast;
++    ///
++    /// #[tokio::main]
++    /// async fn main() {
++    ///     let (tx, rx) = broadcast::channel::<()>(10);
++    ///     assert!(!rx.is_closed());
++    ///
++    ///     drop(tx);
++    ///
++    ///     assert!(rx.is_closed());
++    /// }
++    /// ```
++    pub fn is_closed(&self) -> bool {
++        // Channel is closed when there are no strong senders left active
++        self.shared.num_tx.load(Acquire) == 0
++    }
+ }
+ 
+ impl<T: Clone> Receiver<T> {
+@@ -1534,6 +1689,12 @@ impl<T> fmt::Debug for Sender<T> {
+     }
+ }
+ 
++impl<T> fmt::Debug for WeakSender<T> {
++    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(fmt, "broadcast::WeakSender")
++    }
++}
++
+ impl<T> fmt::Debug for Receiver<T> {
+     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+         write!(fmt, "broadcast::Receiver")
+diff --git a/tokio/tests/async_send_sync.rs b/tokio/tests/async_send_sync.rs
+index 0f578422bc0..4c291b3ccba 100644
+--- a/tokio/tests/async_send_sync.rs
++++ b/tokio/tests/async_send_sync.rs
+@@ -394,6 +394,9 @@ assert_value!(tokio::sync::broadcast::Receiver<YY>: Send & Sync & Unpin);
+ assert_value!(tokio::sync::broadcast::Sender<NN>: !Send & !Sync & Unpin);
+ assert_value!(tokio::sync::broadcast::Sender<YN>: Send & Sync & Unpin);
+ assert_value!(tokio::sync::broadcast::Sender<YY>: Send & Sync & Unpin);
++assert_value!(tokio::sync::broadcast::WeakSender<NN>: !Send & !Sync & Unpin);
++assert_value!(tokio::sync::broadcast::WeakSender<YN>: Send & Sync & Unpin);
++assert_value!(tokio::sync::broadcast::WeakSender<YY>: Send & Sync & Unpin);
+ assert_value!(tokio::sync::futures::Notified<'_>: Send & Sync & !Unpin);
+ assert_value!(tokio::sync::mpsc::OwnedPermit<NN>: !Send & !Sync & Unpin);
+ assert_value!(tokio::sync::mpsc::OwnedPermit<YN>: Send & Sync & Unpin);
+diff --git a/tokio/tests/sync_broadcast.rs b/tokio/tests/sync_broadcast.rs
+index 2153555694b..a5c7828841e 100644
+--- a/tokio/tests/sync_broadcast.rs
++++ b/tokio/tests/sync_broadcast.rs
+@@ -56,6 +56,7 @@ macro_rules! assert_closed {
+ trait AssertSend: Send + Sync {}
+ impl AssertSend for broadcast::Sender<i32> {}
+ impl AssertSend for broadcast::Receiver<i32> {}
++impl AssertSend for broadcast::WeakSender<i32> {}
+ 
+ #[test]
+ fn send_try_recv_bounded() {
+diff --git a/tokio/tests/sync_broadcast_weak.rs b/tokio/tests/sync_broadcast_weak.rs
+new file mode 100644
+index 00000000000..1e7fd6f2d67
+--- /dev/null
++++ b/tokio/tests/sync_broadcast_weak.rs
+@@ -0,0 +1,181 @@
++#![allow(clippy::redundant_clone)]
++#![warn(rust_2018_idioms)]
++#![cfg(feature = "sync")]
++
++#[cfg(all(target_family = "wasm", not(target_os = "wasi")))]
++use wasm_bindgen_test::wasm_bindgen_test as test;
++
++use tokio::sync::broadcast::{self, channel};
++
++#[tokio::test]
++async fn weak_sender() {
++    let (tx, mut rx) = channel(11);
++
++    let tx_weak = tokio::spawn(async move {
++        let tx_weak = tx.clone().downgrade();
++
++        for i in 0..10 {
++            if tx.send(i).is_err() {
++                return None;
++            }
++        }
++
++        let tx2 = tx_weak
++            .upgrade()
++            .expect("expected to be able to upgrade tx_weak");
++        let _ = tx2.send(20);
++        let tx_weak = tx2.downgrade();
++
++        Some(tx_weak)
++    })
++    .await
++    .unwrap();
++
++    for i in 0..12 {
++        let recvd = rx.recv().await;
++
++        match recvd {
++            Ok(msg) => {
++                if i == 10 {
++                    assert_eq!(msg, 20);
++                }
++            }
++            Err(_) => {
++                assert_eq!(i, 11);
++                break;
++            }
++        }
++    }
++
++    let tx_weak = tx_weak.unwrap();
++    let upgraded = tx_weak.upgrade();
++    assert!(upgraded.is_none());
++}
++
++// Tests that a `WeakSender` fails to upgrade when no other `Sender` exists.
++#[test]
++fn downgrade_upgrade_sender_failure() {
++    let (tx, _rx) = broadcast::channel::<i32>(1);
++    let weak_tx = tx.downgrade();
++    drop(tx);
++    assert!(weak_tx.upgrade().is_none());
++}
++
++// Tests that a `WeakSender` cannot be upgraded after a `Sender` was dropped,
++// which existed at the time of the `downgrade` call.
++#[test]
++fn downgrade_drop_upgrade() {
++    let (tx, _rx) = broadcast::channel::<i32>(1);
++
++    // the cloned `Tx` is dropped right away
++    let weak_tx = tx.clone().downgrade();
++    drop(tx);
++    assert!(weak_tx.upgrade().is_none());
++}
++
++// Tests that `downgrade` does not change the `strong_count` of the channel.
++#[test]
++fn test_tx_count_weak_sender() {
++    let (tx, _rx) = broadcast::channel::<i32>(1);
++    let tx_weak = tx.downgrade();
++    let tx_weak2 = tx.downgrade();
++    assert_eq!(tx.strong_count(), 1);
++    assert_eq!(tx.weak_count(), 2);
++
++    drop(tx);
++
++    assert!(tx_weak.upgrade().is_none());
++    assert!(tx_weak2.upgrade().is_none());
++    assert_eq!(tx_weak.strong_count(), 0);
++    assert_eq!(tx_weak.weak_count(), 2);
++}
++
++#[tokio::test]
++async fn test_rx_is_closed_when_dropping_all_senders_except_weak_senders() {
++    let (tx, rx) = broadcast::channel::<()>(10);
++    let weak_sender = tx.clone().downgrade();
++    drop(tx);
++    // is_closed should return true after dropping all senders except for a weak sender.
++    // The strong count should be 0 while the weak count should remain at 1.
++    assert_eq!(weak_sender.strong_count(), 0);
++    assert_eq!(weak_sender.weak_count(), 1);
++    assert!(rx.is_closed());
++}
++
++#[tokio::test]
++async fn sender_strong_count_when_cloned() {
++    let (tx, rx) = broadcast::channel::<()>(1);
++
++    let tx2 = tx.clone();
++
++    assert_eq!(tx.strong_count(), 2);
++    assert_eq!(tx2.strong_count(), 2);
++    assert_eq!(rx.sender_strong_count(), 2);
++}
++
++#[tokio::test]
++async fn sender_weak_count_when_downgraded() {
++    let (tx, _rx) = broadcast::channel::<()>(1);
++
++    let weak = tx.downgrade();
++
++    assert_eq!(tx.weak_count(), 1);
++    assert_eq!(weak.weak_count(), 1);
++}
++
++#[tokio::test]
++async fn sender_strong_count_when_dropped() {
++    let (tx, rx) = broadcast::channel::<()>(1);
++
++    let tx2 = tx.clone();
++
++    drop(tx2);
++
++    assert_eq!(tx.strong_count(), 1);
++    assert_eq!(rx.sender_strong_count(), 1);
++}
++
++#[tokio::test]
++async fn sender_weak_count_when_dropped() {
++    let (tx, rx) = broadcast::channel::<()>(1);
++
++    let weak = tx.downgrade();
++
++    drop(weak);
++
++    assert_eq!(tx.weak_count(), 0);
++    assert_eq!(rx.sender_weak_count(), 0);
++}
++
++#[tokio::test]
++async fn sender_strong_and_weak_conut() {
++    let (tx, rx) = broadcast::channel::<()>(1);
++
++    let tx2 = tx.clone();
++
++    let weak = tx.downgrade();
++    let weak2 = tx2.downgrade();
++
++    assert_eq!(tx.strong_count(), 2);
++    assert_eq!(tx2.strong_count(), 2);
++    assert_eq!(weak.strong_count(), 2);
++    assert_eq!(weak2.strong_count(), 2);
++    assert_eq!(rx.sender_strong_count(), 2);
++
++    assert_eq!(tx.weak_count(), 2);
++    assert_eq!(tx2.weak_count(), 2);
++    assert_eq!(weak.weak_count(), 2);
++    assert_eq!(weak2.weak_count(), 2);
++    assert_eq!(rx.sender_weak_count(), 2);
++
++    drop(tx2);
++    drop(weak2);
++
++    assert_eq!(tx.strong_count(), 1);
++    assert_eq!(weak.strong_count(), 1);
++    assert_eq!(rx.sender_strong_count(), 1);
++
++    assert_eq!(tx.weak_count(), 1);
++    assert_eq!(weak.weak_count(), 1);
++    assert_eq!(rx.sender_weak_count(), 1);
++}

@@ -73,6 +73,8 @@ REPO_CATEGORY: dict[str, str] = {
     "trpc/trpc": "typescript",
     "vuejs/core": "typescript",
     "python/mypy": "python",
+    "tokio-rs/tokio": "rust",
+    "clap-rs/clap": "rust",
 }
 
 

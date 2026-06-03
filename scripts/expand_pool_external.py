@@ -66,6 +66,9 @@ EXTERNAL_REPOS = [
     "vuejs/core",             # 48k stars — Vue 3 reactivity/runtime, vitest tests, clean bug-fixes
     # Python (continued)
     "python/mypy",            # 18k stars — Python type checker, pytest suite, self-contained
+    # Rust external repos
+    "tokio-rs/tokio",         # 28k stars — Rust async runtime, cargo test, real regression bugs
+    "clap-rs/clap",           # 14k stars — Rust CLI parser, cargo test, self-contained
 ]
 
 
@@ -220,9 +223,13 @@ def infer_test_cmd(repo: str, diff: str) -> list[str]:
     """Infer the test command from changed files in the diff.
 
     Handles TypeScript (npm test), Python (pytest), Ruby (bundle exec rspec),
-    with Python as default.
+    Rust (cargo test), with Python as default.
     """
     changed = re.findall(r"^diff --git a/(.+) b/", diff, re.MULTILINE)
+
+    # Rust: any .rs file → cargo test
+    if any(p.endswith(".rs") for p in changed):
+        return ["cargo", "test"]
 
     # TypeScript/JavaScript: *.test.ts / *.spec.ts → npm test
     # npm runner in Docker handles npm ci + npm test; can't easily target individual files

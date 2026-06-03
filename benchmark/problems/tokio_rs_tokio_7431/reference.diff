@@ -1,0 +1,661 @@
+diff --git a/tokio/src/runtime/builder.rs b/tokio/src/runtime/builder.rs
+index 04f7efff057..62f183b5c44 100644
+--- a/tokio/src/runtime/builder.rs
++++ b/tokio/src/runtime/builder.rs
+@@ -1257,22 +1257,21 @@ impl Builder {
+         /// scheduled task being polled first.
+         ///
+         /// To implement this heuristic, each worker thread has a slot which
+-        /// holds the task that should be polled next. However, this slot cannot
+-        /// be stolen by other worker threads, which can result in lower total
+-        /// throughput when tasks tend to have longer poll times.
++        /// holds the task that should be polled next. In earlier versions of
++        /// Tokio, this slot could not be stolen by other worker threads, which
++        /// can result in lower total throughput when tasks tend to have longer
++        /// poll times.
+         ///
+         /// This configuration option will disable this heuristic resulting in
+-        /// all scheduled tasks being pushed into the worker-local queue, which
+-        /// is stealable.
+-        ///
+-        /// Consider trying this option when the task "scheduled" time is high
+-        /// but the runtime is underutilized. Use [tokio-rs/tokio-metrics] to
+-        /// collect this data.
++        /// all scheduled tasks being pushed into the worker-local queue. This
++        /// was intended as a workaround for the LIFO slot not being stealable.
++        /// As of Tokio 1.51, tasks can be stolen from the LIFO slot. In a
++        /// future version, this option may be deprecated.
+         ///
+         /// # Unstable
+         ///
+-        /// This configuration option is considered a workaround for the LIFO
+-        /// slot not being stealable. When the slot becomes stealable, we will
++        /// This configuration option was considered a workaround for the LIFO
++        /// slot not being stealable. Since this is no longer the case, we will
+         /// revisit whether or not this option is necessary. See
+         /// issue [tokio-rs/tokio#4941].
+         ///
+diff --git a/tokio/src/runtime/config.rs b/tokio/src/runtime/config.rs
+index b79df96e1e2..ae972a9e7ba 100644
+--- a/tokio/src/runtime/config.rs
++++ b/tokio/src/runtime/config.rs
+@@ -34,11 +34,13 @@ pub(crate) struct Config {
+ 
+     /// The multi-threaded scheduler includes a per-worker LIFO slot used to
+     /// store the last scheduled task. This can improve certain usage patterns,
+-    /// especially message passing between tasks. However, this LIFO slot is not
+-    /// currently stealable.
++    /// especially message passing between tasks.
+     ///
+-    /// Eventually, the LIFO slot **will** become stealable, however as a
+-    /// stop-gap, this unstable option lets users disable the LIFO task.
++    /// In Tokio versions before 1.51, tasks in the LIFO slot could not be
++    /// stolen, which could cause issues in applications with long poll times.
++    /// As a stop-gap, this unstable option lets users disable the LIFO task.
++    /// Now that the LIFO slot is stealable, we may remove this option in a
++    /// future version.
+     pub(crate) disable_lifo_slot: bool,
+ 
+     /// Random number generator seed to configure runtimes to act in a
+diff --git a/tokio/src/runtime/mod.rs b/tokio/src/runtime/mod.rs
+index 713f60de05b..b4449c4773c 100644
+--- a/tokio/src/runtime/mod.rs
++++ b/tokio/src/runtime/mod.rs
+@@ -367,8 +367,8 @@
+ //! three times in a row, it is temporarily disabled until the worker thread has
+ //! scheduled a task that didn't come from the lifo slot. The lifo slot can be
+ //! disabled using the [`disable_lifo_slot`] setting. The lifo slot is separate
+-//! from the local queue, so other worker threads cannot steal the task in the
+-//! lifo slot.
++//! from the local queue, and is stolen from by other worker threads only when
++//! a worker's local queue has been drained.
+ //!
+ //! When a task is woken from a thread that is not a worker thread, then the
+ //! task is placed in the global queue.
+diff --git a/tokio/src/runtime/scheduler/multi_thread/queue.rs b/tokio/src/runtime/scheduler/multi_thread/queue.rs
+index 68670e63ca1..39e50eddc34 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/queue.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/queue.rs
+@@ -52,6 +52,13 @@ pub(crate) struct Inner<T: 'static> {
+     /// Only updated by producer thread but read by many threads.
+     tail: AtomicUnsignedShort,
+ 
++    /// When a task is scheduled from a worker, it is stored in this slot. The
++    /// worker will check this slot for a task **before** checking the run
++    /// queue. This effectively results in the **last** scheduled task to be run
++    /// next (LIFO). This is an optimization for improving locality which
++    /// benefits message passing patterns and helps to reduce latency.
++    lifo: task::AtomicNotified<T>,
++
+     /// Elements
+     buffer: Box<[UnsafeCell<MaybeUninit<task::Notified<T>>>; LOCAL_QUEUE_CAPACITY]>,
+ }
+@@ -92,6 +99,7 @@ pub(crate) fn local<T: 'static>() -> (Steal<T>, Local<T>) {
+     let inner = Arc::new(Inner {
+         head: AtomicUnsignedLong::new(0),
+         tail: AtomicUnsignedShort::new(0),
++        lifo: task::AtomicNotified::empty(),
+         buffer: make_fixed_size(buffer.into_boxed_slice()),
+     });
+ 
+@@ -108,9 +116,10 @@ impl<T> Local<T> {
+     /// Returns the number of entries in the queue
+     pub(crate) fn len(&self) -> usize {
+         let (_, head) = unpack(self.inner.head.load(Acquire));
++        let lifo = self.inner.lifo.is_some() as usize;
+         // safety: this is the **only** thread that updates this cell.
+         let tail = unsafe { self.inner.tail.unsync_load() };
+-        len(head, tail)
++        len(head, tail) + lifo
+     }
+ 
+     /// How many tasks can be pushed into the queue
+@@ -388,6 +397,19 @@ impl<T> Local<T> {
+ 
+         Some(self.inner.buffer[idx].with(|ptr| unsafe { ptr::read(ptr).assume_init() }))
+     }
++
++    /// Pushes a task to the LIFO slot, returning the task previously in the
++    /// LIFO slot (if there was one).
++    pub(crate) fn push_lifo(&self, task: task::Notified<T>) -> Option<task::Notified<T>> {
++        self.inner.lifo.swap(Some(task))
++    }
++
++    /// Pops the task currently held in the LIFO slot, if there is one;
++    /// otherwise, returns `None`.
++    pub(crate) fn pop_lifo(&self) -> Option<task::Notified<T>> {
++        // LIFO-suction!
++        self.inner.lifo.take()
++    }
+ }
+ 
+ impl<T> Steal<T> {
+@@ -395,7 +417,8 @@ impl<T> Steal<T> {
+     pub(crate) fn len(&self) -> usize {
+         let (_, head) = unpack(self.0.head.load(Acquire));
+         let tail = self.0.tail.load(Acquire);
+-        len(head, tail)
++        let lifo = self.0.lifo.is_some() as usize;
++        len(head, tail) + lifo
+     }
+ 
+     /// Return true if the queue is empty,
+@@ -430,8 +453,14 @@ impl<T> Steal<T> {
+         let mut n = self.steal_into2(dst, dst_tail);
+ 
+         if n == 0 {
+-            // No tasks were stolen
+-            return None;
++            // If no tasks were stolen, let's see if there's one in the LIFO
++            // slot.
++            let lifo = self.0.lifo.take();
++            if lifo.is_some() {
++                dst_stats.incr_steal_count(1);
++                dst_stats.incr_steal_operations();
++            }
++            return lifo;
+         }
+ 
+         dst_stats.incr_steal_count(n as u16);
+@@ -569,6 +598,7 @@ impl<T> Drop for Local<T> {
+     fn drop(&mut self) {
+         if !std::thread::panicking() {
+             assert!(self.pop().is_none(), "queue not empty");
++            assert!(self.pop_lifo().is_none(), "LIFO slot not empty");
+         }
+     }
+ }
+diff --git a/tokio/src/runtime/scheduler/multi_thread/worker.rs b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+index 9bdbcbb8000..beec19c082a 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/worker.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/worker.rs
+@@ -112,13 +112,6 @@ struct Core {
+     /// Used to schedule bookkeeping tasks every so often.
+     tick: u32,
+ 
+-    /// When a task is scheduled from a worker, it is stored in this slot. The
+-    /// worker will check this slot for a task **before** checking the run
+-    /// queue. This effectively results in the **last** scheduled task to be run
+-    /// next (LIFO). This is an optimization for improving locality which
+-    /// benefits message passing patterns and helps to reduce latency.
+-    lifo_slot: Option<Notified>,
+-
+     /// When `true`, locally scheduled tasks go to the LIFO slot. When `false`,
+     /// they go to the back of the `run_queue`.
+     lifo_enabled: bool,
+@@ -280,7 +273,6 @@ pub(super) fn create(
+ 
+         cores.push(Box::new(Core {
+             tick: 0,
+-            lifo_slot: None,
+             lifo_enabled: !config.disable_lifo_slot,
+             run_queue,
+             #[cfg(all(tokio_unstable, feature = "time"))]
+@@ -440,7 +432,7 @@ where
+         // If we heavily call `spawn_blocking`, there might be no available thread to
+         // run this core. Except for the task in the lifo_slot, all tasks can be
+         // stolen, so we move the task out of the lifo_slot to the run_queue.
+-        if let Some(task) = core.lifo_slot.take() {
++        if let Some(task) = core.run_queue.pop_lifo() {
+             core.run_queue
+                 .push_back_or_overflow(task, &*cx.worker.handle, &mut core.stats);
+         }
+@@ -670,7 +662,7 @@ impl Context {
+                 };
+ 
+                 // Check for a task in the LIFO slot
+-                let task = match core.lifo_slot.take() {
++                let task = match core.run_queue.pop_lifo() {
+                     Some(task) => task,
+                     None => {
+                         self.reset_lifo_enabled(&mut core);
+@@ -1079,7 +1071,7 @@ impl Core {
+     }
+ 
+     fn next_local_task(&mut self) -> Option<Notified> {
+-        self.lifo_slot.take().or_else(|| self.run_queue.pop())
++        self.run_queue.pop_lifo().or_else(|| self.run_queue.pop())
+     }
+ 
+     /// Function responsible for stealing tasks from another worker
+@@ -1135,7 +1127,7 @@ impl Core {
+     }
+ 
+     fn has_tasks(&self) -> bool {
+-        self.lifo_slot.is_some() || self.run_queue.has_tasks()
++        self.run_queue.has_tasks()
+     }
+ 
+     fn should_notify_others(&self) -> bool {
+@@ -1144,7 +1136,7 @@ impl Core {
+         if self.is_searching {
+             return false;
+         }
+-        self.lifo_slot.is_some() as usize + self.run_queue.len() > 1
++        self.run_queue.len() > 1
+     }
+ 
+     /// Prepares the worker state for parking.
+@@ -1306,29 +1298,23 @@ impl Handle {
+         // task must always be pushed to the back of the queue, enabling other
+         // tasks to be executed. If **not** a yield, then there is more
+         // flexibility and the task may go to the front of the queue.
+-        let should_notify = if is_yield || !core.lifo_enabled {
++        if is_yield || !core.lifo_enabled {
+             core.run_queue
+                 .push_back_or_overflow(task, self, &mut core.stats);
+-            true
+         } else {
+             // Push to the LIFO slot
+-            let prev = core.lifo_slot.take();
+-            let ret = prev.is_some();
+-
+-            if let Some(prev) = prev {
++            if let Some(prev) = core.run_queue.push_lifo(task) {
++                // There was a previous task in the LIFO slot which needs
++                // to be pushed to the back of the run queue.
+                 core.run_queue
+                     .push_back_or_overflow(prev, self, &mut core.stats);
+             }
+-
+-            core.lifo_slot = Some(task);
+-
+-            ret
+         };
+ 
+         // Only notify if not currently parked. If `park` is `None`, then the
+         // scheduling is from a resource driver. As notifications often come in
+         // batches, the notification is delayed until the park is complete.
+-        if should_notify && core.park.is_some() {
++        if core.park.is_some() {
+             self.notify_parked_local();
+         }
+     }
+diff --git a/tokio/src/runtime/task/atomic_notified.rs b/tokio/src/runtime/task/atomic_notified.rs
+new file mode 100644
+index 00000000000..c5fc539bd70
+--- /dev/null
++++ b/tokio/src/runtime/task/atomic_notified.rs
+@@ -0,0 +1,58 @@
++use crate::loom::sync::atomic::AtomicPtr;
++use crate::runtime::task::{Header, Notified, RawTask};
++
++use std::marker::PhantomData;
++use std::ptr;
++use std::ptr::NonNull;
++use std::sync::atomic::Ordering::SeqCst;
++
++/// An atomic cell which can contain a pointer to a [`Notified`] task.
++///
++/// This is similar to the `crate::util::AtomicCell` type, but specialized to
++/// hold a task pointer --- this type "remembers" the task's scheduler generic
++/// when a task is stored in the cell, so that the pointer can be turned back
++/// into a [`Notified`] task with the correct generic type when it is retrieved.
++pub(crate) struct AtomicNotified<S: 'static> {
++    task: AtomicPtr<Header>,
++    _scheduler: PhantomData<S>,
++}
++
++impl<S: 'static> AtomicNotified<S> {
++    pub(crate) fn empty() -> Self {
++        Self {
++            task: AtomicPtr::new(ptr::null_mut()),
++            _scheduler: PhantomData,
++        }
++    }
++
++    pub(crate) fn swap(&self, task: Option<Notified<S>>) -> Option<Notified<S>> {
++        let new = task
++            .map(|t| t.into_raw().header_ptr().as_ptr())
++            .unwrap_or_else(ptr::null_mut);
++        let old = self.task.swap(new, SeqCst);
++        NonNull::new(old).map(|ptr| unsafe {
++            // Safety: since we only allow tasks with the same scheduler type to
++            // be placed in this cell, we know that the pointed task's scheduler
++            // type matches the type parameter S.
++            Notified::from_raw(RawTask::from_raw(ptr))
++        })
++    }
++
++    pub(crate) fn take(&self) -> Option<Notified<S>> {
++        self.swap(None)
++    }
++
++    pub(crate) fn is_some(&self) -> bool {
++        !self.task.load(SeqCst).is_null()
++    }
++}
++
++unsafe impl<S: Send> Send for AtomicNotified<S> {}
++unsafe impl<S: Send> Sync for AtomicNotified<S> {}
++
++impl<S> Drop for AtomicNotified<S> {
++    fn drop(&mut self) {
++        // Ensure the task reference is dropped if this cell is dropped.
++        let _ = self.take();
++    }
++}
+diff --git a/tokio/src/runtime/task/mod.rs b/tokio/src/runtime/task/mod.rs
+index 53c477d52de..7740c8824a6 100644
+--- a/tokio/src/runtime/task/mod.rs
++++ b/tokio/src/runtime/task/mod.rs
+@@ -209,6 +209,11 @@ pub(crate) use self::raw::RawTask;
+ mod state;
+ use self::state::State;
+ 
++#[cfg(feature = "rt-multi-thread")]
++mod atomic_notified;
++#[cfg(feature = "rt-multi-thread")]
++pub(crate) use self::atomic_notified::AtomicNotified;
++
+ mod waker;
+ 
+ pub(crate) use self::spawn_location::SpawnLocation;
+diff --git a/tokio/src/runtime/tests/loom_multi_thread/queue.rs b/tokio/src/runtime/tests/loom_multi_thread/queue.rs
+index 0d818283653..2098b548a2b 100644
+--- a/tokio/src/runtime/tests/loom_multi_thread/queue.rs
++++ b/tokio/src/runtime/tests/loom_multi_thread/queue.rs
+@@ -62,6 +62,65 @@ fn basic() {
+     });
+ }
+ 
++// Like `basic`, but with tasks in the LIFO slot.
++#[test]
++fn basic_lifo() {
++    loom::model(|| {
++        let (steal, mut local) = queue::local();
++        let inject = RefCell::new(vec![]);
++        let mut stats = new_stats();
++
++        let th = thread::spawn(move || {
++            let mut stats = new_stats();
++            let (_, mut local) = queue::local();
++            let mut n = 0;
++
++            for _ in 0..3 {
++                if steal.steal_into(&mut local, &mut stats).is_some() {
++                    n += 1;
++                }
++
++                while local.pop().is_some() {
++                    n += 1;
++                }
++            }
++
++            n
++        });
++
++        let mut n = 0;
++
++        for _ in 0..2 {
++            for _ in 0..2 {
++                let (task, _) = unowned(async {});
++                if let Some(prev) = local.push_lifo(task) {
++                    local.push_back_or_overflow(prev, &inject, &mut stats);
++                }
++            }
++
++            if local.pop_lifo().or_else(|| local.pop()).is_some() {
++                n += 1;
++            }
++
++            // Push another task
++            let (task, _) = unowned(async {});
++            if let Some(prev) = local.push_lifo(task) {
++                local.push_back_or_overflow(prev, &inject, &mut stats);
++            }
++
++            while local.pop_lifo().or_else(|| local.pop()).is_some() {
++                n += 1;
++            }
++        }
++
++        n += inject.borrow_mut().drain(..).count();
++
++        n += th.join().unwrap();
++
++        assert_eq!(6, n);
++    });
++}
++
+ #[test]
+ fn steal_overflow() {
+     loom::model(|| {
+@@ -116,32 +175,59 @@ fn steal_overflow() {
+ fn multi_stealer() {
+     const NUM_TASKS: usize = 5;
+ 
+-    fn steal_tasks(steal: queue::Steal<NoopSchedule>) -> usize {
++    loom::model(|| {
++        let (steal, mut local) = queue::local();
++        let inject = RefCell::new(vec![]);
+         let mut stats = new_stats();
+-        let (_, mut local) = queue::local();
+ 
+-        if steal.steal_into(&mut local, &mut stats).is_none() {
+-            return 0;
++        // Push work
++        for _ in 0..NUM_TASKS {
++            let (task, _) = unowned(async {});
++            local.push_back_or_overflow(task, &inject, &mut stats);
+         }
+ 
+-        let mut n = 1;
++        let th1 = {
++            let steal = steal.clone();
++            thread::spawn(move || steal_tasks(steal))
++        };
++
++        let th2 = thread::spawn(move || steal_tasks(steal));
++
++        let mut n = 0;
+ 
+         while local.pop().is_some() {
+             n += 1;
+         }
+ 
+-        n
+-    }
++        n += inject.borrow_mut().drain(..).count();
++
++        n += th1.join().unwrap();
++        n += th2.join().unwrap();
++
++        assert_eq!(n, NUM_TASKS);
++    });
++}
++
++// Like `multi_stealer`, but with tasks in the LIFO slot.
++#[test]
++fn multi_stealer_lifo() {
++    const NUM_TASKS: usize = 5;
+ 
+     loom::model(|| {
+         let (steal, mut local) = queue::local();
+         let inject = RefCell::new(vec![]);
+         let mut stats = new_stats();
+ 
+-        // Push work
++        // Push work into the LIFO slot.
+         for _ in 0..NUM_TASKS {
+             let (task, _) = unowned(async {});
+-            local.push_back_or_overflow(task, &inject, &mut stats);
++            // Push the new task into the LIFO slot, as though it's being
++            // notified locally.
++            if let Some(prev) = local.push_lifo(task) {
++                // If a task was already in the LIFO slot, stick the previous
++                // LIFO task into the queue.
++                local.push_back_or_overflow(prev, &inject, &mut stats);
++            }
+         }
+ 
+         let th1 = {
+@@ -153,7 +239,7 @@ fn multi_stealer() {
+ 
+         let mut n = 0;
+ 
+-        while local.pop().is_some() {
++        while local.pop_lifo().or_else(|| local.pop()).is_some() {
+             n += 1;
+         }
+ 
+@@ -166,6 +252,23 @@ fn multi_stealer() {
+     });
+ }
+ 
++fn steal_tasks(steal: queue::Steal<NoopSchedule>) -> usize {
++    let mut stats = new_stats();
++    let (_, mut local) = queue::local();
++
++    if steal.steal_into(&mut local, &mut stats).is_none() {
++        return 0;
++    }
++
++    let mut n = 1;
++
++    while local.pop().is_some() {
++        n += 1;
++    }
++
++    n
++}
++
+ #[test]
+ fn chained_steal() {
+     loom::model(|| {
+diff --git a/tokio/tests/rt_threaded.rs b/tokio/tests/rt_threaded.rs
+index fbcaf60d7e4..133ba4c37db 100644
+--- a/tokio/tests/rt_threaded.rs
++++ b/tokio/tests/rt_threaded.rs
+@@ -692,6 +692,112 @@ fn mutex_in_block_in_place() {
+     })
+ }
+ 
++// Tests that when a task is notified by another task and is placed in the LIFO
++// slot, and then the notifying task blocks the runtime, the notified task will
++// be stolen by another worker thread.
++//
++// Integration test for: https://github.com/tokio-rs/tokio/issues/4941
++#[test]
++fn lifo_stealable() {
++    use std::time::Duration;
++
++    // This test constructs a scenario where a task (the "blocker task")
++    // notifies another task (the "victim task") and then blocks that worker
++    // thread indefinitely. The victim task is placed in the worker's LIFO
++    // slot, and will only run to completion if another worker steals it from
++    // the LIFO slot, as the current worker remains blocked running the blocker
++    // task.
++    //
++    // To make the blocker task block its worker thread without yielding, we use
++    // a `std::sync` blocking channel, so that we can eventually unblock it when
++    // the test completes.
++    let (block_thread_tx, block_thread_rx) = mpsc::channel::<()>();
++    // We use this channel to wait until the victim task has started running. If
++    // we just spawned the victim task and then immediately blocked the worker
++    // thread, it would be in the global inject queue, rather than in the
++    // worker's LIFO slot.
++    let (task_started_tx, task_started_rx) = tokio::sync::oneshot::channel();
++    // Finally, this channel is used by the blocker task to wake up the victim
++    // task, so that it is placed in the worker's LIFO slot.
++    let (notify_tx, notify_rx) = tokio::sync::oneshot::channel();
++    let rt = runtime::Builder::new_multi_thread()
++        // Make sure there are enough workers that one can be parked running the
++        // I/O driver and another can be parked running the timer wheel and
++        // there's still at least one worker free to steal the blocked task.
++        .worker_threads(4)
++        .enable_time()
++        .build()
++        .unwrap();
++
++    rt.block_on(async {
++        // Keep the runtime busy so that the workers that might steal the
++        // blocked task don't all park themselves forever.
++        //
++        // Since this task will always be woken by whichever worker is holding
++        // the time driver, rather than a worker that's executing tasks, it
++        // shouldn't ever kick the victim task out of its worker's LIFO slot.
++        let churn = tokio::spawn(async move {
++            loop {
++                tokio::time::sleep(Duration::from_millis(4)).await;
++            }
++        });
++
++        let victim_task_joined = tokio::spawn(async move {
++            println!("[victim] task started");
++            task_started_tx.send(()).unwrap();
++            println!("[victim] task waiting for wakeup...");
++            notify_rx.await.unwrap();
++            println!("[victim] task running after wakeup");
++        });
++
++        // Wait for the victim task to have been polled once and have yielded
++        // before we spawn the task that will notify it. This ensures that it
++        // will be placed in the LIFO slot of the same worker thread as the
++        // blocker task, rather than on the global injector queue.
++        task_started_rx.await.unwrap();
++        println!("[main] victim slot task start acked!");
++
++        // Now, spawn a task that will notify the victim task before going
++        // blocking forever.
++        tokio::spawn(async move {
++            println!("[blocker] sending wakeup");
++            notify_tx.send(()).unwrap();
++
++            println!("[blocker] blocking the worker thread...");
++            // Block the worker thread indefinitely by waiting for a message on
++            // a blocking channel. Since we just notified the victim task, it
++            // went into the current worker thread's LIFO slot, and will only
++            // be able to complete if another worker thread successfully steals
++            // it from the LIFO slot.
++            //
++            // Using a channel rather than e.g. `loop {}` allows us to terminate
++            // the task cleanly when the test finishes.
++            let _ = block_thread_rx.recv();
++            println!("[blocker] done");
++        });
++
++        println!("[main] blocker task spawned");
++
++        // Wait for the victim task to join. If it does, then it has been stolen
++        // by another worker thread successfully.
++        //
++        // The 30-second timeout is chosen arbitrarily: its purpose is to ensure
++        // that the failure mode for this test is a panic, rather than hanging
++        // indefinitely. 30 seconds should be plenty of time for the task to be
++        // stolen, if it's going to work.
++        let result = tokio::time::timeout(Duration::from_secs(30), victim_task_joined).await;
++        println!("[main] result: {result:?}");
++
++        // Before possibly panicking, make sure that we wake up the blocker task
++        // so that it doesn't stop the runtime from shutting down.
++        block_thread_tx.send(()).unwrap();
++        churn.abort();
++        result
++            .expect("task in LIFO slot should complete within 30 seconds")
++            .expect("task in LIFO slot should not panic");
++    })
++}
++
+ #[test]
+ /// Deferred tasks should be woken before starting the [`tokio::task::block_in_place`]
+ // https://github.com/tokio-rs/tokio/issues/7877
+diff --git a/tokio/tests/rt_unstable_metrics.rs b/tokio/tests/rt_unstable_metrics.rs
+index b6de3159134..9c8672de514 100644
+--- a/tokio/tests/rt_unstable_metrics.rs
++++ b/tokio/tests/rt_unstable_metrics.rs
+@@ -674,9 +674,13 @@ fn worker_local_queue_depth() {
+             });
+ 
+             // Bump the next-run spawn
+-            tokio::spawn(async {});
++            let nop = tokio::spawn(async {});
+ 
++            // Wait until we're sure the other worker is blocked.
+             rx1.recv().unwrap();
++            // Make sure the no-op task has terminated so that it doesn't end up
++            // in the LIFO slot and throw off our counts.
++            let _ = nop.await;
+ 
+             // Spawn some tasks
+             for _ in 0..100 {

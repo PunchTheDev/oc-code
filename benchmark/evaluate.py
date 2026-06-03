@@ -95,14 +95,17 @@ REPO_CATEGORY: dict[str, str] = {
     "vuejs/core": "typescript",
     # Python external repos (continued)
     "python/mypy": "python",
+    # Rust external repos
+    "tokio-rs/tokio": "rust",
+    "clap-rs/clap": "rust",
 }
 
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json
-# Proportional to pool composition: python:45% rust:22% typescript:20% ruby:8% jvm:5%
+# Proportional to pool composition: python:43% rust:27% typescript:19% ruby:8% jvm:4%
 DEFAULT_SHARD_BUDGET: dict[str, int] = {
     "python": 12,
-    "rust": 7,
-    "typescript": 7,
+    "rust": 8,
+    "typescript": 6,
     "ruby": 2,
     "jvm": 2,
 }
@@ -355,8 +358,8 @@ def run_evaluation(
     # Oracle mode: score reference diffs directly — no agent call needed.
     # Used for pipeline calibration; expected weighted mean matches baselines.json.
     if use_oracle:
-        _oracle_weighted = 12.99
-        _oracle_arithmetic = 11.68
+        _oracle_weighted = 12.76
+        _oracle_arithmetic = 11.46
         _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
         if _baselines_path.exists():
             try:
