@@ -2158,3 +2158,28 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - Dashboard: data.json auto-refreshed via CI workflow, 441 problems, oracle 13.03
 - API: gitminer-api restarted on PM2, pool_size=441, oracle=13.03
 - Next DAS check: ~2026-06-16
+
+---
+
+## 2026-06-03 — Documentation audit and data consistency fixes
+
+**Stale stats audit**: found multiple stale pool counts (430/400/325), oracle values (23.46/11.83/12.77), and repo counts (19/20) across docs. All fixed.
+
+**Files updated**:
+- `README.md`: badge 430→441, oracle comment ~11.83→~13.03, repo count 19→13, use `python3`
+- `LEADERBOARD.md`: complete rewrite — was showing oracle 21.60 / pool 325; now 13.03 / 441 / correct difficulty
+- `docs/api.md`: pool_size, repos, oracle_score, by_category/difficulty, leaderboard oracle example
+- `docs/rewards.md`: oracle 23.46→13.03, pool 400→441, maximize earnings section
+- `CONTRIBUTING.md`: all `python gitminer.py` → `python3 gitminer.py` (22 instances)
+- Dashboard `index.html`: meta description pool count 430→441
+- `docs/dashboard_data.json`: was 430 problems (missing 11 gittensory additions); regenerated to 441
+
+**Bug fix**: `docs/dashboard_data.json` was stale (430) because `generate_dashboard_data.py` only writes to root when run locally. Fixed: script now syncs `docs/dashboard_data.json` as a side-effect of local runs.
+
+**Repo count clarification**: corrected "19 registered repos" → "13 active repos" throughout. The 20-entry `registered_repos` in pool_config.json includes DAS-registered repos with no qualifying problems; actual repos with pool problems = 13.
+
+### Status
+- All docs consistent: 441 problems, oracle 13.03 weighted / 12.08 arithmetic, 13 active repos
+- Benchmark commits: `5c088b8` through `d1e2ee8`
+- Dashboard commit: `7670791`
+- Next DAS pool check: ~2026-06-16
