@@ -808,6 +808,18 @@ def cmd_run(args: argparse.Namespace) -> None:
     print(f"Test cmd : {test_str}")
     print()
 
+    # --show-ref alone: print the reference diff without running an agent.
+    if args.show_ref and not args.agent:
+        ref_path = problem_dir / "reference.diff"
+        print("─" * 72)
+        print("Reference diff")
+        print("─" * 72)
+        if ref_path.exists():
+            _print_diff(ref_path.read_text())
+        else:
+            print("(no reference.diff)")
+        return
+
     agent_path = args.agent or str(REPO_ROOT / "agent" / "example" / "agent.py")
     if not Path(agent_path).exists():
         print(f"Agent not found: {agent_path}", file=sys.stderr)
