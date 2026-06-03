@@ -104,6 +104,13 @@ def has_test_files(diff: str) -> bool:
         or re.search(r"^diff --git .+Tests?(?:Case)?\.java\b", diff, re.MULTILINE)
         # Ruby: *_spec.rb
         or re.search(r"^diff --git .+_spec\.rb\b", diff, re.MULTILINE)
+        # Rust: inline tests — #[cfg(test)] blocks live in src/ files, not separate test files.
+        # If the diff touches .rs files and the hunk text includes #[test] or #[cfg(test)],
+        # the module has embedded unit tests that cargo test will execute.
+        or (
+            bool(re.search(r"^diff --git .+\.rs\b", diff, re.MULTILINE))
+            and bool(re.search(r"#\[(?:cfg\(test\)|test)\]", diff))
+        )
     )
 
 
@@ -446,7 +453,7 @@ def main() -> None:
                         help="Comma-separated PR numbers to curate (requires --repo)")
     parser.add_argument("--output", default=cfg["pool_dir"], help="Pool output directory")
     parser.add_argument("--limit-per-repo", type=int, default=50,
-                        help="Max new problems per repo (default: 50)")
+                        help="Max new problems per repo per run (default: 50; overridden by max_new_per_rotation in pool_config.json when called from refresh_pool.yml)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be added without writing files")
     args = parser.parse_args()
