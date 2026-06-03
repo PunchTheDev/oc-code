@@ -365,22 +365,14 @@ def cmd_problems(args: argparse.Namespace) -> None:
     pool_dir = REPO_ROOT / "benchmark" / "problems"
     baselines_path = REPO_ROOT / "results" / "baselines.json"
     baseline_lookup: dict[str, float] = {}
+    difficulty_lookup: dict[str, str] = {}
     if baselines_path.exists():
         raw = _json.loads(baselines_path.read_text())
         for entry in raw.get("problems", []):
             pid_key = entry.get("id", "")
             if pid_key:
                 baseline_lookup[pid_key] = entry.get("base_score", 0.0)
-
-    def _difficulty(score: float | None) -> str:
-        # Mirrors generate_dashboard_data.py: easy≥15, medium 5–15, hard<5
-        if score is None:
-            return "?"
-        if score >= 15:
-            return "easy"
-        if score >= 5:
-            return "medium"
-        return "hard"
+                difficulty_lookup[pid_key] = entry.get("difficulty", "medium")
 
     rows = []
     for meta_path in sorted(pool_dir.glob("*/meta.json")):
@@ -394,7 +386,7 @@ def cmd_problems(args: argparse.Namespace) -> None:
             "id": pid,
             "repo": repo,
             "cat": cat,
-            "difficulty": _difficulty(baseline),
+            "difficulty": difficulty_lookup.get(pid, "?"),
             "baseline": baseline,
             "title": meta.get("issue_title", "")[:60],
         })
