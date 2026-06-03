@@ -3614,3 +3614,27 @@ Two stale metric references cleaned up before miners arrive:
 
 Also audited: eval.yml, record_submission.yml, score.py, runner.py, evaluate.py, record_result.py — all clean.
 Pool rotation workflow (refresh_pool.yml) verified: DAS + external repos both refreshed, duplicate-check correct, oracle recalibration correct.
+
+---
+
+## Step 201 — 2026-06-03
+
+**Dashboard hero stat fix** (gittensor-miner-dashboard PR #5)
+
+Three static fallback values in `index.html` were stale from early pool builds. The `<meta name="description">` and one hardcoded category count are never updated by JS (social preview crawlers read static HTML before JS runs), so these required a direct fix:
+
+| Element | Was | Now |
+|---|---|---|
+| `<meta name="description">` | "446 curated problems" | "1154 curated problems across 6 language categories" |
+| Hero sub text | "446 / 5 language categories" | "1154 / 6 language categories" |
+| Hero live stats bar | "446 problems", "5 categories", oracle "11.83" | "1154", "6", "12.61" |
+
+JS dynamically updates the `id="hs-pool"` and `id="hero-pool-size"` elements from `data.json` after load, so miners see correct numbers at runtime — but search engine crawlers and social preview generators read the static source, meaning any link shared to the dashboard showed a 2.6× understated pool size. Fixed.
+
+### System state after step 201
+
+- gitminer-miner-dashboard main: PR #5 merged
+- Benchmark: 1154 problems, oracle 12.61 weighted / 11.48 arithmetic, 47 repos, 6 languages
+- Allowed models: 19
+- Pool rotation: Sunday 2026-06-08 (automated)
+- CI: all green
