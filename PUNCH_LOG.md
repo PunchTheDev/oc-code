@@ -4,6 +4,18 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## Step 222 — 2026-06-03
+
+**Dashboard PR #9 merged** — live API leaderboard, sortable headers, agent hash routing.
+
+- Leaderboard now fetches from live API (`/api/leaderboard`, `/api/stats`) in parallel with `data.json`; API data overrides stale snapshot for always-current leaderboard
+- Leaderboard headers sortable: Benchmark, Score/30, Date columns — click to sort asc/desc, ▲/▼ indicators
+- Agent code link: each real submission row has `code ↗` link to `agent/submissions/{handle}/agent.py` on GitHub
+- Hash routing: `#/agent/{handle}` opens breakdown drawer; `#/oracle` opens oracle per-problem view; URL updates on open, cleared on close
+- Scoped problem-browser sort indicators to `#problems-table` to avoid visual conflict with leaderboard sort
+
+---
+
 ## Step 221 — 2026-06-03
 
 **Self-hosted: killed GitHub Pages dependency, everything runs on box via PM2.**
