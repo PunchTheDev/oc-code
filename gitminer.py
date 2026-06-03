@@ -399,15 +399,26 @@ def cmd_submit(args: argparse.Namespace) -> None:
     content = agent_path.read_bytes()
     sha = hashlib.sha256(content).hexdigest()
     handle = _derive_handle(agent_path)
-    model = args.model or "deepseek/deepseek-chat"
+
+    import json as _json
+    meta_path = agent_path.parent / "meta.json"
+
+    # Respect existing meta.json model so running `submit` doesn't clobber a
+    # miner's model selection. --model flag always takes precedence.
+    existing_model: str | None = None
+    if meta_path.exists():
+        try:
+            existing_model = _json.loads(meta_path.read_text()).get("model")
+        except Exception:
+            pass
+    model = args.model or existing_model or "deepseek/deepseek-chat"
+
     pr_body = _build_pr_body(handle, sha, model)
     branch = f"submission/{handle}"
 
     print(f"\nAgent SHA-256: {sha}")
 
     # Write meta.json so CI can populate the leaderboard model column
-    import json as _json
-    meta_path = agent_path.parent / "meta.json"
     meta_path.write_text(_json.dumps({"handle": handle, "model": model, "sha256": sha}, indent=2))
 
     if args.open_pr:
@@ -1558,7 +1569,7 @@ def main() -> None:
     p_submit.add_argument(
         "--model",
         metavar="MODEL_ID",
-        help="Model ID to embed in the PR body (default: deepseek/deepseek-chat)",
+        help="Model ID (default: read from meta.json, else deepseek/deepseek-chat)",
     )
     p_submit.add_argument(
         "--open-pr",
