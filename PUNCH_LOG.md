@@ -4335,3 +4335,20 @@ benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier
 ## Step 244
 - **Dashboard PR #22 merged**: Restore `Δ vs leader` column + agent history to submission drawer — Δ Leader column per problem (colour-coded green/red/muted), compares vs rank-1 or rank-2 if current agent is leader; Submission History section shows stat cards, Chart.js progression (≥2 runs), history table; agentHistChart destroyed on close to prevent canvas reuse
 - **PR #110 merged** (base-miner): Fix `/api/shard` `next_rotation` to use epoch-based 7-day cycle from 2024-01-01 (not "next Monday"), matching gitminer.py logic; update `/api/agents` scoring formula to include `× efficiency_factor` (added in PR #107)
+
+## Step 245 — 2026-06-03
+
+**Dashboard PR #23**: Code quality audit fixes
+- Removed 5 duplicate JS functions (esc, probCat, catBadgeHTML, difficultyBadge, rankCell defined twice)
+- Fixed `catColors2` missing `go: '#59e89c'` → Go problems now correctly coloured in oracle breakdown
+- Added `/api/problems/{id}/diff`, `/api/agents/{handle}/history`, `/api/health` to API table in Mining page
+
+**Dashboard PR #24**: Submission queue filter + quickstart accuracy
+- `loadQueue` now filters to agent PRs only (branch prefix `submission/` or `agent/` or CI labels)
+- Quickstart step 4 updated to `gitminer submit ... --open-pr` (matches CONTRIBUTING.md)
+
+**Base-miner PR #111**: gitminer.py cleanup
+- `cmd_mine` docstring: "Monday 00:00 UTC" → "7-day epoch from 2024-01-01"
+- `cmd_init` model warning: now prints actual allowed models list instead of pointing to wrong command
+
+All services healthy. Pool rotation June 8 (automated).
