@@ -34,7 +34,7 @@ Usage:
     python3 gitminer.py shard
     python3 gitminer.py info 0463
     python3 gitminer.py submit agent/submissions/myhandle/agent.py
-    python3 gitminer.py submit agent/submissions/myhandle/agent.py --model claude-3-5-haiku-20241022 --open-pr
+    python3 gitminer.py submit agent/submissions/myhandle/agent.py --model deepseek/deepseek-chat --open-pr
     python3 gitminer.py serve-api
     python3 gitminer.py serve-api --port 9000 --host 127.0.0.1
     python3 gitminer.py mine --agent agent/submissions/myhandle/agent.py --no-sandbox
@@ -308,7 +308,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
     content = agent_path.read_bytes()
     sha = hashlib.sha256(content).hexdigest()
     handle = _derive_handle(agent_path)
-    model = args.model or "claude-3-5-haiku-20241022"
+    model = args.model or "deepseek/deepseek-chat"
     pr_body = _build_pr_body(handle, sha, model)
     branch = f"submission/{handle}"
 
@@ -1078,13 +1078,19 @@ def cmd_mine(args: argparse.Namespace) -> None:
         passed = sum(1 for p in problems if p.get("tests_passed", False))
         print(f"\nResult: {weighted_mean:.2f} / 30.00 (weighted)   ({passed}/{len(problems)} tests passing)")
 
+        if weighted_mean <= 0:
+            print("Score is 0 — no tests passed. Keep improving before submitting.")
+            return
+
         if champ and weighted_mean <= champ:
             gap = champ - weighted_mean
             print(f"Gap to champion: {gap:.2f} — keep improving!")
             return
 
         status = "BEAT CHAMPION" if champ else "FIRST SUBMISSION"
-        print(f"\n🎯  {status}! Your weighted score: {weighted_mean:.2f}")
+        oracle_gap = oracle - weighted_mean
+        oracle_note = f"  (oracle: {oracle:.2f}, gap: {oracle_gap:+.2f})"
+        print(f"\n{status}! Your weighted score: {weighted_mean:.2f}{oracle_note}")
 
         # Generate commit-reveal hash from agent file content
         agent_bytes = Path(agent_path).read_bytes()
@@ -1102,8 +1108,6 @@ def cmd_mine(args: argparse.Namespace) -> None:
         """Seconds until next Monday 00:00 UTC."""
         now = datetime.now(timezone.utc)
         days_ahead = (7 - now.weekday()) % 7 or 7
-        next_monday = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        delta_days = (next_monday.day + days_ahead) - next_monday.day
         return days_ahead * 86400 - (now.hour * 3600 + now.minute * 60 + now.second)
 
     _run_cycle()
@@ -1235,7 +1239,7 @@ def main() -> None:
     p_submit.add_argument(
         "--model",
         metavar="MODEL_ID",
-        help="Model ID to embed in the PR body (default: claude-3-5-haiku-20241022)",
+        help="Model ID to embed in the PR body (default: deepseek/deepseek-chat)",
     )
     p_submit.add_argument(
         "--open-pr",
