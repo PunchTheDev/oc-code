@@ -2305,3 +2305,20 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - Anti-copy: behavior fingerprints now persisted on every champion merge
 - CI post-merge: single workflow (`record_submission.yml`) handles eval + leaderboard + fingerprint + champion + dashboard
 - Next DAS check: ~2026-06-16
+
+---
+
+## 2026-06-03 — Commit-reveal UX fixes
+
+**Root cause**: Three files described the commit-reveal hash protocol inconsistently:
+- `gitminer hash` help text said "patch file" but CONTRIBUTING.md used it with `agent.py`
+- PR template included a "secret salt" that no command generates
+- CONTRIBUTING.md had two incompatible hash flows (salted Python snippet vs `gitminer hash`)
+
+**Fixes (commit 7940f68)**:
+- `gitminer.py`: `hash` command arg renamed `patch` → `agent`; help text updated; success message clarified
+- `gitminer.py`: module-level command description + usage example updated (`my_patch.diff` → `agent/submissions/myhandle/agent.py`)
+- `.github/PULL_REQUEST_TEMPLATE.md`: removed "secret salt" from commit-reveal section; now says `python3 gitminer hash ...` and paste hash
+- `CONTRIBUTING.md`: removed salted Python snippet + phase-2 reveal ceremony; unified to single flow using `gitminer hash` and `gitminer submit`
+
+**Effect**: Miners now see one consistent commit-reveal flow: `gitminer hash` → paste hash → `gitminer submit`.
