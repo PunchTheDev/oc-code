@@ -4,6 +4,46 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## Step 212 — 2026-06-03
+
+**PR #90 merged** — `gitminer doctor` is now Docker-aware.
+
+Before this change, `doctor` had no visibility into Docker. Miners running `gitminer mine` without Docker or with the daemon stopped would get cryptic harness errors. Now `doctor` catches the problem at pre-flight:
+
+- Detects if running **inside** Docker (warns to use `--no-sandbox` instead of failing)
+- Checks Docker binary presence + daemon health via `docker info`
+- Reports scorer image cache state — warns if `ghcr.io/punchthedev/gitminer-scorer:latest` isn't pulled (auto-pulls on first eval, adds ~30s)
+
+**Node.js 24 workflow upgrades: branch prepared, push pending.**
+
+Researched and confirmed all latest action versions for June 2026:
+
+| Action | Old | New |
+|---|---|---|
+| `actions/checkout` | v4 | v6 |
+| `actions/setup-python` | v5 | v6 |
+| `actions/cache` | v4 | v5 |
+| `actions/upload-artifact` | v4 | v7 |
+| `actions/github-script` | v7 | v9 |
+
+Branch `punch/node24-workflow-upgrades` committed locally (76ae804a) with all 5 workflows updated. Push blocked — `workflow` scope still missing. Operator must run:
+```
+gh auth refresh -s workflow
+```
+Then:
+```
+cd /home/punch/punch/workspace/gittensor-base-miner
+git push -u origin punch/node24-workflow-upgrades
+```
+Deadline: **2026-06-16**.
+
+**System state post-step:**
+- base-miner main: 967ac5bf (PR #90 merged)
+- Benchmark: 1123 problems, oracle 12.64, 47 repos, 34 models
+- Branch `punch/node24-workflow-upgrades`: ready to push once operator grants `workflow` scope
+
+---
+
 ## Step 165 — 2026-06-03
 
 **External Python pool expansion: 584→644 (+60 problems)**
