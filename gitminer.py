@@ -53,6 +53,43 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(REPO_ROOT))
 
+# Public URL for the live leaderboard — used by `mine` and `leaderboard --live`
+# so miners who forked the repo see real competition without needing a git pull.
+LIVE_LEADERBOARD_URL = (
+    "https://raw.githubusercontent.com/PunchTheDev/gittensor-base-miner"
+    "/main/results/leaderboard.json"
+)
+
+
+def _fetch_live_leaderboard(timeout: int = 5) -> list[dict] | None:
+    """Fetch the canonical leaderboard from GitHub. Returns None on any failure."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(LIVE_LEADERBOARD_URL, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
+def _load_leaderboard(live: bool = True) -> tuple[list[dict], str]:
+    """Return (entries, source) where source is 'live', 'local', or 'none'.
+
+    When *live* is True (default), tries the GitHub raw URL first so miners
+    who forked the repo see the real competition state, not a stale snapshot.
+    Falls back to the local file automatically.
+    """
+    if live:
+        entries = _fetch_live_leaderboard()
+        if entries is not None:
+            return entries, "live"
+
+    lb_path = REPO_ROOT / "results" / "leaderboard.json"
+    if lb_path.exists():
+        return json.loads(lb_path.read_text()), "local"
+
+    return [], "none"
+
 
 def _oracle_weighted() -> float:
     """Read the oracle weighted mean from leaderboard.json (primary ranking metric)."""
@@ -477,23 +514,34 @@ def cmd_problems(args: argparse.Namespace) -> None:
 
 
 def cmd_leaderboard(args: argparse.Namespace) -> None:
-    """Print the current leaderboard from results/leaderboard.json."""
-    lb_path = REPO_ROOT / "results" / "leaderboard.json"
-    if not lb_path.exists():
-        print("Leaderboard not found. Check results/leaderboard.json.")
+    """Print the current leaderboard.
+
+    By default fetches the canonical live leaderboard from GitHub so forked
+    repos always show up-to-date competition state.  Pass --no-live to use
+    only the local results/leaderboard.json.
+    """
+    use_live = not getattr(args, "no_live", False)
+    rows, source = _load_leaderboard(live=use_live)
+
+    if not rows:
+        print("Leaderboard not found. Run with --no-live to check local file.")
         return
 
-    rows = json.loads(lb_path.read_text())
+    if source == "live":
+        print("(live — fetched from GitHub)")
+    elif source == "local":
+        print("(local — run `git pull` or omit --no-live for up-to-date rankings)")
+
     # Separate oracle row from ranked entries
     oracle = next((r for r in rows if r.get("rank") is None), None)
     ranked = [r for r in rows if r.get("rank") is not None]
 
     if not ranked:
         print("\nNo submissions yet — be the first to submit an agent!")
-        if oracle and oracle.get("weighted_score") is not None:
-            print(f"\nOracle (reference diffs): {oracle['weighted_score']:.2f} / 30.00  ← weighted score to beat")
-        elif oracle and oracle.get("score") is not None:
-            print(f"\nOracle (reference diffs): {oracle['score']:.2f} / 30.00  ← score to beat")
+        if oracle:
+            wbs = oracle.get("weighted_benchmark_score") or oracle.get("benchmark_score")
+            if wbs is not None:
+                print(f"\nOracle normalized score: {wbs:.4f}  ← beat this to be champion")
         print(f"\nDashboard: https://punchthedev.github.io/gittensor-miner-dashboard/")
         return
 
@@ -502,7 +550,8 @@ def cmd_leaderboard(args: argparse.Namespace) -> None:
     model_w = max(len(r.get("model", "")) for r in ranked)
     model_w = max(model_w, 5)
 
-    header = f"{'Rank':>4}  {'Agent':<{handle_w}}  {'Score':>8}  {'Model':<{model_w}}  {'Date'}"
+    # Primary ranking metric is weighted_benchmark_score (normalized, oracle=1.0).
+    header = f"{'Rank':>4}  {'Agent':<{handle_w}}  {'BenchScore':>10}  {'Model':<{model_w}}  {'Date'}"
     print()
     print(header)
     print("─" * len(header))
@@ -510,20 +559,20 @@ def cmd_leaderboard(args: argparse.Namespace) -> None:
     for row in ranked:
         rank = row.get("rank", "?")
         handle = row.get("agent", "—")
-        score = row.get("score")
+        wbs = row.get("weighted_benchmark_score") or row.get("benchmark_score") or row.get("score")
         model = row.get("model", "—")
         date = (row.get("date") or "")[:10]
 
         rank_str = f"#{rank:>3}"
-        score_str = f"{score:>7.2f}" if score is not None else "  pending"
+        score_str = f"{wbs:>9.4f}" if wbs is not None else "   pending"
 
         print(f"{rank_str}  {handle:<{handle_w}}  {score_str}  {model:<{model_w}}  {date}")
 
     print()
     if oracle:
-        w = oracle.get("weighted_score") or oracle.get("score")
-        if w is not None:
-            print(f"Oracle (reference diffs): {w:.2f} / 30.00  (weighted)")
+        wbs = oracle.get("weighted_benchmark_score") or oracle.get("benchmark_score")
+        if wbs is not None:
+            print(f"Oracle (accepted solutions): {wbs:.4f}  (normalized; champion must exceed this)")
     print(f"Dashboard: https://punchthedev.github.io/gittensor-miner-dashboard/")
     print()
 
@@ -1108,33 +1157,36 @@ def cmd_mine(args: argparse.Namespace) -> None:
 
     handle = Path(agent_path).parent.name
 
-    def _champion_score() -> float:
-        """Return the champion's weighted_benchmark_score (PRIMARY metric). Falls back
-        to weighted_score if the entry predates the benchmark_score schema."""
-        lb_path = REPO_ROOT / "results" / "leaderboard.json"
-        if not lb_path.exists():
-            return 0.0
-        entries = json.loads(lb_path.read_text())
+    def _champion_score() -> tuple[float, str]:
+        """Return (score, source) for the current champion.
+
+        Tries the live GitHub leaderboard first so miners who forked the repo
+        see the real competition state.  Falls back to the local file.
+
+        Returns (0.0, source) when there are no human entries yet.
+        """
+        entries, source = _load_leaderboard(live=True)
         human = [e for e in entries if "Oracle" not in e.get("agent", "")]
         if not human:
-            return 0.0
+            return 0.0, source
         row = human[0]
-        # Prefer weighted_benchmark_score; fall back to older weighted_score field.
-        return float(
+        score = float(
             row.get("weighted_benchmark_score")
             or row.get("benchmark_score")
             or row.get("weighted_score")
             or row.get("score", 0.0)
         )
+        return score, source
 
     def _run_cycle() -> None:
-        champ = _champion_score()
+        champ, champ_src = _champion_score()
         oracle = _oracle_weighted()
         label = f"{champ:.4f}" if champ else "none yet"
+        src_tag = f"  [{champ_src}]" if champ_src != "none" else ""
         print(f"\n{'═'*60}")
         print(f"  gitminer mine — {handle}")
         print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-        print(f"  Champion weighted_benchmark: {label}    Oracle: 1.0000")
+        print(f"  Champion weighted_benchmark: {label}{src_tag}    Oracle: 1.0000")
         print(f"{'═'*60}\n")
 
         results = run_evaluation(
@@ -1370,6 +1422,11 @@ def main() -> None:
 
     # leaderboard
     p_lb = sub.add_parser("leaderboard", help="Show current leaderboard in the terminal")
+    p_lb.add_argument(
+        "--no-live",
+        action="store_true",
+        help="Use local results/leaderboard.json instead of fetching from GitHub",
+    )
     p_lb.set_defaults(func=cmd_leaderboard)
 
     # problems
