@@ -3960,3 +3960,23 @@ Then the changes can be pushed. This must happen before June 16.
 - Model whitelist: **34 models** (all verified live 2026-06-03)
 - Pool rotation: Sunday 2026-06-08 (protected)
 - Node.js 24 upgrade: branch `punch/node24-workflow-upgrades` ready locally (operator needs `workflow` scope)
+
+## Step 214 — 2026-06-03
+
+### Action
+Model whitelist expansion 34 → 48: all 14 new models verified live on OpenRouter.
+
+### Added models
+- DeepSeek: `deepseek-v4-pro`, `deepseek-v4-flash`
+- Anthropic: `claude-opus-4.6-fast`, `claude-opus-4.7`, `claude-opus-4.7-fast`, `claude-opus-4.8`, `claude-opus-4.8-fast`
+- OpenAI: `gpt-5.4-nano`, `gpt-5.4-mini`, `gpt-5.5`, `gpt-5.5-pro`
+- Google: `gemini-3.1-flash-lite`
+- Qwen: `qwen3.7-max`, `qwen3.7-plus`
+
+### Results
+- PR #92 merged (9e71c202)
+- Dashboard data.json regenerated: 48 models (3168509)
+- API restarted: `/api/agents` confirms 48 models ✅
+
+### Status
+Pool 1123, oracle 12.64, whitelist 48 models, rotation Sunday 2026-06-08 (5 days, protected).
