@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import subprocess
 import time
@@ -108,11 +109,19 @@ def has_test_files(diff: str) -> bool:
 
 
 def has_source_changes(diff: str) -> bool:
-    """True if the diff modifies at least one non-test source file.
+    """True if the diff modifies at least one non-test, non-changelog source file.
 
     Filters out test-only PRs — those score 0 for miners regardless of
     correctness because src_tok counts source file changes only.
+    Also filters changelog/news-fragment files (towncrier .misc/.bugfix/.feature
+    fragments, CHANGES.rst, etc.) which look like source paths but aren't code.
     """
+    # Towncrier fragment extensions (never real source)
+    _CHANGELOG_EXTS = {".misc", ".bugfix", ".feature", ".deprecation", ".removal",
+                       ".doc", ".trivial", ".breaking"}
+    # Changelog directories
+    _CHANGELOG_DIRS = {"newsfragments", "news", "changelog", "changelogs", "changes"}
+
     for line in diff.splitlines():
         if not line.startswith("diff --git "):
             continue
@@ -122,6 +131,7 @@ def has_source_changes(diff: str) -> bool:
         path = m.group(1)
         parts = path.lower().split("/")
         filename = parts[-1]
+        # Skip test directories and files
         if any(d in ("tests", "test", "__tests__", "spec") for d in parts[:-1]):
             continue
         if filename.startswith("test_") or "_test." in filename:
@@ -133,6 +143,15 @@ def has_source_changes(diff: str) -> bool:
         if filename.endswith("_spec.rb"):
             continue
         if filename.endswith("_test.go"):
+            continue
+        # Skip changelog / news fragment files
+        if any(d in _CHANGELOG_DIRS for d in parts[:-1]):
+            continue
+        _, ext = os.path.splitext(filename)
+        if ext in _CHANGELOG_EXTS:
+            continue
+        if filename in ("changelog.md", "changes.rst", "news.rst", "history.rst",
+                        "history.md", "release-notes.md", "release_notes.md"):
             continue
         return True
     return False

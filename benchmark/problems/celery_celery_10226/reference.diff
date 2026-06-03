@@ -1,0 +1,240 @@
+diff --git a/celery/worker/request.py b/celery/worker/request.py
+index a26eb42ce4f..4b5b97f11ee 100644
+--- a/celery/worker/request.py
++++ b/celery/worker/request.py
+@@ -10,13 +10,13 @@
+ from weakref import ref
+ 
+ from billiard.common import TERM_SIGNAME
+-from billiard.einfo import ExceptionWithTraceback
++from billiard.einfo import ExceptionInfo, ExceptionWithTraceback
+ from kombu.utils.encoding import safe_repr, safe_str
+ from kombu.utils.objects import cached_property
+ 
+-from celery import current_app, signals
++from celery import current_app, signals, states
+ from celery.app.task import Context
+-from celery.app.trace import fast_trace_task, trace_task, trace_task_ret
++from celery.app.trace import fast_trace_task, task_has_custom, trace_task, trace_task_ret, traceback_clear
+ from celery.concurrency.base import BasePool
+ from celery.exceptions import (Ignore, InvalidTaskError, Reject, Retry, TaskRevokedError, Terminated,
+                                TimeLimitExceeded, WorkerLostError)
+@@ -544,6 +544,49 @@ def on_timeout(self, soft, timeout):
+                     store_result=self.store_errors,
+                 )
+ 
++                # Invoke the same failure hooks that a normal task failure
++                # triggers so that on_failure callbacks, errbacks, and
++                # the task_failure signal all fire for hard timeouts.
++                einfo = None
++                try:
++                    try:
++                        raise exc
++                    except TimeLimitExceeded:
++                        einfo = ExceptionInfo()
++
++                    self.task.on_failure(exc, self.id, self.args, self.kwargs, einfo)
++
++                    if task_has_custom(self.task, 'after_return'):
++                        self.task.after_return(
++                            states.FAILURE, exc, self.id, self.args, self.kwargs, None,
++                        )
++
++                    signals.task_failure.send(
++                        sender=self.task,
++                        task_id=self.id,
++                        exception=exc,
++                        args=self.args,
++                        kwargs=self.kwargs,
++                        traceback=exc.__traceback__,
++                        einfo=einfo,
++                    )
++
++                    self.send_event(
++                        'task-failed',
++                        exception=safe_repr(get_pickled_exception(einfo.exception)),
++                        traceback=einfo.traceback,
++                    )
++                    # MEMORY LEAK FIX: clear frame locals retained by the
++                    # synthetic traceback (same pattern as trace.py #8882).
++                    traceback_clear(exc)
++                finally:
++                    # Break the remaining exc → traceback → frame reference
++                    # cycle so the on_timeout frame (and the Request/self it
++                    # contains) can be garbage-collected promptly.
++                    if einfo is not None:
++                        del einfo
++                    exc.__traceback__ = None
++
+             if self.task.acks_late:
+                 if self.task.acks_on_timeout:
+                     self.acknowledge()
+diff --git a/docs/userguide/tasks.rst b/docs/userguide/tasks.rst
+index c09547b4110..1383bc5fdb1 100644
+--- a/docs/userguide/tasks.rst
++++ b/docs/userguide/tasks.rst
+@@ -1044,6 +1044,32 @@ General
+     The soft time limit for this task.
+     When not set the workers default is used.
+ 
++.. note::
++
++    **Hard vs soft time limit failure semantics**
++
++    When a *soft* time limit fires, a :exc:`~celery.exceptions.SoftTimeLimitExceeded`
++    exception is raised inside the worker child process. If this exception
++    propagates and causes the task attempt to fail,
++    :meth:`~celery.app.task.Task.on_failure`, errbacks, and the
++    :signal:`task_failure` signal are all invoked as for any other task failure.
++    Task code may also catch :exc:`~celery.exceptions.SoftTimeLimitExceeded`
++    and exit normally, in which case these failure hooks are not triggered.
++
++    When a *hard* time limit fires the child process is killed and the
++    timeout is handled in the parent (main worker) process.
++    :meth:`~celery.app.task.Task.on_failure`, errbacks, and the
++    :signal:`task_failure` signal are also invoked from the parent process
++    so that cleanup hooks fire consistently for both limit types.
++
++    .. versionchanged:: 5.7
++
++        Hard time limits now invoke :meth:`~celery.app.task.Task.on_failure`,
++        errbacks, and :signal:`task_failure` in the parent worker process,
++        matching the behavior of soft time limits.
++        Previously only :meth:`~celery.backends.base.BaseBackend.mark_as_failure`
++        was called.
++
+ .. attribute:: Task.ignore_result
+ 
+     Don't store task state. Note that this means you can't use
+@@ -1780,8 +1806,9 @@ strongly recommend to inherit from `celery.worker.request.Request`:class:.
+ When using the `pre-forking worker <worker-concurrency>`:ref:, the methods
+ `~celery.worker.request.Request.on_timeout`:meth: and
+ `~celery.worker.request.Request.on_failure`:meth: are executed in the main
+-worker process.  An application may leverage such facility to detect failures
+-which are not detected using `celery.app.task.Task.on_failure`:meth:.
++worker process.  An application may leverage this facility to add extra
++observability or side-effects around task failures and timeouts beyond what
++`celery.app.task.Task.on_failure`:meth: provides.
+ 
+ As an example, the following custom request detects and logs hard time
+ limits, and other failures.
+diff --git a/t/unit/worker/test_request.py b/t/unit/worker/test_request.py
+index 89e7a1affd2..0ad3d0b5e39 100644
+--- a/t/unit/worker/test_request.py
++++ b/t/unit/worker/test_request.py
+@@ -4,7 +4,7 @@
+ import socket
+ from datetime import datetime, timedelta, timezone
+ from time import monotonic, time
+-from unittest.mock import Mock, patch
++from unittest.mock import ANY, Mock, patch
+ 
+ import pytest
+ from billiard.einfo import ExceptionInfo
+@@ -1228,7 +1228,105 @@ def test_on_timeout_should_terminate(self, patching):
+         finally:
+             state.should_terminate = original_should_terminate
+ 
+-    def test_fast_trace_task(self):
++    def test_on_hard_timeout_calls_task_on_failure(self, patching):
++        """Hard timeout must invoke task.on_failure so user hooks fire."""
++        patching('celery.worker.request.error')
++
++        job = self.xRequest()
++        job.task.on_failure = Mock(name='on_failure')
++        job.on_timeout(soft=False, timeout=1337)
++
++        job.task.on_failure.assert_called_once()
++        call_args = job.task.on_failure.call_args[0]
++        exc, task_id = call_args[0], call_args[1]
++        assert isinstance(exc, TimeLimitExceeded)
++        assert task_id == job.id
++
++    def test_on_hard_timeout_sends_task_failure_signal(self, patching):
++        """Hard timeout must send the task_failure signal."""
++        patching('celery.worker.request.error')
++
++        handler = Mock(name='signal_handler')
++        task_failure.connect(handler)
++        try:
++            job = self.xRequest()
++            job.on_timeout(soft=False, timeout=1337)
++        finally:
++            task_failure.disconnect(handler)
++
++        handler.assert_called_once()
++        kwargs = handler.call_args[1]
++        assert isinstance(kwargs['exception'], TimeLimitExceeded)
++        assert kwargs['task_id'] == job.id
++
++    def test_on_hard_timeout_sends_task_failed_event(self, patching):
++        """Hard timeout must emit a task-failed monitoring event."""
++        patching('celery.worker.request.error')
++
++        job = self.xRequest()
++        job.send_event = Mock(name='send_event')
++        job.on_timeout(soft=False, timeout=1337)
++
++        job.send_event.assert_called_once_with(
++            'task-failed',
++            exception=ANY,
++            traceback=ANY,
++        )
++
++    def test_on_hard_timeout_calls_after_return(self, patching):
++        """Hard timeout must invoke task.after_return when overridden."""
++        patching('celery.worker.request.error')
++
++        after_return_mock = Mock(name='after_return')
++
++        class TaskWithAfterReturn(self.app.Task):
++            name = 'test.task_with_after_return'
++
++            def run(self):
++                pass
++
++            def after_return(self, status, retval, task_id, args, kwargs, einfo):
++                after_return_mock(status, retval, task_id, args, kwargs, einfo)
++
++        task_instance = TaskWithAfterReturn()
++        self.app.tasks.register(task_instance)
++
++        job = self.xRequest(name=TaskWithAfterReturn.name)
++        job.on_timeout(soft=False, timeout=1337)
++
++        after_return_mock.assert_called_once()
++        call_args = after_return_mock.call_args[0]
++        assert call_args[0] == 'FAILURE'
++        assert isinstance(call_args[1], TimeLimitExceeded)
++        assert call_args[2] == job.id
++
++    def test_on_hard_timeout_clears_synthetic_traceback(self, patching):
++        """exc.__traceback__ must be None after on_timeout returns (memory leak fix #8882).
++
++        The synthetic traceback created to build ExceptionInfo captures the
++        on_timeout frame, which holds self (the Request object) and all task
++        state.  If not cleared this prevents timely garbage-collection under
++        frequent hard timeouts.
++        """
++        patching('celery.worker.request.error')
++
++        captured = {}
++        original_mark = self.mytask.backend.mark_as_failure
++
++        def capture_exc(task_id, exc, **kw):
++            captured['exc'] = exc
++            return original_mark(task_id, exc, **kw)
++
++        with patch.object(self.mytask.backend, 'mark_as_failure', capture_exc):
++            job = self.xRequest()
++            job.on_timeout(soft=False, timeout=1337)
++
++        assert 'exc' in captured, "mark_as_failure should have been called"
++        assert captured['exc'].__traceback__ is None, (
++            "exc.__traceback__ must be cleared after on_timeout to prevent "
++            "the on_timeout frame (and its locals including self/Request) from "
++            "being retained by the traceback reference cycle"
++        )
+         assert self.app.use_fast_trace_task is False
+         setup_worker_optimizations(self.app)
+         assert self.app.use_fast_trace_task is True

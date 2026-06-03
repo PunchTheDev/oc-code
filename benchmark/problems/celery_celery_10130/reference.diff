@@ -1,0 +1,760 @@
+diff --git a/.github/workflows/python-package.yml b/.github/workflows/python-package.yml
+index 41f6f36ccc6..2e50d500bbb 100644
+--- a/.github/workflows/python-package.yml
++++ b/.github/workflows/python-package.yml
+@@ -93,6 +93,7 @@ jobs:
+         module: [
+           'test_backend.py',
+           'test_canvas.py',
++          'test_database_backend.py',
+           'test_inspect.py',
+           'test_loader.py',
+           'test_mem_leak_in_exception_handling.py',
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index 69bfa550f6c..5a79191fc71 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -609,26 +609,20 @@ def _get_result_meta(self, result,
+     def _sleep(self, amount):
+         time.sleep(amount)
+ 
+-    def store_result(self, task_id, result, state,
+-                     traceback=None, request=None, **kwargs):
+-        """Update task state and result.
+-
+-        if always_retry_backend_operation is activated, in the event of a recoverable exception,
+-        then retry operation with an exponential backoff until a limit has been reached.
+-        """
+-        result = self.encode_result(result, state)
+-
++    def _ensure_retryable(self, func, *args, fallback_exc=None, fallback_msg=None, **kwargs):
++        """Helper to execute a function with the backend's retry policy."""
+         retries = 0
+-
+         while True:
+             try:
+-                self._store_result(task_id, result, state, traceback,
+-                                   request=request, **kwargs)
+-                return result
++                return func(*args, **kwargs)
+             except Exception as exc:
+                 if self.always_retry and self.exception_safe_to_retry(exc):
+                     if retries < self.max_retries:
+                         retries += 1
++                        logger.warning(
++                            'Failed operation %s. Retrying %s more times.',
++                            getattr(func, '__name__', repr(func)), self.max_retries - retries,
++                            exc_info=True)
+                         try:
+                             self.on_backend_retryable_error(exc)
+                         except Exception:
+@@ -643,15 +637,41 @@ def store_result(self, task_id, result, state,
+                             self.max_sleep_between_retries_ms, True) / 1000
+                         self._sleep(sleep_amount)
+                     else:
+-                        raise_with_context(
+-                            BackendStoreError("failed to store result on the backend", task_id=task_id, state=state),
+-                        )
++                        if fallback_exc:
++                            exc_kwargs = {}
++                            for key in ("task_id", "state"):
++                                if key in kwargs:
++                                    exc_kwargs[key] = kwargs[key]
++                            raise_with_context(fallback_exc(fallback_msg, **exc_kwargs))
++                        raise
+                 else:
+                     raise
+ 
++    def store_result(self, task_id, result, state,
++                     traceback=None, request=None, **kwargs):
++        """Update task state and result.
++
++        if always_retry_backend_operation is activated, in the event of a recoverable exception,
++        then retry operation with an exponential backoff until a limit has been reached.
++        """
++        result = self.encode_result(result, state)
++
++        kwargs.update({'task_id': task_id, 'state': state})
++
++        self._ensure_retryable(
++            self._store_result,
++            fallback_exc=BackendStoreError,
++            fallback_msg="failed to store result on the backend",
++            result=result,
++            traceback=traceback,
++            request=request,
++            **kwargs
++        )
++        return result
++
+     def forget(self, task_id):
+         self._cache.pop(task_id, None)
+-        self._forget(task_id)
++        self._ensure_retryable(self._forget, task_id=task_id)
+ 
+     def _forget(self, task_id):
+         raise NotImplementedError('backend does not implement forget.')
+@@ -711,34 +731,13 @@ def get_task_meta(self, task_id, cache=True):
+                 return self._cache[task_id]
+             except KeyError:
+                 pass
+-        retries = 0
+-        while True:
+-            try:
+-                meta = self._get_task_meta_for(task_id)
+-                break
+-            except Exception as exc:
+-                if self.always_retry and self.exception_safe_to_retry(exc):
+-                    if retries < self.max_retries:
+-                        retries += 1
+-                        try:
+-                            self.on_backend_retryable_error(exc)
+-                        except Exception:
+-                            logger.exception(
+-                                "on_backend_retryable_error hook failed; continuing retry loop",
+-                            )
+ 
+-                        # get_exponential_backoff_interval computes integers
+-                        # and time.sleep accept floats for sub second sleep
+-                        sleep_amount = get_exponential_backoff_interval(
+-                            self.base_sleep_between_retries_ms, retries,
+-                            self.max_sleep_between_retries_ms, True) / 1000
+-                        self._sleep(sleep_amount)
+-                    else:
+-                        raise_with_context(
+-                            BackendGetMetaError("failed to get meta", task_id=task_id),
+-                        )
+-                else:
+-                    raise
++        meta = self._ensure_retryable(
++            self._get_task_meta_for,
++            fallback_exc=BackendGetMetaError,
++            fallback_msg="failed to get meta",
++            task_id=task_id
++        )
+ 
+         if cache and meta.get('status') == states.SUCCESS:
+             self._cache[task_id] = meta
+@@ -760,7 +759,7 @@ def get_group_meta(self, group_id, cache=True):
+             except KeyError:
+                 pass
+ 
+-        meta = self._restore_group(group_id)
++        meta = self._ensure_retryable(self._restore_group, group_id=group_id)
+         if cache and meta is not None:
+             self._cache[group_id] = meta
+         return meta
+@@ -773,11 +772,15 @@ def restore_group(self, group_id, cache=True):
+ 
+     def save_group(self, group_id, result):
+         """Store the result of an executed group."""
+-        return self._save_group(group_id, result)
++        return self._ensure_retryable(
++            self._save_group,
++            group_id=group_id,
++            result=result
++        )
+ 
+     def delete_group(self, group_id):
+         self._cache.pop(group_id, None)
+-        return self._delete_group(group_id)
++        return self._ensure_retryable(self._delete_group, group_id=group_id)
+ 
+     def cleanup(self):
+         """Backend cleanup."""
+diff --git a/celery/backends/database/__init__.py b/celery/backends/database/__init__.py
+index 97a96e49813..e4b4f7f59e4 100644
+--- a/celery/backends/database/__init__.py
++++ b/celery/backends/database/__init__.py
+@@ -2,8 +2,6 @@
+ import logging
+ from contextlib import contextmanager
+ 
+-from vine.utils import wraps
+-
+ from celery import states
+ from celery.backends.base import BaseBackend
+ from celery.exceptions import ImproperlyConfigured
+@@ -43,35 +41,6 @@ def session_cleanup(session):
+         session.close()
+ 
+ 
+-def retry(fun):
+-
+-    @wraps(fun)
+-    def _inner(*args, **kwargs):
+-        max_retries = kwargs.pop('max_retries', 3)
+-
+-        for retries in range(max_retries):
+-            try:
+-                return fun(*args, **kwargs)
+-            except RETRYABLE_DB_ERRORS as exc:
+-                backend = args[0] if args else None
+-                on_retryable_error = getattr(backend, 'on_backend_retryable_error', None)
+-                if callable(on_retryable_error):
+-                    try:
+-                        on_retryable_error(exc)
+-                    except Exception:
+-                        logger.exception(
+-                            "on_backend_retryable_error hook failed; continuing retry loop",
+-                        )
+-                logger.warning(
+-                    'Failed operation %s.  Retrying %s more times.',
+-                    fun.__name__, max_retries - retries - 1,
+-                    exc_info=True)
+-                if retries + 1 >= max_retries:
+-                    raise
+-
+-    return _inner
+-
+-
+ class DatabaseBackend(BaseBackend):
+     """The database result backend."""
+ 
+@@ -89,6 +58,12 @@ def __init__(self, dburi=None, engine_options=None, url=None, **kwargs):
+                          url=url, **kwargs)
+         conf = self.app.conf
+ 
++        # Override retry defaults to preserve backward compatibility.
++        # Previously, DatabaseBackend used a custom @retry decorator that always
++        # retried with max_retries=3. We maintain this behavior by default.
++        self.always_retry = conf.get('result_backend_always_retry', True)
++        self.max_retries = conf.get('result_backend_max_retries', 3)
++
+         if self.extended_result:
+             self.task_cls = TaskExtended
+ 
+@@ -147,7 +122,6 @@ def ResultSession(self, session_manager=None):
+             short_lived_sessions=self.short_lived_sessions,
+             **self.engine_options)
+ 
+-    @retry
+     def _store_result(self, task_id, result, state, traceback=None,
+                       request=None, **kwargs):
+         """Store return value and state of an executed task."""
+@@ -183,7 +157,6 @@ def _update_result(self, task, result, state, traceback=None,
+             value = meta.get(column)
+             setattr(task, column, value)
+ 
+-    @retry
+     def _get_task_meta_for(self, task_id):
+         """Get task meta-data for a task by id."""
+         session = self.ResultSession()
+@@ -201,7 +174,6 @@ def _get_task_meta_for(self, task_id):
+                 data['kwargs'] = self.decode(data['kwargs'])
+             return self.meta_from_decoded(data)
+ 
+-    @retry
+     def _save_group(self, group_id, result):
+         """Store the result of an executed group."""
+         session = self.ResultSession()
+@@ -212,7 +184,6 @@ def _save_group(self, group_id, result):
+             session.commit()
+             return result
+ 
+-    @retry
+     def _restore_group(self, group_id):
+         """Get meta-data for group by id."""
+         session = self.ResultSession()
+@@ -222,7 +193,6 @@ def _restore_group(self, group_id):
+             if group:
+                 return group.to_dict()
+ 
+-    @retry
+     def _delete_group(self, group_id):
+         """Delete meta-data for group by id."""
+         session = self.ResultSession()
+@@ -232,7 +202,6 @@ def _delete_group(self, group_id):
+             session.flush()
+             session.commit()
+ 
+-    @retry
+     def _forget(self, task_id):
+         """Forget about result."""
+         session = self.ResultSession()
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index 09242263f6f..67de391a63c 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -809,8 +809,17 @@ Can be one of the following:
+ 
+ Default: :const:`False`
+ 
+-If enable, backend will try to retry on the event of recoverable exceptions instead of propagating the exception.
+-It will use an exponential backoff sleep time between 2 retries.
++.. versionchanged:: 5.7
++
++    The :class:`~celery.backends.database.DatabaseBackend` overrides this
++    setting to :const:`True` by default to preserve backward compatibility
++    with the automatic retry behavior that was previously provided by an
++    internal ``@retry`` decorator. Other backends continue to default to
++    :const:`False`.
++
++If enabled, the backend will try to retry on the event of recoverable
++exceptions instead of propagating the exception.
++It will use an exponential backoff sleep time between retries.
+ 
+ 
+ .. setting:: result_backend_max_sleep_between_retries_ms
+@@ -840,7 +849,14 @@ This specifies the base amount of sleep time between two backend operation retry
+ 
+ Default: Inf
+ 
+-This is the maximum of retries in case of recoverable exceptions.
++.. versionchanged:: 5.7
++
++    The :class:`~celery.backends.database.DatabaseBackend` overrides this
++    setting to ``3`` by default to preserve backward compatibility with the
++    behavior previously provided by an internal ``@retry`` decorator.
++    Other backends continue to default to :const:`Inf` (unlimited retries).
++
++This is the maximum number of retries in case of recoverable exceptions.
+ 
+ 
+ .. setting:: result_backend_thread_safe
+@@ -993,6 +1009,34 @@ Example:
+ Database backend settings
+ -------------------------
+ 
++.. note::
++
++    **Retry configuration for the Database backend**
++
++    As of Celery 5.7, :class:`~celery.backends.database.DatabaseBackend`
++    uses the unified retry mechanism provided by
++    :class:`~celery.backends.base.BaseBackend` for all backend operations
++    (``store_result``, ``get_task_meta``, ``save_group``, ``delete_group``,
++    ``get_group_meta``, and ``forget``).  The database backend preserves
++    backward-compatible defaults:
++
++    * :setting:`result_backend_always_retry` defaults to :const:`True`
++    * :setting:`result_backend_max_retries` defaults to ``3``
++
++    These defaults can be overridden via the standard configuration settings.
++    For example, to disable automatic retries:
++
++    .. code-block:: python
++
++        result_backend_always_retry = False
++
++    Or to increase the retry limit:
++
++    .. code-block:: python
++
++        result_backend_always_retry = True
++        result_backend_max_retries = 10
++
+ Database URL Examples
+ ~~~~~~~~~~~~~~~~~~~~~
+ 
+diff --git a/requirements/test-integration.txt b/requirements/test-integration.txt
+index b915556332f..89aa3f92cd2 100644
+--- a/requirements/test-integration.txt
++++ b/requirements/test-integration.txt
+@@ -3,5 +3,6 @@
+ -r extras/auth.txt
+ -r extras/memcache.txt
+ -r extras/django.txt
++-r extras/sqlalchemy.txt
+ pytest-rerunfailures>=11.1.2
+ git+https://github.com/celery/kombu.git
+diff --git a/t/integration/test_database_backend.py b/t/integration/test_database_backend.py
+new file mode 100644
+index 00000000000..40b24d047a6
+--- /dev/null
++++ b/t/integration/test_database_backend.py
+@@ -0,0 +1,119 @@
++from unittest.mock import patch
++
++import pytest
++from sqlalchemy.exc import OperationalError
++from sqlalchemy.orm import Session
++
++from celery.exceptions import BackendStoreError
++
++
++@pytest.fixture
++def db_retry_app(celery_app, tmp_path):
++    """Fixture to set up a Celery app with a database backend and retry configs."""
++    # Use a temporary file-based SQLite db so tables persist across sessions.
++    # :memory: with SQLAlchemy NullPool drops the db when the connection closes.
++    db_file = tmp_path / "test_backend.db"
++
++    celery_app.conf.update(
++        result_backend=f'db+sqlite:///{db_file}',
++        database_create_tables_at_setup=True,
++        result_backend_always_retry=True,
++        result_backend_max_retries=2,
++        # Keep sleep times low so tests run fast
++        result_backend_base_sleep_between_retries_ms=1,
++        result_backend_max_sleep_between_retries_ms=5,
++    )
++
++    # Initialize backend and force table creation before tests patch the session
++    backend = celery_app.backend
++    backend.store_result('init-task', {'status': 'initialized'}, 'SUCCESS')
++
++    return celery_app
++
++
++def test_database_backend_transient_failure_integration(db_retry_app):
++    """
++    Integration test simulating a transient database failure.
++    The database commit fails on the first attempt but succeeds on the second.
++    """
++    backend = db_retry_app.backend
++    task_id = 'transient-integration-task'
++    expected_result = {'foo': 'bar'}
++
++    original_commit = Session.commit
++    call_count = [0]
++
++    def transient_failing_commit(self, *args, **kwargs):
++        call_count[0] += 1
++        if call_count[0] == 1:
++            # Simulate a network drop or DB disconnect on the first try
++            raise OperationalError("simulated transient DB disconnect", params={}, orig=Exception())
++        return original_commit(self, *args, **kwargs)
++
++    with patch('sqlalchemy.orm.Session.commit', autospec=True, side_effect=transient_failing_commit):
++        # This will trigger the OperationalError, get caught by _ensure_retryable, and retry successfully.
++        backend.store_result(task_id, expected_result, 'SUCCESS')
++
++    # Ensure it failed once and succeeded on the second try
++    assert call_count[0] == 2
++
++    # Verify the result was actually persisted in the SQLite DB
++    meta = backend.get_task_meta(task_id)
++    assert meta['status'] == 'SUCCESS'
++    assert meta['result'] == expected_result
++
++
++def test_database_backend_max_retries_exceeded_integration(db_retry_app):
++    """
++    Integration test simulating a persistent database failure
++    that eventually exceeds the maximum configured retries.
++    """
++    backend = db_retry_app.backend
++    task_id = 'persistent-integration-task'
++
++    call_count = [0]
++
++    def persistent_failing_commit(self, *args, **kwargs):
++        call_count[0] += 1
++        raise OperationalError("simulated persistent DB disconnect", params={}, orig=Exception())
++
++    with patch('sqlalchemy.orm.Session.commit', autospec=True, side_effect=persistent_failing_commit):
++        with pytest.raises(BackendStoreError):
++            backend.store_result(task_id, {'result': 'fail'}, 'SUCCESS')
++
++    # Max retries is 2, so it should attempt exactly 3 times (1 initial + 2 retries)
++    assert call_count[0] == 3
++
++
++def test_database_backend_get_task_meta_transient_failure(db_retry_app):
++    """
++    Integration test simulating a transient database failure during a read operation.
++    The database query fails on the first attempt but succeeds on the second.
++    """
++    backend = db_retry_app.backend
++    task_id = 'transient-read-task'
++    expected_result = {'foo': 'bar'}
++
++    backend.store_result(task_id, expected_result, 'SUCCESS')
++
++    call_count = [0]
++    original_query = Session.query
++
++    def transient_failing_query(self, *args, **kwargs):
++        call_count[0] += 1
++        if call_count[0] == 1:
++            # Simulate a transient read error on the first try
++            raise OperationalError("simulated transient DB read error", params={}, orig=Exception())
++        return original_query(self, *args, **kwargs)
++
++    # Patch Session.query to simulate transient read errors
++    with patch('sqlalchemy.orm.Session.query', autospec=True, side_effect=transient_failing_query):
++        # This will trigger the OperationalError, get caught by _ensure_retryable, and retry successfully.
++        meta = backend.get_task_meta(task_id, cache=False)
++
++    # Ensure it failed once and succeeded on the second try
++    assert call_count[0] == 2
++
++    # Verify the final retrieved data is correct
++    assert meta['status'] == 'SUCCESS'
++    assert meta['result'] == expected_result
+diff --git a/t/unit/backends/test_base.py b/t/unit/backends/test_base.py
+index 44f3f0cbdc7..f5966784b4b 100644
+--- a/t/unit/backends/test_base.py
++++ b/t/unit/backends/test_base.py
+@@ -426,7 +426,7 @@ def test_save_group(self):
+         b = BaseBackend(self.app)
+         b._save_group = Mock()
+         b.save_group('foofoo', 'xxx')
+-        b._save_group.assert_called_with('foofoo', 'xxx')
++        b._save_group.assert_called_with(group_id='foofoo', result='xxx')
+ 
+     def test_add_to_chord_interface(self):
+         b = BaseBackend(self.app)
+diff --git a/t/unit/backends/test_database.py b/t/unit/backends/test_database.py
+index ffff028a755..ad835c81962 100644
+--- a/t/unit/backends/test_database.py
++++ b/t/unit/backends/test_database.py
+@@ -11,7 +11,7 @@
+ 
+ pytest.importorskip('sqlalchemy')
+ 
+-from celery.backends.database import DatabaseBackend, retry, session, session_cleanup  # noqa
++from celery.backends.database import DatabaseBackend, session, session_cleanup  # noqa
+ from celery.backends.database.models import Task, TaskSet  # noqa
+ from celery.backends.database.session import PREPARE_MODELS_MAX_RETRIES, ResultModelBase, SessionManager  # noqa
+ from t import skip  # noqa
+@@ -124,77 +124,202 @@ def setup_method(self):
+         self.uri = 'sqlite:///' + DB_PATH
+         self.app.conf.result_serializer = 'pickle'
+ 
+-    def test_retry_helper(self):
++    def test_store_result_retries_on_database_error(self):
++        """Test that _store_result retries when database errors occur."""
+         from celery.backends.database import DatabaseError
+ 
+-        calls = [0]
++        self.app.conf.result_backend_always_retry = True
++        self.app.conf.result_backend_max_retries = 3
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tb._sleep = Mock()
++
++        original_store = tb._store_result
++        call_count = [0]
++
++        def failing_store(*args, **kwargs):
++            call_count[0] += 1
++            if call_count[0] < 3:
++                raise DatabaseError("connection lost", "SELECT 1", [], Exception())
++            return original_store(*args, **kwargs)
+ 
+-        @retry
+-        def raises():
+-            calls[0] += 1
+-            raise DatabaseError(1, 2, 3)
++        tb._store_result = failing_store
+ 
+-        with pytest.raises(DatabaseError):
+-            raises(max_retries=5)
+-        assert calls[0] == 5
++        tb.store_result('task_id_1', {'result': 42}, states.SUCCESS)
++        assert call_count[0] == 3
++        assert tb._sleep.call_count == 2
+ 
+-    def test_retry_helper_calls_on_backend_retryable_error(self):
++    def test_get_task_meta_retries_on_database_error(self):
++        """Test that _get_task_meta_for retries when database errors occur."""
+         from celery.backends.database import DatabaseError
+ 
+-        calls = [0]
+-        hook_calls = []
++        self.app.conf.result_backend_always_retry = True
++        self.app.conf.result_backend_max_retries = 2
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tb._sleep = Mock()
++
++        tb.store_result('task_id_2', {'result': 'test'}, states.SUCCESS)
+ 
+-        mock_backend = Mock()
+-        mock_backend.on_backend_retryable_error = Mock(side_effect=lambda exc: hook_calls.append(exc))
++        original_get = tb._get_task_meta_for
++        call_count = [0]
+ 
+-        @retry
+-        def raises_with_backend(backend):
+-            calls[0] += 1
+-            raise DatabaseError(1, 2, 3)
++        def failing_get(*args, **kwargs):
++            call_count[0] += 1
++            if call_count[0] == 1:
++                raise DatabaseError("temporary failure", None, None)
++            return original_get(*args, **kwargs)
+ 
+-        with pytest.raises(DatabaseError):
+-            raises_with_backend(mock_backend, max_retries=3)
++        tb._get_task_meta_for = failing_get
+ 
+-        assert calls[0] == 3
+-        assert mock_backend.on_backend_retryable_error.call_count == 3
+-        for exc in hook_calls:
+-            assert isinstance(exc, DatabaseError)
++        meta = tb.get_task_meta('task_id_2')
++        assert meta['status'] == states.SUCCESS
++        assert call_count[0] == 2
++        assert tb._sleep.call_count == 1
+ 
+-    def test_retry_helper_without_hook(self):
++    def test_save_group_retries_on_database_error(self):
++        """Test that _save_group retries when database errors occur."""
+         from celery.backends.database import DatabaseError
+ 
+-        calls = [0]
++        self.app.conf.result_backend_always_retry = True
++        self.app.conf.result_backend_max_retries = 2
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tb._sleep = Mock()
+ 
+-        mock_backend = Mock(spec=[])
++        original_save_group = tb._save_group
++        call_count = [0]
+ 
+-        @retry
+-        def raises_with_backend(backend):
+-            calls[0] += 1
+-            raise DatabaseError(1, 2, 3)
++        def failing_save_group(*args, **kwargs):
++            call_count[0] += 1
++            if call_count[0] == 1:
++                raise DatabaseError("connection error", None, None)
++            return original_save_group(*args, **kwargs)
+ 
+-        with pytest.raises(DatabaseError):
+-            raises_with_backend(mock_backend, max_retries=3)
++        tb._save_group = failing_save_group
+ 
+-        assert calls[0] == 3
++        tb.save_group('group_id_1', {'result': ['task1', 'task2']})
++        assert call_count[0] == 2
++        assert tb._sleep.call_count == 1
+ 
+-    def test_retry_helper_hook_failure_continues(self):
++    def test_forget_retries_on_database_error(self):
++        """Test that _forget retries when database errors occur."""
+         from celery.backends.database import DatabaseError
+ 
+-        calls = [0]
++        self.app.conf.result_backend_always_retry = True
++        self.app.conf.result_backend_max_retries = 2
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tb._sleep = Mock()
++
++        tb.store_result('task_id_3', {'result': 'to_forget'}, states.SUCCESS)
++
++        original_forget = tb._forget
++        call_count = [0]
+ 
+-        mock_backend = Mock()
+-        mock_backend.on_backend_retryable_error = Mock(side_effect=RuntimeError("hook failed"))
++        def failing_forget(*args, **kwargs):
++            call_count[0] += 1
++            if call_count[0] == 1:
++                raise DatabaseError("temporary error", None, None)
++            return original_forget(*args, **kwargs)
+ 
+-        @retry
+-        def raises_with_backend(backend):
+-            calls[0] += 1
+-            raise DatabaseError(1, 2, 3)
++        tb._forget = failing_forget
+ 
+-        with pytest.raises(DatabaseError):
+-            raises_with_backend(mock_backend, max_retries=3)
++        tb.forget('task_id_3')
++        assert call_count[0] == 2
++        assert tb._sleep.call_count == 1
++
++    def test_retries_respect_max_retries_config(self):
++        """Test that retries stop after max_retries is reached."""
++        from celery.backends.database import DatabaseError
++        from celery.exceptions import BackendStoreError
+ 
+-        assert calls[0] == 3
+-        assert mock_backend.on_backend_retryable_error.call_count == 3
++        self.app.conf.result_backend_always_retry = True
++        self.app.conf.result_backend_max_retries = 2
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tb._sleep = Mock()
++
++        call_count = [0]
++
++        def always_failing_store(*args, **kwargs):
++            call_count[0] += 1
++            raise DatabaseError("persistent failure", None, None)
++
++        tb._store_result = always_failing_store
++
++        with pytest.raises(BackendStoreError):
++            tb.store_result('task_id_4', {'result': 42}, states.SUCCESS)
++
++        assert call_count[0] == 3
++        assert tb._sleep.call_count == 2
++
++    def test_retries_call_on_backend_retryable_error_hook(self):
++        """Test that on_backend_retryable_error is called during retries."""
++        from celery.backends.database import DatabaseError
++
++        self.app.conf.result_backend_always_retry = True
++        self.app.conf.result_backend_max_retries = 2
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tb._sleep = Mock()
++        tb.session_manager.invalidate = Mock()
++
++        original_store = tb._store_result
++        call_count = [0]
++
++        def failing_store(*args, **kwargs):
++            call_count[0] += 1
++            if call_count[0] == 1:
++                raise DatabaseError("connection lost", "SELECT 1", [], Exception())
++            return original_store(*args, **kwargs)
++
++        tb._store_result = failing_store
++
++        tb.store_result('task_id_5', {'result': 42}, states.SUCCESS)
++
++        tb.session_manager.invalidate.assert_called_once_with(tb.url)
++        assert tb._sleep.call_count == 1
++
++    def test_non_retryable_exceptions_propagate_immediately(self):
++        """Test that non-retryable exceptions are not retried and propagate directly."""
++        self.app.conf.result_backend_always_retry = True
++        self.app.conf.result_backend_max_retries = 5
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tb._sleep = Mock()
++
++        call_count = [0]
++
++        def failing_store(*args, **kwargs):
++            call_count[0] += 1
++            raise ValueError("not a database error")
++
++        tb._store_result = failing_store
++
++        with pytest.raises(ValueError, match="not a database error"):
++            tb.store_result('task_id_6', {'result': 42}, states.SUCCESS)
++
++        assert call_count[0] == 1
++        assert tb._sleep.call_count == 0
++
++    def test_without_fallback_exc_reaching_max_retries(self):
++        """
++        Test that _ensure_retryable raises the original exception
++        when max retries are reached and no fallback_exc is provided.
++        """
++        self.app.conf.result_backend_always_retry, prev = True, self.app.conf.result_backend_always_retry
++        self.app.conf.result_backend_max_retries, prev_max_retries = 0, self.app.conf.result_backend_max_retries
++
++        expected_exc = Exception("operation failed")
++        try:
++            tb = DatabaseBackend(self.uri, app=self.app)
++            tb.exception_safe_to_retry = lambda exc: True
++            tb._sleep = Mock()
++            tb._forget = Mock()
++            tb._forget.side_effect = expected_exc
++            try:
++                tb.forget('dummy_task_id')
++                assert False, "Should have raised the original exception"
++            except Exception as exc:
++                assert exc == expected_exc
++                assert tb._sleep.call_count == 0
++        finally:
++            self.app.conf.result_backend_always_retry = prev
++            self.app.conf.result_backend_max_retries = prev_max_retries
+ 
+     def test_missing_dburi_raises_ImproperlyConfigured(self):
+         self.app.conf.database_url = None

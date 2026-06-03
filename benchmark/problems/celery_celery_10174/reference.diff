@@ -1,0 +1,425 @@
+diff --git a/celery/app/base.py b/celery/app/base.py
+index f830efa2310..1d15059be41 100644
+--- a/celery/app/base.py
++++ b/celery/app/base.py
+@@ -18,6 +18,7 @@
+ from kombu import Exchange, pools
+ from kombu.clocks import LamportClock
+ from kombu.common import oid_from
++from kombu.exceptions import LimitExceeded
+ from kombu.transport.native_delayed_delivery import calculate_routing_key
+ from kombu.utils.compat import register_after_fork
+ from kombu.utils.objects import cached_property
+@@ -27,7 +28,7 @@
+ from celery import platforms, signals
+ from celery._state import (_announce_app_finalized, _deregister_app, _register_app, _set_current_app, _task_stack,
+                            connect_on_app_finalize, get_current_app, get_current_worker_task, set_default_app)
+-from celery.exceptions import AlwaysEagerIgnored, ImproperlyConfigured
++from celery.exceptions import AlwaysEagerIgnored, ImproperlyConfigured, OperationalError
+ from celery.loaders import get_loader_cls
+ from celery.local import PromiseProxy, maybe_evaluate
+ from celery.utils import abstract
+@@ -872,39 +873,39 @@ def send_task(self, name, args=None, kwargs=None, countdown=None,
+         options = router.route(
+             options, route_name or name, args, kwargs, task_type)
+ 
+-        driver_type = self.producer_pool.connections.connection.transport.driver_type
++        if eta or countdown:
++            driver_type = self.producer_pool.connections.connection.transport.driver_type
++            if detect_quorum_queues(self, driver_type)[0]:
++
++                queue = options.get("queue")
++                exchange_type = queue.exchange.type if queue else options["exchange_type"]
++                routing_key = queue.routing_key if queue else options["routing_key"]
++                exchange_name = queue.exchange.name if queue else options["exchange"]
++
++                if exchange_type != 'direct':
++                    if eta:
++                        if isinstance(eta, str):
++                            eta = isoparse(eta)
++                        countdown = (maybe_make_aware(eta) - self.now()).total_seconds()
++
++                    if countdown:
++                        if countdown > 0:
++                            routing_key = calculate_routing_key(int(countdown), routing_key)
++                            exchange = Exchange(
++                                'celery_delayed_27',
++                                type='topic',
++                            )
++                            options.pop("queue", None)
++                            options['routing_key'] = routing_key
++                            options['exchange'] = exchange
+ 
+-        if (eta or countdown) and detect_quorum_queues(self, driver_type)[0]:
+-
+-            queue = options.get("queue")
+-            exchange_type = queue.exchange.type if queue else options["exchange_type"]
+-            routing_key = queue.routing_key if queue else options["routing_key"]
+-            exchange_name = queue.exchange.name if queue else options["exchange"]
+-
+-            if exchange_type != 'direct':
+-                if eta:
+-                    if isinstance(eta, str):
+-                        eta = isoparse(eta)
+-                    countdown = (maybe_make_aware(eta) - self.now()).total_seconds()
+-
+-                if countdown:
+-                    if countdown > 0:
+-                        routing_key = calculate_routing_key(int(countdown), routing_key)
+-                        exchange = Exchange(
+-                            'celery_delayed_27',
+-                            type='topic',
+-                        )
+-                        options.pop("queue", None)
+-                        options['routing_key'] = routing_key
+-                        options['exchange'] = exchange
+-
+-            else:
+-                logger.warning(
+-                    'Direct exchanges are not supported with native delayed delivery.\n'
+-                    f'{exchange_name} is a direct exchange but should be a topic exchange or '
+-                    'a fanout exchange in order for native delayed delivery to work properly.\n'
+-                    'If quorum queues are used, this task may block the worker process until the ETA arrives.'
+-                )
++                else:
++                    logger.warning(
++                        'Direct exchanges are not supported with native delayed delivery.\n'
++                        f'{exchange_name} is a direct exchange but should be a topic exchange or '
++                        'a fanout exchange in order for native delayed delivery to work properly.\n'
++                        'If quorum queues are used, this task may block the worker process until the ETA arrives.'
++                    )
+ 
+         if expires is not None:
+             if isinstance(expires, datetime):
+@@ -1072,7 +1073,18 @@ def _connection(self, url, userid=None, password=None,
+     def _acquire_connection(self, pool=True):
+         """Helper for :meth:`connection_or_acquire`."""
+         if pool:
+-            return self.pool.acquire(block=True)
++            timeout = self.conf.broker_pool_acquire_timeout
++            try:
++                return self.pool.acquire(block=True, timeout=timeout)
++            except LimitExceeded as exc:
++                pool_limit = self.conf.broker_pool_limit
++                raise OperationalError(
++                    f"Timed out waiting for a broker connection after "
++                    f"{timeout}s. All {pool_limit} connections are in use. "
++                    f"Consider increasing broker_pool_limit (currently "
++                    f"{pool_limit}) or broker_pool_acquire_timeout "
++                    f"(currently {timeout}s)."
++                ) from exc
+         return self.connection_for_write()
+ 
+     def connection_or_acquire(self, connection=None, pool=True, *_, **__):
+@@ -1089,6 +1101,20 @@ def connection_or_acquire(self, connection=None, pool=True, *_, **__):
+ 
+     default_connection = connection_or_acquire  # XXX compat
+ 
++    def _acquire_producer(self, timeout=None):
++        """Helper for :meth:`producer_or_acquire`."""
++        try:
++            return self.producer_pool.acquire(block=True, timeout=timeout)
++        except LimitExceeded as exc:
++            pool_limit = self.conf.broker_pool_limit
++            raise OperationalError(
++                f"Timed out waiting for a broker producer after "
++                f"{timeout}s. All {pool_limit} producer slots are in use. "
++                f"Consider increasing broker_pool_limit (currently "
++                f"{pool_limit}) or broker_pool_acquire_timeout "
++                f"(currently {timeout}s)."
++            ) from exc
++
+     def producer_or_acquire(self, producer=None):
+         """Context used to acquire a producer from the pool.
+ 
+@@ -1099,8 +1125,9 @@ def producer_or_acquire(self, producer=None):
+             producer (kombu.Producer): If not provided, a producer
+                 will be acquired from the producer pool.
+         """
++        timeout = self.conf.broker_pool_acquire_timeout
+         return FallbackContext(
+-            producer, self.producer_pool.acquire, block=True,
++            producer, self._acquire_producer, timeout=timeout,
+         )
+ 
+     default_producer = producer_or_acquire  # XXX compat
+diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index b62b20cc84a..006b78f98b8 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -97,6 +97,7 @@ def __repr__(self):
+         login_method=Option(None, type='string'),
+         native_delayed_delivery_queue_type=Option(default='quorum', type='string'),
+         pool_limit=Option(10, type='int'),
++        pool_acquire_timeout=Option(None, type='float'),
+         use_ssl=Option(False, type='bool'),
+ 
+         host=Option(type='string'),
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index bd8e6ece101..531fcb7fccb 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -80,6 +80,7 @@ have been moved into a new  ``task_`` prefix.
+ ``BROKER_HEARTBEAT``                       :setting:`broker_heartbeat`
+ ``BROKER_LOGIN_METHOD``                    :setting:`broker_login_method`
+ ``BROKER_NATIVE_DELAYED_DELIVERY_QUEUE_TYPE`` :setting:`broker_native_delayed_delivery_queue_type`
++``BROKER_POOL_ACQUIRE_TIMEOUT``            :setting:`broker_pool_acquire_timeout`
+ ``BROKER_POOL_LIMIT``                      :setting:`broker_pool_limit`
+ ``BROKER_USE_SSL``                         :setting:`broker_use_ssl`
+ ``CELERY_CACHE_BACKEND``                   :setting:`cache_backend`
+@@ -3154,6 +3155,26 @@ contention can arise and you should consider increasing the limit.
+ If set to :const:`None` or 0 the connection pool will be disabled and
+ connections will be established and closed for every use.
+ 
++.. setting:: broker_pool_acquire_timeout
++
++``broker_pool_acquire_timeout``
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. versionadded:: 5.7
++
++Default: :const:`None` (block indefinitely).
++
++The maximum number of seconds Celery will wait when high-level sending APIs
++such as :meth:`~celery.app.base.Celery.send_task` or
++:meth:`~celery.app.task.Task.apply_async` acquire a connection or producer
++from the broker pool. When all :setting:`broker_pool_limit` connections are in
++use, such calls will block up to this many seconds before raising
++:exc:`~celery.exceptions.OperationalError`.
++
++Set this to a positive number (e.g. ``120``) to prevent these calls from
++blocking indefinitely under high concurrency. When :const:`None`, the
++previous behavior of blocking without a timeout is preserved.
++
+ .. setting:: broker_connection_timeout
+ 
+ ``broker_connection_timeout``
+diff --git a/t/integration/test_tasks.py b/t/integration/test_tasks.py
+index cda09428d6a..6e2e1a528e0 100644
+--- a/t/integration/test_tasks.py
++++ b/t/integration/test_tasks.py
+@@ -805,3 +805,50 @@ def task_received_handler(request, **kwargs):
+         redis_messages = list(redis_connection.lrange("redis-echo", 0, -1))
+         expected_messages = [b"In A", b"In B", b"In/Out C", b"Out B", b"Out A"]
+         assert redis_messages == expected_messages
++
++
++class test_pool_acquire_timeout:
++    """Integration tests for broker_pool_acquire_timeout setting (#9929)."""
++
++    @flaky
++    def test_task_succeeds_with_pool_timeout_configured(self, manager):
++        """Normal task dispatch works with timeout configured."""
++        app = manager.app
++        orig = app.conf.broker_pool_acquire_timeout
++        app.conf.broker_pool_acquire_timeout = 30
++        try:
++            result = add.delay(1, 2)
++            assert result.get(timeout=TIMEOUT) == 3
++        finally:
++            app.conf.broker_pool_acquire_timeout = orig
++
++    @flaky
++    def test_pool_timeout_none_blocks_successfully(self, manager):
++        """Default None timeout (block forever) still works."""
++        app = manager.app
++        assert app.conf.broker_pool_acquire_timeout is None
++        result = add.delay(4, 5)
++        assert result.get(timeout=TIMEOUT) == 9
++
++    @flaky
++    def test_concurrent_apply_async_with_timeout(self, manager):
++        """Concurrent task dispatch with pool timeout doesn't block."""
++        from concurrent.futures import ThreadPoolExecutor, as_completed
++
++        app = manager.app
++        orig_timeout = app.conf.broker_pool_acquire_timeout
++        app.conf.broker_pool_acquire_timeout = 10
++        try:
++            results = []
++            with ThreadPoolExecutor(max_workers=20) as executor:
++                futures = [
++                    executor.submit(add.delay, i, i)
++                    for i in range(50)
++                ]
++                for future in as_completed(futures):
++                    results.append(future.result())
++            # All tasks should complete successfully
++            for r in results:
++                assert r.get(timeout=TIMEOUT) is not None
++        finally:
++            app.conf.broker_pool_acquire_timeout = orig_timeout
+diff --git a/t/unit/app/test_app.py b/t/unit/app/test_app.py
+index dc5a4cc417e..90a9cb379fe 100644
+--- a/t/unit/app/test_app.py
++++ b/t/unit/app/test_app.py
+@@ -16,6 +16,7 @@
+ 
+ import pytest
+ from kombu import Exchange, Queue
++from kombu.exceptions import LimitExceeded
+ from pydantic import BaseModel, ValidationInfo, model_validator
+ from vine import promise
+ 
+@@ -26,7 +27,7 @@
+ from celery.app import defaults
+ from celery.backends.base import Backend
+ from celery.contrib.testing.mocks import ContextMock
+-from celery.exceptions import ImproperlyConfigured
++from celery.exceptions import ImproperlyConfigured, OperationalError
+ from celery.loaders.base import unconfigured
+ from celery.platforms import pyimplementation
+ from celery.utils.collections import DictAttribute
+@@ -1667,6 +1668,33 @@ def test_native_delayed_delivery_eta_in_the_past(self, detect_quorum_queues):
+             )
+         )
+ 
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_native_delayed_delivery_eta_is_now(self, detect_quorum_queues):
++        """When eta equals now, countdown is 0 (falsy) — no delayed routing."""
++        self.app.amqp = MagicMock(name='amqp')
++        now = datetime(2024, 8, 24, tzinfo=datetime_timezone.utc)
++        self.app.amqp.router.route.return_value = {
++            'queue': Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='topic')
++            )
++        }
++        self.app.now = Mock(return_value=now)
++
++        self.app.send_task('foo', (1, 2), eta=now.isoformat())
++
++        self.app.amqp.send_task_message.assert_called_once_with(
++            ANY,
++            ANY,
++            ANY,
++            queue=Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='topic')
++            )
++        )
++
+     @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
+     def test_native_delayed_delivery_direct_exchange(self, detect_quorum_queues, caplog):
+         self.app.amqp = MagicMock(name='amqp')
+@@ -1701,6 +1729,118 @@ def test_native_delayed_delivery_direct_exchange(self, detect_quorum_queues, cap
+             "If quorum queues are used, this task may block the worker process until the ETA arrives."
+         )
+ 
++    def test_producer_or_acquire_passes_configured_timeout(self):
++        self.app.conf.broker_pool_acquire_timeout = 30
++        with patch.object(
++            type(self.app), 'producer_pool',
++            new_callable=lambda: property(lambda self: MagicMock())
++        ):
++            ctx = self.app.producer_or_acquire()
++            assert ctx.fb_kwargs == {'timeout': 30}
++
++    def test_producer_or_acquire_passes_timeout_none_through(self):
++        self.app.conf.broker_pool_acquire_timeout = None
++        with patch.object(
++            type(self.app), 'producer_pool',
++            new_callable=lambda: property(lambda self: MagicMock())
++        ):
++            ctx = self.app.producer_or_acquire()
++            assert ctx.fb_kwargs == {'timeout': None}
++
++    @patch('celery.app.base.detect_quorum_queues', return_value=[False, ""])
++    def test_send_task_raises_on_pool_exhaustion(self, detect_quorum_queues):
++        self.app.conf.broker_pool_limit = 5
++        self.app.conf.broker_pool_acquire_timeout = 10
++        self.app.amqp = MagicMock(name='amqp')
++        self.app.amqp.router.route.return_value = {}
++
++        with patch.object(
++            type(self.app), 'producer_pool', new_callable=lambda: property(lambda self: MagicMock(
++                acquire=MagicMock(side_effect=LimitExceeded(5))
++            ))
++        ):
++            with pytest.raises(OperationalError, match="broker_pool_limit"):
++                self.app.send_task('foo', (1, 2))
++
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_send_task_skips_driver_type_without_eta_countdown(self, detect_quorum_queues):
++        self.app.amqp = MagicMock(name='amqp')
++        self.app.amqp.router.route.return_value = {
++            'routing_key': 'testcelery',
++            'exchange': 'testcelery',
++            'exchange_type': 'topic',
++        }
++
++        self.app.send_task(name='foo', args=(1, 2))
++        assert not detect_quorum_queues.called
++
++    def test_broker_pool_acquire_timeout_default(self):
++        assert self.app.conf.broker_pool_acquire_timeout is None
++
++    def test_acquire_connection_raises_on_pool_exhaustion(self):
++        self.app.conf.broker_pool_limit = 5
++        self.app.conf.broker_pool_acquire_timeout = 10
++        with patch.object(
++            type(self.app), 'pool',
++            new_callable=lambda: property(lambda self: MagicMock(
++                acquire=MagicMock(side_effect=LimitExceeded(5))
++            ))
++        ):
++            with pytest.raises(OperationalError, match="broker_pool_limit"):
++                self.app._acquire_connection(pool=True)
++
++    def test_acquire_connection_without_pool(self):
++        with patch.object(self.app, 'connection_for_write') as mock_conn:
++            result = self.app._acquire_connection(pool=False)
++            mock_conn.assert_called_once()
++            assert result == mock_conn.return_value
++
++    def test_acquire_connection_success_with_pool(self):
++        self.app.conf.broker_pool_acquire_timeout = 30
++        mock_pool = MagicMock()
++        with patch.object(
++            type(self.app), 'pool',
++            new_callable=lambda: property(lambda self: mock_pool)
++        ):
++            result = self.app._acquire_connection(pool=True)
++            mock_pool.acquire.assert_called_once_with(block=True, timeout=30)
++            assert result == mock_pool.acquire.return_value
++
++    def test_acquire_producer_success(self):
++        mock_pool = MagicMock()
++        with patch.object(
++            type(self.app), 'producer_pool',
++            new_callable=lambda: property(lambda self: mock_pool)
++        ):
++            result = self.app._acquire_producer(timeout=30)
++            mock_pool.acquire.assert_called_once_with(block=True, timeout=30)
++            assert result == mock_pool.acquire.return_value
++
++    def test_acquire_producer_raises_on_pool_exhaustion(self):
++        self.app.conf.broker_pool_limit = 5
++        with patch.object(
++            type(self.app), 'producer_pool',
++            new_callable=lambda: property(lambda self: MagicMock(
++                acquire=MagicMock(side_effect=LimitExceeded(5))
++            ))
++        ):
++            with pytest.raises(OperationalError, match="broker producer"):
++                self.app._acquire_producer(timeout=10)
++
++    @patch('celery.app.base.detect_quorum_queues', return_value=[False, ""])
++    def test_send_task_with_eta_no_quorum_queues(self, detect_quorum_queues):
++        """When eta is set but quorum queues are not detected, skip native delayed delivery."""
++        self.app.amqp = MagicMock(name='amqp')
++        self.app.amqp.router.route.return_value = {
++            'queue': Queue('testcelery', routing_key='testcelery',
++                           exchange=Exchange('testcelery', type='topic'))
++        }
++
++        self.app.send_task('foo', (1, 2), countdown=10)
++        detect_quorum_queues.assert_called_once()
++        # Should still send, just without native delayed delivery routing
++        self.app.amqp.send_task_message.assert_called_once()
++
+ 
+ class test_defaults:
+ 

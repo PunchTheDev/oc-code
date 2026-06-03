@@ -78,15 +78,23 @@ REPO_CATEGORY: dict[str, str] = {
     "pallets/werkzeug": "python",
     "encode/starlette": "python",
     "psf/requests": "python",
+    "aio-libs/aiohttp": "python",
+    "pallets/flask": "python",
+    "tiangolo/fastapi": "python",
+    "tornadoweb/tornado": "python",
+    "twisted/twisted": "python",
+    "python-trio/trio": "python",
+    "celery/celery": "python",
 }
 
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json
+# Proportional to pool composition: python:53% rust:25% typescript:12% jvm:5% ruby:5%
 DEFAULT_SHARD_BUDGET: dict[str, int] = {
-    "python": 10,
-    "rust": 10,
-    "typescript": 6,
+    "python": 13,
+    "rust": 9,
+    "typescript": 5,
     "jvm": 2,
-    "ruby": 2,
+    "ruby": 1,
 }
 
 
@@ -337,8 +345,8 @@ def run_evaluation(
     # Oracle mode: score reference diffs directly — no agent call needed.
     # Used for pipeline calibration; expected weighted mean matches baselines.json.
     if use_oracle:
-        _oracle_weighted = 15.0
-        _oracle_arithmetic = 13.71
+        _oracle_weighted = 13.62
+        _oracle_arithmetic = 12.22
         _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
         if _baselines_path.exists():
             try:

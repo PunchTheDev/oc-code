@@ -1,0 +1,365 @@
+diff --git a/celery/concurrency/prefork.py b/celery/concurrency/prefork.py
+index b163328d0b3..aed83b8a29a 100644
+--- a/celery/concurrency/prefork.py
++++ b/celery/concurrency/prefork.py
+@@ -3,11 +3,14 @@
+ Pool implementation using :mod:`multiprocessing`.
+ """
+ import os
++import threading
++import time
+ 
+ from billiard import forking_enable
+ from billiard.common import REMAP_SIGTERM, TERM_SIGNAME
+ from billiard.pool import CLOSE, RUN
+ from billiard.pool import Pool as BlockingPool
++from kombu.asynchronous import get_event_loop
+ 
+ from celery import platforms, signals
+ from celery._state import _set_task_join_will_block, set_default_app
+@@ -140,7 +143,48 @@ def on_stop(self):
+         """Gracefully stop the pool."""
+         if self._pool is not None and self._pool._state in (RUN, CLOSE):
+             self._pool.close()
+-            self._pool.join()
++
++            # Keep firing timers (for heartbeats on async transports) while
++            # the pool drains. If not using an async transport, no hub exists
++            # and the timer thread is not created.
++            hub = get_event_loop()
++            if hub is not None:
++                shutdown_event = threading.Event()
++
++                def fire_timers_loop():
++                    while not shutdown_event.is_set():
++                        try:
++                            hub.fire_timers()
++                        except Exception:
++                            logger.warning(
++                                "Exception in timer thread during prefork on_stop()",
++                                exc_info=True,
++                            )
++                        # 0.5 seconds was chosen as a balance between joining quickly
++                        # after the pool join is complete and sleeping long enough to
++                        # avoid excessive CPU usage.
++                        time.sleep(0.5)
++
++                timer_thread = threading.Thread(
++                    target=fire_timers_loop,
++                    daemon=True,
++                    name="prefork-timer-shutdown",
++                )
++                timer_thread.start()
++
++                try:
++                    self._pool.join()
++                finally:
++                    shutdown_event.set()
++                    timer_thread.join(timeout=1.0)
++
++                    if timer_thread.is_alive():
++                        logger.warning(
++                            "Timer thread in prefork on_stop() did not terminate cleanly"
++                        )
++            else:
++                self._pool.join()
++
+             self._pool = None
+ 
+     def on_terminate(self):
+diff --git a/celery/worker/components.py b/celery/worker/components.py
+index f062affb61f..d1ec1db2f3e 100644
+--- a/celery/worker/components.py
++++ b/celery/worker/components.py
+@@ -75,7 +75,10 @@ def create(self, w):
+         return self
+ 
+     def start(self, w):
+-        pass
++        # Ensure the kombu hub's poller is initialized before the event loop starts.
++        # Since asynloop() no longer resets the hub on exit (to preserve timers
++        # during shutdown), we must initialize the poller upfront.
++        _ = w.hub.poller
+ 
+     def stop(self, w):
+         w.hub.close()
+diff --git a/celery/worker/consumer/consumer.py b/celery/worker/consumer/consumer.py
+index 95e73707621..2a5d955fef3 100644
+--- a/celery/worker/consumer/consumer.py
++++ b/celery/worker/consumer/consumer.py
+@@ -456,8 +456,6 @@ def on_close(self):
+         # to the current channel.
+         if self.controller and self.controller.semaphore:
+             self.controller.semaphore.clear()
+-        if self.timer:
+-            self.timer.clear()
+         for bucket in self.task_buckets.values():
+             if bucket:
+                 bucket.clear_pending()
+diff --git a/celery/worker/loops.py b/celery/worker/loops.py
+index 1f9e589eeef..f88cddb8d6b 100644
+--- a/celery/worker/loops.py
++++ b/celery/worker/loops.py
+@@ -81,28 +81,21 @@ def asynloop(obj, connection, consumer, blueprint, hub, qos,
+     hub.propagate_errors = errors
+     loop = hub.create_loop()
+ 
+-    try:
+-        while blueprint.state == RUN and obj.connection:
+-            state.maybe_shutdown()
+-            if heartbeat_error[0] is not None:
+-                raise heartbeat_error[0]
+-
+-            # We only update QoS when there's no more messages to read.
+-            # This groups together qos calls, and makes sure that remote
+-            # control commands will be prioritized over task messages.
+-            if qos.prev != qos.value:
+-                update_qos()
+-
+-            try:
+-                next(loop)
+-            except StopIteration:
+-                loop = hub.create_loop()
+-    finally:
++    while blueprint.state == RUN and obj.connection:
++        state.maybe_shutdown()
++        if heartbeat_error[0] is not None:
++            raise heartbeat_error[0]
++
++        # We only update QoS when there's no more messages to read.
++        # This groups together qos calls, and makes sure that remote
++        # control commands will be prioritized over task messages.
++        if qos.prev != qos.value:
++            update_qos()
++
+         try:
+-            hub.reset()
+-        except Exception as exc:  # pylint: disable=broad-except
+-            logger.exception(
+-                'Error cleaning up after event loop: %r', exc)
++            next(loop)
++        except StopIteration:
++            loop = hub.create_loop()
+ 
+ 
+ def synloop(obj, connection, consumer, blueprint, hub, qos,
+diff --git a/docs/userguide/workers.rst b/docs/userguide/workers.rst
+index 01d6491d72b..e665da489d9 100644
+--- a/docs/userguide/workers.rst
++++ b/docs/userguide/workers.rst
+@@ -126,6 +126,12 @@ and will call :func:`WorkController.stop() <celery.worker.worker.WorkController.
+ - Additional :sig:`TERM` signals will be ignored during the warm shutdown process.
+ - The next :sig:`INT` signal will trigger the next stage of the shutdown process.
+ 
++.. versionchanged:: 5.6
++    In previous versions of Celery, when the prefork pool was in use, heartbeats to the broker were not sent during
++    warm shutdown. This caused the broker to terminate the connection, which meant that tasks were not able to complete.
++    As of version 5.6, when the prefork pool is in use, heartbeats are now maintained during warm shutdown and tasks are
++    able to complete before the worker terminates.
++
+ .. _worker-cold-shutdown:
+ 
+ Cold Shutdown
+diff --git a/t/integration/test_prefork_shutdown.py b/t/integration/test_prefork_shutdown.py
+new file mode 100644
+index 00000000000..6ae5c1fffd2
+--- /dev/null
++++ b/t/integration/test_prefork_shutdown.py
+@@ -0,0 +1,89 @@
++"""Integration tests for prefork pool shutdown behaviour.
++
++These tests verify that the prefork pool gracefully shuts down and maintains
++heartbeats during the shutdown process, preventing connection loss during
++worker drain.
++"""
++
++from time import sleep
++
++import pytest
++
++from celery.contrib.testing.worker import start_worker
++from celery.worker import state
++
++from .tasks import sleeping
++
++TEST_HEARTBEAT = 2
++
++# Exceeds AMQP connection timeout (~4 seconds: broker closes after missing
++# 2 consecutive 2-second heartbeats)
++LONG_TASK_DURATION = 10
++
++TIMEOUT = LONG_TASK_DURATION * 2
++
++
++@pytest.fixture
++def heartbeat_worker(celery_session_app):
++    """Worker with short heartbeat for testing purposes."""
++
++    # Temporarily lower heartbeat for this test
++    original_heartbeat = celery_session_app.conf.broker_heartbeat
++    celery_session_app.conf.broker_heartbeat = TEST_HEARTBEAT
++
++    original_acks_late = celery_session_app.conf.task_acks_late
++    celery_session_app.conf.task_acks_late = True
++
++    with start_worker(
++        celery_session_app,
++        pool="prefork",
++        without_heartbeat=False,
++        concurrency=4,
++        shutdown_timeout=TIMEOUT,
++        perform_ping_check=False,
++    ) as worker:
++        # Verify that low heartbeat is configured correctly
++        assert worker.consumer.amqheartbeat == TEST_HEARTBEAT
++
++        yield worker
++
++    celery_session_app.conf.broker_heartbeat = original_heartbeat
++    celery_session_app.conf.task_acks_late = original_acks_late
++
++
++class test_prefork_shutdown:
++    """Test prefork shutdown with heartbeat maintenance."""
++
++    # Test timeout should be longer than worker timeout
++    @pytest.mark.timeout(timeout=TIMEOUT * 2)
++    @pytest.mark.usefixtures("heartbeat_worker")
++    def test_shutdown_with_long_running_tasks(self):
++        """Test that graceful shutdown completes long-running tasks without
++        connection loss.
++
++        This test verifies that when the prefork pool is shutting down with
++        long-running tasks, heartbeats continue to be sent to maintain the
++        broker connection.
++
++        - Heartbeat frames sent every 2 seconds
++        - Connection closes after 4 seconds (two missed frames) without heartbeats
++        - Tasks run 10 seconds to exceed 4-second threshold
++        """
++
++        # Submit multiple long-running tasks that will be active during shutdown
++        num_tasks = 3
++        results = []
++        for _ in range(num_tasks):
++            results.append(sleeping.delay(LONG_TASK_DURATION))
++
++        # Give time for tasks to start executing
++        sleep(1)
++
++        state.should_stop = True
++
++        # Wait for all tasks to complete. If heartbeats aren't maintained during
++        # shutdown, this will fail with `ConnectionResetError`, `BrokenPipeError`
++        # and `celery.exceptions.TimeoutError`.
++        for result in results:
++            result.get(timeout=TIMEOUT)
++            assert result.status == "SUCCESS"
+diff --git a/t/unit/concurrency/test_prefork.py b/t/unit/concurrency/test_prefork.py
+index ea42c09bad9..f72655c0e48 100644
+--- a/t/unit/concurrency/test_prefork.py
++++ b/t/unit/concurrency/test_prefork.py
+@@ -572,6 +572,85 @@ def test_on_close__pool_not_running(self):
+         pool.on_close()
+         pool._pool.close.assert_not_called()
+ 
++    @patch('celery.concurrency.prefork.get_event_loop')
++    @patch('celery.concurrency.prefork.threading.Thread')
++    def test_on_stop_with_hub_fires_timers(self, mock_thread, mock_get_event_loop):
++        pool = TaskPool(10)
++        mock_pool = Mock(name='pool')
++        mock_pool._state = mp.RUN
++        pool._pool = mock_pool
++
++        mock_hub = Mock(name='hub')
++        mock_get_event_loop.return_value = mock_hub
++        mock_timer_thread = Mock(name='timer_thread')
++        mock_thread.return_value = mock_timer_thread
++
++        pool.on_stop()
++
++        mock_pool.close.assert_called_with()
++        mock_pool.join.assert_called_with()
++        mock_get_event_loop.assert_called_once()
++        mock_thread.assert_called_once()
++        assert mock_thread.call_args[1]['daemon'] is True
++        mock_timer_thread.start.assert_called_once()
++        mock_timer_thread.join.assert_called_once_with(timeout=1.0)
++
++    @patch('celery.concurrency.prefork.get_event_loop')
++    @patch('celery.concurrency.prefork.threading.Thread')
++    @patch('celery.concurrency.prefork.threading.Event')
++    def test_on_stop_timer_thread_handles_exceptions(
++        self,
++        mock_event_class,
++        mock_thread,
++        mock_get_event_loop,
++    ):
++        pool = TaskPool(10)
++        mock_pool = Mock(name='pool')
++        mock_pool._state = mp.RUN
++        pool._pool = mock_pool
++
++        mock_hub = Mock(name='hub')
++        mock_hub.fire_timers.side_effect = [Exception("Hub error"), None]
++        mock_get_event_loop.return_value = mock_hub
++
++        mock_shutdown_event = Mock(name='shutdown_event')
++        # Simulate two loop iterations and then shutdown
++        mock_shutdown_event.is_set.side_effect = [False, False, True]
++        mock_event_class.return_value = mock_shutdown_event
++
++        thread_target = None
++
++        def capture_thread(*args, **kwargs):
++            nonlocal thread_target
++            thread_target = kwargs['target']
++            mock_timer_thread = Mock(name='timer_thread')
++            return mock_timer_thread
++
++        mock_thread.side_effect = capture_thread
++
++        pool.on_stop()
++
++        with patch('celery.concurrency.prefork.time.sleep'):
++            thread_target()
++
++        # Should match number of loop iterations allowed by mock_shutdown_event.is_set.side_effect
++        assert mock_hub.fire_timers.call_count == 2
++
++    @patch('celery.concurrency.prefork.get_event_loop')
++    def test_on_stop_no_hub(self, mock_get_event_loop):
++        pool = TaskPool(10)
++        mock_pool = Mock(name='pool')
++        mock_pool._state = mp.RUN
++        pool._pool = mock_pool
++
++        mock_get_event_loop.return_value = None
++
++        pool.on_stop()
++
++        mock_pool.close.assert_called_with()
++        mock_pool.join.assert_called_with()
++        mock_get_event_loop.assert_called_once()
++
+     def test_apply_async(self):
+         pool = TaskPool(10)
+         pool.start()
+diff --git a/t/unit/worker/test_consumer.py b/t/unit/worker/test_consumer.py
+index 734efbaef57..df3f478ce27 100644
+--- a/t/unit/worker/test_consumer.py
++++ b/t/unit/worker/test_consumer.py
+@@ -376,12 +376,11 @@ def test_register_with_event_loop(self):
+         c = self.get_consumer()
+         c.register_with_event_loop(Mock(name='loop'))
+ 
+-    def test_on_close_clears_semaphore_timer_and_reqs(self):
++    def test_on_close_clears_semaphore_and_reqs(self):
+         with patch('celery.worker.consumer.consumer.reserved_requests') as res:
+             c = self.get_consumer()
+             c.on_close()
+             c.controller.semaphore.clear.assert_called_with()
+-            c.timer.clear.assert_called_with()
+             res.clear.assert_called_with()
+             c.pool.flush.assert_called_with()
+ 

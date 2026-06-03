@@ -1,0 +1,272 @@
+diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index b1c812afccb..b62b20cc84a 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -253,6 +253,7 @@ def __repr__(self):
+             },
+             type='dict', old={'celery_result_engine_options'},
+         ),
++        engine_callback=Option(type='any'),
+         short_lived_sessions=Option(
+             False, type='bool', old={'celery_result_db_short_lived_sessions'},
+         ),
+diff --git a/celery/backends/database/__init__.py b/celery/backends/database/__init__.py
+index ddfb985616f..91a7cf3ac61 100644
+--- a/celery/backends/database/__init__.py
++++ b/celery/backends/database/__init__.py
+@@ -5,6 +5,7 @@
+ from celery import states
+ from celery.backends.base import BaseBackend
+ from celery.exceptions import ImproperlyConfigured
++from celery.utils.imports import symbol_by_name
+ from celery.utils.time import maybe_timedelta
+ 
+ from .models import Task, TaskExtended, TaskSet
+@@ -94,7 +95,16 @@ def __init__(self, dburi=None, engine_options=None, url=None, **kwargs):
+                 'Missing connection string! Do you have the'
+                 ' database_url setting set to a real value?')
+ 
+-        self.session_manager = SessionManager()
++        engine_callback = kwargs.get(
++            'engine_callback', conf.database_engine_callback)
++        if isinstance(engine_callback, str):
++            engine_callback = symbol_by_name(engine_callback)
++        if engine_callback is not None and not callable(engine_callback):
++            raise ImproperlyConfigured(
++                'database_engine_callback must be callable, got {!r}'.format(
++                    engine_callback))
++        self.session_manager = SessionManager(
++            engine_callback=engine_callback)
+ 
+         create_tables_at_setup = conf.database_create_tables_at_setup
+         if create_tables_at_setup is True:
+diff --git a/celery/backends/database/session.py b/celery/backends/database/session.py
+index d4b6496a7ed..0aeceb86466 100644
+--- a/celery/backends/database/session.py
++++ b/celery/backends/database/session.py
+@@ -29,11 +29,12 @@ def _after_fork_cleanup_session(session):
+ class SessionManager:
+     """Manage SQLAlchemy sessions."""
+ 
+-    def __init__(self):
++    def __init__(self, engine_callback=None):
+         self._engines = {}
+         self._sessions = {}
+         self.forked = False
+         self.prepared = False
++        self.engine_callback = engine_callback
+         if register_after_fork is not None:
+             register_after_fork(self, _after_fork_cleanup_session)
+ 
+@@ -45,7 +46,10 @@ def get_engine(self, dburi, **kwargs):
+             try:
+                 return self._engines[dburi]
+             except KeyError:
+-                engine = self._engines[dburi] = create_engine(dburi, **kwargs)
++                engine = create_engine(dburi, **kwargs)
++                if self.engine_callback is not None:
++                    self.engine_callback(engine)
++                self._engines[dburi] = engine
+                 return engine
+         else:
+             unsupported_nullpool_kwargs = {'max_overflow', 'echo_pool'}
+@@ -53,7 +57,10 @@ def get_engine(self, dburi, **kwargs):
+                 k: v for k, v in kwargs.items()
+                 if not k.startswith('pool') and k not in unsupported_nullpool_kwargs
+             }
+-            return create_engine(dburi, poolclass=NullPool, **kwargs)
++            engine = create_engine(dburi, poolclass=NullPool, **kwargs)
++            if self.engine_callback is not None:
++                self.engine_callback(engine)
++            return engine
+ 
+     def create_session(self, dburi, short_lived_sessions=False, **kwargs):
+         engine = self.get_engine(dburi, **kwargs)
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index f88849e42b9..34ce2bffad0 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -1198,6 +1198,42 @@ you to customize the table names:
+         'group': 'myapp_groupmeta',
+     }
+ 
++.. setting:: database_engine_callback
++
++``database_engine_callback``
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. versionadded:: 5.7
++
++Default: :const:`None`.
++
++An optional callable (or dotted import path to one) that receives the
++SQLAlchemy engine immediately after it's created. Use this to register
++event listeners or apply any engine-level customization.
++
++This is useful for deployments that need per-connection authentication,
++such as injecting JWT tokens or using IAM-based auth via a ``do_connect``
++listener.
++
++Example configuration:
++
++.. code-block:: python
++
++    from sqlalchemy import event
++
++    def register_do_connect(engine):
++        @event.listens_for(engine, 'do_connect')
++        def on_connect(dialect, conn_rec, cargs, cparams):
++            cparams['password'] = get_auth_token()
++
++    app.conf.database_engine_callback = register_do_connect
++
++Can also be set as a dotted import path:
++
++.. code-block:: python
++
++    app.conf.database_engine_callback = 'myapp.db:register_do_connect'
++
+ .. _conf-rpc-result-backend:
+ 
+ RPC backend settings
+diff --git a/t/unit/backends/test_database.py b/t/unit/backends/test_database.py
+index 1dc701ae61d..9a4706005a6 100644
+--- a/t/unit/backends/test_database.py
++++ b/t/unit/backends/test_database.py
+@@ -805,3 +805,136 @@ def test_get_engine_filters_nullpool_unsupported_kwargs(self, mock_create_engine
+             'dburi',
+             poolclass=NullPool,
+         )
++
++
++@skip.if_pypy
++class test_EngineCallback:
++
++    @pytest.fixture(autouse=True)
++    def remove_db(self):
++        yield
++        if os.path.exists(DB_PATH):
++            os.remove(DB_PATH)
++
++    def setup_method(self):
++        self.uri = 'sqlite:///' + DB_PATH
++
++    def test_no_callback_default_behavior(self):
++        tb = DatabaseBackend(self.uri, app=self.app)
++        assert tb.session_manager.engine_callback is None
++
++    def test_non_callable_callback_raises(self):
++        self.app.conf.database_engine_callback = 42
++        with pytest.raises(ImproperlyConfigured):
++            DatabaseBackend(self.uri, app=self.app)
++
++    def test_callback_from_config(self):
++        callback = Mock()
++        self.app.conf.database_engine_callback = callback
++        tb = DatabaseBackend(self.uri, app=self.app)
++        assert tb.session_manager.engine_callback is callback
++        callback.assert_called_once()
++        engine = callback.call_args[0][0]
++        assert hasattr(engine, 'execute') or hasattr(engine, 'connect')
++
++    def test_callback_from_constructor_kwarg(self):
++        callback = Mock()
++        tb = DatabaseBackend(self.uri, app=self.app, engine_callback=callback)
++        assert tb.session_manager.engine_callback is callback
++        callback.assert_called_once()
++
++    def test_constructor_kwarg_overrides_config(self):
++        config_callback = Mock()
++        kwarg_callback = Mock()
++        self.app.conf.database_engine_callback = config_callback
++        tb = DatabaseBackend(
++            self.uri, app=self.app, engine_callback=kwarg_callback)
++        assert tb.session_manager.engine_callback is kwarg_callback
++        kwarg_callback.assert_called_once()
++        config_callback.assert_not_called()
++
++    def test_callback_from_dotted_path(self):
++        self.app.conf.database_engine_callback = (
++            'unittest.mock:Mock'
++        )
++        tb = DatabaseBackend(self.uri, app=self.app)
++        assert tb.session_manager.engine_callback is not None
++        assert callable(tb.session_manager.engine_callback)
++
++    @patch('celery.backends.database.session.create_engine')
++    def test_callback_called_in_forked_mode(self, create_engine):
++        callback = Mock()
++        s = SessionManager(engine_callback=callback)
++        s._after_fork()
++        s.get_engine('dburi')
++        callback.assert_called_once_with(create_engine.return_value)
++
++    @patch('celery.backends.database.session.create_engine')
++    def test_callback_called_in_non_forked_mode(self, create_engine):
++        callback = Mock()
++        s = SessionManager(engine_callback=callback)
++        s.get_engine('dburi')
++        callback.assert_called_once_with(create_engine.return_value)
++
++    @patch('celery.backends.database.session.create_engine')
++    def test_callback_reapplied_after_invalidate(self, create_engine):
++        callback = Mock()
++        s = SessionManager(engine_callback=callback)
++        s._after_fork()
++
++        s.get_engine('dburi')
++        assert callback.call_count == 1
++
++        s.invalidate('dburi')
++
++        s.get_engine('dburi')
++        assert callback.call_count == 2
++
++    @patch('celery.backends.database.session.create_engine')
++    def test_cached_engine_skips_callback(self, create_engine):
++        callback = Mock()
++        s = SessionManager(engine_callback=callback)
++        s._after_fork()
++
++        s.get_engine('dburi')
++        s.get_engine('dburi')
++        callback.assert_called_once()
++
++    def test_callback_fires_before_create_tables(self):
++        call_order = []
++
++        def track_callback(engine):
++            call_order.append('callback')
++
++        original_create_all = ResultModelBase.metadata.create_all
++
++        def track_create_all(bind, **kwargs):
++            call_order.append('create_all')
++            return original_create_all(bind, **kwargs)
++
++        with patch.object(
++            ResultModelBase.metadata, 'create_all', side_effect=track_create_all
++        ):
++            DatabaseBackend(
++                self.uri, app=self.app, engine_callback=track_callback)
++
++        assert call_order == ['callback', 'create_all']
++
++    def test_do_connect_event_integration(self):
++        """Integration test: engine_callback registers a do_connect event
++        that modifies connection params on every new connection."""
++        connect_calls = []
++
++        def register_do_connect(engine):
++            from sqlalchemy import event
++
++            @event.listens_for(engine, 'do_connect')
++            def on_connect(dialect, conn_rec, cargs, cparams):
++                connect_calls.append(cparams.copy())
++
++        tb = DatabaseBackend(
++            self.uri, app=self.app, engine_callback=register_do_connect)
++
++        tid = 'test-task-id'
++        tb.mark_as_done(tid, 42)
++        assert len(connect_calls) >= 1

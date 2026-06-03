@@ -1,0 +1,258 @@
+diff --git a/CHANGES/7157.bugfix.rst b/CHANGES/7157.bugfix.rst
+new file mode 100644
+index 00000000000..60f06d8da9f
+--- /dev/null
++++ b/CHANGES/7157.bugfix.rst
+@@ -0,0 +1,6 @@
++Fixed ``ZLibDecompressor`` silently dropping data past the first
++member when decompressing concatenated gzip/deflate streams. Each subsequent
++member is now handed to a fresh decompressor, matching the behaviour already
++implemented for ZSTD multi-frame streams.
++
++-- by :user:`Ashutosh-177`
+diff --git a/CONTRIBUTORS.txt b/CONTRIBUTORS.txt
+index 1f94bac5c84..24139ce2cda 100644
+--- a/CONTRIBUTORS.txt
++++ b/CONTRIBUTORS.txt
+@@ -54,6 +54,7 @@ Arcadiy Ivanov
+ Arseny Timoniq
+ Artem Yushkovskiy
+ Arthur Darcet
++Ashutosh Kumar Singh
+ Austin Scola
+ Bai Haoran
+ Ben Bader
+diff --git a/aiohttp/compression_utils.py b/aiohttp/compression_utils.py
+index 75b24d1cbbf..9313d21e009 100644
+--- a/aiohttp/compression_utils.py
++++ b/aiohttp/compression_utils.py
+@@ -55,6 +55,9 @@ def eof(self) -> bool: ...
+     @property
+     def unconsumed_tail(self) -> bytes: ...
+ 
++    @property
++    def unused_data(self) -> bytes: ...
++
+ 
+ class ZLibBackendProtocol(Protocol):
+     MAX_WBITS: int
+@@ -275,15 +278,42 @@ def __init__(
+         self._zlib_backend: Final = ZLibBackendWrapper(ZLibBackend._zlib_backend)
+         self._decompressor = self._zlib_backend.decompressobj(wbits=self._mode)
+         self._last_empty = False
++        self._pending_unused_data: bytes | None = None
+ 
+     def decompress_sync(
+         self, data: Buffer, max_length: int = ZLIB_MAX_LENGTH_UNLIMITED
+     ) -> bytes:
++        if self._pending_unused_data is not None:
++            data = self._pending_unused_data + bytes(data)
++            self._pending_unused_data = None
+         result = self._decompressor.decompress(
+             self._decompressor.unconsumed_tail + data, max_length
+         )
+         # Only way to know that isal has no further data is checking we get no output
+         self._last_empty = result == b""
++
++        # Handle concatenated gzip/deflate streams (multi-member).
++        # After a member ends, unused_data holds the start of the next member.
++        # Create a fresh decompressor for each subsequent member.
++        while self._decompressor.eof and self._decompressor.unused_data:
++            unused = self._decompressor.unused_data
++            self._decompressor = self._zlib_backend.decompressobj(wbits=self._mode)
++            if max_length != ZLIB_MAX_LENGTH_UNLIMITED:
++                max_length -= len(result)
++                if max_length <= 0:
++                    self._pending_unused_data = unused
++                    break
++            chunk = self._decompressor.decompress(unused, max_length)
++            self._last_empty = chunk == b""
++            result += chunk
++
++        # Member ended exactly at chunk boundary — no unused_data, but the
++        # next feed_data() call would fail on the spent decompressor.
++        # Only reset for gzip; deflate's feed_eof() relies on eof=True to
++        # confirm the stream is complete.
++        if self._decompressor.eof and self._mode > self._zlib_backend.MAX_WBITS:
++            self._decompressor = self._zlib_backend.decompressobj(wbits=self._mode)
++
+         return result
+ 
+     def flush(self, length: int = 0) -> bytes:
+@@ -295,7 +325,11 @@ def flush(self, length: int = 0) -> bytes:
+ 
+     @property
+     def data_available(self) -> bool:
+-        return bool(self._decompressor.unconsumed_tail) or not self._last_empty
++        return (
++            bool(self._decompressor.unconsumed_tail)
++            or not self._last_empty
++            or self._pending_unused_data is not None
++        )
+ 
+     @property
+     def eof(self) -> bool:
+diff --git a/docs/spelling_wordlist.txt b/docs/spelling_wordlist.txt
+index c10f10fdce4..1de034c393b 100644
+--- a/docs/spelling_wordlist.txt
++++ b/docs/spelling_wordlist.txt
+@@ -98,6 +98,7 @@ Cython
+ Cythonize
+ cythonized
+ de
++decompressor
+ deduplicate
+ defs
+ Dependabot
+@@ -144,6 +145,7 @@ github
+ google
+ gunicorn
+ gunicorn’s
++gzip
+ gzipped
+ hackish
+ highlevel
+diff --git a/tests/test_compression_utils.py b/tests/test_compression_utils.py
+index 3362b8feed0..5deebc8470d 100644
+--- a/tests/test_compression_utils.py
++++ b/tests/test_compression_utils.py
+@@ -1,5 +1,6 @@
+ """Tests for compression utils."""
+ 
++import gzip
+ import sys
+ 
+ import pytest
+@@ -87,3 +88,38 @@ def test_zstd_multi_frame_max_length_exhausted_preserves_unused_data() -> None:
+     assert result1 == b"AAAA"
+     result2 = d.decompress_sync(frame3)
+     assert result2 == b"BBBBCCCC"
++
++
++def test_zlib_gzip_multi_member_unlimited() -> None:
++    d = ZLibDecompressor(encoding="gzip")
++    member1 = gzip.compress(b"AAAA")
++    member2 = gzip.compress(b"BBBB")
++    result = d.decompress_sync(member1 + member2)
++    assert result == b"AAAABBBB"
++
++
++def test_zlib_gzip_multi_member_max_length_partial() -> None:
++    d = ZLibDecompressor(encoding="gzip")
++    member1 = gzip.compress(b"AAAA")
++    member2 = gzip.compress(b"BBBB")
++    result = d.decompress_sync(member1 + member2, max_length=6)
++    assert result == b"AAAABB"
++
++
++def test_zlib_gzip_multi_member_max_length_exhausted() -> None:
++    d = ZLibDecompressor(encoding="gzip")
++    member1 = gzip.compress(b"AAAA")
++    member2 = gzip.compress(b"BBBB")
++    result = d.decompress_sync(member1 + member2, max_length=4)
++    assert result == b"AAAA"
++
++
++def test_zlib_gzip_multi_member_max_length_exhausted_preserves_unused_data() -> None:
++    d = ZLibDecompressor(encoding="gzip")
++    member1 = gzip.compress(b"AAAA")
++    member2 = gzip.compress(b"BBBB")
++    member3 = gzip.compress(b"CCCC")
++    result1 = d.decompress_sync(member1 + member2, max_length=4)
++    assert result1 == b"AAAA"
++    result2 = d.decompress_sync(member3)
++    assert result2 == b"BBBBCCCC"
+diff --git a/tests/test_http_parser.py b/tests/test_http_parser.py
+index 011edbf912a..5b5f3af6bc0 100644
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -1,6 +1,7 @@
+ # Tests for aiohttp/protocol.py
+ 
+ import asyncio
++import gzip
+ import platform
+ import re
+ import sys
+@@ -2550,6 +2551,81 @@ async def test_http_payload_zstandard_many_small_frames(
+         assert b"".join(parts) == b"".join(out._buffer)
+         assert out.is_eof()
+ 
++    async def test_http_payload_gzip_multi_member(self, protocol: BaseProtocol) -> None:
++        member1 = gzip.compress(b"first")
++        member2 = gzip.compress(b"second")
++        payload = member1 + member2
++        out = aiohttp.StreamReader(
++            protocol, DEFAULT_CHUNK_SIZE, loop=asyncio.get_running_loop()
++        )
++        p = HttpPayloadParser(
++            out,
++            length=len(payload),
++            compression="gzip",
++            headers_parser=HeadersParser(),
++        )
++        p.feed_data(payload)
++        assert b"firstsecond" == b"".join(out._buffer)
++        assert out.is_eof()
++
++    async def test_http_payload_gzip_multi_member_chunked(
++        self, protocol: BaseProtocol
++    ) -> None:
++        member1 = gzip.compress(b"chunk1")
++        member2 = gzip.compress(b"chunk2")
++        out = aiohttp.StreamReader(
++            protocol, DEFAULT_CHUNK_SIZE, loop=asyncio.get_running_loop()
++        )
++        p = HttpPayloadParser(
++            out,
++            length=len(member1) + len(member2),
++            compression="gzip",
++            headers_parser=HeadersParser(),
++        )
++        p.feed_data(member1)
++        p.feed_data(member2)
++        assert b"chunk1chunk2" == b"".join(out._buffer)
++        assert out.is_eof()
++
++    async def test_http_payload_gzip_member_split_mid_chunk(
++        self, protocol: BaseProtocol
++    ) -> None:
++        member1 = gzip.compress(b"AAAA")
++        member2 = gzip.compress(b"BBBB")
++        combined = member1 + member2
++        split_point = len(member1) + 3  # 3 bytes into member2
++        out = aiohttp.StreamReader(
++            protocol, DEFAULT_CHUNK_SIZE, loop=asyncio.get_running_loop()
++        )
++        p = HttpPayloadParser(
++            out,
++            length=len(combined),
++            compression="gzip",
++            headers_parser=HeadersParser(),
++        )
++        p.feed_data(combined[:split_point])
++        p.feed_data(combined[split_point:])
++        assert b"AAAABBBB" == b"".join(out._buffer)
++        assert out.is_eof()
++
++    async def test_http_payload_gzip_many_small_members(
++        self, protocol: BaseProtocol
++    ) -> None:
++        parts = [f"part{i}".encode() for i in range(10)]
++        payload = b"".join(gzip.compress(p) for p in parts)
++        out = aiohttp.StreamReader(
++            protocol, DEFAULT_CHUNK_SIZE, loop=asyncio.get_running_loop()
++        )
++        p = HttpPayloadParser(
++            out,
++            length=len(payload),
++            compression="gzip",
++            headers_parser=HeadersParser(),
++        )
++        p.feed_data(payload)
++        assert b"".join(parts) == b"".join(out._buffer)
++        assert out.is_eof()
++
+ 
+ class TestDeflateBuffer:
+     async def test_feed_data(self, protocol: BaseProtocol) -> None:

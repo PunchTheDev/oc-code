@@ -33,15 +33,23 @@ REPO_CATEGORY: dict[str, str] = {
     "pallets/werkzeug": "python",
     "encode/starlette": "python",
     "psf/requests": "python",
+    "aio-libs/aiohttp": "python",
+    "pallets/flask": "python",
+    "tiangolo/fastapi": "python",
+    "tornadoweb/tornado": "python",
+    "twisted/twisted": "python",
+    "python-trio/trio": "python",
+    "celery/celery": "python",
 }
 
-# Shard sampling budget per category (sums to ~30)
+# Shard sampling budget per category (sums to 30)
+# Proportional to pool: python:53% rust:25% typescript:12% jvm:5% ruby:5%
 SHARD_BUDGET: dict[str, int] = {
-    "python": 12,
-    "typescript": 8,
-    "rust": 5,
-    "jvm": 3,
-    "ruby": 2,
+    "python": 13,
+    "rust": 9,
+    "typescript": 5,
+    "jvm": 2,
+    "ruby": 1,
 }
 
 
@@ -81,9 +89,9 @@ def _load_oracle_row() -> dict:
         except Exception:
             pass
     if mean_score is None:
-        mean_score = 13.62
-        weighted_score = 14.94
-        count = 675
+        mean_score = 12.22
+        weighted_score = 13.62
+        count = 812
     return {
         "rank": None,
         "agent": "Oracle (accepted solution)",

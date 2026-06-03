@@ -97,6 +97,14 @@ def main() -> None:
             except Exception:
                 pass
 
+    # Prune entries for problems that no longer exist on disk
+    current_ids = {d.name for d in problems}
+    if existing:
+        removed = set(existing.keys()) - current_ids
+        for rid in removed:
+            del existing[rid]
+        if removed:
+            print(f"Pruned {len(removed)} removed problems from existing scores")
     baselines = list(existing.values()) if existing else []
     existing_ids = set(existing.keys())
     skipped = 0

@@ -1,0 +1,427 @@
+diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index 77fcfd02196..480667eeced 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -247,6 +247,10 @@ def __repr__(self):
+     database=Namespace(
+         url=Option(old={'celery_result_dburi'}),
+         engine_options=Option(
++            {
++                'pool_pre_ping': True,
++                'pool_recycle': 3600,
++            },
+             type='dict', old={'celery_result_engine_options'},
+         ),
+         short_lived_sessions=Option(
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index c80591de19c..69bfa550f6c 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -629,6 +629,12 @@ def store_result(self, task_id, result, state,
+                 if self.always_retry and self.exception_safe_to_retry(exc):
+                     if retries < self.max_retries:
+                         retries += 1
++                        try:
++                            self.on_backend_retryable_error(exc)
++                        except Exception:
++                            logger.exception(
++                                "on_backend_retryable_error hook failed; continuing retry loop",
++                            )
+ 
+                         # get_exponential_backoff_interval computes integers
+                         # and time.sleep accept floats for sub second sleep
+@@ -689,6 +695,10 @@ def exception_safe_to_retry(self, exc):
+         """
+         return False
+ 
++    def on_backend_retryable_error(self, exc):
++        """Hook called before retrying a recoverable backend exception."""
++        return None
++
+     def get_task_meta(self, task_id, cache=True):
+         """Get task meta from backend.
+ 
+@@ -710,6 +720,12 @@ def get_task_meta(self, task_id, cache=True):
+                 if self.always_retry and self.exception_safe_to_retry(exc):
+                     if retries < self.max_retries:
+                         retries += 1
++                        try:
++                            self.on_backend_retryable_error(exc)
++                        except Exception:
++                            logger.exception(
++                                "on_backend_retryable_error hook failed; continuing retry loop",
++                            )
+ 
+                         # get_exponential_backoff_interval computes integers
+                         # and time.sleep accept floats for sub second sleep
+diff --git a/celery/backends/database/__init__.py b/celery/backends/database/__init__.py
+index df03db56d38..97a96e49813 100644
+--- a/celery/backends/database/__init__.py
++++ b/celery/backends/database/__init__.py
+@@ -13,7 +13,7 @@
+ from .session import SessionManager
+ 
+ try:
+-    from sqlalchemy.exc import DatabaseError, InvalidRequestError
++    from sqlalchemy.exc import DatabaseError, InterfaceError, InvalidRequestError
+     from sqlalchemy.orm.exc import StaleDataError
+ except ImportError:
+     raise ImproperlyConfigured(
+@@ -24,6 +24,13 @@
+ 
+ __all__ = ('DatabaseBackend',)
+ 
++RETRYABLE_DB_ERRORS = (
++    DatabaseError,
++    InterfaceError,
++    InvalidRequestError,
++    StaleDataError,
++)
++
+ 
+ @contextmanager
+ def session_cleanup(session):
+@@ -45,7 +52,16 @@ def _inner(*args, **kwargs):
+         for retries in range(max_retries):
+             try:
+                 return fun(*args, **kwargs)
+-            except (DatabaseError, InvalidRequestError, StaleDataError):
++            except RETRYABLE_DB_ERRORS as exc:
++                backend = args[0] if args else None
++                on_retryable_error = getattr(backend, 'on_backend_retryable_error', None)
++                if callable(on_retryable_error):
++                    try:
++                        on_retryable_error(exc)
++                    except Exception:
++                        logger.exception(
++                            "on_backend_retryable_error hook failed; continuing retry loop",
++                        )
+                 logger.warning(
+                     'Failed operation %s.  Retrying %s more times.',
+                     fun.__name__, max_retries - retries - 1,
+@@ -77,9 +93,14 @@ def __init__(self, dburi=None, engine_options=None, url=None, **kwargs):
+             self.task_cls = TaskExtended
+ 
+         self.url = url or dburi or conf.database_url
++
++        # Merge engine options: defaults from config <- constructor overrides
++        # The defaults (pool_pre_ping=True, pool_recycle=3600) are defined in
++        # celery/app/defaults.py under database_engine_options
+         self.engine_options = dict(
+-            engine_options or {},
+-            **conf.database_engine_options or {})
++            conf.database_engine_options or {},
++            **(engine_options or {})
++        )
+         self.short_lived_sessions = kwargs.get(
+             'short_lived_sessions',
+             conf.database_short_lived_sessions)
+@@ -108,6 +129,12 @@ def __init__(self, dburi=None, engine_options=None, url=None, **kwargs):
+     def extended_result(self):
+         return self.app.conf.find_value_for_key('extended', 'result')
+ 
++    def exception_safe_to_retry(self, exc):
++        return isinstance(exc, RETRYABLE_DB_ERRORS)
++
++    def on_backend_retryable_error(self, exc):
++        self.session_manager.invalidate(self.url)
++
+     def _create_tables(self):
+         """Create the task and taskset tables."""
+         self.ResultSession()
+diff --git a/celery/backends/database/session.py b/celery/backends/database/session.py
+index 415d4623e00..f4f3ca6a2f5 100644
+--- a/celery/backends/database/session.py
++++ b/celery/backends/database/session.py
+@@ -60,6 +60,13 @@ def create_session(self, dburi, short_lived_sessions=False, **kwargs):
+             return engine, self._sessions[dburi]
+         return engine, sessionmaker(bind=engine)
+ 
++    def invalidate(self, dburi):
++        """Dispose cached engine/session state for a database URI."""
++        self._sessions.pop(dburi, None)
++        engine = self._engines.pop(dburi, None)
++        if engine is not None:
++            engine.dispose()
++
+     def prepare_models(self, engine):
+         if not self.prepared:
+             # SQLAlchemy will check if the items exist before trying to
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index b0bb46fa2a7..270dd187843 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -1017,7 +1017,14 @@ Default: True by default.
+ ``database_engine_options``
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+-Default: ``{}`` (empty mapping).
++Default: ``{'pool_pre_ping': True, 'pool_recycle': 3600}``
++
++.. versionchanged:: 5.7
++
++    The default was changed from ``{}`` to include ``pool_pre_ping=True``
++    and ``pool_recycle=3600`` for improved connection health handling.
++    This helps prevent stale connection errors such as
++    ``(OperationalError) (2006, 'MySQL server has gone away')``.
+ 
+ To specify additional SQLAlchemy database engine options you can use
+ the :setting:`database_engine_options` setting::
+@@ -1025,6 +1032,9 @@ the :setting:`database_engine_options` setting::
+     # echo enables verbose logging from SQLAlchemy.
+     app.conf.database_engine_options = {'echo': True}
+ 
++    # To disable the default pool health options:
++    app.conf.database_engine_options = {'pool_pre_ping': False, 'pool_recycle': None}
++
+ .. setting:: database_short_lived_sessions
+ 
+ ``database_short_lived_sessions``
+diff --git a/t/unit/backends/test_base.py b/t/unit/backends/test_base.py
+index ce25ff72ad8..44f3f0cbdc7 100644
+--- a/t/unit/backends/test_base.py
++++ b/t/unit/backends/test_base.py
+@@ -1492,6 +1492,7 @@ def test_get_with_retries(self):
+             b = BaseBackend(app=self.app)
+             b.exception_safe_to_retry = lambda exc: True
+             b._sleep = Mock()
++            b.on_backend_retryable_error = Mock()
+             b._get_task_meta_for = Mock()
+             b._get_task_meta_for.side_effect = [
+                 Exception("failed"),
+@@ -1500,6 +1501,7 @@ def test_get_with_retries(self):
+             res = b.get_task_meta(sentinel.task_id)
+             assert res == {'status': states.SUCCESS, 'result': 42}
+             assert b._sleep.call_count == 1
++            b.on_backend_retryable_error.assert_called_once()
+         finally:
+             self.app.conf.result_backend_always_retry = prev
+ 
+@@ -1554,6 +1556,7 @@ def test_store_result_never_retries(self):
+             b = BaseBackend(app=self.app)
+             b.exception_safe_to_retry = lambda exc: True
+             b._sleep = Mock()
++            b.on_backend_retryable_error = Mock()
+             b._get_task_meta_for = Mock()
+             b._get_task_meta_for.return_value = {
+                 'status': states.RETRY,
+@@ -1583,6 +1586,7 @@ def test_store_result_with_retries(self):
+             b = BaseBackend(app=self.app)
+             b.exception_safe_to_retry = lambda exc: True
+             b._sleep = Mock()
++            b.on_backend_retryable_error = Mock()
+             b._get_task_meta_for = Mock()
+             b._get_task_meta_for.return_value = {
+                 'status': states.RETRY,
+@@ -1600,6 +1604,56 @@ def test_store_result_with_retries(self):
+             res = b.store_result(sentinel.task_id, 42, states.SUCCESS)
+             assert res == 42
+             assert b._sleep.call_count == 1
++            b.on_backend_retryable_error.assert_called_once()
++        finally:
++            self.app.conf.result_backend_always_retry = prev
++
++    def test_get_with_retries_hook_failure_continues(self):
++        self.app.conf.result_backend_always_retry, prev = True, self.app.conf.result_backend_always_retry
++
++        try:
++            b = BaseBackend(app=self.app)
++            b.exception_safe_to_retry = lambda exc: True
++            b._sleep = Mock()
++            b.on_backend_retryable_error = Mock(side_effect=RuntimeError("hook failed"))
++            b._get_task_meta_for = Mock()
++            b._get_task_meta_for.side_effect = [
++                Exception("failed"),
++                {'status': states.SUCCESS, 'result': 42}
++            ]
++            res = b.get_task_meta(sentinel.task_id)
++            assert res == {'status': states.SUCCESS, 'result': 42}
++            assert b._sleep.call_count == 1
++            b.on_backend_retryable_error.assert_called_once()
++        finally:
++            self.app.conf.result_backend_always_retry = prev
++
++    def test_store_result_with_retries_hook_failure_continues(self):
++        self.app.conf.result_backend_always_retry, prev = True, self.app.conf.result_backend_always_retry
++
++        try:
++            b = BaseBackend(app=self.app)
++            b.exception_safe_to_retry = lambda exc: True
++            b._sleep = Mock()
++            b.on_backend_retryable_error = Mock(side_effect=RuntimeError("hook failed"))
++            b._get_task_meta_for = Mock()
++            b._get_task_meta_for.return_value = {
++                'status': states.RETRY,
++                'result': {
++                    "exc_type": "Exception",
++                    "exc_message": ["failed"],
++                    "exc_module": "builtins",
++                },
++            }
++            b._store_result = Mock()
++            b._store_result.side_effect = [
++                Exception("failed"),
++                42
++            ]
++            res = b.store_result(sentinel.task_id, 42, states.SUCCESS)
++            assert res == 42
++            assert b._sleep.call_count == 1
++            b.on_backend_retryable_error.assert_called_once()
+         finally:
+             self.app.conf.result_backend_always_retry = prev
+ 
+diff --git a/t/unit/backends/test_database.py b/t/unit/backends/test_database.py
+index d59df1cbc8f..b922962af74 100644
+--- a/t/unit/backends/test_database.py
++++ b/t/unit/backends/test_database.py
+@@ -126,11 +126,115 @@ def raises():
+             raises(max_retries=5)
+         assert calls[0] == 5
+ 
++    def test_retry_helper_calls_on_backend_retryable_error(self):
++        from celery.backends.database import DatabaseError
++
++        calls = [0]
++        hook_calls = []
++
++        mock_backend = Mock()
++        mock_backend.on_backend_retryable_error = Mock(side_effect=lambda exc: hook_calls.append(exc))
++
++        @retry
++        def raises_with_backend(backend):
++            calls[0] += 1
++            raise DatabaseError(1, 2, 3)
++
++        with pytest.raises(DatabaseError):
++            raises_with_backend(mock_backend, max_retries=3)
++
++        assert calls[0] == 3
++        assert mock_backend.on_backend_retryable_error.call_count == 3
++        for exc in hook_calls:
++            assert isinstance(exc, DatabaseError)
++
++    def test_retry_helper_without_hook(self):
++        from celery.backends.database import DatabaseError
++
++        calls = [0]
++
++        mock_backend = Mock(spec=[])
++
++        @retry
++        def raises_with_backend(backend):
++            calls[0] += 1
++            raise DatabaseError(1, 2, 3)
++
++        with pytest.raises(DatabaseError):
++            raises_with_backend(mock_backend, max_retries=3)
++
++        assert calls[0] == 3
++
++    def test_retry_helper_hook_failure_continues(self):
++        from celery.backends.database import DatabaseError
++
++        calls = [0]
++
++        mock_backend = Mock()
++        mock_backend.on_backend_retryable_error = Mock(side_effect=RuntimeError("hook failed"))
++
++        @retry
++        def raises_with_backend(backend):
++            calls[0] += 1
++            raise DatabaseError(1, 2, 3)
++
++        with pytest.raises(DatabaseError):
++            raises_with_backend(mock_backend, max_retries=3)
++
++        assert calls[0] == 3
++        assert mock_backend.on_backend_retryable_error.call_count == 3
++
+     def test_missing_dburi_raises_ImproperlyConfigured(self):
+         self.app.conf.database_url = None
+         with pytest.raises(ImproperlyConfigured):
+             DatabaseBackend(app=self.app)
+ 
++    def test_engine_options_include_pool_health_defaults(self):
++        tb = DatabaseBackend(self.uri, app=self.app)
++        assert tb.engine_options["pool_pre_ping"] is True
++        assert tb.engine_options["pool_recycle"] == 3600
++
++    def test_engine_options_explicit_values_override_defaults(self):
++        self.app.conf.database_engine_options = {"pool_pre_ping": False}
++        tb = DatabaseBackend(
++            self.uri,
++            app=self.app,
++            engine_options={"pool_recycle": 15},
++        )
++        assert tb.engine_options["pool_pre_ping"] is False
++        assert tb.engine_options["pool_recycle"] == 15
++
++    def test_exception_safe_to_retry(self):
++        from celery.backends.database import DatabaseError, InvalidRequestError, StaleDataError
++
++        tb = DatabaseBackend(self.uri, app=self.app)
++        assert tb.exception_safe_to_retry(DatabaseError("", "", Exception("db error")))
++        assert tb.exception_safe_to_retry(InvalidRequestError())
++        assert tb.exception_safe_to_retry(StaleDataError())
++        assert not tb.exception_safe_to_retry(RuntimeError("not retryable"))
++
++    def test_exception_safe_to_retry_with_interface_error(self):
++        from celery.backends.database import InterfaceError
++
++        tb = DatabaseBackend(self.uri, app=self.app)
++        assert tb.exception_safe_to_retry(InterfaceError("", None, Exception("connection lost")))
++
++    def test_on_backend_retryable_error_invalidates_session(self):
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tb.session_manager.invalidate = Mock()
++
++        tb.on_backend_retryable_error(RuntimeError("retryable"))
++        tb.session_manager.invalidate.assert_called_once_with(tb.url)
++
++    def test_on_backend_retryable_error_called_with_exception(self):
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tb.session_manager.invalidate = Mock()
++        mock_exc = RuntimeError("connection lost")
++
++        tb.on_backend_retryable_error(mock_exc)
++
++        tb.session_manager.invalidate.assert_called_once_with(tb.url)
++
+     def test_table_schema_config(self):
+         self.app.conf.database_table_schemas = {
+             'task': 'foo',
+@@ -445,6 +549,34 @@ def test_get_engine_kwargs(self, create_engine):
+         engine2 = s.get_engine('dburi', foo=1)
+         assert engine2 is engine
+ 
++    def test_invalidate_disposes_cached_engine(self):
++        s = SessionManager()
++        engine = Mock()
++        s._engines['dburi'] = engine
++        s._sessions['dburi'] = Mock()
++
++        s.invalidate('dburi')
++
++        assert 'dburi' not in s._engines
++        assert 'dburi' not in s._sessions
++        engine.dispose.assert_called_once_with()
++
++    def test_invalidate_nonexistent_dburi_is_noop(self):
++        s = SessionManager()
++        s.invalidate('nonexistent-dburi')
++        assert 'nonexistent-dburi' not in s._engines
++        assert 'nonexistent-dburi' not in s._sessions
++
++    def test_invalidate_only_engine_cached(self):
++        s = SessionManager()
++        engine = Mock()
++        s._engines['dburi'] = engine
++
++        s.invalidate('dburi')
++
++        assert 'dburi' not in s._engines
++        engine.dispose.assert_called_once_with()
++
+     @patch('celery.backends.database.session.sessionmaker')
+     def test_create_session_forked(self, sessionmaker):
+         s = SessionManager()

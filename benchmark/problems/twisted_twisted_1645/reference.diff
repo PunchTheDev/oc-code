@@ -1,0 +1,168 @@
+diff --git a/src/twisted/mail/smtp.py b/src/twisted/mail/smtp.py
+index 6015eff14f6..058f4e24783 100644
+--- a/src/twisted/mail/smtp.py
++++ b/src/twisted/mail/smtp.py
+@@ -24,7 +24,7 @@
+ 
+ from twisted import cred
+ from twisted.copyright import longversion
+-from twisted.internet import defer, error, protocol, reactor
++from twisted.internet import defer, protocol, reactor
+ from twisted.internet._idna import _idnaText
+ from twisted.internet.interfaces import ISSLTransport, ITLSTransport
+ from twisted.mail._cred import (
+@@ -949,6 +949,10 @@ def __init__(self, identity, logsize=10):
+         self.code = -1
+         self.log = util.LineLog(logsize)
+ 
++        # A `Failure` giving the reason we were unable to successfully send the message,
++        # if any. Otherwise, `None`.
++        self._failureReason = None
++
+     def sendLine(self, line):
+         # Log sendLine only if you are in debug mode for performance
+         if self.debug:
+@@ -967,6 +971,7 @@ def connectionLost(self, reason=protocol.connectionDone):
+         """
+         We are no longer connected
+         """
++        self._failureReason = reason
+         self.setTimeout(None)
+         self.mailFile = None
+ 
+@@ -1921,8 +1926,22 @@ def clientConnectionLost(self, connector, err):
+         self._processConnectionError(connector, err)
+ 
+     def _processConnectionError(self, connector, err):
++        # If the initial connection succeeded, but there was a later error
++        # (such as TLS validation failure), we're more interested in that than
++        # "Connection was closed cleanly" or whatever.
++        if (
++            self.currentProtocol is not None
++            and self.currentProtocol._failureReason is not None
++        ):
++            err = self.currentProtocol._failureReason
++
+         self.currentProtocol = None
+-        if (self.retries < 0) and (not self.sendFinished):
++        if self.sendFinished:
++            # we already completed the send, and the deferred has been called.
++            # There is nothing more we can do.
++            return
++
++        if self.retries < 0:
+             log.msg("SMTP Client retrying server. Retry: %s" % -self.retries)
+ 
+             # Rewind the file in case part of it was read while attempting to
+@@ -1930,12 +1949,14 @@ def _processConnectionError(self, connector, err):
+             self.file.seek(0, 0)
+             connector.connect()
+             self.retries += 1
+-        elif not self.sendFinished:
+-            # If we were unable to communicate with the SMTP server a ConnectionDone will be
+-            # returned. We want a more clear error message for debugging
+-            if err.check(error.ConnectionDone):
+-                err.value = SMTPConnectError(-1, "Unable to connect to server.")
+-            self.result.errback(err.value)
++            return
++
++        # do our best to wrap the error into something more meaningful.
++        exn = SMTPConnectError(
++            -1, "Unable to connect to SMTP server: " + str(err.value)
++        )
++        exn.__cause__ = err.value
++        self.result.errback(exn)
+ 
+     def buildProtocol(self, addr):
+         p = self.protocol(self.domain, self.nEmails * 2 + 2)
+diff --git a/src/twisted/mail/test/test_smtp.py b/src/twisted/mail/test/test_smtp.py
+index ad7937ba161..b2597a98b18 100644
+--- a/src/twisted/mail/test/test_smtp.py
++++ b/src/twisted/mail/test/test_smtp.py
+@@ -10,7 +10,7 @@
+ import inspect
+ import re
+ from io import BytesIO
+-from typing import Any
++from typing import Any, cast
+ 
+ from zope.interface import directlyProvides, implementer
+ 
+@@ -24,6 +24,8 @@
+ from twisted.cred.error import UnauthorizedLogin
+ from twisted.cred.portal import IRealm, Portal
+ from twisted.internet import address, defer, error, interfaces, protocol, reactor, task
++from twisted.internet.address import IPv4Address
++from twisted.internet.protocol import Factory, ServerFactory
+ from twisted.internet.testing import MemoryReactor, StringTransport
+ from twisted.mail import smtp
+ from twisted.mail._cred import LOGINCredentials
+@@ -33,6 +35,7 @@
+ 
+ sslSkip: str | None
+ try:
++    from twisted.internet.ssl import optionsForClientTLS
+     from twisted.test.ssl_helpers import ClientTLSContext, ServerTLSContext
+ except ImportError:
+     sslSkip = "OpenSSL not present"
+@@ -668,6 +671,52 @@ def check(ignored):
+ 
+         return self.loopback(server, client).addCallback(check)
+ 
++    def test_ESMTPSenderFactory_TLSError(self) -> defer.Deferred[Any]:
++        """
++        Attempting to connect to an ESMTP server which presents an invalid certificate
++        will trigger a failure that contains information that the failure was caused by
++        the certificate validation.
++        """
++        # set up a dummy ESMTP server which will present a self-signed cert after
++        # STARTTLS
++        buildServerProtocol = lambda: DummyESMTP(contextFactory=ServerTLSContext())
++        serverFactory = Factory.forProtocol(buildServerProtocol)
++        serverPort = reactor.listenTCP(
++            0, cast(ServerFactory, serverFactory), interface="127.0.0.1"
++        )
++        self.addCleanup(serverPort.stopListening)
++
++        # build a client, which won't accept the certificate presented by the dummy
++        # server.
++        sentDeferred: defer.Deferred[Any] = defer.Deferred()
++        clientFactory = smtp.ESMTPSenderFactory(
++            "username",
++            "password",
++            "source@address",
++            "recipient@address",
++            BytesIO(b"message"),
++            sentDeferred,
++            retries=0,
++            requireAuthentication=False,
++            contextFactory=optionsForClientTLS("testdomain"),
++        )
++
++        # connect the two together
++        serverPortAddress = serverPort.getHost()
++        assert isinstance(serverPortAddress, IPv4Address)
++        connector = reactor.connectTCP(
++            serverPortAddress.host, serverPortAddress.port, clientFactory
++        )
++        self.addCleanup(connector.disconnect)
++
++        def checkVerifyFailedMessage(e: smtp.SMTPConnectError) -> None:
++            # check that the SMTPConnectError has a message relating to the TLS error
++            self.assertIn("VerificationError", str(e))
++
++        return self.assertFailure(sentDeferred, smtp.SMTPConnectError).addCallback(
++            checkVerifyFailedMessage
++        )
++
+ 
+ class EmptyLineTests(TestCase):
+     def test_emptyLineSyntaxError(self):
+diff --git a/src/twisted/newsfragments/10210.bugfix b/src/twisted/newsfragments/10210.bugfix
+new file mode 100644
+index 00000000000..b62d277541e
+--- /dev/null
++++ b/src/twisted/newsfragments/10210.bugfix
+@@ -0,0 +1 @@
++twisted.internet.mail will now return a meaningful Failure when TLS validation fails.
+\ No newline at end of file

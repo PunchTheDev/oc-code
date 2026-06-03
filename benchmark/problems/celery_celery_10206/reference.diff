@@ -1,0 +1,400 @@
+diff --git a/celery/app/task.py b/celery/app/task.py
+index 6e9495e7074..0047c6f257d 100644
+--- a/celery/app/task.py
++++ b/celery/app/task.py
+@@ -25,6 +25,9 @@
+ 
+ __all__ = ('Context', 'Task')
+ 
++# Sentinel used by Context.update() to detect whether 'timelimit' was changed.
++_UNSET = object()
++
+ #: extracts attributes related to publishing a message from an object.
+ extract_exec_options = mattrgetter(
+     'queue', 'routing_key', 'exchange', 'priority', 'expires',
+@@ -104,6 +107,8 @@ class Context:
+     shadow = None
+     taskset = None   # compat alias to group
+     timelimit = None
++    time_limit = None
++    soft_time_limit = None
+     utc = None
+     stamped_headers = None
+     stamps = None
+@@ -124,7 +129,24 @@ def _get_custom_headers(self, *args, **kwargs):
+         return headers
+ 
+     def update(self, *args, **kwargs):
+-        return self.__dict__.update(*args, **kwargs)
++        # O(1) detection: snapshot the current timelimit identity before the
++        # update, then compare after.  Any input form that dict.update()
++        # accepts (Mapping, iterable of pairs, kwargs) will change the stored
++        # object if 'timelimit' was present, so an `is not` identity check is
++        # sufficient — no need to pre-scan the arguments.
++        old_timelimit = self.__dict__.get('timelimit', _UNSET)
++
++        self.__dict__.update(*args, **kwargs)
++
++        new_timelimit = self.__dict__.get('timelimit', _UNSET)
++        if new_timelimit is not old_timelimit:
++            if isinstance(new_timelimit, (list, tuple)) and len(new_timelimit) >= 2:
++                self.time_limit, self.soft_time_limit = new_timelimit[0], new_timelimit[1]
++            else:
++                # Explicitly clear any previously set values when timelimit is
++                # provided but is None or otherwise invalid.
++                self.time_limit = None
++                self.soft_time_limit = None
+ 
+     def clear(self):
+         return self.__dict__.clear()
+@@ -371,6 +393,8 @@ class Task:
+         ('serializer', 'task_serializer'),
+         ('rate_limit', 'task_default_rate_limit'),
+         ('priority', 'task_default_priority'),
++        ('time_limit', 'task_time_limit'),
++        ('soft_time_limit', 'task_soft_time_limit'),
+         ('track_started', 'task_track_started'),
+         ('acks_late', 'task_acks_late'),
+         ('acks_on_failure_or_timeout', 'task_acks_on_failure_or_timeout'),
+@@ -883,6 +907,10 @@ def apply(self, args=None, kwargs=None,
+             'callbacks': maybe_list(link),
+             'errbacks': maybe_list(link_error),
+             'headers': headers,
++            'timelimit': (
++                None if self.time_limit is None and self.soft_time_limit is None
++                else [self.time_limit, self.soft_time_limit]
++            ),
+             'ignore_result': options.get('ignore_result', False),
+             'delivery_info': {
+                 'is_eager': True,
+diff --git a/docs/userguide/tasks.rst b/docs/userguide/tasks.rst
+index 0a29e0982d9..c09547b4110 100644
+--- a/docs/userguide/tasks.rst
++++ b/docs/userguide/tasks.rst
+@@ -348,8 +348,24 @@ The request defines the following attributes:
+ :called_directly: This flag is set to true if the task wasn't
+                   executed by the worker.
+ 
+-:timelimit: A tuple of the current ``(soft, hard)`` time limits active for
+-            this task (if any).
++:timelimit: A 2-item sequence ``(hard, soft)`` of the current time limits
++            active for this task (if any).
++
++:time_limit: The hard time limit (in seconds) active for this task, or :const:`None`
++             if no hard limit is set. This value is unpacked from :attr:`timelimit`
++             and reflects limits configured via :setting:`task_time_limit`,
++             task-level ``time_limit``, or the ``time_limit`` argument passed to
++             :meth:`~@Task.apply_async`.
++
++             .. versionadded:: 5.7
++
++:soft_time_limit: The soft time limit (in seconds) active for this task, or :const:`None`
++                  if no soft limit is set. This value is unpacked from :attr:`timelimit`
++                  and reflects limits configured via :setting:`task_soft_time_limit`,
++                  task-level ``soft_time_limit``, or the ``soft_time_limit`` argument
++                  passed to :meth:`~@Task.apply_async`.
++
++                  .. versionadded:: 5.7
+ 
+ :callbacks: A list of signatures to be called if this task returns successfully.
+ 
+@@ -1043,10 +1059,10 @@ General
+     to ignore results.
+ 
+     .. versionchanged:: 5.7
+-        Previously, if the ``ignore_result`` key was missing from the request 
+-        message, ``store_errors`` would default to ``True``, ignoring the 
+-        task's own ``ignore_result`` setting. The worker now correctly 
+-        falls back to ``Task.ignore_result`` when no per-request override 
++        Previously, if the ``ignore_result`` key was missing from the request
++        message, ``store_errors`` would default to ``True``, ignoring the
++        task's own ``ignore_result`` setting. The worker now correctly
++        falls back to ``Task.ignore_result`` when no per-request override
+         is present.
+ 
+ .. attribute:: Task.serializer
+@@ -1608,9 +1624,9 @@ The following diagram shows the exact order of execution:
+     └───────────────────────────────────────────────────────────────┘
+ 
+ .. important::
+-   
++
+    **Key points:**
+-   
++
+    - All handlers run in the **same worker process** as your task
+    - ``before_start`` **blocks** the task - ``run()`` won't start until it completes
+    - Result backend is updated **before** ``on_success``/``on_failure`` - other clients can see the task as finished while handlers are still running
+@@ -1723,19 +1739,19 @@ Example usage
+     from celery import Task
+ 
+     class MyTask(Task):
+-        
++
+         def before_start(self, task_id, args, kwargs):
+             print(f"Task {task_id} starting with args {args}")
+             # This blocks - run() won't start until this returns
+-            
++
+         def on_success(self, retval, task_id, args, kwargs):
+             print(f"Task {task_id} succeeded with result: {retval}")
+             # Result is already visible to clients at this point
+-            
++
+         def on_failure(self, exc, task_id, args, kwargs, einfo):
+             print(f"Task {task_id} failed: {exc}")
+             # Task state is already FAILURE in backend
+-            
++
+         def after_return(self, status, retval, task_id, args, kwargs, einfo):
+             print(f"Task {task_id} finished with status: {status}")
+             # Always runs last
+diff --git a/t/integration/tasks.py b/t/integration/tasks.py
+index 4bd874a8882..28aa618fd53 100644
+--- a/t/integration/tasks.py
++++ b/t/integration/tasks.py
+@@ -546,3 +546,21 @@ def reject_then_succeed(self):
+ @shared_task(soft_time_limit=2, time_limit=1)
+ def soft_time_limit_must_exceed_time_limit():
+     pass
++
++
++@shared_task(bind=True)
++def return_request_time_limits(self):
++    """Return time_limit and soft_time_limit from the task request context."""
++    return {
++        'time_limit': self.request.time_limit,
++        'soft_time_limit': self.request.soft_time_limit,
++    }
++
++
++@shared_task(bind=True, time_limit=60, soft_time_limit=45)
++def task_with_declared_time_limits(self):
++    """Task with explicitly declared time limits — verifies request fields are set."""
++    return {
++        'time_limit': self.request.time_limit,
++        'soft_time_limit': self.request.soft_time_limit,
++    }
+diff --git a/t/integration/test_tasks.py b/t/integration/test_tasks.py
+index 74e15b5913c..cda09428d6a 100644
+--- a/t/integration/test_tasks.py
++++ b/t/integration/test_tasks.py
+@@ -18,7 +18,8 @@
+ from .tasks import (ClassBasedAutoRetryTask, ExpectedException, add, add_ignore_result, add_not_typed, add_pydantic,
+                     add_pydantic_string_annotations, fail, fail_unpickleable, print_unicode, retry, retry_once,
+                     retry_once_headers, retry_once_priority, retry_unpickleable, return_properties,
+-                    second_order_replace1, sleeping, soft_time_limit_must_exceed_time_limit)
++                    return_request_time_limits, second_order_replace1, sleeping,
++                    soft_time_limit_must_exceed_time_limit, task_with_declared_time_limits)
+ 
+ TIMEOUT = 10
+ 
+@@ -525,6 +526,42 @@ def test_soft_time_limit_exceeding_time_limit(self):
+ 
+             assert result.status == 'FAILURE'
+ 
++    @flaky
++    def test_request_time_limits_set_via_apply_async(self, manager):
++        """time_limit and soft_time_limit passed to apply_async must be accessible
++        via task.request.time_limit and task.request.soft_time_limit inside the task."""
++        result = return_request_time_limits.apply_async(time_limit=30, soft_time_limit=20)
++        data = result.get(timeout=TIMEOUT)
++        assert data['time_limit'] == 30
++        assert data['soft_time_limit'] == 20
++
++    @flaky
++    def test_request_time_limits_none_when_not_configured(self, manager):
++        """When no time limits are set, task.request.time_limit and
++        task.request.soft_time_limit must both be None."""
++        result = return_request_time_limits.apply_async()
++        data = result.get(timeout=TIMEOUT)
++        assert data['time_limit'] is None
++        assert data['soft_time_limit'] is None
++
++    @flaky
++    def test_request_time_limits_from_task_declaration(self, manager):
++        """A task with time_limit and soft_time_limit declared at class level must
++        expose those values via task.request.time_limit and task.request.soft_time_limit."""
++        result = task_with_declared_time_limits.apply_async()
++        data = result.get(timeout=TIMEOUT)
++        assert data['time_limit'] == 60
++        assert data['soft_time_limit'] == 45
++
++    @flaky
++    def test_apply_async_time_limits_override_task_declaration(self, manager):
++        """time_limit and soft_time_limit passed to apply_async must override
++        values declared at the task class level."""
++        result = task_with_declared_time_limits.apply_async(time_limit=10, soft_time_limit=5)
++        data = result.get(timeout=TIMEOUT)
++        assert data['time_limit'] == 10
++        assert data['soft_time_limit'] == 5
++
+ 
+ class test_apply_tasks:
+     """Tests for tasks called via apply() method."""
+diff --git a/t/unit/tasks/test_context.py b/t/unit/tasks/test_context.py
+index 0af40515375..e0f0b1391b2 100644
+--- a/t/unit/tasks/test_context.py
++++ b/t/unit/tasks/test_context.py
+@@ -84,3 +84,59 @@ def test_dont_override_headers(self):
+         }
+         ctx = Context(request)
+         assert ctx.headers == {'custom-header': 'custom-value'}
++
++    # ------------------------------------------------------------------
++    # Context.update() – timelimit detection with non-Mapping iterables
++    # ------------------------------------------------------------------
++
++    def test_update_timelimit_via_dict(self):
++        """update({'timelimit': [30, 20]}) unpacks time_limit and soft_time_limit."""
++        ctx = Context()
++        ctx.update({'timelimit': [30, 20]})
++        assert ctx.time_limit == 30
++        assert ctx.soft_time_limit == 20
++
++    def test_update_timelimit_via_list_of_pairs(self):
++        """update([('timelimit', [30, 20])]) must also unpack correctly.
++
++        dict.update() accepts an iterable of (key, value) pairs, so
++        Context.update() must handle that form too — previously provided_timelimit
++        stayed False because 'timelimit' in list_of_pairs checks for membership
++        among the tuples, not among the keys.
++        """
++        ctx = Context()
++        ctx.update([('timelimit', [30, 20])])
++        assert ctx.time_limit == 30
++        assert ctx.soft_time_limit == 20
++
++    def test_update_timelimit_via_dict_items(self):
++        """update(some_dict.items()) is equivalent to update(some_dict) and must unpack."""
++        ctx = Context()
++        source = {'timelimit': [60, 45]}
++        ctx.update(source.items())
++        assert ctx.time_limit == 60
++        assert ctx.soft_time_limit == 45
++
++    def test_update_timelimit_via_kwarg(self):
++        """update(timelimit=[30, 20]) via keyword argument still unpacks."""
++        ctx = Context()
++        ctx.update(timelimit=[30, 20])
++        assert ctx.time_limit == 30
++        assert ctx.soft_time_limit == 20
++
++    def test_update_timelimit_none_clears_limits(self):
++        """Explicitly passing timelimit=None clears previously set limits."""
++        ctx = Context()
++        ctx.update({'timelimit': [30, 20]})
++        ctx.update([('timelimit', None)])
++        assert ctx.time_limit is None
++        assert ctx.soft_time_limit is None
++
++    def test_update_without_timelimit_does_not_touch_limits(self):
++        """An update that does not contain 'timelimit' must not alter time_limit."""
++        ctx = Context()
++        ctx.update({'timelimit': [30, 20]})
++        ctx.update([('id', 'abc')])
++        # time_limit / soft_time_limit must be preserved
++        assert ctx.time_limit == 30
++        assert ctx.soft_time_limit == 20
+diff --git a/t/unit/tasks/test_tasks.py b/t/unit/tasks/test_tasks.py
+index 13b39739e5f..adf3f406735 100644
+--- a/t/unit/tasks/test_tasks.py
++++ b/t/unit/tasks/test_tasks.py
+@@ -1276,6 +1276,60 @@ def test_context_get(self):
+         finally:
+             self.mytask.pop_request()
+ 
++    def test_context_timelimit_unpacked_into_time_limit_fields(self):
++        """Context.update() must unpack timelimit tuple into time_limit/soft_time_limit."""
++        self.mytask.push_request()
++        try:
++            self.mytask.request.update({'timelimit': [30, 20]})
++            assert self.mytask.request.time_limit == 30
++            assert self.mytask.request.soft_time_limit == 20
++        finally:
++            self.mytask.pop_request()
++
++    def test_context_timelimit_none_leaves_fields_none(self):
++        """When timelimit is None, time_limit and soft_time_limit must remain None."""
++        self.mytask.push_request()
++        try:
++            self.mytask.request.update({'timelimit': None})
++            assert self.mytask.request.time_limit is None
++            assert self.mytask.request.soft_time_limit is None
++        finally:
++            self.mytask.pop_request()
++
++    def test_context_timelimit_tuple_format_also_unpacked(self):
++        """timelimit as a tuple (not just list) must also be unpacked."""
++        self.mytask.push_request()
++        try:
++            self.mytask.request.update({'timelimit': (30, 20)})
++            assert self.mytask.request.time_limit == 30
++            assert self.mytask.request.soft_time_limit == 20
++        finally:
++            self.mytask.pop_request()
++
++    def test_task_inherits_time_limit_from_app_config(self):
++        """Task.bind() must copy task_time_limit and task_soft_time_limit from app config."""
++        self.app.conf.task_time_limit = 60
++        self.app.conf.task_soft_time_limit = 50
++
++        @self.app.task(shared=False)
++        def timed_task():
++            pass
++
++        assert timed_task.time_limit == 60
++        assert timed_task.soft_time_limit == 50
++
++    def test_explicit_task_time_limit_not_overwritten_by_app_config(self):
++        """Explicitly set task.time_limit must not be overwritten by app config."""
++        self.app.conf.task_time_limit = 60
++        self.app.conf.task_soft_time_limit = 50
++
++        @self.app.task(shared=False, time_limit=10, soft_time_limit=5)
++        def timed_task():
++            pass
++
++        assert timed_task.time_limit == 10
++        assert timed_task.soft_time_limit == 5
++
+     def test_annotate(self):
+         with patch('celery.app.task.resolve_all_annotations') as anno:
+             anno.return_value = [{'FOO': 'BAR'}]
+@@ -1458,6 +1512,36 @@ def yyy():
+ 
+ class test_apply_task(TasksCase):
+ 
++    def test_apply_with_app_conf_time_limit_sets_request_fields(self):
++        """End-to-end: app.conf time limits must be accessible via task.request during execution."""
++        self.app.conf.task_time_limit = 30
++        self.app.conf.task_soft_time_limit = 20
++        captured = {}
++
++        @self.app.task(bind=True, shared=False)
++        def check_request(self):
++            captured['time_limit'] = self.request.time_limit
++            captured['soft_time_limit'] = self.request.soft_time_limit
++
++        check_request.apply()
++        assert captured['time_limit'] == 30
++        assert captured['soft_time_limit'] == 20
++
++    def test_apply_without_time_limit_keeps_timelimit_none(self):
++        """When no time limits are configured, timelimit in request must remain None."""
++        captured = {}
++
++        @self.app.task(bind=True, shared=False)
++        def check_request(self):
++            captured['timelimit'] = self.request.timelimit
++            captured['time_limit'] = self.request.time_limit
++            captured['soft_time_limit'] = self.request.soft_time_limit
++
++        check_request.apply()
++        assert captured['timelimit'] is None
++        assert captured['time_limit'] is None
++        assert captured['soft_time_limit'] is None
++
+     def test_apply_throw(self):
+         with pytest.raises(KeyError):
+             self.raising.apply(throw=True)
