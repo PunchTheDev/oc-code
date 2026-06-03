@@ -27,12 +27,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import importlib.util
 import json
 import os
 import random
 import sys
+import tempfile
+import threading
 import time
 from datetime import date
 from pathlib import Path
@@ -308,12 +311,101 @@ def _annotate_and_aggregate(results: list[dict], selected: list[Path]) -> dict:
     }
 
 
+_print_lock = threading.Lock()
+
+
+def _solve_with_timeout(agent, problem, timeout_seconds: int):
+    """Call agent.solve() with a hard per-problem timeout.
+
+    Returns the Patch on success. Raises concurrent.futures.TimeoutError if the
+    agent does not return within timeout_seconds. The underlying thread may
+    continue running (Python can't forcibly kill threads), but the caller
+    receives control immediately so other problems can proceed.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        return ex.submit(agent.solve, problem).result(timeout=timeout_seconds)
+
+
+def _score_one_problem(
+    idx: int,
+    problem_dir: Path,
+    agent,
+    use_sandbox: bool,
+    solve_timeout: int,
+) -> tuple[int, dict]:
+    """Score a single problem and return (original_index, result_dict).
+
+    Isolated so it can run in a thread pool alongside other problems.
+    Logs a one-line summary to stdout under a lock to prevent interleaving.
+    """
+    problem = load_problem(problem_dir)
+    pid = problem.id
+    start = time.time()
+
+    try:
+        patch = _solve_with_timeout(agent, problem, solve_timeout)
+        elapsed = time.time() - start
+
+        with tempfile.NamedTemporaryFile(suffix=".diff", mode="w", delete=False) as f:
+            f.write(patch.diff)
+            patch_path = Path(f.name)
+
+        try:
+            if not use_sandbox:
+                from benchmark.harness.score import score_patch
+                score = score_patch(problem_dir, patch_path)
+            else:
+                from benchmark.harness.runner import run_in_sandbox
+                score = run_in_sandbox(problem_dir, patch_path)
+
+            score["diff_hash"] = _diff_hash(patch.diff)
+        finally:
+            patch_path.unlink(missing_ok=True)
+
+        score["elapsed_seconds"] = round(elapsed, 2)
+
+        status = "PASS" if score.get("tests_passed") else "FAIL"
+        rel = score.get("relative_score")
+        rel_str = f"  rel={rel:.2f}" if rel is not None else ""
+        with _print_lock:
+            print(f"  [{pid}] {status}  score={score['final_score']:.2f}{rel_str}  ({elapsed:.1f}s)")
+
+        return idx, score
+
+    except concurrent.futures.TimeoutError:
+        elapsed = time.time() - start
+        with _print_lock:
+            print(f"  [{pid}] TIMEOUT  agent.solve exceeded {solve_timeout}s")
+        return idx, {
+            "problem_id": pid,
+            "error": f"agent.solve() timed out after {solve_timeout}s",
+            "final_score": 0.0,
+            "relative_score": 0.0,
+            "benchmark_score": 0.0,
+            "elapsed_seconds": round(elapsed, 2),
+            "timed_out": True,
+        }
+    except Exception as e:
+        elapsed = time.time() - start
+        with _print_lock:
+            print(f"  [{pid}] ERROR  {e}")
+        return idx, {
+            "problem_id": pid,
+            "error": str(e),
+            "final_score": 0.0,
+            "relative_score": 0.0,
+            "benchmark_score": 0.0,
+            "elapsed_seconds": round(elapsed, 2),
+        }
+
+
 def run_evaluation(
     agent_path: str | None = None,
     problem_ids: list[str] | None = None,
     use_sandbox: bool = True,
     use_all: bool = False,
     use_oracle: bool = False,
+    workers: int = 4,
 ) -> dict:
     config = load_pool_config()
     all_problem_dirs = sorted(POOL_DIR.glob("*/meta.json"))
@@ -396,49 +488,52 @@ def run_evaluation(
 
     agent = load_agent(agent_path)
 
-    results = []
-    for problem_dir in selected:
-        problem = load_problem(problem_dir)
+    # Default solve_timeout: from meta.json time_limit_seconds (120s) plus a
+    # generous buffer for model API latency. Callers can override via workers.
+    # Docker sandbox enforces its own time_limit separately; this timeout guards
+    # against agent.solve() hanging before the sandbox even starts.
+    solve_timeout = int(os.environ.get("SOLVE_TIMEOUT", "300"))
 
-        print(f"  [{problem.id}] {problem.issue_title[:60]}...")
-        start = time.time()
-        try:
-            patch = agent.solve(problem)
-            elapsed = time.time() - start
+    # --no-sandbox mode shares a repo cache directory; concurrent git operations
+    # on the same repo can conflict. Warn and clamp workers=1 for safety.
+    effective_workers = workers
+    if not use_sandbox and workers > 1:
+        print(
+            f"  [warn] --no-sandbox uses a shared repo cache; "
+            f"forcing workers=1 to avoid git conflicts."
+        )
+        effective_workers = 1
 
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".diff", mode="w", delete=False) as f:
-                f.write(patch.diff)
-                patch_path = Path(f.name)
+    print(f"  Scoring {len(selected)} problems  [workers={effective_workers}, solve_timeout={solve_timeout}s]")
 
-            if not use_sandbox:
-                from benchmark.harness.score import score_patch
-                score = score_patch(problem_dir, patch_path)
-            else:
-                from benchmark.harness.runner import run_in_sandbox
-                score = run_in_sandbox(problem_dir, patch_path)
+    # Run problems in parallel; collect (original_index, result) to preserve order.
+    indexed_results: list[tuple[int, dict]] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as pool:
+        futures = {
+            pool.submit(_score_one_problem, idx, d, agent, use_sandbox, solve_timeout): idx
+            for idx, d in enumerate(selected)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                idx, result = future.result()
+            except Exception as e:
+                idx = futures[future]
+                meta = json.loads((selected[idx] / "meta.json").read_text())
+                with _print_lock:
+                    print(f"  [{meta['id']}] FATAL  {e}")
+                result = {
+                    "problem_id": meta["id"],
+                    "error": str(e),
+                    "final_score": 0.0,
+                    "relative_score": 0.0,
+                    "benchmark_score": 0.0,
+                    "elapsed_seconds": 0.0,
+                }
+            indexed_results.append((idx, result))
 
-            # Capture a normalized diff hash for output-level similarity checks.
-            score["diff_hash"] = _diff_hash(patch.diff)
-            patch_path.unlink()
-
-            score["elapsed_seconds"] = round(elapsed, 2)
-            results.append(score)
-            status = "PASS" if score.get("tests_passed") else "FAIL"
-            rel = score.get("relative_score")
-            rel_str = f"  rel={rel:.2f}" if rel is not None else ""
-            print(f"       {status}  final_score={score['final_score']}{rel_str}  ({elapsed:.1f}s)")
-
-        except Exception as e:
-            elapsed = time.time() - start
-            results.append({
-                "problem_id": problem.id,
-                "error": str(e),
-                "final_score": 0.0,
-                "relative_score": 0.0,
-                "elapsed_seconds": round(elapsed, 2),
-            })
-            print(f"       ERROR: {e}")
+    # Restore original shard order so _annotate_and_aggregate's zip is correct.
+    indexed_results.sort(key=lambda x: x[0])
+    results = [r for _, r in indexed_results]
 
     agg = _annotate_and_aggregate(results, selected)
     return {
@@ -447,6 +542,7 @@ def run_evaluation(
         "pool_size": len(all_problem_dirs),
         "shard_size": len(selected),
         "rotation_policy": config.get("rotation_policy", "weekly"),
+        "workers": effective_workers,
         "problems": results,
     }
 
@@ -466,6 +562,8 @@ def main() -> None:
                         help="Skip Docker sandbox (local dev mode)")
     parser.add_argument("--oracle", action="store_true",
                         help="Score reference diffs (calibration check, no agent needed)")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Parallel problem workers (default: 4; use 1 for sequential)")
     args = parser.parse_args()
 
     if args.list_shard:
@@ -497,6 +595,7 @@ def main() -> None:
         use_sandbox=not args.no_sandbox,
         use_all=args.all,
         use_oracle=args.oracle,
+        workers=args.workers,
     )
 
     pool_info = f"{results['shard_size']}/{results['pool_size']} problems"
