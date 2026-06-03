@@ -452,8 +452,8 @@ def run_evaluation(
     # Oracle mode: score reference diffs directly — no agent call needed.
     # Used for pipeline calibration; expected weighted mean matches baselines.json.
     if use_oracle:
-        _oracle_weighted = 12.61
-        _oracle_arithmetic = 11.48
+        _oracle_weighted = 12.64
+        _oracle_arithmetic = 11.49
         _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
         if _baselines_path.exists():
             try:

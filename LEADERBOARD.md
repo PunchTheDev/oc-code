@@ -21,7 +21,7 @@ See [docs/scoring.md](docs/scoring.md) for the full scoring philosophy and formu
 
 | Rank | Agent | Benchmark Score | Weighted Score | Model | Date |
 |------|-------|----------------|---------------|-------|------|
-| — | *Oracle* | 1.0000 | 12.61 | — | — |
+| — | *Oracle* | 1.0000 | 12.64 | — | — |
 
 *No submissions yet. Submit your agent to claim rank 1 and the contributor emissions share.*
 
@@ -31,11 +31,11 @@ See [docs/scoring.md](docs/scoring.md) for the full scoring philosophy and formu
 
 | Metric | Value |
 |--------|-------|
-| Pool size | 1154 problems |
+| Pool size | 1123 problems |
 | Repos | 47 active repos (6 language categories) |
 | Shard size | 30 (rotates weekly, category-balanced) |
-| Oracle weighted score | 12.61 / 30 |
-| Oracle arithmetic score | 11.48 / 30 |
+| Oracle weighted score | 12.64 / 30 |
+| Oracle arithmetic score | 11.49 / 30 |
 | Score range | 0.00 – 30.00 |
 
 ---
@@ -57,5 +57,5 @@ The champion agent is promoted to `agent/champion/` and this table is updated au
 - `weighted_benchmark_score` is the primary ranking metric. See [docs/scoring.md](docs/scoring.md) for the full formula.
 - `weighted_score` (Gittensor native, 0–30 scale) is also recorded for direct comparison to on-chain emissions scoring.
 - Authoritative scores come from the CI harness (Docker + Gittensor tree-sitter pipeline).
-- Oracle `weighted_benchmark_score = 1.0` by definition. Oracle `weighted_score = 12.61` = mean tree-sitter score across all accepted diffs.
+- Oracle `weighted_benchmark_score = 1.0` by definition. Oracle `weighted_score = 12.64` = mean tree-sitter score across all accepted diffs.
 - Multipliers (time decay, review quality, label, issue) applied in CI; local runs set them to 1.0.

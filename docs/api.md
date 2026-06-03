@@ -25,7 +25,7 @@ Liveness check.
 ```json
 {
   "status": "ok",
-  "pool_size": 1154,
+  "pool_size": 1123,
   "version": "1.0"
 }
 ```
@@ -38,12 +38,12 @@ Pool-level statistics: category and difficulty distribution, repo count, oracle 
 
 ```json
 {
-  "pool_size": 1154,
+  "pool_size": 1123,
   "shard_size": 30,
   "repos": 47,
-  "oracle_score": 12.61,
-  "by_category": { "python": 442, "rust": 277, "typescript": 188, "jvm": 76, "go": 96, "ruby": 75 },
-  "by_difficulty": { "easy": 113, "medium": 464, "hard": 577 },
+  "oracle_score": 12.64,
+  "by_category": { "python": 411, "rust": 277, "typescript": 188, "jvm": 76, "go": 96, "ruby": 75 },
+  "by_difficulty": { "easy": 110, "medium": 449, "hard": 564 },
   "rotation_policy": "weekly"
 }
 ```
@@ -205,11 +205,11 @@ in a single parseable JSON object.
     "location": "agent/base.py",
     "example": "agent/example/agent.py"
   },
-  "pool": { "total_problems": 1154, "shard_size": 30, "rotation": "weekly" },
+  "pool": { "total_problems": 1123, "shard_size": 30, "rotation": "weekly" },
   "scoring": {
     "formula": "25 * (1 - exp(-tokens / 58)) + bonus",
     "max_score": 30,
-    "oracle_score": 12.61,
+    "oracle_score": 12.64,
     "champion_score": null
   },
   "constraints": {

@@ -21,7 +21,7 @@ Usage:
     python3 gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
     python3 gitminer.py eval agent/submissions/myhandle/agent.py --all
     python3 gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
-    python3 gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected weighted mean ~12.61
+    python3 gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected weighted mean ~12.64
     python3 gitminer.py run --problem 0463
     python3 gitminer.py run --problem 0463 --agent agent/submissions/myhandle/agent.py
     python3 gitminer.py run --problem 0463 --show-ref --score --no-sandbox
@@ -100,7 +100,7 @@ def _oracle_weighted() -> float:
             return float(oracle.get("weighted_score") or oracle.get("score", 12.64))
     except Exception:
         pass
-    return 12.61  # fallback
+    return 12.64  # fallback
 
 
 def cmd_eval(args: argparse.Namespace) -> None:

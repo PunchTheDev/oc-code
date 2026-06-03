@@ -401,6 +401,18 @@ def curate_pr(
         print(f"  Skip {repo}#{pr_number}: deletion-only diff (scores 0 on token-overlap)")
         return False
 
+    # Reject problems whose tests require a live server (HTTP/web/SDK API integration tests).
+    # These always fail in Docker because no application server is running, meaning any
+    # agent submission scores test_pass_rate=0.0 regardless of correctness.
+    SERVER_TEST_PATTERNS = ("test_http_api/", "test_web_api/", "test_sdk_api/")
+    diff_test_paths = re.findall(r"^diff --git a/(\S+)", diff, re.MULTILINE)
+    if any(
+        any(pat in p for pat in SERVER_TEST_PATTERNS)
+        for p in diff_test_paths
+    ):
+        print(f"  Skip {repo}#{pr_number}: server-required integration tests (test_http_api/web/sdk)")
+        return False
+
     if dry_run:
         print(f"  [DRY RUN] {repo}#{pr_number}: {issue_data['title'][:60]}")
         return True
