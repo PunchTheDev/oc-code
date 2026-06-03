@@ -113,7 +113,7 @@ python3 gitminer.py submit agent/submissions/yourhandle/agent.py
 # --- Pool exploration ---
 
 # List and filter benchmark problems
-python3 gitminer.py problems                                    # all 1000 problems
+python3 gitminer.py problems                                    # list all pool problems
 python3 gitminer.py problems --cat python --difficulty hard     # filter by language/difficulty
 python3 gitminer.py problems --repo ragflow --limit 10          # filter by repo name
 python3 gitminer.py problems --search "rate limit"              # full-text search
