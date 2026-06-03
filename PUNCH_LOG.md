@@ -4183,3 +4183,22 @@ Pool 1123, oracle 12.64, whitelist 65 models. Agent history tracking live in sto
 
 ### Status
 Pool 1123, oracle 12.64, 65 models. `gitminer init` reduces onboarding friction.
+
+---
+
+## Step 227 — 2026-06-03
+
+### What changed
+- **PR #101**: Add per-IP rate limiting to `/api/shard` and `/api/problems` endpoints (merged f00635d6)
+  - 120 req/min per IP, per-endpoint token bucket with `threading.Lock`
+  - Returns `429 Too Many Requests` + `Retry-After: 60` header on breach
+  - Blocks bulk scrapers probing the problem pool; generous for normal use
+
+- **Dashboard PR #14**: Leaderboard pagination — 25 submissions per page (merged 1967ce9)
+  - `LB_PAGE_SIZE = 25`, `lbPage` module state; oracle pinned to last page
+  - Prev/Next buttons in `#lb-pagination` (hidden when ≤1 page)
+  - Page resets to 1 on sort/filter change
+  - Scales to 100+ agents without DOM growing unbounded
+
+### Status
+Pool 1123, oracle 12.64, 65 models. API rate-limited, leaderboard pagination ready for volume.
