@@ -34,6 +34,14 @@ from benchmark.harness.score import score_diff_quality
 from benchmark.evaluate import problem_difficulty
 
 
+def _count_added_lines(ref_path: Path) -> int:
+    """Count lines starting with '+' (not '+++ ') in a unified diff."""
+    return sum(
+        1 for line in ref_path.read_text(errors="replace").splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    )
+
+
 def score_reference(problem_dir: Path) -> dict | None:
     meta_path = problem_dir / "meta.json"
     ref_path = problem_dir / "reference.diff"
@@ -48,6 +56,9 @@ def score_reference(problem_dir: Path) -> dict | None:
         print(f"  WARN: {problem_dir.name} — {e}", file=sys.stderr)
         return None
 
+    added = _count_added_lines(ref_path)
+    tier, weight = problem_difficulty(problem_dir)
+
     return {
         "id": meta["id"],
         "repo": meta.get("repo_name", ""),
@@ -55,6 +66,9 @@ def score_reference(problem_dir: Path) -> dict | None:
         "source_token_score": round(src_tok, 2),
         "total_token_score": round(total_tok, 2),
         "base_score": base_score,
+        "added_lines": added,
+        "difficulty": tier,
+        "weight": weight,
     }
 
 
@@ -92,8 +106,7 @@ def main() -> None:
     # Weighted mean mirrors evaluate.py: hard×2, medium×1.5, easy×1
     w_total = w_count = 0.0
     for b in baselines:
-        prob_dir = PROBLEMS_DIR / b["id"]
-        _, w = problem_difficulty(prob_dir) if prob_dir.exists() else ("medium", 1.5)
+        w = b.get("weight", 1.5)
         w_total += b["base_score"] * w
         w_count += w
     weighted_mean_score = round(w_total / w_count, 2) if w_count else mean_score
