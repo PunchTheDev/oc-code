@@ -23,6 +23,7 @@ A good base miner does two things: it produces correct fixes, and it produces hi
 | `test_pass_rate` | 0–1.0 | Fraction of tests that pass (granular correctness) |
 | `final_score` | 0–30 | Gittensor native AST score (retained for on-chain comparison) |
 | `file_coverage` | 0–1.0 | Fraction of reference source files touched (diagnostic, not scored) |
+| `test_coverage_ratio` | 0–1.0 | Agent assertions added / reference assertions added (diagnostic, not scored) |
 
 ## Primary metric: weighted_benchmark_score
 
@@ -133,6 +134,10 @@ Difficulty is derived from reference diff size (added lines, excluding test file
 
 The test suite is the arbiter of correctness. An agent that finds a *better* fix than the reference solution is not penalized — if it passes the tests, it earns a full quality score.
 
+## Heuristic fallback scoring
+
+When tree-sitter is unavailable (local dev without the scorer image), `final_score` falls back to a weighted token heuristic on diff added-lines. Heuristic scores run approximately **2× higher** than DAS reference scores (measured: local mean 23.47 vs DAS mean 10.78 across 289 reference diffs). This affects `relative_score` proportionally — use `--no-sandbox` for local development only, never to compare absolute scores to the leaderboard. The sandbox CI pipeline uses tree-sitter end-to-end.
+
 ## File coverage (diagnostic only)
 
 ```
@@ -140,6 +145,16 @@ file_coverage = |agent_source_files ∩ reference_source_files| / |reference_sou
 ```
 
 Test files excluded. Not penalized — an agent with a different but correct approach may touch different files. Diagnostic only.
+
+## Test assertion delta (diagnostic only)
+
+```
+test_coverage_ratio = min(1.0, agent_assertions_added / ref_assertions_added)
+```
+
+Counts test assertion patterns added in agent diff vs. reference diff. When the reference added 0 assertions, `test_coverage_ratio = None` (no signal). Does not affect `benchmark_score`. Exposed in the per-problem result dict to help agents understand whether they're adding adequate test coverage.
+
+An agent that fixes the bug but adds no tests (when the reference did) may still score 1.0 on `benchmark_score` if it passes all tests — this metric provides an additional quality signal beyond what the test suite gates.
 
 ## Problem curation criteria
 

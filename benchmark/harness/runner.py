@@ -572,6 +572,7 @@ def _enrich_result(
         load_baselines,
         file_coverage_stats,
         detect_test_deletion,
+        test_assertion_delta,
     )
 
     if not result.get("patch_applied"):
@@ -624,5 +625,8 @@ def _enrich_result(
     anti_gaming = 0.5 if deletion_info["test_deletion_warning"] else 1.0
     result["anti_gaming_multiplier"] = anti_gaming
     result["benchmark_score"] = round(test_pass_rate * (rel_score or 0.0) * anti_gaming, 4)
+
+    # --- test_assertion_delta (observational) ----------------------------------
+    result.update(test_assertion_delta(problem_dir, diff_text))
 
     return result

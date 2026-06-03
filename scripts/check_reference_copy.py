@@ -33,7 +33,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent
 PROBLEMS_DIR = REPO_ROOT / "benchmark" / "problems"
 
-DEFAULT_THRESHOLD = 0.40   # flag if >40% of shard problems match reference exactly
+DEFAULT_THRESHOLD = 0.15   # flag if >15% of shard problems match reference exactly
+# (At 30 problems: 5 matches triggers. At 40%, 12 matches were needed — far too lenient.)
 MIN_PROBLEMS = 5           # need at least this many evaluated problems to check
 
 

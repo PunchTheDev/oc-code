@@ -631,6 +631,57 @@ def detect_test_deletion(diff_text: str) -> dict:
     }
 
 
+def test_assertion_delta(problem_dir: Path, agent_diff_text: str) -> dict:
+    """
+    Measure how many test assertions the agent added vs. the reference.
+
+    When a reference PR adds assertions that verify the fix, a good agent should
+    add similar tests. An agent that fixes code without adding any tests is more
+    likely to be fragile or incomplete.
+
+    Returns a dict with:
+      - ref_assertions_added (int): assertions added in reference diff
+      - agent_assertions_added (int): assertions added in agent diff
+      - test_coverage_ratio (float|None): agent/reference ratio (None when ref added 0)
+        1.0 = agent added as many test assertions as the reference
+        0.0 = agent added none (when reference added >0)
+        None = reference added no assertions (no test expectation signal)
+
+    Observational only — does not affect benchmark_score. Informational signal
+    to identify agents that never write tests.
+    """
+    def count_added_assertions(diff_text: str) -> int:
+        in_test = False
+        count = 0
+        for line in diff_text.splitlines():
+            if line.startswith("diff --git"):
+                path_match = re.search(r"b/(.+)$", line)
+                in_test = bool(path_match and is_test_file(path_match.group(1)))
+                continue
+            if not in_test:
+                continue
+            if line.startswith("+") and not line.startswith("+++"):
+                content = line[1:].strip()
+                if content and _TEST_ASSERTION_RE.search(content):
+                    count += 1
+        return count
+
+    ref_diff_path = problem_dir / "reference.diff"
+    if not ref_diff_path.exists():
+        return {"ref_assertions_added": 0, "agent_assertions_added": 0, "test_coverage_ratio": None}
+
+    ref_count = count_added_assertions(ref_diff_path.read_text(errors="replace"))
+    agent_count = count_added_assertions(agent_diff_text)
+
+    ratio = round(min(1.0, agent_count / ref_count), 3) if ref_count > 0 else None
+
+    return {
+        "ref_assertions_added": ref_count,
+        "agent_assertions_added": agent_count,
+        "test_coverage_ratio": ratio,
+    }
+
+
 def _score_in_worktree(
     problem_dir: Path, repo_dir: Path, meta: dict, patch_path: Path, saturation_scale: float
 ) -> dict:
@@ -750,6 +801,11 @@ def _score_in_worktree(
         **coverage,
         # Anti-gaming: flag suspicious test assertion removals (reflected in anti_gaming_multiplier).
         **deletion_info,
+        # test_coverage_ratio: observational signal for how many assertions agent added vs reference.
+        # 1.0 = agent added as many test assertions as the accepted solution.
+        # None = reference added no assertions (no expectation set).
+        # Not part of benchmark_score — informational only.
+        **test_assertion_delta(problem_dir, diff_text),
         # Multipliers (time_decay, review_quality, label, issue) require GitHub
         # API data — local scoring sets them to 1.0 as a conservative estimate.
         "multipliers": {"time_decay": 1.0, "review_quality": 1.0, "label": 1.0, "issue": 1.0},
