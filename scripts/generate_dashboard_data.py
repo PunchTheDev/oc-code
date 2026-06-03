@@ -124,7 +124,7 @@ def _load_oracle_row() -> dict:
         "weighted_score": weighted_score,
         "model": "—",
         "date": "—",
-        "note": f"Weighted mean {weighted_score} (arithmetic {mean_score}) across {count} accepted solutions (Gittensor DAS only)",
+        "note": f"Weighted mean {weighted_score} (arithmetic {mean_score}) across {count} accepted solutions (DAS + external prestige repos)",
     }
 
 
