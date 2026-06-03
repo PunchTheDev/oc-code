@@ -3368,3 +3368,37 @@ Fix: `git log origin/main --since=7 days ago` — only counts commits already on
 - main: 52edbd33
 - Benchmark: 1154 problems, oracle 12.70 weighted, 47 repos
 - Eval: parallel (workers=4), solve timeout 300s, rate limit hard-blocked on merged commits only
+
+---
+
+## Step 191 — Dashboard primary metric fix + stale data audit
+
+### Findings
+
+**Dashboard showing wrong primary metric**: The leaderboard was displaying `score / 30` (raw Gittensor token metric) as the primary column. The actual ranking metric is `weighted_benchmark_score` (0–2.0, oracle = 1.0). Column relabeled and JS rendering updated.
+
+**Dashboard data stale**: `data.json` in the dashboard repo was at pool 812 / oracle 13.62. The CI refresh had been running but commits were orphaned due to squash-merge conflicts with my earlier PRs. Manually synced to current state.
+
+**Category counts wrong in info box**: Dashboard said "12 Python · 8 TypeScript · 5 Rust · 3 JVM · 2 Ruby" (missing Go, stale). Fixed to "11 Python · 7 Rust · 5 TypeScript · 3 Go · 2 JVM · 2 Ruby".
+
+**`generate_dashboard_data.py` used hardcoded shard budget**: Read from `DEFAULT_SHARD_BUDGET` in catalog.py instead of live `pool_config.json`. Fixed to read from pool_config.json with fallback.
+
+**`refresh_dashboard.yml` missing trigger paths**: `benchmark/catalog.py` and `benchmark/pool_config.json` changes didn't trigger dashboard refresh. Added to paths.
+
+**`cmd_mine` oracle gap display**: When `weighted_benchmark_score >= 1.0`, displayed negative gap "gap to oracle: -0.03". Fixed to "beats oracle by +0.03".
+
+### PRs
+
+- **PR #59**: `gitminer.py` mine oracle-gap fix + `refresh_dashboard.yml` trigger paths (merged 9dca8d7e)
+- **PR #60**: `generate_dashboard_data.py` reads live shard budget from pool_config.json (merged 6a8f7e05)
+- **Dashboard PR #2**: Show `weighted_benchmark_score` as primary leaderboard column (merged)
+  - Per-problem breakdown now shows `benchmark_score` + `test_pass_rate`; raw score demoted to secondary
+- **Dashboard PR #3**: Sync `data.json` — pool 1154, oracle 12.70, 6 languages, 47 repos (merged)
+
+### System state after step 191
+
+- base-miner main: 6a8f7e05
+- dashboard main: d1f481b (pool 1154, oracle 12.70, weighted_benchmark_score as primary)
+- Benchmark: 1154 problems, oracle 12.70 weighted, 47 repos, 6 languages
+- Scoring model v4: `benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier`
+  `weighted_benchmark_score = sum(benchmark × difficulty_weight) / sum(weight)` (PRIMARY)
