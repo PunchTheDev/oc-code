@@ -3173,3 +3173,43 @@ Operator asked: "How do we score benchmark performance? It can't just be Gittens
 
 ### Pool state
 - Pool: **1154 problems** | Oracle: **12.70** weighted / **11.48** arithmetic | Repos: **47** (13 DAS + 34 external)
+
+---
+
+## Step 186 — 2026-06-03
+
+### Partial test scoring + composite benchmark_score (PR #47, merged 95b49b86)
+
+**Problem**: The scoring was binary pass/fail — fixing 9/10 tests scored the same as fixing 0/10. The primary metric (`mean_relative_score`) was not clearly connected to the `final_score` field (which was raw Gittensor token score). The operator correctly identified this as insufficient.
+
+**What changed**:
+
+1. **`_parse_test_count(output, test_cmd)`** — parses test runner output to extract `(passed, total)` counts:
+   - pytest: `N passed, M failed in Xs`
+   - cargo test: `test result: ok. N passed; M failed`
+   - go test: count `--- PASS:` / `--- FAIL:` lines
+   - jest/vitest: `Tests: N passed, M total`
+   - rspec: `N examples, M failures`
+   - gradle: `N tests completed, M failed`
+   - Falls back to binary (exit code) when parsing fails
+
+2. **`test_pass_rate = passed / total`** (0–1) per problem
+
+3. **`benchmark_score = test_pass_rate × relative_score`** — composite PRIMARY metric:
+   - All tests pass + oracle quality → 1.0
+   - All tests pass + better than oracle → >1.0 (cap 2.0)
+   - 50% tests pass at oracle quality → 0.5
+   - No tests pass → 0.0
+
+4. **`mean_benchmark_score`** aggregated in evaluate.py, shown first in CLI output
+
+5. **LEADERBOARD.md**: rankings now by benchmark_score (was weighted_mean_score)
+
+6. **docs/scoring.md**: rewritten to explain the full scoring philosophy — partial credit rationale, formula, per-runner parsing table
+
+### Scoring philosophy
+The benchmark now captures two orthogonal dimensions:
+- **Correctness depth** (`test_pass_rate`): did the agent fix the actual bugs?
+- **Quality alignment** (`relative_score`): is the fix as clean/structured as the oracle?
+
+`benchmark_score` is their product. An agent that's 80% correct but 120% quality earns 0.96. An agent that's 100% correct but 80% quality earns 0.80. Both signals matter.
