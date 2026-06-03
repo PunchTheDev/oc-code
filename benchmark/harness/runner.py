@@ -261,7 +261,13 @@ def run_in_sandbox(problem_dir: Path, patch_path: Path) -> dict:
     Score a patch in an isolated Docker container.
 
     Falls back to in-process scoring when Docker is unavailable (local dev mode).
-    Return dict matches score.score_patch() exactly.
+    Return dict matches score.score_patch() exactly — including all benchmark
+    metrics (test_pass_rate, relative_score, benchmark_score, file_coverage,
+    test_deletion_warning) that the Phase 2 script cannot compute internally.
+
+    Metric enrichment reads test_out.txt from the staging dir before cleanup,
+    then computes the full metric set using the same functions as score.score_patch().
+    This ensures sandbox and local scoring paths return identical result shapes.
     """
     if not _docker_available():
         from benchmark.harness.score import score_patch
@@ -273,7 +279,11 @@ def run_in_sandbox(problem_dir: Path, patch_path: Path) -> dict:
     with tempfile.TemporaryDirectory(prefix="bminer_") as staging:
         staging_path = Path(staging)
         _prepare_staging(staging_path, meta, patch_path)
-        return _run_container(staging_path, meta, time_limit)
+        result = _run_container(staging_path, meta, time_limit)
+        # Enrich with full metrics before staging dir is cleaned up.
+        result = _enrich_result(result, staging_path, problem_dir, patch_path, meta)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -530,3 +540,84 @@ def _error_result(problem_id: str, detail: str) -> dict:
         "final_score": 0.0,
         "error": detail,
     }
+
+
+def _enrich_result(
+    result: dict,
+    staging: Path,
+    problem_dir: Path,
+    patch_path: Path,
+    meta: dict,
+) -> dict:
+    """
+    Add the full benchmark metric set to a sandbox result dict.
+
+    The Phase 2 scorer script only emits base_score and tests_passed — it
+    cannot access baselines.json or the reference diff from inside the
+    network-isolated container. This function computes the remaining metrics
+    (test_pass_rate, relative_score, benchmark_score, file_coverage,
+    test_deletion_warning) using the staging directory artifacts after the
+    container has exited but before the temp dir is cleaned up.
+
+    Idempotent: if the result already has benchmark_score set, skips re-computation.
+    Skips enrichment when patch_applied is False (nothing to score).
+    """
+    from benchmark.harness.score import (
+        parse_test_count,
+        load_baselines,
+        file_coverage_stats,
+        detect_test_deletion,
+    )
+
+    if not result.get("patch_applied"):
+        # Ensure zero-value fields are present even for non-applied patches.
+        result.setdefault("test_pass_rate", 0.0)
+        result.setdefault("relative_score", None)
+        result.setdefault("benchmark_score", 0.0)
+        result.setdefault("anti_gaming_multiplier", 1.0)
+        return result
+
+    if "benchmark_score" in result:
+        return result  # already enriched
+
+    # --- test_pass_rate -------------------------------------------------------
+    test_out = ""
+    test_out_path = staging / "test_out.txt"
+    if test_out_path.exists():
+        test_out = test_out_path.read_text(errors="replace")
+
+    test_cmd: list[str] = meta.get("test_cmd", ["python", "-m", "pytest"])
+    n_passed, n_total = parse_test_count(test_out, test_cmd)
+    tests_passed = result.get("tests_passed", False)
+
+    if n_total > 0:
+        test_pass_rate = round(n_passed / n_total, 4)
+    else:
+        # parse failed — binary fallback
+        test_pass_rate = 1.0 if tests_passed else 0.0
+        n_passed = n_total = 0
+
+    result["tests_passed_count"] = n_passed
+    result["tests_total_count"] = n_total
+    result["test_pass_rate"] = test_pass_rate
+
+    # --- relative_score -------------------------------------------------------
+    base_score = result.get("base_score", 0.0)
+    pid = meta.get("id", "")
+    oracle = load_baselines().get(pid, 0.0)
+    rel_score = round(min(base_score / oracle, 2.0), 4) if oracle > 0 else None
+    result["relative_score"] = rel_score
+    result["oracle_base_score"] = oracle
+
+    # --- file_coverage + test_deletion ----------------------------------------
+    diff_text = patch_path.read_text(errors="replace")
+    result.update(file_coverage_stats(problem_dir, diff_text))
+    deletion_info = detect_test_deletion(diff_text)
+    result.update(deletion_info)
+
+    # --- benchmark_score -------------------------------------------------------
+    anti_gaming = 0.5 if deletion_info["test_deletion_warning"] else 1.0
+    result["anti_gaming_multiplier"] = anti_gaming
+    result["benchmark_score"] = round(test_pass_rate * (rel_score or 0.0) * anti_gaming, 4)
+
+    return result

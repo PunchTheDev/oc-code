@@ -51,14 +51,14 @@ MAX_CONTRIBUTION_BONUS = 5
 CONTRIBUTION_SCORE_FOR_FULL_BONUS = 1500
 
 
-def _repo_cache_dir() -> Path:
+def repo_cache_dir() -> Path:
     """Return (and create) the gitminer repo cache directory."""
     cache = Path(os.environ.get("GITMINER_CACHE", Path.home() / ".cache" / "gitminer" / "repos"))
     cache.mkdir(parents=True, exist_ok=True)
     return cache
 
 
-def _cached_repo(repo_url: str) -> Path:
+def cached_repo(repo_url: str) -> Path:
     """
     Return a path to a local bare-ish clone of repo_url.
 
@@ -69,7 +69,7 @@ def _cached_repo(repo_url: str) -> Path:
     """
     parts = repo_url.rstrip("/").split("/")
     key = "_".join(parts[-2:])  # owner_repo
-    cached = _repo_cache_dir() / key
+    cached = repo_cache_dir() / key
 
     if not cached.exists():
         subprocess.run(
@@ -162,7 +162,7 @@ _RSPEC_RE = re.compile(r"(\d+)\s+examples?,\s*(\d+)\s+failures?")
 _GRADLE_RE = re.compile(r"(\d+)\s+tests?\s+completed,\s*(\d+)\s+failed")
 
 
-def _parse_test_count(output: str, test_cmd: list[str]) -> tuple[int, int]:
+def parse_test_count(output: str, test_cmd: list[str]) -> tuple[int, int]:
     """Parse test runner output to extract (tests_passed, tests_total).
 
     Returns (0, 0) when parsing fails — callers should treat this as unknown,
@@ -327,7 +327,7 @@ def score_diff_quality(problem_dir: Path, patch_path: Path) -> tuple[float, floa
     saturation_scale = float(meta.get("src_tok_saturation_scale", SRC_TOK_SATURATION_SCALE))
     diff_text = patch_path.read_text()
 
-    cached = _cached_repo(meta["repo_url"])
+    cached = cached_repo(meta["repo_url"])
     base_commit = meta["base_commit"]
 
     with tempfile.TemporaryDirectory(prefix="bminer_qual_") as tmpdir:
@@ -383,7 +383,7 @@ def score_patch(problem_dir: Path, patch_path: Path) -> dict:
 
     # Use a cached clone so repeated evals on the same repo skip the network round-trip.
     # Each problem gets an isolated git worktree checked out at the exact base commit.
-    cached = _cached_repo(meta["repo_url"])
+    cached = cached_repo(meta["repo_url"])
 
     base_commit = meta["base_commit"]
 
@@ -414,7 +414,7 @@ def score_patch(problem_dir: Path, patch_path: Path) -> dict:
             )
 
 
-def _parse_diff_paths(diff_text: str) -> list[tuple[str, str]]:
+def parse_diff_paths(diff_text: str) -> list[tuple[str, str]]:
     """Return [(path, status)] from diff headers. Status: 'added'|'removed'|'modified'."""
     results = []
     current_old: str | None = None
@@ -473,7 +473,7 @@ def _build_file_pairs(repo_dir: Path, diff_text: str) -> "list | None":
     except ImportError:
         return None
 
-    paths = _parse_diff_paths(diff_text)
+    paths = parse_diff_paths(diff_text)
     pairs = []
 
     for rel_path, status in paths:
@@ -505,11 +505,11 @@ _TEST_PATH_RE = re.compile(
 )
 
 
-def _is_test_file(path: str) -> bool:
+def is_test_file(path: str) -> bool:
     return bool(_TEST_PATH_RE.search(path))
 
 
-def _file_coverage(problem_dir: Path, agent_diff_text: str) -> dict:
+def file_coverage_stats(problem_dir: Path, agent_diff_text: str) -> dict:
     """
     Measure what fraction of the reference diff's source files the agent also touches.
 
@@ -525,8 +525,8 @@ def _file_coverage(problem_dir: Path, agent_diff_text: str) -> dict:
         return {"file_coverage": None, "reference_source_files": 0, "agent_files_matched": 0}
 
     ref_diff_text = ref_diff_path.read_text(errors="replace")
-    ref_src_paths = {p for p, _ in _parse_diff_paths(ref_diff_text) if not _is_test_file(p)}
-    agent_src_paths = {p for p, _ in _parse_diff_paths(agent_diff_text) if not _is_test_file(p)}
+    ref_src_paths = {p for p, _ in parse_diff_paths(ref_diff_text) if not is_test_file(p)}
+    agent_src_paths = {p for p, _ in parse_diff_paths(agent_diff_text) if not is_test_file(p)}
 
     if not ref_src_paths:
         return {"file_coverage": None, "reference_source_files": 0, "agent_files_matched": 0}
@@ -542,7 +542,7 @@ def _file_coverage(problem_dir: Path, agent_diff_text: str) -> dict:
 _BASELINES_CACHE: "dict[str, float] | None" = None
 
 
-def _load_baselines() -> "dict[str, float]":
+def load_baselines() -> "dict[str, float]":
     """Return {problem_id: base_score} from results/baselines.json (loaded once)."""
     global _BASELINES_CACHE
     if _BASELINES_CACHE is not None:
@@ -565,7 +565,7 @@ def _load_baselines() -> "dict[str, float]":
     return mapping
 
 
-def _relative_score(base_score: float, meta: dict) -> float | None:
+def relative_score_for(base_score: float, meta: dict) -> float | None:
     """
     Compute relative benchmark score: agent_score / oracle_score.
 
@@ -582,7 +582,7 @@ def _relative_score(base_score: float, meta: dict) -> float | None:
     Capped at 2.0 so verbose diffs can't inflate scores unboundedly.
     """
     pid = meta.get("id", "")
-    baselines = _load_baselines()
+    baselines = load_baselines()
     oracle = baselines.get(pid, 0.0)
     if oracle <= 0.0:
         return None
@@ -596,7 +596,7 @@ _TEST_ASSERTION_RE = re.compile(
 )
 
 
-def _detect_test_deletion(diff_text: str) -> dict:
+def detect_test_deletion(diff_text: str) -> dict:
     """
     Detect if a diff suspiciously removes test assertions or test functions.
 
@@ -614,7 +614,7 @@ def _detect_test_deletion(diff_text: str) -> dict:
     for line in diff_text.splitlines():
         if line.startswith("diff --git"):
             path_match = re.search(r"b/(.+)$", line)
-            in_test = bool(path_match and _is_test_file(path_match.group(1)))
+            in_test = bool(path_match and is_test_file(path_match.group(1)))
             continue
 
         if not in_test:
@@ -666,7 +666,7 @@ def _score_in_worktree(
         for c in raw_cmd
     ]
     tests_passed, test_output, all_skipped = run_tests(repo_dir, test_cmd)
-    n_passed, n_total = _parse_test_count(test_output, test_cmd)
+    n_passed, n_total = parse_test_count(test_output, test_cmd)
 
     # test_pass_rate: fraction of tests that pass.
     # When parsing fails (n_total=0), fall back to binary: 1.0 if all tests
@@ -708,9 +708,9 @@ def _score_in_worktree(
         )
 
     base_score = compute_base_score(src_tok, total_tok, saturation_scale)
-    rel_score = _relative_score(base_score, meta)
-    coverage = _file_coverage(problem_dir, diff_text)
-    deletion_info = _detect_test_deletion(diff_text)
+    rel_score = relative_score_for(base_score, meta)
+    coverage = file_coverage_stats(problem_dir, diff_text)
+    deletion_info = detect_test_deletion(diff_text)
 
     # Anti-gaming multiplier: halve benchmark_score when test deletion is detected.
     # A submission that removes >3 test assertions to force a pass is penalized.
@@ -739,7 +739,7 @@ def _score_in_worktree(
         # relative_score: agent quality / oracle quality for this problem.
         # 1.0 = matches accepted solution quality, >1.0 = better, <1.0 = lower quality.
         "relative_score": rel_score,
-        "oracle_base_score": _load_baselines().get(meta.get("id", ""), 0.0),
+        "oracle_base_score": load_baselines().get(meta.get("id", ""), 0.0),
         # benchmark_score: PRIMARY per-problem metric.
         #   = test_pass_rate × relative_score × anti_gaming_multiplier
         # Combined into weighted_benchmark_score at the shard level (hard×2 / medium×1.5 / easy×1).

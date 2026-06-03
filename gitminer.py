@@ -645,7 +645,7 @@ def cmd_validate(args: argparse.Namespace) -> None:
     """
     import subprocess
     import tempfile
-    from benchmark.harness.score import _cached_repo, apply_patch, run_tests
+    from benchmark.harness.score import cached_repo, apply_patch, run_tests
 
     pool_dir = REPO_ROOT / "benchmark" / "problems"
     problem_dir = pool_dir / args.problem
@@ -680,7 +680,7 @@ def cmd_validate(args: argparse.Namespace) -> None:
     # Ensure cached clone exists
     print("Checking repo cache...", end=" ", flush=True)
     try:
-        cached = _cached_repo(repo_url)
+        cached = cached_repo(repo_url)
         print("ok")
     except Exception as e:
         print(f"FAILED\n{e}", file=sys.stderr)
@@ -1046,7 +1046,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 def cmd_cache(args: argparse.Namespace) -> None:
     """Pre-warm the local repo cache used by --no-sandbox eval."""
     import json as _json
-    from benchmark.harness.score import _cached_repo, _repo_cache_dir
+    from benchmark.harness.score import cached_repo, repo_cache_dir
 
     pool_dir = REPO_ROOT / "benchmark" / "problems"
     meta_files = sorted(pool_dir.glob("*/meta.json"))
@@ -1061,7 +1061,7 @@ def cmd_cache(args: argparse.Namespace) -> None:
         if url:
             urls[url] = urls.get(url, 0) + 1
 
-    cache_dir = _repo_cache_dir()
+    cache_dir = repo_cache_dir()
     print(f"Cache location: {cache_dir}")
     print(f"Repos to cache: {len(urls)} ({len(meta_files)} problems)\n")
 
@@ -1069,7 +1069,7 @@ def cmd_cache(args: argparse.Namespace) -> None:
         repo_name = "/".join(url.rstrip("/").split("/")[-2:])
         print(f"[{i}/{len(urls)}] {repo_name} ({count} problems)...", end=" ", flush=True)
         try:
-            _cached_repo(url)
+            cached_repo(url)
             print("ok")
         except Exception as e:
             print(f"FAILED: {e}")
