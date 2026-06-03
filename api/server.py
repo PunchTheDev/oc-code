@@ -25,7 +25,7 @@ import json
 import hashlib
 import os
 import random
-from datetime import date
+from datetime import date, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -297,7 +297,7 @@ class Handler(BaseHTTPRequestHandler):
         # Next rotation: next Monday
         today = date.today()
         days_to_monday = (7 - today.weekday()) % 7 or 7
-        next_rotation = str(today.replace(day=today.day + days_to_monday) if days_to_monday else today)
+        next_rotation = str(today + timedelta(days=days_to_monday))
 
         problems = []
         for pid in shard_ids:
