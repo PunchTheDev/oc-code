@@ -486,12 +486,16 @@ def cmd_info(args: argparse.Namespace) -> None:
 
     # Baselines
     baseline_score: float | None = None
+    baseline_difficulty: str | None = None
+    baseline_weight: float | None = None
     bl_path = REPO_ROOT / "results" / "baselines.json"
     if bl_path.exists():
         bl = json.loads(bl_path.read_text())
         for entry in bl.get("problems", []):
             if entry.get("id") == args.id:
                 baseline_score = entry.get("base_score")
+                baseline_difficulty = entry.get("difficulty")
+                baseline_weight = entry.get("weight")
                 break
 
     # Context files
@@ -544,13 +548,14 @@ def cmd_info(args: argparse.Namespace) -> None:
     # Scores
     print(f"\n{BOLD}Scores{RESET}")
     if baseline_score is not None:
-        # Thresholds mirror generate_dashboard_data.py: easy≥15, medium 5–15, hard<5
-        if baseline_score >= 15:
-            diff_str = f"  {GREEN}easy{RESET}"
-        elif baseline_score >= 5:
-            diff_str = f"  {YELLOW}medium{RESET}"
+        if baseline_difficulty == "easy":
+            diff_str = f"  {GREEN}easy ×1{RESET}"
+        elif baseline_difficulty == "medium":
+            diff_str = f"  {YELLOW}medium ×1.5{RESET}"
+        elif baseline_difficulty == "hard":
+            diff_str = f"  {RED}hard ×2{RESET}"
         else:
-            diff_str = f"  {RED}hard{RESET}"
+            diff_str = ""
         print(f"  Baseline: {CYAN}{baseline_score:.2f}{RESET}/30{diff_str}")
     das = meta.get("das_score")
     if das is not None:
