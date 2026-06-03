@@ -42,17 +42,25 @@ def _load_oracle_row() -> dict:
         except Exception:
             pass
     if mean_score is None:
-        mean_score = 12.38
-        weighted_score = 13.73
-        count = 800
+        mean_score = 11.48
+        weighted_score = 12.70
+        count = 1154
     return {
         "rank": None,
         "agent": "Oracle (accepted solution)",
         "score": mean_score,
         "weighted_score": weighted_score,
+        # benchmark_score and weighted_benchmark_score are always 1.0 for the oracle
+        # (it defines the 1.0 baseline). Required for correct leaderboard sorting.
+        "benchmark_score": 1.0,
+        "weighted_benchmark_score": 1.0,
         "model": "—",
         "date": "—",
-        "note": f"Weighted mean {weighted_score} (arithmetic {mean_score}) across {count} accepted solutions (DAS + external prestige repos)",
+        "note": (
+            f"Oracle baseline: weighted_benchmark_score=1.0 (definition). "
+            f"Weighted mean {weighted_score} (arithmetic {mean_score}) across "
+            f"{count} accepted solutions (DAS + external prestige repos)"
+        ),
     }
 
 
@@ -209,10 +217,9 @@ def load_allowed_models() -> list[str]:
 
 
 def oracle_score_from_leaderboard(leaderboard: list) -> float:
-    """Read oracle weighted mean from the leaderboard entry (the metric miners compete on)."""
+    """Return oracle weighted mean score (miners' primary target metric)."""
     for row in leaderboard:
         if row.get("agent") == "Oracle (accepted solution)":
-            # Prefer weighted_score; fall back to score for backward compat
             ws = row.get("weighted_score")
             if ws is not None:
                 return float(ws)
