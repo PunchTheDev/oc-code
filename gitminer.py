@@ -1359,6 +1359,44 @@ def cmd_doctor(args: argparse.Namespace) -> None:
     except Exception as e:
         fail("Shard config", str(e))
 
+    # Docker
+    import shutil
+    import subprocess
+
+    in_docker = Path("/.dockerenv").exists()
+    docker_bin = shutil.which("docker")
+
+    if in_docker:
+        warn("Docker sandbox", "running inside Docker — use --no-sandbox for local eval")
+    elif docker_bin:
+        try:
+            r = subprocess.run(
+                ["docker", "info", "--format", "{{.ServerVersion}}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                ok("Docker", f"daemon running  (v{r.stdout.strip()})")
+                # Scorer image cache
+                ri = subprocess.run(
+                    ["docker", "image", "inspect",
+                     "ghcr.io/punchthedev/gitminer-scorer:latest",
+                     "--format", "{{.Id}}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if ri.returncode == 0:
+                    ok("Scorer image", "ghcr.io/punchthedev/gitminer-scorer:latest cached")
+                else:
+                    warn("Scorer image",
+                         "not pulled — will auto-pull on first eval (adds ~30s)")
+            else:
+                fail("Docker", "daemon not running — start Docker or use --no-sandbox")
+        except subprocess.TimeoutExpired:
+            fail("Docker", "docker info timed out — daemon may be starting")
+        except FileNotFoundError:
+            fail("Docker", "docker binary not found")
+    else:
+        fail("Docker", "not found in PATH — install Docker or use --no-sandbox")
+
     print()
     if failed:
         print(f"\033[31mFailed {len(failed)} check(s)\033[0m: {', '.join(failed)}")
