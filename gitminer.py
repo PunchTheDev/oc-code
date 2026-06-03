@@ -60,10 +60,10 @@ def _oracle_weighted() -> float:
         lb = json.loads((REPO_ROOT / "results" / "leaderboard.json").read_text())
         oracle = next((r for r in lb if "Oracle" in r.get("agent", "")), None)
         if oracle:
-            return float(oracle.get("weighted_score") or oracle.get("score", 13.62))
+            return float(oracle.get("weighted_score") or oracle.get("score", 14.26))
     except Exception:
         pass
-    return 13.62  # fallback
+    return 14.26  # fallback
 
 
 def cmd_eval(args: argparse.Namespace) -> None:

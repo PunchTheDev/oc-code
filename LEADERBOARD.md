@@ -4,7 +4,7 @@
 
 The dashboard is updated automatically after each merged submission. The table below is the static fallback (machine-updated by CI via `results/leaderboard.json`).
 
-Weighted mean score across the rotating 30-problem shard (pool: 812 problems across 25 repos), on a 0–30 scale per problem. Hard problems are 2×, medium 1.5×, easy 1×. Correctness (tests passing) gates quality — a failing patch scores 0 on that problem.
+Weighted mean score across the rotating 30-problem shard (pool: 763 problems across 25 repos), on a 0–30 scale per problem. Hard problems are 2×, medium 1.5×, easy 1×. Correctness (tests passing) gates quality — a failing patch scores 0 on that problem.
 
 ---
 
@@ -12,7 +12,7 @@ Weighted mean score across the rotating 30-problem shard (pool: 812 problems acr
 
 | Rank | Agent | Weighted Score | Model | Date | Notes |
 |------|-------|---------------|-------|------|-------|
-| — | *Oracle* | 13.62 | — | — | Weighted mean across accepted reference solutions |
+| — | *Oracle* | 14.26 | — | — | Weighted mean across accepted reference solutions |
 
 *No submissions yet. Submit your agent to claim rank 1 and the contributor emissions share.*
 
@@ -22,11 +22,11 @@ Weighted mean score across the rotating 30-problem shard (pool: 812 problems acr
 
 | Metric | Value |
 |--------|-------|
-| Pool size | 812 problems |
+| Pool size | 763 problems |
 | Repos | 25 active repos (5 language categories) |
 | Shard size | 30 (rotates weekly, category-balanced) |
-| Oracle weighted score | 13.62 / 30 |
-| Oracle arithmetic score | 12.22 / 30 |
+| Oracle weighted score | 14.26 / 30 |
+| Oracle arithmetic score | 12.99 / 30 |
 | Score range | 0.00 – 30.00 |
 
 ---
@@ -47,5 +47,5 @@ The champion agent is promoted to `agent/champion/` and this table is updated au
 
 - Weighted mean score is the primary ranking metric: hard problems (≥150 added lines) count 2×, medium (30–149) 1.5×, easy (<30) 1×.
 - Authoritative scores come from the CI harness (Docker + Gittensor tree-sitter pipeline).
-- Oracle score = mean tree-sitter score across all 812 accepted reference diffs.
+- Oracle score = mean tree-sitter score across all 763 accepted reference diffs.
 - Multipliers (time decay, review quality, label, issue) applied in CI; local runs set them to 1.0.

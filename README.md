@@ -1,7 +1,7 @@
 # Gittensor Base-Miner Benchmark
 
 [![Dashboard](https://img.shields.io/badge/dashboard-live-brightgreen)](https://punchthedev.github.io/gittensor-miner-dashboard/)
-[![Pool](https://img.shields.io/badge/pool-812%20problems-blue)](benchmark/problems/)
+[![Pool](https://img.shields.io/badge/pool-763%20problems-blue)](benchmark/problems/)
 [![CI](https://github.com/PunchTheDev/gittensor-base-miner/actions/workflows/eval.yml/badge.svg)](https://github.com/PunchTheDev/gittensor-base-miner/actions/workflows/eval.yml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -31,7 +31,7 @@ The champion agent lives in `agent/champion/` and is updated each time a miner b
 
 ## How scoring works
 
-1. A curated pool of 812 real issues is held in `benchmark/problems/`, spanning 25 active repos across 5 language categories. Each eval round uses a rotating 30-problem shard.
+1. A curated pool of 763 real issues is held in `benchmark/problems/`, spanning 25 active repos across 5 language categories. Each eval round uses a rotating 30-problem shard.
 2. Each issue has a recorded "correct" solution (the merged PR diff) used as a reference signal.
 3. Your agent checks out the repo at the pre-issue commit, reads the issue, and produces a patch.
 4. Scoring is done by Gittensor's native engine: tests passing + issue requirements covered, then code quality/density.
@@ -90,9 +90,9 @@ python3 gitminer.py run --problem 0463 --score --no-sandbox --repair 3   # if te
 python3 gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 
 # Calibration check: score reference diffs to verify the full pipeline (no agent or API key needed)
-python3 gitminer.py eval --oracle --no-sandbox   # expected weighted mean: ~13.62 / 30.00
+python3 gitminer.py eval --oracle --no-sandbox   # expected weighted mean: ~14.26 / 30.00
 
-# Evaluate against all 812 pool problems
+# Evaluate against all 763 pool problems
 python3 gitminer.py eval agent/submissions/yourhandle/agent.py --all
 
 # Evaluate against specific problem IDs
@@ -113,7 +113,7 @@ python3 gitminer.py submit agent/submissions/yourhandle/agent.py
 # --- Pool exploration ---
 
 # List and filter benchmark problems
-python3 gitminer.py problems                                    # all 812 problems
+python3 gitminer.py problems                                    # all 763 problems
 python3 gitminer.py problems --cat python --difficulty hard     # filter by language/difficulty
 python3 gitminer.py problems --repo ragflow --limit 10          # filter by repo name
 python3 gitminer.py problems --search "rate limit"              # full-text search
@@ -155,7 +155,7 @@ agent/
   example/             # baseline reference implementation (observe → plan → act loop)
   submissions/         # miner agent landing zone
 benchmark/
-  problems/            # 812 curated historical issues (one dir per PR id)
+  problems/            # 763 curated historical issues (one dir per PR id)
   harness/             # replay and scoring pipeline
   evaluate.py          # evaluation runner (used by gitminer and CI)
   pool_config.json     # pool/shard configuration
