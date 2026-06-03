@@ -34,7 +34,7 @@ import os
 import random
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date
 from pathlib import Path
 
 from benchmark.catalog import DIFFICULTY_TIERS, DEFAULT_SHARD_BUDGET, REPO_CATEGORY

@@ -97,55 +97,25 @@ def _oracle_weighted_score() -> float:
         return 0.0
 
 
-def _shard_ids(all_ids: list[str], config: dict) -> list[str]:
-    shard_size = config.get("shard_size", 30)
-    policy = config.get("rotation_policy", "weekly")
-    base_seed = config.get("rotation_seed", 42)
-
-    if shard_size >= len(all_ids):
-        return all_ids
-
-    if policy == "fixed":
-        seed = base_seed
-    elif policy == "weekly":
-        epoch = date(2024, 1, 1)
-        week_number = (date.today() - epoch).days // 7
-        seed = base_seed ^ week_number
-    else:
-        seed = random.randint(0, 2**32)
-
-    secret = os.environ.get("SHARD_SECRET", "")
-    if secret:
-        secret_int = int(hashlib.sha256(secret.encode()).hexdigest()[:8], 16)
-        seed ^= secret_int
-
-    rng = random.Random(seed)
-    pool = list(all_ids)
-    rng.shuffle(pool)
-    return pool[:shard_size]
-
-
-def _difficulty(base_score: float) -> str:
-    """Legacy score-based tier — not used internally, kept for external callers."""
-    if base_score >= 15:
-        return "easy"
-    if base_score >= 5:
-        return "medium"
-    return "hard"
+def _shard_problem_dirs(config: dict) -> list[Path]:
+    """Return the category-balanced shard dirs, matching evaluate.py exactly."""
+    from benchmark.evaluate import select_shard
+    all_dirs = sorted(POOL_DIR.glob("*/meta.json"))
+    if not all_dirs:
+        return []
+    return select_shard([p.parent for p in all_dirs], config)
 
 
 def _difficulty_by_lines(problem_dir: Path) -> str:
-    """Difficulty based on reference diff added-line count — mirrors evaluate.py."""
+    """Difficulty tier based on reference diff size — uses catalog thresholds."""
+    from benchmark.catalog import problem_tier
     ref = problem_dir / "reference.diff"
     if not ref.exists():
         return "medium"
     added = sum(1 for line in ref.read_text(errors="replace").splitlines()
                 if line.startswith("+") and not line.startswith("+++"))
-    if added < 30:
-        return "easy"
-    if added < 150:
-        return "medium"
-    return "hard"
+    name, _ = problem_tier(added)
+    return name
 
 
 def _category(meta: dict) -> str:
@@ -245,7 +215,7 @@ class Handler(BaseHTTPRequestHandler):
         scores = list(baselines.values())
         config = _pool_config()
         all_ids = _all_problem_ids()
-        shard = _shard_ids(all_ids, config)
+        shard = _shard_problem_dirs(config)
 
         by_category: dict[str, int] = {}
         by_difficulty: dict[str, int] = {}
@@ -272,26 +242,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _shard(self) -> dict:
         config = _pool_config()
-        all_ids = _all_problem_ids()
-        shard_ids = _shard_ids(all_ids, config)
         baselines = _baseline_map()
+        shard_dirs = _shard_problem_dirs(config)
 
         epoch = date(2024, 1, 1)
         week_number = (date.today() - epoch).days // 7
-        # Next rotation: next Monday
         today = date.today()
         days_to_monday = (7 - today.weekday()) % 7 or 7
         next_rotation = str(today + timedelta(days=days_to_monday))
 
         problems = []
-        for pid in shard_ids:
-            meta = _load_meta(pid)
+        for d in shard_dirs:
+            meta = _load_meta(d.name)
             if meta:
                 problems.append(_problem_summary(meta, baselines))
 
         return {
             "week": week_number,
-            "shard_size": len(shard_ids),
+            "shard_size": len(shard_dirs),
             "next_rotation": next_rotation,
             "problems": problems,
         }
@@ -372,7 +340,7 @@ class Handler(BaseHTTPRequestHandler):
         config = _pool_config()
         baselines = _baseline_map()
         all_ids = _all_problem_ids()
-        shard_ids = _shard_ids(all_ids, config)
+        shard_dirs = _shard_problem_dirs(config)
 
         # Load allowed models
         allowed_models_path = REPO_ROOT / "benchmark" / "harness" / "allowed_models.txt"
@@ -417,7 +385,7 @@ class Handler(BaseHTTPRequestHandler):
             },
             "pool": {
                 "total_problems": len(all_ids),
-                "shard_size": len(shard_ids),
+                "shard_size": len(shard_dirs),
                 "rotation": config.get("rotation_policy", "weekly"),
                 "categories": config.get("shard_budget", {}),
                 "source": "Gittensor DAS network — real merged PRs from registered repos",

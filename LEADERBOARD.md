@@ -31,7 +31,7 @@ See [docs/scoring.md](docs/scoring.md) for the full scoring philosophy and formu
 | Metric | Value |
 |--------|-------|
 | Pool size | 1154 problems |
-| Repos | 46 active repos (6 language categories) |
+| Repos | 47 active repos (6 language categories) |
 | Shard size | 30 (rotates weekly, category-balanced) |
 | Oracle weighted score | 12.70 / 30 |
 | Oracle arithmetic score | 11.48 / 30 |
