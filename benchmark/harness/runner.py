@@ -130,6 +130,10 @@ Phase 2 scorer — reads staging artifacts from Phase 1, emits JSON score.
 
 Primary: tree-sitter AST scorer (when ts_scorer.py + weights present in staging).
 Fallback: heuristic diff-token count (always available, ~2x above DAS).
+
+Always computes base_score from diff quality regardless of test result.
+Partial test passes earn partial credit via test_pass_rate × relative_score
+in the enrichment step — so quality must be scored even when tests fail.
 """
 import json, math, pathlib, re, sys
 
@@ -153,13 +157,8 @@ test_rc = int((staging / "test_rc").read_text().strip()) if (staging / "test_rc"
 tests_passed = test_rc == 0
 test_out = (staging / "test_out.txt").read_text(errors="replace") if (staging / "test_out.txt").exists() else ""
 
-if not tests_passed:
-    print(json.dumps({"problem_id": problem_id, "patch_applied": True, "tests_passed": False,
-                       "test_output": test_out[-2000:], "base_score": 0.0, "final_score": 0.0}))
-    sys.exit(0)
 
-
-def _compute_base(src_tok: float, total_tok: float) -> float:
+def compute_base(src_tok: float, total_tok: float) -> float:
     initial = MERGED_PR_BASE_SCORE * (1.0 - math.exp(-src_tok / saturation_scale))
     bonus = round(min(1.0, total_tok / CONTRIBUTION_SCORE_FOR_FULL_BONUS) * MAX_CONTRIBUTION_BONUS, 2)
     return round(initial + bonus, 2)
@@ -168,7 +167,7 @@ def _compute_base(src_tok: float, total_tok: float) -> float:
 # ---------------------------------------------------------------------------
 # Primary: tree-sitter scorer
 # ---------------------------------------------------------------------------
-def _try_tree_sitter() -> "tuple[float, float] | None":
+def try_tree_sitter() -> "tuple[float, float] | None":
     fp_path = staging / "file_pairs.json"
     ts_path = staging / "ts_scorer.py"
     if not fp_path.exists() or not ts_path.exists():
@@ -198,7 +197,12 @@ def _try_tree_sitter() -> "tuple[float, float] | None":
         return None
 
 
-ts_result = _try_tree_sitter()
+# ---------------------------------------------------------------------------
+# Compute diff quality regardless of test result.
+# benchmark_score = test_pass_rate × relative_score — so partial passes earn
+# proportional credit when tests_passed is False but test_pass_rate > 0.
+# ---------------------------------------------------------------------------
+ts_result = try_tree_sitter()
 if ts_result is not None:
     src_tok, total_tok = ts_result
     scoring_method = "tree-sitter"
@@ -238,11 +242,12 @@ else:
 
     scoring_method = "heuristic"
 
-base_score = _compute_base(src_tok, total_tok)
+base_score = compute_base(src_tok, total_tok)
 print(json.dumps({
     "problem_id": problem_id,
     "patch_applied": True,
-    "tests_passed": True,
+    "tests_passed": tests_passed,
+    "test_output": test_out[-2000:] if not tests_passed else None,
     "source_token_score": round(src_tok, 2),
     "total_token_score": round(total_tok, 2),
     "scoring_method": scoring_method,
