@@ -1,0 +1,2341 @@
+import {Buffer} from 'node:buffer';
+import {Agent as HttpAgent} from 'node:http';
+import test from 'ava';
+import nock from 'nock';
+import getStream from 'get-stream';
+import FormData from 'form-data';
+import sinon from 'sinon';
+import delay from 'delay';
+import type {Handler} from 'express';
+import Responselike from 'responselike';
+import type {Constructor} from 'type-fest';
+import got, {
+	RequestError,
+	HTTPError,
+	type Response,
+	type OptionsInit,
+} from '../source/index.js';
+import withServer from './helpers/with-server.js';
+
+const errorString = 'oops';
+const error = new Error(errorString);
+
+const echoHeaders: Handler = (request, response) => {
+	response.end(JSON.stringify(request.headers));
+};
+
+const echoBody: Handler = async (request, response) => {
+	response.end(await getStream(request));
+};
+
+const echoUrl: Handler = (request, response) => {
+	response.end(request.url);
+};
+
+const retryEndpoint: Handler = (request, response) => {
+	if (request.headers.foo) {
+		response.statusCode = 302;
+		response.setHeader('location', '/');
+		response.end();
+	}
+
+	response.statusCode = 500;
+	response.end();
+};
+
+const redirectEndpoint: Handler = (_request, response) => {
+	response.statusCode = 302;
+	response.setHeader('location', '/');
+	response.end();
+};
+
+const createAgentSpy = <T extends HttpAgent>(AgentClass: Constructor<any>): {agent: T; spy: sinon.SinonSpy} => {
+	const agent: T = new AgentClass({keepAlive: true});
+	// eslint-disable-next-line import/no-named-as-default-member
+	const spy = sinon.spy(agent, 'addRequest' as any);
+	return {agent, spy};
+};
+
+test('async hooks', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	const {body} = await got<Record<string, string>>({
+		responseType: 'json',
+		hooks: {
+			beforeRequest: [
+				async options => {
+					await delay(100);
+					options.headers.foo = 'bar';
+				},
+			],
+		},
+	});
+	t.is(body.foo, 'bar');
+});
+
+test('catches init thrown errors', async t => {
+	await t.throwsAsync(got('https://example.com', {
+		hooks: {
+			init: [() => {
+				throw error;
+			}],
+		},
+	}), {
+		instanceOf: RequestError,
+		message: errorString,
+	});
+});
+
+test('passes init thrown errors to beforeError hooks (promise-only)', async t => {
+	t.plan(1);
+
+	await t.throwsAsync(got('https://example.com', {
+		hooks: {
+			init: [() => {
+				throw error;
+			}],
+			beforeError: [error => {
+				t.is(error.message, errorString);
+
+				return error;
+			}],
+		},
+	}), {
+		instanceOf: RequestError,
+		message: errorString,
+	});
+});
+
+test('catches beforeRequest thrown errors', async t => {
+	await t.throwsAsync(got('https://example.com', {
+		hooks: {
+			beforeRequest: [() => {
+				throw error;
+			}],
+		},
+	}), {
+		instanceOf: RequestError,
+		message: errorString,
+	});
+});
+
+test('catches beforeRedirect thrown errors', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+	server.get('/redirect', redirectEndpoint);
+
+	await t.throwsAsync(got('redirect', {
+		hooks: {
+			beforeRedirect: [() => {
+				throw error;
+			}],
+		},
+	}), {
+		instanceOf: RequestError,
+		message: errorString,
+	});
+});
+
+test('catches beforeRetry thrown errors', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+	server.get('/retry', retryEndpoint);
+
+	await t.throwsAsync(got('retry', {
+		hooks: {
+			beforeRetry: [() => {
+				throw error;
+			}],
+		},
+	}), {
+		instanceOf: RequestError,
+		message: errorString,
+	});
+});
+
+test('throws if afterResponse returns an invalid value', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	await t.throwsAsync(got('', {
+		hooks: {
+			afterResponse: [
+				// @ts-expect-error Testing purposes
+				() => {},
+			],
+		},
+	}), {
+		message: 'The `afterResponse` hook returned an invalid value',
+	});
+});
+
+test('catches afterResponse thrown errors', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	await t.throwsAsync(got({
+		hooks: {
+			afterResponse: [() => {
+				throw error;
+			}],
+		},
+	}), {
+		instanceOf: RequestError,
+		message: errorString,
+	});
+});
+
+test('accepts an async function as init hook', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.end('ok');
+	});
+
+	await got('', {
+		hooks: {
+			init: [
+				async () => {
+					t.pass();
+				},
+			],
+		},
+	});
+});
+
+test('catches beforeRequest promise rejections', async t => {
+	await t.throwsAsync(got('https://example.com', {
+		hooks: {
+			beforeRequest: [
+				async () => {
+					throw error;
+				},
+			],
+		},
+	}), {
+		instanceOf: RequestError,
+		message: errorString,
+	});
+});
+
+test('catches beforeRedirect promise rejections', withServer, async (t, server, got) => {
+	server.get('/', redirectEndpoint);
+
+	await t.throwsAsync(got({
+		hooks: {
+			beforeRedirect: [
+				async () => {
+					throw error;
+				},
+			],
+		},
+	}), {
+		instanceOf: RequestError,
+		message: errorString,
+	});
+});
+
+test('catches beforeRetry promise rejections', withServer, async (t, server, got) => {
+	server.get('/retry', retryEndpoint);
+
+	await t.throwsAsync(got('retry', {
+		hooks: {
+			beforeRetry: [
+				async () => {
+					throw error;
+				},
+			],
+		},
+	}), {
+		instanceOf: RequestError,
+		message: errorString,
+	});
+});
+
+test('catches afterResponse promise rejections', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	await t.throwsAsync(got({
+		hooks: {
+			afterResponse: [
+				async () => {
+					throw error;
+				},
+			],
+		},
+	}), {message: errorString});
+});
+
+test('catches beforeError errors', async t => {
+	await t.throwsAsync(got('https://example.com', {
+		request() {
+			throw new Error('No way');
+		},
+		hooks: {
+			beforeError: [
+				async () => {
+					throw error;
+				},
+			],
+		},
+	}), {message: errorString});
+});
+
+test('init is called with options', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	const context = {};
+
+	await got({
+		hooks: {
+			init: [
+				options => {
+					t.deepEqual(options.context, context);
+				},
+			],
+		},
+		context,
+	});
+});
+
+test('init from defaults is called with options', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	const context = {};
+
+	let count = 0;
+
+	const instance = got.extend({
+		hooks: {
+			init: [
+				options => {
+					count += options.context ? 1 : 0;
+				},
+			],
+		},
+	});
+
+	await instance({context});
+
+	t.is(count, 1);
+});
+
+test('init allows modifications', withServer, async (t, server, got) => {
+	server.get('/', (request, response) => {
+		response.end(request.headers.foo);
+	});
+
+	const options = {
+		headers: {},
+		hooks: {
+			init: [
+				(options: OptionsInit) => {
+					options.headers = {
+						foo: 'bar',
+					};
+				},
+			],
+		},
+	};
+
+	const {body} = await got('', options);
+
+	t.deepEqual(options.headers, {});
+	t.is(body, 'bar');
+});
+
+test('beforeRequest is called with options', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	await got({
+		responseType: 'json',
+		hooks: {
+			beforeRequest: [
+				options => {
+					const url = options.url!;
+					t.is(url.pathname, '/');
+					t.is(url.hostname, 'localhost');
+				},
+			],
+		},
+	});
+});
+
+test('beforeRequest allows modifications', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	const {body} = await got<Record<string, string>>({
+		responseType: 'json',
+		hooks: {
+			beforeRequest: [
+				options => {
+					options.headers.foo = 'bar';
+				},
+			],
+		},
+	});
+	t.is(body.foo, 'bar');
+});
+
+test('beforeRequest is called with context', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	await got({
+		hooks: {
+			beforeRequest: [
+				(_options, context) => {
+					t.truthy(context);
+					t.is(typeof context.retryCount, 'number');
+				},
+			],
+		},
+	});
+});
+
+test('beforeRequest context has retryCount 0 on initial request', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	await got({
+		hooks: {
+			beforeRequest: [
+				(_options, context) => {
+					t.is(context.retryCount, 0);
+				},
+			],
+		},
+	});
+});
+
+test('beforeRequest context retryCount increments on retries', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 500;
+		response.end();
+	});
+
+	const retryCounts: number[] = [];
+
+	await t.throwsAsync(got({
+		retry: {
+			limit: 2,
+		},
+		hooks: {
+			beforeRequest: [
+				(_options, context) => {
+					retryCounts.push(context.retryCount);
+				},
+			],
+		},
+	}), {instanceOf: HTTPError});
+
+	t.is(retryCounts.length, 3);
+	t.is(retryCounts[0], 0); // Initial request
+	t.is(retryCounts[1], 1); // First retry
+	t.is(retryCounts[2], 2); // Second retry
+});
+
+test('returning HTTP response from a beforeRequest hook', withServer, async (t, server, got) => {
+	server.get('/', echoUrl);
+
+	const {statusCode, headers, body} = await got({
+		hooks: {
+			beforeRequest: [
+				() => new Responselike({
+					statusCode: 200,
+					headers: {
+						foo: 'bar',
+					},
+					body: Buffer.from('Hi!'),
+					url: '',
+				}),
+			],
+		},
+	});
+
+	t.is(statusCode, 200);
+	t.is(headers.foo, 'bar');
+	t.is(body, 'Hi!');
+});
+
+test('returning HTTP response from a beforeRequest hook with FormData body', withServer, async (t, server, got) => {
+	server.post('/', echoBody);
+
+	const form = new FormData();
+	form.append('field', 'value');
+
+	const data = await got.post({
+		body: form,
+		hooks: {
+			beforeRequest: [
+				() => new Responselike({
+					statusCode: 200,
+					headers: {},
+					body: Buffer.from('{"cached": "response"}'),
+					url: '',
+				}),
+			],
+		},
+	}).json<{cached: string}>();
+
+	t.is(data.cached, 'response');
+});
+
+test('beforeRedirect is called with options and response', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+	server.get('/redirect', redirectEndpoint);
+
+	await got('redirect', {
+		responseType: 'json',
+		hooks: {
+			beforeRedirect: [
+				(options, response) => {
+					const url = options.url!;
+					t.is(url.pathname, '/');
+					t.is(url.hostname, 'localhost');
+
+					t.is(response.statusCode, 302);
+					t.is(new URL(response.url).pathname, '/redirect');
+					t.is(response.redirectUrls.length, 1);
+				},
+			],
+		},
+	});
+});
+
+test('beforeRedirect allows modifications', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+	server.get('/redirect', redirectEndpoint);
+
+	const {body} = await got<Record<string, string>>('redirect', {
+		responseType: 'json',
+		hooks: {
+			beforeRedirect: [
+				options => {
+					options.headers.foo = 'bar';
+				},
+			],
+		},
+	});
+	t.is(body.foo, 'bar');
+});
+
+test('beforeRetry is called with options', withServer, async (t, server) => {
+	server.get('/', echoHeaders);
+	server.get('/retry', retryEndpoint);
+
+	const context = {};
+
+	await got('retry', {
+		prefixUrl: server.url,
+		responseType: 'json',
+		retry: {
+			limit: 1,
+		},
+		throwHttpErrors: false,
+		context,
+		hooks: {
+			beforeRetry: [
+				(error, retryCount) => {
+					const {options} = error;
+					const {retryCount: requestRetryCount} = error.request!;
+					t.is((options.url as URL).hostname, 'localhost');
+					t.deepEqual(options.context, context);
+					t.truthy(error);
+					t.is(requestRetryCount, 0);
+					t.is(retryCount, 1);
+				},
+			],
+		},
+	});
+});
+
+test('beforeRetry allows modifications', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+	server.get('/retry', retryEndpoint);
+
+	const {body} = await got<Record<string, string>>('retry', {
+		responseType: 'json',
+		hooks: {
+			beforeRetry: [
+				({options}) => {
+					options.headers.foo = 'bar';
+				},
+			],
+		},
+	});
+	t.is(body.foo, 'bar');
+});
+
+test('beforeRetry allows stream body if different from original', withServer, async (t, server, got) => {
+	server.post('/retry', async (request, response) => {
+		if (request.headers.foo) {
+			response.send('test');
+		} else {
+			response.statusCode = 500;
+		}
+
+		response.end();
+	});
+
+	const generateBody = () => {
+		const form = new FormData();
+		form.append('A', 'B');
+		return form;
+	};
+
+	const {body} = await got.post('retry', {
+		body: generateBody(),
+		retry: {
+			methods: ['POST'],
+		},
+		hooks: {
+			beforeRetry: [
+				({options}) => {
+					const form = generateBody();
+					options.body = form;
+					options.headers['content-type'] = `multipart/form-data; boundary=${form.getBoundary()}`;
+					options.headers.foo = 'bar';
+				},
+			],
+		},
+	});
+
+	t.is(body, 'test');
+});
+
+test('prefixUrl is preserved in beforeRequest hook', withServer, async (t, server, got) => {
+	server.get('/endpoint', (_request, response) => {
+		response.end('success');
+	});
+
+	let capturedPrefixUrl: string | URL | undefined;
+
+	await got('endpoint', {
+		prefixUrl: server.url,
+		hooks: {
+			beforeRequest: [
+				options => {
+					capturedPrefixUrl = options.prefixUrl;
+				},
+			],
+		},
+	});
+
+	const normalizedServerUrl = new URL(server.url).toString();
+	t.is(capturedPrefixUrl, normalizedServerUrl);
+});
+
+test('prefixUrl is preserved in beforeRetry hook', withServer, async (t, server, got) => {
+	server.get('/retry', (_request, response) => {
+		response.statusCode = 500;
+		response.end();
+	});
+
+	let capturedPrefixUrl: string | URL | undefined;
+
+	await t.throwsAsync(got('retry', {
+		prefixUrl: server.url,
+		retry: {
+			limit: 1,
+		},
+		hooks: {
+			beforeRetry: [
+				({options}) => {
+					capturedPrefixUrl = options.prefixUrl;
+				},
+			],
+		},
+	}));
+
+	const normalizedServerUrl = new URL(server.url).toString();
+	t.is(capturedPrefixUrl, normalizedServerUrl);
+});
+
+test('setting absolute URL in hook does not concatenate with prefixUrl', withServer, async (t, server, got) => {
+	server.get('/original', (_request, response) => {
+		response.end('original');
+	});
+
+	server.get('/changed', (_request, response) => {
+		response.end('changed');
+	});
+
+	const {body} = await got('original', {
+		prefixUrl: server.url,
+		hooks: {
+			beforeRequest: [
+				options => {
+					// Set absolute URL - should not concatenate with prefixUrl
+					options.url = new URL(`${server.url}/changed`);
+				},
+			],
+		},
+	});
+
+	t.is(body, 'changed');
+});
+
+test('allows colon in path segment with prefixUrl (CouchDB user URLs)', withServer, async (t, server, serverGot) => {
+	server.get('/_users/org.couchdb.user:test@user.com', (_request, response) => {
+		response.end('user document');
+	});
+
+	const client = serverGot.extend({
+		prefixUrl: `${server.url}/_users/`,
+	});
+
+	const {body} = await client.get('org.couchdb.user:test@user.com');
+	t.is(body, 'user document');
+});
+
+test('allows multiple colons in path with prefixUrl', withServer, async (t, server, serverGot) => {
+	server.get('/api/ns:type:id', (_request, response) => {
+		response.end('namespaced');
+	});
+
+	const client = serverGot.extend({
+		prefixUrl: `${server.url}/api/`,
+	});
+
+	const {body} = await client.get('ns:type:id');
+	t.is(body, 'namespaced');
+});
+
+test('allows mailto-like patterns in path with prefixUrl', withServer, async (t, server, serverGot) => {
+	server.get('/users/mailto:test@example.com', (_request, response) => {
+		response.end('email user');
+	});
+
+	const client = serverGot.extend({
+		prefixUrl: `${server.url}/users/`,
+	});
+
+	const {body} = await client.get('mailto:test@example.com');
+	t.is(body, 'email user');
+});
+
+test('allows URN-like patterns in path with prefixUrl', withServer, async (t, server, serverGot) => {
+	server.get('/resources/urn:isbn:123', (_request, response) => {
+		response.end('book');
+	});
+
+	const client = serverGot.extend({
+		prefixUrl: `${server.url}/resources/`,
+	});
+
+	const {body} = await client.get('urn:isbn:123');
+	t.is(body, 'book');
+});
+
+test('afterResponse is called with response', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	await got({
+		responseType: 'json',
+		hooks: {
+			afterResponse: [
+				response => {
+					t.is(typeof response.body, 'object');
+
+					return response;
+				},
+			],
+		},
+	});
+});
+
+test('afterResponse allows modifications', withServer, async (t, server, got) => {
+	server.get('/', echoHeaders);
+
+	const {body} = await got<Record<string, string>>({
+		responseType: 'json',
+		hooks: {
+			afterResponse: [
+				response => {
+					response.body = {hello: 'world'};
+					return response;
+				},
+			],
+		},
+	});
+	t.is(body.hello, 'world');
+});
+
+test('afterResponse allows to retry', withServer, async (t, server, got) => {
+	server.get('/', (request, response) => {
+		if (request.headers.token !== 'unicorn') {
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	const {statusCode} = await got({
+		hooks: {
+			afterResponse: [
+				(response, retryWithMergedOptions) => {
+					if (response.statusCode === 401) {
+						return retryWithMergedOptions({
+							headers: {
+								token: 'unicorn',
+							},
+						});
+					}
+
+					return response;
+				},
+			],
+		},
+	});
+	t.is(statusCode, 200);
+});
+
+test('afterResponse allows to retry without losing the port', withServer, async (t, server) => {
+	server.get('/', (request, response) => {
+		if (request.headers.token !== 'unicorn') {
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	const {statusCode} = await got({
+		url: server.url,
+		hooks: {
+			afterResponse: [
+				(response: Response, retryWithMergedOptions: (options: OptionsInit) => never) => {
+					if (response.statusCode === 401) {
+						return retryWithMergedOptions({
+							headers: {
+								token: 'unicorn',
+							},
+						});
+					}
+
+					return response;
+				},
+			],
+		},
+	});
+	t.is(statusCode, 200);
+});
+
+test('cancelling the request after retrying in a afterResponse hook', withServer, async (t, server, got) => {
+	let requests = 0;
+	server.get('/', (_request, response) => {
+		requests++;
+		response.end();
+	});
+
+	const controller = new AbortController();
+
+	const gotPromise = got({
+		signal: controller.signal,
+		hooks: {
+			afterResponse: [
+				(_response, retryWithMergedOptions) => {
+					const promise = retryWithMergedOptions({
+						headers: {
+							token: 'unicorn',
+						},
+					});
+
+					controller.abort();
+
+					return promise;
+				},
+			],
+		},
+		retry: {
+			calculateDelay: () => 1,
+		},
+	});
+
+	await t.throwsAsync(gotPromise);
+	await delay(100);
+	t.is(requests, 1);
+});
+
+test('afterResponse allows to retry - `beforeRetry` hook', withServer, async (t, server, got) => {
+	server.get('/', (request, response) => {
+		if (request.headers.token !== 'unicorn') {
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	let isCalled = false;
+
+	const {statusCode} = await got({
+		hooks: {
+			afterResponse: [
+				(response, retryWithMergedOptions) => {
+					if (response.statusCode === 401) {
+						return retryWithMergedOptions({
+							headers: {
+								token: 'unicorn',
+							},
+						});
+					}
+
+					return response;
+				},
+			],
+			beforeRetry: [
+				options => {
+					t.truthy(options);
+					isCalled = true;
+				},
+			],
+		},
+	});
+	t.is(statusCode, 200);
+	t.true(isCalled);
+});
+
+test('no infinity loop when retrying on afterResponse', withServer, async (t, server, got) => {
+	server.get('/', (request, response) => {
+		if (request.headers.token !== 'unicorn') {
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	await t.throwsAsync(got({
+		retry: {
+			limit: 0,
+		},
+		hooks: {
+			afterResponse: [
+				(_response, retryWithMergedOptions) => retryWithMergedOptions({
+					headers: {
+						token: 'invalid',
+					},
+				}),
+			],
+		},
+	}), {instanceOf: HTTPError, message: /^Request failed with status code 401 \(Unauthorized\): GET http:\/\/localhost:\d+\/$/});
+});
+
+test('throws on afterResponse retry failure', withServer, async (t, server, got) => {
+	let didVisit401then500: boolean;
+	server.get('/', (_request, response) => {
+		if (didVisit401then500) {
+			response.statusCode = 500;
+		} else {
+			didVisit401then500 = true;
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	await t.throwsAsync(got({
+		retry: {
+			limit: 1,
+		},
+		hooks: {
+			afterResponse: [
+				(response, retryWithMergedOptions) => {
+					if (response.statusCode === 401) {
+						return retryWithMergedOptions({
+							headers: {
+								token: 'unicorn',
+							},
+						});
+					}
+
+					return response;
+				},
+			],
+		},
+	}), {instanceOf: HTTPError, message: /^Request failed with status code 500 \(Internal Server Error\): GET http:\/\/localhost:\d+\/$/});
+});
+
+test('does not throw on afterResponse retry HTTP failure if throwHttpErrors is false', withServer, async (t, server, got) => {
+	let didVisit401then500: boolean;
+	server.get('/', (_request, response) => {
+		if (didVisit401then500) {
+			response.statusCode = 500;
+		} else {
+			didVisit401then500 = true;
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	const {statusCode} = await got({
+		throwHttpErrors: false,
+		retry: {
+			limit: 1,
+		},
+		hooks: {
+			afterResponse: [
+				(response, retryWithMergedOptions) => {
+					if (response.statusCode === 401) {
+						return retryWithMergedOptions({
+							headers: {
+								token: 'unicorn',
+							},
+						});
+					}
+
+					return response;
+				},
+			],
+		},
+	});
+	t.is(statusCode, 500);
+});
+
+test('afterResponse preserveHooks keeps remaining hooks on retry', withServer, async (t, server, got) => {
+	server.get('/', (request, response) => {
+		if (request.headers.token !== 'unicorn') {
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	let firstHookCalls = 0;
+	let secondHookCalls = 0;
+
+	const {statusCode} = await got({
+		hooks: {
+			afterResponse: [
+				(response, retryWithMergedOptions) => {
+					firstHookCalls++;
+
+					if (response.statusCode === 401) {
+						return retryWithMergedOptions({
+							headers: {
+								token: 'unicorn',
+							},
+							preserveHooks: true,
+						});
+					}
+
+					return response;
+				},
+				response => {
+					secondHookCalls++;
+					return response;
+				},
+			],
+		},
+	});
+
+	t.is(statusCode, 200);
+	t.is(firstHookCalls, 2); // Called for both original and retry
+	t.is(secondHookCalls, 1); // Called only on retry (original was interrupted by RetryError)
+});
+
+test('afterResponse without preserveHooks skips remaining hooks on retry', withServer, async (t, server, got) => {
+	server.get('/', (request, response) => {
+		if (request.headers.token !== 'unicorn') {
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	let firstHookCalls = 0;
+	let secondHookCalls = 0;
+
+	const {statusCode} = await got({
+		hooks: {
+			afterResponse: [
+				(response, retryWithMergedOptions) => {
+					firstHookCalls++;
+
+					if (response.statusCode === 401) {
+						return retryWithMergedOptions({
+							headers: {
+								token: 'unicorn',
+							},
+						});
+					}
+
+					return response;
+				},
+				response => {
+					secondHookCalls++;
+					return response;
+				},
+			],
+		},
+	});
+
+	t.is(statusCode, 200);
+	t.is(firstHookCalls, 1); // Called only on original request (removed from retry by default)
+	t.is(secondHookCalls, 0); // Never called (removed by slice before it could run)
+});
+
+test('afterResponse preserveHooks with three hooks', withServer, async (t, server, got) => {
+	server.get('/', (request, response) => {
+		if (request.headers.token !== 'unicorn') {
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	let firstHookCalls = 0;
+	let secondHookCalls = 0;
+	let thirdHookCalls = 0;
+
+	const {statusCode} = await got({
+		hooks: {
+			afterResponse: [
+				(response, retryWithMergedOptions) => {
+					firstHookCalls++;
+
+					if (response.statusCode === 401) {
+						return retryWithMergedOptions({
+							headers: {
+								token: 'unicorn',
+							},
+							preserveHooks: true,
+						});
+					}
+
+					return response;
+				},
+				response => {
+					secondHookCalls++;
+					return response;
+				},
+				response => {
+					thirdHookCalls++;
+					return response;
+				},
+			],
+		},
+	});
+
+	t.is(statusCode, 200);
+	t.is(firstHookCalls, 2); // Called for both original and retry
+	t.is(secondHookCalls, 1); // Called only on retry
+	t.is(thirdHookCalls, 1); // Called only on retry
+});
+
+test('afterResponse preserveHooks when second hook triggers retry', withServer, async (t, server, got) => {
+	server.get('/', (request, response) => {
+		if (request.headers.token !== 'unicorn') {
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	let firstHookCalls = 0;
+	let secondHookCalls = 0;
+	let thirdHookCalls = 0;
+
+	const {statusCode} = await got({
+		hooks: {
+			afterResponse: [
+				response => {
+					firstHookCalls++;
+					return response;
+				},
+				(response, retryWithMergedOptions) => {
+					secondHookCalls++;
+
+					if (response.statusCode === 401) {
+						return retryWithMergedOptions({
+							headers: {
+								token: 'unicorn',
+							},
+							preserveHooks: true,
+						});
+					}
+
+					return response;
+				},
+				response => {
+					thirdHookCalls++;
+					return response;
+				},
+			],
+		},
+	});
+
+	t.is(statusCode, 200);
+	t.is(firstHookCalls, 2); // Called for both original and retry (preserved by preserveHooks)
+	t.is(secondHookCalls, 2); // Called for both original and retry
+	t.is(thirdHookCalls, 1); // Called only on retry
+});
+
+test('throwing in a beforeError hook - promise', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.end('ok');
+	});
+
+	await t.throwsAsync(got({
+		hooks: {
+			afterResponse: [
+				() => {
+					throw error;
+				},
+			],
+			beforeError: [
+				(): never => {
+					throw new Error('foobar');
+				},
+				() => {
+					throw new Error('This shouldn\'t be called at all');
+				},
+			],
+		},
+	}), {message: 'foobar'});
+});
+
+test('throwing in a beforeError hook - stream', withServer, async (t, _server, got) => {
+	await t.throwsAsync(getStream(got.stream({
+		hooks: {
+			beforeError: [
+				() => {
+					throw new Error('foobar');
+				},
+				() => {
+					throw new Error('This shouldn\'t be called at all');
+				},
+			],
+		},
+	})), {message: 'foobar'});
+});
+
+test('beforeError is called with an error - promise', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.end('ok');
+	});
+
+	await t.throwsAsync(got({
+		hooks: {
+			afterResponse: [
+				() => {
+					throw error;
+				},
+			],
+			beforeError: [error2 => {
+				t.true(error2 instanceof Error);
+				return error2;
+			}],
+		},
+	}), {message: errorString});
+});
+
+test('beforeError is called with an error - stream', withServer, async (t, _server, got) => {
+	await t.throwsAsync(getStream(got.stream({
+		hooks: {
+			beforeError: [error2 => {
+				t.true(error2 instanceof Error);
+				return error2;
+			}],
+		},
+	})), {message: /^Request failed with status code 404 \(Not Found\): GET http:\/\/localhost:\d+\/$/});
+});
+
+test('beforeError allows modifications', async t => {
+	const errorString2 = 'foobar';
+
+	await t.throwsAsync(got('https://example.com', {
+		request() {
+			throw error;
+		},
+		hooks: {
+			beforeError: [
+				error => {
+					const newError = new Error(errorString2);
+
+					return new RequestError(newError.message, newError, error.options);
+				},
+			],
+		},
+	}), {message: errorString2});
+});
+
+test('does not break on `afterResponse` hook with JSON mode', withServer, async (t, server, got) => {
+	server.get('/foobar', echoHeaders);
+
+	await t.notThrowsAsync(got('', {
+		hooks: {
+			afterResponse: [
+				(response, retryWithMergedOptions) => {
+					if (response.statusCode === 404) {
+						return retryWithMergedOptions({
+							url: new URL('/foobar', response.url),
+						});
+					}
+
+					return response;
+				},
+			],
+		},
+		responseType: 'json',
+	}));
+});
+
+test('catches HTTPErrors', withServer, async (t, _server, got) => {
+	t.plan(2);
+
+	await t.throwsAsync(got({
+		hooks: {
+			beforeError: [
+				error => {
+					t.true(error instanceof HTTPError);
+					return error;
+				},
+			],
+		},
+	}));
+});
+
+test('timeout can be modified using a hook', withServer, async (t, server, got) => {
+	server.get('/', () => {});
+
+	await t.throwsAsync(got({
+		timeout: {
+			request: 1000,
+		},
+		hooks: {
+			beforeRequest: [
+				options => {
+					options.timeout.request = 500;
+				},
+			],
+		},
+		retry: {
+			limit: 1,
+		},
+	}), {message: 'Timeout awaiting \'request\' for 500ms'});
+});
+
+test('beforeRequest hook is called before each request', withServer, async (t, server, got) => {
+	server.post('/', echoUrl);
+	server.post('/redirect', redirectEndpoint);
+
+	const buffer = Buffer.from('Hello, Got!');
+	let counts = 0;
+
+	await got.post('redirect', {
+		body: buffer,
+		hooks: {
+			beforeRequest: [
+				options => {
+					counts++;
+					t.is(options.headers['content-length'], String(buffer.length));
+				},
+			],
+		},
+	});
+
+	t.is(counts, 2);
+});
+
+test('beforeError emits valid promise `HTTPError`s', async t => {
+	t.plan(3);
+
+	nock('https://ValidHTTPErrors.com').get('/').reply(() => [422, 'no']);
+
+	const instance = got.extend({
+		hooks: {
+			beforeError: [
+				error => {
+					t.true(error instanceof HTTPError);
+					t.truthy(error.response!.body);
+
+					return error;
+				},
+			],
+		},
+		retry: {
+			limit: 0,
+		},
+	});
+
+	await t.throwsAsync(instance('https://ValidHTTPErrors.com'));
+});
+
+test('hooks are not duplicated', withServer, async (t, _server, got) => {
+	let calls = 0;
+
+	await t.throwsAsync(got({
+		hooks: {
+			beforeError: [
+				error => {
+					calls++;
+
+					return error;
+				},
+			],
+		},
+		retry: {
+			limit: 0,
+		},
+	}), {message: /^Request failed with status code 404 \(Not Found\): GET http:\/\/localhost:\d+\/$/});
+
+	t.is(calls, 1);
+});
+
+test('async afterResponse allows to retry with allowGetBody and json payload', withServer, async (t, server, got) => {
+	server.get('/', (request, response) => {
+		if (request.headers.token !== 'unicorn') {
+			response.statusCode = 401;
+		}
+
+		response.end();
+	});
+
+	const {statusCode} = await got({
+		allowGetBody: true,
+		json: {hello: 'world'},
+		hooks: {
+			afterResponse: [
+				(response, retryWithMergedOptions) => {
+					if (response.statusCode === 401) {
+						return retryWithMergedOptions({headers: {token: 'unicorn'}});
+					}
+
+					return response;
+				},
+			],
+		},
+		retry: {
+			limit: 0,
+		},
+		throwHttpErrors: false,
+	});
+
+	t.is(statusCode, 200);
+});
+
+test('beforeRequest hook respect `agent` option', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.end('ok');
+	});
+
+	const {agent, spy} = createAgentSpy(HttpAgent);
+
+	t.truthy((await got({
+		hooks: {
+			beforeRequest: [
+				options => {
+					options.agent = {
+						http: agent,
+					};
+				},
+			],
+		},
+	})).body);
+	t.true(spy.calledOnce);
+
+	// Make sure to close all open sockets
+	agent.destroy();
+});
+
+test('beforeRequest hook respect `url` option', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.end('ko');
+	});
+
+	server.get('/changed', (_request, response) => {
+		response.end('ok');
+	});
+
+	t.is((await got(server.hostname, {
+		hooks: {
+			beforeRequest: [
+				options => {
+					options.url = new URL(`${server.url}/changed`);
+				},
+			],
+		},
+	})).body, 'ok');
+});
+
+test('no duplicate hook calls in single-page paginated requests', withServer, async (t, server, got) => {
+	server.get('/get', (_request, response) => {
+		response.end('i <3 koalas');
+	});
+
+	let beforeHookCount = 0;
+	let beforeHookCountAdditional = 0;
+	let afterHookCount = 0;
+	let afterHookCountAdditional = 0;
+
+	const hooks = {
+		beforeRequest: [
+			() => {
+				beforeHookCount++;
+			},
+		],
+		afterResponse: [
+			(response: any) => {
+				afterHookCount++;
+				return response;
+			},
+		],
+	};
+
+	// Test only one request
+	const instance = got.extend({
+		hooks,
+		pagination: {
+			paginate: () => false,
+			countLimit: 2009,
+			transform: response => [response],
+		},
+	});
+
+	await instance.paginate.all('get');
+	t.is(beforeHookCount, 1);
+	t.is(afterHookCount, 1);
+
+	await instance.paginate.all('get', {
+		hooks: {
+			beforeRequest: [
+				() => {
+					beforeHookCountAdditional++;
+				},
+			],
+			afterResponse: [
+				(response: any) => {
+					afterHookCountAdditional++;
+					return response;
+				},
+			],
+		},
+	});
+	t.is(beforeHookCount, 2);
+	t.is(afterHookCount, 2);
+	t.is(beforeHookCountAdditional, 1);
+	t.is(afterHookCountAdditional, 1);
+
+	await got.paginate.all('get', {
+		hooks,
+		pagination: {
+			paginate: () => false,
+			transform: response => [response],
+		},
+	});
+
+	t.is(beforeHookCount, 3);
+	t.is(afterHookCount, 3);
+});
+
+test('no duplicate hook calls in sequential paginated requests', withServer, async (t, server, got) => {
+	server.get('/get', (_request, response) => {
+		response.end('i <3 unicorns');
+	});
+
+	let requestNumber = 0;
+	let beforeHookCount = 0;
+	let afterHookCount = 0;
+
+	const hooks = {
+		beforeRequest: [
+			() => {
+				beforeHookCount++;
+			},
+		],
+		afterResponse: [
+			(response: any) => {
+				afterHookCount++;
+				return response;
+			},
+		],
+	};
+
+	// Test only two requests, one after another
+	const paginate = () => requestNumber++ === 0 ? {} : false;
+
+	const instance = got.extend({
+		hooks,
+		pagination: {
+			paginate,
+			countLimit: 2009,
+			transform: response => [response],
+		},
+	});
+
+	await instance.paginate.all('get');
+
+	t.is(beforeHookCount, 2);
+	t.is(afterHookCount, 2);
+	requestNumber = 0;
+
+	await got.paginate.all('get', {
+		hooks,
+		pagination: {
+			paginate,
+			transform: response => [response],
+		},
+	});
+
+	t.is(beforeHookCount, 4);
+	t.is(afterHookCount, 4);
+});
+
+test('intentional duplicate hooks in pagination with extended instance', withServer, async (t, server, got) => {
+	server.get('/get', (_request, response) => {
+		response.end('<3');
+	});
+
+	let beforeCount = 0; // Number of times the hooks from `extend` are called
+	let afterCount = 0;
+	let beforeCountAdditional = 0; // Number of times the added hooks are called
+	let afterCountAdditional = 0;
+
+	const beforeHook = () => {
+		beforeCount++;
+	};
+
+	const afterHook = (response: any) => {
+		afterCount++;
+		return response;
+	};
+
+	const instance = got.extend({
+		hooks: {
+			beforeRequest: [
+				beforeHook,
+				beforeHook,
+			],
+			afterResponse: [
+				afterHook,
+				afterHook,
+			],
+		},
+		pagination: {
+			paginate: () => false,
+			countLimit: 2009,
+			transform: response => [response],
+		},
+	});
+
+	// Add duplicate hooks when calling paginate
+	const beforeHookAdditional = () => {
+		beforeCountAdditional++;
+	};
+
+	const afterHookAdditional = (response: any) => {
+		afterCountAdditional++;
+		return response;
+	};
+
+	await instance.paginate.all('get', {
+		hooks: {
+			beforeRequest: [
+				beforeHook,
+				beforeHookAdditional,
+				beforeHookAdditional,
+			],
+			afterResponse: [
+				afterHook,
+				afterHookAdditional,
+				afterHookAdditional,
+			],
+		},
+	});
+
+	t.is(beforeCount, 3);
+	t.is(afterCount, 3);
+	t.is(beforeCountAdditional, 2);
+	t.is(afterCountAdditional, 2);
+});
+
+test('no duplicate hook calls when returning original request options', withServer, async (t, server, got) => {
+	server.get('/get', (_request, response) => {
+		response.end('i <3 unicorns');
+	});
+
+	let requestNumber = 0;
+	let beforeHookCount = 0;
+	let afterHookCount = 0;
+
+	const hooks = {
+		beforeRequest: [
+			() => {
+				beforeHookCount++;
+			},
+		],
+		afterResponse: [
+			(response: any) => {
+				afterHookCount++;
+				return response;
+			},
+		],
+	};
+
+	// Test only two requests, one after another
+	const paginate = ({response}: {response: Response}) => requestNumber++ === 0 ? response.request.options : false;
+
+	const instance = got.extend({
+		hooks,
+		pagination: {
+			paginate,
+			countLimit: 2009,
+			transform: response => [response],
+		},
+	});
+
+	await instance.paginate.all('get');
+
+	t.is(beforeHookCount, 2);
+	t.is(afterHookCount, 2);
+	requestNumber = 0;
+
+	await got.paginate.all('get', {
+		hooks,
+		pagination: {
+			paginate,
+			transform: response => [response],
+		},
+	});
+
+	t.is(beforeHookCount, 4);
+	t.is(afterHookCount, 4);
+});
+
+test('`beforeRequest` change body', withServer, async (t, server, got) => {
+	server.post('/', echoBody);
+
+	const response = await got.post({
+		json: {payload: 'old'},
+		hooks: {
+			beforeRequest: [
+				options => {
+					options.body = JSON.stringify({payload: 'new'});
+					options.headers['content-length'] = Buffer.byteLength(options.body as string).toString();
+				},
+			],
+		},
+	});
+
+	t.is(JSON.parse(response.body).payload, 'new');
+});
+
+test('`beforeRequest` change body with multi-byte characters', withServer, async (t, server, got) => {
+	server.post('/', echoBody);
+
+	const response = await got.post({
+		json: {payload: 'old'},
+		hooks: {
+			beforeRequest: [
+				options => {
+					// Use multi-byte UTF-8 characters (emoji, accented characters)
+					options.body = JSON.stringify({payload: 'new 🦄 café'});
+					options.headers['content-length'] = Buffer.byteLength(options.body as string).toString();
+				},
+			],
+		},
+	});
+
+	t.is(JSON.parse(response.body).payload, 'new 🦄 café');
+});
+
+test('can retry without an agent', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 408;
+		response.end();
+	});
+
+	let counter = 0;
+
+	class MyAgent extends HttpAgent {
+		override createConnection(...args: Parameters<InstanceType<typeof HttpAgent>['createConnection']>): ReturnType<InstanceType<typeof HttpAgent>['createConnection']> {
+			counter++;
+
+			return (HttpAgent as any).prototype.createConnection.apply(this, args as any);
+		}
+	}
+
+	const {response} = (await t.throwsAsync<HTTPError>(got({
+		agent: {
+			http: new MyAgent(),
+		},
+		hooks: {
+			beforeRetry: [
+				error => {
+					error.options.agent.http = undefined;
+				},
+			],
+		},
+		retry: {
+			calculateDelay: ({computedValue}) => computedValue ? 1 : 0,
+		},
+	})))!;
+
+	t.is(response.retryCount, 2);
+	t.is(counter, 1);
+});
+
+test('does not throw on empty body when running afterResponse hooks', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.end();
+	});
+
+	await t.notThrowsAsync(got('', {
+		hooks: {
+			afterResponse: [
+				response => response,
+			],
+		},
+	}));
+});
+
+test('does not throw on null body with afterResponse hook and responseType json', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.setHeader('content-type', 'application/json');
+		response.end('null');
+	});
+
+	const instance = got.extend({
+		hooks: {
+			afterResponse: [response => response],
+		},
+	});
+
+	const {body} = await instance.get('', {responseType: 'json'});
+	t.is(body, null);
+});
+
+test('does not throw on null body with afterResponse hook and responseType json - resolveBodyOnly', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.setHeader('content-type', 'application/json');
+		response.end('null');
+	});
+
+	const instance = got.extend({
+		hooks: {
+			afterResponse: [response => response],
+		},
+	});
+
+	const body = await instance.get('', {
+		responseType: 'json',
+		resolveBodyOnly: true,
+	});
+	t.is(body, null);
+});
+
+test('does not call beforeError hooks on falsy throwHttpErrors', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 404;
+		response.end();
+	});
+
+	let called = false;
+
+	await got('', {
+		throwHttpErrors: false,
+		hooks: {
+			beforeError: [
+				error => {
+					called = true;
+					return error;
+				},
+			],
+		},
+	});
+
+	t.false(called);
+});
+
+test('beforeError hook is called for ERR_UNSUPPORTED_PROTOCOL', async t => {
+	let hookCalled = false;
+
+	const beforeErrorHook = (error: RequestError) => {
+		hookCalled = true;
+		return error;
+	};
+
+	await t.throwsAsync(
+		got.post('xhttps://example.com', {
+			headers: {authorization: 'Bearer secret'},
+			json: {foo: 42},
+			hooks: {
+				beforeError: [beforeErrorHook],
+			},
+		}),
+		{code: 'ERR_UNSUPPORTED_PROTOCOL'},
+	);
+
+	t.true(hookCalled);
+});
+
+test('beforeError hook can redact sensitive headers for ERR_UNSUPPORTED_PROTOCOL', async t => {
+	const redactAuthorizationHeader = (error: RequestError) => {
+		if (error.options?.headers?.authorization) {
+			error.options.headers.authorization = '<redacted>';
+		}
+
+		return error;
+	};
+
+	const error = await t.throwsAsync<RequestError>(
+		got.post('xhttps://example.com/some/resource', {
+			headers: {authorization: 'Bearer secret'},
+			json: {foo: 42},
+			hooks: {
+				beforeError: [redactAuthorizationHeader],
+			},
+		}),
+		{code: 'ERR_UNSUPPORTED_PROTOCOL'},
+	);
+
+	t.is(error?.options.headers.authorization, '<redacted>');
+});
+
+test('beforeRetry can reassign plain stream body', withServer, async (t, server, got) => {
+	const {Readable: readable} = await import('node:stream');
+	let requestCount = 0;
+	const testData = 'Hello, Got!';
+
+	server.post('/retry', async (request, response) => {
+		requestCount++;
+		let body = '';
+		for await (const chunk of request) {
+			body += String(chunk);
+		}
+
+		// First request fails, second succeeds
+		if (requestCount === 1) {
+			response.statusCode = 500;
+			response.end('Server Error');
+		} else {
+			response.statusCode = 200;
+			response.end(`Received: ${body}`);
+		}
+	});
+
+	// Factory function to create fresh streams
+	const createStream = () => readable.from([testData]);
+
+	const response = await got.post('retry', {
+		body: createStream(),
+		retry: {
+			limit: 1,
+			methods: ['POST'],
+		},
+		hooks: {
+			beforeRetry: [
+				({options}) => {
+					// Reassign with a fresh stream - this previously failed
+					options.body = createStream();
+				},
+			],
+		},
+	});
+
+	t.is(response.statusCode, 200);
+	t.is(response.body, `Received: ${testData}`);
+	t.is(requestCount, 2);
+});
+
+test('beforeRetry destroys old stream when reassigning body', withServer, async (t, server, got) => {
+	const {Readable: readable} = await import('node:stream');
+	let requestCount = 0;
+	const testData = 'Stream data';
+
+	server.post('/retry', async (request, response) => {
+		requestCount++;
+		let body = '';
+		for await (const chunk of request) {
+			body += String(chunk);
+		}
+
+		// First request fails, second succeeds
+		if (requestCount === 1) {
+			response.statusCode = 500;
+			response.end('Server Error');
+		} else {
+			response.statusCode = 200;
+			response.end(`Received: ${body}`);
+		}
+	});
+
+	const createStream = () => readable.from([testData]);
+	const firstStream = createStream();
+	let oldStreamDestroyed = false;
+
+	// Monitor when the old stream is destroyed
+	firstStream.on('close', () => {
+		oldStreamDestroyed = true;
+	});
+
+	await got.post('retry', {
+		body: firstStream,
+		retry: {
+			limit: 1,
+			methods: ['POST'],
+		},
+		hooks: {
+			beforeRetry: [
+				({options}) => {
+					// Reassign with a fresh stream
+					options.body = createStream();
+				},
+			],
+		},
+	});
+
+	t.true(oldStreamDestroyed, 'Old stream should be destroyed to prevent memory leak');
+	t.is(requestCount, 2);
+});
+
+test('beforeRetry handles multiple retries with stream reassignment', withServer, async (t, server, got) => {
+	const {Readable: readable} = await import('node:stream');
+	let requestCount = 0;
+	const testData = 'Multi-retry data';
+
+	server.post('/retry', async (request, response) => {
+		requestCount++;
+		let body = '';
+		for await (const chunk of request) {
+			body += String(chunk);
+		}
+
+		// First two requests fail, third succeeds
+		if (requestCount < 3) {
+			response.statusCode = 500;
+			response.end('Server Error');
+		} else {
+			response.statusCode = 200;
+			response.end(`Received: ${body}`);
+		}
+	});
+
+	const createStream = () => readable.from([testData]);
+	const destroyedStreams: number[] = [];
+	let streamId = 0;
+
+	const response = await got.post('retry', {
+		body: createStream(),
+		retry: {
+			limit: 2,
+			methods: ['POST'],
+		},
+		hooks: {
+			beforeRetry: [
+				({options}) => {
+					const currentStreamId = ++streamId;
+					const newStream = createStream();
+					newStream.on('close', () => {
+						destroyedStreams.push(currentStreamId);
+					});
+					options.body = newStream;
+				},
+			],
+		},
+	});
+
+	t.is(response.statusCode, 200);
+	t.is(response.body, `Received: ${testData}`);
+	t.is(requestCount, 3);
+	t.is(destroyedStreams.length, 2, 'All old streams should be destroyed');
+});
+
+test('beforeRetry handles non-stream body reassignment', withServer, async (t, server, got) => {
+	let requestCount = 0;
+
+	server.post('/retry', async (request, response) => {
+		requestCount++;
+		let body = '';
+		for await (const chunk of request) {
+			body += String(chunk);
+		}
+
+		if (requestCount === 1) {
+			response.statusCode = 500;
+			response.end('Server Error');
+		} else {
+			response.statusCode = 200;
+			response.end(`Received: ${body}`);
+		}
+	});
+
+	const response = await got.post('retry', {
+		body: 'initial body',
+		retry: {
+			limit: 1,
+			methods: ['POST'],
+		},
+		hooks: {
+			beforeRetry: [
+				({options}) => {
+					// Reassign with a different string body
+					options.body = 'retried body';
+				},
+			],
+		},
+	});
+
+	t.is(response.statusCode, 200);
+	t.is(response.body, 'Received: retried body');
+	t.is(requestCount, 2);
+});
+
+test('beforeRetry handles body set to undefined', withServer, async (t, server, got) => {
+	const {Readable: readable} = await import('node:stream');
+	let requestCount = 0;
+
+	server.post('/retry', async (_request, response) => {
+		requestCount++;
+		// First request fails, second succeeds (with no body)
+		if (requestCount === 1) {
+			response.statusCode = 500;
+			response.end('Error');
+		} else {
+			response.statusCode = 200;
+			response.end('Success');
+		}
+	});
+
+	await got.post('retry', {
+		body: readable.from(['initial']),
+		retry: {
+			limit: 1,
+			methods: ['POST'],
+		},
+		hooks: {
+			beforeRetry: [
+				({options}) => {
+					options.body = undefined;
+				},
+			],
+		},
+	});
+
+	t.is(requestCount, 2);
+});
+
+test('beforeRetry handles body from undefined to stream', withServer, async (t, server, got) => {
+	const {Readable: readable} = await import('node:stream');
+	let requestCount = 0;
+
+	server.post('/retry', async (request, response) => {
+		requestCount++;
+		let body = '';
+		for await (const chunk of request) {
+			body += String(chunk);
+		}
+
+		if (requestCount === 1) {
+			response.statusCode = 500;
+			response.end('Error');
+		} else {
+			response.statusCode = 200;
+			response.end(`Got: ${body}`);
+		}
+	});
+
+	const response = await got.post('retry', {
+		retry: {
+			limit: 1,
+			methods: ['POST'],
+		},
+		hooks: {
+			beforeRetry: [
+				({options}) => {
+					options.body = readable.from(['stream-data']);
+				},
+			],
+		},
+	});
+
+	t.is(response.body, 'Got: stream-data');
+	t.is(requestCount, 2);
+});
+
+test('beforeRetry handles stream to Buffer conversion', withServer, async (t, server, got) => {
+	const {Readable: readable} = await import('node:stream');
+	let requestCount = 0;
+
+	server.post('/retry', async (request, response) => {
+		requestCount++;
+		let body = '';
+		for await (const chunk of request) {
+			body += String(chunk);
+		}
+
+		if (requestCount === 1) {
+			response.statusCode = 500;
+			response.end('Error');
+		} else {
+			response.statusCode = 200;
+			response.end(`Got: ${body}`);
+		}
+	});
+
+	const response = await got.post('retry', {
+		body: readable.from(['initial']),
+		retry: {
+			limit: 1,
+			methods: ['POST'],
+		},
+		hooks: {
+			beforeRetry: [
+				({options}) => {
+					options.body = Buffer.from('buffer-data');
+				},
+			],
+		},
+	});
+
+	t.is(response.body, 'Got: buffer-data');
+	t.is(requestCount, 2);
+});
+
+test('handler error is properly thrown in .json()', withServer, async (t, _server, got) => {
+	const customError = new Error('Custom handler error');
+	const instance = got.extend({
+		handlers: [
+			(options, next) => (async () => {
+				try {
+					return await next(options);
+				} catch {
+					throw customError;
+				}
+			})(),
+		],
+	});
+
+	await t.throwsAsync(instance('').json(), {message: 'Custom handler error'});
+});
+
+test('handler error is properly thrown in .text()', withServer, async (t, _server, got) => {
+	const customError = new Error('Custom handler error for text');
+	const instance = got.extend({
+		handlers: [
+			(options, next) => (async () => {
+				try {
+					return await next(options);
+				} catch {
+					throw customError;
+				}
+			})(),
+		],
+	});
+
+	await t.throwsAsync(instance('').text(), {message: 'Custom handler error for text'});
+});
+
+test('handler error is properly thrown in .buffer()', withServer, async (t, _server, got) => {
+	const customError = new Error('Custom handler error for buffer');
+	const instance = got.extend({
+		handlers: [
+			(options, next) => (async () => {
+				try {
+					return await next(options);
+				} catch {
+					throw customError;
+				}
+			})(),
+		],
+	});
+
+	await t.throwsAsync(instance('').buffer(), {message: 'Custom handler error for buffer'});
+});
+
+test('handler throwing on successful response works with .json()', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.setHeader('content-type', 'application/json');
+		response.end('{"success": true}');
+	});
+
+	const customError = new Error('Handler rejected success');
+	const instance = got.extend({
+		handlers: [
+			(options, next) => (async () => {
+				await next(options);
+				throw customError;
+			})(),
+		],
+	});
+
+	await t.throwsAsync(instance('').json(), {message: 'Handler rejected success'});
+});
+
+test('multiple handlers with error transformation work with .json()', withServer, async (t, _server, got) => {
+	const instance = got.extend({
+		handlers: [
+			// First handler: catches and wraps error
+			(options, next) => (async () => {
+				try {
+					return await next(options);
+				} catch (error: any) {
+					const wrappedError = new Error(`Handler 1: ${error.message}`);
+					throw wrappedError;
+				}
+			})(),
+			// Second handler: catches and wraps error again
+			(options, next) => (async () => {
+				try {
+					return await next(options);
+				} catch (error: any) {
+					const wrappedError = new Error(`Handler 2: ${error.message}`);
+					throw wrappedError;
+				}
+			})(),
+		],
+	});
+
+	// Should get error from first handler (outermost)
+	await t.throwsAsync(instance('').json(), {message: /Handler 1: Handler 2:/});
+});
+
+test('beforeError can return custom Error class', async t => {
+	class CustomError extends Error {
+		constructor(message: string) {
+			super(message);
+			this.name = 'CustomError';
+		}
+	}
+
+	const customMessage = 'This is a custom error';
+
+	const error = await t.throwsAsync(
+		got('https://example.com', {
+			request() {
+				throw new Error('Original error');
+			},
+			hooks: {
+				beforeError: [
+					() => new CustomError(customMessage),
+				],
+			},
+		}),
+	);
+
+	t.is(error?.name, 'CustomError');
+	t.is(error?.message, customMessage);
+	t.true(error instanceof CustomError);
+});
+
+test('beforeError can extend RequestError with custom error', async t => {
+	class MyCustomError extends RequestError {
+		constructor(message: string, error: Error, request: any) {
+			super(message, error, request);
+			this.name = 'MyCustomError';
+		}
+	}
+
+	const customMessage = 'Custom RequestError';
+
+	const error = await t.throwsAsync(
+		got('https://example.com', {
+			request() {
+				throw new Error('Original error');
+			},
+			hooks: {
+				beforeError: [
+					error => new MyCustomError(customMessage, error, error.request),
+				],
+			},
+		}),
+	);
+
+	t.is(error?.name, 'MyCustomError');
+	t.is(error?.message, customMessage);
+	t.true(error instanceof MyCustomError);
+	t.true(error instanceof RequestError);
+});

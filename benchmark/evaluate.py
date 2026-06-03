@@ -109,6 +109,12 @@ REPO_CATEGORY: dict[str, str] = {
     "gofiber/fiber": "go",
     "grpc/grpc-go": "go",
     "spf13/cobra": "go",
+    # JVM external repos (continued)
+    "google/guava": "jvm",
+    # Rust external repos (continued)
+    "serde-rs/serde": "rust",
+    # TypeScript external repos (continued)
+    "sindresorhus/got": "typescript",
 }
 
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json

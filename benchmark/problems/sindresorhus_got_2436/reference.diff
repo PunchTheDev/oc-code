@@ -1,0 +1,525 @@
+diff --git a/source/core/index.ts b/source/core/index.ts
+index 712b24b08..e1c710ee5 100644
+--- a/source/core/index.ts
++++ b/source/core/index.ts
+@@ -32,7 +32,12 @@ import Options, {
+ 	type OptionsInit,
+ 	type NormalizedOptions,
+ } from './options.js';
+-import {isResponseOk, type PlainResponse, type Response} from './response.js';
++import {
++	cacheDecodedBody,
++	isResponseOk,
++	type PlainResponse,
++	type Response,
++} from './response.js';
+ import isClientRequest from './utils/is-client-request.js';
+ import isUnixSocketURL, {getUnixSocketPath} from './utils/is-unix-socket-url.js';
+ import {
+@@ -66,6 +71,7 @@ export type Progress = {
+ 
+ const supportsBrotli = is.string(process.versions.brotli);
+ const supportsZstd = is.string(process.versions.zstd);
++const isUtf8Encoding = (encoding?: BufferEncoding): boolean => encoding === undefined || encoding.toLowerCase().replace('-', '') === 'utf8';
+ 
+ const methodsWithoutBody: ReadonlySet<string> = new Set(['GET', 'HEAD']);
+ 
+@@ -198,6 +204,8 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 	private _expectedContentLength?: number;
+ 	private _compressedBytesCount?: number;
+ 	private _skipRequestEndInFinal = false;
++	private _incrementalBodyDecoder?: TextDecoder;
++	private _incrementalDecodedBodyChunks: string[] = [];
+ 	private readonly _requestId = generateRequestId();
+ 
+ 	// We need this because `this._request` if `undefined` when using cache
+@@ -539,6 +547,18 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 			while ((data = response.read()) !== null) {
+ 				this._downloadedSize += data.length; // eslint-disable-line @typescript-eslint/restrict-plus-operands
+ 
++				if (this._incrementalBodyDecoder) {
++					try {
++						const decodedChunk = isBuffer(data) ? this._incrementalBodyDecoder.decode(data, {stream: true}) : String(data);
++						if (decodedChunk.length > 0) {
++							this._incrementalDecodedBodyChunks.push(decodedChunk);
++						}
++					} catch {
++						this._incrementalBodyDecoder = undefined;
++						this._incrementalDecodedBodyChunks = [];
++					}
++				}
++
+ 				const progress = this.downloadProgress;
+ 
+ 				if (progress.percent < 1) {
+@@ -668,6 +688,15 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 		return this;
+ 	}
+ 
++	private _shouldIncrementallyDecodeBody(): boolean {
++		const {responseType, encoding} = this.options;
++
++		return Boolean(this._noPipe)
++			&& (responseType === 'text' || responseType === 'json')
++			&& isUtf8Encoding(encoding)
++			&& typeof globalThis.TextDecoder === 'function';
++	}
++
+ 	private _checkContentLengthMismatch(): boolean {
+ 		if (this.options.strictContentLength && this._expectedContentLength !== undefined) {
+ 			// Use compressed bytes count when available (for compressed responses),
+@@ -823,6 +852,9 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 		this._responseSize = Number(response.headers['content-length']) || undefined;
+ 
+ 		this.response = typedResponse;
++		// eslint-disable-next-line @typescript-eslint/naming-convention
++		this._incrementalBodyDecoder = this._shouldIncrementallyDecodeBody() ? new globalThis.TextDecoder('utf8', {ignoreBOM: true}) : undefined;
++		this._incrementalDecodedBodyChunks = [];
+ 
+ 		// Publish response start event
+ 		publishResponseStart({
+@@ -1106,17 +1138,39 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 		try {
+ 			// Errors are emitted via the `error` event
+ 			const fromArray = await from.toArray();
+-			const rawBody = isBuffer(fromArray.at(0)) ? Buffer.concat(fromArray) : Buffer.from(fromArray.join(''));
++			const rawBody = isBuffer(fromArray.at(0)) ? Buffer.concat(fromArray as Buffer[]) : Buffer.from(fromArray.join(''));
++			const shouldUseIncrementalDecodedBody = from === this && this._incrementalBodyDecoder !== undefined;
+ 
+ 			// On retry Request is destroyed with no error, therefore the above will successfully resolve.
+-			// So in order to check if this was really successfull, we need to check if it has been properly ended.
+-			if (!this.isAborted) {
+-				this.response!.rawBody = rawBody;
++			// So in order to check if this was really successful, we need to check if it has been properly ended.
++			if (
++				!this.isAborted
++				&& this.response
++			) {
++				this.response.rawBody = rawBody;
++
++				if (shouldUseIncrementalDecodedBody) {
++					try {
++						const decoder = this._incrementalBodyDecoder!;
++						const finalDecodedChunk = decoder.decode();
++						if (finalDecodedChunk.length > 0) {
++							this._incrementalDecodedBodyChunks.push(finalDecodedChunk);
++						}
++
++						cacheDecodedBody(this.response, this._incrementalDecodedBodyChunks.join(''));
++					} catch {}
++				}
++
++				this._incrementalBodyDecoder = undefined;
++				this._incrementalDecodedBodyChunks = [];
+ 
+ 				return true;
+ 			}
+ 		} catch {}
+ 
++		this._incrementalBodyDecoder = undefined;
++		this._incrementalDecodedBodyChunks = [];
++
+ 		return false;
+ 	}
+ 
+diff --git a/source/core/response.ts b/source/core/response.ts
+index d713fa78d..eede07dc5 100644
+--- a/source/core/response.ts
++++ b/source/core/response.ts
+@@ -4,6 +4,8 @@ import {RequestError} from './errors.js';
+ import type {ParseJsonFunction, ResponseType} from './options.js';
+ import type Request from './index.js';
+ 
++const decodedBodyCache = new WeakMap<PlainResponse, string>();
++
+ export type PlainResponse = {
+ 	/**
+ 	The original request URL.
+@@ -137,16 +139,30 @@ export class ParseError extends RequestError {
+ 	}
+ }
+ 
++export const cacheDecodedBody = (response: PlainResponse, decodedBody: string): void => {
++	decodedBodyCache.set(response, decodedBody);
++};
++
+ export const parseBody = (response: Response, responseType: ResponseType, parseJson: ParseJsonFunction, encoding?: BufferEncoding): unknown => {
+ 	const {rawBody} = response;
++	const cachedDecodedBody = decodedBodyCache.get(response);
+ 
+ 	try {
+ 		if (responseType === 'text') {
++			if (cachedDecodedBody !== undefined) {
++				return cachedDecodedBody;
++			}
++
+ 			return rawBody.toString(encoding);
+ 		}
+ 
+ 		if (responseType === 'json') {
+-			return rawBody.length === 0 ? '' : parseJson(rawBody.toString(encoding));
++			if (rawBody.length === 0) {
++				return '';
++			}
++
++			const text = cachedDecodedBody ?? rawBody.toString(encoding);
++			return parseJson(text);
+ 		}
+ 
+ 		if (responseType === 'buffer') {
+diff --git a/test/response-parse.ts b/test/response-parse.ts
+index f150ae09f..c5971a84f 100644
+--- a/test/response-parse.ts
++++ b/test/response-parse.ts
+@@ -51,6 +51,14 @@ test('Text response #2', withServer, async (t, server, got) => {
+ 	t.is((await got({responseType: undefined})).body, jsonResponse);
+ });
+ 
++test('Text response preserves UTF-8 BOM', withServer, async (t, server, got) => {
++	server.get('/', (_request, response) => {
++		response.end(Buffer.from([0xEF, 0xBB, 0xBF, ...Buffer.from('hello')]));
++	});
++
++	t.is((await got({responseType: 'text'})).body, '\uFEFFhello');
++});
++
+ test('JSON response - promise.json()', withServer, async (t, server, got) => {
+ 	server.get('/', defaultHandler);
+ 
+@@ -102,6 +110,14 @@ test('wraps parsing errors', withServer, async (t, server, got) => {
+ 	t.is(error?.code, 'ERR_BODY_PARSE_FAILURE');
+ });
+ 
++test('JSON response with UTF-8 BOM throws ParseError', withServer, async (t, server, got) => {
++	server.get('/', (_request, response) => {
++		response.end(Buffer.from([0xEF, 0xBB, 0xBF, ...Buffer.from(jsonResponse)]));
++	});
++
++	await t.throwsAsync(got({responseType: 'json'}), {instanceOf: ParseError});
++});
++
+ test('parses non-200 responses', withServer, async (t, server, got) => {
+ 	server.get('/', (_request, response) => {
+ 		response.statusCode = 500;
+@@ -253,3 +269,265 @@ test('JSON response custom parser', withServer, async (t, server, got) => {
+ 		parseJson: text => ({...JSON.parse(text), custom: 'parser'}),
+ 	})).body, {...dog, custom: 'parser'});
+ });
++
++test.serial('incrementally decodes UTF-8 text response while downloading', withServer, async (t, server, got) => {
++	if (globalThis.TextDecoder === undefined) {
++		t.pass();
++		return;
++	}
++
++	const originalDecode = globalThis.TextDecoder.prototype.decode;
++	let responseEnded = false;
++	let streamDecodeCallCount = 0;
++	let decodedBeforeResponseEnded = false;
++
++	globalThis.TextDecoder.prototype.decode = function (input?: BufferSource, options?: TextDecodeOptions): string {
++		if (options?.stream) {
++			streamDecodeCallCount++;
++			if (!responseEnded) {
++				decodedBeforeResponseEnded = true;
++			}
++		}
++
++		return originalDecode.call(this, input, options);
++	};
++
++	server.get('/', (_request, response) => {
++		response.write('hello ');
++
++		setTimeout(() => {
++			responseEnded = true;
++			response.end('world');
++		}, 25);
++	});
++
++	try {
++		const {body} = await got({responseType: 'text'});
++		t.is(body, 'hello world');
++		t.true(streamDecodeCallCount > 0);
++		t.true(decodedBeforeResponseEnded);
++	} finally {
++		globalThis.TextDecoder.prototype.decode = originalDecode;
++	}
++});
++
++test.serial('incrementally decodes UTF-8 JSON response while downloading', withServer, async (t, server, got) => {
++	if (globalThis.TextDecoder === undefined) {
++		t.pass();
++		return;
++	}
++
++	const originalDecode = globalThis.TextDecoder.prototype.decode;
++	let responseEnded = false;
++	let streamDecodeCallCount = 0;
++	let decodedBeforeResponseEnded = false;
++
++	globalThis.TextDecoder.prototype.decode = function (input?: BufferSource, options?: TextDecodeOptions): string {
++		if (options?.stream) {
++			streamDecodeCallCount++;
++			if (!responseEnded) {
++				decodedBeforeResponseEnded = true;
++			}
++		}
++
++		return originalDecode.call(this, input, options);
++	};
++
++	server.get('/', (_request, response) => {
++		response.write('{"hello":"');
++
++		setTimeout(() => {
++			responseEnded = true;
++			response.end('world"}');
++		}, 25);
++	});
++
++	try {
++		const {body} = await got<{hello: string}>({responseType: 'json'});
++		t.deepEqual(body, {hello: 'world'});
++		t.true(streamDecodeCallCount > 0);
++		t.true(decodedBeforeResponseEnded);
++	} finally {
++		globalThis.TextDecoder.prototype.decode = originalDecode;
++	}
++});
++
++test.serial('falls back to buffered decode when incremental decode throws', withServer, async (t, server, got) => {
++	if (globalThis.TextDecoder === undefined) {
++		t.pass();
++		return;
++	}
++
++	const originalDecode = globalThis.TextDecoder.prototype.decode;
++	const payload = {hello: 'world'};
++	let thrown = false;
++
++	globalThis.TextDecoder.prototype.decode = function (input?: BufferSource, options?: TextDecodeOptions): string {
++		if (!thrown && options?.stream) {
++			thrown = true;
++			throw new TypeError('Injected decode failure');
++		}
++
++		return originalDecode.call(this, input, options);
++	};
++
++	server.get('/', (_request, response) => {
++		response.end(JSON.stringify(payload));
++	});
++
++	try {
++		const {body} = await got<typeof payload>({responseType: 'json'});
++		t.true(thrown);
++		t.deepEqual(body, payload);
++	} finally {
++		globalThis.TextDecoder.prototype.decode = originalDecode;
++	}
++});
++
++test.serial('falls back to buffered decode when incremental decoder final flush throws', withServer, async (t, server, got) => {
++	if (globalThis.TextDecoder === undefined) {
++		t.pass();
++		return;
++	}
++
++	const originalDecode = globalThis.TextDecoder.prototype.decode;
++	const payload = {hello: 'world'};
++	let thrown = false;
++
++	globalThis.TextDecoder.prototype.decode = function (input?: BufferSource, options?: TextDecodeOptions): string {
++		if (!thrown && options === undefined) {
++			thrown = true;
++			throw new TypeError('Injected final flush decode failure');
++		}
++
++		return originalDecode.call(this, input, options);
++	};
++
++	server.get('/', (_request, response) => {
++		response.end(JSON.stringify(payload));
++	});
++
++	try {
++		const {body} = await got<typeof payload>({responseType: 'json'});
++		t.true(thrown);
++		t.deepEqual(body, payload);
++	} finally {
++		globalThis.TextDecoder.prototype.decode = originalDecode;
++	}
++});
++
++test.serial('does not incrementally decode for non-UTF-8 encoding', withServer, async (t, server, got) => {
++	if (globalThis.TextDecoder === undefined) {
++		t.pass();
++		return;
++	}
++
++	const originalDecode = globalThis.TextDecoder.prototype.decode;
++	const payload = 'a'.repeat(1024);
++	let streamDecodeCallCount = 0;
++
++	globalThis.TextDecoder.prototype.decode = function (input?: BufferSource, options?: TextDecodeOptions): string {
++		if (options?.stream) {
++			streamDecodeCallCount++;
++		}
++
++		return originalDecode.call(this, input, options);
++	};
++
++	server.get('/', (_request, response) => {
++		response.end(payload);
++	});
++
++	try {
++		const {body} = await got({
++			responseType: 'text',
++			encoding: 'base64',
++		});
++
++		t.is(body, Buffer.from(payload).toString('base64'));
++		t.is(streamDecodeCallCount, 0);
++	} finally {
++		globalThis.TextDecoder.prototype.decode = originalDecode;
++	}
++});
++
++test.serial('incrementally decodes for case-insensitive UTF-8 encoding names', withServer, async (t, server, got) => {
++	if (globalThis.TextDecoder === undefined) {
++		t.pass();
++		return;
++	}
++
++	const originalDecode = globalThis.TextDecoder.prototype.decode;
++	const payload = 'hello world';
++	const encoding = Buffer.from([85, 84, 70, 45, 56]).toString() as BufferEncoding;
++	let streamDecodeCallCount = 0;
++
++	globalThis.TextDecoder.prototype.decode = function (input?: BufferSource, options?: TextDecodeOptions): string {
++		if (options?.stream) {
++			streamDecodeCallCount++;
++		}
++
++		return originalDecode.call(this, input, options);
++	};
++
++	server.get('/', (_request, response) => {
++		response.end(payload);
++	});
++
++	try {
++		const encodingWithoutHyphen = Buffer.from([85, 84, 70, 56]).toString() as BufferEncoding;
++		const responses = await Promise.all([
++			got({
++				responseType: 'text',
++				encoding,
++			}),
++			got({
++				responseType: 'text',
++				encoding: encodingWithoutHyphen,
++			}),
++		]);
++
++		for (const response of responses) {
++			t.is(response.body, payload);
++		}
++
++		t.true(streamDecodeCallCount > 0);
++	} finally {
++		globalThis.TextDecoder.prototype.decode = originalDecode;
++	}
++});
++
++test.serial('does not incrementally decode in stream mode', withServer, async (t, server, got) => {
++	if (globalThis.TextDecoder === undefined) {
++		t.pass();
++		return;
++	}
++
++	const originalDecode = globalThis.TextDecoder.prototype.decode;
++	let streamDecodeCallCount = 0;
++
++	globalThis.TextDecoder.prototype.decode = function (input?: BufferSource, options?: TextDecodeOptions): string {
++		if (options?.stream) {
++			streamDecodeCallCount++;
++		}
++
++		return originalDecode.call(this, input, options);
++	};
++
++	server.get('/', (_request, response) => {
++		response.end('hello');
++	});
++
++	try {
++		await new Promise<void>((resolve, reject) => {
++			const streamRequest = got.stream({responseType: 'text'});
++			streamRequest.on('error', reject);
++			streamRequest.on('end', resolve);
++			streamRequest.resume();
++		});
++
++		t.is(streamDecodeCallCount, 0);
++	} finally {
++		globalThis.TextDecoder.prototype.decode = originalDecode;
++	}
++});
+diff --git a/test/timings.ts b/test/timings.ts
+index 2d1d6fa11..0a557c7bf 100644
+--- a/test/timings.ts
++++ b/test/timings.ts
+@@ -1,5 +1,7 @@
+ import http from 'node:http';
++import {promises as dnsPromises} from 'node:dns';
+ import test from 'ava';
++import CacheableLookup from 'cacheable-lookup';
+ import got from '../source/index.js';
+ import withServer from './helpers/with-server.js';
+ 
+@@ -120,9 +122,32 @@ test('dns timing is 0 for cached DNS lookups', withServer, async (t, server, got
+ 		response.end('ok');
+ 	});
+ 
++	let resolve4CallCount = 0;
++	let resolve6CallCount = 0;
++	const serverAddress = server.http.address() as {family: string};
++	const isIpv6Server = serverAddress.family === 'IPv6';
++
++	const resolver = new dnsPromises.Resolver();
++	resolver.resolve4 = (async (_hostname: string, _options: unknown) => {
++		resolve4CallCount++;
++		if (isIpv6Server) {
++			return [];
++		}
++
++		return [{address: '127.0.0.1', ttl: 60}];
++	}) as typeof resolver.resolve4;
++	resolver.resolve6 = (async (_hostname: string, _options: unknown) => {
++		resolve6CallCount++;
++		if (isIpv6Server) {
++			return [{address: '::1', ttl: 60}];
++		}
++
++		return [];
++	}) as typeof resolver.resolve6;
++
+ 	// Enable DNS cache and disable keep-alive to get new connections
+ 	const instance = got.extend({
+-		dnsCache: true,
++		dnsCache: new CacheableLookup({resolver}),
+ 		agent: {
+ 			http: new http.Agent({
+ 				keepAlive: false,
+@@ -142,6 +167,9 @@ test('dns timing is 0 for cached DNS lookups', withServer, async (t, server, got
+ 	const response2 = await instance('');
+ 	const response3 = await instance('');
+ 
++	t.is(resolve4CallCount, 1);
++	t.is(resolve6CallCount, 1);
++
+ 	// When DNS is cached, if lookup and connect happen at the exact same time (tcp=0),
+ 	// then dns is set to 0 to indicate no actual DNS resolution occurred.
+ 	// Otherwise, dns will be small but may vary on CI due to system load.

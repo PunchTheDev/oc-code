@@ -4,7 +4,7 @@
 
 The dashboard is updated automatically after each merged submission. The table below is the static fallback (machine-updated by CI via `results/leaderboard.json`).
 
-Weighted mean score across the rotating 30-problem shard (pool: 1114 problems, spanning 43 repos), on a 0–30 scale per problem. Hard problems are 2×, medium 1.5×, easy 1×. Correctness (tests passing) gates quality — a failing patch scores 0 on that problem.
+Weighted mean score across the rotating 30-problem shard (pool: 1131 problems, spanning 46 repos), on a 0–30 scale per problem. Hard problems are 2×, medium 1.5×, easy 1×. Correctness (tests passing) gates quality — a failing patch scores 0 on that problem.
 
 ---
 
@@ -22,8 +22,8 @@ Weighted mean score across the rotating 30-problem shard (pool: 1114 problems, s
 
 | Metric | Value |
 |--------|-------|
-| Pool size | 1114 problems |
-| Repos | 43 active repos (6 language categories) |
+| Pool size | 1131 problems |
+| Repos | 46 active repos (6 language categories) |
 | Shard size | 30 (rotates weekly, category-balanced) |
 | Oracle weighted score | 12.64 / 30 |
 | Oracle arithmetic score | 11.41 / 30 |
@@ -47,5 +47,5 @@ The champion agent is promoted to `agent/champion/` and this table is updated au
 
 - Weighted mean score is the primary ranking metric: hard problems (≥150 added lines) count 2×, medium (30–149) 1.5×, easy (<30) 1×.
 - Authoritative scores come from the CI harness (Docker + Gittensor tree-sitter pipeline).
-- Oracle score = mean tree-sitter score across all 1114 accepted reference diffs.
+- Oracle score = mean tree-sitter score across all 1131 accepted reference diffs.
 - Multipliers (time decay, review quality, label, issue) applied in CI; local runs set them to 1.0.

@@ -1,0 +1,896 @@
+diff --git a/documentation/3-streams.md b/documentation/3-streams.md
+index 717cb4d56..c2b71b298 100644
+--- a/documentation/3-streams.md
++++ b/documentation/3-streams.md
+@@ -125,33 +125,16 @@ An object representing how much data have been downloaded.
+ 
+ An object representing how much data have been uploaded.
+ 
+-> **Note:** To get granular upload progress instead of just 0% and 100%, split the body into chunks using the [`chunk-data`](https://github.com/sindresorhus/chunk-data) package:
+-> - `chunk(buffer, chunkSize)` - For buffers/typed arrays
+-> - `chunkFromAsync(iterable, chunkSize)` - For iterables (Node.js streams are async iterables)
++Granular upload progress is automatically supported for non-stream `body` (string/Buffer/TypedArray), `json`, and `form` options. For Node.js streams, you can use the [`chunk-data`](https://github.com/sindresorhus/chunk-data) package to get granular progress:
+ 
+ ```js
++import fs from 'node:fs';
+ import got from 'got';
+-import {chunk, chunkFromAsync} from 'chunk-data';
+-import {Readable} from 'node:stream';
+-
+-// Chunk a buffer
+-
+-const buffer = new Uint8Array(1024 * 1024);
+-
+-await got.post('https://httpbin.org/anything', {
+-	body: chunk(buffer, 65_536),
+-	headers: {
+-		'content-length': buffer.byteLength.toString()
+-	}
+-})
+-.on('uploadProgress', progress => {
+-	console.log(progress);
+-});
+-
+-
+-// Chunk an iterable/stream
++import {chunkFromAsync} from 'chunk-data';
+ 
+-const [stream, size] = getStream();
++const filePath = 'large-file.bin';
++const stream = fs.createReadStream(filePath);
++const size = fs.statSync(filePath).size;
+ 
+ await got.post('https://httpbin.org/anything', {
+ 	body: chunkFromAsync(stream, 65_536),
+diff --git a/package.json b/package.json
+index 3df19b8b0..23a0da267 100644
+--- a/package.json
++++ b/package.json
+@@ -55,6 +55,7 @@
+ 		"byte-counter": "^0.1.0",
+ 		"cacheable-lookup": "^7.0.0",
+ 		"cacheable-request": "^13.0.12",
++		"chunk-data": "^0.1.0",
+ 		"decompress-response": "^10.0.0",
+ 		"form-data-encoder": "^4.0.2",
+ 		"http2-wrapper": "^2.2.1",
+@@ -82,7 +83,6 @@
+ 		"bluebird": "^3.7.2",
+ 		"body-parser": "^1.20.3",
+ 		"c8": "^10.1.3",
+-		"chunk-data": "^0.1.0",
+ 		"create-cert": "^1.0.6",
+ 		"create-test-server": "^3.0.1",
+ 		"del-cli": "^6.0.0",
+diff --git a/source/core/index.ts b/source/core/index.ts
+index d3bc620d9..712b24b08 100644
+--- a/source/core/index.ts
++++ b/source/core/index.ts
+@@ -4,6 +4,7 @@ import {Duplex, type Readable} from 'node:stream';
+ import http, {ServerResponse, type ClientRequest, type RequestOptions} from 'node:http';
+ import type {Socket} from 'node:net';
+ import {byteLength} from 'byte-counter';
++import {chunk} from 'chunk-data';
+ import CacheableRequest, {
+ 	CacheError as CacheableCacheError,
+ 	type CacheableRequestFunction,
+@@ -196,6 +197,7 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 	private _aborted = false;
+ 	private _expectedContentLength?: number;
+ 	private _compressedBytesCount?: number;
++	private _skipRequestEndInFinal = false;
+ 	private readonly _requestId = generateRequestId();
+ 
+ 	// We need this because `this._request` if `undefined` when using cache
+@@ -562,25 +564,30 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 
+ 	override _final(callback: (error?: Error | null) => void): void { // eslint-disable-line @typescript-eslint/ban-types
+ 		const endRequest = (): void => {
++			if (this._skipRequestEndInFinal) {
++				this._skipRequestEndInFinal = false;
++				callback();
++				return;
++			}
++
++			const request = this._request;
++
+ 			// We need to check if `this._request` is present,
+ 			// because it isn't when we use cache.
+-			if (!this._request || this._request.destroyed) {
++			if (!request || request.destroyed) {
+ 				callback();
+ 				return;
+ 			}
+ 
+-			this._request.end((error?: Error | null) => { // eslint-disable-line @typescript-eslint/ban-types
++			request.end((error?: Error | null) => { // eslint-disable-line @typescript-eslint/ban-types
+ 				// The request has been destroyed before `_final` finished.
+ 				// See https://github.com/nodejs/node/issues/39356
+-				if ((this._request as any)?._writableState?.errored) {
++				if ((request as any)?._writableState?.errored) {
+ 					return;
+ 				}
+ 
+ 				if (!error) {
+-					this._bodySize = this._uploadedSize;
+-
+-					this.emit('uploadProgress', this.uploadProgress);
+-					this._request?.emit('upload-complete');
++					this._emitUploadComplete(request);
+ 				}
+ 
+ 				callback(error);
+@@ -893,16 +900,18 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 
+ 				this._request = undefined;
+ 
+-				// Reset download progress for the new request
++				// Reset progress for the new request.
+ 				this._downloadedSize = 0;
++				this._uploadedSize = 0;
+ 
+ 				const updatedOptions = new Options(undefined, undefined, this.options);
+ 
+ 				const serverRequestedGet = statusCode === 303 && updatedOptions.method !== 'GET' && updatedOptions.method !== 'HEAD';
+ 				const canRewrite = statusCode !== 307 && statusCode !== 308;
+ 				const userRequestedGet = updatedOptions.methodRewriting && canRewrite;
++				const shouldDropBody = serverRequestedGet || userRequestedGet;
+ 
+-				if (serverRequestedGet || userRequestedGet) {
++				if (shouldDropBody) {
+ 					updatedOptions.method = 'GET';
+ 
+ 					updatedOptions.body = undefined;
+@@ -910,6 +919,8 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 					updatedOptions.form = undefined;
+ 
+ 					delete updatedOptions.headers['content-length'];
++					// Only clear `_bodySize` when the redirect drops the request body.
++					this._bodySize = undefined;
+ 				}
+ 
+ 				try {
+@@ -1198,15 +1209,13 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 			body.pipe(currentRequest);
+ 		} else if (is.buffer(body)) {
+ 			// Buffer should be sent directly without conversion
+-			this._writeRequest(body, undefined, () => {});
+-			currentRequest.end();
++			this._writeBodyInChunks(body, currentRequest);
+ 		} else if (is.typedArray(body)) {
+ 			// Typed arrays should be treated like buffers, not iterated over
+ 			// Create a Uint8Array view over the data (Node.js streams accept Uint8Array)
+ 			const typedArray = body as ArrayBufferView;
+ 			const uint8View = new Uint8Array(typedArray.buffer, typedArray.byteOffset, typedArray.byteLength);
+-			this._writeRequest(uint8View, undefined, () => {});
+-			currentRequest.end();
++			this._writeBodyInChunks(uint8View, currentRequest);
+ 		} else if (is.asyncIterable(body) || (is.iterable(body) && !is.string(body) && !isBuffer(body))) {
+ 			(async () => {
+ 				try {
+@@ -1227,8 +1236,116 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 				currentRequest.end();
+ 			}
+ 		} else {
+-			this._writeRequest(body, undefined, () => {});
+-			currentRequest.end();
++			// Handles string bodies (from json/form options).
++			this._writeBodyInChunks(Buffer.from(body as string), currentRequest);
++		}
++	}
++
++	/*
++	Write a body buffer in chunks to enable granular `uploadProgress` events.
++
++	Without chunking, string/Buffer/TypedArray bodies are written in a single call, causing `uploadProgress` to only emit 0% and 100% with nothing in between.
++
++	The 64 KB chunk size matches Node.js fs stream defaults.
++	*/
++	private _writeBodyInChunks(buffer: Uint8Array, currentRequest: Request | ClientRequest) {
++		const isInitialRequest = currentRequest === this;
++
++		(async () => {
++			try {
++				const request = isInitialRequest ? this._request : currentRequest as ClientRequest;
++
++				if (!request) {
++					if (isInitialRequest) {
++						super.end();
++					}
++
++					return;
++				}
++
++				if (request.destroyed) {
++					return;
++				}
++
++				await this._writeChunksToRequest(buffer, request);
++
++				if (this._request !== request || request.destroyed || request.writableEnded) {
++					this._finalizeStaleChunkedWrite(request, isInitialRequest);
++					return;
++				}
++
++				if (isInitialRequest) {
++					super.end();
++					return;
++				}
++
++				await new Promise<void>((resolve, reject) => {
++					request.end((error?: Error | null) => { // eslint-disable-line @typescript-eslint/ban-types
++						if (error) {
++							reject(error);
++							return;
++						}
++
++						if (this._request === request && !request.destroyed) {
++							this._emitUploadComplete(request);
++						}
++
++						resolve();
++					});
++				});
++			} catch (error: any) {
++				if (!isInitialRequest && (this._request !== currentRequest || currentRequest.destroyed || currentRequest.writableEnded)) {
++					return;
++				}
++
++				this._beforeError(error);
++			}
++		})();
++	}
++
++	private _finalizeStaleChunkedWrite(request: ClientRequest, isInitialRequest: boolean) {
++		if (!request.destroyed && !request.writableEnded) {
++			request.destroy();
++		}
++
++		if (isInitialRequest) {
++			// Finalize writable state without ending the active redirected request.
++			this._skipRequestEndInFinal = true;
++			super.end();
++		}
++	}
++
++	private _emitUploadComplete(request: ClientRequest) {
++		this._bodySize = this._uploadedSize;
++		this.emit('uploadProgress', this.uploadProgress);
++		request.emit('upload-complete');
++	}
++
++	private async _writeChunksToRequest(buffer: Uint8Array, request: ClientRequest): Promise<void> {
++		const chunkSize = 65_536; // 64 KB
++		const isStale = () => this._request !== request || request.destroyed || request.writableEnded;
++
++		for (const part of chunk(buffer, chunkSize)) {
++			if (isStale()) {
++				return;
++			}
++
++			// eslint-disable-next-line no-await-in-loop
++			await new Promise<void>((resolve, reject) => {
++				this._writeRequest(part, undefined, error => {
++					if (error) {
++						if (isStale()) {
++							resolve();
++							return;
++						}
++
++						reject(error);
++						return;
++					}
++
++					resolve();
++				}, request);
++			});
+ 		}
+ 	}
+ 
+@@ -1558,17 +1675,18 @@ export default class Request extends Duplex implements RequestEvents<Request> {
+ 		}
+ 	}
+ 
+-	private _writeRequest(chunk: any, encoding: BufferEncoding | undefined, callback: (error?: Error | null) => void): void { // eslint-disable-line @typescript-eslint/ban-types
+-		if (!this._request || this._request.destroyed) {
++	private _writeRequest(chunk: any, encoding: BufferEncoding | undefined, callback: (error?: Error | null) => void, request: ClientRequest | undefined = this._request): void { // eslint-disable-line @typescript-eslint/ban-types
++		if (!request || request.destroyed) {
+ 			// When there's no request (e.g., using cached response from beforeRequest hook),
+ 			// we still need to call the callback to allow the stream to finish properly.
+ 			callback();
+ 			return;
+ 		}
+ 
+-		this._request.write(chunk, encoding!, (error?: Error | null) => { // eslint-disable-line @typescript-eslint/ban-types
+-			// The `!destroyed` check is required to prevent `uploadProgress` being emitted after the stream was destroyed
+-			if (!error && !this._request!.destroyed) {
++		request.write(chunk, encoding!, (error?: Error | null) => { // eslint-disable-line @typescript-eslint/ban-types
++			// The `!destroyed` check is required to prevent `uploadProgress` being emitted after the stream was destroyed.
++			// The `this._request === request` check prevents stale write callbacks from a pre-redirect request from incrementing `_uploadedSize` after it's been reset.
++			if (!error && !request.destroyed && this._request === request) {
+ 				// For strings, encode them first to measure the actual bytes that will be sent
+ 				const bytes = typeof chunk === 'string' ? Buffer.from(chunk, encoding) : chunk;
+ 				this._uploadedSize += byteLength(bytes);
+diff --git a/test/hooks.ts b/test/hooks.ts
+index f65164e19..d95002488 100644
+--- a/test/hooks.ts
++++ b/test/hooks.ts
+@@ -473,6 +473,68 @@ test('returning HTTP response from a beforeRequest hook with FormData body', wit
+ 	t.is(data.cached, 'response');
+ });
+ 
++test('returning HTTP response from a beforeRequest hook with large buffer body', withServer, async (t, server, got) => {
++	server.post('/', echoBody);
++
++	const {body} = await got.post({
++		body: Buffer.alloc(1024 * 256, 'a'),
++		hooks: {
++			beforeRequest: [
++				() => new Responselike({
++					statusCode: 200,
++					headers: {},
++					body: Buffer.from('hooked'),
++					url: '',
++				}),
++			],
++		},
++	});
++
++	t.is(body, 'hooked');
++});
++
++test('returning HTTP response from a beforeRequest hook with large json body', withServer, async (t, server, got) => {
++	server.post('/', echoBody);
++
++	const data = await got.post({
++		json: {
++			key: '.'.repeat(1024 * 256),
++		},
++		hooks: {
++			beforeRequest: [
++				() => new Responselike({
++					statusCode: 200,
++					headers: {},
++					body: Buffer.from('{"cached":"json"}'),
++					url: '',
++				}),
++			],
++		},
++	}).json<{cached: string}>();
++
++	t.is(data.cached, 'json');
++});
++
++test('returning HTTP response from a beforeRequest hook with large typed array body', withServer, async (t, server, got) => {
++	server.post('/', echoBody);
++
++	const {body} = await got.post({
++		body: new Uint8Array(1024 * 256),
++		hooks: {
++			beforeRequest: [
++				() => new Responselike({
++					statusCode: 200,
++					headers: {},
++					body: Buffer.from('typed-array'),
++					url: '',
++				}),
++			],
++		},
++	});
++
++	t.is(body, 'typed-array');
++});
++
+ test('beforeRedirect is called with options and response', withServer, async (t, server, got) => {
+ 	server.get('/', echoHeaders);
+ 	server.get('/redirect', redirectEndpoint);
+diff --git a/test/progress.ts b/test/progress.ts
+index 878c5f3d1..b0600fd5e 100644
+--- a/test/progress.ts
++++ b/test/progress.ts
+@@ -255,7 +255,7 @@ test('upload progress - no body', withServer, async (t, server, got) => {
+ 	]);
+ });
+ 
+-test('upload progress - no events when immediatly removed listener', withServer, async (t, server, got) => {
++test('upload progress - no events when immediately removed listener', withServer, async (t, server, got) => {
+ 	server.post('/', uploadEndpoint);
+ 
+ 	const events: Progress[] = [];
+@@ -361,3 +361,79 @@ test('upload progress - chunkFromAsync async generator with stream', withServer,
+ 	// Ensure we got more than just 0% and 100%
+ 	t.true(events.length > 2, `Expected more than 2 events with chunkFromAsync, got ${events.length}`);
+ });
++
++test('upload progress - buffer body', withServer, async (t, server, got) => {
++	server.post('/', uploadEndpoint);
++
++	const events: Progress[] = [];
++	const body = Buffer.alloc(1024 * 256); // 256 KB
++
++	await got.post({
++		body,
++		headers: {'content-length': body.byteLength.toString()},
++	}).on('uploadProgress', (event: Progress) => events.push(event));
++
++	checkEvents(t, events, body.byteLength);
++
++	// Ensure we got more than just 0% and 100%
++	t.true(events.length > 2, `Expected more than 2 events with buffer body, got ${events.length}`);
++});
++
++test('upload progress - typed array body', withServer, async (t, server, got) => {
++	server.post('/', uploadEndpoint);
++
++	const events: Progress[] = [];
++	const body = new Uint8Array(1024 * 256); // 256 KB
++
++	await got.post({
++		body,
++		headers: {'content-length': body.byteLength.toString()},
++	}).on('uploadProgress', (event: Progress) => events.push(event));
++
++	checkEvents(t, events, body.byteLength);
++
++	// Ensure we got more than just 0% and 100%
++	t.true(events.length > 2, `Expected more than 2 events with typed array body, got ${events.length}`);
++});
++
++test('upload progress - small json option', withServer, async (t, server, got) => {
++	server.post('/', uploadEndpoint);
++
++	const events: Progress[] = [];
++	const payload = {key: 'value'};
++	const size = Buffer.byteLength(JSON.stringify(payload));
++
++	await got.post({json: payload}).on('uploadProgress', (event: Progress) => events.push(event));
++
++	checkEvents(t, events, size);
++});
++
++test('upload progress - json option', withServer, async (t, server, got) => {
++	server.post('/', uploadEndpoint);
++
++	const events: Progress[] = [];
++	const payload = {key: '.'.repeat(1e6)};
++	const size = Buffer.byteLength(JSON.stringify(payload));
++
++	await got.post({json: payload}).on('uploadProgress', (event: Progress) => events.push(event));
++
++	checkEvents(t, events, size);
++
++	// Ensure we got more than just 0% and 100%
++	t.true(events.length > 2, `Expected more than 2 events with json option, got ${events.length}`);
++});
++
++test('upload progress - form option', withServer, async (t, server, got) => {
++	server.post('/', uploadEndpoint);
++
++	const events: Progress[] = [];
++	const payload = {key: '.'.repeat(1e6)};
++	const size = Buffer.byteLength(new URLSearchParams(payload).toString());
++
++	await got.post({form: payload}).on('uploadProgress', (event: Progress) => events.push(event));
++
++	checkEvents(t, events, size);
++
++	// Ensure we got more than just 0% and 100%
++	t.true(events.length > 2, `Expected more than 2 events with form option, got ${events.length}`);
++});
+diff --git a/test/redirects.ts b/test/redirects.ts
+index 054141141..649f126e5 100644
+--- a/test/redirects.ts
++++ b/test/redirects.ts
+@@ -1,4 +1,7 @@
+ import {Buffer} from 'node:buffer';
++import {Agent as HttpAgent} from 'node:http';
++import type {ClientRequest} from 'node:http';
++import {setTimeout as delay} from 'node:timers/promises';
+ import test from 'ava';
+ import type {Handler} from 'express';
+ import nock from 'nock';
+@@ -42,6 +45,25 @@ const unixHostname: Handler = (_request, response) => {
+ 	response.end();
+ };
+ 
++const early307RedirectHandler = (location: string): Handler => (request, response) => {
++	let redirected = false;
++
++	request.on('error', () => {});
++	request.on('data', () => {
++		if (redirected) {
++			return;
++		}
++
++		redirected = true;
++		response.writeHead(307, {
++			location,
++		});
++		response.end();
++	});
++
++	request.resume();
++};
++
+ test('cannot redirect to UNIX protocol when UNIX sockets are enabled', withServer, async (t, server, got) => {
+ 	server.get('/protocol', unixProtocol);
+ 	server.get('/hostname', unixHostname);
+@@ -478,6 +500,333 @@ test('body is passed on POST redirect', withServer, async (t, server, got) => {
+ 	t.is(body, 'foobar');
+ });
+ 
++test('large body is preserved on 307 redirect', withServer, async (t, server, got) => {
++	const requestBody = Buffer.alloc(1024 * 1024 * 2, 'a');
++
++	server.post('/redirect', async (request, response) => {
++		for await (const receivedChunk of request) {
++			void receivedChunk;
++		}
++
++		response.writeHead(307, {
++			location: '/target',
++		});
++		response.end();
++	});
++
++	server.post('/target', async (request, response) => {
++		const receivedChunks: Buffer[] = [];
++
++		for await (const receivedChunk of request) {
++			receivedChunks.push(Buffer.from(receivedChunk));
++		}
++
++		const receivedBody = Buffer.concat(receivedChunks);
++
++		t.true(receivedBody.equals(requestBody));
++		response.end('ok');
++	});
++
++	const {body} = await got.post('redirect', {
++		body: requestBody,
++		retry: {
++			limit: 0,
++		},
++	});
++
++	t.is(body, 'ok');
++});
++
++test('large body is preserved on early 307 redirect', withServer, async (t, server, got) => {
++	const requestBody = Buffer.alloc(1024 * 1024 * 4, 'b');
++	const agent = new HttpAgent({
++		keepAlive: true,
++		maxSockets: 1,
++	});
++	const requests: ClientRequest[] = [];
++
++	server.post('/redirect-early', early307RedirectHandler('/target-early'));
++
++	server.post('/target-early', async (request, response) => {
++		const receivedChunks: Buffer[] = [];
++
++		for await (const receivedChunk of request) {
++			receivedChunks.push(Buffer.from(receivedChunk));
++		}
++
++		const receivedBody = Buffer.concat(receivedChunks);
++
++		t.true(receivedBody.equals(requestBody));
++		response.end('ok');
++	});
++
++	try {
++		const {body} = await got.post('redirect-early', {
++			body: requestBody,
++			retry: {
++				limit: 0,
++			},
++			agent: {
++				http: agent,
++			},
++		}).on('request', request => {
++			requests.push(request);
++		});
++
++		t.is(body, 'ok');
++		t.is(requests.length, 2);
++
++		const staleRequest = requests[0];
++		if (!staleRequest) {
++			throw new Error('Expected a stale redirected request');
++		}
++
++		if (!staleRequest.destroyed && !staleRequest.writableEnded) {
++			await Promise.race([
++				new Promise<void>(resolve => {
++					staleRequest.once('finish', resolve);
++					staleRequest.once('close', resolve);
++				}),
++				delay(1000).then(() => {
++					throw new Error('Stale redirected request was not finalized');
++				}),
++			]);
++		}
++
++		t.true(staleRequest.destroyed || staleRequest.writableEnded);
++	} finally {
++		agent.destroy();
++	}
++});
++
++test('early 307 redirect emits final upload progress event', withServer, async (t, server, got) => {
++	const requestBody = Buffer.alloc(1024 * 1024 * 4, 'c');
++	const events: Array<{percent: number; transferred: number; total?: number}> = [];
++
++	server.post('/redirect-early-progress', early307RedirectHandler('/target-early-progress'));
++
++	server.post('/target-early-progress', async (request, response) => {
++		for await (const receivedChunk of request) {
++			void receivedChunk;
++		}
++
++		response.end('ok');
++	});
++
++	const {body} = await got.post('redirect-early-progress', {
++		body: requestBody,
++		retry: {
++			limit: 0,
++		},
++	}).on('uploadProgress', event => {
++		events.push({
++			percent: event.percent,
++			transferred: event.transferred,
++			total: event.total,
++		});
++	});
++
++	t.is(body, 'ok');
++	t.true(events.length > 1);
++
++	const finalEvent = events.at(-1);
++	t.truthy(finalEvent);
++	t.is(finalEvent?.percent, 1);
++	t.is(finalEvent?.transferred, requestBody.byteLength);
++	t.is(finalEvent?.total, requestBody.byteLength);
++});
++
++test('early 307 redirect emits final upload progress event for small body', withServer, async (t, server, got) => {
++	const requestBody = Buffer.alloc(32, 'd');
++	const events: Array<{percent: number; transferred: number; total?: number}> = [];
++
++	server.post('/redirect-early-progress-small', early307RedirectHandler('/target-early-progress-small'));
++
++	server.post('/target-early-progress-small', async (request, response) => {
++		for await (const receivedChunk of request) {
++			void receivedChunk;
++		}
++
++		response.end('ok');
++	});
++
++	const {body} = await got.post('redirect-early-progress-small', {
++		body: requestBody,
++		retry: {
++			limit: 0,
++		},
++	}).on('uploadProgress', event => {
++		events.push({
++			percent: event.percent,
++			transferred: event.transferred,
++			total: event.total,
++		});
++	});
++
++	t.is(body, 'ok');
++	t.true(events.length > 1);
++
++	const finalEvent = events.at(-1);
++	t.truthy(finalEvent);
++	t.is(finalEvent?.percent, 1);
++	t.is(finalEvent?.transferred, requestBody.byteLength);
++	t.is(finalEvent?.total, requestBody.byteLength);
++});
++
++test('early 307 redirect preserves upload progress totals', withServer, async (t, server, got) => {
++	const requestBody = Buffer.alloc(1024 * 1024 * 4, 'e');
++	const events: Array<{percent: number; transferred: number; total: number | undefined}> = [];
++	const requestMethods: string[] = [];
++
++	server.post('/redirect-early-progress-preserve', early307RedirectHandler('/target-early-progress-preserve'));
++
++	server.post('/target-early-progress-preserve', async (request, response) => {
++		for await (const receivedChunk of request) {
++			void receivedChunk;
++		}
++
++		response.end('ok');
++	});
++
++	const {body} = await got.post('redirect-early-progress-preserve', {
++		body: requestBody,
++		retry: {
++			limit: 0,
++		},
++	}).on('request', request => {
++		requestMethods.push(request.method ?? '');
++	}).on('uploadProgress', event => {
++		events.push({
++			percent: event.percent,
++			transferred: event.transferred,
++			total: event.total,
++		});
++	});
++
++	t.is(body, 'ok');
++	t.deepEqual(requestMethods, ['POST', 'POST']);
++
++	let redirectedStartEventIndex = -1;
++	for (let index = events.length - 1; index >= 0; index--) {
++		if (events[index]!.transferred === 0) {
++			redirectedStartEventIndex = index;
++			break;
++		}
++	}
++
++	t.true(redirectedStartEventIndex >= 0);
++
++	const redirectedStartEvent = events[redirectedStartEventIndex]!;
++	t.is(redirectedStartEvent.total, requestBody.byteLength);
++
++	const redirectedProgressEvents = events.slice(redirectedStartEventIndex + 1).filter(event => event.transferred > 0 && event.transferred < requestBody.byteLength);
++	t.true(redirectedProgressEvents.length > 0);
++
++	for (const event of redirectedProgressEvents) {
++		t.is(event.total, requestBody.byteLength);
++		t.true(event.percent > 0);
++		t.true(event.percent < 1);
++	}
++});
++
++test('early 307 redirect finalizes writable side for buffered body', withServer, async (t, server, got) => {
++	const requestBody = Buffer.alloc(1024 * 1024 * 4, 'f');
++
++	server.post('/redirect-early-writable-finish', early307RedirectHandler('/target-early-writable-finish'));
++
++	server.post('/target-early-writable-finish', async (request, response) => {
++		for await (const receivedChunk of request) {
++			void receivedChunk;
++		}
++
++		response.end('ok');
++	});
++
++	const requestStream = got.stream.post('redirect-early-writable-finish', {
++		body: requestBody,
++		retry: {
++			limit: 0,
++		},
++	});
++
++	let finished = false;
++	requestStream.once('finish', () => {
++		finished = true;
++	});
++
++	let responseBody = '';
++	for await (const chunk of requestStream) {
++		responseBody += Buffer.isBuffer(chunk) ? chunk.toString() : String(chunk);
++	}
++
++	if (!finished) {
++		await Promise.race([
++			new Promise<void>(resolve => {
++				requestStream.once('finish', resolve);
++			}),
++			delay(1000).then(() => {
++				throw new Error('Redirected buffered stream did not emit finish');
++			}),
++		]);
++	}
++
++	t.is(responseBody, 'ok');
++	t.true(requestStream.writableFinished);
++});
++
++test('early 307 redirect does not prematurely end redirected request while replaying body', withServer, async (t, server, got) => {
++	const requestBody = Buffer.alloc(1024 * 1024 * 4, 'g');
++	let redirectedRequestAborted = false;
++	let redirectedBodyLength = 0;
++
++	server.post('/redirect-early-race', early307RedirectHandler('/target-early-race'));
++
++	server.post('/target-early-race', async (request, response) => {
++		request.on('aborted', () => {
++			redirectedRequestAborted = true;
++		});
++
++		const receivedChunks: Buffer[] = [];
++		for await (const receivedChunk of request) {
++			receivedChunks.push(Buffer.from(receivedChunk));
++		}
++
++		redirectedBodyLength = Buffer.concat(receivedChunks).byteLength;
++		response.end('ok');
++	});
++
++	const {body} = await got.post('redirect-early-race', {
++		body: requestBody,
++		retry: {
++			limit: 0,
++		},
++	}).on('request', request => {
++		const originalWrite = request.write.bind(request);
++
++		request.write = ((chunk: any, encoding?: any, callback?: any) => {
++			if (typeof encoding === 'function') {
++				callback = encoding;
++				encoding = undefined;
++			}
++
++			if (typeof callback === 'function') {
++				const originalCallback = callback;
++				callback = (error?: Error) => {
++					setTimeout(() => {
++						originalCallback(error);
++					}, 25);
++				};
++			}
++
++			return originalWrite(chunk, encoding, callback);
++		}) as typeof request.write;
++	});
++
++	t.is(body, 'ok');
++	t.false(redirectedRequestAborted);
++	t.is(redirectedBodyLength, requestBody.byteLength);
++});
++
+ test('method rewriting', withServer, async (t, server, got) => {
+ 	server.post('/redirect', (_request, response) => {
+ 		response.writeHead(302, {
+@@ -529,6 +878,44 @@ test('method rewriting', withServer, async (t, server, got) => {
+ 	t.is(temporaryRedirectBody, 'foobar');
+ });
+ 
++test('upload progress total is reset on redirected GET request', withServer, async (t, server, got) => {
++	server.post('/redirect-upload-progress', (_request, response) => {
++		response.writeHead(303, {
++			location: '/redirect-upload-progress-target',
++		});
++		response.end();
++	});
++	server.get('/redirect-upload-progress-target', (_request, response) => {
++		response.end('ok');
++	});
++
++	const events: Array<{transferred: number; total: number | undefined}> = [];
++	const requestMethods: string[] = [];
++	const {body} = await got.post('redirect-upload-progress', {
++		body: 'foobar',
++		retry: {
++			limit: 0,
++		},
++	}).on('request', request => {
++		requestMethods.push(request.method ?? '');
++	}).on('uploadProgress', event => {
++		events.push({
++			transferred: event.transferred,
++			total: event.total,
++		});
++	});
++
++	t.is(body, 'ok');
++	t.deepEqual(requestMethods, ['POST', 'GET']);
++
++	const zeroTransferredEvents = events.filter(event => event.transferred === 0);
++	t.true(zeroTransferredEvents.length >= 2);
++
++	const redirectedRequestEvent = zeroTransferredEvents.at(-1);
++	t.truthy(redirectedRequestEvent);
++	t.is(redirectedRequestEvent?.total, undefined);
++});
++
+ test('clears username and password when redirecting to a different hostname', withServer, async (t, server, got) => {
+ 	server.get('/', (_request, response) => {
+ 		response.writeHead(302, {

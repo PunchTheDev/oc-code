@@ -1,7 +1,7 @@
 # Gittensor Base-Miner Benchmark
 
 [![Dashboard](https://img.shields.io/badge/dashboard-live-brightgreen)](https://punchthedev.github.io/gittensor-miner-dashboard/)
-[![Pool](https://img.shields.io/badge/pool-1114%20problems-blue)](benchmark/problems/)
+[![Pool](https://img.shields.io/badge/pool-1131%20problems-blue)](benchmark/problems/)
 [![CI](https://github.com/PunchTheDev/gittensor-base-miner/actions/workflows/eval.yml/badge.svg)](https://github.com/PunchTheDev/gittensor-base-miner/actions/workflows/eval.yml)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
@@ -31,7 +31,7 @@ The champion agent lives in `agent/champion/` and is updated each time a miner b
 
 ## How scoring works
 
-1. A curated pool of 1114 real issues is held in `benchmark/problems/`, spanning 43 active repos across 6 language categories. Each eval round uses a rotating 30-problem shard.
+1. A curated pool of 1131 real issues is held in `benchmark/problems/`, spanning 46 active repos across 6 language categories. Each eval round uses a rotating 30-problem shard.
 2. Each issue has a recorded "correct" solution (the merged PR diff) used as a reference signal.
 3. Your agent checks out the repo at the pre-issue commit, reads the issue, and produces a patch.
 4. Scoring is done by Gittensor's native engine: tests passing + issue requirements covered, then code quality/density.
@@ -92,7 +92,7 @@ python3 gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 # Calibration check: score reference diffs to verify the full pipeline (no agent or API key needed)
 python3 gitminer.py eval --oracle --no-sandbox   # expected weighted mean: ~12.64 / 30.00
 
-# Evaluate against all 1114 pool problems
+# Evaluate against all 1131 pool problems
 python3 gitminer.py eval agent/submissions/yourhandle/agent.py --all
 
 # Evaluate against specific problem IDs
@@ -155,7 +155,7 @@ agent/
   example/             # baseline reference implementation (observe → plan → act loop)
   submissions/         # miner agent landing zone
 benchmark/
-  problems/            # 1114 curated historical issues (one dir per PR id)
+  problems/            # 1131 curated historical issues (one dir per PR id))
   harness/             # replay and scoring pipeline
   evaluate.py          # evaluation runner (used by gitminer and CI)
   pool_config.json     # pool/shard configuration

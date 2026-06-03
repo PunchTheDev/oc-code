@@ -64,6 +64,9 @@ REPO_CATEGORY: dict[str, str] = {
     "gofiber/fiber": "go",
     "grpc/grpc-go": "go",
     "spf13/cobra": "go",
+    "google/guava": "jvm",
+    "serde-rs/serde": "rust",
+    "sindresorhus/got": "typescript",
 }
 
 # Shard sampling budget per category (sums to 30)

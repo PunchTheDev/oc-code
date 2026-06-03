@@ -80,6 +80,12 @@ EXTERNAL_REPOS = [
     "gofiber/fiber",               # 31k stars — Go web framework, Express-style, active bug-fixes
     "grpc/grpc-go",                # 21k stars — Go gRPC implementation, real protocol bugs
     "spf13/cobra",                 # 35k stars — Go CLI library, well-tested edge cases
+    # JVM expanded
+    "google/guava",                # 50k stars — Java core libraries, gradlew-tested utility bugs
+    # Rust expanded
+    "serde-rs/serde",              # 24k stars — Rust serialization framework, real derivation bugs
+    # TypeScript expanded
+    "sindresorhus/got",            # 14k stars — Node HTTP client, TypeScript, real HTTP edge cases
 ]
 
 

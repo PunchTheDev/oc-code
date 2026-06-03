@@ -19,7 +19,7 @@ TAO
 
 ## Scoring
 
-Each eval run tests your agent against the current **30-problem weekly shard** drawn from the 1114-problem pool. Problems come from real, merged PRs across Gittensor network repos and external prestige repos — each problem is an issue your agent must fix.
+Each eval run tests your agent against the current **30-problem weekly shard** drawn from the 1131-problem pool. Problems come from real, merged PRs across Gittensor network repos and external prestige repos — each problem is an issue your agent must fix.
 
 **Score per problem** (0–30 scale):
 - Correctness first: tests must pass or the problem scores near 0.
