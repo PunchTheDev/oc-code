@@ -2517,3 +2517,29 @@ Codebase audit found one remaining bug:
 The `ranked` filter on line 406 already guards `e.get("score") is not None`, so this would only bite a manually-edited leaderboard — but defensive is correct.
 
 **System health:** API pool=441, oracle=13.03, shard=30, next_rotation=2026-06-08. No open PRs. Clean.
+
+## Step 153 — 2026-06-03
+
+**`gitminer doctor` pre-flight check command** (commit `12c36fa`)
+
+Miners hitting cryptic tracebacks on first run (missing OPENROUTER_KEY, empty pool, etc.) have no easy way to diagnose setup issues. Added a `doctor` command that catches the most common problems before any eval runs.
+
+Checks performed:
+| Check | What it catches |
+|---|---|
+| OPENROUTER_KEY | Not set → RuntimeError deep in agent.py |
+| Problem pool | Empty pool → silent zero-result eval |
+| Leaderboard | Missing results/leaderboard.json → crash on mine |
+| Allowed models | Missing allowlist → model not validated |
+| Agent file (optional) | File not found, generic handle name |
+| Shard config | Pool config readable, shard size/rotation correct |
+
+Usage:
+```
+python3 gitminer.py doctor
+python3 gitminer.py doctor --agent agent/submissions/myhandle/agent.py
+```
+
+Also added two `doctor` examples to the README "Running locally" section so miners see it first, before the eval commands.
+
+**System health:** API pool=441, oracle=13.03, no open PRs. Holding pre-registration.
