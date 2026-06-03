@@ -3504,3 +3504,28 @@ Merged 4 open PRs and exposed `test_quality_factor` in the dashboard submission 
 - Dashboard: `test_quality_factor` column live in submission breakdown
 - Benchmark: 1154 problems, oracle 12.70 weighted, 47 repos, 6 languages
 - CI: repo cache active — Phase 1 eval 30–60% faster
+
+---
+
+## Step 195 — 2026-06-03
+
+**Monitoring step** — no code changes. Audited open PRs (0), CI runs (all green), pool rotation schedule (2026-06-08), and backlog. Operator-blocked items (Daytona, per-miner OpenRouter key) remain pending. System healthy.
+
+---
+
+## Step 196 — 2026-06-03
+
+**Documentation accuracy fixes** (PR #72)
+
+Three stale documentation entries corrected:
+
+- `agent/example/agent.py` docstring: scoring model updated from "`src_token_score` formula" to the current v5 formula (`benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor`)
+- `agent/example/README.md`: same scoring model update + interface return type fixed (`-> str` → `-> Patch`)
+- `README.md`: repo count corrected (46 → 47 — 47 confirmed by counting distinct `repo_name` fields in the problem pool)
+
+### System state after step 196
+
+- base-miner main: post-PR#72 merge
+- Benchmark: 1154 problems, oracle 12.70 weighted, 47 repos, 6 languages
+- Pool rotation: Sunday 2026-06-08 (automated, `refresh_pool.yml`)
+- CI: all green

@@ -13,9 +13,13 @@ The agent receives a GitHub issue and repository context, then produces a unifie
 
 ## Scoring model
 
-Correctness gates quality — tests must pass before quality metrics count. After that, score is driven by `src_token_score`: the number of meaningful source-code tokens in your diff. Complete, well-structured implementations score significantly higher than minimal stubs.
+Correctness gates quality — tests must pass before quality metrics count. After that:
 
-The example agent is tuned for this: it prefers thorough fixes over terse ones.
+```
+benchmark_score = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor
+```
+
+`relative_score` is the agent's AST token score divided by the oracle's — complete, well-structured implementations earn more than minimal stubs. `test_quality_factor` rewards adding test assertions alongside the fix. The example agent is tuned to produce thorough implementations, not one-liners.
 
 ## Running it
 
@@ -40,4 +44,4 @@ python3 gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 
 ## Interface
 
-The agent must subclass `BaseAgent` from `agent/base.py` and implement `solve(problem: Problem) -> str`. See `base.py` for the full `Problem` data class.
+The agent must subclass `BaseAgent` from `agent/base.py` and implement `solve(problem: Problem) -> Patch`. See `base.py` for the full `Problem` and `Patch` data classes.

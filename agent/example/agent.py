@@ -5,10 +5,10 @@ Demonstrates the scaffolding pattern — same frozen model, better wrapper.
 Miners compete to outperform this baseline.
 
 Scoring model: correctness gates quality. Tests must pass first; then the
-score is driven by the number of meaningful source-code tokens in the diff
-(Gittensor's src_token_score formula). This agent is tuned to produce
-complete, well-structured implementations — not minimal one-liners — because
-a thorough fix that passes tests scores significantly higher than a bare stub.
+score is driven by `benchmark_score = test_pass_rate × relative_score ×
+anti_gaming_multiplier × test_quality_factor`. `relative_score` is the
+agent's AST token score divided by the oracle's, so complete, well-structured
+implementations earn more than minimal stubs that barely pass tests.
 
 Improvements over a naive single-shot approach:
 - Test-first reasoning: plan step analyzes what each test assertion requires before
