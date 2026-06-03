@@ -4,6 +4,22 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Pool 446 → 532 + dashboard deep links (step 163)
+
+**Pool expanded: 446 → 532 problems** (PR #12 merged)
+- 85 new phase-rs/phase problems (Rust — bug fixes, all with linked issues + inline tests)
+- 1 new infiniflow/ragflow problem
+- Oracle: 15.15 weighted → **15.62 weighted** / 14.04 → **14.57 arithmetic**
+- pool_config.json pool_size updated to 532
+- Added `--incremental` flag to `baseline_scores.py` (only re-scores new problems)
+
+**Dashboard: URL deep links for problems** (gittensor-miner-dashboard commit dfe486c)
+- Each problem now gets a shareable URL: `#/problem/<id>` 
+- Browser back/forward works through problem navigation
+- Static pool count placeholders updated to 446
+
+---
+
 ## 2026-06-03 — Full system audit, pre-registration holding
 
 **Codebase-wide audit** — nothing to fix.
