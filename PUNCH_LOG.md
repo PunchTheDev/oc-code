@@ -3814,3 +3814,29 @@ Pool quality audit revealed that `expand_pool_external.py` was missing the `SERV
 - base-miner main: 3251f0d2 (PR #86 merged)
 - Benchmark: 1123 problems, oracle 12.64 weighted / 11.49 arithmetic, 47 repos
 - Pool rotation: Sunday 2026-06-08 — now protected against server-required re-injection
+
+## Step 209 — 2026-06-03
+
+**Full codebase audit + README fix**
+
+No open PRs at start. Performed a comprehensive pre-rotation audit of the codebase — pool quality, scoring pipeline, CI workflows, docs, dashboard, CLI, and anti-gaming scripts.
+
+**Findings (all clean):**
+- Pool: 1123 problems, 0 empty diffs, 0 server-required tests
+- 67 ragflow problems in pool: `test_files: []` but all have valid `test_cmd` pointing to unit/mock tests — confirmed safe in step 208 audit
+- Scoring pipeline: `benchmark_score`, `weighted_benchmark_score`, `test_quality_factor` all correct
+- Oracle consistency: baselines.json ↔ pool_config.json ↔ leaderboard.json ↔ dashboard all match (12.64 weighted, 11.49 arithmetic)
+- CI workflows: `eval.yml`, `record_submission.yml`, `refresh_pool.yml` — no issues
+- Anti-gaming scripts: `check_similarity.py`, `check_reference_copy.py`, `check_output_similarity.py`, `check_rate_limit.py` — all robust
+- CLI: all subcommands reviewed (eval/run/validate/hash/submit/mine/doctor) — all correct
+- `SERVER_TEST_PATTERNS` filter: confirmed in both `build_pool.py` and `expand_pool_external.py`
+- Pool rotation 2026-06-08: all automation in place and protected
+
+**Bug fixed:**
+- `README.md` line 116: "all 1000 problems" → "list all pool problems" (count-agnostic, won't go stale as pool grows)
+- **PR #87**: merged (ab8a0816)
+
+**System state post-step:**
+- base-miner main: ab8a0816 (PR #87 merged)
+- Benchmark: 1123 problems, oracle 12.64 weighted / 11.49 arithmetic, 47 repos
+- Pool rotation: Sunday 2026-06-08 (5 days, protected)
