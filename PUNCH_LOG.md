@@ -3858,3 +3858,37 @@ No open PRs at start. Performed a comprehensive pre-rotation audit of the codeba
 - dashboard main: 9cbb570 (dashboard PR #7 merged)
 - Benchmark: 1123 problems, oracle 12.64 weighted / 11.49 arithmetic, 47 repos
 - Pool rotation: Sunday 2026-06-08 (5 days, protected)
+
+## Step 211 — 2026-06-03
+
+**Model whitelist expansion 28 → 34 + GitHub Actions Node.js 24 audit**
+
+**PR #89 merged** — expanded model whitelist to include 6 new models verified live on OpenRouter 2026-06-03:
+- `anthropic/claude-sonnet-4.6` (same model as Claude Code default)
+- `anthropic/claude-opus-4.5` (Opus 4 generation)
+- `anthropic/claude-opus-4.6` (latest Opus)
+- `deepseek/deepseek-v3.1-terminus` (new DeepSeek V3 variant)
+- `qwen/qwen3-coder-plus` (enhanced Qwen3 coding model)
+- `qwen/qwen3-235b-a22b` (large Qwen3 MoE — 235B params / 22B active)
+
+Net: 28 → 34 whitelisted models. API restarted and confirmed 34 models via `/api/agents`.
+
+**GitHub Actions Node.js 24 deadline (June 16):**
+GitHub forces Node.js 24 by default on June 16, 2026. All 5 workflows need action version updates:
+- `actions/checkout@v4` → `actions/checkout@v6`
+- `actions/setup-python@v5` → `actions/setup-python@v6`
+- `actions/cache@v4` → `actions/cache@v5`
+- `actions/upload-artifact@v4` → `actions/upload-artifact@v7`
+- `actions/github-script@v7` → `actions/github-script@v9`
+
+Push blocked — OAuth token lacks `workflow` scope. Operator must run:
+```
+gh auth refresh -s workflow
+```
+Then the changes can be pushed. This must happen before June 16.
+
+**System state post-step:**
+- base-miner main: 29534cbf (PR #89 merged)
+- Benchmark: 1123 problems, oracle 12.64 weighted / 11.49 arithmetic, 47 repos
+- Model whitelist: **34 models** (all verified live 2026-06-03)
+- Pool rotation: Sunday 2026-06-08 (5 days, protected)
