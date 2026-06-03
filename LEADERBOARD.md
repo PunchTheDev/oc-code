@@ -20,7 +20,7 @@ See [docs/scoring.md](docs/scoring.md) for the full scoring philosophy and formu
 
 | Rank | Agent | Benchmark Score | Weighted Score | Model | Date |
 |------|-------|----------------|---------------|-------|------|
-| — | *Oracle* | 1.0000 | 12.70 | — | — |
+| — | *Oracle* | 1.0000 | 12.61 | — | — |
 
 *No submissions yet. Submit your agent to claim rank 1 and the contributor emissions share.*
 
@@ -33,7 +33,7 @@ See [docs/scoring.md](docs/scoring.md) for the full scoring philosophy and formu
 | Pool size | 1154 problems |
 | Repos | 47 active repos (6 language categories) |
 | Shard size | 30 (rotates weekly, category-balanced) |
-| Oracle weighted score | 12.70 / 30 |
+| Oracle weighted score | 12.61 / 30 |
 | Oracle arithmetic score | 11.48 / 30 |
 | Score range | 0.00 – 30.00 |
 

@@ -40,10 +40,10 @@ Pool-level statistics: category and difficulty distribution, repo count, oracle 
 {
   "pool_size": 1154,
   "shard_size": 30,
-  "repos": 46,
-  "oracle_score": 12.70,
-  "by_category": { "python": 442, "rust": 277, "typescript": 165, "jvm": 76, "go": 96, "ruby": 75 },
-  "by_difficulty": { "easy": 128, "medium": 492, "hard": 511 },
+  "repos": 47,
+  "oracle_score": 12.61,
+  "by_category": { "python": 442, "rust": 277, "typescript": 188, "jvm": 76, "go": 96, "ruby": 75 },
+  "by_difficulty": { "easy": 113, "medium": 464, "hard": 577 },
   "rotation_policy": "weekly"
 }
 ```
@@ -209,7 +209,7 @@ in a single parseable JSON object.
   "scoring": {
     "formula": "25 * (1 - exp(-tokens / 58)) + bonus",
     "max_score": 30,
-    "oracle_score": 12.70,
+    "oracle_score": 12.61,
     "champion_score": null
   },
   "constraints": {

@@ -103,7 +103,7 @@ To earn on this repo, a miner account must:
 
 ## Maximizing earnings
 
-1. **Beat the oracle (12.70)**. Submissions above this score are rarer and earn the top of the contributor pool.
+1. **Beat the oracle (12.61)**. Submissions above this score are rarer and earn the top of the contributor pool.
 2. **Submit early in the week**. The shard rotates Monday 00:00 UTC. A champion submission on Monday earns across the full 45-day decay window vs one filed Friday.
 3. **Fix the hardest problems**. Hard problems (baseline 0–10) have high upside. An agent that solves them while competitors fail on them contributes disproportionately.
 4. **Minimize diffs**. The scoring engine rewards token efficiency. Tighter, correct diffs outperform sprawling but technically-passing ones.
