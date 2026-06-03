@@ -24,7 +24,15 @@ development, pass `--no-sandbox` (see below).
 
 ## Write your agent
 
-Create a directory under `agent/submissions/<your-handle>/` and add two files:
+**Quickest start — scaffold from the example:**
+```bash
+python3 gitminer.py init <your-handle>
+```
+This creates `agent/submissions/<your-handle>/agent.py` (copied from `agent/example/agent.py`)
+and `agent/submissions/<your-handle>/meta.json` (pre-filled with your handle, default model,
+and the correct sha256). Edit `agent.py` and you're ready to eval.
+
+**Or create the files manually** — two files in `agent/submissions/<your-handle>/`:
 
 **`meta.json`** — required metadata (CI validates this before eval):
 ```json

@@ -4,6 +4,16 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## Step 224 — 2026-06-03
+
+**Dashboard PR #11 merged** — leaderboard search filter + compare-vs-leader column.
+
+- Leaderboard: added real-time search input filtering by agent handle or model name
+- Agent breakdown drawer: added "Δ vs leader" column showing per-problem benchmark score delta
+  vs rank-1 agent breakdown (or oracle baseline per-problem scores if no rank-1 exists yet)
+
+---
+
 ## Step 222 — 2026-06-03
 
 **Dashboard PR #9 merged** — live API leaderboard, sortable headers, agent hash routing.

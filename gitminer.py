@@ -3,6 +3,7 @@
 gitminer — CLI for the Gittensor Base-Miner Benchmark.
 
 Subcommands:
+    init        Scaffold a new agent directory from the example (quickest start)
     eval        Score an agent against the current shard (or all problems)
     run         Run an agent on one problem and print its patch (fast dev loop)
     validate    Check that a patch applies cleanly to a problem's base commit
@@ -17,6 +18,8 @@ Subcommands:
     mine        Run your agent continuously; auto-submit when it beats the champion
 
 Usage:
+    python3 gitminer.py init myhandle
+    python3 gitminer.py init myhandle --model anthropic/claude-3.5-haiku
     python3 gitminer.py eval agent/submissions/myhandle/agent.py
     python3 gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
     python3 gitminer.py eval agent/submissions/myhandle/agent.py --all
@@ -1445,6 +1448,84 @@ def cmd_doctor(args: argparse.Namespace) -> None:
         print(f"\033[32mAll {len(passed)} checks passed.\033[0m You're ready to mine!\n")
 
 
+def cmd_init(args: argparse.Namespace) -> None:
+    """
+    Scaffold a new agent directory from the example agent.
+
+    Creates agent/submissions/<handle>/agent.py (copied from agent/example/agent.py)
+    and agent/submissions/<handle>/meta.json (pre-filled with handle, default model,
+    and the correct sha256). The miner can then edit agent.py and submit.
+
+    Examples:
+        python3 gitminer.py init myhandle
+        python3 gitminer.py init myhandle --model anthropic/claude-3.5-haiku
+    """
+    import shutil
+
+    handle = args.handle.strip()
+    if not handle or "/" in handle or "\\" in handle or " " in handle:
+        print("Error: handle must be a simple identifier (no slashes or spaces).",
+              file=sys.stderr)
+        sys.exit(1)
+
+    model = args.model or "deepseek/deepseek-chat"
+
+    # Validate model against whitelist (warn, not hard-fail — whitelist may change)
+    allowed_path = REPO_ROOT / "benchmark" / "harness" / "allowed_models.txt"
+    if allowed_path.exists():
+        allowed = {
+            ln.strip()
+            for ln in allowed_path.read_text().splitlines()
+            if ln.strip() and not ln.startswith("#")
+        }
+        if model not in allowed:
+            print(f"Warning: '{model}' is not in benchmark/harness/allowed_models.txt")
+            print("CI will reject the submission. Run: python3 gitminer.py problems --cat python "
+                  "to see available models, or check benchmark/harness/allowed_models.txt")
+
+    src_dir = REPO_ROOT / "agent" / "example"
+    dst_dir = REPO_ROOT / "agent" / "submissions" / handle
+
+    if dst_dir.exists():
+        print(f"Directory already exists: {dst_dir}")
+        print("Delete it first if you want to reset, or edit the files directly.")
+        sys.exit(1)
+
+    dst_dir.mkdir(parents=True)
+
+    # Copy agent.py
+    agent_src = src_dir / "agent.py"
+    agent_dst = dst_dir / "agent.py"
+    shutil.copy(agent_src, agent_dst)
+
+    # Compute sha256 of the copied agent file
+    sha256 = hashlib.sha256(agent_dst.read_bytes()).hexdigest()
+
+    # Write meta.json
+    meta = {"handle": handle, "model": model, "sha256": sha256}
+    (dst_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+
+    print(f"Initialized agent for handle '{handle}' at {dst_dir}/")
+    print()
+    print("Files created:")
+    print(f"  {agent_dst}   — copy of example agent (edit this)")
+    print(f"  {dst_dir / 'meta.json'}  — metadata (handle, model, sha256)")
+    print()
+    print("Next steps:")
+    print(f"  1. Edit agent/submissions/{handle}/agent.py — improve the reasoning loop")
+    print(f"  2. Test on one problem:")
+    print(f"       python3 gitminer.py run --problem 0463 "
+          f"--agent agent/submissions/{handle}/agent.py --score --no-sandbox")
+    print(f"  3. Run the full shard eval:")
+    print(f"       python3 gitminer.py eval agent/submissions/{handle}/agent.py --no-sandbox")
+    print(f"  4. When ready to submit:")
+    print(f"       python3 gitminer.py submit agent/submissions/{handle}/agent.py --open-pr")
+    print()
+    print("Tip: if you change agent.py, update the sha256 in meta.json:")
+    print(f"     python3 gitminer.py hash agent/submissions/{handle}/agent.py")
+    print("     then paste the output into meta.json 'sha256' field.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="gitminer",
@@ -1608,6 +1689,17 @@ def main() -> None:
     p_doctor.add_argument("--agent", metavar="PATH",
                           help="Path to your agent.py (optional — also validates handle and file)")
     p_doctor.set_defaults(func=cmd_doctor)
+
+    # init
+    p_init = sub.add_parser(
+        "init",
+        help="Scaffold a new agent directory from the example (quickest start)",
+    )
+    p_init.add_argument("handle", metavar="HANDLE",
+                        help="Your submission handle (e.g. myhandle)")
+    p_init.add_argument("--model", metavar="MODEL_ID",
+                        help="Model ID to declare in meta.json (default: deepseek/deepseek-chat)")
+    p_init.set_defaults(func=cmd_init)
 
     args = parser.parse_args()
     args.func(args)

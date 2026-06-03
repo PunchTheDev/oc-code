@@ -430,10 +430,11 @@ class Handler(BaseHTTPRequestHandler):
                 "clone": "git clone https://github.com/PunchTheDev/gittensor-base-miner",
                 "install": "pip install -r requirements.txt",
                 "env": "export OPENROUTER_KEY=sk-or-...",
+                "scaffold": "python3 gitminer.py init <handle>",
                 "run_one": (
                     "python3 gitminer.py run "
                     "--problem 0463 "
-                    "--agent agent/example/agent.py "
+                    "--agent agent/submissions/<handle>/agent.py "
                     "--score --no-sandbox"
                 ),
                 "run_shard": (
