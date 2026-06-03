@@ -12,7 +12,21 @@ if str(_REPO_ROOT) not in sys.path:
 
 from benchmark.catalog import DEFAULT_SHARD_BUDGET, REPO_CATEGORY, problem_tier  # noqa: E402
 
-SHARD_BUDGET = DEFAULT_SHARD_BUDGET
+
+def _load_shard_budget() -> dict:
+    """Read shard_budget from pool_config.json; fall back to catalog default."""
+    cfg_path = pathlib.Path(__file__).parent.parent / "benchmark" / "pool_config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text())
+        budget = cfg.get("shard_budget")
+        if isinstance(budget, dict) and budget:
+            return budget
+    except Exception:
+        pass
+    return DEFAULT_SHARD_BUDGET
+
+
+SHARD_BUDGET = _load_shard_budget()
 
 
 def repo_category(repo: str) -> str:
