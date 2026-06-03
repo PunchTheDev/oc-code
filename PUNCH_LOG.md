@@ -4,6 +4,19 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Stale oracle fallback cleanup (commit 06c9987)
+
+Three files had hardcoded fallback values (11.83/12.77) from before the gittensory pool expansion. The fallbacks are only reached when baselines.json/leaderboard.json can't be read, but they should still reflect current state.
+
+**Files updated**:
+- `.github/workflows/eval.yml`: fallback oracle 12.77 → 13.03
+- `scripts/generate_dashboard_data.py`: fallbacks 11.83→12.08, 12.77→13.03, count 430→441
+- `scripts/record_result.py`: fallback (11.83, 12.77) → (12.08, 13.03)
+
+**Also verified**: JVM problem baselines are correct (0.01–26.88 range); earlier diagnostic was checking wrong field (`baseline_score` vs `base_score`). Pool composition confirmed: 441 problems across 13 DAS-registered repos. API live on PM2, oracle 13.03.
+
+---
+
 ## 2026-06-03 — Difficulty tier consistency sweep (commits 2d5bab4, 13535cd)
 
 **Root cause**: Two places still used oracle score to classify problem difficulty (easy/medium/hard) instead of the canonical line-count system in `evaluate.py`. The eval.yml PR comment used `score ≥ 15 → easy`, and `gitminer.py problems` used the same score thresholds.
