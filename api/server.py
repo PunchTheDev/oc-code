@@ -88,6 +88,7 @@ REPO_CATEGORY: dict[str, str] = {
     "google/guava": "jvm",
     "serde-rs/serde": "rust",
     "sindresorhus/got": "typescript",
+    "tanstack/query": "typescript",
 }
 
 

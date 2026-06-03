@@ -86,6 +86,7 @@ EXTERNAL_REPOS = [
     "serde-rs/serde",              # 24k stars — Rust serialization framework, real derivation bugs
     # TypeScript expanded
     "sindresorhus/got",            # 14k stars — Node HTTP client, TypeScript, real HTTP edge cases
+    "TanStack/query",              # 38k stars — React Query data-fetching library, vitest, real async bugs
 ]
 
 

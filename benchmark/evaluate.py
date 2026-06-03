@@ -115,14 +115,15 @@ REPO_CATEGORY: dict[str, str] = {
     "serde-rs/serde": "rust",
     # TypeScript external repos (continued)
     "sindresorhus/got": "typescript",
+    "tanstack/query": "typescript",
 }
 
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json
-# Proportional to pool composition: python:40% rust:25% typescript:18% ruby:7% jvm:5% go:9%
+# Proportional to pool composition: python:38% rust:24% typescript:16% go:8% jvm:7% ruby:7%
 DEFAULT_SHARD_BUDGET: dict[str, int] = {
-    "python": 12,
+    "python": 11,
     "rust": 7,
-    "typescript": 4,
+    "typescript": 5,
     "ruby": 2,
     "jvm": 2,
     "go": 3,
@@ -376,8 +377,8 @@ def run_evaluation(
     # Oracle mode: score reference diffs directly — no agent call needed.
     # Used for pipeline calibration; expected weighted mean matches baselines.json.
     if use_oracle:
-        _oracle_weighted = 12.64
-        _oracle_arithmetic = 11.41
+        _oracle_weighted = 12.70
+        _oracle_arithmetic = 11.48
         _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
         if _baselines_path.exists():
             try:

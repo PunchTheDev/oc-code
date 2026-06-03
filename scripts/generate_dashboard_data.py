@@ -67,14 +67,15 @@ REPO_CATEGORY: dict[str, str] = {
     "google/guava": "jvm",
     "serde-rs/serde": "rust",
     "sindresorhus/got": "typescript",
+    "tanstack/query": "typescript",
 }
 
 # Shard sampling budget per category (sums to 30)
-# Proportional to pool: python:40% rust:25% typescript:18% ruby:7% jvm:5% go:9%
+# Proportional to pool: python:38% rust:24% typescript:16% go:8% jvm:7% ruby:6%
 SHARD_BUDGET: dict[str, int] = {
-    "python": 12,
+    "python": 11,
     "rust": 7,
-    "typescript": 4,
+    "typescript": 5,
     "ruby": 2,
     "jvm": 2,
     "go": 3,
