@@ -201,12 +201,18 @@ def load_problems():
 
 
 def load_leaderboard():
-    """Load leaderboard from results/leaderboard.json, fall back to oracle-only."""
+    """Load leaderboard from results/leaderboard.json, fall back to oracle-only.
+
+    The oracle row is always replaced with the freshly computed ORACLE_ROW so that
+    scores stay in sync with baselines.json after pool rotations — not whatever was
+    frozen in the stored file.
+    """
     lb_file = RESULTS_DIR / "leaderboard.json"
     if lb_file.exists():
         try:
             rows = json.loads(lb_file.read_text())
-            # Ensure oracle row is always present at top
+            # Replace stored oracle row with fresh values from baselines.json
+            rows = [ORACLE_ROW if r.get("agent") == "Oracle (accepted solution)" else r for r in rows]
             if not any(r.get("agent") == "Oracle (accepted solution)" for r in rows):
                 rows.insert(0, ORACLE_ROW)
             return rows
