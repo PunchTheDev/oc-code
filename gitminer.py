@@ -21,7 +21,7 @@ Usage:
     python gitminer.py eval agent/submissions/myhandle/agent.py --no-sandbox
     python gitminer.py eval agent/submissions/myhandle/agent.py --all
     python gitminer.py eval agent/submissions/myhandle/agent.py --problems 930,986
-    python gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected mean ~23.46
+    python gitminer.py eval --oracle --no-sandbox   # calibration: score reference diffs, expected weighted mean ~13.03
     python gitminer.py run --problem 0463
     python gitminer.py run --problem 0463 --agent agent/submissions/myhandle/agent.py
     python gitminer.py run --problem 0463 --show-ref --score --no-sandbox
@@ -54,16 +54,16 @@ REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(REPO_ROOT))
 
 
-def _oracle_mean() -> float:
-    """Read the oracle (reference-diff baseline) mean from leaderboard.json."""
+def _oracle_weighted() -> float:
+    """Read the oracle weighted mean from leaderboard.json (primary ranking metric)."""
     try:
         lb = json.loads((REPO_ROOT / "results" / "leaderboard.json").read_text())
         oracle = next((r for r in lb if "Oracle" in r.get("agent", "")), None)
         if oracle:
-            return float(oracle.get("score", 23.46))
+            return float(oracle.get("weighted_score") or oracle.get("score", 13.03))
     except Exception:
         pass
-    return 23.46  # fallback
+    return 13.03  # fallback
 
 
 def cmd_eval(args: argparse.Namespace) -> None:
@@ -96,48 +96,51 @@ def cmd_eval(args: argparse.Namespace) -> None:
     errored = [r for r in problems if r.get("error")]
 
     mean = sum(scores) / len(scores)
-    oracle = _oracle_mean()
+    oracle_weighted = _oracle_weighted()
 
-    # Read language info from meta.json for each problem
+    from benchmark.evaluate import REPO_CATEGORY
+
+    # Read category info from meta.json for each problem
     pool_dir = REPO_ROOT / "benchmark" / "problems"
-    lang_map: dict[str, str] = {}
+    cat_map: dict[str, str] = {}
     for r in problems:
         pid = r.get("problem_id", "")
-        meta_path = pool_dir / str(pid) / "meta.json"
-        if meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text())
-                runner = meta.get("test_cmd", ["python"])[0]
-                lang = {"npm": "JS", "cargo": "Rust", "./gradlew": "Java"}.get(runner, "Python")
-                lang_map[pid] = lang
-            except Exception:
-                lang_map[pid] = "?"
+        cat = r.get("category", "")
+        if not cat:
+            meta_path = pool_dir / str(pid) / "meta.json"
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text())
+                    cat = REPO_CATEGORY.get(meta.get("repo_name", ""), "?")
+                except Exception:
+                    cat = "?"
+        cat_map[pid] = cat or "?"
 
-    # Per-language pass rates
-    lang_stats: dict[str, list] = {}
+    # Per-category pass rates
+    cat_stats: dict[str, list] = {}
     for r in problems:
         pid = r.get("problem_id", "")
-        lang = lang_map.get(pid, "?")
-        if lang not in lang_stats:
-            lang_stats[lang] = []
-        lang_stats[lang].append(r.get("tests_passed", False))
+        cat = cat_map.get(pid, "?")
+        if cat not in cat_stats:
+            cat_stats[cat] = []
+        cat_stats[cat].append(r.get("tests_passed", False))
 
     weighted_mean = results.get("weighted_mean_score", mean)
     print(f"\n{'─'*54}")
     print(f"  Problems evaluated : {len(problems)} ({len(passed)} passed, {len(failed)} failed, {len(errored)} errors)")
     print(f"  Mean score         : {mean:.2f} / 30.00")
     print(f"  Weighted mean      : {weighted_mean:.2f} / 30.00  (easy×1 / medium×1.5 / hard×2)")
-    print(f"  Oracle mean        : {oracle:.2f} / 30.00  (reference diffs)")
-    delta = mean - oracle
+    print(f"  Oracle weighted    : {oracle_weighted:.2f} / 30.00  (reference diffs, weighted)")
+    delta = weighted_mean - oracle_weighted
     arrow = "▲" if delta >= 0 else "▼"
     print(f"  vs oracle          : {arrow} {abs(delta):.2f}")
 
-    if len(lang_stats) > 1:
-        print(f"\n  Pass rate by language:")
-        for lang in sorted(lang_stats):
-            bits = lang_stats[lang]
+    if len(cat_stats) > 1:
+        print(f"\n  Pass rate by category:")
+        for cat in sorted(cat_stats):
+            bits = cat_stats[cat]
             n_pass = sum(bits)
-            print(f"    {lang:8s}: {n_pass}/{len(bits)}")
+            print(f"    {cat:12s}: {n_pass}/{len(bits)}")
 
     if failed or errored:
         print(f"\n  Failed problems:")
@@ -441,7 +444,9 @@ def cmd_leaderboard(args: argparse.Namespace) -> None:
 
     if not ranked:
         print("\nNo submissions yet — be the first to submit an agent!")
-        if oracle and oracle.get("score") is not None:
+        if oracle and oracle.get("weighted_score") is not None:
+            print(f"\nOracle (reference diffs): {oracle['weighted_score']:.2f} / 30.00  ← weighted score to beat")
+        elif oracle and oracle.get("score") is not None:
             print(f"\nOracle (reference diffs): {oracle['score']:.2f} / 30.00  ← score to beat")
         print(f"\nDashboard: https://punchthedev.github.io/gittensor-miner-dashboard/")
         return
@@ -469,8 +474,10 @@ def cmd_leaderboard(args: argparse.Namespace) -> None:
         print(f"{rank_str}  {handle:<{handle_w}}  {score_str}  {model:<{model_w}}  {date}")
 
     print()
-    if oracle and oracle.get("score") is not None:
-        print(f"Oracle (reference diffs): {oracle['score']:.2f} / 30.00")
+    if oracle:
+        w = oracle.get("weighted_score") or oracle.get("score")
+        if w is not None:
+            print(f"Oracle (reference diffs): {w:.2f} / 30.00  (weighted)")
     print(f"Dashboard: https://punchthedev.github.io/gittensor-miner-dashboard/")
     print()
 
@@ -896,11 +903,11 @@ def cmd_run(args: argparse.Namespace) -> None:
                     except (ValueError, TypeError):
                         pass
 
-            oracle_mean = _oracle_mean()
+            oracle_mean = _oracle_weighted()
             delta_vs_oracle = score - oracle_mean
             sign = "+" if delta_vs_oracle >= 0 else ""
             color = GREEN if delta_vs_oracle >= 0 else CYAN
-            print(f"Pool mean: {oracle_mean:.2f}  (vs mean: {color}{sign}{delta_vs_oracle:.2f}{RESET})")
+            print(f"Oracle weighted: {oracle_mean:.2f}  (vs oracle: {color}{sign}{delta_vs_oracle:.2f}{RESET})")
 
             if args.no_sandbox:
                 print(f"\n{CYAN}Note:{RESET} --no-sandbox scores ~3-5× above Docker CI.  "
@@ -1050,12 +1057,12 @@ def cmd_mine(args: argparse.Namespace) -> None:
 
     def _run_cycle() -> None:
         champ = _champion_score()
-        oracle = _oracle_mean()
+        oracle = _oracle_weighted()
         label = f"{champ:.2f}" if champ else "none yet"
         print(f"\n{'═'*60}")
         print(f"  gitminer mine — {handle}")
         print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-        print(f"  Champion: {label}    Oracle ceiling: {oracle:.2f}")
+        print(f"  Champion: {label}    Oracle weighted: {oracle:.2f}")
         print(f"{'═'*60}\n")
 
         results = run_evaluation(
