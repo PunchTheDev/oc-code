@@ -8,6 +8,9 @@ Writes/updates:
   results/leaderboard.json          — ranked table, re-sorted after each addition
   results/history.json              — append-only SOTA-over-time log
   results/behaviors/{handle}.json   — behavior fingerprint for future anti-copy checks (if --behaviors given)
+
+Ranking metric: weighted_benchmark_score (PRIMARY — difficulty-weighted correctness × quality).
+Falls back to weighted_mean_score for entries that predate the benchmark_score schema.
 """
 
 from __future__ import annotations
@@ -20,8 +23,9 @@ from datetime import date
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 RESULTS_DIR = REPO_ROOT / "results"
 
-def _oracle_score_from_baselines() -> tuple[float, float]:
-    """Read oracle scores from baselines.json. Returns (mean, weighted_mean)."""
+
+def _oracle_scores_from_baselines() -> tuple[float, float]:
+    """Read oracle arithmetic and weighted mean from baselines.json."""
     baseline_file = RESULTS_DIR / "baselines.json"
     try:
         data = json.loads(baseline_file.read_text())
@@ -29,19 +33,27 @@ def _oracle_score_from_baselines() -> tuple[float, float]:
         weighted = round(float(data.get("weighted_mean_score") or mean), 2)
         return mean, weighted
     except Exception:
-        return 12.08, 13.03
+        return 11.48, 12.70
 
 
-_oracle_mean, _oracle_weighted = _oracle_score_from_baselines()
+_oracle_mean, _oracle_weighted = _oracle_scores_from_baselines()
 
 ORACLE_ROW = {
     "rank": None,
     "agent": "Oracle (accepted solution)",
     "score": _oracle_mean,
     "weighted_score": _oracle_weighted,
+    # benchmark_score and weighted_benchmark_score are always 1.0 for the oracle
+    # — it defines the 1.0 baseline for the primary ranking metric.
+    "benchmark_score": 1.0,
+    "weighted_benchmark_score": 1.0,
     "model": "—",
     "date": "—",
-    "note": "Weighted mean tree-sitter score across accepted solutions (DAS + external prestige repos)",
+    "note": (
+        f"Oracle baseline: weighted_benchmark_score=1.0 (definition). "
+        f"Weighted mean {_oracle_weighted} (arithmetic {_oracle_mean}) across "
+        f"accepted solutions (DAS + external prestige repos)"
+    ),
 }
 
 
@@ -54,18 +66,28 @@ def load_json(path: pathlib.Path, default):
     return default
 
 
+def primary_score(entry: dict) -> float:
+    """Return the primary ranking metric for a leaderboard entry.
+
+    weighted_benchmark_score is the canonical metric. Falls back to
+    weighted_score (raw Gittensor formula) for entries that predate the
+    benchmark_score schema (step 186+).
+    """
+    wbs = entry.get("weighted_benchmark_score")
+    if wbs is not None and isinstance(wbs, (int, float)):
+        return float(wbs)
+    ws = entry.get("weighted_score") or entry.get("score")
+    return float(ws) if ws is not None else 0.0
+
+
 def current_sota(leaderboard: list[dict]) -> float:
-    """Best weighted score among real (ranked) entries (primary ranking metric)."""
-    real = [
-        r.get("weighted_score") or r.get("score")
-        for r in leaderboard
-        if r.get("rank") and r.get("score") is not None
-    ]
-    return max((s for s in real if s is not None), default=0.0)
+    """Best primary score among real (ranked) entries."""
+    real = [primary_score(r) for r in leaderboard if r.get("rank") is not None]
+    return max((s for s in real if s > 0), default=0.0)
 
 
 def marginal_gain(score: float, sota: float) -> float:
-    """Score delta above current SOTA; zero for submissions at or below SOTA."""
+    """Score delta above current SOTA; zero for at-or-below SOTA submissions."""
     return max(0.0, score - sota)
 
 
@@ -77,7 +99,7 @@ def contribution_weight(score: float, sota: float, champion_mult: float = 3.0, p
                           + max(0, score - sota) × champion_mult)
 
     A submission that copies the leader (score == sota) earns only the
-    participation term.  A new champion earns disproportionately more.
+    participation term. A new champion earns disproportionately more.
     Label multiplier and time decay are applied by the Gittensor validator
     on top of this weight.
     """
@@ -85,16 +107,14 @@ def contribution_weight(score: float, sota: float, champion_mult: float = 3.0, p
 
 
 def update_leaderboard(leaderboard: list[dict], entry: dict) -> list[dict]:
-    """Upsert by agent handle, re-rank by weighted_score descending (falls back to score)."""
+    """Upsert by agent handle, re-rank by weighted_benchmark_score descending."""
     handle = entry["agent"]
-    # Remove existing entry for this handle
     rows = [r for r in leaderboard if r.get("rank") is None or r.get("agent") != handle]
     rows.append(entry)
-    # Sort real entries by weighted_score (primary) then score (secondary)
     oracle = [r for r in rows if r.get("rank") is None]
     real = sorted(
         [r for r in rows if r.get("rank") is not None],
-        key=lambda r: (r.get("weighted_score") or r.get("score") or 0, r.get("score") or 0),
+        key=primary_score,
         reverse=True,
     )
     for i, r in enumerate(real, 1):
@@ -120,7 +140,10 @@ def main():
     mean_score = results.get("mean_score")
     if mean_score is None:
         raise SystemExit("results.json missing mean_score field")
+
     weighted_mean = results.get("weighted_mean_score", mean_score)
+    benchmark_score = results.get("mean_benchmark_score")
+    weighted_benchmark = results.get("weighted_benchmark_score")
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     lb_file = RESULTS_DIR / "leaderboard.json"
@@ -129,25 +152,26 @@ def main():
     leaderboard = load_json(lb_file, [ORACLE_ROW])
     history = load_json(hist_file, [])
 
-    # Ensure oracle row present
     if not any(r.get("agent") == "Oracle (accepted solution)" for r in leaderboard):
         leaderboard.insert(0, ORACLE_ROW)
 
     today = date.today().isoformat()
 
-    # Per-problem breakdown for dashboard drill-down (problem_id, score, passed, category)
     raw_problems = results.get("problems", [])
     breakdown = [
         {
             "problem_id": p.get("problem_id", ""),
             "score": round(float(p.get("final_score", 0.0)), 4),
+            "benchmark_score": round(float(p.get("benchmark_score", 0.0)), 4) if p.get("benchmark_score") is not None else None,
+            "test_pass_rate": round(float(p.get("test_pass_rate", 0.0)), 4) if p.get("test_pass_rate") is not None else None,
             "passed": bool(p.get("tests_passed", False)),
             "category": p.get("category", ""),
+            "difficulty": p.get("difficulty", ""),
         }
         for p in raw_problems
     ]
 
-    entry = {
+    entry: dict = {
         "rank": 1,  # placeholder — update_leaderboard will re-rank
         "agent": args.handle,
         "score": round(float(mean_score), 4),
@@ -158,9 +182,15 @@ def main():
         "breakdown": breakdown,
     }
 
+    if benchmark_score is not None:
+        entry["benchmark_score"] = round(float(benchmark_score), 4)
+    if weighted_benchmark is not None:
+        entry["weighted_benchmark_score"] = round(float(weighted_benchmark), 4)
+
     prev_sota = current_sota(leaderboard)
-    gain = marginal_gain(float(weighted_mean), prev_sota)
-    weight = contribution_weight(float(weighted_mean), prev_sota)
+    my_primary = primary_score(entry)
+    gain = marginal_gain(my_primary, prev_sota)
+    weight = contribution_weight(my_primary, prev_sota)
 
     entry["sota_at_submission"] = round(prev_sota, 4)
     entry["marginal_gain"] = round(gain, 4)
@@ -170,10 +200,11 @@ def main():
     new_sota = current_sota(leaderboard)
 
     lb_file.write_text(json.dumps(leaderboard, indent=2))
-    print(f"Leaderboard updated: {args.handle} scored weighted={weighted_mean:.4f} / arithmetic={mean_score:.4f}")
+
+    wbs_str = f" / weighted_benchmark={weighted_benchmark:.4f}" if weighted_benchmark is not None else ""
+    print(f"Leaderboard updated: {args.handle} scored weighted={weighted_mean:.4f}{wbs_str} / arithmetic={mean_score:.4f}")
     print(f"  SOTA at submission: {prev_sota:.4f}  |  marginal gain: {gain:.4f}  |  weight: {weight:.4f}")
 
-    # Append to history if this beats or ties SOTA
     if new_sota >= prev_sota:
         hist_entry = {
             "date": today,
@@ -188,9 +219,8 @@ def main():
         else:
             print(f"SOTA unchanged at {new_sota:.4f}")
     else:
-        print(f"Weighted score {weighted_mean:.4f} below current SOTA {prev_sota:.4f} — history unchanged")
+        print(f"Primary score {my_primary:.4f} below current SOTA {prev_sota:.4f} — history unchanged")
 
-    # Persist behavior fingerprint so future submissions can be checked for output copying.
     if args.behaviors:
         behaviors_path = pathlib.Path(args.behaviors)
         if behaviors_path.exists():
