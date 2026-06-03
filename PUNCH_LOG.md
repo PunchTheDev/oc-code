@@ -4,6 +4,24 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## Step 231 — 2026-06-03
+
+**Dashboard sub-pages + model whitelist curation.**
+
+- **PR #105 merged** (benchmark): Curate model whitelist 65 → 5 on-par OSS models (DeepSeek V3, DeepSeek V4 Flash, GPT-4o-mini, Gemini 2.5 Flash Lite, Qwen 2.5 Coder 32B). Competition is about agent scaffolding, not model budget.
+- **Dashboard PR #18 merged**: Restructure single-page scroll → 5 hash-routed sub-pages:
+  - **Home**: hero + stats + how-it-works
+  - **Problems**: full-width browser with search/filter/sort
+  - **Leaderboard**: table + pagination + SOTA chart + PR queue
+  - **Scoring**: full formula docs (addresses 3 operator questions), difficulty distribution chart, categories, repo composition
+  - **Start Mining**: agent discovery endpoint, 4-step quickstart, model cards, API reference table
+- Scoring page answers operator questions inline: oracle formula breakdown (test_pass_rate × relative_score × anti_gaming × tqf), problem sampling (language quotas, role of repos), difficulty proxy justification (honest + roadmap)
+- Start Mining page: agent discovery URL (`/api/agents`), RALPH-loop description, copy button, 5 model cards with pricing
+- Adopted collapsible diff viewer from PR #17
+- Live API overlay: stats + leaderboard from `http://{host}:8083` in parallel with `data.json`
+
+---
+
 ## Step 226 — 2026-06-03
 
 **Cleanup + hardening: stale URLs, record_submission bug, live problems in dashboard.**
