@@ -4,7 +4,7 @@
 
 The dashboard is updated automatically after each merged submission. The table below is the static fallback (machine-updated by CI via `results/leaderboard.json`).
 
-Weighted mean score across the rotating 30-problem shard (pool: 441 problems across 19 repos), on a 0–30 scale per problem. Hard problems are 2×, medium 1.5×, easy 1×. Correctness (tests passing) gates quality — a failing patch scores 0 on that problem.
+Weighted mean score across the rotating 30-problem shard (pool: 441 problems across 13 repos), on a 0–30 scale per problem. Hard problems are 2×, medium 1.5×, easy 1×. Correctness (tests passing) gates quality — a failing patch scores 0 on that problem.
 
 ---
 
