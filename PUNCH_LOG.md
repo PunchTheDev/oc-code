@@ -2136,3 +2136,25 @@ Repos evaluated and rejected: `celery/celery` (Redis/RabbitMQ integration tests)
 - Benchmark: **430 problems**, oracle **11.83**, commit `3a68b53`
 - Dashboard: difficulty badges aligned with scoring weights, commit `19cca40`
 - Both pushed to main
+
+---
+
+## 2026-06-03 — Pool expansion: +11 jsonbored/gittensory (new DAS repo)
+
+**DAS pool check**: 4 newly active repos found vs. prior state:
+- `infiniflow/ragflow` (225 merged PRs): 0 qualify — most PRs have no linked issue or no test files in diff
+- `jsonbored/awesome-claude` (24 merged PRs): 0 qualify — PRs have no linked issues
+- `aglover1221/product-data-extractor` (6 merged PRs): 0 qualify (checked via dry-run)
+- `jsonbored/gittensory` (56 merged PRs): **11 qualify** — TypeScript Cloudflare Workers project with vitest test coverage
+
+**Pool expansion**: 430 → **441 problems** (+11 TypeScript)
+- TypeScript pool: 87 → 98 problems
+- Oracle arithmetic: 11.83 → **12.08**
+- Oracle weighted: 12.77 → **13.03**
+- Gittensory problems scored higher (mean ~20+ vs overall 12.08) because their diffs include substantial type-safe code changes
+
+### Status
+- Benchmark: **441 problems**, oracle **13.03** (weighted), commit `e7fd8f0`
+- Dashboard: data.json auto-refreshed via CI workflow, 441 problems, oracle 13.03
+- API: gitminer-api restarted on PM2, pool_size=441, oracle=13.03
+- Next DAS check: ~2026-06-16
