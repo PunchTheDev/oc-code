@@ -4,6 +4,25 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Weighted oracle consistency fix (commits 768ba4b, e712227, a917b42, f463f35, 9dacbb7)
+
+**Root cause**: The oracle score displayed everywhere (11.83) was the arithmetic mean of all 430 baseline scores. But `evaluate.py` computes `weighted_mean_score` (hard×2, medium×1.5, easy×1) as the primary ranking metric for miners. Miners comparing their weighted mean against the arithmetic oracle would see artificially favorable comparisons. Weighted oracle = **12.77**.
+
+**What changed**:
+- `scripts/baseline_scores.py`: now also computes and saves `weighted_mean_score` to `baselines.json`
+- `scripts/record_result.py`: oracle row now carries `weighted_score: 12.77`; `_oracle_score_from_baselines()` returns both values
+- `scripts/generate_dashboard_data.py`: `oracle_score_from_leaderboard()` now reads `weighted_score` first; `oracle_score` in `data.json` = 12.77
+- `api/server.py`: new `_oracle_weighted_score()` helper reads `weighted_mean_score`; `_stats` and `_agents` endpoints return 12.77; `_problem_summary` and `_stats` both now use `_difficulty_by_lines()` (added lines in reference.diff) instead of score-based thresholds — matches `evaluate.py`
+- `.github/workflows/eval.yml`: PR comment header shows `weighted_mean` as primary; oracle comparison uses `weighted_score`; champion detection uses `weighted_score` for SOTA
+- `.github/workflows/refresh_pool.yml`: commit message shows weighted oracle
+- `results/baselines.json`: `weighted_mean_score: 12.77` added
+- `results/leaderboard.json`: oracle row gets `weighted_score: 12.77`
+- `docs/dashboard_data.json` + `docs/api.md`: regenerated and updated
+
+**Net effect**: Everything that shows "oracle score" or compares against the oracle now uses the correct weighted mean (12.77). `by_difficulty` in `/api/stats` now shows 27/143/260 (easy/medium/hard by line count) instead of the old 169/106/155 (by score thresholds).
+
+---
+
 ## 2026-06-02 — Three agent correctness fixes (commits ceaccbd, 3e7abea)
 
 **What shipped**:
