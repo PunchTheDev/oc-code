@@ -4,6 +4,28 @@ Milestone trail for the base-miner benchmark. Discord is the primary channel; th
 
 ---
 
+## 2026-06-03 — Full system audit, pre-registration holding
+
+**Codebase-wide audit** — nothing to fix.
+
+Everything verified clean heading into the pre-registration holding period:
+
+| Check | Result |
+|---|---|
+| API health | pool=441, oracle=13.03 weighted / 12.08 arithmetic ✓ |
+| Shard | week=126, size=30, next_rotation=2026-06-08 ✓ |
+| CLI | `shard`, `problems`, `leaderboard`, `mine`, `doctor` all working ✓ |
+| All Python files | Syntax-clean (benchmark, scripts, api, agent, gitminer) ✓ |
+| CI workflows (5) | eval, record_submission, refresh_pool, refresh_dashboard, build-scorer — all correct ✓ |
+| Anti-gaming scripts | check_rate_limit, check_similarity, check_output_similarity — verified ✓ |
+| Hyperparameters | hyperparameters.json consistent with docs/hyperparameters.md ✓ |
+| Leaderboard.json | Oracle row values (weighted=13.03, arithmetic=12.08) match baselines.json ✓ |
+| No open PRs | ✓ |
+
+No changes shipped this step — system is stable. Holding pre-registration.
+
+---
+
 ## 2026-06-03 — Oracle row stays fresh after pool rotation (commit 1d5f9c9)
 
 **Bug**: After every pool rotation, `refresh_pool.yml` recalibrates `baselines.json` with new oracle scores, but `generate_dashboard_data.py` read the oracle row from `leaderboard.json` (where it was frozen). Dashboard would show stale oracle scores and the stale static note.
