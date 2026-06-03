@@ -4243,3 +4243,22 @@ Pool 1123, oracle 12.64, 65 models. Dashboard console errors cleared, oracle exp
 
 ### Status
 Pool 1123, oracle 12.64, 65 models. Next shard rotation: 2026-06-08 (5 days).
+
+---
+
+## Step 230 — 2026-06-03
+
+### What changed
+- **PR #104**: Add `test_files` list to `/api/problems/{id}` API endpoint (merged ea5ef0e3)
+  - Dashboard already had `const testSet = new Set(p.test_files || [])` and renders test files with 🧪 icon
+  - API was returning empty list — test file icons never appeared in problem detail drawer
+  - Pattern-matched same `_TEST_PATS` used by `cmd_info` (`test_`, `_test.`, `.spec.`, `/tests/`, etc.)
+- **`punch/node24-action-upgrades` rebuilt cleanly** on top of current main (3 commits, only 5 workflow files):
+  - Bump checkout@v4→v6, setup-python@v5→v6, cache@v4→v5, github-script@v7→v9, upload-artifact@v4→v7
+  - Trigger dashboard refresh on `allowed_models.txt` changes
+  - Commit `results/agents/` in `record_submission.yml` (fixes history storage bug)
+  - Rebased after PR #104 merge — clean diff confirmed (only workflow files)
+- **Stale local branches cleaned**: punch/api-rate-limiting, punch/fix-stale-urls-cleanup, punch/node24-workflow-upgrades, punch/stats-api-shard-budget, punch/sync-dashboard-data
+
+### Status
+Pool 1123, oracle 12.64, 65 models. API serves `test_files` for problem drawer. Node24 branch ready.
