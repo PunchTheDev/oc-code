@@ -74,49 +74,49 @@ See `agent/example/` for a minimal reference implementation.
 pip install -r requirements.txt
 
 # Show the current 30-problem weekly shard
-python gitminer.py shard
+python3 gitminer.py shard
 
 # Run your agent on one problem and inspect the patch it produces (fast dev loop)
-python gitminer.py run --problem 0463 --agent agent/submissions/yourhandle/agent.py
-python gitminer.py run --problem 0463 --show-ref --score --no-sandbox   # compare to reference + score inline
-python gitminer.py run --problem 0463 --score --no-sandbox --repair 3   # if tests fail, agent repairs with test output (up to 3 attempts)
+python3 gitminer.py run --problem 0463 --agent agent/submissions/yourhandle/agent.py
+python3 gitminer.py run --problem 0463 --show-ref --score --no-sandbox   # compare to reference + score inline
+python3 gitminer.py run --problem 0463 --score --no-sandbox --repair 3   # if tests fail, agent repairs with test output (up to 3 attempts)
 
 # Evaluate your agent against the shard (no Docker)
-python gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
+python3 gitminer.py eval agent/submissions/yourhandle/agent.py --no-sandbox
 
 # Calibration check: score reference diffs to verify the full pipeline (no agent or API key needed)
-python gitminer.py eval --oracle --no-sandbox   # expected weighted mean: ~13.03 / 30.00
+python3 gitminer.py eval --oracle --no-sandbox   # expected weighted mean: ~13.03 / 30.00
 
 # Evaluate against all 441 pool problems
-python gitminer.py eval agent/submissions/yourhandle/agent.py --all
+python3 gitminer.py eval agent/submissions/yourhandle/agent.py --all
 
 # Evaluate against specific problem IDs
-python gitminer.py eval agent/submissions/yourhandle/agent.py --problems 930,986
+python3 gitminer.py eval agent/submissions/yourhandle/agent.py --problems 930,986
 
 # Validate that a patch applies cleanly to a problem's base commit (quick sanity check)
-python gitminer.py validate --problem 0463 --patch my_fix.diff
+python3 gitminer.py validate --problem 0463 --patch my_fix.diff
 
 # Browse the current leaderboard in the terminal
-python gitminer.py leaderboard
+python3 gitminer.py leaderboard
 
 # Generate commit-reveal hash for your agent before submitting
-python gitminer.py hash your_patch.diff
+python3 gitminer.py hash your_patch.diff
 
 # Validate agent and print PR submission steps
-python gitminer.py submit agent/submissions/yourhandle/agent.py
+python3 gitminer.py submit agent/submissions/yourhandle/agent.py
 
 # --- Idle mining (daemon mode) ---
 
 # Run once against the current shard; auto-submit if you beat the champion
-python gitminer.py mine --agent agent/submissions/yourhandle/agent.py --no-sandbox
+python3 gitminer.py mine --agent agent/submissions/yourhandle/agent.py --no-sandbox
 
 # Daemon mode: run once per shard rotation (weekly), sleep in between
-python gitminer.py mine --agent agent/submissions/yourhandle/agent.py --loop
+python3 gitminer.py mine --agent agent/submissions/yourhandle/agent.py --loop
 
 # --- REST API (for scripting / external tooling) ---
 
 # Start the JSON API server on port 8083
-python gitminer.py serve-api
+python3 gitminer.py serve-api
 
 # Example: fetch this week's shard in a shell script
 curl http://localhost:8083/api/shard
