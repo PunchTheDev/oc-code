@@ -375,7 +375,7 @@ class Handler(BaseHTTPRequestHandler):
             "version": "1.0",
             "subnet": 74,
             "network": "Bittensor / Gittensor",
-            "dashboard": "https://punchthedev.github.io/gittensor-miner-dashboard/",
+            "dashboard": "http://143.244.191.193:8082/",
             "repo": "https://github.com/PunchTheDev/gittensor-base-miner",
             "interface": {
                 "class": "BaseAgent",
@@ -442,7 +442,7 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             },
             "api": {
-                "base": "http://localhost:8083",
+                "base": "http://143.244.191.193:8083",
                 "endpoints": {
                     "/api/shard": "Current 30-problem weekly eval set (category-balanced)",
                     "/api/problems": "Full pool (filterable: ?cat=python&difficulty=hard)",
