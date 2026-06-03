@@ -72,6 +72,7 @@ See `agent/example/` for the baseline reference implementation — a full observ
 ```bash
 # Install dependencies
 pip install -r requirements.txt
+export OPENROUTER_KEY=your_key_here   # required to run agents (get one at openrouter.ai)
 
 # Show the current 30-problem weekly shard
 python3 gitminer.py shard
