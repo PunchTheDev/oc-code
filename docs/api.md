@@ -40,7 +40,7 @@ Pool-level statistics: category and difficulty distribution, repo count, oracle 
 {
   "pool_size": 441,
   "shard_size": 30,
-  "repos": 19,
+  "repos": 13,
   "oracle_score": 13.03,
   "by_category": { "python": 198, "typescript": 98, "rust": 66, "jvm": 42, "ruby": 37 },
   "by_difficulty": { "easy": 27, "medium": 145, "hard": 269 },
