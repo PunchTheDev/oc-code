@@ -43,11 +43,15 @@ GH_RATE_DELAY = 0.15  # seconds between GitHub API calls
 # Prestigious external repos: self-contained test suites, active development,
 # concrete bug-fix issues, high visibility.
 EXTERNAL_REPOS = [
+    # Python
     "pytest-dev/pytest",      # 14k stars — Python testing framework, perfect self-contained tests
     "pallets/click",          # 18k stars — Python CLI toolkit, no external deps
     "pallets/werkzeug",       # 7k stars  — Python WSGI utils, no external deps
     "encode/starlette",       # 12k stars — Python ASGI framework, asyncio only
     "psf/requests",           # 54k stars — Python HTTP, mocked in tests
+    # Ruby
+    "rubocop/rubocop",        # 13k stars — Ruby linter/formatter, RSpec tests, real cop bug-fixes
+    "rubocop/rubocop-rails",  # 2k stars  — Rails-specific cops, same RSpec harness
 ]
 
 
@@ -199,18 +203,26 @@ def extract_added_file(diff: str, path: str) -> str | None:
 
 
 def infer_test_cmd(repo: str, diff: str) -> list[str]:
-    """Infer the test command for an external Python repo."""
-    # Extract changed test files
+    """Infer the test command from changed files in the diff.
+
+    Handles Python (pytest), Ruby (bundle exec rspec), with Python as default.
+    """
+    changed = re.findall(r"^diff --git a/(.+) b/", diff, re.MULTILINE)
+
+    # Ruby: _spec.rb files → bundle exec rspec <specs>
+    spec_files = [p for p in changed if p.endswith("_spec.rb")][:5]
+    if spec_files:
+        return ["bundle", "exec", "rspec", "--format", "progress"] + spec_files
+
+    # Python: test_*.py / *_test.py files → pytest <files>
     test_files = re.findall(
         r"^diff --git a/((?:[^/\s]*/)*(test_[^/\s]*\.py|[^/\s]*_test\.py))",
         diff, re.MULTILINE,
     )
     specific = [m[0] for m in test_files if m[0].endswith(".py")][:5]
-
     base = ["python", "-m", "pytest", "--tb=short", "-q"]
     if specific:
         return base + specific
-    # For test dirs
     for pat in (r"^diff --git a/(tests?/[^/\s]+\.py)", r"^diff --git a/(testing/[^/\s]+\.py)"):
         hits = re.findall(pat, diff, re.MULTILINE)
         if hits:

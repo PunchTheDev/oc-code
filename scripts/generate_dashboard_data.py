@@ -40,16 +40,19 @@ REPO_CATEGORY: dict[str, str] = {
     "twisted/twisted": "python",
     "python-trio/trio": "python",
     "celery/celery": "python",
+    # Ruby external repos
+    "rubocop/rubocop": "ruby",
+    "rubocop/rubocop-rails": "ruby",
 }
 
 # Shard sampling budget per category (sums to 30)
-# Proportional to pool: python:53% rust:25% typescript:12% jvm:5% ruby:5%
+# Proportional to pool: python:50% rust:25% typescript:12% jvm:5% ruby:8%
 SHARD_BUDGET: dict[str, int] = {
-    "python": 13,
+    "python": 12,
     "rust": 9,
     "typescript": 5,
+    "ruby": 2,
     "jvm": 2,
-    "ruby": 1,
 }
 
 
@@ -89,9 +92,9 @@ def _load_oracle_row() -> dict:
         except Exception:
             pass
     if mean_score is None:
-        mean_score = 12.22
-        weighted_score = 13.62
-        count = 812
+        mean_score = 12.58
+        weighted_score = 13.88
+        count = 800
     return {
         "rank": None,
         "agent": "Oracle (accepted solution)",

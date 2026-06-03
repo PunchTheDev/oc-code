@@ -85,16 +85,19 @@ REPO_CATEGORY: dict[str, str] = {
     "twisted/twisted": "python",
     "python-trio/trio": "python",
     "celery/celery": "python",
+    # Ruby external repos
+    "rubocop/rubocop": "ruby",
+    "rubocop/rubocop-rails": "ruby",
 }
 
 # Default per-category shard budget (sums to 30) — overridable via pool_config.json
-# Proportional to pool composition: python:53% rust:25% typescript:12% jvm:5% ruby:5%
+# Proportional to pool composition: python:50% rust:25% typescript:12% jvm:5% ruby:8%
 DEFAULT_SHARD_BUDGET: dict[str, int] = {
-    "python": 13,
+    "python": 12,
     "rust": 9,
     "typescript": 5,
+    "ruby": 2,
     "jvm": 2,
-    "ruby": 1,
 }
 
 
@@ -345,8 +348,8 @@ def run_evaluation(
     # Oracle mode: score reference diffs directly — no agent call needed.
     # Used for pipeline calibration; expected weighted mean matches baselines.json.
     if use_oracle:
-        _oracle_weighted = 14.26
-        _oracle_arithmetic = 12.99
+        _oracle_weighted = 13.88
+        _oracle_arithmetic = 12.58
         _baselines_path = Path(__file__).parent.parent / "results" / "baselines.json"
         if _baselines_path.exists():
             try:
