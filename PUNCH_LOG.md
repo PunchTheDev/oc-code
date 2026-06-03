@@ -3213,3 +3213,47 @@ The benchmark now captures two orthogonal dimensions:
 - **Quality alignment** (`relative_score`): is the fix as clean/structured as the oracle?
 
 `benchmark_score` is their product. An agent that's 80% correct but 120% quality earns 0.96. An agent that's 100% correct but 80% quality earns 0.80. Both signals matter.
+
+## Step 187 — 2026-06-03
+
+### Scoring depth: difficulty-weighted benchmark, test deletion penalty, CI consistency (PR #48, merged f5eba538)
+
+**Problem**: The scoring system had three gaps:
+1. `mean_benchmark_score` was arithmetic mean — difficulty weights (easy×1/medium×1.5/hard×2) weren't applied to the primary ranking metric. Easy and hard problems counted the same.
+2. `test_deletion_warning` was a flag only — no actual score penalty for test gaming.
+3. `mine` command compared `weighted_mean_score` (Gittensor tokens) against champion, not `benchmark_score`.
+
+**Changes**:
+
+1. **`weighted_benchmark_score`** (new PRIMARY leaderboard metric):
+   ```
+   weighted_benchmark_score = sum(benchmark_score_i × difficulty_weight_i) / sum(difficulty_weight_i)
+   ```
+   Hard problems (150+ changed lines, weight 2.0) now count twice in the aggregate. Oracle = 1.0 by definition.
+
+2. **Anti-gaming penalty in score** (`anti_gaming_multiplier`):
+   - `test_deletion_warning=True` → `benchmark_score` halved (×0.5)
+   - Previously just flagged, now affects the score
+
+3. **Mine command uses `weighted_benchmark_score`** for champion comparison — consistent with leaderboard ranking
+
+4. **CI eval.yml updated**:
+   - Parse step extracts `weighted_benchmark_score` from results.json
+   - PR comment shows `weighted_benchmark_score` as primary, adds `test_pass_rate` and `benchmark_score` columns per problem, marks ⚠️ for test deletion
+   - Champion detection compares `weighted_benchmark_score` (not `weighted_mean_score`)
+
+5. **leaderboard.json oracle entry**: added `benchmark_score: 1.0` and `weighted_benchmark_score: 1.0`
+
+6. **docs/scoring.md** rewritten: documents all metrics, anti-gaming multiplier, weighted aggregate formula
+
+### Scoring philosophy (updated)
+Four dimensions now captured:
+- **Correctness depth** (`test_pass_rate`): fraction of tests passing
+- **Quality alignment** (`relative_score`): agent quality vs oracle quality for this specific problem
+- **Integrity** (`anti_gaming_multiplier`): penalty for test deletion
+- **Difficulty weight**: hard problems count more in the aggregate
+
+```
+benchmark_score          = test_pass_rate × relative_score × anti_gaming_multiplier
+weighted_benchmark_score = sum(benchmark_score_i × weight_i) / sum(weight_i)
+```
