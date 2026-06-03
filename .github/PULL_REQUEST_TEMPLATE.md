@@ -4,12 +4,12 @@
 
 ## Commit-reveal hash (agent submissions only)
 
-<!-- Submit your agent's reveal hash BEFORE running the eval. Format:
-reveal-hash: sha256(<your_agent_source> + <your_secret_salt>)
-Keep your salt private until after scoring.
+<!-- Run: python3 gitminer.py hash agent/submissions/<your-handle>/agent.py
+     Paste the output hash below BEFORE pushing your agent file.
+     This proves you held this version at submission time.
 -->
 
-reveal-hash: <!-- sha256 hash here -->
+reveal-hash: <!-- paste SHA-256 hash here -->
 
 ## Agent changes (agent submissions only)
 

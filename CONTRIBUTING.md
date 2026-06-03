@@ -113,53 +113,31 @@ shows the current champion's score — that's the number to beat.
 
 ## Commit-reveal flow
 
-Public PRs are visible to everyone, so we use a two-phase process to prevent copying.
+Public PRs are visible to everyone, so we use a two-phase commit-reveal to establish first-to-commit credit.
 
-### Phase 1 — hash commit (when you open the PR)
+### Phase 1 — hash before pushing (when you open the PR)
 
-Generate a hash of your agent source and a private salt:
-
-```python
-import hashlib, secrets
-
-salt = secrets.token_hex(16)           # keep this — you need it for phase 2
-source = open("agent/submissions/<your-handle>/agent.py").read()
-h = hashlib.sha256((source + salt).encode()).hexdigest()
-print(f"reveal-hash: {h}")
-print(f"salt (private): {salt}")
-```
-
-Paste `reveal-hash: <hash>` into your PR description. Do **not** share the salt yet.
-
-### Phase 2 — reveal (after scoring)
-
-Once CI posts your score, share the salt in the PR so anyone can verify:
-
-```python
-import hashlib
-source = open("agent/submissions/<your-handle>/agent.py").read()
-assert hashlib.sha256((source + "<your-salt>").encode()).hexdigest() == "<your-hash>"
-```
-
-The reveal must happen within **7 days** of the score being posted.
-
-You can also use `gitminer hash` to generate the SHA-256 hash of your agent file before submitting:
+Before pushing your agent file, generate and record its hash:
 
 ```bash
 python3 gitminer.py hash agent/submissions/<your-handle>/agent.py
 ```
 
+Paste the printed SHA-256 into the `reveal-hash:` field of your PR description **before** pushing the agent file.
+
+### Phase 2 — automatic verification (after merge)
+
+Once your PR merges, anyone can verify your hash by re-running the same command against the merged file. The hash proves you held this version at open time — preventing post-eval copying for first-to-commit credit.
+
 ## PR format
 
-Use the PR template. Fill in every section:
+Run `gitminer submit` to auto-generate the PR body and branch with the correct format. Fill in your local eval results and a brief description of your approach in the generated body.
 
-- `reveal-hash:` — your phase-1 hash (required)
-- `Score on local eval:` — your best local score (no sandbox is fine)
-- `Model used:` — exact model ID from the whitelist
-- `Approach:` — a sentence or two on what makes your scaffolding better
-
-A minimal PR that beats the leader on the full 30-problem suite with a clean hash
-and a brief explanation is all that's needed.
+If submitting manually, use the PR template and include:
+- `reveal-hash:` — your SHA-256 hash (from `gitminer hash`)
+- Your local eval score
+- The model ID you used (must be on the whitelist)
+- A sentence on what your scaffolding does differently
 
 ## After you open the PR
 

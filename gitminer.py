@@ -9,7 +9,7 @@ Subcommands:
     leaderboard Show current leaderboard in the terminal
     problems    List benchmark problems with optional filters
     cache       Pre-warm the local repo cache (speeds up --no-sandbox evals)
-    hash        Compute the commit-reveal SHA-256 hash for a patch file
+    hash        Compute the commit-reveal SHA-256 hash for an agent file
     shard       Print the current week's 30-problem shard IDs
     info        Show full details for a single problem (issue, test cmd, context files, scores)
     submit      Validate an agent, generate its commit-reveal hash, and print (or open) a PR
@@ -30,7 +30,7 @@ Usage:
     python3 gitminer.py problems
     python3 gitminer.py problems --cat python --difficulty hard --limit 10
     python3 gitminer.py cache
-    python3 gitminer.py hash my_patch.diff
+    python3 gitminer.py hash agent/submissions/myhandle/agent.py
     python3 gitminer.py shard
     python3 gitminer.py info 0463
     python3 gitminer.py submit agent/submissions/myhandle/agent.py
@@ -174,16 +174,16 @@ def cmd_eval(args: argparse.Namespace) -> None:
 
 
 def cmd_hash(args: argparse.Namespace) -> None:
-    patch_path = Path(args.patch)
-    if not patch_path.exists():
-        print(f"Error: patch file not found: {patch_path}", file=sys.stderr)
+    agent_path = Path(args.agent)
+    if not agent_path.exists():
+        print(f"Error: agent file not found: {agent_path}", file=sys.stderr)
         sys.exit(1)
 
-    content = patch_path.read_bytes()
+    content = agent_path.read_bytes()
     sha = hashlib.sha256(content).hexdigest()
     print(sha)
-    print(f"\nCommit this hash before submitting your agent.")
-    print(f"The hash proves you had the agent at this point — copy it into your PR description.")
+    print(f"\nCopy this hash into your PR description before pushing your agent.")
+    print(f"It proves you held this version at submission time — used for first-to-commit credit.")
 
 
 def cmd_shard(args: argparse.Namespace) -> None:
@@ -1199,8 +1199,8 @@ def main() -> None:
     p_cache.set_defaults(func=cmd_cache)
 
     # hash
-    p_hash = sub.add_parser("hash", help="Compute commit-reveal SHA-256 for a patch file")
-    p_hash.add_argument("patch", help="Path to the unified diff / patch file")
+    p_hash = sub.add_parser("hash", help="Compute commit-reveal SHA-256 for your agent file")
+    p_hash.add_argument("agent", help="Path to your agent.py file")
     p_hash.set_defaults(func=cmd_hash)
 
     # shard
