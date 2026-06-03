@@ -358,6 +358,14 @@ Improvements over a naive single-shot approach:
   the model about which diff is current.  Root cause: the `pending_prose_critique` mechanism
   handled the prose-critique case correctly, but the symmetric partial-repair case had no
   corresponding guard.
+- Assertion pre-extraction in plan step: `_extract_assertions()` is now called before the
+  OBSERVE_PROMPT is sent, and the extracted assertions are injected as
+  `PLAN_ASSERTIONS_SECTION_TEMPLATE` between the test files and source files sections.
+  This gives the model a concise, deduplicated checklist of what the tests actually assert
+  before it performs its step-1 analysis (test contract), reducing the risk that a large
+  windowed test file causes the model to miss critical assertion lines that were outside
+  the keyword-matched window. The section is omitted when no recognizable assertions are
+  found (older test styles without standard assert functions).
 """
 
 from __future__ import annotations
@@ -430,8 +438,7 @@ The harness runs this command to determine correctness. Your patch must make it 
 ```
 {tree}
 ```
-{init_hint}{test_section}{new_test_section}
-## Source files (ranked by relevance)
+{init_hint}{test_section}{new_test_section}{plan_assertions_section}## Source files (ranked by relevance)
 {impl_files}
 
 ---
@@ -602,6 +609,14 @@ Required new files (each MUST appear in the diff as `new file mode 100644`):
 
 ASSERTIONS_SECTION_TEMPLATE = """\
 Key test assertions (from context — each must pass after your diff):
+```
+{assertions}
+```
+
+"""
+
+PLAN_ASSERTIONS_SECTION_TEMPLATE = """\
+## Test assertions (auto-extracted — use these in step 1 of your plan)
 ```
 {assertions}
 ```
@@ -2666,6 +2681,19 @@ class ExampleAgent(BaseAgent):
                 f"({pruned_tree_len} chars, saved {raw_tree_len - pruned_tree_len} chars)"
             )
 
+        # Pre-extract assertions for the plan step.  Injecting them as a quick-reference
+        # checklist before the source files helps the model's step-1 analysis (test contract)
+        # be more accurate — especially for keyword-windowed test files where the most
+        # relevant assertions may be scattered across hundreds of lines.
+        plan_assertions_text = _extract_assertions(test_files, keywords=keywords) if test_files else ""
+        plan_assertions_section = (
+            PLAN_ASSERTIONS_SECTION_TEMPLATE.format(assertions=plan_assertions_text)
+            if plan_assertions_text else ""
+        )
+        if plan_assertions_text:
+            n_assertions = plan_assertions_text.count("\n") + 1
+            log.append(f"[context] {n_assertions} assertions injected into plan step")
+
         observe_user = OBSERVE_PROMPT.format(
             title=problem.issue_title,
             body=problem.issue_body,
@@ -2676,6 +2704,7 @@ class ExampleAgent(BaseAgent):
             init_hint=init_hint,
             test_section=test_section,
             new_test_section=new_test_section + new_impl_section,
+            plan_assertions_section=plan_assertions_section,
             impl_files=_format_files(selected_impl, keywords),
         )
         history: list[dict[str, str]] = [
