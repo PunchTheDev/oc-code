@@ -4064,3 +4064,23 @@ Deploy artifacts now in repo. Operator blocked items: nginx hookup, Node.js 24 w
 ### Status
 Pool 1123, oracle 12.64, whitelist 65 models, rotation Sunday 2026-06-08 (5 days, green).
 All 65 whitelist models confirmed live on OpenRouter. Submit footgun fixed.
+
+---
+
+## Step 220 — 2026-06-03
+
+### Actions
+- **PR #96**: Sync `docs/dashboard_data.json` to 65 whitelisted models (merged d2dba935)
+  - File was stale at 28 models after PRs #89–#93 expanded the whitelist to 65
+  - `refresh_dashboard.yml` trigger paths don't include `benchmark/harness/allowed_models.txt`
+    so whitelist changes don't auto-refresh the dashboard data snapshot
+  - Regenerated via `python scripts/generate_dashboard_data.py`
+- **trigger path fix**: added `benchmark/harness/allowed_models.txt` to `refresh_dashboard.yml`
+  trigger paths in `punch/node24-action-upgrades` branch
+  - Bundled with Node.js 24 upgrades since both require `workflow` scope
+  - Future whitelist expansions will auto-trigger dashboard refresh once branch is merged
+- Full health check: pool 1123, oracle 12.64, API healthy (65 models), CI all green
+
+### Status
+Pool 1123, oracle 12.64, whitelist 65 models, rotation Sunday 2026-06-08 (5 days, green).
+Stale dashboard data fixed. Trigger gap fixed in pending node24 branch.
