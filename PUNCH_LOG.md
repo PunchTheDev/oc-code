@@ -1,3 +1,15 @@
+## Step 264 — 2026-06-04
+
+### What was done
+- Full browser audit: 20 issues catalogued across all 5 pages; prior-loop steps 262–263 had already fixed 14
+- Dashboard `eff62a4`: Leaderboard column tooltips clarified — "Benchmark ⓘ" now explains it's the primary ranking metric (normalized, oracle=1.0); "Score / 30 ⓘ" explains raw Gittensor scale and that 12.64 is context only
+- Confirmed prior-loop fixes live: shard badge "N-problem shard", SOTA state unified, LB stat cards full-width grid, Qwen pricing consistent, DeepSeek model ID dedup, slider labels `assertions_removed`/`output_tokens`, scoring sub-nav JS scroll (preserves SPA hash), oracle quality signal link to scoring page
+
+### Commits
+- dashboard: eff62a4 (leaderboard tooltips)
+
+---
+
 ## Step 261 — 2026-06-04
 
 ### What was done
