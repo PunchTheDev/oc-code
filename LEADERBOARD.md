@@ -7,7 +7,7 @@ The dashboard is updated automatically after each merged submission. The table b
 Rankings are by **weighted_benchmark_score** — a difficulty-weighted composite of correctness and quality across all 30 shard problems:
 
 ```
-benchmark_score          = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor
+benchmark_score          = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor × efficiency_factor
 weighted_benchmark_score = sum(benchmark_score × difficulty_weight) / sum(difficulty_weight)
 ```
 

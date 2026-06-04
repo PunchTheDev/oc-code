@@ -18,10 +18,11 @@ A good base miner does two things: it produces correct fixes, and it produces hi
 | Metric | Scale | Purpose |
 |---|---|---|
 | `weighted_benchmark_score` | 0–2.0 | **PRIMARY leaderboard rank** — difficulty-weighted `benchmark_score` |
-| `benchmark_score` | 0–2.0 | Per-problem: `test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor` |
+| `benchmark_score` | 0–2.0 | Per-problem: `test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor × efficiency_factor` |
 | `relative_score` | 0–2.0 | Agent quality / oracle quality for this specific problem |
 | `test_pass_rate` | 0–1.0 | Fraction of tests that pass (granular correctness) |
 | `test_quality_factor` | 0.85–1.0 | Test assertion coverage multiplier (1.0 when no expectation set) |
+| `efficiency_factor` | 0.85–1.0 | Token efficiency multiplier — 1.0 at ≤10k output tokens, decays linearly to 0.85 at 50k |
 | `final_score` | 0–30 | Gittensor native AST score (retained for on-chain comparison) |
 | `file_coverage` | 0–1.0 | Fraction of reference source files touched (diagnostic, not scored) |
 | `test_coverage_ratio` | 0–1.0 | Agent assertions added / reference assertions added (feeds test_quality_factor) |
@@ -29,13 +30,13 @@ A good base miner does two things: it produces correct fixes, and it produces hi
 ## Primary metric: weighted_benchmark_score
 
 ```
-benchmark_score          = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor
+benchmark_score          = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor × efficiency_factor
 weighted_benchmark_score = sum(benchmark_score_i × difficulty_weight_i) / sum(difficulty_weight_i)
 ```
 
 This is the leaderboard ranking metric. Hard problems (weight 2.0) contribute twice as much as easy ones (weight 1.0). A submission that scores 1.0 on a hard problem is worth more than 1.0 on an easy problem.
 
-**Oracle baseline**: the oracle (accepted reference solution) scores exactly `weighted_benchmark_score = 1.0` by definition — `test_pass_rate = 1.0`, `relative_score = 1.0`, `test_quality_factor = 1.0`.
+**Oracle baseline**: the oracle (accepted reference solution) scores exactly `weighted_benchmark_score = 1.0` by definition — `test_pass_rate = 1.0`, `relative_score = 1.0`, `test_quality_factor = 1.0`, `efficiency_factor = 1.0` (oracle does not report tokens).
 
 ### Interpreting benchmark_score
 
@@ -87,10 +88,23 @@ Interpretation:
 ## Anti-gaming: test deletion penalty
 
 ```
-anti_gaming_multiplier = 0.5  if test_deletion_warning else 1.0
+anti_gaming_multiplier = 1.0                          if removed ≤ 3   (noise tolerance)
+anti_gaming_multiplier = 1.0 − 0.1 × (removed − 3)  if 4 ≤ removed ≤ 8  (0.9 → 0.5)
+anti_gaming_multiplier = 0.5                          if removed > 8   (floor)
 ```
 
-If a submission removes more than 3 test assertions from test files, it is flagged as suspicious (likely gaming the test suite to force a pass). The `benchmark_score` is halved. The flag and raw count are both exposed in the result dict for transparency.
+If a submission removes test assertions from test files, a graduated penalty is applied. Up to 3 removals are tolerated as noise. From 4 to 8 removals, the multiplier decays linearly from 0.9 to 0.5. Beyond 8 removals, the floor of 0.5 applies.
+
+| Assertions removed | `anti_gaming_multiplier` |
+|---|---|
+| ≤ 3 | 1.0 (no penalty) |
+| 4 | 0.9 |
+| 5 | 0.8 |
+| 6 | 0.7 |
+| 7 | 0.6 |
+| ≥ 8 | 0.5 |
+
+The graduated approach avoids the binary cliff where removing 4 assertions is penalised identically to removing 40. The flag (`test_deletion_warning`) and raw count (`test_assertions_removed`) are both exposed in the result dict for transparency.
 
 ## Base quality formula
 
@@ -177,6 +191,26 @@ Counts test assertion patterns added in the agent diff vs. the reference diff, t
 | `0.0` | `0.85` | Agent added no assertions (when reference did) — 15% penalty |
 
 When `test_coverage_ratio = None` (reference added 0 assertions), the factor is 1.0 and plays no role. This avoids penalizing agents on problems where test assertions were not part of the fix.
+
+## Efficiency factor
+
+```
+efficiency_factor = 1.0                                             if tokens_used ≤ 10 000
+efficiency_factor = 1.0 − 0.15 × (tokens_used − 10 000) / 40 000  if 10 000 < tokens_used ≤ 50 000
+efficiency_factor = 0.85                                            if tokens_used > 50 000
+```
+
+A linear decay from 1.0 to 0.85 as output token usage grows from 10 000 to 50 000. Agents that don't report `tokens_used` receive 1.0 — backward-compatible with agents that predate token tracking.
+
+| `tokens_used` | `efficiency_factor` |
+|---|---|
+| ≤ 10 000 | 1.0 (no penalty) |
+| 20 000 | 0.9625 |
+| 30 000 | 0.925 |
+| 40 000 | 0.8875 |
+| ≥ 50 000 | 0.85 (floor) |
+
+This incentivizes compact reasoning rather than long chain-of-thought padding. An agent using 10k tokens earns full score; one using the full 50k budget earns 85% after correctness and quality. Token tracking is opt-in: return `(diff, tokens)` from `_call()` in your agent and `tokens_used` accumulates automatically.
 
 ## Problem curation criteria
 

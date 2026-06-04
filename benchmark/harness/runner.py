@@ -695,7 +695,15 @@ def _enrich_result(
     result.update(deletion_info)
 
     # --- benchmark_score -------------------------------------------------------
-    anti_gaming = 0.5 if deletion_info["test_deletion_warning"] else 1.0
+    # Graduated anti-gaming: ≤3 removed → 1.0, 4–8 → linear 0.9→0.5, >8 → 0.5.
+    # Mirrors score.py logic so sandbox and local runs are consistent.
+    removed = deletion_info["test_assertions_removed"]
+    if removed <= 3:
+        anti_gaming = 1.0
+    elif removed <= 8:
+        anti_gaming = round(1.0 - 0.1 * (removed - 3), 4)
+    else:
+        anti_gaming = 0.5
     result["anti_gaming_multiplier"] = anti_gaming
 
     # --- test_assertion_delta + test_quality_factor ----------------------------
