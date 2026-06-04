@@ -28,6 +28,7 @@ import collections
 import json
 import hashlib
 import os
+import re
 import random
 import sys
 import threading
@@ -53,6 +54,16 @@ POOL_CONFIG = REPO_ROOT / "benchmark" / "pool_config.json"
 BASELINES = REPO_ROOT / "results" / "baselines.json"
 LEADERBOARD = REPO_ROOT / "results" / "leaderboard.json"
 AGENTS_DIR = REPO_ROOT / "results" / "agents"
+
+# Regex for safe identifiers used in URL path segments (agent handles, problem IDs).
+# Handles: alphanumeric, underscores, hyphens — no dots, no slashes, no traversal.
+_SAFE_HANDLE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Problem IDs are owner_repo_number or plain numbers (e.g. "0992", "entrius_gittensor_992").
+_SAFE_PROBLEM_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+
+# Fallback base URL when Host header is absent (override via API_BASE_URL env var).
+_DEFAULT_BASE_URL = os.environ.get("API_BASE_URL", "http://143.244.191.193:8083")
+_DASHBOARD_URL = os.environ.get("DASHBOARD_URL", "http://143.244.191.193:8082/")
 
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
@@ -261,6 +272,14 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send(500, {"error": str(e)})
 
+    def _base_url(self) -> str:
+        """Return the API base URL derived from the Host header, or fallback."""
+        host = self.headers.get("Host", "")
+        if host:
+            scheme = "https" if host.endswith(":443") else "http"
+            return f"{scheme}://{host}"
+        return _DEFAULT_BASE_URL
+
     def _route(self, path: str, qs: dict) -> Any:
         if path == "/api/health":
             return self._health()
@@ -272,8 +291,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._leaderboard()
         if path.startswith("/api/agents/") and path.endswith("/history"):
             handle = path[len("/api/agents/"):-len("/history")]
-            if handle:
-                return self._agent_history(handle)
+            if not handle or not _SAFE_HANDLE_RE.match(handle):
+                raise _NotFound("Invalid agent handle")
+            return self._agent_history(handle)
         if path == "/api/agents":
             return self._agents()
         if path == "/api/problems":
@@ -282,7 +302,11 @@ class Handler(BaseHTTPRequestHandler):
             rest = path[len("/api/problems/"):]
             if rest.endswith("/diff"):
                 pid = rest[: -len("/diff")]
+                if not _SAFE_PROBLEM_ID_RE.match(pid):
+                    raise _NotFound("Invalid problem ID")
                 return self._problem_diff(pid)
+            if not _SAFE_PROBLEM_ID_RE.match(rest):
+                raise _NotFound("Invalid problem ID")
             return self._problem(rest)
         if path == "/api/openapi.json":
             return self._openapi_spec()
@@ -471,7 +495,7 @@ class Handler(BaseHTTPRequestHandler):
             "version": "1.0",
             "subnet": 74,
             "network": "Bittensor / Gittensor",
-            "dashboard": "http://143.244.191.193:8082/",
+            "dashboard": _DASHBOARD_URL,
             "repo": "https://github.com/PunchTheDev/gittensor-base-miner",
             "interface": {
                 "class": "BaseAgent",
@@ -540,9 +564,9 @@ class Handler(BaseHTTPRequestHandler):
                 ),
             },
             "api": {
-                "base": "http://143.244.191.193:8083",
-                "docs": "http://143.244.191.193:8083/docs",
-                "spec": "http://143.244.191.193:8083/api/openapi.json",
+                "base": self._base_url(),
+                "docs": f"{self._base_url()}/docs",
+                "spec": f"{self._base_url()}/api/openapi.json",
                 "endpoints": {
                     "/api/shard": "Current 30-problem weekly eval set (category-balanced)",
                     "/api/problems": "Full pool (filterable: ?cat=python&difficulty=hard)",
@@ -619,7 +643,7 @@ class Handler(BaseHTTPRequestHandler):
                 "license": {"name": "MIT"},
                 "contact": {"url": "https://github.com/PunchTheDev/gittensor-base-miner"},
             },
-            "servers": [{"url": "http://143.244.191.193:8083", "description": "Production"}],
+            "servers": [{"url": self._base_url(), "description": "Production"}],
             "paths": {
                 "/api/health": {
                     "get": {

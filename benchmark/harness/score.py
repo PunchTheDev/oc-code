@@ -646,7 +646,7 @@ def detect_test_deletion(diff_text: str) -> dict:
             if content and _TEST_ASSERTION_RE.search(content):
                 removed_assertions += 1
 
-    # Warn if more than 3 test assertions were removed — likely gaming.
+    # Flag when more than 3 test assertions removed — triggers graduated penalty.
     return {
         "test_assertions_removed": removed_assertions,
         "test_deletion_warning": removed_assertions > 3,
@@ -836,9 +836,17 @@ def _score_in_worktree(
     coverage = file_coverage_stats(problem_dir, diff_text)
     deletion_info = detect_test_deletion(diff_text)
 
-    # Anti-gaming multiplier: halve benchmark_score when test deletion is detected.
-    # A submission that removes >3 test assertions to force a pass is penalized.
-    anti_gaming_multiplier = 0.5 if deletion_info["test_deletion_warning"] else 1.0
+    # Anti-gaming multiplier: graduated penalty for test assertion deletion.
+    # ≤3 removed → 1.0 (noise tolerance). 4–8 → linear decay from 1.0 → 0.5.
+    # >8 removed → floor 0.5. Graduated to avoid the binary cliff where removing
+    # 4 assertions is penalised identically to removing 40.
+    removed = deletion_info["test_assertions_removed"]
+    if removed <= 3:
+        anti_gaming_multiplier = 1.0
+    elif removed <= 8:
+        anti_gaming_multiplier = round(1.0 - 0.1 * (removed - 3), 4)  # 0.9 → 0.5
+    else:
+        anti_gaming_multiplier = 0.5
 
     # test_quality_factor: 0.85–1.0 multiplier based on test assertion coverage.
     # Agents that add test assertions proportional to the reference earn 1.0;
