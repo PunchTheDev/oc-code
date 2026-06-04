@@ -888,7 +888,7 @@ def _score_in_worktree(
         "relative_score": rel_score,
         "oracle_base_score": load_baselines().get(meta.get("id", ""), 0.0),
         # benchmark_score: PRIMARY per-problem metric.
-        #   = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor
+        #   = test_pass_rate × relative_score × anti_gaming_multiplier × test_quality_factor × efficiency_factor
         # Combined into weighted_benchmark_score at the shard level (hard×2 / medium×1.5 / easy×1).
         "benchmark_score": benchmark_score,
         "anti_gaming_multiplier": anti_gaming_multiplier,
