@@ -177,6 +177,8 @@ def main():
                     help="Behavior fingerprint JSON from --save-behaviors; saved to results/behaviors/ for future anti-copy checks")
     ap.add_argument("--agent-file", metavar="FILE",
                     help="Path to the agent.py being scored — used for commit-reveal hash verification")
+    ap.add_argument("--pr-number", type=int, metavar="N",
+                    help="GitHub PR number — stored so the leaderboard can link to the agent's source code")
     args = ap.parse_args()
 
     results_path = pathlib.Path(args.results)
@@ -239,6 +241,12 @@ def main():
         entry["weighted_benchmark_score"] = round(float(weighted_benchmark), 4)
     if shard_week is not None:
         entry["shard_week"] = int(shard_week)
+
+    # Link back to source code for flywheel: champion code gets open-sourced
+    repo_base = "https://github.com/PunchTheDev/gittensor-base-miner"
+    if args.pr_number:
+        entry["pr_url"] = f"{repo_base}/pull/{args.pr_number}"
+        entry["agent_code_url"] = f"{repo_base}/blob/main/agent/submissions/{args.handle}/agent.py"
 
     # Aggregate token efficiency across all problems
     entry["total_tokens_used"] = sum(b["tokens_used"] for b in breakdown)
