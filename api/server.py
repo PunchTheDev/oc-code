@@ -656,7 +656,8 @@ class Handler(BaseHTTPRequestHandler):
                 "weighted_formula": "weighted_benchmark_score = sum(benchmark_score × difficulty_weight) / sum(weight)",
                 "difficulty_weights": {"easy": 1.0, "medium": 1.5, "hard": 2.0},
                 "correctness_gates_quality": True,
-                "oracle_score": oracle_score,
+                "oracle_weighted_benchmark_score": 1.0,
+                "oracle_raw_weighted_score": oracle_score,
                 "champion_score": champion_score,
                 "champion_agent": champion_agent,
                 "note": (
@@ -665,7 +666,8 @@ class Handler(BaseHTTPRequestHandler):
                     "anti_gaming_multiplier penalises test deletion and submission similarity. "
                     "test_quality_factor (0.85–1.0) rewards agents that add test assertions. "
                     "efficiency_factor (0.85–1.0) rewards agents that use fewer output tokens. "
-                    "oracle_score is the difficulty-weighted mean (hard×2/medium×1.5/easy×1). "
+                    "oracle_weighted_benchmark_score is always 1.0 (definition) — beat it to win. "
+                    f"oracle_raw_weighted_score (currently {oracle_score:.2f}) is the difficulty-weighted mean across all pool problems. "
                     "Beat the champion weighted_benchmark_score across 30 problems to win."
                 ),
             },
