@@ -4429,3 +4429,24 @@ Services healthy. Mining page verified: 5 model cards, 5-step quickstart with co
 
 Deployed: gitminer-dashboard live copy updated (`/home/punch/punch/workspace/gittensor-miner-dashboard/`).
 Forge-dashboard auto-deployed via GitHub Actions (run 26923549549, 31s).
+
+---
+
+## Step 251 — 2026-06-04
+
+**Data quality fix: problem language derived from test_cmd, not repo name**
+
+Root cause discovered via pool stats audit: 52 problems misclassified because REPO_CATEGORY used repo-level language (e.g. infiniflow/ragflow → "python") but a subset of PRs test Go or TypeScript subsystems. Mismatch corrupted shard language balance + example agent language-specific prompting.
+
+**PR #116 merged** (base-miner): `problem_lang(meta)` in catalog.py
+- Maps `test_cmd[0]` → language: go/cargo/npm/bundle/gradlew → go/rust/typescript/ruby/jvm
+- Falls back to `repo_lang` for Python/other commands
+- Updated `_problem_category` (evaluate.py), `_category` (api/server.py), `generate_dashboard_data.py`, `gitminer.py`
+
+**Shard budget updated**: python 11→10, go 3→4 (total still 30, proportional to corrected distribution)
+
+**Impact**: Pool now correctly reports python:368, rust:268, typescript:200, go:136, jvm:76, ruby:75 (vs python:411, rust:277, typescript:188, go:96 before fix). Shard: python=10, rust=7, typescript=5, go=4, jvm=2, ruby=2.
+
+**Hotfix direct to main**: `gitminer problems --cat go` was erroring (choices list missing "go"). Fixed argparse choices.
+
+API restarted. Dashboard updated. Verified via browser audit.
