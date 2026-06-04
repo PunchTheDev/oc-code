@@ -646,6 +646,8 @@ def _enrich_result(
         detect_test_deletion,
         test_assertion_delta,
         compute_test_quality_factor,
+        compute_efficiency_factor,
+        DEFAULT_TOKEN_BUDGET,
     )
 
     if not result.get("patch_applied"):
@@ -712,6 +714,16 @@ def _enrich_result(
     tqf = compute_test_quality_factor(assertion_info["test_coverage_ratio"])
     result["test_quality_factor"] = tqf
 
-    result["benchmark_score"] = round(test_pass_rate * (rel_score or 0.0) * anti_gaming * tqf, 4)
+    # --- efficiency_factor -----------------------------------------------------
+    # Mirrors score.py: 1.0 when tokens_used=0 (not reported), decays above budget.
+    tokens_used = result.get("tokens_used", 0)
+    token_budget = int(meta.get("output_token_budget", DEFAULT_TOKEN_BUDGET))
+    eff = compute_efficiency_factor(tokens_used, token_budget)
+    result.setdefault("efficiency_factor", eff)
+    result.setdefault("tokens_used", tokens_used)
+
+    result["benchmark_score"] = round(
+        test_pass_rate * (rel_score or 0.0) * anti_gaming * tqf * eff, 4
+    )
 
     return result
