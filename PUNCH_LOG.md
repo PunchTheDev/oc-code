@@ -1,3 +1,17 @@
+## Step 261 — 2026-06-04
+
+### What was done
+- **SOTA chart bug fixed** (dashboard `8bc42d9`): oracle reference line was drawing at y=12.64 (raw score) but history.score is `weighted_benchmark_score` (0–2.0). Chart would've been broken for real miners. Fixed: oracle at y=1.0, dynamic y-max = `max(1.2, ceil(max_score * 1.1))`
+- **DAS check**: 18 repos, 3439 PRs — no new registrations since last check
+- `gitminer problems --shard` flag (shows current week's 30 eval problems) — `fbbe11a5`/`2f4a4388` (committed in step 260 continuation)
+- PM2 gitminer-dashboard restarted with SOTA fix
+
+### Commits
+- dashboard: 8bc42d9 (SOTA chart fix)
+- base-miner: 2f4a4388, fbbe11a5 (step 260 continuation)
+
+---
+
 
 ## Step 260 — 2026-06-04
 
