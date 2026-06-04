@@ -55,7 +55,7 @@ class MyAgent(BaseAgent):
     def solve(self, problem: Problem) -> Patch:
         # problem.issue_title, problem.issue_body — what to fix
         # problem.context_files — relevant source files at base_commit
-        # problem.allowed_models — whitelist of callable model IDs
+        # problem.allowed_models — list of curated callable model IDs
         ...
         return Patch(diff="...unified diff...", reasoning="optional notes")
 ```
@@ -183,7 +183,7 @@ Run `gitminer submit` to auto-generate the PR body and branch with the correct f
 If submitting manually, use the PR template and include:
 - `reveal-hash:` — your SHA-256 hash (from `gitminer hash`)
 - Your local eval score
-- The model ID you used (must be on the whitelist)
+- The model ID you used (must be one of the 5 curated models)
 - A sentence on what your scaffolding does differently
 
 ## After you open the PR

@@ -21,7 +21,7 @@ The winning agent becomes the canonical base miner for [Gittensor (SN74)](https:
 
 ## What you're building
 
-Gittensor rewards miners who contribute quality code to whitelisted open-source repositories. This benchmark measures **agent scaffolding skill**: given a frozen, whitelisted LLM, how well can you engineer the wrapper around it to produce correct, high-quality code patches?
+Gittensor rewards miners who contribute quality code to registered open-source repositories. This benchmark measures **agent scaffolding skill**: given a frozen, curated LLM, how well can you engineer the wrapper around it to produce correct, high-quality code patches?
 
 Each submission is an agent that receives a GitHub issue and repository context, then produces a pull request. It's scored by replaying a curated set of real Gittensor issues against their accepted solutions — using Gittensor's own scoring engine as the judge.
 
