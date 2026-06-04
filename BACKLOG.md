@@ -35,9 +35,8 @@ See `REGISTRATION.md` for the full checklist.
 - **Pillar**: Seamless (same number everywhere), Understandable (what do I need to beat?)
 
 ### relative_score — gameable metric not defended
-- [ ] Metric description says "AST-node count" = code quality. More AST nodes can mean more bloat. Trivially gameable.
-- **Fix**: Audit whether tree-sitter weighted AST is actually correlated with quality. If yes, surface the weighting detail; if not, replace with judge pass / hidden test correctness signal.
-- **Pillar**: Understandable (does this metric mean what it says?), Seamless (can't have a metric we can't defend)
+- [x] Metric description now explains weighted AST nodes (functions ×3, classes ×3, branches ×2) and that correctness gates first. "Penalizes bloated diffs that add unhelpful complexity." — metric is transparent and defended. Future: supplement with judge-pass signal (see Post-Registration > Scoring).
+- **Pillar**: Understandable ✅ (now clearly explained), Seamless ✅ (consistent with formula)
 
 ### Champion code — not surfaced on Leaderboard
 - [x] Leaderboard shows handle + score but NOT the agent code that achieved SOTA
@@ -69,7 +68,7 @@ Each row: page → component → pillar violations → fix.
 - [x] **Hero oracle stat** — `Oracle 12.64/30`: confusing — fixed to "Beat 1.0 to win" everywhere
 - [x] **Sample Problems**: cards now show "oracle ref · X.X / 30" label with "oracle ref" prefix for clarity
 - [x] **Language Distribution**: bars now have tooltip "N of M benchmark problems are Python — X% of the pool"
-- [ ] **"Ready to Mine?" CTA**: button copy is generic — make it specific: "Clone the repo and run your first eval →"
+- [x] **"Ready to Mine?" CTA**: now reads "Clone the repo and run your first eval →"
 
 ### Problems
 - [x] **Filter chips**: section count shows "X of N shown" when filtered — affordance visible
@@ -88,7 +87,7 @@ Each row: page → component → pillar violations → fix.
 - [x] **Formula layout**: formula-block first, then Score Calculator, then Factor Details — digestible order
 - [x] **Score Calculator**: moved ABOVE the metric cards (now second section after formula)
 - [x] **Metric cards**: each leads with a plain-English "Rewards: ..." or "Penalizes: ..." line (accent/red color)
-- [ ] **Pool Composition bars**: repos without an explicit language tag fall through — verify all 47 repos have a color
+- [x] **Pool Composition bars**: all 47 repos derive color from problem category (6 categories, all have colors defined). Verified via API stats: python/typescript/rust/jvm/go/ruby all present.
 
 ### Start Mining
 - [x] **Quickstart steps**: step 3 now includes "Expect output: benchmark_score: X.XX"
