@@ -1,0 +1,705 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/MainActivity.kt b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+index ced3ddc9..6f681324 100644
+--- a/app/src/main/java/dev/touchpilot/app/MainActivity.kt
++++ b/app/src/main/java/dev/touchpilot/app/MainActivity.kt
+@@ -76,8 +76,18 @@ class MainActivity : Activity() {
+         super.onCreate(savedInstanceState)
+ 
+         preferences = getSharedPreferences("touchpilot", MODE_PRIVATE)
+-        skills = SkillStore(this).loadSkills()
+         ToolExecutionLog.configure(this)
++        val skillLoad = SkillStore(this).load()
++        skills = skillLoad.skills
++        skillLoad.invalid.forEach { invalid ->
++            ToolExecutionLog.record(
++                name = "skill_load_failed",
++                args = "skill=${invalid.id}",
++                ok = false,
++                message = invalid.errors.joinToString("; "),
++                source = "skills"
++            )
++        }
+         toolExecutor = AndroidToolExecutor(this)
+         debugTraceExporter = DebugTraceExporter(
+             context = this,
+diff --git a/app/src/main/java/dev/touchpilot/app/memory/SkillModels.kt b/app/src/main/java/dev/touchpilot/app/memory/SkillModels.kt
+index 6ec6caeb..5bf86fba 100644
+--- a/app/src/main/java/dev/touchpilot/app/memory/SkillModels.kt
++++ b/app/src/main/java/dev/touchpilot/app/memory/SkillModels.kt
+@@ -1,8 +1,69 @@
+ package dev.touchpilot.app.memory
+ 
++/**
++ * Skill-level risk hint declared in Skills v2 front matter (see docs/SKILLS.md).
++ * Risk may only ever increase caution in downstream policy/approval copy; it can
++ * never lower the risk of an individual tool call.
++ */
++enum class SkillRisk {
++    LOW,
++    MEDIUM,
++    HIGH;
++
++    companion object {
++        /** Parses a wire value (`low`/`medium`/`high`); returns null for anything else. */
++        fun fromWire(value: String): SkillRisk? = when (value.trim().lowercase()) {
++            "low" -> LOW
++            "medium" -> MEDIUM
++            "high" -> HIGH
++            else -> null
++        }
++    }
++}
++
++/** How a bundled `SKILL.md` file was parsed. */
++enum class SkillFormat {
++    /** Legacy heading + "Allowed initial tools:" list. Carries no structured metadata. */
++    LEGACY_V1,
++
++    /** Skills v2 front matter (see docs/SKILLS.md). */
++    V2
++}
++
+ data class Skill(
+     val id: String,
+     val title: String,
+     val markdown: String,
+-    val allowedTools: Set<String>
++    val allowedTools: Set<String>,
++    val description: String = "",
++    val risk: SkillRisk = SkillRisk.LOW,
++    val aliases: List<String> = emptyList(),
++    val examples: List<String> = emptyList(),
++    val successCriteria: List<String> = emptyList(),
++    val format: SkillFormat = SkillFormat.LEGACY_V1
++)
++
++/** Result of parsing a single `SKILL.md` file. */
++sealed class SkillParseResult {
++    abstract val id: String
++
++    data class Valid(val skill: Skill) : SkillParseResult() {
++        override val id: String get() = skill.id
++    }
++
++    /**
++     * The file declared Skills v2 front matter but failed validation. Carries
++     * every problem found so broken skills are diagnosable from tests and
++     * developer logs instead of silently losing metadata.
++     */
++    data class Invalid(
++        override val id: String,
++        val errors: List<String>
++    ) : SkillParseResult()
++}
++
++/** Outcome of loading the bundled skill pack. */
++data class SkillLoad(
++    val skills: List<Skill>,
++    val invalid: List<SkillParseResult.Invalid>
+ )
+diff --git a/app/src/main/java/dev/touchpilot/app/memory/SkillParser.kt b/app/src/main/java/dev/touchpilot/app/memory/SkillParser.kt
+new file mode 100644
+index 00000000..4db00b6a
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/memory/SkillParser.kt
+@@ -0,0 +1,221 @@
++package dev.touchpilot.app.memory
++
++/**
++ * Parses bundled `SKILL.md` files into structured [Skill] models.
++ *
++ * A file whose first non-blank line is `---` is treated as **Skills v2**
++ * (docs/SKILLS.md) and validated strictly: every required field must be present,
++ * `risk` must be `low`/`medium`/`high`, and every entry in `allowed_tools` must
++ * name a known Android tool. Policy-sensitive problems (unknown risk, unknown or
++ * empty tools, missing required fields, id mismatch) fail closed as a
++ * [SkillParseResult.Invalid] rather than loading a partial skill.
++ *
++ * Files without front matter fall back to the legacy v1 reader (heading +
++ * "Allowed initial tools:" list) so the not-yet-upgraded bundled pack keeps
++ * loading until issue #229 migrates it to v2. The legacy path stays permissive
++ * (it does not validate tool names) to preserve current behavior.
++ *
++ * The parser is pure — no Android dependency — so it is fully unit-testable.
++ */
++object SkillParser {
++    private const val FrontMatterFence = "---"
++    private val IdPattern = Regex("^[a-z0-9-]+$")
++    private val RequiredScalarFields = listOf("id", "title", "description", "risk")
++
++    fun parse(directoryId: String, markdown: String, knownTools: Set<String>): SkillParseResult {
++        val normalized = markdown.replace("\r\n", "\n").replace("\r", "\n")
++        return if (declaresFrontMatter(normalized)) {
++            parseV2(directoryId, normalized, knownTools)
++        } else {
++            SkillParseResult.Valid(parseLegacy(directoryId, normalized))
++        }
++    }
++
++    private fun declaresFrontMatter(markdown: String): Boolean {
++        val firstNonBlank = markdown.lineSequence().firstOrNull { it.isNotBlank() } ?: return false
++        return firstNonBlank.trim() == FrontMatterFence
++    }
++
++    private fun parseV2(
++        directoryId: String,
++        markdown: String,
++        knownTools: Set<String>
++    ): SkillParseResult {
++        val split = splitFrontMatter(markdown)
++            ?: return SkillParseResult.Invalid(
++                directoryId,
++                listOf("front matter must be closed with a line containing only '---'")
++            )
++
++        val (block, body) = split
++        val fields = parseFrontMatter(block)
++        val errors = mutableListOf<String>()
++
++        for (field in RequiredScalarFields) {
++            if (fields.scalar(field).isNullOrBlank()) {
++                errors += "missing required field: $field"
++            }
++        }
++
++        val id = fields.scalar("id").orEmpty().trim()
++        if (id.isNotBlank()) {
++            if (!IdPattern.matches(id)) {
++                errors += "id '$id' must use only a-z, 0-9, and '-'"
++            } else if (id != directoryId) {
++                errors += "id '$id' does not match the skill directory '$directoryId'"
++            }
++        }
++
++        val rawRisk = fields.scalar("risk").orEmpty().trim()
++        val risk = if (rawRisk.isBlank()) null else SkillRisk.fromWire(rawRisk)
++        if (rawRisk.isNotBlank() && risk == null) {
++            errors += "invalid risk '$rawRisk' (allowed: low, medium, high)"
++        }
++
++        val allowedTools = fields.list("allowed_tools")
++        if (allowedTools.isEmpty()) {
++            errors += "missing or empty required field: allowed_tools"
++        } else {
++            val unknown = allowedTools.filter { it !in knownTools }
++            if (unknown.isNotEmpty()) {
++                errors += "unknown tool(s) in allowed_tools: ${unknown.joinToString()}"
++            }
++        }
++
++        if (errors.isNotEmpty()) {
++            return SkillParseResult.Invalid(directoryId, errors)
++        }
++
++        return SkillParseResult.Valid(
++            Skill(
++                id = directoryId,
++                title = fields.scalar("title").orEmpty().trim(),
++                markdown = body.trim(),
++                allowedTools = allowedTools.toCollection(LinkedHashSet()),
++                description = fields.scalar("description").orEmpty().trim(),
++                // risk is non-null here: errors is empty, so it parsed cleanly.
++                risk = risk ?: SkillRisk.LOW,
++                aliases = fields.list("aliases"),
++                examples = fields.list("examples"),
++                successCriteria = fields.list("success_criteria"),
++                format = SkillFormat.V2
++            )
++        )
++    }
++
++    /** Splits a v2 file into its front matter block and the Markdown body, or null if unclosed. */
++    private fun splitFrontMatter(markdown: String): Pair<String, String>? {
++        val lines = markdown.lines()
++        val openIndex = lines.indexOfFirst { it.isNotBlank() }
++        if (openIndex < 0 || lines[openIndex].trim() != FrontMatterFence) return null
++        val closeIndex = (openIndex + 1 until lines.size)
++            .firstOrNull { lines[it].trim() == FrontMatterFence }
++            ?: return null
++        val block = lines.subList(openIndex + 1, closeIndex).joinToString("\n")
++        val body = lines.subList(closeIndex + 1, lines.size).joinToString("\n")
++        return block to body
++    }
++
++    /**
++     * Parses the front matter block as the documented YAML subset: `key: value`
++     * scalars and `key:` followed by indented `- item` lists. Values may be
++     * single- or double-quoted. This is intentionally not a full YAML parser.
++     */
++    private fun parseFrontMatter(block: String): FrontMatter {
++        val values = LinkedHashMap<String, Any>()
++        var pendingListKey: String? = null
++        val pendingList = mutableListOf<String>()
++
++        fun flush() {
++            val key = pendingListKey ?: return
++            values[key] = pendingList.toList()
++            pendingList.clear()
++            pendingListKey = null
++        }
++
++        for (raw in block.lines()) {
++            if (raw.isBlank()) continue
++            val trimmed = raw.trim()
++            if (trimmed.startsWith("#")) continue
++            if (trimmed.startsWith("-")) {
++                if (pendingListKey == null) continue
++                val item = unquote(trimmed.removePrefix("-").trim())
++                if (item.isNotEmpty()) pendingList += item
++                continue
++            }
++            val colon = trimmed.indexOf(':')
++            if (colon <= 0) continue
++            flush()
++            val key = trimmed.substring(0, colon).trim()
++            val value = trimmed.substring(colon + 1).trim()
++            if (value.isEmpty()) {
++                pendingListKey = key
++            } else {
++                values[key] = unquote(value)
++            }
++        }
++        flush()
++        return FrontMatter(values)
++    }
++
++    private fun unquote(value: String): String {
++        if (value.length >= 2) {
++            val first = value.first()
++            val last = value.last()
++            if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
++                return value.substring(1, value.length - 1)
++            }
++        }
++        return value
++    }
++
++    private fun parseLegacy(directoryId: String, markdown: String): Skill {
++        return Skill(
++            id = directoryId,
++            title = parseLegacyTitle(markdown).ifBlank { directoryId },
++            markdown = markdown.trim(),
++            allowedTools = parseLegacyAllowedTools(markdown),
++            format = SkillFormat.LEGACY_V1
++        )
++    }
++
++    private fun parseLegacyTitle(markdown: String): String {
++        return markdown.lineSequence()
++            .firstOrNull { it.startsWith("# ") }
++            ?.removePrefix("# ")
++            ?.trim()
++            .orEmpty()
++    }
++
++    private fun parseLegacyAllowedTools(markdown: String): Set<String> {
++        val tools = linkedSetOf<String>()
++        var inAllowedTools = false
++
++        markdown.lineSequence().forEach { line ->
++            val trimmed = line.trim()
++            if (trimmed.equals("Allowed initial tools:", ignoreCase = true)) {
++                inAllowedTools = true
++                return@forEach
++            }
++            if (inAllowedTools && trimmed.startsWith("#")) {
++                inAllowedTools = false
++            }
++            if (inAllowedTools && trimmed.startsWith("-")) {
++                Regex("`([^`]+)`").find(trimmed)?.groupValues?.getOrNull(1)?.let { tool ->
++                    tools.add(tool)
++                }
++            }
++        }
++        return tools
++    }
++
++    private class FrontMatter(private val values: Map<String, Any>) {
++        fun scalar(key: String): String? = values[key] as? String
++
++        fun list(key: String): List<String> = when (val value = values[key]) {
++            is List<*> -> value.filterIsInstance<String>()
++            is String -> if (value.isBlank()) emptyList() else listOf(value)
++            else -> emptyList()
++        }
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/memory/SkillStore.kt b/app/src/main/java/dev/touchpilot/app/memory/SkillStore.kt
+index 0c1545a0..672b7ab1 100644
+--- a/app/src/main/java/dev/touchpilot/app/memory/SkillStore.kt
++++ b/app/src/main/java/dev/touchpilot/app/memory/SkillStore.kt
+@@ -1,64 +1,36 @@
+ package dev.touchpilot.app.memory
+ 
+ import android.content.Context
++import dev.touchpilot.app.tools.AndroidToolCatalog
+ 
+-class SkillStore(context: Context) {
++class SkillStore(
++    context: Context,
++    private val knownTools: Set<String> = AndroidToolCatalog.initialTools.map { it.name }.toSet()
++) {
+     private val assets = context.applicationContext.assets
+ 
+-    fun loadSkills(): List<Skill> {
+-        return runCatching {
++    /** Valid bundled skills only. Kept for callers that do not need diagnostics. */
++    fun loadSkills(): List<Skill> = load().skills
++
++    /** Parses every bundled skill, separating valid skills from invalid files. */
++    fun load(): SkillLoad {
++        val results = runCatching {
+             assets.list(SkillsRoot).orEmpty()
+                 .sorted()
+-                .mapNotNull { id -> loadSkill(id) }
++                .mapNotNull { id -> parseSkill(id) }
+         }.getOrDefault(emptyList())
+-    }
+ 
+-    private fun loadSkill(id: String): Skill? {
+-        val path = "$SkillsRoot/$id/SKILL.md"
+-        val markdown = runCatching {
+-            assets.open(path).bufferedReader().use { it.readText() }
+-        }.getOrNull() ?: return null
+-
+-        return Skill(
+-            id = id,
+-            title = parseTitle(markdown).ifBlank { id },
+-            markdown = markdown.trim(),
+-            allowedTools = parseAllowedTools(markdown)
++        return SkillLoad(
++            skills = results.filterIsInstance<SkillParseResult.Valid>().map { it.skill },
++            invalid = results.filterIsInstance<SkillParseResult.Invalid>()
+         )
+     }
+ 
+-    private fun parseTitle(markdown: String): String {
+-        return markdown
+-            .lineSequence()
+-            .firstOrNull { it.startsWith("# ") }
+-            ?.removePrefix("# ")
+-            ?.trim()
+-            .orEmpty()
+-    }
+-
+-    private fun parseAllowedTools(markdown: String): Set<String> {
+-        val tools = mutableSetOf<String>()
+-        var inAllowedTools = false
+-
+-        markdown.lineSequence().forEach { line ->
+-            val trimmed = line.trim()
+-            if (trimmed.equals("Allowed initial tools:", ignoreCase = true)) {
+-                inAllowedTools = true
+-                return@forEach
+-            }
+-
+-            if (inAllowedTools && trimmed.startsWith("#")) {
+-                inAllowedTools = false
+-            }
+-
+-            if (inAllowedTools && trimmed.startsWith("-")) {
+-                Regex("`([^`]+)`").find(trimmed)?.groupValues?.getOrNull(1)?.let { tool ->
+-                    tools.add(tool)
+-                }
+-            }
+-        }
+-
+-        return tools
++    private fun parseSkill(id: String): SkillParseResult? {
++        val markdown = runCatching {
++            assets.open("$SkillsRoot/$id/SKILL.md").bufferedReader().use { it.readText() }
++        }.getOrNull() ?: return null
++        return SkillParser.parse(id, markdown, knownTools)
+     }
+ 
+     private companion object {
+diff --git a/app/src/test/java/dev/touchpilot/app/memory/SkillParserTest.kt b/app/src/test/java/dev/touchpilot/app/memory/SkillParserTest.kt
+new file mode 100644
+index 00000000..813d0abc
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/memory/SkillParserTest.kt
+@@ -0,0 +1,284 @@
++package dev.touchpilot.app.memory
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertTrue
++import kotlin.test.fail
++
++class SkillParserTest {
++    private val knownTools = setOf(
++        "observe_screen_context",
++        "open_app",
++        "open_settings_panel",
++        "tap",
++        "scroll",
++        "press_back",
++        "wait_for_idle",
++        "wait_for_app"
++    )
++
++    private fun validV2(): String = """
++        ---
++        id: settings
++        title: Settings
++        description: Navigate and inspect Android Settings screens safely.
++        risk: medium
++        aliases:
++          - settings
++          - android settings
++          - wi-fi settings
++        allowed_tools:
++          - observe_screen_context
++          - open_app
++          - open_settings_panel
++          - tap
++          - scroll
++          - press_back
++          - wait_for_idle
++        success_criteria:
++          - The requested Settings screen is foreground.
++          - The agent stops after the requested state is visible.
++        examples:
++          - open Wi-Fi settings
++          - show Bluetooth settings
++        ---
++
++        # Settings
++
++        Prefer direct settings panels when available.
++    """.trimIndent()
++
++    private fun valid(result: SkillParseResult): Skill = when (result) {
++        is SkillParseResult.Valid -> result.skill
++        is SkillParseResult.Invalid -> fail("expected Valid, got Invalid: ${result.errors}")
++    }
++
++    private fun invalid(result: SkillParseResult): SkillParseResult.Invalid = when (result) {
++        is SkillParseResult.Invalid -> result
++        is SkillParseResult.Valid -> fail("expected Invalid, got Valid: ${result.skill}")
++    }
++
++    @Test
++    fun parsesAllV2Fields() {
++        val skill = valid(SkillParser.parse("settings", validV2(), knownTools))
++
++        assertEquals("settings", skill.id)
++        assertEquals("Settings", skill.title)
++        assertEquals(SkillFormat.V2, skill.format)
++        assertEquals(SkillRisk.MEDIUM, skill.risk)
++        assertEquals("Navigate and inspect Android Settings screens safely.", skill.description)
++        assertEquals(
++            listOf("settings", "android settings", "wi-fi settings"),
++            skill.aliases
++        )
++        assertEquals(listOf("open Wi-Fi settings", "show Bluetooth settings"), skill.examples)
++        assertEquals(2, skill.successCriteria.size)
++        assertTrue("observe_screen_context" in skill.allowedTools)
++        assertEquals(7, skill.allowedTools.size)
++    }
++
++    @Test
++    fun preservesMarkdownBodyOnly() {
++        val skill = valid(SkillParser.parse("settings", validV2(), knownTools))
++
++        assertTrue(skill.markdown.startsWith("# Settings"), skill.markdown)
++        assertFalse(skill.markdown.contains("allowed_tools"))
++        assertFalse(skill.markdown.contains("---"))
++    }
++
++    @Test
++    fun stripsQuotesFromScalarValues() {
++        val markdown = """
++            ---
++            id: demo
++            title: "Quoted Title"
++            description: 'Single quoted.'
++            risk: low
++            allowed_tools:
++              - tap
++            ---
++            body
++        """.trimIndent()
++
++        val skill = valid(SkillParser.parse("demo", markdown, knownTools))
++
++        assertEquals("Quoted Title", skill.title)
++        assertEquals("Single quoted.", skill.description)
++    }
++
++    @Test
++    fun reportsUnknownRiskAndFailsClosed() {
++        val markdown = validV2().replace("risk: medium", "risk: critical")
++
++        val result = invalid(SkillParser.parse("settings", markdown, knownTools))
++
++        assertTrue(
++            result.errors.any { it.contains("invalid risk 'critical'") },
++            result.errors.toString()
++        )
++    }
++
++    @Test
++    fun reportsUnknownToolsInAllowlist() {
++        val markdown = validV2().replace("  - wait_for_idle", "  - teleport\n  - hack_root")
++
++        val result = invalid(SkillParser.parse("settings", markdown, knownTools))
++
++        val toolError = result.errors.single { it.contains("unknown tool") }
++        assertTrue(toolError.contains("teleport"), toolError)
++        assertTrue(toolError.contains("hack_root"), toolError)
++    }
++
++    @Test
++    fun reportsEmptyAllowedTools() {
++        val markdown = """
++            ---
++            id: demo
++            title: Demo
++            description: A demo skill.
++            risk: low
++            allowed_tools:
++            ---
++            body
++        """.trimIndent()
++
++        val result = invalid(SkillParser.parse("demo", markdown, knownTools))
++
++        assertTrue(
++            result.errors.any { it.contains("allowed_tools") },
++            result.errors.toString()
++        )
++    }
++
++    @Test
++    fun reportsMissingRequiredFields() {
++        val markdown = """
++            ---
++            id: demo
++            allowed_tools:
++              - tap
++            ---
++            body
++        """.trimIndent()
++
++        val result = invalid(SkillParser.parse("demo", markdown, knownTools))
++
++        assertTrue(result.errors.any { it.contains("missing required field: title") }, result.errors.toString())
++        assertTrue(result.errors.any { it.contains("missing required field: description") }, result.errors.toString())
++        assertTrue(result.errors.any { it.contains("missing required field: risk") }, result.errors.toString())
++    }
++
++    @Test
++    fun reportsIdMismatchWithDirectory() {
++        val result = invalid(SkillParser.parse("settings-panel", validV2(), knownTools))
++
++        assertTrue(
++            result.errors.any { it.contains("does not match the skill directory 'settings-panel'") },
++            result.errors.toString()
++        )
++    }
++
++    @Test
++    fun reportsMalformedId() {
++        val markdown = validV2().replace("id: settings", "id: Settings_Panel")
++
++        val result = invalid(SkillParser.parse("Settings_Panel", markdown, knownTools))
++
++        assertTrue(
++            result.errors.any { it.contains("must use only a-z, 0-9, and '-'") },
++            result.errors.toString()
++        )
++    }
++
++    @Test
++    fun reportsUnclosedFrontMatter() {
++        val markdown = """
++            ---
++            id: demo
++            title: Demo
++            description: A demo.
++            risk: low
++            allowed_tools:
++              - tap
++
++            # Demo
++            no closing fence
++        """.trimIndent()
++
++        val result = invalid(SkillParser.parse("demo", markdown, knownTools))
++
++        assertTrue(
++            result.errors.any { it.contains("front matter must be closed") },
++            result.errors.toString()
++        )
++    }
++
++    @Test
++    fun collectsMultipleErrorsAtOnce() {
++        val markdown = """
++            ---
++            id: demo
++            title: Demo
++            description: A demo.
++            risk: spicy
++            allowed_tools:
++              - teleport
++            ---
++            body
++        """.trimIndent()
++
++        val result = invalid(SkillParser.parse("demo", markdown, knownTools))
++
++        assertTrue(result.errors.size >= 2, result.errors.toString())
++        assertTrue(result.errors.any { it.contains("invalid risk") }, result.errors.toString())
++        assertTrue(result.errors.any { it.contains("unknown tool") }, result.errors.toString())
++    }
++
++    @Test
++    fun parsesLegacyV1WithoutToolValidation() {
++        // The bundled settings skill still ships in v1 and even lists a tool
++        // name that is not in the catalog (wait_for_ui). The legacy path must
++        // stay permissive so it keeps loading until issue #229 upgrades it.
++        val markdown = """
++            # Settings Skill
++
++            Use Android settings screens carefully.
++
++            Allowed initial tools:
++
++            - `open_app`
++            - `wait_for_ui`
++        """.trimIndent()
++
++        val skill = valid(SkillParser.parse("settings", markdown, knownTools))
++
++        assertEquals(SkillFormat.LEGACY_V1, skill.format)
++        assertEquals("Settings Skill", skill.title)
++        assertEquals(SkillRisk.LOW, skill.risk)
++        assertEquals(setOf("open_app", "wait_for_ui"), skill.allowedTools)
++        assertTrue(skill.aliases.isEmpty())
++    }
++
++    @Test
++    fun optionalListFieldsDefaultToEmpty() {
++        val markdown = """
++            ---
++            id: demo
++            title: Demo
++            description: A demo.
++            risk: high
++            allowed_tools:
++              - tap
++            ---
++            body
++        """.trimIndent()
++
++        val skill = valid(SkillParser.parse("demo", markdown, knownTools))
++
++        assertEquals(SkillRisk.HIGH, skill.risk)
++        assertTrue(skill.aliases.isEmpty())
++        assertTrue(skill.examples.isEmpty())
++        assertTrue(skill.successCriteria.isEmpty())
++    }
++}

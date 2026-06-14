@@ -1,0 +1,441 @@
+diff --git a/CHANGES/11634.bugfix.rst b/CHANGES/11634.bugfix.rst
+new file mode 100644
+index 00000000000..649577c50b9
+--- /dev/null
++++ b/CHANGES/11634.bugfix.rst
+@@ -0,0 +1 @@
++Fixed blocking I/O in the event loop when using netrc authentication by moving netrc file lookup to an executor -- by :user:`bdraco`.
+diff --git a/aiohttp/client.py b/aiohttp/client.py
+index a7da3ff0c57..7a4ad715362 100644
+--- a/aiohttp/client.py
++++ b/aiohttp/client.py
+@@ -86,8 +86,10 @@
+     EMPTY_BODY_METHODS,
+     BasicAuth,
+     TimeoutHandle,
++    basicauth_from_netrc,
+     frozen_dataclass_decorator,
+     get_env_proxy_for_url,
++    netrc_from_env,
+     sentinel,
+     strip_auth_from_url,
+ )
+@@ -586,6 +588,20 @@ async def _request(
+                         )
+                     ):
+                         auth = self._default_auth
++
++                    # Try netrc if auth is still None and trust_env is enabled.
++                    # Only check if NETRC environment variable is set to avoid
++                    # creating an expensive executor job unnecessarily.
++                    if (
++                        auth is None
++                        and self._trust_env
++                        and url.host is not None
++                        and os.environ.get("NETRC")
++                    ):
++                        auth = await self._loop.run_in_executor(
++                            None, self._get_netrc_auth, url.host
++                        )
++
+                     # It would be confusing if we support explicit
+                     # Authorization header with auth argument
+                     if auth is not None and hdrs.AUTHORIZATION in headers:
+@@ -1131,6 +1147,19 @@ def _prepare_headers(self, headers: LooseHeaders | None) -> "CIMultiDict[str]":
+                     added_names.add(key)
+         return result
+ 
++    def _get_netrc_auth(self, host: str) -> BasicAuth | None:
++        """
++        Get auth from netrc for the given host.
++
++        This method is designed to be called in an executor to avoid
++        blocking I/O in the event loop.
++        """
++        netrc_obj = netrc_from_env()
++        try:
++            return basicauth_from_netrc(netrc_obj, host)
++        except LookupError:
++            return None
++
+     if sys.version_info >= (3, 11) and TYPE_CHECKING:
+ 
+         def get(
+diff --git a/aiohttp/client_reqrep.py b/aiohttp/client_reqrep.py
+index 880e1085bab..050d3a259e1 100644
+--- a/aiohttp/client_reqrep.py
++++ b/aiohttp/client_reqrep.py
+@@ -40,10 +40,8 @@
+     BasicAuth,
+     HeadersMixin,
+     TimerNoop,
+-    basicauth_from_netrc,
+     frozen_dataclass_decorator,
+     is_expected_content_type,
+-    netrc_from_env,
+     parse_mimetype,
+     reify,
+     sentinel,
+@@ -1068,10 +1066,6 @@ def update_auth(self, auth: BasicAuth | None, trust_env: bool = False) -> None:
+         """Set basic auth."""
+         if auth is None:
+             auth = self.auth
+-        if auth is None and trust_env and self.url.host is not None:
+-            netrc_obj = netrc_from_env()
+-            with contextlib.suppress(LookupError):
+-                auth = basicauth_from_netrc(netrc_obj, self.url.host)
+         if auth is None:
+             return
+ 
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 5e872dec5c7..6833d2c1653 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -71,10 +71,6 @@ def blockbuster(request: pytest.FixtureRequest) -> Iterator[None]:
+     with blockbuster_ctx(
+         "aiohttp", excluded_modules=["aiohttp.pytest_plugin", "aiohttp.test_utils"]
+     ) as bb:
+-        # TODO: Fix blocking call in ClientRequest's constructor.
+-        # https://github.com/aio-libs/aiohttp/issues/10435
+-        for func in ["io.TextIOWrapper.read", "os.stat"]:
+-            bb.functions[func].can_block_in("aiohttp/client_reqrep.py", "update_auth")
+         for func in [
+             "os.getcwd",
+             "os.readlink",
+@@ -292,6 +288,34 @@ def netrc_contents(
+     return netrc_file_path
+ 
+ 
++@pytest.fixture
++def netrc_default_contents(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
++    """Create a temporary netrc file with default test credentials and set NETRC env var."""
++    netrc_file = tmp_path / ".netrc"
++    netrc_file.write_text("default login netrc_user password netrc_pass\n")
++
++    monkeypatch.setenv("NETRC", str(netrc_file))
++
++    return netrc_file
++
++
++@pytest.fixture
++def no_netrc(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Ensure NETRC environment variable is not set."""
++    monkeypatch.delenv("NETRC", raising=False)
++
++
++@pytest.fixture
++def netrc_other_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
++    """Create a temporary netrc file with credentials for a different host and set NETRC env var."""
++    netrc_file = tmp_path / ".netrc"
++    netrc_file.write_text("machine other.example.com login user password pass\n")
++
++    monkeypatch.setenv("NETRC", str(netrc_file))
++
++    return netrc_file
++
++
+ @pytest.fixture
+ def start_connection() -> Iterator[mock.Mock]:
+     with mock.patch(
+diff --git a/tests/test_client_functional.py b/tests/test_client_functional.py
+index 5006a745346..731878d7c1b 100644
+--- a/tests/test_client_functional.py
++++ b/tests/test_client_functional.py
+@@ -70,6 +70,23 @@ def fname(here: pathlib.Path) -> pathlib.Path:
+     return here / "conftest.py"
+ 
+ 
++@pytest.fixture
++def headers_echo_client(
++    aiohttp_client: AiohttpClient,
++) -> Callable[..., Awaitable[TestClient[web.Request, web.Application]]]:
++    """Create a client with an app that echoes request headers as JSON."""
++
++    async def factory(**kwargs: Any) -> TestClient[web.Request, web.Application]:
++        async def handler(request: web.Request) -> web.Response:
++            return web.json_response({"headers": dict(request.headers)})
++
++        app = web.Application()
++        app.router.add_get("/", handler)
++        return await aiohttp_client(app, **kwargs)
++
++    return factory
++
++
+ async def test_keepalive_two_requests_success(aiohttp_client: AiohttpClient) -> None:
+     async def handler(request: web.Request) -> web.Response:
+         body = await request.read()
+@@ -3702,14 +3719,12 @@ async def handler(request: web.Request) -> web.Response:
+         assert resp.status == 200
+ 
+ 
+-async def test_session_auth(aiohttp_client: AiohttpClient) -> None:
+-    async def handler(request: web.Request) -> web.Response:
+-        return web.json_response({"headers": dict(request.headers)})
+-
+-    app = web.Application()
+-    app.router.add_get("/", handler)
+-
+-    client = await aiohttp_client(app, auth=aiohttp.BasicAuth("login", "pass"))
++async def test_session_auth(
++    headers_echo_client: Callable[
++        ..., Awaitable[TestClient[web.Request, web.Application]]
++    ],
++) -> None:
++    client = await headers_echo_client(auth=aiohttp.BasicAuth("login", "pass"))
+ 
+     async with client.get("/") as r:
+         assert r.status == 200
+@@ -3717,14 +3732,12 @@ async def handler(request: web.Request) -> web.Response:
+     assert content["headers"]["Authorization"] == "Basic bG9naW46cGFzcw=="
+ 
+ 
+-async def test_session_auth_override(aiohttp_client: AiohttpClient) -> None:
+-    async def handler(request: web.Request) -> web.Response:
+-        return web.json_response({"headers": dict(request.headers)})
+-
+-    app = web.Application()
+-    app.router.add_get("/", handler)
+-
+-    client = await aiohttp_client(app, auth=aiohttp.BasicAuth("login", "pass"))
++async def test_session_auth_override(
++    headers_echo_client: Callable[
++        ..., Awaitable[TestClient[web.Request, web.Application]]
++    ],
++) -> None:
++    client = await headers_echo_client(auth=aiohttp.BasicAuth("login", "pass"))
+ 
+     async with client.get("/", auth=aiohttp.BasicAuth("other_login", "pass")) as r:
+         assert r.status == 200
+@@ -3746,30 +3759,77 @@ async def handler(request: web.Request) -> NoReturn:
+         await client.get("/", headers=headers)
+ 
+ 
+-async def test_session_headers(aiohttp_client: AiohttpClient) -> None:
+-    async def handler(request: web.Request) -> web.Response:
+-        return web.json_response({"headers": dict(request.headers)})
+-
+-    app = web.Application()
+-    app.router.add_get("/", handler)
++@pytest.mark.usefixtures("netrc_default_contents")
++async def test_netrc_auth_from_env(  # type: ignore[misc]
++    headers_echo_client: Callable[
++        ..., Awaitable[TestClient[web.Request, web.Application]]
++    ],
++) -> None:
++    """Test that netrc authentication works when NETRC env var is set and trust_env=True."""
++    client = await headers_echo_client(trust_env=True)
++    async with client.get("/") as r:
++        assert r.status == 200
++        content = await r.json()
++    # Base64 encoded "netrc_user:netrc_pass" is "bmV0cmNfdXNlcjpuZXRyY19wYXNz"
++    assert content["headers"]["Authorization"] == "Basic bmV0cmNfdXNlcjpuZXRyY19wYXNz"
+ 
+-    client = await aiohttp_client(app, headers={"X-Real-IP": "192.168.0.1"})
+ 
++@pytest.mark.usefixtures("no_netrc")
++async def test_netrc_auth_skipped_without_env_var(  # type: ignore[misc]
++    headers_echo_client: Callable[
++        ..., Awaitable[TestClient[web.Request, web.Application]]
++    ],
++) -> None:
++    """Test that netrc authentication is skipped when NETRC env var is not set."""
++    client = await headers_echo_client(trust_env=True)
+     async with client.get("/") as r:
+         assert r.status == 200
+         content = await r.json()
+-    assert content["headers"]["X-Real-IP"] == "192.168.0.1"
++    # No Authorization header should be present
++    assert "Authorization" not in content["headers"]
+ 
+ 
+-async def test_session_headers_merge(aiohttp_client: AiohttpClient) -> None:
+-    async def handler(request: web.Request) -> web.Response:
+-        return web.json_response({"headers": dict(request.headers)})
++@pytest.mark.usefixtures("netrc_default_contents")
++async def test_netrc_auth_overridden_by_explicit_auth(  # type: ignore[misc]
++    headers_echo_client: Callable[
++        ..., Awaitable[TestClient[web.Request, web.Application]]
++    ],
++) -> None:
++    """Test that explicit auth parameter overrides netrc authentication."""
++    client = await headers_echo_client(trust_env=True)
++    # Make request with explicit auth (should override netrc)
++    async with client.get(
++        "/", auth=aiohttp.BasicAuth("explicit_user", "explicit_pass")
++    ) as r:
++        assert r.status == 200
++        content = await r.json()
++    # Base64 encoded "explicit_user:explicit_pass" is "ZXhwbGljaXRfdXNlcjpleHBsaWNpdF9wYXNz"
++    assert (
++        content["headers"]["Authorization"]
++        == "Basic ZXhwbGljaXRfdXNlcjpleHBsaWNpdF9wYXNz"
++    )
+ 
+-    app = web.Application()
+-    app.router.add_get("/", handler)
+ 
+-    client = await aiohttp_client(
+-        app, headers=[("X-Real-IP", "192.168.0.1"), ("X-Sent-By", "requests")]
++async def test_session_headers(
++    headers_echo_client: Callable[
++        ..., Awaitable[TestClient[web.Request, web.Application]]
++    ],
++) -> None:
++    client = await headers_echo_client(headers={"X-Real-IP": "192.168.0.1"})
++
++    async with client.get("/") as r:
++        assert r.status == 200
++        content = await r.json()
++    assert content["headers"]["X-Real-IP"] == "192.168.0.1"
++
++
++async def test_session_headers_merge(
++    headers_echo_client: Callable[
++        ..., Awaitable[TestClient[web.Request, web.Application]]
++    ],
++) -> None:
++    client = await headers_echo_client(
++        headers=[("X-Real-IP", "192.168.0.1"), ("X-Sent-By", "requests")]
+     )
+ 
+     async with client.get("/", headers={"X-Sent-By": "aiohttp"}) as r:
+diff --git a/tests/test_client_request.py b/tests/test_client_request.py
+index ef444f1008f..e05b3198a79 100644
+--- a/tests/test_client_request.py
++++ b/tests/test_client_request.py
+@@ -14,7 +14,7 @@
+ from yarl import URL
+ 
+ import aiohttp
+-from aiohttp import BaseConnector, hdrs, helpers, payload
++from aiohttp import BaseConnector, hdrs, payload
+ from aiohttp.abc import AbstractStreamWriter
+ from aiohttp.base_protocol import BaseProtocol
+ from aiohttp.client_exceptions import ClientConnectionError
+@@ -1574,26 +1574,6 @@ def test_gen_default_accept_encoding(
+             assert _gen_default_accept_encoding() == expected
+ 
+ 
+-@pytest.mark.parametrize(
+-    ("netrc_contents", "expected_auth"),
+-    [
+-        (
+-            "machine example.com login username password pass\n",
+-            helpers.BasicAuth("username", "pass"),
+-        )
+-    ],
+-    indirect=("netrc_contents",),
+-)
+-@pytest.mark.usefixtures("netrc_contents")
+-def test_basicauth_from_netrc_present(  # type: ignore[misc]
+-    make_request: _RequestMaker,
+-    expected_auth: helpers.BasicAuth,
+-) -> None:
+-    """Test appropriate Authorization header is sent when netrc is not empty."""
+-    req = make_request("get", "http://example.com", trust_env=True)
+-    assert req.headers[hdrs.AUTHORIZATION] == expected_auth.encode()
+-
+-
+ @pytest.mark.parametrize(
+     "netrc_contents",
+     ("machine example.com login username password pass\n",),
+diff --git a/tests/test_client_session.py b/tests/test_client_session.py
+index 11a815a325e..84a417f9219 100644
+--- a/tests/test_client_session.py
++++ b/tests/test_client_session.py
+@@ -26,6 +26,7 @@
+ from aiohttp.cookiejar import CookieJar
+ from aiohttp.http import RawResponseMessage
+ from aiohttp.pytest_plugin import AiohttpClient, AiohttpServer
++from aiohttp.test_utils import TestServer
+ from aiohttp.tracing import Trace
+ 
+ 
+@@ -89,6 +90,21 @@ def params() -> _Params:
+     )
+ 
+ 
++@pytest.fixture
++async def auth_server(aiohttp_server: AiohttpServer) -> TestServer:
++    """Create a server with an auth handler that returns auth header or 'no_auth'."""
++
++    async def handler(request: web.Request) -> web.Response:
++        auth_header = request.headers.get(hdrs.AUTHORIZATION)
++        if auth_header:
++            return web.Response(text=f"auth:{auth_header}")
++        return web.Response(text="no_auth")
++
++    app = web.Application()
++    app.router.add_get("/", handler)
++    return await aiohttp_server(app)
++
++
+ async def test_close_coro(
+     create_session: Callable[..., Awaitable[ClientSession]],
+ ) -> None:
+@@ -1326,3 +1342,64 @@ async def test_properties(
+     value = uuid4()
+     setattr(session, inner_name, value)
+     assert value == getattr(session, outer_name)
++
++
++@pytest.mark.usefixtures("netrc_default_contents")
++async def test_netrc_auth_with_trust_env(auth_server: TestServer) -> None:
++    """Test that netrc authentication works with ClientSession when NETRC env var is set."""
++    async with (
++        ClientSession(trust_env=True) as session,
++        session.get(auth_server.make_url("/")) as resp,
++    ):
++        text = await resp.text()
++        # Base64 encoded "netrc_user:netrc_pass" is "bmV0cmNfdXNlcjpuZXRyY19wYXNz"
++        assert text == "auth:Basic bmV0cmNfdXNlcjpuZXRyY19wYXNz"
++
++
++@pytest.mark.usefixtures("netrc_default_contents")
++async def test_netrc_auth_skipped_without_trust_env(auth_server: TestServer) -> None:
++    """Test that netrc authentication is skipped when trust_env=False."""
++    async with (
++        ClientSession(trust_env=False) as session,
++        session.get(auth_server.make_url("/")) as resp,
++    ):
++        text = await resp.text()
++        assert text == "no_auth"
++
++
++@pytest.mark.usefixtures("no_netrc")
++async def test_netrc_auth_skipped_without_netrc_env(auth_server: TestServer) -> None:
++    """Test that netrc authentication is skipped when NETRC env var is not set."""
++    async with (
++        ClientSession(trust_env=True) as session,
++        session.get(auth_server.make_url("/")) as resp,
++    ):
++        text = await resp.text()
++        assert text == "no_auth"
++
++
++@pytest.mark.usefixtures("netrc_default_contents")
++async def test_netrc_auth_overridden_by_explicit_auth(auth_server: TestServer) -> None:
++    """Test that explicit auth parameter overrides netrc authentication."""
++    async with (
++        ClientSession(trust_env=True) as session,
++        session.get(
++            auth_server.make_url("/"),
++            auth=aiohttp.BasicAuth("explicit_user", "explicit_pass"),
++        ) as resp,
++    ):
++        text = await resp.text()
++        # Base64 encoded "explicit_user:explicit_pass" is "ZXhwbGljaXRfdXNlcjpleHBsaWNpdF9wYXNz"
++        assert text == "auth:Basic ZXhwbGljaXRfdXNlcjpleHBsaWNpdF9wYXNz"
++
++
++@pytest.mark.usefixtures("netrc_other_host")
++async def test_netrc_auth_host_not_in_netrc(auth_server: TestServer) -> None:
++    """Test that netrc lookup returns None when host is not in netrc file."""
++    async with (
++        ClientSession(trust_env=True) as session,
++        session.get(auth_server.make_url("/")) as resp,
++    ):
++        text = await resp.text()
++        # Should not have auth since the host is not in netrc
++        assert text == "no_auth"

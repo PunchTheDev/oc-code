@@ -1,0 +1,588 @@
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index d7f1d1dcd..38378cb5b 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -10935,7 +10935,10 @@ pub fn can_activate_ability_now(
+     // `OnlyOnceEachTurn` activation restriction tracks per `(source_id, ability_index)`,
+     // which is the wrong granularity — it would let each loyalty ability fire once.
+     // Defer to `can_activate_loyalty`, the single authority for the per-permanent gate.
+-    if matches!(ability_def.cost, Some(AbilityCost::Loyalty { .. }))
++    if ability_def
++        .cost
++        .as_ref()
++        .is_some_and(crate::types::ability::is_loyalty_ability_cost)
+         && !super::planeswalker::can_activate_loyalty_ability(
+             state,
+             source_id,
+@@ -11275,6 +11278,22 @@ pub fn handle_activate_ability(
+     // CR 118.3: Pre-check for non-self sacrifice costs — must detour to WaitingFor
+     // before any cost payment, regardless of whether targets were auto-selected.
+     if let Some(ref cost) = ability_def.cost {
++        // CR 606.3: `can_activate_ability_now` gates legal-action generation,
++        // but direct `GameAction::ActivateAbility` submissions must be rejected
++        // here before the chosen-X detour can announce/pay a `[−X]` loyalty cost.
++        if crate::types::ability::is_loyalty_ability_cost(cost)
++            && !super::planeswalker::can_activate_loyalty_ability(
++                state,
++                source_id,
++                player,
++                ability_index,
++            )
++        {
++            return Err(EngineError::ActionNotAllowed(
++                "Cannot activate loyalty ability".to_string(),
++            ));
++        }
++
+         if casting_costs::activation_cost_needs_x_choice(&resolved, cost) {
+             // CR 602.2b + CR 601.2f: A non-mana activation cost that removes
+             // X counters still needs the same X announcement step before any
+diff --git a/crates/engine/src/game/casting_costs.rs b/crates/engine/src/game/casting_costs.rs
+index 659fbd07c..0ed57ed30 100644
+--- a/crates/engine/src/game/casting_costs.rs
++++ b/crates/engine/src/game/casting_costs.rs
+@@ -1894,6 +1894,9 @@ pub(super) fn push_activated_ability_to_stack(
+     // pass the original full cost; choice-based sub-costs already paid by a
+     // WaitingFor handler are no-ops here.
+     if let Some(cost) = remaining_cost {
++        // CR 606.3 + CR 606.5: Capture the symbolic `[−X]` loyalty shape before
++        // chosen-X concretization turns it into a fixed counter-removal count.
++        let should_record_loyalty = crate::types::ability::is_loyalty_ability_cost(cost);
+         let concretized_cost;
+         let cost = if let Some(chosen_x) = resolved.chosen_x {
+             // CR 602.2b + CR 601.2f + CR 122.1: Once X is announced for an
+@@ -1919,12 +1922,30 @@ pub(super) fn push_activated_ability_to_stack(
+                 ability_index,
+             ));
+         }
++        // CR 606.3: A `[−X]` loyalty ability is modeled as a chosen-X removal of
++        // loyalty counters, so it finalizes through this X-cost path rather than
++        // `handle_activate_loyalty`. Capture whether it is a loyalty activation
++        // (before payment mutates loyalty) so the once-per-turn activation can be
++        // recorded after a successful payment — mirroring the post-target path in
++        // `pay_activation_costs_after_target_selection`.
+         super::casting::stamp_self_ref_discard_cost_paid_object(
+             state,
+             source_id,
+             &mut resolved,
+             cost,
+         );
++        if should_record_loyalty
++            && !super::planeswalker::can_activate_loyalty_ability(
++                state,
++                source_id,
++                player,
++                ability_index,
++            )
++        {
++            return Err(EngineError::ActionNotAllowed(
++                "Cannot activate loyalty ability".to_string(),
++            ));
++        }
+         if let super::casting::PaymentOutcome::Paused { remaining_cost } =
+             super::casting::pay_ability_cost_for_activation(state, player, source_id, cost, events)?
+         {
+@@ -1934,6 +1955,9 @@ pub(super) fn push_activated_ability_to_stack(
+             state.pending_cast = Some(Box::new(pending));
+             return Ok(state.waiting_for.clone());
+         }
++        if should_record_loyalty {
++            super::planeswalker::record_loyalty_activation(state, source_id, player);
++        }
+     }
+ 
+     // CR 602.2b: Check if the ability has targets that need selection.
+diff --git a/crates/engine/src/game/casting_targets.rs b/crates/engine/src/game/casting_targets.rs
+index 886d7002b..805e34161 100644
+--- a/crates/engine/src/game/casting_targets.rs
++++ b/crates/engine/src/game/casting_targets.rs
+@@ -482,7 +482,7 @@ fn pay_activation_costs_after_target_selection(
+     }
+ 
+     if let Some(ref activation_cost) = pending.activation_cost {
+-        let should_record_loyalty = matches!(activation_cost, AbilityCost::Loyalty { .. })
++        let should_record_loyalty = crate::types::ability::is_loyalty_ability_cost(activation_cost)
+             && super::planeswalker::can_activate_loyalty_ability(
+                 state,
+                 pending.object_id,
+diff --git a/crates/engine/src/game/planeswalker.rs b/crates/engine/src/game/planeswalker.rs
+index 0a1d60d81..9e854f5c3 100644
+--- a/crates/engine/src/game/planeswalker.rs
++++ b/crates/engine/src/game/planeswalker.rs
+@@ -13,7 +13,7 @@ use super::casting::emit_targeting_events;
+ use super::engine::EngineError;
+ use super::stack;
+ 
+-use crate::types::ability::{AbilityCost, ResolvedAbility};
++use crate::types::ability::ResolvedAbility;
+ 
+ /// CR 306.5d + CR 606.3: Loyalty abilities may only be activated once per turn.
+ /// CR 606.1: Loyalty abilities are activated abilities with a loyalty symbol in their cost.
+@@ -29,7 +29,10 @@ pub fn can_activate_loyalty(
+         .iter()
+         .enumerate()
+         .any(|(ability_index, ability)| {
+-            matches!(ability.cost, Some(AbilityCost::Loyalty { .. }))
++            ability
++                .cost
++                .as_ref()
++                .is_some_and(crate::types::ability::is_loyalty_ability_cost)
+                 && can_activate_loyalty_ability(state, planeswalker_id, player, ability_index)
+         })
+ }
+@@ -80,7 +83,11 @@ pub fn can_activate_loyalty_ability(
+     let Some(ability) = obj.abilities.get(ability_index) else {
+         return false;
+     };
+-    if !matches!(ability.cost, Some(AbilityCost::Loyalty { .. })) {
++    if !ability
++        .cost
++        .as_ref()
++        .is_some_and(crate::types::ability::is_loyalty_ability_cost)
++    {
+         return false;
+     }
+ 
+@@ -318,10 +325,12 @@ mod tests {
+     use super::*;
+     use crate::game::zones::create_object;
+     use crate::types::ability::{
+-        AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, Effect, EffectScope,
+-        QuantityExpr, TapStateChange, TargetFilter, TypedFilter,
++        AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, CounterCostSelection,
++        Effect, EffectScope, QuantityExpr, QuantityRef, TapStateChange, TargetFilter, TypedFilter,
++        REMOVE_COUNTER_COST_X,
+     };
+     use crate::types::card_type::CoreType;
++    use crate::types::counter::{CounterMatch, CounterType};
+     use crate::types::game_state::CastingVariant;
+     use crate::types::identifiers::CardId;
+     use crate::types::phase::Phase;
+@@ -352,6 +361,17 @@ mod tests {
+         ability
+     }
+ 
++    fn make_minus_x_loyalty_ability(effect: Effect) -> AbilityDefinition {
++        AbilityDefinition::new(AbilityKind::Activated, effect)
++            .cost(AbilityCost::RemoveCounter {
++                count: REMOVE_COUNTER_COST_X,
++                counter_type: CounterMatch::OfType(CounterType::Loyalty),
++                target: None,
++                selection: CounterCostSelection::SingleObject,
++            })
++            .sorcery_speed()
++    }
++
+     fn create_planeswalker(
+         state: &mut GameState,
+         owner: PlayerId,
+@@ -429,6 +449,148 @@ mod tests {
+         assert_eq!(state.objects[&pw].loyalty, Some(2)); // 5 - 3
+     }
+ 
++    /// CR 606.5 + CR 107.3: a `[−X]` loyalty ability (modeled as removing X
++    /// loyalty counters) activates through the generic activated-ability path,
++    /// which announces X capped at current loyalty, removes the chosen X loyalty,
++    /// records the CR 606.3 once-per-turn activation, and binds the chosen X into
++    /// the effect. Uses a non-targeted "gain X life" body so no target-selection
++    /// round-trip is needed; the X-damage cards (Chandra Nalaar, Jeska, …) share
++    /// this exact cost + X-binding path. Issues #653 / #1069 / #2851.
++    #[test]
++    fn minus_x_loyalty_removes_chosen_x_and_binds_x_into_effect() {
++        use crate::game::engine::apply_as_current;
++        use crate::types::GameAction;
++
++        let mut state = setup();
++
++        // "[−X]: You gain X life." — the loyalty-X cost is a chosen-X removal of
++        // loyalty counters (exactly what the parser builds for `[−X]:` lines).
++        let ability = make_minus_x_loyalty_ability(Effect::GainLife {
++            amount: QuantityExpr::Ref {
++                qty: QuantityRef::CostXPaid,
++            },
++            player: TargetFilter::Controller,
++        });
++
++        let pw = create_planeswalker(&mut state, PlayerId(0), "Variable Walker", 6, vec![ability]);
++        let life_before = state.players[0].life;
++
++        // Activating must prompt for X, capped at the current loyalty (6).
++        apply_as_current(
++            &mut state,
++            GameAction::ActivateAbility {
++                source_id: pw,
++                ability_index: 0,
++            },
++        )
++        .expect("activation must be accepted");
++        match &state.waiting_for {
++            WaitingFor::ChooseXValue { max, .. } => {
++                assert_eq!(*max, 6, "X must be capped at current loyalty (6)")
++            }
++            other => panic!("expected ChooseXValue, got {other:?}"),
++        }
++
++        // Choosing X = 4 pays the cost: remove 4 loyalty counters, keeping
++        // `loyalty` and the counter map in sync (CR 306.5b), and records the
++        // CR 606.3 once-per-turn loyalty activation.
++        apply_as_current(&mut state, GameAction::ChooseX { value: 4 })
++            .expect("choosing X=4 must be accepted");
++        assert_eq!(
++            state.objects[&pw].loyalty,
++            Some(2),
++            "loyalty must drop by the chosen X (6 - 4)"
++        );
++        assert_eq!(
++            state.objects[&pw]
++                .counters
++                .get(&CounterType::Loyalty)
++                .copied()
++                .unwrap_or(0),
++            2,
++            "loyalty counter map must stay in sync with the loyalty field"
++        );
++        assert!(
++            state.objects[&pw].loyalty_activations_this_turn > 0,
++            "CR 606.3: the loyalty activation must be recorded (once-per-turn gate)"
++        );
++
++        // Resolving binds the chosen X into the effect: gain X (= 4) life.
++        let mut events = Vec::new();
++        crate::game::stack::resolve_top(&mut state, &mut events);
++        assert_eq!(
++            state.players[0].life,
++            life_before + 4,
++            "the effect must gain the chosen X (4) life"
++        );
++    }
++
++    /// CR 606.3: The generic `GameAction::ActivateAbility` path must enforce
++    /// the same once-per-turn loyalty gate before a `[−X]` cost can prompt for X.
++    #[test]
++    fn minus_x_loyalty_direct_activation_rejected_after_other_loyalty_ability() {
++        use crate::game::engine::apply_as_current;
++        use crate::types::GameAction;
++
++        let mut state = setup();
++        let plus_one = make_loyalty_ability(
++            1,
++            Effect::Draw {
++                count: QuantityExpr::Fixed { value: 1 },
++                target: TargetFilter::Controller,
++            },
++        );
++        let minus_x = make_minus_x_loyalty_ability(Effect::GainLife {
++            amount: QuantityExpr::Ref {
++                qty: QuantityRef::CostXPaid,
++            },
++            player: TargetFilter::Controller,
++        });
++        let pw = create_planeswalker(
++            &mut state,
++            PlayerId(0),
++            "Variable Walker",
++            4,
++            vec![plus_one, minus_x],
++        );
++
++        apply_as_current(
++            &mut state,
++            GameAction::ActivateAbility {
++                source_id: pw,
++                ability_index: 0,
++            },
++        )
++        .expect("first loyalty activation must be accepted");
++        state.stack.clear();
++        let loyalty_after_first_activation = state.objects[&pw].loyalty;
++
++        let result = apply_as_current(
++            &mut state,
++            GameAction::ActivateAbility {
++                source_id: pw,
++                ability_index: 1,
++            },
++        );
++
++        assert!(
++            matches!(result, Err(EngineError::ActionNotAllowed(_))),
++            "second same-turn loyalty activation must be rejected, got {result:?}"
++        );
++        assert!(
++            !matches!(state.waiting_for, WaitingFor::ChooseXValue { .. }),
++            "the rejected `[−X]` activation must not prompt for X"
++        );
++        assert_eq!(
++            state.objects[&pw].loyalty, loyalty_after_first_activation,
++            "the rejected `[−X]` activation must not remove loyalty counters"
++        );
++        assert!(
++            state.stack.is_empty(),
++            "the rejected `[−X]` activation must not put an ability on the stack"
++        );
++    }
++
+     #[test]
+     fn second_activation_same_turn_rejected() {
+         let mut state = setup();
+diff --git a/crates/engine/src/parser/oracle.rs b/crates/engine/src/parser/oracle.rs
+index fee49154b..0fb785935 100644
+--- a/crates/engine/src/parser/oracle.rs
++++ b/crates/engine/src/parser/oracle.rs
+@@ -3936,14 +3936,62 @@ fn split_trailing_self_cost_reduction(
+     (line[..activation_len].trim(), Some(reduction))
+ }
+ 
+-/// Try to parse a planeswalker loyalty line: "+N:", "−N:", "0:", "[+N]:", "[−N]:", "[0]:"
++/// CR 606.5 + CR 107.3: True when a loyalty-cost inner token is the variable
++/// `−X` form (any minus glyph followed by a lone `X`), e.g. the inner of
++/// `[−X]:`. The fixed `[−N]` forms are handled by `parse_loyalty_number`.
++fn is_minus_x_loyalty(inner: &str) -> bool {
++    let trimmed = inner.trim();
++    let mut chars = trimmed.chars();
++    match chars.next() {
++        // U+2212 minus, en dash, ASCII hyphen — mirrors `parse_loyalty_number`.
++        Some('−') | Some('–') | Some('-') => {}
++        _ => return false,
++    }
++    chars.as_str().trim().eq_ignore_ascii_case("x")
++}
++
++/// CR 606.5 + CR 107.3: Build the cost for a `[−X]` loyalty ability — remove X
++/// loyalty counters, where the controller chooses X at activation. Modeled as a
++/// chosen-X `RemoveCounter` of `Loyalty` counters so it reuses the existing
++/// chosen-X announcement (`max` derives from the source's loyalty counters),
++/// concretization (`count` → chosen X), and replacement-aware payment (which
++/// keeps `obj.loyalty` in sync per CR 306.5b). The chosen X is stamped to
++/// `cost_x_paid`, so `X` references in the effect resolve to it. `is_loyalty_ability_cost`
++/// recognizes this shape so the CR 606.3 once-per-turn gate still applies.
++fn minus_x_loyalty_cost() -> AbilityCost {
++    AbilityCost::RemoveCounter {
++        count: crate::types::ability::REMOVE_COUNTER_COST_X,
++        counter_type: crate::types::counter::CounterMatch::OfType(
++            crate::types::counter::CounterType::Loyalty,
++        ),
++        target: None,
++        selection: crate::types::ability::CounterCostSelection::default(),
++    }
++}
++
++/// Try to parse a planeswalker loyalty line: "+N:", "−N:", "0:", "[+N]:", "[−N]:", "[0]:", "[−X]:"
+ fn try_parse_loyalty_line(line: &str, ctx: &mut ParseContext) -> Option<AbilityDefinition> {
+     let trimmed = line.trim();
+ 
+-    // Try bracket format first: [+2]: ..., [−1]: ..., [0]: ...
++    // Try bracket format first: [+2]: ..., [−1]: ..., [0]: ..., [−X]: ...
+     if let Some(after_open) = trimmed.strip_prefix('[') {
+         if let Some((inner, rest)) = after_open.split_once(']') {
+             if let Some(effect_text) = rest.trim().strip_prefix(':') {
++                // CR 606.5 + CR 107.3: "[−X]" variable-loyalty ability — the
++                // controller chooses X at activation (0..=current loyalty) and X
++                // feeds the effect via `cost_x_paid`. Checked before
++                // `parse_loyalty_number`, which only handles fixed amounts.
++                if is_minus_x_loyalty(inner) {
++                    let effect_text = effect_text.trim();
++                    ctx.subject = None;
++                    ctx.actor = None;
++                    let mut def =
++                        parse_effect_chain_with_context(effect_text, AbilityKind::Activated, ctx);
++                    def.cost = Some(minus_x_loyalty_cost());
++                    def.description = Some(trimmed.to_string());
++                    apply_loyalty_restrictions(&mut def);
++                    return Some(def);
++                }
+                 if let Some(amount) = parse_loyalty_number(inner) {
+                     let effect_text = effect_text.trim();
+                     ctx.subject = None;
+@@ -3959,8 +4007,21 @@ fn try_parse_loyalty_line(line: &str, ctx: &mut ParseContext) -> Option<AbilityD
+         }
+     }
+ 
+-    // Try bare format: +2: ..., −1: ..., 0: ...
++    // Try bare format: +2: ..., −1: ..., 0: ..., −X: ...
+     if let Some((prefix, effect_text)) = trimmed.split_once(':') {
++        // CR 606.5 + CR 107.3: bare "−X:" variable-loyalty ability (mirrors the
++        // bracket branch). `parse_loyalty_number` rejects "X", so this must be
++        // checked first.
++        if is_minus_x_loyalty(prefix) {
++            let effect_text = effect_text.trim();
++            ctx.subject = None;
++            ctx.actor = None;
++            let mut def = parse_effect_chain_with_context(effect_text, AbilityKind::Activated, ctx);
++            def.cost = Some(minus_x_loyalty_cost());
++            def.description = Some(trimmed.to_string());
++            apply_loyalty_restrictions(&mut def);
++            return Some(def);
++        }
+         if let Some(amount) = parse_loyalty_number(prefix) {
+             // Verify it looks like a loyalty prefix (starts with +, −, –, -, or is "0")
+             let first_char = prefix.trim().chars().next()?;
+@@ -8614,6 +8675,84 @@ mod tests {
+         assert_eq!(*destination, Zone::Battlefield);
+     }
+ 
++    /// CR 606.5 + CR 107.3: a `[−X]` loyalty ability parses to a chosen-X
++    /// `RemoveCounter` of `Loyalty` counters (so it reuses the existing X
++    /// announcement/payment machinery), carries the sorcery-speed restriction,
++    /// is recognized as a loyalty cost, and binds the chosen X into the effect
++    /// (Chandra Nalaar deals X damage to a target creature). Issues #653 / #1069
++    /// / #2851.
++    #[test]
++    fn minus_x_loyalty_ability_parses_to_chosen_x_loyalty_counter_removal() {
++        use crate::types::ability::{is_loyalty_ability_cost, QuantityRef, REMOVE_COUNTER_COST_X};
++        use crate::types::counter::{CounterMatch, CounterType};
++
++        let r = parse(
++            "[\u{2212}X]: Chandra Nalaar deals X damage to target creature.",
++            "Chandra Nalaar",
++            &[],
++            &["Planeswalker"],
++            &["Chandra Nalaar", "Chandra"],
++        );
++        assert_eq!(r.abilities.len(), 1, "abilities: {:?}", r.abilities);
++        let ability = &r.abilities[0];
++        assert_eq!(ability.kind, AbilityKind::Activated);
++
++        // The cost is "remove X loyalty counters" with the chosen-X sentinel.
++        let cost = ability.cost.as_ref().expect("[\u{2212}X] must have a cost");
++        match cost {
++            AbilityCost::RemoveCounter {
++                count,
++                counter_type,
++                target,
++                ..
++            } => {
++                assert_eq!(
++                    *count, REMOVE_COUNTER_COST_X,
++                    "count must be the chosen-X sentinel"
++                );
++                assert_eq!(
++                    *counter_type,
++                    CounterMatch::OfType(CounterType::Loyalty),
++                    "must remove loyalty counters"
++                );
++                assert_eq!(
++                    *target, None,
++                    "cost removes counters from the source planeswalker"
++                );
++            }
++            other => panic!("expected RemoveCounter loyalty cost, got {other:?}"),
++        }
++        assert!(
++            is_loyalty_ability_cost(cost),
++            "the [\u{2212}X] cost must be recognized as a loyalty ability cost (CR 606.3 gate)"
++        );
++
++        // CR 606.3: sorcery-speed timing restriction applied like fixed loyalty.
++        assert!(
++            ability
++                .activation_restrictions
++                .contains(&ActivationRestriction::AsSorcery),
++            "loyalty abilities activate at sorcery speed: {:?}",
++            ability.activation_restrictions
++        );
++
++        // The chosen X binds into the damage amount: "X damage" parses to the
++        // `Variable("X")` quantity ref, which resolves to the resolving ability's
++        // `chosen_x` (falling back to the source's `cost_x_paid`) at resolution.
++        let Effect::DealDamage { amount, .. } = &*ability.effect else {
++            panic!("effect must be DealDamage, got {:?}", ability.effect);
++        };
++        assert!(
++            matches!(
++                amount,
++                QuantityExpr::Ref {
++                    qty: QuantityRef::Variable { name }
++                } if name == "X"
++            ),
++            "X damage must resolve from the chosen X (Variable \"X\"), got {amount:?}"
++        );
++    }
++
+     #[test]
+     fn forest_reminder_text_only() {
+         let r = parse("({T}: Add {G}.)", "Forest", &[], &["Land"], &["Forest"]);
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 47d9aa786..02bdc6573 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -5135,6 +5135,33 @@ pub fn is_chosen_remove_counter_cost_count(count: u32) -> bool {
+     )
+ }
+ 
++/// CR 606.5: Is this activation cost a planeswalker loyalty-ability cost?
++///
++/// Two shapes qualify: the fixed `[+N]` / `[−N]` / `[0]` form (`Loyalty`), and
++/// the variable `[−X]` form, which is modeled as *removing X loyalty counters*
++/// from the source. Modeling `[−X]` as a counter-removal cost reuses the
++/// existing chosen-X announcement, concretization, and replacement-aware payment
++/// machinery; this predicate lets the CR 606.3 once-per-turn gate and
++/// loyalty-activation tracking treat both shapes as loyalty abilities without
++/// folding arbitrary loyalty-counter removal costs into the CR 606 rules.
++pub fn is_loyalty_ability_cost(cost: &AbilityCost) -> bool {
++    match cost {
++        AbilityCost::Loyalty { .. } => true,
++        AbilityCost::RemoveCounter {
++            count,
++            counter_type,
++            target,
++            selection,
++        } => {
++            *count == REMOVE_COUNTER_COST_X
++                && matches!(counter_type, CounterMatch::OfType(CounterType::Loyalty))
++                && target.is_none()
++                && matches!(selection, CounterCostSelection::SingleObject)
++        }
++        _ => false,
++    }
++}
++
+ pub fn is_variable_remove_counter_cost_count(count: u32) -> bool {
+     matches!(
+         count,
+@@ -14496,6 +14523,45 @@ mod tests {
+         assert!(benign_json.get("consumes_source").is_none());
+     }
+ 
++    #[test]
++    fn loyalty_cost_classifier_accepts_only_loyalty_symbol_shapes() {
++        assert!(is_loyalty_ability_cost(&AbilityCost::Loyalty {
++            amount: -2,
++        }));
++
++        let minus_x_loyalty = AbilityCost::RemoveCounter {
++            count: REMOVE_COUNTER_COST_X,
++            counter_type: CounterMatch::OfType(CounterType::Loyalty),
++            target: None,
++            selection: CounterCostSelection::SingleObject,
++        };
++        assert!(is_loyalty_ability_cost(&minus_x_loyalty));
++
++        let fixed_counter_removal = AbilityCost::RemoveCounter {
++            count: 1,
++            counter_type: CounterMatch::OfType(CounterType::Loyalty),
++            target: None,
++            selection: CounterCostSelection::SingleObject,
++        };
++        assert!(!is_loyalty_ability_cost(&fixed_counter_removal));
++
++        let targeted_counter_removal = AbilityCost::RemoveCounter {
++            count: REMOVE_COUNTER_COST_X,
++            counter_type: CounterMatch::OfType(CounterType::Loyalty),
++            target: Some(TargetFilter::Any),
++            selection: CounterCostSelection::SingleObject,
++        };
++        assert!(!is_loyalty_ability_cost(&targeted_counter_removal));
++
++        let multi_object_counter_removal = AbilityCost::RemoveCounter {
++            count: REMOVE_COUNTER_COST_X,
++            counter_type: CounterMatch::OfType(CounterType::Loyalty),
++            target: None,
++            selection: CounterCostSelection::AmongObjects,
++        };
++        assert!(!is_loyalty_ability_cost(&multi_object_counter_removal));
++    }
++
+     /// #1446: `Effect::count_expr`/`count_expr_mut` are the building block the
+     /// vote-tally assembly layer uses to bind a typed `QuantityRef::VoteCount`
+     /// into a per-choice effect's magnitude slot. Exercise the accessor directly

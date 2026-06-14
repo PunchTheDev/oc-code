@@ -1,0 +1,284 @@
+diff --git a/rag/graphrag/search.py b/rag/graphrag/search.py
+index 0c8a37a565a..0cbb884f251 100644
+--- a/rag/graphrag/search.py
++++ b/rag/graphrag/search.py
+@@ -78,10 +78,18 @@ def _ent_info_from_(self, es_res, sim_thr=0.3):
+                 continue
+             if isinstance(ent["entity_kwd"], list):
+                 ent["entity_kwd"] = ent["entity_kwd"][0]
++            # n_hop_with_weight may be absent (older chunks) or an empty string
++            # (the Infinity column default), neither of which json.loads handles.
++            n_hop_raw = ent.get("n_hop_with_weight") or "[]"
++            try:
++                n_hop_ents = json.loads(n_hop_raw)
++            except (json.JSONDecodeError, TypeError):
++                logging.warning(f"Failed to parse n_hop_with_weight for entity {ent.get('entity_kwd')}: {n_hop_raw}")
++                n_hop_ents = []
+             res[ent["entity_kwd"]] = {
+                 "sim": get_float(ent.get("_score", 0)),
+                 "pagerank": get_float(ent.get("rank_flt", 0)),
+-                "n_hop_ents": json.loads(ent.get("n_hop_with_weight", "[]")),
++                "n_hop_ents": n_hop_ents,
+                 "description": ent.get("content_with_weight", "{}")
+             }
+         return res
+@@ -111,7 +119,7 @@ def get_relevant_ents_by_keywords(self, keywords, filters, idxnms, kb_ids, emb_m
+         filters = deepcopy(filters)
+         filters["knowledge_graph_kwd"] = "entity"
+         matchDense = self.get_vector(", ".join(keywords), emb_mdl, 1024, sim_thr)
+-        es_res = self.dataStore.search(["content_with_weight", "entity_kwd", "rank_flt"], [], filters, [matchDense],
++        es_res = self.dataStore.search(["content_with_weight", "entity_kwd", "rank_flt", "n_hop_with_weight"], [], filters, [matchDense],
+                                        OrderByExpr(), 0, N,
+                                        idxnms, kb_ids)
+         return self._ent_info_from_(es_res, sim_thr)
+diff --git a/rag/graphrag/utils.py b/rag/graphrag/utils.py
+index c92fe0c6feb..038646199c4 100644
+--- a/rag/graphrag/utils.py
++++ b/rag/graphrag/utils.py
+@@ -18,6 +18,7 @@
+ import re
+ import time
+ from collections import defaultdict
++from copy import deepcopy
+ from hashlib import md5
+ from typing import Any, Callable, Set, Tuple
+ 
+@@ -370,7 +371,7 @@ def chunk_id(chunk):
+     return xxhash.xxh64((chunk["content_with_weight"] + chunk["kb_id"]).encode("utf-8")).hexdigest()
+ 
+ 
+-async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks):
++async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks, nhop_neighbors=None):
+     global chat_limiter
+     enable_timeout_assertion = os.environ.get("ENABLE_TIMEOUT_ASSERTION")
+     chunk = {
+@@ -383,6 +384,11 @@ async def graph_node_to_chunk(kb_id, embd_mdl, ent_name, meta, chunks):
+         "content_with_weight": json.dumps(meta, ensure_ascii=False),
+         "content_ltks": rag_tokenizer.tokenize(meta["description"]),
+         "source_id": meta["source_id"],
++        # pagerank drives the P(E|Q) = pagerank * sim ranking in KGSearch; the
++        # n-hop neighbour paths feed its relation-enrichment step.  Both are read
++        # back as `rank_flt` / `n_hop_with_weight` in rag/graphrag/search.py.
++        "rank_flt": float(meta.get("pagerank", 0) or 0),
++        "n_hop_with_weight": json.dumps(nhop_neighbors or [], ensure_ascii=False),
+         "kb_id": kb_id,
+         "available_int": 0,
+     }
+@@ -549,8 +555,9 @@ async def set_graph(tenant_id: str, kb_id: str, embd_mdl, graph: nx.Graph, chang
+     tasks = []
+     for ii, node in enumerate(change.added_updated_nodes):
+         node_attrs = graph.nodes[node]
++        nhop_neighbors = n_neighbor(graph, node)
+         tasks.append(asyncio.create_task(
+-            graph_node_to_chunk(kb_id, embd_mdl, node, node_attrs, chunks)
++            graph_node_to_chunk(kb_id, embd_mdl, node, node_attrs, chunks, nhop_neighbors)
+         ))
+         if ii % 100 == 9 and callback:
+             callback(msg=f"Get embedding of nodes: {ii}/{len(change.added_updated_nodes)}")
+@@ -697,6 +704,41 @@ def merge_tuples(list1, list2):
+     return result
+ 
+ 
++def n_neighbor(graph: nx.Graph, node, n_hop: int = 2):
++    """Enumerate paths of up to ``n_hop`` edges starting at ``node`` together
++    with the edge weight along each step.
++
++    Returns a list of ``{"path": (n0, n1, ...), "weights": [w0, w1, ...]}``
++    dicts (``len(weights) == len(path) - 1``).  This is the structure consumed
++    by :class:`rag.graphrag.search.KGSearch` for n-hop relation enrichment and
++    is stored per entity chunk as ``n_hop_with_weight``.
++    """
++    source_edge = list(graph.edges(node))
++    if not source_edge:
++        return []
++    count = 1
++    while count < n_hop:
++        count += 1
++        sc_edge = deepcopy(source_edge)
++        source_edge = []
++        for pair in sc_edge:
++            append_edge = list(graph.edges(pair[-1]))
++            for tuples in merge_tuples([pair], append_edge):
++                source_edge.append(tuples)
++    wts = nx.get_edge_attributes(graph, "weight")
++    nbrs = []
++    for path in source_edge:
++        nbr = {"path": path, "weights": []}
++        for i in range(len(path) - 1):
++            f, t = path[i], path[i + 1]
++            w = wts.get((f, t))
++            if w is None:
++                w = wts.get((t, f), 0)
++            nbr["weights"].append(w)
++        nbrs.append(nbr)
++    return nbrs
++
++
+ async def get_entity_type2samples(idxnms, kb_ids: list):
+     es_res = await settings.retriever.search({"knowledge_graph_kwd": "ty2ents", "kb_id": kb_ids, "size": 10000, "fields": ["content_with_weight"]},idxnms,kb_ids)
+ 
+diff --git a/rag/utils/ob_conn.py b/rag/utils/ob_conn.py
+index fde2138f0e5..a51c923b641 100644
+--- a/rag/utils/ob_conn.py
++++ b/rag/utils/ob_conn.py
+@@ -48,6 +48,8 @@
+ column_chunk_data = Column("chunk_data", JSON, nullable=True, comment="table parser row data")
+ column_raptor_kwd = Column("raptor_kwd", String(256), nullable=True, comment="RAPTOR summary marker")
+ column_raptor_layer_int = Column("raptor_layer_int", Integer, nullable=True, comment="RAPTOR summary layer")
++column_n_hop_with_weight = Column("n_hop_with_weight", LONGTEXT, nullable=True,
++                                  comment="JSON-encoded n-hop neighbour paths and weights for a graph entity")
+ 
+ column_definitions: list[Column] = [
+     Column("id", String(256), primary_key=True, comment="chunk id"),
+@@ -86,6 +88,7 @@
+     Column("weight_flt", Double, nullable=True, comment="the weight of community report"),
+     Column("entities_kwd", ARRAY(String(256)), nullable=True, comment="node ids of entities"),
+     Column("rank_flt", Double, nullable=True, comment="rank of this entity"),
++    column_n_hop_with_weight,
+     Column("removed_kwd", String(256), nullable=True, index=True, server_default="'N'",
+            comment="whether it has been deleted"),
+     column_raptor_kwd,
+@@ -138,6 +141,7 @@
+     column_chunk_data,
+     column_raptor_kwd,
+     column_raptor_layer_int,
++    column_n_hop_with_weight,
+ ]
+ 
+ 
+diff --git a/test/unit_test/rag/graphrag/test_graphrag_utils.py b/test/unit_test/rag/graphrag/test_graphrag_utils.py
+index 8a15d30d255..06ee172b895 100644
+--- a/test/unit_test/rag/graphrag/test_graphrag_utils.py
++++ b/test/unit_test/rag/graphrag/test_graphrag_utils.py
+@@ -14,9 +14,14 @@
+ #  limitations under the License.
+ #
+ 
++import json
++from types import SimpleNamespace
++
+ import networkx as nx
++import numpy as np
+ import pytest
+ 
++import rag.graphrag.utils as graphrag_utils
+ from rag.graphrag.utils import (
+     GRAPH_FIELD_SEP,
+     GraphChange,
+@@ -31,6 +36,7 @@
+     is_continuous_subsequence,
+     is_float_regex,
+     merge_tuples,
++    n_neighbor,
+     pack_user_ass_to_openai_messages,
+     perform_variable_replacements,
+     split_string_by_multi_markers,
+@@ -510,6 +516,108 @@ def test_empty_lists(self):
+         assert merge_tuples([], []) == []
+ 
+ 
++@pytest.mark.p1
++class TestNNeighbor:
++    """Tests for n_neighbor function (n-hop neighbour path enumeration).
++
++    Regression coverage for the GraphRAG entity-ranking pipeline: the result
++    is serialized into each entity chunk as ``n_hop_with_weight`` and consumed
++    by KGSearch for n-hop relation enrichment.
++    """
++
++    def _line_graph(self):
++        # A -1- B -2- C -3- D
++        g = nx.Graph()
++        g.add_edge("A", "B", weight=1)
++        g.add_edge("B", "C", weight=2)
++        g.add_edge("C", "D", weight=3)
++        return g
++
++    def test_isolated_node_returns_empty(self):
++        g = nx.Graph()
++        g.add_node("A")
++        assert n_neighbor(g, "A") == []
++
++    def test_result_shape(self):
++        nbrs = n_neighbor(self._line_graph(), "A")
++        assert isinstance(nbrs, list)
++        for nbr in nbrs:
++            assert set(nbr.keys()) == {"path", "weights"}
++            assert len(nbr["weights"]) == len(nbr["path"]) - 1
++
++    def test_two_hop_paths_and_weights(self):
++        # From A, 2-hop reaches the path A -> B -> C with weights [1, 2].
++        nbrs = n_neighbor(self._line_graph(), "A", n_hop=2)
++        paths = {tuple(n["path"]): n["weights"] for n in nbrs}
++        assert ("A", "B", "C") in paths
++        assert paths[("A", "B", "C")] == [1, 2]
++
++    def test_one_hop_only(self):
++        nbrs = n_neighbor(self._line_graph(), "A", n_hop=1)
++        paths = {tuple(n["path"]) for n in nbrs}
++        assert paths == {("A", "B")}
++
++    def test_missing_weight_defaults_to_zero(self):
++        g = nx.Graph()
++        g.add_edge("A", "B")  # no weight attribute
++        nbrs = n_neighbor(g, "A", n_hop=1)
++        assert nbrs[0]["weights"] == [0]
++
++    def test_weight_lookup_is_direction_agnostic(self):
++        # Undirected graph: edge attributes may be keyed either way; the
++        # weight must still be recovered regardless of traversal direction.
++        nbrs = n_neighbor(self._line_graph(), "D", n_hop=1)
++        assert nbrs[0]["path"][0] == "D"
++        assert nbrs[0]["weights"] == [3]
++
++
++@pytest.mark.p1
++class TestGraphNodeToChunk:
++    """Tests for graph_node_to_chunk field population.
++
++    Regression coverage for the dropped ranking fields: the entity chunk must
++    carry ``rank_flt`` (pagerank) and ``n_hop_with_weight`` so KGSearch's
++    ``pagerank * sim`` ranking and n-hop enrichment are not permanently dead.
++    """
++
++    @pytest.fixture
++    def fake_embd(self, monkeypatch):
++        # Skip the real encode/Redis path by returning a cached embedding.
++        monkeypatch.setattr(graphrag_utils, "get_embed_cache", lambda *_a, **_k: np.array([0.1, 0.2, 0.3]))
++        return graphrag_utils
++
++    @pytest.mark.asyncio
++    async def test_writes_rank_flt_from_pagerank(self, fake_embd):
++        chunks = []
++        meta = {"entity_type": "PERSON", "description": "desc", "source_id": ["s1"], "pagerank": 0.42}
++        await fake_embd.graph_node_to_chunk("kb1", SimpleNamespace(llm_name="m"), "ALICE", meta, chunks)
++        assert len(chunks) == 1
++        assert chunks[0]["rank_flt"] == pytest.approx(0.42)
++
++    @pytest.mark.asyncio
++    async def test_rank_flt_defaults_to_zero_without_pagerank(self, fake_embd):
++        chunks = []
++        meta = {"entity_type": "PERSON", "description": "desc", "source_id": ["s1"]}
++        await fake_embd.graph_node_to_chunk("kb1", SimpleNamespace(llm_name="m"), "ALICE", meta, chunks)
++        assert chunks[0]["rank_flt"] == 0.0
++
++    @pytest.mark.asyncio
++    async def test_writes_n_hop_with_weight(self, fake_embd):
++        chunks = []
++        meta = {"entity_type": "PERSON", "description": "desc", "source_id": ["s1"], "pagerank": 0.1}
++        nhop = [{"path": ("ALICE", "BOB"), "weights": [3]}]
++        await fake_embd.graph_node_to_chunk("kb1", SimpleNamespace(llm_name="m"), "ALICE", meta, chunks, nhop)
++        stored = json.loads(chunks[0]["n_hop_with_weight"])
++        assert stored == [{"path": ["ALICE", "BOB"], "weights": [3]}]
++
++    @pytest.mark.asyncio
++    async def test_n_hop_defaults_to_empty_list(self, fake_embd):
++        chunks = []
++        meta = {"entity_type": "PERSON", "description": "desc", "source_id": ["s1"]}
++        await fake_embd.graph_node_to_chunk("kb1", SimpleNamespace(llm_name="m"), "ALICE", meta, chunks)
++        assert json.loads(chunks[0]["n_hop_with_weight"]) == []
++
++
+ class TestFlatUniqList:
+     """Tests for flat_uniq_list function."""
+ 

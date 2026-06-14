@@ -1,0 +1,1027 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index fc778df..6c94213 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,16 @@ All notable changes to vouch are documented here. Format follows
+ ## [Unreleased]
+ 
+ ### Added
++- `vouch sync --vault <dir>` — bidirectional sync between the KB and an
++  Obsidian/Logseq-style markdown vault. Forward (vault → KB): edits to
++  `<vault>/vouch/pages/<id>.md` become page-edit proposals citing a
++  `vault:<relpath>` source. Backward (KB → vault): approved pages mirror
++  to `<vault>/vouch/pages/` and approved claims surface as markdown stubs
++  in `<vault>/vouch/claims/` with Obsidian wikilink backlinks to citing
++  pages. `--watch` keeps a polling loop alive; `--direction` lets you
++  run forward-only or backward-only. The starter KB now seeds an
++  approved "Edit in Obsidian" walkthrough page so new users discover the
++  workflow the moment they `vouch init` (#181).
+ - `vouch install-mcp <host>` — one-command adapter writer that drops the
+   right MCP config templates into a project tree, idempotently. Eight hosts
+   ship in the catalogue: `claude-code`, `claude-desktop`, `cursor`,
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index e446d4c..87c0af5 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -28,6 +28,7 @@
+ from . import pr_cache as prc_mod
+ from . import sessions as sess_mod
+ from . import sync as sync_mod
++from . import vault_sync as vault_sync_mod
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+ from .context import build_context_pack
+@@ -1564,5 +1565,80 @@ def install_mcp(host: str | None, list_hosts: bool, path: str,
+     )
+ 
+ 
++# --- sync: bidirectional vouch <-> Obsidian-style vault -------------------
++
++
++@cli.command(name="sync")
++@click.option("--vault", "vault_dir", required=True,
++              type=click.Path(file_okay=False),
++              help="Path to an Obsidian-style markdown vault. "
++                   "Mirroring happens under <vault>/vouch/.")
++@click.option("--direction", default="both", show_default=True,
++              type=click.Choice(["both", "forward", "backward"]),
++              help="forward = vault→KB (file page-edit proposals), "
++                   "backward = KB→vault (mirror approved pages + claim stubs).")
++@click.option("--actor", default="vault-sync", show_default=True,
++              help="Proposer name recorded on every page-edit proposal.")
++@click.option("--watch", is_flag=True,
++              help="Stay alive and re-sync the vault every --poll seconds.")
++@click.option("--poll", default=2.0, show_default=True, type=float,
++              help="Polling interval (seconds) when --watch is set.")
++def sync_cmd(vault_dir: str, direction: str, actor: str,
++             watch: bool, poll: float) -> None:
++    """Sync the KB with an Obsidian-compatible markdown vault (VEP-style #181).
++
++    \b
++    Forward (vault→KB):
++        Edits to <vault>/vouch/pages/<id>.md become page-edit proposals
++        in .vouch/proposed/, citing a vault:<relpath> source so the review
++        gate can see exactly which bytes triggered the proposal.
++
++    \b
++    Backward (KB→vault):
++        Approved pages mirror into <vault>/vouch/pages/. Approved claims
++        get a markdown stub under <vault>/vouch/claims/ with Obsidian
++        wikilink backlinks to citing pages so the graph view connects them.
++
++    \b
++    Re-runs are idempotent — only real edits become proposals, the rest is
++    a no-op. Add --watch to keep a polling loop alive while you edit.
++    """
++    store = _load_store()
++    vault_path = Path(vault_dir).resolve()
++    try:
++        if watch:
++            click.echo(
++                f"Watching {vault_path} every {poll}s "
++                f"(direction={direction}, actor={actor}); Ctrl-C to stop."
++            )
++            ticks = vault_sync_mod.watch_vault(
++                store, vault_path,
++                direction=direction, actor=actor, poll_interval=poll,
++            )
++            click.echo(f"Stopped after {ticks} tick(s).")
++            return
++        result = vault_sync_mod.sync_vault(
++            store, vault_path, direction=direction, actor=actor,
++        )
++    except vault_sync_mod.VaultSyncError as e:
++        raise click.ClickException(str(e)) from e
++
++    for pid in result.pages_mirrored:
++        click.echo(f"  ↓ pages/{pid}.md  (mirrored)")
++    for cid in result.claims_mirrored:
++        click.echo(f"  ↓ claims/{cid}.md  (mirrored)")
++    for pid in result.pages_proposed:
++        click.echo(f"  ↑ pages/{pid}  (proposal filed)")
++    for rel in result.pages_skipped_unchanged:
++        click.echo(f"  · {rel}  (unchanged)")
++    for rel in result.pages_skipped_unknown_id:
++        click.echo(f"  ! {rel}  (skipped — could not parse page id)")
++    click.echo(
++        f"Done — {len(result.pages_mirrored)} pages and "
++        f"{len(result.claims_mirrored)} claims mirrored, "
++        f"{len(result.pages_proposed)} proposals filed."
++    )
++
++
+ if __name__ == "__main__":
+     cli()
+diff --git a/src/vouch/onboarding.py b/src/vouch/onboarding.py
+index 64df0e6..d810a20 100644
+--- a/src/vouch/onboarding.py
++++ b/src/vouch/onboarding.py
+@@ -5,7 +5,17 @@
+ from collections.abc import Callable
+ from dataclasses import dataclass
+ 
+-from .models import Claim, ClaimStatus, ClaimType, Entity, EntityType, Source
++from .models import (
++    Claim,
++    ClaimStatus,
++    ClaimType,
++    Entity,
++    EntityType,
++    Page,
++    PageStatus,
++    PageType,
++    Source,
++)
+ from .storage import ArtifactNotFoundError, KBStore, sha256_hex
+ 
+ STARTER_SOURCE_TEXT = """# Vouch starter source
+@@ -23,17 +33,43 @@
+     "sessions can retrieve agreed project context."
+ )
+ 
++# The "Edit in Obsidian" walkthrough required by #181's acceptance: a one-
++# page primer that explains the bidirectional sync from the KB's side, so
++# new users discover the workflow the moment they `vouch init`.
++STARTER_PAGE_ID = "edit-in-obsidian"
++STARTER_PAGE_BODY = """# Edit in Obsidian
++
++Vouch's pages are plain markdown with YAML frontmatter -- your knowledge
++base is already an Obsidian-compatible vault. To edit pages in your own
++Obsidian vault:
++
++1. Run `vouch sync --vault ~/Obsidian/YourVault` once to mirror approved
++   pages and claims under `<vault>/vouch/`.
++2. Open `<vault>/vouch/pages/<id>.md` in Obsidian and edit it.
++3. Re-run `vouch sync --vault ~/Obsidian/YourVault` to file your edits as
++   page-edit proposals in `.vouch/proposed/`.
++4. Review and approve with `vouch approve <id>`. The next sync mirrors the
++   approved version back into the vault.
++
++Claims appear as stub markdown files under `<vault>/vouch/claims/`; pages
++that cite them are linked via Obsidian `[[wikilink]]` syntax so the graph
++view connects them. Use `--watch` to keep a polling loop alive while you
++edit.
++"""
++
+ 
+ @dataclass(frozen=True)
+ class StarterSeedResult:
+     source_id: str
+     claim_id: str
++    page_id: str
+     created_source: bool
+     created_claim: bool
++    created_page: bool
+ 
+     @property
+     def created_anything(self) -> bool:
+-        return self.created_source or self.created_claim
++        return self.created_source or self.created_claim or self.created_page
+ 
+ 
+ def seed_starter_kb(
+@@ -41,11 +77,14 @@ def seed_starter_kb(
+ ) -> StarterSeedResult:
+     source, created_source = _starter_source(store)
+     created_claim = _starter_claim(store, source_id=source.id, approved_by=approved_by)
++    created_page = _starter_page(store, source_id=source.id)
+     return StarterSeedResult(
+         source_id=source.id,
+         claim_id=STARTER_CLAIM_ID,
++        page_id=STARTER_PAGE_ID,
+         created_source=created_source,
+         created_claim=created_claim,
++        created_page=created_page,
+     )
+ 
+ 
+@@ -83,6 +122,31 @@ def _starter_claim(store: KBStore, *, source_id: str, approved_by: str) -> bool:
+         return True
+ 
+ 
++def _starter_page(store: KBStore, *, source_id: str) -> bool:
++    """Approved walkthrough page for the Obsidian sync flow.
++
++    Seeded as ``status: active`` so `vouch sync --vault` mirrors it
++    immediately on first run, and new users see the workflow inside
++    Obsidian without having to read external docs first.
++    """
++    try:
++        store.get_page(STARTER_PAGE_ID)
++        return False
++    except ArtifactNotFoundError:
++        page = Page(
++            id=STARTER_PAGE_ID,
++            title="Edit in Obsidian",
++            body=STARTER_PAGE_BODY,
++            type=PageType.WORKFLOW,
++            status=PageStatus.ACTIVE,
++            claims=[STARTER_CLAIM_ID],
++            sources=[source_id],
++            tags=["vouch", "onboarding", "obsidian"],
++        )
++        store.put_page(page)
++        return True
++
++
+ # --- template registry ----------------------------------------------------
+ 
+ DEFAULT_TEMPLATE = "starter"
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index 2e21333..4519e77 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -424,7 +424,11 @@ def put_page(self, page: Page) -> Page:
+             if not (self._source_dir(sid) / "meta.yaml").exists():
+                 raise ValueError(f"page {page.id} references unknown source {sid}")
+         try:
+-            with self._page_path(page.id).open("x") as f:
++            # Explicit UTF-8: page bodies are user / agent prose and routinely
++            # contain non-ASCII (em-dashes, smart quotes, unicode in claims).
++            # The default text-mode encoding follows the locale (Latin-1 on a
++            # bare Linux container), which would mangle anything past 0x7F.
++            with self._page_path(page.id).open("x", encoding="utf-8") as f:
+                 f.write(_serialize_page(page))
+         except FileExistsError as e:
+             raise ValueError(
+@@ -437,13 +441,16 @@ def get_page(self, page_id: str) -> Page:
+         p = self._page_path(page_id)
+         if not p.exists():
+             raise ArtifactNotFoundError(f"page {page_id}")
+-        return _deserialize_page(p.read_text())
++        return _deserialize_page(p.read_text(encoding="utf-8"))
+ 
+     def list_pages(self) -> list[Page]:
+         pdir = self.kb_dir / "pages"
+         if not pdir.is_dir():
+             return []
+-        return [_deserialize_page(p.read_text()) for p in sorted(pdir.glob("*.md"))]
++        return [
++            _deserialize_page(p.read_text(encoding="utf-8"))
++            for p in sorted(pdir.glob("*.md"))
++        ]
+ 
+     # --- entities ----------------------------------------------------------
+ 
+diff --git a/src/vouch/vault_sync.py b/src/vouch/vault_sync.py
+new file mode 100644
+index 0000000..07293e4
+--- /dev/null
++++ b/src/vouch/vault_sync.py
+@@ -0,0 +1,436 @@
++"""Bidirectional sync between vouch's KB and an Obsidian-style vault (#181).
++
++Why this exists: ``.vouch/pages/*.md`` is already plain markdown with YAML
++frontmatter -- it *is* an Obsidian/Logseq-compatible vault. Today the loop
++is one-way: agents propose, humans approve. This module closes the loop so
++a human can edit a page in Obsidian and have those edits come back through
++the review gate as a normal page-edit proposal.
++
++The vault has a single managed subdirectory:
++
++* ``<vault>/vouch/pages/<id>.md``   - mirrored copies of approved pages
++* ``<vault>/vouch/claims/<id>.md``  - stub markdown for each approved claim,
++                                      with backlinks to citing pages
++* ``<vault>/vouch/.sync-state.json`` - per-mirrored-file content hash so the
++                                      next forward sync can tell whether the
++                                      user has edited anything
++
++Forward sync (vault -> KB) walks ``<vault>/vouch/pages/``, detects edits by
++comparing the on-disk hash against the state file, and for each detected
++edit:
++
++1. Registers a vault-origin source via ``store.put_source(...)`` with
++   ``locator="vault:<relpath>"``; the bytes are exactly what the user has on
++   disk so a reviewer can audit the precise edit.
++2. Files a ``page-edit`` proposal via ``proposals.propose_page(...)`` with
++   ``proposed_by`` set to the configured actor (default ``vault-sync``).
++
++Backward sync (KB -> vault) lists approved pages and approved claims, writes
++the page mirrors verbatim, and renders a small markdown stub per claim with
++Obsidian ``[[wikilinks]]`` to citing pages and source ids. After both
++directions, the state file is rewritten to the new content hashes so the
++next forward pass only flags real user edits.
++
++The watch loop is intentionally a stdlib polling loop (no ``watchdog`` dep):
++~2 s intervals are fine for an interactive Obsidian edit-then-review flow,
++and zero new runtime deps matches vouch's small-surface convention.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import logging
++import re
++import time
++from collections.abc import Iterable
++from dataclasses import dataclass, field
++from pathlib import Path
++
++from .models import (
++    ClaimStatus,
++    PageStatus,
++)
++from .proposals import propose_page
++from .storage import (
++    ArtifactNotFoundError,
++    KBStore,
++    _deserialize_page,
++    _serialize_page,
++)
++
++log = logging.getLogger(__name__)
++
++# The "house" subdirectory inside the user's vault. Everything we read or
++# write lives under here -- the user's own notes are untouchable.
++VAULT_DIR = "vouch"
++STATE_FILENAME = ".sync-state.json"
++
++_VALID_DIRECTIONS: frozenset[str] = frozenset({"forward", "backward", "both"})
++
++
++class VaultSyncError(RuntimeError):
++    """Raised on misconfiguration (bad vault dir, unknown direction)."""
++
++
++@dataclass
++class VaultSyncResult:
++    """Outcome of one ``sync_vault`` call, partitioned by what happened.
++
++    All page ids are reported relative -- the caller can format them however.
++    """
++    pages_mirrored: list[str] = field(default_factory=list)
++    claims_mirrored: list[str] = field(default_factory=list)
++    pages_proposed: list[str] = field(default_factory=list)
++    pages_skipped_unchanged: list[str] = field(default_factory=list)
++    pages_skipped_unknown_id: list[str] = field(default_factory=list)
++
++
++# --- state file -----------------------------------------------------------
++
++
++def _state_path(vault_dir: Path) -> Path:
++    return vault_dir / VAULT_DIR / STATE_FILENAME
++
++
++def _load_state(vault_dir: Path) -> dict[str, str]:
++    p = _state_path(vault_dir)
++    if not p.is_file():
++        return {}
++    try:
++        data = json.loads(p.read_text(encoding="utf-8"))
++    except json.JSONDecodeError as e:
++        # A corrupted state file shouldn't wedge the sync forever. Log it,
++        # treat as empty -- the worst case is one batch of "is this an edit?"
++        # false positives that the user can re-approve or reject in the
++        # review queue.
++        log.warning("vault sync state file %s is unreadable: %s", p, e)
++        return {}
++    if not isinstance(data, dict):
++        return {}
++    return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
++
++
++def _save_state(vault_dir: Path, state: dict[str, str]) -> None:
++    p = _state_path(vault_dir)
++    p.parent.mkdir(parents=True, exist_ok=True)
++    p.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
++
++
++def _sha256_text(text: str) -> str:
++    return hashlib.sha256(text.encode("utf-8")).hexdigest()
++
++
++# --- page <-> file helpers -----------------------------------------------
++
++
++_PAGE_ID_RE = re.compile(r"^id:\s*([\w.-]+)\s*$", re.MULTILINE)
++
++
++def _page_id_from_frontmatter(text: str) -> str | None:
++    """Pull the ``id:`` from a markdown file's frontmatter.
++
++    Uses a regex (not the full YAML parser) so a file the user is mid-editing
++    -- with broken YAML below the id line -- still gets its id extracted.
++    The full validation happens later when we feed it through
++    ``_deserialize_page``.
++    """
++    m = _PAGE_ID_RE.search(text[:1024])  # frontmatter is at file start
++    return m.group(1) if m else None
++
++
++def _mirror_dir(vault_dir: Path) -> Path:
++    return vault_dir / VAULT_DIR / "pages"
++
++
++def _claims_dir(vault_dir: Path) -> Path:
++    return vault_dir / VAULT_DIR / "claims"
++
++
++# --- backward direction: KB -> vault --------------------------------------
++
++
++def _approved_pages(store: KBStore) -> Iterable:
++    for page in store.list_pages():
++        if page.status != PageStatus.DRAFT:
++            yield page
++
++
++def _approved_claims(store: KBStore) -> Iterable:
++    for claim in store.list_claims():
++        # Working claims have not been through the review gate; archived /
++        # superseded / redacted claims are intentionally not surfaced into the
++        # vault (Obsidian backlinks would otherwise resurrect dead knowledge).
++        if claim.status in {
++            ClaimStatus.ACTIONABLE,
++            ClaimStatus.STABLE,
++            ClaimStatus.CONTESTED,
++        }:
++            yield claim
++
++
++def _render_claim_stub(
++    claim_id: str,
++    claim_text: str,
++    status: str,
++    citing_pages: list[str],
++    sources: list[str],
++) -> str:
++    """Markdown stub for a single approved claim.
++
++    Obsidian renders ``[[pages/<id>]]`` as a backlink in the graph view; the
++    inverse direction (claim -> page) gets rendered as a normal wikilink in
++    the body so the user can navigate either way from inside Obsidian.
++    """
++    lines = [
++        "---",
++        f"id: {claim_id}",
++        f"status: {status}",
++        "type: claim",
++        "---",
++        "",
++        f"# {claim_id}",
++        "",
++        claim_text.rstrip(),
++        "",
++    ]
++    if citing_pages:
++        lines.append("## Cited by")
++        lines.append("")
++        for pid in citing_pages:
++            lines.append(f"- [[pages/{pid}]]")
++        lines.append("")
++    if sources:
++        lines.append("## Sources")
++        lines.append("")
++        for sid in sources:
++            # Sources are content-addressed sha256; truncate for human eyes.
++            short = sid[:16] + ("…" if len(sid) > 16 else "")
++            lines.append(f"- `{short}`")
++        lines.append("")
++    return "\n".join(lines)
++
++
++def kb_to_vault(store: KBStore, vault_dir: Path) -> VaultSyncResult:
++    """Mirror approved KB artifacts into the vault under ``<vault>/vouch/``.
++
++    Overwrites the mirror each call: the vault subdirectory is vouch's house,
++    and only the KB writes there. User edits to mirrored files are picked
++    up by :func:`vault_to_kb` on the next forward pass *before* this function
++    overwrites them.
++    """
++    result = VaultSyncResult()
++    mirror = _mirror_dir(vault_dir)
++    claims_out = _claims_dir(vault_dir)
++    mirror.mkdir(parents=True, exist_ok=True)
++    claims_out.mkdir(parents=True, exist_ok=True)
++
++    # Build a citing-pages index up front so claim stubs can backlink in O(1).
++    citers: dict[str, list[str]] = {}
++    for page in _approved_pages(store):
++        for cid in page.claims:
++            citers.setdefault(cid, []).append(page.id)
++
++    # Pages
++    for page in _approved_pages(store):
++        text = _serialize_page(page)
++        dst = mirror / f"{page.id}.md"
++        dst.write_text(text, encoding="utf-8")
++        result.pages_mirrored.append(page.id)
++
++    # Claim stubs
++    for claim in _approved_claims(store):
++        body = _render_claim_stub(
++            claim_id=claim.id,
++            claim_text=claim.text,
++            status=str(claim.status.value if hasattr(claim.status, "value") else claim.status),
++            citing_pages=sorted(set(citers.get(claim.id, []))),
++            sources=list(claim.evidence),
++        )
++        dst = claims_out / f"{claim.id}.md"
++        dst.write_text(body, encoding="utf-8")
++        result.claims_mirrored.append(claim.id)
++
++    # Refresh state file: record the hash of every mirrored file so the next
++    # forward pass can detect user edits as "current content != recorded hash".
++    new_state: dict[str, str] = {}
++    for f in mirror.glob("*.md"):
++        rel = f"pages/{f.name}"
++        new_state[rel] = _sha256_text(f.read_text(encoding="utf-8"))
++    for f in claims_out.glob("*.md"):
++        rel = f"claims/{f.name}"
++        new_state[rel] = _sha256_text(f.read_text(encoding="utf-8"))
++    _save_state(vault_dir, new_state)
++
++    return result
++
++
++# --- forward direction: vault -> KB ---------------------------------------
++
++
++def vault_to_kb(
++    store: KBStore,
++    vault_dir: Path,
++    *,
++    actor: str = "vault-sync",
++) -> VaultSyncResult:
++    """Scan ``<vault>/vouch/pages/`` for user edits and file proposals."""
++    result = VaultSyncResult()
++    mirror = _mirror_dir(vault_dir)
++    if not mirror.is_dir():
++        return result
++
++    state = _load_state(vault_dir)
++
++    for path in sorted(mirror.glob("*.md")):
++        rel = f"pages/{path.name}"
++        text = path.read_text(encoding="utf-8")
++        current_hash = _sha256_text(text)
++        recorded = state.get(rel)
++        if recorded is None:
++            # Never mirrored on this side -- skip silently. We only file
++            # proposals for *edits* to KB-managed pages, not arbitrary new
++            # files the user dropped into the mirror dir.
++            continue
++        if current_hash == recorded:
++            result.pages_skipped_unchanged.append(rel)
++            continue
++
++        page_id = _page_id_from_frontmatter(text)
++        if not page_id:
++            result.pages_skipped_unknown_id.append(rel)
++            continue
++
++        # Validate the edit roundtrips through the Page model -- if the user
++        # broke the YAML, surface that as a skip with a log line rather than
++        # filing a malformed proposal.
++        try:
++            edited = _deserialize_page(text)
++        except (ValueError, KeyError) as e:
++            log.warning(
++                "vault sync: vault edit at %s does not deserialise as a Page (%s); "
++                "skipping rather than filing a malformed proposal",
++                rel, e,
++            )
++            result.pages_skipped_unknown_id.append(rel)
++            continue
++
++        # Record the user's edit as a vault-origin source so reviewers can
++        # see the exact bytes that triggered the proposal. Content-addressed
++        # via sha256, so re-runs against the same bytes coalesce on the same
++        # source id rather than spawning duplicates.
++        source = store.put_source(
++            text.encode("utf-8"),
++            title=f"Vault edit: {path.name}",
++            locator=f"vault:{rel}",
++            source_type="file",
++            media_type="text/markdown",
++            tags=["vault", "vault-sync"],
++        )
++
++        # File the page-edit proposal. The store-side validator will reject
++        # any references to artifacts the KB doesn't know about -- which is
++        # the right behaviour: the user can't introduce phantom claim ids
++        # from inside Obsidian.
++        propose_page(
++            store,
++            title=edited.title,
++            body=edited.body,
++            page_type=str(edited.type.value if hasattr(edited.type, "value") else edited.type),
++            claim_ids=list(edited.claims),
++            entity_ids=list(edited.entities),
++            source_ids=list({*edited.sources, source.id}),
++            proposed_by=actor,
++            tags=list(edited.tags),
++        )
++        result.pages_proposed.append(page_id)
++
++        # Update state so we don't re-propose the same edit on the next tick.
++        state[rel] = current_hash
++
++    _save_state(vault_dir, state)
++    return result
++
++
++# --- orchestrator ---------------------------------------------------------
++
++
++def sync_vault(
++    store: KBStore,
++    vault_dir: Path,
++    *,
++    direction: str = "both",
++    actor: str = "vault-sync",
++) -> VaultSyncResult:
++    """Run vault sync; the default direction is bidirectional.
++
++    Order matters: **forward runs first** so user edits land as proposals
++    before the backward mirror overwrites them. Once the forward pass has
++    captured the edit, the backward pass restores the vault to the KB's
++    canonical state for any *unchanged* artifacts (no-op for the edited ones
++    until the proposal lands).
++    """
++    if direction not in _VALID_DIRECTIONS:
++        raise VaultSyncError(
++            f"unknown direction {direction!r} "
++            f"(valid: {', '.join(sorted(_VALID_DIRECTIONS))})"
++        )
++    if not vault_dir.is_dir():
++        raise VaultSyncError(
++            f"vault directory {vault_dir} does not exist or is not a directory"
++        )
++
++    combined = VaultSyncResult()
++    if direction in {"forward", "both"}:
++        try:
++            r = vault_to_kb(store, vault_dir, actor=actor)
++        except ArtifactNotFoundError as e:
++            # A vault edit referenced a claim/entity/source that no longer
++            # exists in the KB. That's a *real* conflict the user has to
++            # resolve in Obsidian, not a vouch bug; surface it cleanly.
++            raise VaultSyncError(f"vault edit references unknown artifact: {e}") from e
++        combined.pages_proposed.extend(r.pages_proposed)
++        combined.pages_skipped_unchanged.extend(r.pages_skipped_unchanged)
++        combined.pages_skipped_unknown_id.extend(r.pages_skipped_unknown_id)
++    if direction in {"backward", "both"}:
++        r = kb_to_vault(store, vault_dir)
++        combined.pages_mirrored.extend(r.pages_mirrored)
++        combined.claims_mirrored.extend(r.claims_mirrored)
++    return combined
++
++
++def watch_vault(
++    store: KBStore,
++    vault_dir: Path,
++    *,
++    direction: str = "both",
++    actor: str = "vault-sync",
++    poll_interval: float = 2.0,
++    iterations: int | None = None,
++) -> int:
++    """Poll the vault on a fixed interval, syncing each tick.
++
++    Returns the number of ticks executed. ``iterations`` lets tests bound
++    the loop; the CLI calls with ``iterations=None`` (forever, exits on
++    ``KeyboardInterrupt``).
++    """
++    if direction not in _VALID_DIRECTIONS:
++        raise VaultSyncError(
++            f"unknown direction {direction!r} "
++            f"(valid: {', '.join(sorted(_VALID_DIRECTIONS))})"
++        )
++    if not vault_dir.is_dir():
++        raise VaultSyncError(
++            f"vault directory {vault_dir} does not exist or is not a directory"
++        )
++
++    ticks = 0
++    try:
++        while True:
++            sync_vault(store, vault_dir, direction=direction, actor=actor)
++            ticks += 1
++            if iterations is not None and ticks >= iterations:
++                return ticks
++            time.sleep(poll_interval)
++    except KeyboardInterrupt:
++        return ticks
+diff --git a/tests/test_vault_sync.py b/tests/test_vault_sync.py
+new file mode 100644
+index 0000000..b041104
+--- /dev/null
++++ b/tests/test_vault_sync.py
+@@ -0,0 +1,314 @@
++"""Bidirectional vault sync — `vouch sync --vault <obsidian-dir>` (vouchdev/vouch#181).
++
++``.vouch/pages/*.md`` is already plain markdown + YAML frontmatter, so an
++Obsidian/Logseq vault is already a valid pages-tree. This module closes the
++loop in both directions:
++
++* **Forward (vault -> vouch).** When the human edits a previously-mirrored
++  page in their vault, the next sync detects the diff, registers a
++  ``vault:<relpath>`` source carrying the new bytes, and files a
++  ``page-edit`` proposal in ``.vouch/proposed/`` so the existing review gate
++  still gets the final say.
++* **Backward (vouch -> vault).** Approved pages are mirrored into
++  ``<vault>/vouch/pages/`` and approved claims surface as stub markdown
++  files in ``<vault>/vouch/claims/`` so Obsidian can link to them via
++  ``[[claim/<id>]]`` backlinks.
++
++These tests cover the two directions independently, the orchestrator that
++runs them together, the idempotency guarantee (re-running on an unchanged
++tree must produce zero proposals), and the CLI surface.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pytest
++from click.testing import CliRunner
++
++from vouch.cli import cli
++from vouch.models import Claim, ClaimStatus, ClaimType, Page, PageStatus, PageType
++from vouch.storage import KBStore
++from vouch.vault_sync import (
++    VAULT_DIR,
++    VaultSyncError,
++    VaultSyncResult,
++    kb_to_vault,
++    sync_vault,
++    vault_to_kb,
++)
++
++
++@pytest.fixture
++def store(tmp_path: Path) -> KBStore:
++    """Fresh KB with one source, one approved claim, one approved page."""
++    s = KBStore.init(tmp_path / "project")
++    src = s.put_source(b"seed", title="seed", locator="seed:1")
++    claim = Claim(
++        id="alpha-claim",
++        text="The KB uses Obsidian-compatible markdown frontmatter.",
++        type=ClaimType.FACT,
++        status=ClaimStatus.ACTIONABLE,
++        evidence=[src.id],
++        approved_by="tester",
++    )
++    s.put_claim(claim)
++    page = Page(
++        id="alpha-page",
++        title="Alpha page",
++        body="# Alpha page\n\nOriginal body.\n",
++        type=PageType.CONCEPT,
++        status=PageStatus.ACTIVE,
++        claims=[claim.id],
++        sources=[src.id],
++    )
++    s.put_page(page)
++    return s
++
++
++@pytest.fixture
++def vault(tmp_path: Path) -> Path:
++    v = tmp_path / "vault"
++    v.mkdir()
++    return v
++
++
++# --- backward sync: vouch -> vault ---------------------------------------
++
++
++def test_kb_to_vault_mirrors_approved_pages(store: KBStore, vault: Path) -> None:
++    result = kb_to_vault(store, vault)
++    page_file = vault / VAULT_DIR / "pages" / "alpha-page.md"
++    assert page_file.is_file()
++    body = page_file.read_text(encoding="utf-8")
++    # Mirrored copy carries the on-disk frontmatter + body intact.
++    assert "id: alpha-page" in body
++    assert "title: Alpha page" in body
++    assert "Original body." in body
++    assert "alpha-page" in result.pages_mirrored
++
++
++def test_kb_to_vault_creates_claim_stubs_with_backlinks(
++    store: KBStore, vault: Path,
++) -> None:
++    """Approved claims become a markdown stub each so the vault can
++    [[claim/...]]-backlink to them. The stub must cite the pages that
++    reference the claim so Obsidian renders the graph."""
++    kb_to_vault(store, vault)
++    stub = vault / VAULT_DIR / "claims" / "alpha-claim.md"
++    assert stub.is_file()
++    text = stub.read_text(encoding="utf-8")
++    assert "alpha-claim" in text
++    assert "Obsidian-compatible" in text
++    # The stub must mention the citing page so Obsidian's graph view links them.
++    assert "alpha-page" in text
++
++
++def test_kb_to_vault_skips_draft_pages(tmp_path: Path, vault: Path) -> None:
++    """Mirror is for *approved* artifacts only -- a draft has not been
++    through the review gate and must not leak into the vault."""
++    s = KBStore.init(tmp_path / "kb")
++    src = s.put_source(b"x", title="x")
++    s.put_page(Page(
++        id="draft-page", title="Draft",
++        body="not yet approved", type=PageType.CONCEPT,
++        status=PageStatus.DRAFT, sources=[src.id],
++    ))
++    result = kb_to_vault(s, vault)
++    assert not (vault / VAULT_DIR / "pages" / "draft-page.md").exists()
++    assert "draft-page" not in result.pages_mirrored
++
++
++def test_kb_to_vault_is_idempotent(store: KBStore, vault: Path) -> None:
++    kb_to_vault(store, vault)
++    first = (vault / VAULT_DIR / "pages" / "alpha-page.md").read_text(encoding="utf-8")
++    kb_to_vault(store, vault)
++    second = (vault / VAULT_DIR / "pages" / "alpha-page.md").read_text(encoding="utf-8")
++    assert first == second
++
++
++# --- forward sync: vault -> vouch ----------------------------------------
++
++
++def test_vault_to_kb_proposes_page_edit_on_changed_body(
++    store: KBStore, vault: Path,
++) -> None:
++    """Acceptance #1: edit a mirrored page in Obsidian, run sync, see a
++    page-edit proposal in .vouch/proposed/."""
++    # Materialise the mirror first so the vault has the page.
++    kb_to_vault(store, vault)
++    mirror = vault / VAULT_DIR / "pages" / "alpha-page.md"
++    text = mirror.read_text(encoding="utf-8")
++    edited = text.replace("Original body.", "Edited in Obsidian on a rainy night.")
++    mirror.write_text(edited, encoding="utf-8")
++
++    result = vault_to_kb(store, vault, actor="vault-sync")
++
++    assert "alpha-page" in result.pages_proposed, result
++    proposals = sorted((store.kb_dir / "proposed").glob("*.yaml"))
++    assert proposals, "no proposal file was written"
++    proposal_text = proposals[-1].read_text(encoding="utf-8")
++    assert "alpha-page" in proposal_text
++    assert "Edited in Obsidian on a rainy night." in proposal_text
++    assert "vault-sync" in proposal_text
++
++
++def test_vault_to_kb_creates_source_with_vault_locator(
++    store: KBStore, vault: Path,
++) -> None:
++    """The proposal must cite a source whose locator is `vault:<relpath>`
++    so a reviewer can trace the edit back to the vault file."""
++    kb_to_vault(store, vault)
++    mirror = vault / VAULT_DIR / "pages" / "alpha-page.md"
++    mirror.write_text(
++        mirror.read_text(encoding="utf-8").replace("Original body.", "Edited."),
++        encoding="utf-8",
++    )
++
++    vault_to_kb(store, vault, actor="vault-sync")
++    sources = store.list_sources()
++    vault_sources = [
++        s for s in sources if s.locator and s.locator.startswith("vault:")
++    ]
++    locators = [s.locator for s in sources]
++    assert vault_sources, f"no vault source registered; locators were {locators}"
++    assert any("alpha-page.md" in (s.locator or "") for s in vault_sources)
++
++
++def test_vault_to_kb_is_idempotent_when_nothing_changed(
++    store: KBStore, vault: Path,
++) -> None:
++    """Acceptance: re-running sync on an unchanged tree produces zero
++    proposals. Without this, every cron tick would spam the review queue."""
++    kb_to_vault(store, vault)
++    # First sync after mirror: nothing has changed.
++    r1 = vault_to_kb(store, vault, actor="vault-sync")
++    assert r1.pages_proposed == []
++    # Second sync: still nothing.
++    r2 = vault_to_kb(store, vault, actor="vault-sync")
++    assert r2.pages_proposed == []
++
++
++def test_vault_to_kb_ignores_files_outside_vouch_subdir(
++    store: KBStore, vault: Path,
++) -> None:
++    """The user's own notes (outside `<vault>/vouch/`) are not vouch's
++    business -- forward sync only watches the mirror subtree."""
++    kb_to_vault(store, vault)
++    (vault / "personal-note.md").write_text(
++        "---\nid: personal-note\ntitle: Personal\n---\n\nThis is mine.\n",
++        encoding="utf-8",
++    )
++    result = vault_to_kb(store, vault, actor="vault-sync")
++    assert "personal-note" not in result.pages_proposed
++
++
++def test_vault_to_kb_skips_when_no_mirror_dir_yet(
++    store: KBStore, vault: Path,
++) -> None:
++    """First-ever forward sync on a never-mirrored vault must be benign."""
++    result = vault_to_kb(store, vault, actor="vault-sync")
++    assert isinstance(result, VaultSyncResult)
++    assert result.pages_proposed == []
++
++
++# --- sync_vault orchestrator ----------------------------------------------
++
++
++def test_sync_vault_runs_both_directions_by_default(
++    store: KBStore, vault: Path,
++) -> None:
++    result = sync_vault(store, vault)
++    assert result.pages_mirrored == ["alpha-page"]
++    # No vault edits yet -> no proposals.
++    assert result.pages_proposed == []
++
++
++def test_sync_vault_forward_only(store: KBStore, vault: Path) -> None:
++    result = sync_vault(store, vault, direction="forward")
++    # No mirror established, nothing to compare against.
++    assert result.pages_mirrored == []
++    assert result.pages_proposed == []
++
++
++def test_sync_vault_backward_only(store: KBStore, vault: Path) -> None:
++    result = sync_vault(store, vault, direction="backward")
++    assert "alpha-page" in result.pages_mirrored
++    assert (vault / VAULT_DIR / "pages" / "alpha-page.md").is_file()
++
++
++def test_sync_vault_rejects_unknown_direction(store: KBStore, vault: Path) -> None:
++    with pytest.raises(VaultSyncError, match="direction"):
++        sync_vault(store, vault, direction="sideways")
++
++
++def test_sync_vault_rejects_missing_vault(store: KBStore, tmp_path: Path) -> None:
++    with pytest.raises(VaultSyncError, match="vault"):
++        sync_vault(store, tmp_path / "does-not-exist")
++
++
++# --- CLI surface ----------------------------------------------------------
++
++
++def test_cli_sync_writes_mirror_on_first_run(
++    store: KBStore, vault: Path, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.chdir(store.root)
++    result = CliRunner().invoke(cli, ["sync", "--vault", str(vault)])
++    assert result.exit_code == 0, result.output
++    assert (vault / VAULT_DIR / "pages" / "alpha-page.md").is_file()
++    assert "alpha-page" in result.output
++
++
++def test_cli_sync_files_proposal_on_vault_edit(
++    store: KBStore, vault: Path, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.chdir(store.root)
++    runner = CliRunner()
++    # First run mirrors only (nothing in vault to compare).
++    runner.invoke(cli, ["sync", "--vault", str(vault)])
++    # User edits the mirrored page.
++    mirror = vault / VAULT_DIR / "pages" / "alpha-page.md"
++    mirror.write_text(
++        mirror.read_text(encoding="utf-8").replace("Original body.", "Edited!"),
++        encoding="utf-8",
++    )
++    # Second run picks up the edit and files a proposal.
++    second = runner.invoke(cli, ["sync", "--vault", str(vault)])
++    assert second.exit_code == 0, second.output
++    proposals = sorted((store.kb_dir / "proposed").glob("*.yaml"))
++    assert proposals, "no proposal filed by CLI"
++
++
++def test_cli_sync_missing_vault_is_clean_error(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.chdir(store.root)
++    result = CliRunner().invoke(cli, ["sync", "--vault", "/nonexistent/path/here"])
++    assert result.exit_code != 0
++    assert "Traceback" not in result.output
++    assert "Error:" in result.output
++
++
++def test_cli_sync_requires_vault_flag(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.chdir(store.root)
++    result = CliRunner().invoke(cli, ["sync"])
++    assert result.exit_code != 0
++    assert any(w in result.output.lower() for w in ("--vault", "vault is required", "missing"))
++
++
++# --- state-file behaviour (idempotency engine) ----------------------------
++
++
++def test_state_file_lives_under_vouch_subdir(store: KBStore, vault: Path) -> None:
++    sync_vault(store, vault)
++    state = vault / VAULT_DIR / ".sync-state.json"
++    assert state.is_file()
++    data = json.loads(state.read_text(encoding="utf-8"))
++    # Schema: a mapping from "pages/<id>.md" -> sha256 of the mirrored content
++    # so the next forward pass can detect user edits.
++    assert isinstance(data, dict)
++    assert any(k.startswith("pages/") for k in data)

@@ -1,0 +1,224 @@
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index 33a5c340..682b128d 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -2050,6 +2050,21 @@ export async function listIssues(env: Env, fullName: string): Promise<IssueRecor
+   return rows.map(toIssueRecordFromRow);
+ }
+ 
++/**
++ * Closed issues whose body carries a contributor-issue-draft marker, recent-first and bounded.
++ * Used to suppress re-proposing drafts a maintainer already declined (closed).
++ */
++export async function listClosedContributorDraftIssues(env: Env, fullName: string, markerPrefix: string, limit = 200): Promise<IssueRecord[]> {
++  const db = getDb(env.DB);
++  const rows = await db
++    .select()
++    .from(issues)
++    .where(and(eq(issues.repoFullName, fullName), eq(issues.state, "closed"), sql`${issues.payloadJson} LIKE ${`%${markerPrefix}%`}`))
++    .orderBy(desc(issues.updatedAt))
++    .limit(limit);
++  return rows.map(toIssueRecordFromRow);
++}
++
+ export async function listAllIssues(env: Env): Promise<IssueRecord[]> {
+   const db = getDb(env.DB);
+   const rows = await db.select().from(issues).limit(2000);
+diff --git a/src/services/contributor-issue-draft.ts b/src/services/contributor-issue-draft.ts
+index 6409447a..192e8504 100644
+--- a/src/services/contributor-issue-draft.ts
++++ b/src/services/contributor-issue-draft.ts
+@@ -1,6 +1,7 @@
+ import {
+   getRepository,
+   getRepositorySettings,
++  listClosedContributorDraftIssues,
+   listIssueSignalSample,
+   listOpenIssues,
+   listOpenPullRequests,
+@@ -44,7 +45,7 @@ export type ContributorIssueDraftTopic =
+   | "upstream:registry_drift"
+   | `focus:wanted_path:${string}`;
+ 
+-export type ContributorIssueDraftStatus = "proposed" | "skipped_duplicate" | "skipped_unsafe" | "created" | "skipped_create_failed";
++export type ContributorIssueDraftStatus = "proposed" | "skipped_duplicate" | "skipped_declined" | "skipped_unsafe" | "created" | "skipped_create_failed";
+ 
+ export type ContributorIssueDraft = {
+   fingerprint: string;
+@@ -54,6 +55,7 @@ export type ContributorIssueDraft = {
+   labels: string[];
+   status: ContributorIssueDraftStatus;
+   duplicateOf?: { number: number; title: string; reason: "marker" | "title" } | undefined;
++  declinedBy?: { number: number; title: string; reason: "wontfix" | "cooldown" } | undefined;
+   issue?: { number: number; url: string } | undefined;
+ };
+ 
+@@ -64,6 +66,7 @@ export type ContributorIssueDraftGenerationResult = {
+   createRequested: boolean;
+   proposed: number;
+   skippedDuplicate: number;
++  skippedDeclined: number;
+   skippedUnsafe: number;
+   created: number;
+   skippedCreateFailed: number;
+@@ -88,6 +91,7 @@ type ContributorIssueDraftContext = {
+   contributorIntakeHealth: ContributorIntakeHealth;
+   focusManifest: FocusManifest;
+   openIssues: IssueRecord[];
++  declinedIssues?: IssueRecord[] | undefined;
+   upstreamDriftWarnings: string[];
+ };
+ 
+@@ -170,6 +174,37 @@ export function findDuplicateContributorDraft(
+   return null;
+ }
+ 
++export const CONTRIBUTOR_ISSUE_DRAFT_DECLINED_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
++const DECLINED_DRAFT_WONTFIX_LABELS = new Set(["wontfix", "wont-fix", "invalid", "duplicate", "not-planned"]);
++
++/**
++ * Detect whether a draft was already declined by a maintainer closing the generated issue.
++ * Matches by the stable marker fingerprint on a closed issue. A `wontfix`-style label suppresses
++ * re-proposal indefinitely; otherwise the closure is honored only within the cooldown window, so a
++ * genuine later regression of the underlying warning can resurface once the cooldown elapses.
++ */
++export function findDeclinedContributorDraft(
++  closedIssues: IssueRecord[],
++  draft: Pick<ContributorIssueDraft, "fingerprint">,
++  options: { now?: number | undefined; cooldownMs?: number | undefined } = {},
++): { number: number; title: string; reason: "wontfix" | "cooldown" } | null {
++  const marker = contributorIssueDraftMarker(draft.fingerprint);
++  const nowMs = options.now ?? Date.now();
++  const cooldownMs = options.cooldownMs ?? CONTRIBUTOR_ISSUE_DRAFT_DECLINED_COOLDOWN_MS;
++  for (const issue of closedIssues) {
++    if (issue.state !== "closed") continue;
++    if (!issue.body?.includes(marker)) continue;
++    if (issue.labels.some((label) => DECLINED_DRAFT_WONTFIX_LABELS.has(label.trim().toLowerCase()))) {
++      return { number: issue.number, title: issue.title, reason: "wontfix" };
++    }
++    const closedAtMs = issue.updatedAt ? Date.parse(issue.updatedAt) : Number.NaN;
++    if (!Number.isFinite(closedAtMs) || nowMs - closedAtMs < cooldownMs) {
++      return { number: issue.number, title: issue.title, reason: "cooldown" };
++    }
++  }
++  return null;
++}
++
+ export function buildContributorIssueDraftBody(fingerprint: string, sections: ContributorIssueDraftSections): string {
+   const blocks: string[] = [contributorIssueDraftMarker(fingerprint), "", "## Background", "", ...sections.background, "", "## Current Behavior", "", ...sections.currentBehavior, "", "## Desired Behavior", "", ...sections.desiredBehavior, "", "## Implementation Requirements", "", ...sections.implementationRequirements.map((line) => `- ${line}`), "", "## Public/Private Output Boundaries", "", ...sections.publicPrivateBoundaries.map((line) => `- ${line}`), "", "## Acceptance Criteria", "", ...sections.acceptanceCriteria.map((line) => `- ${line}`), "", "## Testing Requirements", "", ...sections.testingRequirements.map((line) => `- ${line}`)];
+   return blocks.join("\n");
+@@ -223,6 +258,7 @@ export async function generateContributorIssueDrafts(
+   const drafts: ContributorIssueDraft[] = [];
+   let proposed = 0;
+   let skippedDuplicate = 0;
++  let skippedDeclined = 0;
+   let skippedUnsafe = 0;
+   let created = 0;
+   let skippedCreateFailed = 0;
+@@ -252,6 +288,15 @@ export async function generateContributorIssueDrafts(
+       drafts.push(draft);
+       continue;
+     }
++    /* v8 ignore next -- loadContributorIssueDraftContext always sets declinedIssues; the [] fallback only guards hand-built candidate contexts. */
++    const declined = findDeclinedContributorDraft(context.declinedIssues ?? [], draft);
++    if (declined) {
++      draft.status = "skipped_declined";
++      draft.declinedBy = declined;
++      skippedDeclined += 1;
++      drafts.push(draft);
++      continue;
++    }
+     if (!dryRun && createRequested) {
+       const issue = await createGitHubContributorIssue(env, repoFullName, draft);
+       if (issue) {
+@@ -297,6 +342,7 @@ export async function generateContributorIssueDrafts(
+     createRequested,
+     proposed,
+     skippedDuplicate,
++    skippedDeclined,
+     skippedUnsafe,
+     created,
+     skippedCreateFailed,
+@@ -444,10 +490,11 @@ function pathSlug(path: string): string {
+ }
+ 
+ async function loadContributorIssueDraftContext(env: Env, repoFullName: string): Promise<ContributorIssueDraftContext> {
+-  const [repo, settings, openIssues, focusManifest, upstreamReports, issues, pullRequests, recentMergedPullRequests, labels, queueCounts] = await Promise.all([
++  const [repo, settings, openIssues, declinedIssues, focusManifest, upstreamReports, issues, pullRequests, recentMergedPullRequests, labels, queueCounts] = await Promise.all([
+     getRepository(env, repoFullName),
+     getRepositorySettings(env, repoFullName),
+     listOpenIssues(env, repoFullName),
++    listClosedContributorDraftIssues(env, repoFullName, `<!-- ${CONTRIBUTOR_ISSUE_DRAFT_MARKER_PREFIX}`),
+     loadRepoFocusManifest(env, repoFullName, { fetcher: async () => null }),
+     listUpstreamDriftReports(env, 20),
+     listIssueSignalSample(env, repoFullName),
+@@ -472,6 +519,7 @@ async function loadContributorIssueDraftContext(env: Env, repoFullName: string):
+     contributorIntakeHealth,
+     focusManifest,
+     openIssues,
++    declinedIssues,
+     upstreamDriftWarnings: registryHyperparameterDriftWarningsForRepo(upstreamReports, repoFullName),
+   };
+ }
+diff --git a/test/unit/contributor-issue-draft.test.ts b/test/unit/contributor-issue-draft.test.ts
+index 839ca2b9..c8afff52 100644
+--- a/test/unit/contributor-issue-draft.test.ts
++++ b/test/unit/contributor-issue-draft.test.ts
+@@ -8,6 +8,7 @@ import {
+   buildContributorIssueDraftTestingRequirements,
+   contributorIssueDraftFingerprint,
+   contributorIssueDraftMarker,
++  findDeclinedContributorDraft,
+   findDuplicateContributorDraft,
+   generateContributorIssueDrafts,
+   isContributorIssueDraftPublicSafe,
+@@ -229,6 +230,49 @@ describe("contributor issue drafts", () => {
+     expect(result.drafts[0]?.status).toBe("skipped_duplicate");
+   });
+ 
++  it("detects declined drafts by stable marker with wontfix and cooldown policy", async () => {
++    const fingerprint = await contributorIssueDraftFingerprint("JSONbored/gittensory", "policy:focus_policy_missing", "policy:focus_policy_missing");
++    const marker = contributorIssueDraftMarker(fingerprint);
++    const closed = (over: Partial<IssueRecord>): IssueRecord => ({
++      ...openIssue(5, "feat(issues): address focus-policy-missing policy readiness for repo", marker),
++      state: "closed",
++      updatedAt: new Date().toISOString(),
++      ...over,
++    });
++    const longAgo = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString();
++
++    // Recently closed -> suppressed within the cooldown window.
++    expect(findDeclinedContributorDraft([closed({})], { fingerprint })).toMatchObject({ number: 5, reason: "cooldown" });
++    // wontfix-style label -> suppressed regardless of age.
++    expect(findDeclinedContributorDraft([closed({ updatedAt: longAgo, labels: ["wontfix"] })], { fingerprint })).toMatchObject({ reason: "wontfix" });
++    // Past the cooldown without a wontfix label -> may resurface (a later regression).
++    expect(findDeclinedContributorDraft([closed({ updatedAt: longAgo })], { fingerprint })).toBeNull();
++    // Missing/unparseable close timestamp -> treat as still within cooldown (suppress).
++    expect(findDeclinedContributorDraft([closed({ updatedAt: undefined })], { fingerprint })).toMatchObject({ reason: "cooldown" });
++    // Open issues, missing markers, and other fingerprints are ignored.
++    expect(findDeclinedContributorDraft([{ ...closed({}), state: "open" }], { fingerprint })).toBeNull();
++    expect(findDeclinedContributorDraft([closed({ body: "no marker here" })], { fingerprint })).toBeNull();
++    expect(findDeclinedContributorDraft([closed({})], { fingerprint: "other-fingerprint" })).toBeNull();
++  });
++
++  it("skips drafts a maintainer already declined by closing the issue", async () => {
++    const env = createTestEnv();
++    // Use a non-self repo so the policy candidate is deterministic (the self-repo carries a bundled manifest).
++    const repoFullName = "other-owner/other-repo";
++    const fingerprint = await contributorIssueDraftFingerprint(repoFullName, "policy:focus_policy_missing", "policy:focus_policy_missing");
++    const marker = contributorIssueDraftMarker(fingerprint);
++    vi.spyOn(repositories, "listOpenIssues").mockResolvedValue([]);
++    vi.spyOn(repositories, "listClosedContributorDraftIssues").mockResolvedValue([
++      { ...openIssue(90, "feat(issues): address focus-policy-missing policy readiness for repo", marker), state: "closed", updatedAt: new Date().toISOString() },
++    ]);
++
++    const result = await generateContributorIssueDrafts(env, repoFullName, { dryRun: false, create: true, limit: 1 });
++    expect(result.skippedDeclined).toBe(1);
++    expect(result.created).toBe(0);
++    expect(result.drafts[0]?.status).toBe("skipped_declined");
++    expect(result.drafts[0]?.declinedBy).toMatchObject({ number: 90, reason: "cooldown" });
++  });
++
+   it("records skipped_create_failed when GitHub create is unavailable", async () => {
+     const env = createTestEnv();
+     vi.spyOn(repositories, "listOpenIssues").mockResolvedValue([]);

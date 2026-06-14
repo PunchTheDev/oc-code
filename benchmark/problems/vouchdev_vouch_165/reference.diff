@@ -1,0 +1,548 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6c94213..8579862 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -32,6 +32,11 @@ All notable changes to vouch are documented here. Format follows
+   non-blocking `warnings` (`similar_approved`, `similar_pending`) when the
+   embeddings extra is installed. Configurable via `review.similarity_threshold`
+   (default `0.95`). CLI prints warnings to stderr; dry-run included.
++- `vouch stats` and `kb.stats` expose read-only KB observability: pending
++  proposals by agent (with median/max age), review decision counts and
++  approval rate over a configurable window (`--days`, default 30; `0` for
++  all-time), citation coverage (valid / invalid / broken), plus audit-log
++  cross-check totals. Available on MCP, JSONL, and HTTP transports.
+ - `vouch fsck` performs deep consistency checks beyond `vouch doctor`:
+   orphaned embeddings, dangling supersede/contradict chains, decided
+   proposals whose artifact is missing, and FTS5 index-vs-file drift
+diff --git a/README.md b/README.md
+index 3148b2b..017a0a3 100644
+--- a/README.md
++++ b/README.md
+@@ -143,6 +143,7 @@ vouch init                                  # set up .vouch/ at PATH
+ vouch discover [--path P]                   # find the nearest .vouch/ root
+ vouch capabilities                          # emit the JSON capabilities descriptor
+ vouch status [--json]                       # KB counts + pending proposals
++vouch stats [--days N] [--json]             # observability: queue, review rates, citations
+ vouch lint [--stale-days N]                 # user-actionable problems
+ vouch doctor                                # full sweep incl. source verification
+ vouch fsck                                  # deep consistency: indexes, lifecycle, decided
+diff --git a/docs/multi-agent.md b/docs/multi-agent.md
+index 5af5337..2ea14ed 100644
+--- a/docs/multi-agent.md
++++ b/docs/multi-agent.md
+@@ -78,12 +78,18 @@ Two agents will eventually disagree. What it looks like:
+ 
+ ## Tracking who's busy
+ 
++```bash
++vouch stats              # pending by agent, review rates, citation coverage
++vouch stats --json       # same, for dashboards / CI
++```
++
++Or, if you only need the queue breakdown:
++
+ ```bash
+ vouch pending --json | jq -r '.[] | "\(.proposed_by)\t\(.id)"' | sort | uniq -c
+ ```
+ 
+-Tells you which agent has the most pending work. Useful when one
+-agent has been spammy or is asleep at the wheel.
++Useful when one agent has been spammy or is asleep at the wheel.
+ 
+ ## Crystallisation per agent
+ 
+diff --git a/src/vouch/capabilities.py b/src/vouch/capabilities.py
+index a9945f8..a4c7533 100644
+--- a/src/vouch/capabilities.py
++++ b/src/vouch/capabilities.py
+@@ -16,6 +16,7 @@
+ METHODS = [
+     "kb.capabilities",
+     "kb.status",
++    "kb.stats",
+     "kb.search",
+     "kb.context",
+     "kb.read_page",
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index 87c0af5..ce905a9 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -27,6 +27,7 @@
+ from . import migrations as migrations_mod
+ from . import pr_cache as prc_mod
+ from . import sessions as sess_mod
++from . import stats as stats_mod
+ from . import sync as sync_mod
+ from . import vault_sync as vault_sync_mod
+ from . import verify as verify_mod
+@@ -259,6 +260,60 @@ def status(as_json: bool) -> None:
+           f"index: {index_str}")
+ 
+ 
++@cli.command()
++@click.option(
++    "--days",
++    default=30,
++    show_default=True,
++    type=int,
++    help="Review decision window (days). Use 0 for all-time.",
++)
++@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
++def stats(days: int, as_json: bool) -> None:
++    """KB observability: pending queue, review rates, citation coverage."""
++    store = _load_store()
++    since = None if days == 0 else days
++    body = stats_mod.collect_stats(store, since_days=since)
++    if as_json:
++        _emit_json(body)
++        return
++    _echo(f"KB at {_style(str(body['kb_dir']), bold=True)}")
++    pending = body["pending"]
++    _echo(
++        f"  pending: {_style(str(pending['total']), fg='yellow' if pending['total'] else 'green')} "
++        f"proposal(s)"
++    )
++    if pending["by_agent"]:
++        for agent, count in pending["by_agent"].items():
++            _echo(f"    {agent}: {count}")
++    age = pending["age_days"]
++    if age["median"] is not None:
++        _echo(
++            f"  pending age (days): median {age['median']}, max {age['max']}"
++            + (f" ({age['oldest_id']})" if age["oldest_id"] else "")
++        )
++    review = body["review"]
++    window = "all time" if review["window_days"] is None else f"last {review['window_days']}d"
++    _echo(f"  review ({window}): "
++          f"{review['approved']} approved, {review['rejected']} rejected, "
++          f"{review['expired']} expired")
++    rate = review["approval_rate"]
++    if rate is not None:
++        _echo(f"  approval rate: {_style(f'{rate * 100:.1f}%', fg='cyan')}")
++    cites = body["citations"]
++    cov = cites["coverage_rate"]
++    cov_str = f"{cov * 100:.1f}%" if cov is not None else "n/a"
++    _echo(
++        f"  citations: {cites['claims_with_valid_citation']}/{cites['claims_total']} "
++        f"claims with valid citations ({cov_str})"
++    )
++    if cites["invalid_claim"] or cites["broken_citation"]:
++        _echo(
++            f"    invalid: {cites['invalid_claim']}, "
++            f"broken: {cites['broken_citation']}"
++        )
++
++
+ def _findings_json(report) -> list[dict[str, Any]]:
+     return [
+         {"severity": f.severity, "code": f.code, "message": f.message,
+diff --git a/src/vouch/jsonl_server.py b/src/vouch/jsonl_server.py
+index 556a6d1..dff9ce1 100644
+--- a/src/vouch/jsonl_server.py
++++ b/src/vouch/jsonl_server.py
+@@ -45,6 +45,7 @@
+     propose_relation,
+     reject,
+ )
++from .stats import collect_stats
+ from .storage import (
+     ArtifactNotFoundError,
+     KBNotFoundError,
+@@ -82,6 +83,12 @@ def _h_status(_: dict) -> dict:
+     return health.status(_store())
+ 
+ 
++def _h_stats(p: dict) -> dict:
++    days = int(p.get("days", 30))
++    since = None if days == 0 else days
++    return collect_stats(_store(), since_days=since)
++
++
+ def _h_search(p: dict) -> list[dict]:
+     from . import index_db
+     s = _store()
+@@ -506,6 +513,7 @@ def _h_embeddings_stats(_: dict) -> dict:
+ HANDLERS: dict[str, Callable[[dict], Any]] = {
+     "kb.capabilities": _h_capabilities,
+     "kb.status": _h_status,
++    "kb.stats": _h_stats,
+     "kb.search": _h_search,
+     "kb.context": _h_context,
+     "kb.read_page": _h_read_page,
+diff --git a/src/vouch/server.py b/src/vouch/server.py
+index 8672e25..ebd37d7 100644
+--- a/src/vouch/server.py
++++ b/src/vouch/server.py
+@@ -36,6 +36,7 @@
+     propose_relation,
+     reject,
+ )
++from .stats import collect_stats
+ from .storage import (
+     ArtifactNotFoundError,
+     KBNotFoundError,
+@@ -74,6 +75,16 @@ def kb_status() -> dict[str, Any]:
+     return health.status(_store())
+ 
+ 
++@mcp.tool()
++def kb_stats(*, days: int = 30) -> dict[str, Any]:
++    """Observability: pending by agent, review rates, citation coverage.
++
++    days: decision window in days; 0 means all-time.
++    """
++    since = None if days == 0 else days
++    return collect_stats(_store(), since_days=since)
++
++
+ # === read tools (unrestricted) ============================================
+ 
+ 
+diff --git a/src/vouch/stats.py b/src/vouch/stats.py
+new file mode 100644
+index 0000000..8f382e4
+--- /dev/null
++++ b/src/vouch/stats.py
+@@ -0,0 +1,198 @@
++"""KB observability — `vouch stats` / `kb.stats`.
++
++Read-only aggregates for multi-agent review workflows: pending queue by
++agent, decision rates over a time window, and citation coverage.
++"""
++
++from __future__ import annotations
++
++import statistics
++from datetime import UTC, datetime, timedelta
++from typing import Any
++
++from . import audit, health
++from .models import Proposal, ProposalStatus
++from .proposals import EXPIRE_REASON
++from .storage import KBStore, _yaml_load
++
++
++def _utc(dt: datetime) -> datetime:
++    if dt.tzinfo is None:
++        return dt.replace(tzinfo=UTC)
++    return dt.astimezone(UTC)
++
++
++def _cutoff(*, since_days: int | None) -> datetime | None:
++    if since_days is None:
++        return None
++    return datetime.now(UTC) - timedelta(days=since_days)
++
++
++def _in_window(dt: datetime | None, cutoff: datetime | None) -> bool:
++    if cutoff is None:
++        return True
++    if dt is None:
++        return False
++    return _utc(dt) >= cutoff
++
++
++def _decision_bucket(proposal: Proposal) -> str:
++    if proposal.status == ProposalStatus.APPROVED:
++        return "approved"
++    if proposal.decision_reason == EXPIRE_REASON:
++        return "expired"
++    return "rejected"
++
++
++def _list_decided(store: KBStore) -> list[Proposal]:
++    ddir = store.kb_dir / "decided"
++    if not ddir.is_dir():
++        return []
++    out: list[Proposal] = []
++    for path in sorted(ddir.glob("*.yaml")):
++        out.append(Proposal.model_validate(_yaml_load(path.read_text())))
++    return out
++
++
++def _audit_decision_kind(event: str) -> str | None:
++    if event == "proposal.expire":
++        return "expired"
++    if event.endswith(".approve"):
++        return "approved"
++    if event.endswith(".reject"):
++        return "rejected"
++    return None
++
++
++def _audit_review_totals(
++    kb_dir: Any, *, cutoff: datetime | None,
++) -> dict[str, int]:
++    totals = {"approved": 0, "rejected": 0, "expired": 0}
++    for ev in audit.read_events(kb_dir):
++        kind = _audit_decision_kind(ev.event)
++        if kind is None:
++            continue
++        if not _in_window(ev.created_at, cutoff):
++            continue
++        totals[kind] += 1
++    return totals
++
++
++def _rate(numerator: int, denominator: int) -> float | None:
++    if denominator <= 0:
++        return None
++    return round(numerator / denominator, 4)
++
++
++def citation_summary(store: KBStore) -> dict[str, Any]:
++    claims, findings = health._load_claims_for_lint(store)
++    sources_present = {s.id for s in store.list_sources()}
++    evidence_present = {e.id for e in store.list_evidence()}
++
++    invalid_claim = sum(
++        1 for f in findings if f.code == "invalid_claim" and f.object_ids
++    )
++
++    broken_claim_ids: set[str] = set()
++    with_valid = 0
++    for c in claims:
++        if not c.evidence:
++            continue
++        refs_ok = all(
++            ref in sources_present or ref in evidence_present for ref in c.evidence
++        )
++        if not refs_ok:
++            broken_claim_ids.add(c.id)
++            continue
++        with_valid += 1
++
++    loadable = len(claims)
++    total = loadable + invalid_claim
++    return {
++        "claims_total": total,
++        "claims_loadable": loadable,
++        "claims_with_valid_citation": with_valid,
++        "invalid_claim": invalid_claim,
++        "broken_citation": len(broken_claim_ids),
++        "coverage_rate": _rate(with_valid, total),
++    }
++
++
++def pending_summary(store: KBStore) -> dict[str, Any]:
++    pending = store.list_proposals(ProposalStatus.PENDING)
++    by_agent: dict[str, int] = {}
++    ages_days: list[float] = []
++    oldest: tuple[float, str] | None = None
++    now = datetime.now(UTC)
++
++    for pr in pending:
++        agent = pr.proposed_by or "unknown"
++        by_agent[agent] = by_agent.get(agent, 0) + 1
++        age = (now - _utc(pr.proposed_at)).total_seconds() / 86400.0
++        ages_days.append(age)
++        if oldest is None or age > oldest[0]:
++            oldest = (age, pr.id)
++
++    median_age = round(statistics.median(ages_days), 2) if ages_days else None
++    max_age = round(max(ages_days), 2) if ages_days else None
++    return {
++        "total": len(pending),
++        "by_agent": dict(sorted(by_agent.items(), key=lambda kv: (-kv[1], kv[0]))),
++        "age_days": {
++            "median": median_age,
++            "max": max_age,
++            "oldest_id": oldest[1] if oldest else None,
++        },
++    }
++
++
++def review_summary(store: KBStore, *, since_days: int | None) -> dict[str, Any]:
++    cutoff = _cutoff(since_days=since_days)
++    totals = {"approved": 0, "rejected": 0, "expired": 0}
++    by_agent: dict[str, dict[str, int]] = {}
++
++    def bump(agent: str, bucket: str) -> None:
++        row = by_agent.setdefault(
++            agent,
++            {"pending": 0, "approved": 0, "rejected": 0, "expired": 0},
++        )
++        row[bucket] += 1
++
++    for pr in store.list_proposals(ProposalStatus.PENDING):
++        bump(pr.proposed_by or "unknown", "pending")
++
++    for pr in _list_decided(store):
++        if not _in_window(pr.decided_at, cutoff):
++            continue
++        bucket = _decision_bucket(pr)
++        totals[bucket] += 1
++        bump(pr.proposed_by or "unknown", bucket)
++
++    decided = totals["approved"] + totals["rejected"] + totals["expired"]
++    audit_totals = _audit_review_totals(store.kb_dir, cutoff=cutoff)
++
++    return {
++        "window_days": since_days,
++        "decided_in_window": decided,
++        "approved": totals["approved"],
++        "rejected": totals["rejected"],
++        "expired": totals["expired"],
++        "approval_rate": _rate(totals["approved"], decided),
++        "audit_totals": audit_totals,
++        "by_agent": {
++            agent: dict(sorted(counts.items()))
++            for agent, counts in sorted(by_agent.items())
++        },
++    }
++
++
++def collect_stats(store: KBStore, *, since_days: int | None = 30) -> dict[str, Any]:
++    """Aggregate observability metrics for the KB at ``store``."""
++    return {
++        "kb_dir": str(store.kb_dir),
++        "generated_at": datetime.now(UTC).isoformat(),
++        "counts": health.status(store),
++        "pending": pending_summary(store),
++        "review": review_summary(store, since_days=since_days),
++        "citations": citation_summary(store),
++    }
+diff --git a/tests/test_stats.py b/tests/test_stats.py
+new file mode 100644
+index 0000000..08aa5da
+--- /dev/null
++++ b/tests/test_stats.py
+@@ -0,0 +1,138 @@
++"""KB observability — vouch stats / kb.stats."""
++
++from __future__ import annotations
++
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++
++import pytest
++import yaml
++from click.testing import CliRunner
++
++from vouch import stats
++from vouch.cli import cli
++from vouch.jsonl_server import handle_request
++from vouch.models import Claim
++from vouch.proposals import approve, expire_one, propose_claim, reject
++from vouch.storage import KBStore
++
++
++@pytest.fixture
++def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> KBStore:
++    s = KBStore.init(tmp_path)
++    monkeypatch.chdir(s.root)
++    return s
++
++
++def test_citation_summary_clean_kb(store: KBStore) -> None:
++    src = store.put_source(b"evidence body")
++    store.put_claim(Claim(id="c1", text="fact", evidence=[src.id]))
++    summary = stats.citation_summary(store)
++    assert summary["claims_total"] == 1
++    assert summary["claims_with_valid_citation"] == 1
++    assert summary["coverage_rate"] == 1.0
++    assert summary["broken_citation"] == 0
++
++
++def test_citation_summary_flags_broken_and_invalid(store: KBStore) -> None:
++    src_ok = store.put_source(b"ok")
++    src_gone = store.put_source(b"gone")
++    store.put_claim(Claim(id="good", text="t", evidence=[src_ok.id]))
++    store.put_claim(Claim(id="broken", text="t", evidence=[src_gone.id]))
++    import shutil
++
++    shutil.rmtree(store.kb_dir / "sources" / src_gone.id)
++    (store.kb_dir / "claims" / "legacy.yaml").write_text(
++        "id: legacy\n"
++        'text: "uncited"\n'
++        "type: fact\n"
++        "status: stable\n"
++        "confidence: 1.0\n"
++        "evidence: []\n"
++    )
++    summary = stats.citation_summary(store)
++    assert summary["claims_total"] == 3
++    assert summary["invalid_claim"] == 1
++    assert summary["broken_citation"] == 1
++    assert summary["claims_with_valid_citation"] == 1
++
++
++def test_pending_summary_by_agent(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    propose_claim(store, text="a", evidence=[src.id], proposed_by="agent-a")
++    propose_claim(store, text="b", evidence=[src.id], proposed_by="agent-a")
++    propose_claim(store, text="c", evidence=[src.id], proposed_by="agent-b")
++    pending = stats.pending_summary(store)
++    assert pending["total"] == 3
++    assert pending["by_agent"] == {"agent-a": 2, "agent-b": 1}
++    assert pending["age_days"]["median"] is not None
++
++
++def test_review_summary_counts_decisions(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    p_ok = propose_claim(store, text="ok", evidence=[src.id], proposed_by="a1")
++    p_no = propose_claim(store, text="no", evidence=[src.id], proposed_by="a2")
++    approve(store, p_ok.id, approved_by="human")
++    reject(store, p_no.id, rejected_by="human", reason="duplicate")
++
++    review = stats.review_summary(store, since_days=None)
++    assert review["approved"] == 1
++    assert review["rejected"] == 1
++    assert review["approval_rate"] == 0.5
++    assert review["by_agent"]["a1"]["approved"] == 1
++    assert review["by_agent"]["a2"]["rejected"] == 1
++
++
++def test_review_summary_respects_window(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="old", evidence=[src.id], proposed_by="a")
++    approve(store, pr.id, approved_by="human")
++    path = store.kb_dir / "decided" / f"{pr.id}.yaml"
++    raw = yaml.safe_load(path.read_text())
++    raw["decided_at"] = (datetime.now(UTC) - timedelta(days=60)).isoformat()
++    path.write_text(yaml.safe_dump(raw, sort_keys=False))
++
++    narrow = stats.review_summary(store, since_days=30)
++    wide = stats.review_summary(store, since_days=None)
++    assert narrow["approved"] == 0
++    assert wide["approved"] == 1
++
++
++def test_collect_stats_includes_audit_totals(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="t", evidence=[src.id], proposed_by="a")
++    approve(store, pr.id, approved_by="human")
++    body = stats.collect_stats(store, since_days=30)
++    assert body["review"]["audit_totals"]["approved"] >= 1
++    assert "citations" in body
++    assert body["counts"]["claims"] >= 1
++
++
++def test_cli_stats_json(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    store.put_claim(Claim(id="c1", text="t", evidence=[src.id]))
++    result = CliRunner().invoke(cli, ["stats", "--json"])
++    assert result.exit_code == 0, result.output
++    import json
++    data = json.loads(result.output)
++    assert data["citations"]["coverage_rate"] == 1.0
++
++
++def test_jsonl_kb_stats(store: KBStore) -> None:
++    resp = handle_request({"id": "1", "method": "kb.stats", "params": {}})
++    assert resp["ok"] is True
++    assert "pending" in resp["result"]
++    assert "review" in resp["result"]
++
++
++def test_stats_marks_expired_decisions(store: KBStore) -> None:
++    src = store.put_source(b"x")
++    pr = propose_claim(store, text="stale", evidence=[src.id], proposed_by="a")
++    path = store.kb_dir / "proposed" / f"{pr.id}.yaml"
++    raw = yaml.safe_load(path.read_text())
++    raw["proposed_at"] = (datetime.now(UTC) - timedelta(days=5)).isoformat()
++    path.write_text(yaml.safe_dump(raw, sort_keys=False))
++    expire_one(store, pr.id)
++    review = stats.review_summary(store, since_days=None)
++    assert review["expired"] == 1
++    assert review["by_agent"]["a"]["expired"] == 1

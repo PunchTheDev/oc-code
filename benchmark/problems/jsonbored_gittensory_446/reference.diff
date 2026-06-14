@@ -1,0 +1,306 @@
+diff --git a/src/github/backfill.ts b/src/github/backfill.ts
+index cc933f05..7e7d34ef 100644
+--- a/src/github/backfill.ts
++++ b/src/github/backfill.ts
+@@ -606,10 +606,14 @@ export async function refreshContributorActivity(
+       if (pullRequestCount + issueCount === 0) continue;
+ 
+       const openNodes = compactNodes(openPullRequests);
++      // allPullRequests, mergedPullRequests, and openPullRequests are overlapping views of the same
++      // PR set -- deduplicate by URL before extracting labels to avoid counting a PR's labels multiple times.
++      const seenUrls = new Set<string>();
++      const uniquePrNodes = [...compactNodes(allPullRequests), ...compactNodes(mergedPullRequests), ...compactNodes(openPullRequests)].filter(
++        (node) => node.url && !seenUrls.has(node.url) && seenUrls.add(node.url),
++      );
+       const labelNames = [
+-        ...labelsFromBucket(allPullRequests),
+-        ...labelsFromBucket(mergedPullRequests),
+-        ...labelsFromBucket(openPullRequests),
++        ...uniquePrNodes.flatMap((node) => (node.labels?.nodes ?? []).flatMap((label) => (label?.name ? [label.name] : []))),
+         ...labelsFromBucket(authoredIssues),
+       ];
+       await upsertContributorRepoStat(env, {
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index 9fd65545..00e7209c 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -123,6 +123,7 @@ import {
+   buildRoleContext,
+   detectGittensorContributor,
+   PR_PANEL_RETRIGGER_MARKER,
++  unionScopedOverlapClusters,
+ } from "../signals/engine";
+ import { decidePublicSurface } from "../signals/settings-preview";
+ import type { LocalBranchAnalysisInput } from "../signals/local-branch";
+@@ -780,10 +781,6 @@ function linkedIssueDuplicatePullRequestsForGate(pr: PullRequestRecord, pullRequ
+   ].sort((left, right) => left - right);
+ }
+ 
+-function pullRequestSpecificCollisionCount(collisions: ReturnType<typeof buildCollisionReport>, pr: PullRequestRecord): number {
+-  return collisions.clusters.filter((cluster) => cluster.items.some((item) => item.type === "pull_request" && item.number === pr.number)).length;
+-}
+-
+ async function auditGateCheckPermissionMissing(
+   env: Env,
+   actor: string | null,
+@@ -933,7 +930,7 @@ async function maybePublishPrPublicSurface(
+     preflight,
+     queueHealth,
+     linkedDuplicatePrs: linkedIssueDuplicatePullRequestsForGate(pr, repoPullRequests),
+-    scopedOverlapCount: Math.max(pullRequestSpecificCollisionCount(collisions, pr), preflight.collisions.length),
++    scopedOverlapCount: unionScopedOverlapClusters(collisions, pr, preflight.collisions).length,
+   });
+ 
+   const gateEvaluation = settings.gateCheckMode === "enabled" ? evaluateGateCheck(advisory, gateCheckPolicy(settings, readiness.total)) : undefined;
+diff --git a/src/signals/engine.ts b/src/signals/engine.ts
+index 39c59b45..9456b49b 100644
+--- a/src/signals/engine.ts
++++ b/src/signals/engine.ts
+@@ -3564,10 +3564,7 @@ export function buildPublicPrIntelligenceComment(args: {
+     .slice(0, args.settings.publicSignalLevel === "minimal" ? 2 : 5);
+   const prCollisionClusters = pullRequestSpecificCollisionClusters(args.collisions, args.pr);
+   const linkedDuplicatePrs = linkedIssueDuplicatePullRequests(args.pr, prCollisionClusters);
+-  // Deduplicated union of PR-specific clusters and planned-overlap (preflight) clusters -- they are
+-  // different filtered subsets of the same report, so the count must be their union, not max(), to
+-  // match the related-work items rendered in the panel details below.
+-  const scopedOverlapClusters = [...new Map([...prCollisionClusters, ...args.preflight.collisions].map((cluster) => [cluster.id, cluster])).values()];
++  const scopedOverlapClusters = unionScopedOverlapClusters(args.collisions, args.pr, args.preflight.collisions);
+   const scopedOverlapCount = scopedOverlapClusters.length;
+   const hasRelatedWork = linkedDuplicatePrs.length > 0 || scopedOverlapCount > 0;
+   const readiness = buildPublicReadinessScore({ pr: args.pr, preflight: args.preflight, queueHealth: args.queueHealth, linkedDuplicatePrs, scopedOverlapCount });
+@@ -3728,6 +3725,16 @@ function pullRequestSpecificCollisionClusters(report: CollisionReport, pr: PullR
+   return report.clusters.filter((cluster) => cluster.items.some((item) => item.type === "pull_request" && item.number === pr.number));
+ }
+ 
++/** Deduplicated union of PR-specific collision clusters and preflight overlap clusters. */
++export function unionScopedOverlapClusters(
++  report: CollisionReport,
++  pr: PullRequestRecord,
++  preflightCollisions: CollisionCluster[],
++): CollisionCluster[] {
++  const prCollisionClusters = pullRequestSpecificCollisionClusters(report, pr);
++  return [...new Map([...prCollisionClusters, ...preflightCollisions].map((cluster) => [cluster.id, cluster])).values()];
++}
++
+ function linkedIssueDuplicatePullRequests(pr: PullRequestRecord, clusters: CollisionCluster[]): number[] {
+   const linkedIssues = new Set(pr.linkedIssues);
+   if (linkedIssues.size === 0) return [];
+diff --git a/src/signals/settings-preview.ts b/src/signals/settings-preview.ts
+index 8e58cac5..5bf85a2d 100644
+--- a/src/signals/settings-preview.ts
++++ b/src/signals/settings-preview.ts
+@@ -13,6 +13,7 @@ import {
+   buildQueueHealth,
+   type ContributorDetection,
+ } from "./engine";
++import { REQUIRED_INSTALLATION_PERMISSIONS } from "../github/backfill";
+ 
+ export function hasVisiblePrSurface(settings: RepositorySettings): boolean {
+   return settings.publicSurface !== "off" || settings.checkRunMode === "enabled" || settings.gateCheckMode === "enabled";
+@@ -481,10 +482,13 @@ function writesPrPublicSurface(settings: RepositorySettings, decision: PublicSur
+ }
+ 
+ function requiredInstallPermissions(settings: RepositorySettings, decision: PublicSurfaceDecision): string[] {
+-  // PR conversation comments and PR labels use GitHub Issues endpoints, so they require issues:write, not
+-  // pull_requests:write -- the app only reads PRs. This matches REQUIRED_INSTALLATION_PERMISSIONS
+-  // (pull_requests: read) and avoids asking maintainers for broader PR-write scope than the app uses.
+-  const permissions = new Set(["metadata: read", "pull_requests: read"]);
++  // Read-only base permissions are derived from the canonical constant so this surface stays in sync.
++  // Write permissions are gated on whether the current settings actually produce that output.
++  const permissions = new Set(
++    Object.entries(REQUIRED_INSTALLATION_PERMISSIONS)
++      .filter(([, value]) => value === "read")
++      .map(([key, value]) => `${key}: ${value}`),
++  );
+   if (writesPrPublicSurface(settings, decision)) permissions.add("issues: write");
+   if (decision.willCheckRun || settings.checkRunMode === "enabled" || settings.gateCheckMode === "enabled") permissions.add("checks: write");
+   return [...permissions];
+diff --git a/test/unit/backfill.test.ts b/test/unit/backfill.test.ts
+index ae530dbb..1a648397 100644
+--- a/test/unit/backfill.test.ts
++++ b/test/unit/backfill.test.ts
+@@ -257,6 +257,50 @@ describe("GitHub backfill", () => {
+     ]);
+   });
+ 
++  it("does not double-count labels appearing in overlapping PR buckets (all/merged/open regression)", async () => {
++    // Regression: allPullRequests, mergedPullRequests, and openPullRequests are overlapping views of
++    // the same PR set. A label on a PR that appears in all three buckets was previously counted three
++    // times, biasing dominantLabels toward labels on frequently-bucketed PRs over labels that only
++    // appear once per PR but on many distinct PRs.
++    const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
++    await seedRegisteredRepo(env);
++    const sharedPrUrl = "https://github.com/JSONbored/gittensory/pull/10";
++    vi.stubGlobal("fetch", async () =>
++      Response.json({
++        data: {
++          // One PR with label "shared-label" appears in all three overlapping buckets.
++          // Two distinct issue records each have label "issue-label" once.
++          r_JSONbored_gittensory_all: {
++            issueCount: 1,
++            nodes: [{ __typename: "PullRequest", url: sharedPrUrl, updatedAt: "2026-05-24T00:00:00Z", labels: { nodes: [{ name: "shared-label" }] }, body: "" }],
++          },
++          r_JSONbored_gittensory_merged: {
++            issueCount: 1,
++            nodes: [{ __typename: "PullRequest", url: sharedPrUrl, updatedAt: "2026-05-24T00:00:00Z", labels: { nodes: [{ name: "shared-label" }] }, body: "" }],
++          },
++          r_JSONbored_gittensory_open: {
++            issueCount: 1,
++            nodes: [{ __typename: "PullRequest", url: sharedPrUrl, updatedAt: "2026-05-24T00:00:00Z", labels: { nodes: [{ name: "shared-label" }] }, body: "" }],
++          },
++          r_JSONbored_gittensory_issues: {
++            issueCount: 2,
++            nodes: [
++              { __typename: "Issue", updatedAt: "2026-05-23T00:00:00Z", labels: { nodes: [{ name: "issue-label" }] }, body: "" },
++              { __typename: "Issue", updatedAt: "2026-05-22T00:00:00Z", labels: { nodes: [{ name: "issue-label" }] }, body: "" },
++            ],
++          },
++        },
++      }),
++    );
++
++    await refreshContributorActivity(env, "jsonbored");
++    const [stat] = await listContributorRepoStats(env, "jsonbored");
++
++    // Without deduplication: shared-label count=3, issue-label count=2 → ["shared-label", "issue-label"]
++    // With deduplication:    shared-label count=1, issue-label count=2 → ["issue-label", "shared-label"]
++    expect(stat?.dominantLabels).toEqual(["issue-label", "shared-label"]);
++  });
++
+   it("carries GraphQL warnings and ignores repos with no contributor activity", async () => {
+     const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
+     await seedRegisteredRepo(env);
+diff --git a/test/unit/settings-preview.test.ts b/test/unit/settings-preview.test.ts
+index 1086f5fd..6e89034b 100644
+--- a/test/unit/settings-preview.test.ts
++++ b/test/unit/settings-preview.test.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from "vitest";
+ import { buildRepoSettingsPreview, decidePublicSurface, type InstallationHealthSummary } from "../../src/signals/settings-preview";
++import { REQUIRED_INSTALLATION_PERMISSIONS } from "../../src/github/backfill";
+ import type { IssueRecord, PullRequestRecord, RepositoryRecord, RepositorySettings } from "../../src/types";
+ 
+ const FORBIDDEN_INSTALL_PREVIEW_PUBLIC_LANGUAGE =
+@@ -350,4 +351,22 @@ describe("buildRepoSettingsPreview", () => {
+     expect(preview.installPreview.publicOutputs).toEqual(["No public comment, label, or check run for this sample."]);
+     expect(preview.installPreview.checklist.find((item) => item.id === "public-outputs")?.summary).toMatch(/no public output action is enabled/i);
+   });
++
++  it("derives read-only base permissions from REQUIRED_INSTALLATION_PERMISSIONS so the preview stays in sync with the canonical constant", () => {
++    // Regression: settings-preview previously hardcoded ["metadata: read", "pull_requests: read"] instead
++    // of reading from REQUIRED_INSTALLATION_PERMISSIONS, so any change to the constant would leave the
++    // preview silently stale (issue #419/#420 pattern).
++    const readEntries = Object.entries(REQUIRED_INSTALLATION_PERMISSIONS).filter(([, v]) => v === "read");
++    const expectedReadPerms = readEntries.map(([k, v]) => `${k}: ${v}`).sort();
++
++    const preview = buildRepoSettingsPreview({
++      ...base,
++      settings: settings({ publicSurface: "label_only", autoLabelEnabled: false, commentMode: "off", checkRunMode: "off" }),
++      installation: healthyInstall,
++      sample: { authorLogin: "miner", minerStatus: "confirmed" },
++    });
++
++    const actualReadPerms = (preview.installPreview.permissions.required as string[]).filter((p) => p.endsWith(": read")).sort();
++    expect(actualReadPerms).toEqual(expectedReadPerms);
++  });
+ });
+diff --git a/test/unit/signals-coverage.test.ts b/test/unit/signals-coverage.test.ts
+index cbd329cf..21010aeb 100644
+--- a/test/unit/signals-coverage.test.ts
++++ b/test/unit/signals-coverage.test.ts
+@@ -24,6 +24,7 @@ import {
+   buildRoleContext,
+   detectGittensorContributor,
+   shouldPublishPrIntelligenceComment,
++  unionScopedOverlapClusters,
+   type CollisionCluster,
+   type CollisionReport,
+   type QueueHealth,
+@@ -1142,6 +1143,54 @@ describe("signal coverage edge cases", () => {
+     expect(scoreComponent(weak, "queue_pressure")).toMatchObject({ score: 3, action: "Expect slower review." });
+   });
+ 
++  it("unionScopedOverlapClusters deduplicates PR-specific and preflight clusters (regression for Math.max mismatch)", () => {
++    const directRepo = repo("owner/dedup-overlap");
++    const currentPr = pr(directRepo.fullName, 10, "Cache refresh performance fix", { linkedIssues: [] });
++    const clusterA: CollisionCluster = {
++      id: "title-cluster-a",
++      risk: "medium",
++      reason: "Titles share meaningful terms.",
++      items: [
++        { type: "pull_request", number: currentPr.number, title: currentPr.title, authorLogin: "dev", labels: [], linkedIssues: [] },
++        { type: "pull_request", number: 20, title: "Cache refresh bug fix", authorLogin: "other", labels: [], linkedIssues: [] },
++      ],
++    };
++    const clusterB: CollisionCluster = {
++      id: "title-cluster-b",
++      risk: "medium",
++      reason: "Path overlap with another open PR.",
++      items: [
++        { type: "pull_request", number: currentPr.number, title: currentPr.title, authorLogin: "dev", labels: [], linkedIssues: [] },
++        { type: "issue", number: 5, title: "Perf regression in cache layer", authorLogin: "reporter", labels: [], linkedIssues: [] },
++      ],
++    };
++    const clusterC: CollisionCluster = {
++      id: "preflight-only-cluster",
++      risk: "low",
++      reason: "Planned overlap surfaced only in preflight.",
++      items: [
++        { type: "issue", number: 9, title: "Cache layer follow-up", authorLogin: "reporter", labels: [], linkedIssues: [] },
++      ],
++    };
++    const collisions: CollisionReport = {
++      repoFullName: directRepo.fullName,
++      generatedAt: "2026-06-07T00:00:00.000Z",
++      summary: { clusterCount: 2, highRiskCount: 0, itemsReviewed: 3 },
++      clusters: [clusterA, clusterB],
++    };
++
++    const preflightCollisions = [clusterB, clusterC];
++    const prSpecificCount = collisions.clusters.filter((cluster) =>
++      cluster.items.some((item) => item.type === "pull_request" && item.number === currentPr.number),
++    ).length;
++    const union = unionScopedOverlapClusters(collisions, currentPr, preflightCollisions);
++
++    expect(union.map((cluster) => cluster.id).sort()).toEqual(["preflight-only-cluster", "title-cluster-a", "title-cluster-b"]);
++    expect(union.length).toBe(3);
++    expect(Math.max(prSpecificCount, preflightCollisions.length)).toBe(2);
++    expect(union.length).toBeGreaterThan(Math.max(prSpecificCount, preflightCollisions.length));
++  });
++
+   it("keeps the public PR queue row coherent for zero and sampled queue evidence", () => {
+     const directRepo = repo("owner/queue-panel");
+     const currentPr = pr(directRepo.fullName, 43, "Fix queue display", {
+@@ -1214,6 +1263,32 @@ describe("signal coverage edge cases", () => {
+     });
+     expect(scoreComponent(sampledScore, "queue_pressure")).toMatchObject({ score: 3, action: "Expect slower review." });
+     expect(scoreComponent(sampledScore, "queue_pressure").evidence).toContain("1 likely reviewable in 1 cached PR(s); full queue reviewability is sampled");
++
++    // score=8 bucket (5–8 open PRs) — not covered by other cases
++    const mediumQueue: QueueHealth = {
++      ...queueHealthFixture(directRepo.fullName, "medium"),
++      signals: {
++        ...queueHealthFixture(directRepo.fullName, "medium").signals,
++        openPullRequests: 7,
++        likelyReviewablePullRequests: 3,
++        likelyReviewablePullRequestsSource: "cache",
++      },
++    };
++    expect(scoreComponent(buildPublicReadinessScore({ pr: currentPr, preflight: { ...preflight, status: "ready", reviewBurden: "low", findings: [] }, queueHealth: mediumQueue }), "queue_pressure")).toMatchObject({ score: 8, action: "No action." });
++
++    // sampledLikelyReviewable=true with cachedOpenPullRequests=0 → "likely-reviewable count unavailable" branch
++    const sampledNoCacheQueue: QueueHealth = {
++      ...queueHealthFixture(directRepo.fullName, "critical"),
++      signals: {
++        ...queueHealthFixture(directRepo.fullName, "critical").signals,
++        openPullRequests: 20,
++        cachedOpenPullRequests: 0,
++        likelyReviewablePullRequests: 0,
++        likelyReviewablePullRequestsSource: "sampled_cache",
++        ageBuckets: { under7Days: 0, days7To30: 0, over30Days: 0 },
++      },
++    };
++    expect(scoreComponent(buildPublicReadinessScore({ pr: currentPr, preflight: { ...preflight, status: "ready", reviewBurden: "low", findings: [] }, queueHealth: sampledNoCacheQueue }), "queue_pressure").evidence).toContain("likely-reviewable count unavailable from cached PR metadata");
+   });
+ 
+   it("filters disabled linked-issue findings and uses fallback next steps when the panel is clean", () => {

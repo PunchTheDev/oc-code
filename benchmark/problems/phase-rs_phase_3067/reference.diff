@@ -1,0 +1,731 @@
+diff --git a/crates/engine/src/game/engine_replacement.rs b/crates/engine/src/game/engine_replacement.rs
+index f479ccf23..1fda5398c 100644
+--- a/crates/engine/src/game/engine_replacement.rs
++++ b/crates/engine/src/game/engine_replacement.rs
+@@ -82,7 +82,20 @@ pub(super) fn handle_replacement_choice(
+         .pending_replacement
+         .as_ref()
+         .and_then(|pending| pending.library_placement.clone());
+-    match super::replacement::continue_replacement(state, index, events) {
++    let result = super::replacement::continue_replacement(state, index, events);
++    // CR 614.12a: an optional `MayCost` accept whose payment surfaced an
++    // interactive sub-choice (e.g. Mox Diamond's "discard a land card" with
++    // multiple eligible lands) re-parked the pending replacement with
++    // `may_cost_paid: true` plus any `may_cost_remaining`, and left
++    // `waiting_for` on the live sub-choice prompt.
++    // Surface that prompt as-is; the sub-choice's resolution re-enters
++    // `continue_replacement` (resume) to finish entering the permanent once the
++    // cost is paid. The carried `Execute` payload is inert and must not be
++    // delivered here.
++    if std::mem::take(&mut state.replacement_may_cost_paused) {
++        return Ok(state.waiting_for.clone());
++    }
++    match result {
+         super::replacement::ReplacementResult::Execute(event) => {
+             let mut zone_change_object_id = None;
+             let mut enters_battlefield = false;
+@@ -1580,6 +1593,8 @@ mod tests {
+             depth: 0,
+             is_optional: false,
+             library_placement: None,
++            may_cost_paid: false,
++            may_cost_remaining: None,
+         });
+         state.waiting_for = replacement_mod::replacement_choice_waiting_for(PlayerId(0), &state);
+         state.priority_player = PlayerId(0);
+diff --git a/crates/engine/src/game/engine_resolution_choices.rs b/crates/engine/src/game/engine_resolution_choices.rs
+index 0d910ed41..f64bd5ca3 100644
+--- a/crates/engine/src/game/engine_resolution_choices.rs
++++ b/crates/engine/src/game/engine_resolution_choices.rs
+@@ -2312,6 +2312,33 @@ pub(super) fn handle_resolution_choice(
+                 kind: effect_kind,
+                 source_id,
+             });
++
++            // CR 614.12a: this `DiscardChoice` was the interactive payment of an
++            // optional `MayCost` replacement's accept (e.g. Mox Diamond's
++            // "discard a land card" with multiple eligible lands). The cost is
++            // now paid, so resume the parked replacement with the accept index —
++            // `continue_replacement` sees `may_cost_paid: true`, pays any
++            // `may_cost_remaining`, and finishes entering the permanent. This
++            // runs instead of the ordinary continuation drain (there is no
++            // `Effect::PayCost` chain behind a replacement-originated discard).
++            if state
++                .pending_replacement
++                .as_ref()
++                .is_some_and(|pending| pending.may_cost_paid)
++            {
++                let waiting_for =
++                    super::engine_replacement::handle_replacement_choice(state, 0, events)?;
++                if let Some(outcome) = batch_or_drain_observer_triggers(
++                    state,
++                    events,
++                    events_before_effect,
++                    events_after_move,
++                ) {
++                    return Ok(outcome);
++                }
++                return Ok(ResolutionChoiceOutcome::WaitingFor(waiting_for));
++            }
++
+             let waiting_for = finish_with_continuation(state, player, events);
+ 
+             // CR 603.2c: each opponent's discard is a separate occurrence of a
+diff --git a/crates/engine/src/game/replacement.rs b/crates/engine/src/game/replacement.rs
+index 793178463..7f8f6983e 100644
+--- a/crates/engine/src/game/replacement.rs
++++ b/crates/engine/src/game/replacement.rs
+@@ -5,7 +5,8 @@ use crate::types::ability::{
+     AbilityCost, AbilityDefinition, CombatDamageScope, ControllerRef, DamageModification,
+     DamageTargetFilter, DamageTargetPlayerScope, Effect, EffectScope, PostReplacementContinuation,
+     PreventionAmount, QuantityExpr, QuantityModification, ReplacementCondition,
+-    ReplacementDefinition, ReplacementMode, ShieldKind, TapStateChange, TargetFilter, TargetRef,
++    ReplacementDefinition, ReplacementMode, ResolvedAbility, ShieldKind, TapStateChange,
++    TargetFilter, TargetRef,
+ };
+ use crate::types::card_type::CoreType;
+ use crate::types::counter::CounterType;
+@@ -537,17 +538,51 @@ fn replacement_mode_decline_cloned(mode: &ReplacementMode) -> Option<Box<Ability
+     }
+ }
+ 
++/// CR 614.12a: outcome of attempting to pay an optional `MayCost` replacement's
++/// accept-cost. The accept path applies the replacement only on [`Paid`]; on
++/// [`Unpaid`] it falls through to the decline branch (CR 614.12); on
++/// [`PausedForChoice`] the payment has set an interactive `WaitingFor` (e.g. a
++/// `DiscardChoice`) and the replacement must re-park itself so the post-choice
++/// resume can finish any remaining cost before entering the permanent — never
++/// let it enter early.
++///
++/// [`Paid`]: MayCostOutcome::Paid
++/// [`Unpaid`]: MayCostOutcome::Unpaid
++/// [`PausedForChoice`]: MayCostOutcome::PausedForChoice
++#[derive(Debug, Clone, PartialEq, Eq)]
++enum MayCostOutcome {
++    Paid,
++    Unpaid,
++    PausedForChoice { remaining_cost: Option<AbilityCost> },
++}
++
++fn combine_paused_may_cost(
++    paused_remaining: Option<AbilityCost>,
++    following_costs: &[AbilityCost],
++) -> Option<AbilityCost> {
++    let mut costs = Vec::new();
++    if let Some(cost) = paused_remaining {
++        costs.push(cost);
++    }
++    costs.extend(following_costs.iter().cloned());
++    match costs.len() {
++        0 => None,
++        1 => costs.into_iter().next(),
++        _ => Some(AbilityCost::Composite { costs }),
++    }
++}
++
+ fn pay_replacement_may_cost(
+     state: &mut GameState,
+     player: PlayerId,
+     source_id: ObjectId,
+     cost: &AbilityCost,
+     events: &mut Vec<GameEvent>,
+-) -> bool {
++) -> MayCostOutcome {
+     if !cost.is_payable(state, player, source_id) {
+-        return false;
++        return MayCostOutcome::Unpaid;
+     }
+-    match cost {
++    let paid = match cost {
+         AbilityCost::Mana { cost } => {
+             crate::game::casting::pay_unless_cost(state, player, cost, events).is_ok()
+         }
+@@ -560,10 +595,92 @@ fn pay_replacement_may_cost(
+                 crate::game::life_costs::PayLifeCostResult::Paid { .. }
+             )
+         }
+-        AbilityCost::Composite { costs } => costs
+-            .iter()
+-            .all(|cost| pay_replacement_may_cost(state, player, source_id, cost, events)),
++        AbilityCost::Composite { costs } => {
++            // CR 614.12a: a composite accept-cost pays each sub-cost in order; a
++            // mid-composite pause carries the unpaid suffix so the resume
++            // completes the rest before the replacement applies.
++            for (index, sub_cost) in costs.iter().enumerate() {
++                match pay_replacement_may_cost(state, player, source_id, sub_cost, events) {
++                    MayCostOutcome::Paid => {}
++                    MayCostOutcome::PausedForChoice { remaining_cost } => {
++                        return MayCostOutcome::PausedForChoice {
++                            remaining_cost: combine_paused_may_cost(
++                                remaining_cost,
++                                &costs[index + 1..],
++                            ),
++                        };
++                    }
++                    MayCostOutcome::Unpaid => return MayCostOutcome::Unpaid,
++                }
++            }
++            true
++        }
++        // CR 614.12a + CR 118.12 + CR 701.9a: a "discard a [type] card" cost
++        // paid as the replacement is applied (Mox Diamond, Chrome Mox-style
++        // as-enters discards). This is the chosen-from-hand discard shape, which
++        // only has a real payment arm in *resolution* scope — the activation-
++        // scope `pay_ability_cost` no-ops it (it expects the interactive
++        // `WaitingFor::PayCost`/`DiscardChoice` detour to have run first, which
++        // never happens on the replacement accept path). Routing through the
++        // resolution authority discards the card(s) for real: when the eligible
++        // set exactly fills the requirement the discard auto-pays synchronously
++        // (`PaymentOutcome::Paid`); otherwise the authority sets
++        // `WaitingFor::DiscardChoice` and returns `Paused`, which surfaces as
++        // `PausedForChoice` so the accept path re-parks the replacement and the
++        // permanent enters only after the card actually leaves the hand.
++        AbilityCost::Discard {
++            selection: crate::types::ability::CardSelectionMode::Chosen,
++            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
++            ..
++        } => {
++            // The synthesized ability is the payment context for the resolution
++            // authority: `pay_ability_cost_for_resolution` reads only its
++            // `source_id` and resolves the (here fixed) discard `count` against
++            // it. Modeling it as `Effect::PayCost { cost }` keeps the context
++            // self-describing without inventing a fake target chain.
++            let ability = ResolvedAbility::new(
++                crate::types::ability::Effect::PayCost {
++                    cost: cost.clone(),
++                    scale: None,
++                    payer: TargetFilter::Controller,
++                },
++                Vec::new(),
++                source_id,
++                player,
++            );
++            // CR 118.12 + CR 701.9b: when the eligible set exceeds the requirement
++            // the resolution authority sets `WaitingFor::DiscardChoice` for the
++            // player to pick *which* card(s) to discard. The non-composite discard
++            // arm reports `Paid` in that case (the pending choice IS the payment),
++            // so the set `waiting_for` — not just the `PaymentOutcome` — signals
++            // the interactive pause. Snapshot it to distinguish a synchronous
++            // forced/auto discard (`Paid`, no choice) from a paused one.
++            let prior_waiting_for = state.waiting_for.clone();
++            match crate::game::costs::pay_ability_cost_for_resolution(
++                state, player, cost, &ability, events,
++            ) {
++                Ok(crate::game::costs::PaymentOutcome::Paid) => {
++                    if state.waiting_for != prior_waiting_for
++                        && matches!(state.waiting_for, WaitingFor::DiscardChoice { .. })
++                    {
++                        return MayCostOutcome::PausedForChoice {
++                            remaining_cost: None,
++                        };
++                    }
++                    true
++                }
++                Ok(crate::game::costs::PaymentOutcome::Paused { remaining_cost }) => {
++                    return MayCostOutcome::PausedForChoice { remaining_cost };
++                }
++                Ok(crate::game::costs::PaymentOutcome::Failed { .. }) | Err(_) => false,
++            }
++        }
+         _ => crate::game::casting::pay_ability_cost(state, player, source_id, cost, events).is_ok(),
++    };
++    if paid {
++        MayCostOutcome::Paid
++    } else {
++        MayCostOutcome::Unpaid
+     }
+ }
+ 
+@@ -4867,6 +4984,10 @@ fn pipeline_loop(
+                     // CR 701.24a: set by the W3 library-placement arm after parking
+                     // (the pipeline doesn't know the caller's placement here).
+                     library_placement: None,
++                    // CR 614.12a: first park of this choice — no MayCost has been
++                    // paid yet. Set only when re-parking after a paused accept.
++                    may_cost_paid: false,
++                    may_cost_remaining: None,
+                 });
+                 return ReplacementResult::NeedsChoice(affected);
+             }
+@@ -4896,6 +5017,9 @@ fn pipeline_loop(
+                 is_optional: false,
+                 // CR 701.24a: set by the W3 library-placement arm after parking.
+                 library_placement: None,
++                // CR 614.12a: distinct-replacement choices carry no MayCost.
++                may_cost_paid: false,
++                may_cost_remaining: None,
+             });
+             return ReplacementResult::NeedsChoice(affected);
+         } else {
+@@ -5030,6 +5154,15 @@ pub fn continue_replacement(
+     if pending.is_optional {
+         let rid = pending.candidates[0];
+         let payer = pending.proposed.affected_player(state);
++        // CR 614.12a: a `true` flag means this is the post-choice resume of an
++        // accept whose `MayCost` payment paused for an interactive sub-choice
++        // (e.g. a `DiscardChoice`). Re-park fields are captured up front so a
++        // fresh pause can re-stash the same record.
++        let resuming_after_paid_cost = pending.may_cost_paid;
++        let remaining_may_cost = pending.may_cost_remaining.clone();
++        let reparked_candidates = pending.candidates.clone();
++        let reparked_depth = pending.depth;
++        let reparked_library_placement = pending.library_placement.clone();
+         let mut proposed = pending.proposed;
+         proposed.mark_applied(rid);
+ 
+@@ -5049,12 +5182,51 @@ pub fn continue_replacement(
+             })
+             .unwrap_or((None, None, None));
+ 
+-        let paid_may_cost = if chosen_index == 0 {
+-            may_cost
+-                .as_ref()
+-                .is_none_or(|cost| pay_replacement_may_cost(state, payer, rid.source, cost, events))
++        // CR 614.12a: on accept, pay the MayCost (skipped on a paid resume). A
++        // `PausedForChoice` outcome means the payment surfaced an interactive
++        // sub-choice (`WaitingFor` already set) — re-park the SAME pending record
++        // with `may_cost_paid: true` plus any unpaid suffix so the post-choice
++        // resume re-enters here, continues payment, and finishes entering the
++        // permanent. The permanent must NOT enter until the card actually leaves
++        // the hand.
++        let pay_outcome = if chosen_index != 0 {
++            MayCostOutcome::Unpaid
++        } else if resuming_after_paid_cost {
++            match &remaining_may_cost {
++                None => MayCostOutcome::Paid,
++                Some(cost) => pay_replacement_may_cost(state, payer, rid.source, cost, events),
++            }
+         } else {
+-            false
++            match &may_cost {
++                None => MayCostOutcome::Paid,
++                Some(cost) => pay_replacement_may_cost(state, payer, rid.source, cost, events),
++            }
++        };
++
++        let paid_may_cost = match pay_outcome {
++            MayCostOutcome::Paid => true,
++            MayCostOutcome::Unpaid => false,
++            MayCostOutcome::PausedForChoice { remaining_cost } => {
++                // CR 614.12a: the payment surfaced an interactive sub-choice (e.g. a
++                // `DiscardChoice`); `state.waiting_for` is already set to it. Re-park
++                // the SAME pending record with `may_cost_paid: true` and flag the
++                // pause so `handle_replacement_choice` surfaces the live sub-choice
++                // (not a fresh ReplacementChoice). The permanent enters only when
++                // the resume finishes any `may_cost_remaining`. The carried
++                // `Execute` payload is inert — the flag short-circuits the caller
++                // before it is read.
++                state.pending_replacement = Some(crate::types::game_state::PendingReplacement {
++                    proposed: proposed.clone(),
++                    candidates: reparked_candidates,
++                    depth: reparked_depth,
++                    is_optional: true,
++                    library_placement: reparked_library_placement,
++                    may_cost_paid: true,
++                    may_cost_remaining: remaining_cost,
++                });
++                state.replacement_may_cost_paused = true;
++                return ReplacementResult::Execute(proposed);
++            }
+         };
+ 
+         let (branch, post_effect) = if chosen_index == 0 && paid_may_cost {
+@@ -6288,6 +6460,8 @@ mod tests {
+             depth: 0,
+             is_optional: true,
+             library_placement: None,
++            may_cost_paid: false,
++            may_cost_remaining: None,
+         });
+ 
+         let WaitingFor::ReplacementChoice {
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index b7ace9dbd..0083bf2db 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -5127,6 +5127,17 @@ pub struct GameState {
+ 
+     // Replacement effects
+     pub pending_replacement: Option<PendingReplacement>,
++    /// CR 614.12a: set by `continue_replacement` when an optional `MayCost`
++    /// accept's payment paused for an interactive sub-choice (e.g. Mox Diamond's
++    /// "discard a land card" with multiple eligible lands). It re-parks the
++    /// pending replacement (`may_cost_paid: true`, plus any `may_cost_remaining`)
++    /// and leaves `waiting_for` on the live sub-choice prompt.
++    /// `handle_replacement_choice` reads this flag to surface that prompt instead
++    /// of re-applying the replacement, and the sub-choice's resolution resumes
++    /// the accept once the cost is settled.
++    /// Cleared the moment it is observed. Transient — never serialized.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub replacement_may_cost_paused: bool,
+     /// CR 614.12a + CR 615.5: Continuation effect to resolve after a
+     /// replacement's modifications complete. The two binding states (Template
+     /// AST vs. Resolved with captured targets) share one slot via
+@@ -6335,6 +6346,22 @@ pub struct PendingReplacement {
+     /// away. `None` for every other parked event (the common case).
+     #[serde(default)]
+     pub library_placement: Option<crate::types::ability::LibraryPosition>,
++    /// CR 614.12a: set when an optional `MayCost` accept already paid its cost
++    /// but the payment paused for an interactive sub-choice (e.g. Mox Diamond's
++    /// "discard a land card" with more than one eligible land surfaces a
++    /// `WaitingFor::DiscardChoice`). The pending record is re-parked so the
++    /// post-choice resume re-enters `continue_replacement` with the accept
++    /// index; this flag tells that resume to continue MayCost payment from
++    /// `may_cost_remaining` instead of restarting the whole cost. `false` for
++    /// every other parked event.
++    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++    pub may_cost_paid: bool,
++    /// CR 614.12a + CR 118.12: unpaid suffix of a composite `MayCost` after an
++    /// interactive sub-choice paused payment. `None` means the sub-choice was
++    /// the final cost component; `Some(cost)` is paid on the post-choice resume
++    /// before the replacement is applied.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub may_cost_remaining: Option<AbilityCost>,
+ }
+ 
+ /// CR 703.4q + CR 616.1 + CR 614.1a: One step-end mana handler entry pending
+@@ -6616,6 +6643,7 @@ impl GameState {
+             max_lands_per_turn: 1,
+             priority_pass_count: 0,
+             pending_replacement: None,
++            replacement_may_cost_paused: false,
+             post_replacement_continuation: None,
+             legacy_post_replacement_effect: None,
+             legacy_post_replacement_resolved_effect: None,
+diff --git a/crates/engine/tests/mox_diamond_discard_cost_2853.rs b/crates/engine/tests/mox_diamond_discard_cost_2853.rs
+new file mode 100644
+index 000000000..bba649759
+--- /dev/null
++++ b/crates/engine/tests/mox_diamond_discard_cost_2853.rs
+@@ -0,0 +1,331 @@
++//! Mox Diamond — the as-enters "you may discard a land card instead" cost must
++//! actually discard a land when accepted, and only then does the artifact enter.
++//!
++//! Regression for issue #2853: the `MayCost { Discard }` replacement parsed
++//! correctly (accept/decline branches present), but the runtime accept path
++//! routed the discard through `pay_ability_cost` in *activation* scope. The
++//! `Discard { FromHand, Chosen }` shape is only paid in *resolution* scope; in
++//! activation scope it fell through to the interactive-pass-through arm and
++//! returned `Paid` as a silent no-op. The land was never discarded, yet the
++//! artifact still entered (the cost was skipped). These tests drive the real
++//! parsed replacement through the as-enters pipeline and assert the land is
++//! discarded on accept, kept on decline, and that an unpayable accept routes
++//! the artifact to the graveyard.
++//!
++//! CR 614.12a / CR 614.12: a declined/unpayable alternative routes to the
++//! owner's graveyard; CR 701.9a: discarding moves a card from hand to graveyard.
++
++use engine::game::effects::change_zone::resolve;
++use engine::game::scenario::{GameScenario, P0};
++use engine::types::ability::{
++    AbilityCost, QuantityExpr, ReplacementMode, ResolvedAbility, TargetFilter,
++};
++use engine::types::actions::GameAction;
++use engine::types::game_state::WaitingFor;
++use engine::types::identifiers::ObjectId;
++use engine::types::player::PlayerId;
++use engine::types::zones::Zone;
++
++const MOX_DIAMOND_ORACLE: &str =
++    "If this artifact would enter, you may discard a land card instead. If you do, \
++     put this artifact onto the battlefield. If you don't, put it into its owner's \
++     graveyard.";
++
++/// Move a card from hand to the battlefield, surfacing its as-enters `MayCost`
++/// replacement choice (mirrors the production ETB pathway for Mox Diamond).
++fn enter_via_change_zone(runner_state: &mut engine::types::game_state::GameState, card: ObjectId) {
++    let ability = ResolvedAbility::new(
++        engine::types::ability::Effect::ChangeZone {
++            origin: Some(Zone::Hand),
++            destination: Zone::Battlefield,
++            target: TargetFilter::SpecificObject { id: card },
++            owner_library: false,
++            enter_transformed: false,
++            enters_under: None,
++            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
++            enters_attacking: false,
++            up_to: false,
++            enter_with_counters: vec![],
++            face_down_profile: None,
++        },
++        vec![],
++        ObjectId(9000),
++        PlayerId(0),
++    );
++    let mut events = Vec::new();
++    resolve(runner_state, &ability, &mut events)
++        .expect("Mox Diamond enter resolves into a MayCost pause");
++}
++
++/// CR 614.12a + CR 701.9a: accepting the discard cost must discard a land from
++/// hand and only then put Mox Diamond onto the battlefield.
++#[test]
++fn mox_diamond_accept_discards_land_and_enters() {
++    let mut scenario = GameScenario::new();
++    let mox = scenario
++        .add_creature_to_hand(P0, "Mox Diamond", 0, 0)
++        .as_artifact()
++        .from_oracle_text(MOX_DIAMOND_ORACLE)
++        .id();
++    let forest = scenario.add_land_to_hand(P0, "Forest").id();
++    let mut runner = scenario.build();
++
++    enter_via_change_zone(runner.state_mut(), mox);
++
++    // The as-enters replacement pauses for the accept/decline choice.
++    assert!(
++        matches!(
++            runner.state().waiting_for,
++            WaitingFor::ReplacementChoice { .. }
++        ),
++        "expected Mox Diamond MayCost ReplacementChoice, got {:?}",
++        runner.state().waiting_for
++    );
++
++    // Accept (index 0): pay the discard cost. With exactly one land in hand the
++    // discard is forced — no further choice round-trip.
++    runner
++        .act(GameAction::ChooseReplacement { index: 0 })
++        .expect("accepting the Mox Diamond discard cost should resolve");
++
++    assert!(
++        !matches!(
++            runner.state().waiting_for,
++            WaitingFor::ReplacementChoice { .. }
++        ),
++        "the replacement choice must be consumed after accepting"
++    );
++    assert_eq!(
++        runner.state().objects[&forest].zone,
++        Zone::Graveyard,
++        "accepting the cost must discard the land to its owner's graveyard, \
++         not leave it in hand"
++    );
++    assert_eq!(
++        runner.state().objects[&mox].zone,
++        Zone::Battlefield,
++        "after paying the discard cost, Mox Diamond enters the battlefield"
++    );
++}
++
++/// CR 614.12a: declining sends Mox Diamond to its owner's graveyard and never
++/// discards a land.
++#[test]
++fn mox_diamond_decline_routes_to_graveyard_without_discard() {
++    let mut scenario = GameScenario::new();
++    let mox = scenario
++        .add_creature_to_hand(P0, "Mox Diamond", 0, 0)
++        .as_artifact()
++        .from_oracle_text(MOX_DIAMOND_ORACLE)
++        .id();
++    let forest = scenario.add_land_to_hand(P0, "Forest").id();
++    let mut runner = scenario.build();
++
++    enter_via_change_zone(runner.state_mut(), mox);
++
++    let WaitingFor::ReplacementChoice {
++        candidate_descriptions,
++        ..
++    } = &runner.state().waiting_for
++    else {
++        panic!(
++            "expected Mox Diamond MayCost ReplacementChoice, got {:?}",
++            runner.state().waiting_for
++        );
++    };
++    let decline = candidate_descriptions
++        .iter()
++        .position(|d| d.contains("Decline"))
++        .expect("decline option must be offered");
++
++    runner
++        .act(GameAction::ChooseReplacement { index: decline })
++        .expect("declining should resolve");
++
++    assert_eq!(
++        runner.state().objects[&mox].zone,
++        Zone::Graveyard,
++        "a declined Mox Diamond is routed to its owner's graveyard"
++    );
++    assert_eq!(
++        runner.state().objects[&forest].zone,
++        Zone::Hand,
++        "declining must not discard a land"
++    );
++}
++
++/// CR 614.12a: accepting with no land to discard is an unpayable cost — it falls
++/// through to the decline branch (Mox to graveyard), never entering for free.
++#[test]
++fn mox_diamond_accept_unpayable_routes_to_graveyard() {
++    let mut scenario = GameScenario::new();
++    let mox = scenario
++        .add_creature_to_hand(P0, "Mox Diamond", 0, 0)
++        .as_artifact()
++        .from_oracle_text(MOX_DIAMOND_ORACLE)
++        .id();
++    let mut runner = scenario.build();
++
++    enter_via_change_zone(runner.state_mut(), mox);
++
++    assert!(
++        matches!(
++            runner.state().waiting_for,
++            WaitingFor::ReplacementChoice { .. }
++        ),
++        "expected Mox Diamond MayCost ReplacementChoice, got {:?}",
++        runner.state().waiting_for
++    );
++
++    runner
++        .act(GameAction::ChooseReplacement { index: 0 })
++        .expect("accepting an unpayable cost should resolve");
++
++    assert_eq!(
++        runner.state().objects[&mox].zone,
++        Zone::Graveyard,
++        "an unpayable Mox Diamond discard cost falls through to the graveyard \
++         redirect — it must never enter the battlefield for free"
++    );
++}
++
++/// CR 701.9a: with more than one eligible land, the discard requires a genuine
++/// choice. The accept path must surface that choice (not silently auto-pick or
++/// no-op); only after a land is actually discarded does Mox Diamond enter.
++#[test]
++fn mox_diamond_accept_with_multiple_lands_requires_choice() {
++    let mut scenario = GameScenario::new();
++    let mox = scenario
++        .add_creature_to_hand(P0, "Mox Diamond", 0, 0)
++        .as_artifact()
++        .from_oracle_text(MOX_DIAMOND_ORACLE)
++        .id();
++    let forest_a = scenario.add_land_to_hand(P0, "Forest").id();
++    let forest_b = scenario.add_land_to_hand(P0, "Forest").id();
++    let mut runner = scenario.build();
++
++    enter_via_change_zone(runner.state_mut(), mox);
++
++    assert!(
++        matches!(
++            runner.state().waiting_for,
++            WaitingFor::ReplacementChoice { .. }
++        ),
++        "expected Mox Diamond MayCost ReplacementChoice, got {:?}",
++        runner.state().waiting_for
++    );
++
++    runner
++        .act(GameAction::ChooseReplacement { index: 0 })
++        .expect("accepting the discard cost should resolve");
++
++    // Two lands: the cost is not forced, so the engine must ask which land to
++    // discard before the artifact can enter.
++    assert!(
++        matches!(runner.state().waiting_for, WaitingFor::DiscardChoice { .. }),
++        "expected a DiscardChoice for the two-land case, got {:?}",
++        runner.state().waiting_for
++    );
++
++    runner
++        .act(GameAction::SelectCards {
++            cards: vec![forest_a],
++        })
++        .expect("selecting the land to discard should resolve");
++
++    assert_eq!(
++        runner.state().objects[&forest_a].zone,
++        Zone::Graveyard,
++        "the chosen land is discarded"
++    );
++    assert_eq!(
++        runner.state().objects[&forest_b].zone,
++        Zone::Hand,
++        "the un-chosen land stays in hand"
++    );
++    assert_eq!(
++        runner.state().objects[&mox].zone,
++        Zone::Battlefield,
++        "Mox Diamond enters after the discard choice is committed"
++    );
++}
++
++/// CR 614.12a + CR 118.12: if a composite MayCost pauses for an interactive
++/// discard choice, the post-choice resume must still pay the remaining suffix
++/// before the replacement applies.
++#[test]
++fn may_cost_discard_choice_resume_pays_remaining_composite_suffix() {
++    let mut scenario = GameScenario::new();
++    let mox = scenario
++        .add_creature_to_hand(P0, "Mox Diamond", 0, 0)
++        .as_artifact()
++        .from_oracle_text(MOX_DIAMOND_ORACLE)
++        .id();
++    let forest_a = scenario.add_land_to_hand(P0, "Forest").id();
++    let forest_b = scenario.add_land_to_hand(P0, "Forest").id();
++
++    let mut runner = scenario.build();
++
++    {
++        let obj = runner.state_mut().objects.get_mut(&mox).unwrap();
++        let replacement_index = obj
++            .replacement_definitions
++            .iter_unchecked()
++            .position(|definition| matches!(definition.mode, ReplacementMode::MayCost { .. }))
++            .expect("Mox Diamond replacement should parse as MayCost");
++        let replacement = &mut obj.replacement_definitions[replacement_index];
++        let (discard_cost, decline) = match &replacement.mode {
++            ReplacementMode::MayCost { cost, decline } => (cost.clone(), decline.clone()),
++            other => panic!("expected MayCost, got {other:?}"),
++        };
++        replacement.mode = ReplacementMode::MayCost {
++            cost: AbilityCost::Composite {
++                costs: vec![
++                    discard_cost,
++                    AbilityCost::PayLife {
++                        amount: QuantityExpr::Fixed { value: 2 },
++                    },
++                ],
++            },
++            decline,
++        };
++    }
++
++    enter_via_change_zone(runner.state_mut(), mox);
++
++    runner
++        .act(GameAction::ChooseReplacement { index: 0 })
++        .expect("accepting the composite MayCost should surface discard choice");
++    assert!(
++        matches!(runner.state().waiting_for, WaitingFor::DiscardChoice { .. }),
++        "expected a DiscardChoice for the two-land composite case, got {:?}",
++        runner.state().waiting_for
++    );
++
++    runner
++        .act(GameAction::SelectCards {
++            cards: vec![forest_a],
++        })
++        .expect("selecting the land to discard should resume the remaining cost");
++
++    assert_eq!(
++        runner.state().objects[&forest_a].zone,
++        Zone::Graveyard,
++        "the chosen land is discarded"
++    );
++    assert_eq!(
++        runner.state().objects[&forest_b].zone,
++        Zone::Hand,
++        "the un-chosen land stays in hand"
++    );
++    assert_eq!(
++        runner.state().players[0].life,
++        18,
++        "the remaining PayLife suffix must be paid after the discard choice"
++    );
++    assert_eq!(
++        runner.state().objects[&mox].zone,
++        Zone::Battlefield,
++        "Mox Diamond enters only after all composite cost components are paid"
++    );
++}

@@ -1,0 +1,982 @@
+diff --git a/celery/app/base.py b/celery/app/base.py
+index 7af07de9410..27b0421763c 100644
+--- a/celery/app/base.py
++++ b/celery/app/base.py
+@@ -14,9 +14,10 @@
+ 
+ from click.exceptions import Exit
+ from dateutil.parser import isoparse
+-from kombu import pools
++from kombu import Exchange, pools
+ from kombu.clocks import LamportClock
+ from kombu.common import oid_from
++from kombu.transport.native_delayed_delivery import calculate_routing_key
+ from kombu.utils.compat import register_after_fork
+ from kombu.utils.objects import cached_property
+ from kombu.utils.uuid import uuid
+@@ -38,6 +39,7 @@
+ from celery.utils.time import maybe_make_aware, timezone, to_utc
+ 
+ from ..utils.annotations import annotation_is_class, annotation_issubclass, get_optional_arg
++from ..utils.quorum_queues import detect_quorum_queues
+ # Load all builtin tasks
+ from . import backends, builtins  # noqa
+ from .annotations import prepare as prepare_annotations
+@@ -513,6 +515,7 @@ def _create_task_cls(fun):
+                 if shared:
+                     def cons(app):
+                         return app._task_from_fun(fun, **opts)
++
+                     cons.__name__ = fun.__name__
+                     connect_on_app_finalize(cons)
+                 if not lazy or self.finalized:
+@@ -828,6 +831,33 @@ def send_task(self, name, args=None, kwargs=None, countdown=None,
+         ignore_result = options.pop('ignore_result', False)
+         options = router.route(
+             options, route_name or name, args, kwargs, task_type)
++
++        is_native_delayed_delivery = detect_quorum_queues(self,
++                                                          self.producer_pool.connections.connection.transport_cls)[0]
++        if is_native_delayed_delivery and options['queue'].exchange.type != 'direct':
++            if eta:
++                if isinstance(eta, str):
++                    eta = isoparse(eta)
++                countdown = (maybe_make_aware(eta) - self.now()).total_seconds()
++
++            if countdown:
++                if countdown > 0:
++                    routing_key = calculate_routing_key(int(countdown), options["queue"].routing_key)
++                    exchange = Exchange(
++                        'celery_delayed_27',
++                        type='topic',
++                    )
++                    del options['queue']
++                    options['routing_key'] = routing_key
++                    options['exchange'] = exchange
++        elif is_native_delayed_delivery and options['queue'].exchange.type == 'direct':
++            logger.warning(
++                'Direct exchanges are not supported with native delayed delivery.\n'
++                f'{options["queue"].exchange.name} is a direct exchange but should be a topic exchange or '
++                'a fanout exchange in order for native delayed delivery to work properly.\n'
++                'If quorum queues are used, this task may block the worker process until the ETA arrives.'
++            )
++
+         if expires is not None:
+             if isinstance(expires, datetime):
+                 expires_s = (maybe_make_aware(
+@@ -988,6 +1018,7 @@ def _connection(self, url, userid=None, password=None,
+                 'broker_connection_timeout', connect_timeout
+             ),
+         )
++
+     broker_connection = connection
+ 
+     def _acquire_connection(self, pool=True):
+@@ -1007,6 +1038,7 @@ def connection_or_acquire(self, connection=None, pool=True, *_, **__):
+                 will be acquired from the connection pool.
+         """
+         return FallbackContext(connection, self._acquire_connection, pool=pool)
++
+     default_connection = connection_or_acquire  # XXX compat
+ 
+     def producer_or_acquire(self, producer=None):
+@@ -1022,6 +1054,7 @@ def producer_or_acquire(self, producer=None):
+         return FallbackContext(
+             producer, self.producer_pool.acquire, block=True,
+         )
++
+     default_producer = producer_or_acquire  # XXX compat
+ 
+     def prepare_config(self, c):
+diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index 04bc1927944..f8e2511fd01 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -95,6 +95,7 @@ def __repr__(self):
+         heartbeat=Option(120, type='int'),
+         heartbeat_checkrate=Option(3.0, type='int'),
+         login_method=Option(None, type='string'),
++        native_delayed_delivery_queue_type=Option(default='quorum', type='string'),
+         pool_limit=Option(10, type='int'),
+         use_ssl=Option(False, type='bool'),
+ 
+diff --git a/celery/backends/dynamodb.py b/celery/backends/dynamodb.py
+index d5159353b00..0423a468014 100644
+--- a/celery/backends/dynamodb.py
++++ b/celery/backends/dynamodb.py
+@@ -504,7 +504,7 @@ def _prepare_inc_count_request(self, key: str) -> Dict[str, Any]:
+             "ExpressionAttributeValues": {
+                 ":num": {"N": "1"},
+             },
+-            "ReturnValues" : "UPDATED_NEW",
++            "ReturnValues": "UPDATED_NEW",
+         }
+ 
+     def _item_to_dict(self, raw_response):
+diff --git a/celery/backends/elasticsearch.py b/celery/backends/elasticsearch.py
+index a97869bef52..9e6f2655639 100644
+--- a/celery/backends/elasticsearch.py
++++ b/celery/backends/elasticsearch.py
+@@ -97,7 +97,7 @@ def exception_safe_to_retry(self, exc):
+             # N/A: Low level exception (i.e. socket exception)
+             if exc.status_code in {401, 409, 500, 502, 504, 'N/A'}:
+                 return True
+-        if isinstance(exc , elasticsearch.exceptions.TransportError):
++        if isinstance(exc, elasticsearch.exceptions.TransportError):
+             return True
+         return False
+ 
+diff --git a/celery/bin/base.py b/celery/bin/base.py
+index 073b86a7e91..61cc37a0291 100644
+--- a/celery/bin/base.py
++++ b/celery/bin/base.py
+@@ -173,6 +173,7 @@ def format_options(self, ctx, formatter):
+ 
+ class DaemonOption(CeleryOption):
+     """Common daemonization option"""
++
+     def __init__(self, *args, **kwargs):
+         super().__init__(args,
+                          help_group=kwargs.pop("help_group", "Daemonization Options"),
+diff --git a/celery/utils/quorum_queues.py b/celery/utils/quorum_queues.py
+new file mode 100644
+index 00000000000..0eb058fa6b2
+--- /dev/null
++++ b/celery/utils/quorum_queues.py
+@@ -0,0 +1,20 @@
++from __future__ import annotations
++
++
++def detect_quorum_queues(app, driver_type: str) -> tuple[bool, str]:
++    """Detect if any of the queues are quorum queues.
++
++    Returns:
++        tuple[bool, str]: A tuple containing a boolean indicating if any of the queues are quorum queues
++        and the name of the first quorum queue found or an empty string if no quorum queues were found.
++    """
++    is_rabbitmq_broker = driver_type == 'amqp'
++
++    if is_rabbitmq_broker:
++        queues = app.amqp.queues
++        for qname in queues:
++            qarguments = queues[qname].queue_arguments or {}
++            if qarguments.get("x-queue-type") == "quorum":
++                return True, qname
++
++    return False, ""
+diff --git a/celery/worker/consumer/consumer.py b/celery/worker/consumer/consumer.py
+index d1b38232c6e..a66f5443872 100644
+--- a/celery/worker/consumer/consumer.py
++++ b/celery/worker/consumer/consumer.py
+@@ -169,6 +169,7 @@ class Blueprint(bootsteps.Blueprint):
+             'celery.worker.consumer.heart:Heart',
+             'celery.worker.consumer.control:Control',
+             'celery.worker.consumer.tasks:Tasks',
++            'celery.worker.consumer.delayed_delivery:DelayedDelivery',
+             'celery.worker.consumer.consumer:Evloop',
+             'celery.worker.consumer.agent:Agent',
+         ]
+@@ -477,9 +478,9 @@ def connection_for_read(self, heartbeat=None):
+         return self.ensure_connected(
+             self.app.connection_for_read(heartbeat=heartbeat))
+ 
+-    def connection_for_write(self, heartbeat=None):
++    def connection_for_write(self, url=None, heartbeat=None):
+         return self.ensure_connected(
+-            self.app.connection_for_write(heartbeat=heartbeat))
++            self.app.connection_for_write(url=url, heartbeat=heartbeat))
+ 
+     def ensure_connected(self, conn):
+         # Callback called for each retry while the connection
+diff --git a/celery/worker/consumer/delayed_delivery.py b/celery/worker/consumer/delayed_delivery.py
+new file mode 100644
+index 00000000000..d6672d32f5e
+--- /dev/null
++++ b/celery/worker/consumer/delayed_delivery.py
+@@ -0,0 +1,37 @@
++from kombu.transport.native_delayed_delivery import (bind_queue_to_native_delayed_delivery_exchange,
++                                                     declare_native_delayed_delivery_exchanges_and_queues)
++
++from celery import Celery, bootsteps
++from celery.utils.log import get_logger
++from celery.utils.quorum_queues import detect_quorum_queues
++from celery.worker.consumer import Consumer, Tasks
++
++__all__ = ('DelayedDelivery',)
++
++logger = get_logger(__name__)
++
++
++class DelayedDelivery(bootsteps.StartStopStep):
++    """This bootstep declares native delayed delivery queues and exchanges and binds all queues to them"""
++    requires = (Tasks,)
++
++    def include_if(self, c):
++        return detect_quorum_queues(c.app, c.app.connection_for_write().transport.driver_type)[0]
++
++    def start(self, c: Consumer):
++        app: Celery = c.app
++
++        for broker_url in app.conf.broker_url.split(';'):
++            try:
++                # We use connection for write directly to avoid using ensure_connection()
++                connection = c.app.connection_for_write(url=broker_url)
++                declare_native_delayed_delivery_exchanges_and_queues(
++                    connection,
++                    app.conf.broker_native_delayed_delivery_queue_type
++                )
++
++                for queue in app.amqp.queues.values():
++                    bind_queue_to_native_delayed_delivery_exchange(connection, queue)
++            except ConnectionRefusedError:
++                # We may receive this error if a fail-over occurs
++                continue
+diff --git a/celery/worker/consumer/tasks.py b/celery/worker/consumer/tasks.py
+index 9f5d9408845..67cbfc1207f 100644
+--- a/celery/worker/consumer/tasks.py
++++ b/celery/worker/consumer/tasks.py
+@@ -2,32 +2,21 @@
+ 
+ from __future__ import annotations
+ 
+-import warnings
+-
+ from kombu.common import QoS, ignore_errors
+ 
+ from celery import bootsteps
+-from celery.exceptions import CeleryWarning
+ from celery.utils.log import get_logger
++from celery.utils.quorum_queues import detect_quorum_queues
+ 
+ from .mingle import Mingle
+ 
+ __all__ = ('Tasks',)
+ 
++
+ logger = get_logger(__name__)
+ debug = logger.debug
+ 
+ 
+-ETA_TASKS_NO_GLOBAL_QOS_WARNING = """
+-Detected quorum queue "%r", disabling global QoS.
+-With global QoS disabled, ETA tasks may not function as expected. Instead of adjusting
+-the prefetch count dynamically, ETA tasks will occupy the prefetch buffer, potentially
+-blocking other tasks from being consumed. To mitigate this, either set a high prefetch
+-count or avoid using quorum queues until the ETA mechanism is updated to support a
+-disabled global QoS, which is required for quorum queues.
+-"""
+-
+-
+ class Tasks(bootsteps.StartStopStep):
+     """Bootstep starting the task message consumer."""
+ 
+@@ -90,31 +79,10 @@ def qos_global(self, c) -> bool:
+         qos_global = not c.connection.qos_semantics_matches_spec
+ 
+         if c.app.conf.worker_detect_quorum_queues:
+-            using_quorum_queues, qname = self.detect_quorum_queues(c)
++            using_quorum_queues, qname = detect_quorum_queues(c.app, c.connection.transport.driver_type)
++
+             if using_quorum_queues:
+                 qos_global = False
+                 logger.info("Global QoS is disabled. Prefetch count in now static.")
+-                # The ETA tasks mechanism requires additional work for Celery to fully support
+-                # quorum queues. Warn the user that ETA tasks may not function as expected until
+-                # this is done so we can at least support quorum queues partially for now.
+-                warnings.warn(ETA_TASKS_NO_GLOBAL_QOS_WARNING % (qname,), CeleryWarning)
+ 
+         return qos_global
+-
+-    def detect_quorum_queues(self, c) -> tuple[bool, str]:
+-        """Detect if any of the queues are quorum queues.
+-
+-        Returns:
+-            tuple[bool, str]: A tuple containing a boolean indicating if any of the queues are quorum queues
+-            and the name of the first quorum queue found or an empty string if no quorum queues were found.
+-        """
+-        is_rabbitmq_broker = c.connection.transport.driver_type == 'amqp'
+-
+-        if is_rabbitmq_broker:
+-            queues = c.app.amqp.queues
+-            for qname in queues:
+-                qarguments = queues[qname].queue_arguments or {}
+-                if qarguments.get("x-queue-type") == "quorum":
+-                    return True, qname
+-
+-        return False, ""
+diff --git a/docs/getting-started/backends-and-brokers/rabbitmq.rst b/docs/getting-started/backends-and-brokers/rabbitmq.rst
+index a7f1bfbaba4..2c6d14ab640 100644
+--- a/docs/getting-started/backends-and-brokers/rabbitmq.rst
++++ b/docs/getting-started/backends-and-brokers/rabbitmq.rst
+@@ -172,3 +172,67 @@ but rather use the :command:`rabbitmqctl` command:
+     $ sudo rabbitmqctl stop
+ 
+ When the server is running, you can continue reading `Setting up RabbitMQ`_.
++
++.. _using-quorum-queues:
++
++Using Quorum Queues
++===================
++
++.. versionadded:: 5.5
++
++.. warning::
++
++    Quorum Queues require disabling global QoS which means some features won't work as expected.
++    See `limitations`_ for details.
++
++Celery supports `Quorum Queues`_ by setting the ``x-queue-type`` header to ``quorum` like so:
++
++.. code-block:: python
++
++    from kombu import Queue
++
++    task_queues = [Queue('my-queue', queue_arguments={'x-queue-type': 'quorum'})]
++    broker_transport_options = {"confirm_publish": True}
++
++If you'd like to change the type of the default queue, set the :setting:`task_default_queue_type` setting to ``quorum``.
++
++Celery automatically detects if quorum queues are used using the :setting:`worker_detect_quorum_queues` setting.
++We recommend to keep the default behavior turned on.
++
++To migrate from classic mirrored queues to quorum queues, please refer to RabbitMQ's `documentation <https://www.rabbitmq.com/blog/2023/03/02/quorum-queues-migration>`_ on the subject.
++
++.. _`Quorum Queues`: https://www.rabbitmq.com/docs/quorum-queues
++
++.. _limitations:
++
++Limitations
++-----------
++
++Disabling global QoS means that the the per-channel QoS is now static.
++This means that some Celery features won't work when using Quorum Queues.
++
++Autoscaling relies on increasing and decreasing the prefetch count whenever a new process is instantiated
++or terminated so it won't work when Quorum Queues are detected.
++
++Similarly, the :setting:`worker_enable_prefetch_count_reduction` setting will be a no-op even when set to ``True``
++when Quorum Queues are detected.
++
++In addition, :ref:`ETA/Countdown <calling-eta>` will block the worker when received until the ETA arrives since
++we can no longer increase the prefetch count and fetch another task from the queue.
++
++In order to properly schedule ETA/Countdown tasks we automatically detect if quorum queues are used
++and in case they are, Celery automatically enables :ref:`Native Delayed Delivery <native-delayed-delivery>`.
++
++.. _native-delayed-delivery:
++
++Native Delayed Delivery
++-----------------------
++
++Since tasks with ETA/Countdown will block the worker until they are scheduled for execution,
++we need to use RabbitMQ's native capabilities to schedule the execution of tasks.
++
++The design is borrowed from NServiceBus. If you are interested in the implementation details, refer to their `documentation`_.
++
++.. _documentation: https://docs.particular.net/transports/rabbitmq/delayed-delivery
++
++Native Delayed Delivery is automatically enabled when quorum queues are detected.
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index 391dc35c8b9..ef0dc811701 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -79,6 +79,7 @@ have been moved into a new  ``task_`` prefix.
+ ``BROKER_FAILOVER_STRATEGY``               :setting:`broker_failover_strategy`
+ ``BROKER_HEARTBEAT``                       :setting:`broker_heartbeat`
+ ``BROKER_LOGIN_METHOD``                    :setting:`broker_login_method`
++``BROKER_NATIVE_DELAYED_DELIVERY_QUEUE_TYPE`` :setting:`broker_native_delayed_delivery_queue_type`
+ ``BROKER_POOL_LIMIT``                      :setting:`broker_pool_limit`
+ ``BROKER_USE_SSL``                         :setting:`broker_use_ssl`
+ ``CELERY_CACHE_BACKEND``                   :setting:`cache_backend`
+@@ -2654,14 +2655,6 @@ queue argument.
+ If the :setting:`worker_detect_quorum_queues` setting is enabled, the worker will
+ automatically detect the queue type and disable the global QoS accordingly.
+ 
+-.. warning::
+-
+-    When using quorum queues, ETA tasks may not function as expected. Instead of adjusting
+-    the prefetch count dynamically, ETA tasks will occupy the prefetch buffer, potentially
+-    blocking other tasks from being consumed. To mitigate this, either set a high prefetch
+-    count or avoid using quorum queues until the ETA mechanism is updated to support a
+-    disabled global QoS, which is required for quorum queues.
+-
+ .. warning::
+ 
+     Quorum queues require confirm publish to be enabled.
+@@ -3004,6 +2997,22 @@ Default: ``"AMQPLAIN"``.
+ 
+ Set custom amqp login method.
+ 
++.. setting:: broker_native_delayed_delivery_queue_type
++
++``broker_native_delayed_delivery_queue_type``
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. versionadded:: 5.5
++
++:transports supported: ``pyamqp``
++
++Default: ``"quorum"``.
++
++This setting is used to allow changing the default queue type for the
++native delayed delivery queues. The other viable option is ``"classic"`` which
++is only supported by RabbitMQ and sets the queue type to ``classic`` using the ``x-queue-type``
++queue argument.
++
+ .. setting:: broker_transport_options
+ 
+ ``broker_transport_options``
+diff --git a/t/integration/tasks.py b/t/integration/tasks.py
+index 227e3cb2917..031c89e002e 100644
+--- a/t/integration/tasks.py
++++ b/t/integration/tasks.py
+@@ -344,6 +344,7 @@ def __hash__(self):
+ 
+ class UnpickleableException(Exception):
+     """Exception that doesn't survive a pickling roundtrip (dump + load)."""
++
+     def __init__(self, foo, bar=None):
+         if bar is None:
+             # We define bar with a default value in the signature so that
+diff --git a/t/smoke/tests/quorum_queues/test_native_delayed_delivery.py b/t/smoke/tests/quorum_queues/test_native_delayed_delivery.py
+new file mode 100644
+index 00000000000..904b7047287
+--- /dev/null
++++ b/t/smoke/tests/quorum_queues/test_native_delayed_delivery.py
+@@ -0,0 +1,150 @@
++from datetime import timedelta
++from datetime import timezone as datetime_timezone
++
++import pytest
++import requests
++from future.backports.datetime import datetime
++from pytest_celery import CeleryTestSetup
++from requests.auth import HTTPBasicAuth
++
++from celery import Celery
++from t.smoke.tasks import noop
++from t.smoke.tests.quorum_queues.conftest import RabbitMQManagementBroker
++
++
++@pytest.fixture
++def queues(celery_setup: CeleryTestSetup) -> list:
++    broker: RabbitMQManagementBroker = celery_setup.broker
++    api = broker.get_management_url() + "/api/queues"
++    response = requests.get(api, auth=HTTPBasicAuth("guest", "guest"))
++    assert response.status_code == 200
++
++    queues = response.json()
++    assert isinstance(queues, list)
++
++    return queues
++
++
++@pytest.fixture
++def exchanges(celery_setup: CeleryTestSetup) -> list:
++    broker: RabbitMQManagementBroker = celery_setup.broker
++    api = broker.get_management_url() + "/api/exchanges"
++    response = requests.get(api, auth=HTTPBasicAuth("guest", "guest"))
++    assert response.status_code == 200
++
++    exchanges = response.json()
++    assert isinstance(exchanges, list)
++
++    return exchanges
++
++
++def queue_configuration_test_helper(celery_setup, queues):
++    res = [queue for queue in queues if queue["name"].startswith('celery_delayed')]
++    assert len(res) == 28
++    for queue in res:
++        queue_level = int(queue["name"].split("_")[-1])
++
++        queue_arguments = queue["arguments"]
++        if queue_level == 0:
++            assert queue_arguments["x-dead-letter-exchange"] == "celery_delayed_delivery"
++        else:
++            assert queue_arguments["x-dead-letter-exchange"] == f"celery_delayed_{queue_level - 1}"
++
++        assert queue_arguments["x-message-ttl"] == pow(2, queue_level) * 1000
++
++        conf = celery_setup.app.conf
++        assert queue_arguments["x-queue-type"] == conf.broker_native_delayed_delivery_queue_type
++
++
++def exchange_configuration_test_helper(exchanges):
++    res = [exchange for exchange in exchanges if exchange["name"].startswith('celery_delayed')]
++    assert len(res) == 29
++    for exchange in res:
++        assert exchange["type"] == "topic"
++
++
++class test_broker_configuration_quorum:
++    @pytest.fixture
++    def default_worker_app(self, default_worker_app: Celery) -> Celery:
++        app = default_worker_app
++        app.conf.broker_transport_options = {"confirm_publish": True}
++        app.conf.task_default_queue_type = "quorum"
++        app.conf.broker_native_delayed_delivery_queue_type = 'quorum'
++        app.conf.task_default_exchange_type = 'topic'
++        app.conf.task_default_routing_key = 'celery'
++
++        return app
++
++    def test_native_delayed_delivery_queue_configuration(
++        self,
++        queues: list,
++        celery_setup: CeleryTestSetup
++    ):
++        queue_configuration_test_helper(celery_setup, queues)
++
++    def test_native_delayed_delivery_exchange_configuration(self, exchanges: list, celery_setup: CeleryTestSetup):
++        exchange_configuration_test_helper(exchanges)
++
++
++class test_broker_configuration_classic:
++    @pytest.fixture
++    def default_worker_app(self, default_worker_app: Celery) -> Celery:
++        app = default_worker_app
++        app.conf.broker_transport_options = {"confirm_publish": True}
++        app.conf.task_default_queue_type = "quorum"
++        app.conf.broker_native_delayed_delivery_queue_type = 'classic'
++        app.conf.task_default_exchange_type = 'topic'
++        app.conf.task_default_routing_key = 'celery'
++
++        return app
++
++    def test_native_delayed_delivery_queue_configuration(
++        self,
++        queues: list,
++        celery_setup: CeleryTestSetup,
++        default_worker_app: Celery
++    ):
++        queue_configuration_test_helper(celery_setup, queues)
++
++    def test_native_delayed_delivery_exchange_configuration(self, exchanges: list, celery_setup: CeleryTestSetup):
++        exchange_configuration_test_helper(exchanges)
++
++
++class test_native_delayed_delivery:
++    @pytest.fixture
++    def default_worker_app(self, default_worker_app: Celery) -> Celery:
++        app = default_worker_app
++        app.conf.broker_transport_options = {"confirm_publish": True}
++        app.conf.task_default_queue_type = "quorum"
++        app.conf.task_default_exchange_type = 'topic'
++        app.conf.task_default_routing_key = 'celery'
++
++        return app
++
++    def test_countdown(self, celery_setup: CeleryTestSetup):
++        s = noop.s().set(queue=celery_setup.worker.worker_queue)
++
++        result = s.apply_async(countdown=5)
++
++        result.get(timeout=10)
++
++    def test_eta(self, celery_setup: CeleryTestSetup):
++        s = noop.s().set(queue=celery_setup.worker.worker_queue)
++
++        result = s.apply_async(eta=datetime.now(datetime_timezone.utc) + timedelta(0, 5))
++
++        result.get(timeout=10)
++
++    def test_eta_str(self, celery_setup: CeleryTestSetup):
++        s = noop.s().set(queue=celery_setup.worker.worker_queue)
++
++        result = s.apply_async(eta=(datetime.now(datetime_timezone.utc) + timedelta(0, 5)).isoformat())
++
++        result.get(timeout=10)
++
++    def test_eta_in_the_past(self, celery_setup: CeleryTestSetup):
++        s = noop.s().set(queue=celery_setup.worker.worker_queue)
++
++        result = s.apply_async(eta=(datetime.now(datetime_timezone.utc) - timedelta(0, 5)).isoformat())
++
++        result.get(timeout=10)
+diff --git a/t/unit/app/test_app.py b/t/unit/app/test_app.py
+index 4d132a537d3..479a418cf67 100644
+--- a/t/unit/app/test_app.py
++++ b/t/unit/app/test_app.py
+@@ -9,11 +9,13 @@
+ from copy import deepcopy
+ from datetime import datetime, timedelta
+ from datetime import timezone as datetime_timezone
++from logging import LogRecord
+ from pickle import dumps, loads
+ from typing import Optional
+-from unittest.mock import DEFAULT, Mock, patch
++from unittest.mock import ANY, DEFAULT, MagicMock, Mock, patch
+ 
+ import pytest
++from kombu import Exchange, Queue
+ from pydantic import BaseModel, ValidationInfo, model_validator
+ from vine import promise
+ 
+@@ -1270,7 +1272,8 @@ def test_pool_no_multiprocessing(self, mask_modules):
+     def test_bugreport(self):
+         assert self.app.bugreport()
+ 
+-    def test_send_task__connection_provided(self):
++    @patch('celery.app.base.detect_quorum_queues', return_value=[False, ""])
++    def test_send_task__connection_provided(self, detect_quorum_queues):
+         connection = Mock(name='connection')
+         router = Mock(name='router')
+         router.route.return_value = {}
+@@ -1421,6 +1424,183 @@ def test_send_task_expire_as_string(self):
+         except TypeError as e:
+             pytest.fail(f'raise unexcepted error {e}')
+ 
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_native_delayed_delivery_countdown(self, detect_quorum_queues):
++        self.app.amqp = MagicMock(name='amqp')
++        self.app.amqp.router.route.return_value = {
++            'queue': Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='topic')
++            )
++        }
++
++        self.app.send_task('foo', (1, 2), countdown=30)
++
++        exchange = Exchange(
++            'celery_delayed_27',
++            type='topic',
++        )
++        self.app.amqp.send_task_message.assert_called_once_with(
++            ANY,
++            ANY,
++            ANY,
++            exchange=exchange,
++            routing_key='0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.1.1.1.1.0.testcelery'
++        )
++
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_native_delayed_delivery_eta_datetime(self, detect_quorum_queues):
++        self.app.amqp = MagicMock(name='amqp')
++        self.app.amqp.router.route.return_value = {
++            'queue': Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='topic')
++            )
++        }
++        self.app.now = Mock(return_value=datetime(2024, 8, 24, tzinfo=datetime_timezone.utc))
++
++        self.app.send_task('foo', (1, 2), eta=datetime(2024, 8, 25))
++
++        exchange = Exchange(
++            'celery_delayed_27',
++            type='topic',
++        )
++        self.app.amqp.send_task_message.assert_called_once_with(
++            ANY,
++            ANY,
++            ANY,
++            exchange=exchange,
++            routing_key='0.0.0.0.0.0.0.0.0.0.0.1.0.1.0.1.0.0.0.1.1.0.0.0.0.0.0.0.testcelery'
++        )
++
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_native_delayed_delivery_eta_str(self, detect_quorum_queues):
++        self.app.amqp = MagicMock(name='amqp')
++        self.app.amqp.router.route.return_value = {
++            'queue': Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='topic')
++            )
++        }
++        self.app.now = Mock(return_value=datetime(2024, 8, 24, tzinfo=datetime_timezone.utc))
++
++        self.app.send_task('foo', (1, 2), eta=datetime(2024, 8, 25).isoformat())
++
++        exchange = Exchange(
++            'celery_delayed_27',
++            type='topic',
++        )
++        self.app.amqp.send_task_message.assert_called_once_with(
++            ANY,
++            ANY,
++            ANY,
++            exchange=exchange,
++            routing_key='0.0.0.0.0.0.0.0.0.0.0.1.0.1.0.1.0.0.0.1.1.0.0.0.0.0.0.0.testcelery',
++        )
++
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_native_delayed_delivery_no_eta_or_countdown(self, detect_quorum_queues):
++        self.app.amqp = MagicMock(name='amqp')
++        self.app.amqp.router.route.return_value = {'queue': Queue('testcelery', routing_key='testcelery')}
++
++        self.app.send_task('foo', (1, 2), countdown=-10)
++
++        self.app.amqp.send_task_message.assert_called_once_with(
++            ANY,
++            ANY,
++            ANY,
++            queue=Queue(
++                'testcelery',
++                routing_key='testcelery'
++            )
++        )
++
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_native_delayed_delivery_countdown_in_the_past(self, detect_quorum_queues):
++        self.app.amqp = MagicMock(name='amqp')
++        self.app.amqp.router.route.return_value = {
++            'queue': Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='topic')
++            )
++        }
++
++        self.app.send_task('foo', (1, 2))
++
++        self.app.amqp.send_task_message.assert_called_once_with(
++            ANY,
++            ANY,
++            ANY,
++            queue=Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='topic')
++            )
++        )
++
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_native_delayed_delivery_eta_in_the_past(self, detect_quorum_queues):
++        self.app.amqp = MagicMock(name='amqp')
++        self.app.amqp.router.route.return_value = {
++            'queue': Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='topic')
++            )
++        }
++        self.app.now = Mock(return_value=datetime(2024, 8, 24, tzinfo=datetime_timezone.utc))
++
++        self.app.send_task('foo', (1, 2), eta=datetime(2024, 8, 23).isoformat())
++
++        self.app.amqp.send_task_message.assert_called_once_with(
++            ANY,
++            ANY,
++            ANY,
++            queue=Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='topic')
++            )
++        )
++
++    @patch('celery.app.base.detect_quorum_queues', return_value=[True, "testcelery"])
++    def test_native_delayed_delivery_direct_exchange(self, detect_quorum_queues, caplog):
++        self.app.amqp = MagicMock(name='amqp')
++        self.app.amqp.router.route.return_value = {
++            'queue': Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='direct')
++            )
++        }
++
++        self.app.send_task('foo', (1, 2), countdown=10)
++
++        self.app.amqp.send_task_message.assert_called_once_with(
++            ANY,
++            ANY,
++            ANY,
++            queue=Queue(
++                'testcelery',
++                routing_key='testcelery',
++                exchange=Exchange('testcelery', type='direct')
++            )
++        )
++
++        assert len(caplog.records) == 1
++        record: LogRecord = caplog.records[0]
++        assert record.levelname == "WARNING"
++        assert record.message == (
++            "Direct exchanges are not supported with native delayed delivery.\n"
++            "testcelery is a direct exchange but should be a topic exchange or "
++            "a fanout exchange in order for native delayed delivery to work properly.\n"
++            "If quorum queues are used, this task may block the worker process until the ETA arrives."
++        )
++
+ 
+ class test_defaults:
+ 
+diff --git a/t/unit/app/test_backends.py b/t/unit/app/test_backends.py
+index 54b28456627..af6def1d150 100644
+--- a/t/unit/app/test_backends.py
++++ b/t/unit/app/test_backends.py
+@@ -115,8 +115,8 @@ def test_backend_can_not_be_module(self, app):
+ 
+     @pytest.mark.celery(
+         result_backend=f'{CachedBackendWithTreadTrucking.__module__}.'
+-                       f'{CachedBackendWithTreadTrucking.__qualname__}'
+-                       f'+memory://')
++        f'{CachedBackendWithTreadTrucking.__qualname__}'
++        f'+memory://')
+     def test_backend_thread_safety(self):
+         @self.app.task
+         def dummy_add_task(x, y):
+diff --git a/t/unit/tasks/test_tasks.py b/t/unit/tasks/test_tasks.py
+index f262efc1bc6..7462313c74f 100644
+--- a/t/unit/tasks/test_tasks.py
++++ b/t/unit/tasks/test_tasks.py
+@@ -377,6 +377,7 @@ class MyCustomException(Exception):
+ 
+ class UnpickleableException(Exception):
+     """Exception that doesn't survive a pickling roundtrip (dump + load)."""
++
+     def __init__(self, foo, bar):
+         super().__init__(foo)
+         self.bar = bar
+diff --git a/t/unit/worker/test_consumer.py b/t/unit/worker/test_consumer.py
+index b43471134b2..3523e18056d 100644
+--- a/t/unit/worker/test_consumer.py
++++ b/t/unit/worker/test_consumer.py
+@@ -10,14 +10,15 @@
+ 
+ from celery import bootsteps
+ from celery.contrib.testing.mocks import ContextMock
+-from celery.exceptions import CeleryWarning, WorkerShutdown, WorkerTerminate
++from celery.exceptions import WorkerShutdown, WorkerTerminate
+ from celery.utils.collections import LimitedSet
++from celery.utils.quorum_queues import detect_quorum_queues
+ from celery.worker.consumer.agent import Agent
+ from celery.worker.consumer.consumer import CANCEL_TASKS_BY_DEFAULT, CLOSE, TERMINATE, Consumer
+ from celery.worker.consumer.gossip import Gossip
+ from celery.worker.consumer.heart import Heart
+ from celery.worker.consumer.mingle import Mingle
+-from celery.worker.consumer.tasks import ETA_TASKS_NO_GLOBAL_QOS_WARNING, Tasks
++from celery.worker.consumer.tasks import Tasks
+ from celery.worker.state import active_requests
+ 
+ 
+@@ -652,8 +653,7 @@ def test_detect_quorum_queues_positive(self):
+         c = self.c
+         self.c.connection.transport.driver_type = 'amqp'
+         c.app.amqp.queues = {"celery": Mock(queue_arguments={"x-queue-type": "quorum"})}
+-        tasks = Tasks(c)
+-        result, name = tasks.detect_quorum_queues(c)
++        result, name = detect_quorum_queues(c.app, c.connection.transport.driver_type)
+         assert result
+         assert name == "celery"
+ 
+@@ -661,16 +661,14 @@ def test_detect_quorum_queues_negative(self):
+         c = self.c
+         self.c.connection.transport.driver_type = 'amqp'
+         c.app.amqp.queues = {"celery": Mock(queue_arguments=None)}
+-        tasks = Tasks(c)
+-        result, name = tasks.detect_quorum_queues(c)
++        result, name = detect_quorum_queues(c.app, c.connection.transport.driver_type)
+         assert not result
+         assert name == ""
+ 
+     def test_detect_quorum_queues_not_rabbitmq(self):
+         c = self.c
+         self.c.connection.transport.driver_type = 'redis'
+-        tasks = Tasks(c)
+-        result, name = tasks.detect_quorum_queues(c)
++        result, name = detect_quorum_queues(c.app, c.connection.transport.driver_type)
+         assert not result
+         assert name == ""
+ 
+@@ -693,14 +691,6 @@ def test_qos_global_worker_detect_quorum_queues_true_with_quorum_queues(self):
+         tasks = Tasks(c)
+         assert tasks.qos_global(c) is False
+ 
+-    def test_qos_global_eta_warning(self):
+-        c = self.c
+-        self.c.connection.transport.driver_type = 'amqp'
+-        c.app.amqp.queues = {"celery": Mock(queue_arguments={"x-queue-type": "quorum"})}
+-        tasks = Tasks(c)
+-        with pytest.warns(CeleryWarning, match=ETA_TASKS_NO_GLOBAL_QOS_WARNING % "celery"):
+-            tasks.qos_global(c)
+-
+     def test_log_when_qos_is_false(self, caplog):
+         c = self.c
+         c.connection.transport.driver_type = 'amqp'
+diff --git a/t/unit/worker/test_native_delayed_delivery.py b/t/unit/worker/test_native_delayed_delivery.py
+new file mode 100644
+index 00000000000..2170869d7ef
+--- /dev/null
++++ b/t/unit/worker/test_native_delayed_delivery.py
+@@ -0,0 +1,74 @@
++from logging import LogRecord
++from unittest.mock import Mock, patch
++
++from kombu import Exchange, Queue
++
++from celery.worker.consumer.delayed_delivery import DelayedDelivery
++
++
++class test_DelayedDelivery:
++    @patch('celery.worker.consumer.delayed_delivery.detect_quorum_queues', return_value=[False, ""])
++    def test_include_if_no_quorum_queues_detected(self, detect_quorum_queues):
++        consumer_mock = Mock()
++
++        delayed_delivery = DelayedDelivery(consumer_mock)
++
++        assert delayed_delivery.include_if(consumer_mock) is False
++
++    @patch('celery.worker.consumer.delayed_delivery.detect_quorum_queues', return_value=[True, ""])
++    def test_include_if_quorum_queues_detected(self, detect_quorum_queues):
++        consumer_mock = Mock()
++
++        delayed_delivery = DelayedDelivery(consumer_mock)
++
++        assert delayed_delivery.include_if(consumer_mock) is True
++
++    def test_start_native_delayed_delivery_direct_exchange(self, caplog):
++        consumer_mock = Mock()
++        consumer_mock.app.conf.broker_native_delayed_delivery_queue_type = 'classic'
++        consumer_mock.app.conf.broker_url = 'amqp://'
++        consumer_mock.app.amqp.queues = {
++            'celery': Queue('celery', exchange=Exchange('celery', type='direct'))
++        }
++
++        delayed_delivery = DelayedDelivery(consumer_mock)
++
++        delayed_delivery.start(consumer_mock)
++
++        assert len(caplog.records) == 1
++        record: LogRecord = caplog.records[0]
++        assert record.levelname == "WARNING"
++        assert record.message == (
++            "Exchange celery is a direct exchange "
++            "and native delayed delivery do not support direct exchanges.\n"
++            "ETA tasks published to this exchange "
++            "will block the worker until the ETA arrives."
++        )
++
++    def test_start_native_delayed_delivery_topic_exchange(self, caplog):
++        consumer_mock = Mock()
++        consumer_mock.app.conf.broker_native_delayed_delivery_queue_type = 'classic'
++        consumer_mock.app.conf.broker_url = 'amqp://'
++        consumer_mock.app.amqp.queues = {
++            'celery': Queue('celery', exchange=Exchange('celery', type='topic'))
++        }
++
++        delayed_delivery = DelayedDelivery(consumer_mock)
++
++        delayed_delivery.start(consumer_mock)
++
++        assert len(caplog.records) == 0
++
++    def test_start_native_delayed_delivery_fanout_exchange(self, caplog):
++        consumer_mock = Mock()
++        consumer_mock.app.conf.broker_native_delayed_delivery_queue_type = 'classic'
++        consumer_mock.app.conf.broker_url = 'amqp://'
++        consumer_mock.app.amqp.queues = {
++            'celery': Queue('celery', exchange=Exchange('celery', type='fanout'))
++        }
++
++        delayed_delivery = DelayedDelivery(consumer_mock)
++
++        delayed_delivery.start(consumer_mock)
++
++        assert len(caplog.records) == 0

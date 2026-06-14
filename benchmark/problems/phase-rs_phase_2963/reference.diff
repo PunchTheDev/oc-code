@@ -1,0 +1,249 @@
+diff --git a/crates/engine/src/game/game_object.rs b/crates/engine/src/game/game_object.rs
+index 01280eccaf..29e5ddf007 100644
+--- a/crates/engine/src/game/game_object.rs
++++ b/crates/engine/src/game/game_object.rs
+@@ -614,6 +614,15 @@ pub struct GameObject {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub merge_layer_effect_id: Option<u64>,
+ 
++    /// CR 730.2d: A merged permanent is a token only if its TOPMOST component is a
++    /// token. The survivor keeps its own `ObjectId` (CR 730.2c) but adopts the
++    /// topmost component's token-ness while merged; this captures the survivor's
++    /// intrinsic `is_token` (once, on the first merge that overrides it) so
++    /// `merge::split_merged_permanent_on_leave` can restore it when the pile
++    /// leaves the battlefield. `None` when no override is active.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub pre_merge_is_token: Option<bool>,
++
+     /// CR 730.3c: When a merged permanent leaves the battlefield it "becomes"
+     /// multiple new objects (CR 730.3 / CR 400.7). Each absorbed component records
+     /// the surviving object's id here, so that an effect which finds the object
+@@ -1101,6 +1110,7 @@ impl GameObject {
+             prototype_form: None,
+             mutate_form: None,
+             merged_components: Vec::new(),
++            pre_merge_is_token: None,
+             merge_layer_effect_id: None,
+             split_from_merge_survivor: None,
+             cleave_form: None,
+@@ -1355,6 +1365,11 @@ impl GameObject {
+         // re-entering object is not stuck carrying stale component ids. `mutate_form`
+         // (stack-only, paralleling `bestow_form`) is intentionally NOT cleared here.
+         self.merged_components.clear();
++        // CR 730.2d + CR 400.7: the topmost-derived token-ness override is
++        // battlefield-scoped. `split_merged_permanent_on_leave` restores it before
++        // this reset runs; clear it defensively so a re-entering object never
++        // carries a stale override value.
++        self.pre_merge_is_token = None;
+         // CR 730.3 + CR 400.7: merge copy effects are battlefield-scoped and are
+         // pruned at the battlefield-exit seam before this reset. Clear the stored
+         // id so a re-entering object cannot point at a stale transient effect.
+diff --git a/crates/engine/src/game/merge.rs b/crates/engine/src/game/merge.rs
+index eda308e77a..bc099d018c 100644
+--- a/crates/engine/src/game/merge.rs
++++ b/crates/engine/src/game/merge.rs
+@@ -144,6 +144,20 @@ pub fn merge_object_onto(
+         survivor.merged_components = ordered;
+     }
+ 
++    // CR 730.2d: a merged permanent is a token only if its TOPMOST component is a
++    // token. The survivor keeps its `ObjectId` (CR 730.2c) but adopts the topmost
++    // component's token-ness while merged. Capture the survivor's intrinsic value
++    // once (on the first merge that actually overrides it) so the on-leave split
++    // can restore it (CR 111.7 cease-to-exist must fire for a token host that had
++    // a card mutated on top of it). The all-card case is a no-op (topmost matches).
++    let topmost_is_token = state.objects.get(&topmost_id).is_some_and(|o| o.is_token);
++    if let Some(survivor) = state.objects.get_mut(&target_id) {
++        if survivor.pre_merge_is_token.is_none() && survivor.is_token != topmost_is_token {
++            survivor.pre_merge_is_token = Some(survivor.is_token);
++        }
++        survivor.is_token = topmost_is_token;
++    }
++
+     install_merge_layer_effect(
+         state,
+         target_id,
+@@ -329,6 +343,19 @@ pub fn split_merged_permanent_on_leave(
+     // `reset_for_battlefield_exit` during the subsequent `move_to_zone`.
+ }
+ 
++/// CR 730.2d + CR 400.7 + CR 111.7: restore the survivor's intrinsic token-ness
++/// after the leave-event snapshot captures the merged permanent's topmost-derived
++/// token-ness, but before the object lands outside the battlefield. This lets
++/// "creature token dies" filters see the object as it existed immediately before
++/// leaving while still letting the restored token host cease to exist.
++pub(crate) fn restore_pre_merge_tokenness_for_leave(state: &mut GameState, merged_id: ObjectId) {
++    if let Some(survivor) = state.objects.get_mut(&merged_id) {
++        if let Some(intrinsic) = survivor.pre_merge_is_token.take() {
++            survivor.is_token = intrinsic;
++        }
++    }
++}
++
+ /// CR 730.3c: "If an effect can find the new object that a merged permanent
+ /// becomes as it leaves the battlefield, it finds ALL of those objects. ... the
+ /// same actions are taken upon each of them." When an effect references the
+diff --git a/crates/engine/src/game/merge_tests.rs b/crates/engine/src/game/merge_tests.rs
+index 6c4ff79b40..e354f3e16b 100644
+--- a/crates/engine/src/game/merge_tests.rs
++++ b/crates/engine/src/game/merge_tests.rs
+@@ -113,6 +113,141 @@ fn merge_unions_component_abilities_per_cr_702_140e() {
+     );
+ }
+ 
++/// CR 730.2d: a merged permanent is a token only if its TOPMOST component is a
++/// token. Mutating a card on top of a creature token (the host) makes the merged
++/// permanent NONTOKEN while merged; the survivor's intrinsic token-ness is
++/// captured and restored when the pile leaves the battlefield, so the CR 111.7
++/// cease-to-exist SBA applies to it again instead of leaking a nontoken object.
++#[test]
++fn merge_card_on_top_of_token_host_is_nontoken_and_restores_on_leave() {
++    let (mut state, host, rider, _p0) = two_creatures();
++    // CR 702.140a: the mutate host is a non-Human creature TOKEN you own.
++    state.objects.get_mut(&host).unwrap().is_token = true;
++    // Runtime invariant: the mutating spell resolved off the stack, never listed.
++    state.battlefield.retain(|&id| id != rider);
++    let mut events = Vec::new();
++
++    // Mutate the card (rider) ON TOP of the token (host).
++    merge_object_onto(&mut state, rider, host, MergeSide::Top, &mut events);
++    assert!(
++        !state.objects.get(&host).unwrap().is_token,
++        "card on top of a token host → nontoken merged permanent (CR 730.2d)"
++    );
++    assert_eq!(
++        state.objects.get(&host).unwrap().pre_merge_is_token,
++        Some(true),
++        "the survivor's intrinsic token-ness is captured for the on-leave restore"
++    );
++
++    // On leave, the survivor's intrinsic token-ness is restored.
++    crate::game::zones::move_to_zone(&mut state, host, Zone::Graveyard, &mut events);
++    let leave_record = events
++        .iter()
++        .find_map(|event| match event {
++            GameEvent::ZoneChanged {
++                object_id,
++                from,
++                to,
++                record,
++            } if *object_id == host
++                && *from == Some(Zone::Battlefield)
++                && *to == Zone::Graveyard =>
++            {
++                Some(record)
++            }
++            _ => None,
++        })
++        .expect("merged survivor emits a battlefield-to-graveyard ZoneChanged event");
++    assert!(
++        !leave_record.is_token,
++        "the leave event observes the card-on-top merged permanent as nontoken (CR 730.2d)"
++    );
++    let o = state.objects.get(&host).unwrap();
++    assert!(
++        o.is_token,
++        "the token host is a token again when the pile leaves (CR 730.2d + CR 111.7)"
++    );
++    assert_eq!(
++        o.pre_merge_is_token, None,
++        "the token-ness override is consumed on leave"
++    );
++}
++
++/// CR 730.2d: when the token host is TOPMOST (a card mutated underneath it), the
++/// merged permanent stays a token — and no override is captured because the
++/// topmost token-ness already matches the survivor's.
++#[test]
++fn merge_card_under_token_host_keeps_token_no_override() {
++    let (mut state, host, rider, _p0) = two_creatures();
++    state.objects.get_mut(&host).unwrap().is_token = true;
++    state.battlefield.retain(|&id| id != rider);
++    let mut events = Vec::new();
++
++    merge_object_onto(&mut state, rider, host, MergeSide::Bottom, &mut events);
++    assert!(
++        state.objects.get(&host).unwrap().is_token,
++        "token host on top (card underneath) → merged permanent stays a token (CR 730.2d)"
++    );
++    assert_eq!(
++        state.objects.get(&host).unwrap().pre_merge_is_token,
++        None,
++        "no override captured when the topmost already matches the survivor's token-ness"
++    );
++}
++
++/// CR 730.2d regression guard: an all-card merge (no token component) is nontoken
++/// and captures no override — the common case must be untouched.
++#[test]
++fn merge_all_card_components_stays_nontoken_no_override() {
++    let (mut state, host, rider, _p0) = two_creatures();
++    state.battlefield.retain(|&id| id != rider);
++    let mut events = Vec::new();
++
++    merge_object_onto(&mut state, rider, host, MergeSide::Top, &mut events);
++    assert!(
++        !state.objects.get(&host).unwrap().is_token,
++        "an all-card pile is nontoken"
++    );
++    assert_eq!(
++        state.objects.get(&host).unwrap().pre_merge_is_token,
++        None,
++        "no token-ness override is captured when no component is a token"
++    );
++}
++
++/// CR 730.2d + CR 730.2 (stacking): the topmost-derived token-ness is re-applied
++/// on each merge, and the survivor's intrinsic value is captured exactly ONCE so a
++/// multi-mutate token host still restores correctly on leave.
++#[test]
++fn merge_stacking_onto_token_host_captures_intrinsic_token_ness_once() {
++    use crate::game::scenario::GameScenario;
++    let mut sc = GameScenario::new();
++    let host = sc.add_creature(P0, "Token Host", 2, 2).id();
++    let rider1 = sc.add_creature(P0, "Rider1", 3, 3).id();
++    let rider2 = sc.add_creature(P0, "Rider2", 4, 4).id();
++    let mut state = sc.state;
++    state.objects.get_mut(&host).unwrap().is_token = true;
++    state.battlefield.retain(|&id| id != rider1 && id != rider2);
++    let mut events = Vec::new();
++
++    merge_object_onto(&mut state, rider1, host, MergeSide::Top, &mut events);
++    merge_object_onto(&mut state, rider2, host, MergeSide::Top, &mut events);
++    // Topmost is always a card (mutating objects are cards) → nontoken; the
++    // intrinsic token-ness is captured once, not overwritten by the second merge.
++    assert!(!state.objects.get(&host).unwrap().is_token);
++    assert_eq!(
++        state.objects.get(&host).unwrap().pre_merge_is_token,
++        Some(true),
++        "intrinsic token-ness captured exactly once across stacked merges"
++    );
++
++    crate::game::zones::move_to_zone(&mut state, host, Zone::Graveyard, &mut events);
++    assert!(
++        state.objects.get(&host).unwrap().is_token,
++        "the token host restores to a token on leave after multiple merges"
++    );
++}
++
+ #[test]
+ fn merge_is_same_object_no_etb_event() {
+     // CR 730.2b/c: the merged permanent is NOT considered to have entered the
+diff --git a/crates/engine/src/game/zones.rs b/crates/engine/src/game/zones.rs
+index 7754b062c6..15501d3aea 100644
+--- a/crates/engine/src/game/zones.rs
++++ b/crates/engine/src/game/zones.rs
+@@ -507,6 +507,13 @@ pub fn move_to_zone(
+     }
+     zone_change_record.combat_status = capture_combat_status(state, object_id);
+ 
++    // CR 730.2d + CR 111.7: for a merged permanent whose topmost component
++    // temporarily changed the survivor's token-ness, the ZoneChanged record above
++    // must retain the merged permanent's event-time token-ness. Restore the
++    // survivor only after that snapshot so the moved token component can cease to
++    // exist without corrupting leave-trigger filters.
++    super::merge::restore_pre_merge_tokenness_for_leave(state, object_id);
++
+     apply_zone_exit_cleanup(state, object_id, from, to);
+ 
+     remove_from_zone(state, object_id, from, owner);

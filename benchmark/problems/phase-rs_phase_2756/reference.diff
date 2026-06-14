@@ -1,0 +1,466 @@
+diff --git a/crates/engine/src/game/combat.rs b/crates/engine/src/game/combat.rs
+index 317f1c15e1..9d8ccd662c 100644
+--- a/crates/engine/src/game/combat.rs
++++ b/crates/engine/src/game/combat.rs
+@@ -592,6 +592,37 @@ fn blocker_has_cant_block_static(state: &GameState, blocker_id: ObjectId) -> boo
+         .is_some()
+ }
+ 
++/// CR 509.1b: Static abilities on the blocker (or on another source whose
++/// `affected` filter matches the blocker) that restrict which attackers it
++/// may block — e.g. "This creature can block only creatures with flying."
++fn blocker_block_allowed_statics_for<'a>(
++    state: &'a GameState,
++    blocker_id: ObjectId,
++) -> impl Iterator<Item = (&'a GameObject, &'a StaticDefinition)> + 'a {
++    super::functioning_abilities::game_functioning_statics(state)
++        .filter(|(_, def)| matches!(def.mode, StaticMode::BlockRestriction { .. }))
++        .filter(move |(src, def)| match def.affected.as_ref() {
++            None => src.id == blocker_id,
++            Some(filter) => matches_target_filter(
++                state,
++                blocker_id,
++                filter,
++                &FilterContext::from_source(state, src.id),
++            ),
++        })
++        .filter(move |(src, def)| {
++            def.condition.as_ref().is_none_or(|condition| {
++                crate::game::layers::evaluate_condition_with_recipient(
++                    state,
++                    condition,
++                    src.controller,
++                    src.id,
++                    blocker_id,
++                )
++            })
++        })
++}
++
+ /// CR 509.1c: Static abilities that force blockers onto `attacker_id` — e.g.
+ /// "must be blocked if able" on the attacker itself, or on an Aura/Equipment
+ /// whose `affected` filter matches the enchanted/equipped creature (Predatory
+@@ -917,6 +948,23 @@ pub fn validate_blockers_for_player(
+             ));
+         }
+ 
++        // CR 509.1b: blocker-side "can block only <filter>" restrictions.
++        for (src, sd) in blocker_block_allowed_statics_for(state, blocker_id) {
++            let StaticMode::BlockRestriction { filter } = &sd.mode else {
++                continue;
++            };
++            if !matches_target_filter(
++                state,
++                attacker_id,
++                filter,
++                &FilterContext::from_source(state, src.id),
++            ) {
++                return Err(format!(
++                    "{blocker_id:?} can block only creatures matching the block restriction"
++                ));
++            }
++        }
++
+         blockers_per_attacker
+             .entry(attacker_id)
+             .or_default()
+@@ -2657,6 +2705,20 @@ pub fn can_block_pair(state: &GameState, blocker_id: ObjectId, attacker_id: Obje
+     if is_landwalk_unblockable(state, attacker, blocker.controller) {
+         return false;
+     }
++    // CR 509.1b: blocker-side "can block only <filter>" restrictions.
++    for (src, sd) in blocker_block_allowed_statics_for(state, blocker_id) {
++        let StaticMode::BlockRestriction { filter } = &sd.mode else {
++            continue;
++        };
++        if !matches_target_filter(
++            state,
++            attacker_id,
++            filter,
++            &FilterContext::from_source(state, src.id),
++        ) {
++            return false;
++        }
++    }
+     true
+ }
+ 
+@@ -6221,6 +6283,54 @@ mod tests {
+         assert!(validate_blockers(&state, &[(flying_blocker, attacker)]).is_ok());
+     }
+ 
++    /// Issue #2364: Pinnacle Emissary Drone tokens carry "can block only
++    /// creatures with flying" — a blocker-side BlockRestriction, distinct
++    /// from attacker-side CantBeBlockedExceptBy.
++    #[test]
++    fn issue_2364_block_restriction_limits_blocker_to_flying_attackers() {
++        use crate::types::ability::StaticDefinition;
++        use crate::types::statics::{block_only_creatures_with_flying_filter, StaticMode};
++
++        let mut state = setup();
++        let ground_attacker = create_creature(&mut state, PlayerId(0), "Bear", 2, 2);
++        let flying_attacker = create_creature(&mut state, PlayerId(0), "Bird", 2, 2);
++        state
++            .objects
++            .get_mut(&flying_attacker)
++            .unwrap()
++            .keywords
++            .push(Keyword::Flying);
++
++        let drone = create_creature(&mut state, PlayerId(1), "Drone", 1, 1);
++        {
++            let drone_obj = state.objects.get_mut(&drone).unwrap();
++            drone_obj.keywords.push(Keyword::Flying);
++            drone_obj.static_definitions.push(
++                StaticDefinition::new(StaticMode::BlockRestriction {
++                    filter: block_only_creatures_with_flying_filter(),
++                })
++                .affected(TargetFilter::SelfRef),
++            );
++        }
++
++        assert!(
++            validate_blockers(&state, &[(drone, ground_attacker)]).is_err(),
++            "Drone must not block non-flying attackers"
++        );
++        assert!(
++            !can_block_pair(&state, drone, ground_attacker),
++            "can_block_pair must reject non-flying attacker"
++        );
++        assert!(
++            validate_blockers(&state, &[(drone, flying_attacker)]).is_ok(),
++            "Drone may block flying attackers"
++        );
++        assert!(
++            can_block_pair(&state, drone, flying_attacker),
++            "can_block_pair must accept flying attacker"
++        );
++    }
++
+     /// Issue #496: "can't be blocked except by three or more creatures" must
+     /// enforce the count. Reverted-fix discrimination: the old `String` path
+     /// degrades `parse_target("three or more creatures")` to a permissive
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index cd7f164de4..559a8ac06c 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -86,6 +86,8 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
+             // CR 509.1b: CantBeBlockedByMoreThan carries the blocker maximum
+             // (Stalking Tiger). Enforced in combat.rs declare-blockers validation.
+             | StaticMode::CantBeBlockedByMoreThan { .. }
++            // CR 509.1b: BlockRestriction carries the allowed-attacker filter.
++            | StaticMode::BlockRestriction { .. }
+             // CR 301.5 + CR 303.4 + CR 701.3a: AttachmentRestriction carries the
+             // `TargetFilter` of legal hosts (Strata Scythe, Konda's Banner).
+             // Enforced via active static definitions in effects/attach.rs::attachment_illegality.
+diff --git a/crates/engine/src/game/static_abilities.rs b/crates/engine/src/game/static_abilities.rs
+index 638c754a9a..3e876b4062 100644
+--- a/crates/engine/src/game/static_abilities.rs
++++ b/crates/engine/src/game/static_abilities.rs
+@@ -253,8 +253,9 @@ pub fn build_static_registry() -> HashMap<StaticMode, StaticAbilityHandler> {
+     // casting.rs::is_blocked_by_per_turn_cast_limit(). Coverage support is via is_data_carrying_static().
+ 
+     // Promoted Tier 3 statics -- parser-produced, rule-modification handlers
+-    // CR 509.1b: BlockRestriction — restricts what a creature can block.
+-    registry.insert(StaticMode::BlockRestriction, handle_rule_mod);
++    // Note: BlockRestriction is data-carrying — runtime enforcement is in
++    // combat.rs::can_block_pair via blocker-side static scan. Coverage support
++    // is via is_data_carrying_static().
+     // CR 402.2: NoMaximumHandSize — player has no maximum hand size.
+     registry.insert(StaticMode::NoMaximumHandSize, handle_rule_mod);
+     // CR 305.2: MayPlayAdditionalLand — player may play additional lands.
+@@ -1568,7 +1569,6 @@ mod tests {
+             StaticMode::Lifelink,
+             StaticMode::Shroud,
+             // Tier 3 promoted statics
+-            StaticMode::BlockRestriction,
+             StaticMode::NoMaximumHandSize,
+             StaticMode::MayPlayAdditionalLand,
+             StaticMode::MayChooseNotToUntap,
+diff --git a/crates/engine/src/parser/oracle.rs b/crates/engine/src/parser/oracle.rs
+index 0054c9236f..9c91b21ef9 100644
+--- a/crates/engine/src/parser/oracle.rs
++++ b/crates/engine/src/parser/oracle.rs
+@@ -7493,7 +7493,9 @@ mod tests {
+         assert_eq!(r.statics.len(), 1);
+         assert_eq!(
+             r.statics[0].mode,
+-            crate::types::statics::StaticMode::BlockRestriction
++            crate::types::statics::StaticMode::BlockRestriction {
++                filter: crate::types::statics::block_only_creatures_with_flying_filter(),
++            }
+         );
+     }
+ 
+diff --git a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__brazen_borrower_ir.snap b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__brazen_borrower_ir.snap
+index 5d85d639a2..028fa1c318 100644
+--- a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__brazen_borrower_ir.snap
++++ b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__brazen_borrower_ir.snap
+@@ -46,7 +46,23 @@ expression: "&ir"
+     },
+     {
+       "PreLoweredStatic": {
+-        "mode": "BlockRestriction",
++        "mode": {
++          "BlockRestriction": {
++            "filter": {
++              "type": "Typed",
++              "type_filters": [
++                "Creature"
++              ],
++              "controller": null,
++              "properties": [
++                {
++                  "type": "WithKeyword",
++                  "value": "Flying"
++                }
++              ]
++            }
++          }
++        },
+         "affected": {
+           "type": "SelfRef"
+         },
+diff --git a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__brazen_borrower_lowered.snap b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__brazen_borrower_lowered.snap
+index 36321d1317..425657ad89 100644
+--- a/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__brazen_borrower_lowered.snap
++++ b/crates/engine/src/parser/oracle_ir/snapshots/engine__parser__oracle_ir__snapshot_tests__brazen_borrower_lowered.snap
+@@ -44,7 +44,23 @@ expression: "&lowered"
+   "triggers": [],
+   "statics": [
+     {
+-      "mode": "BlockRestriction",
++      "mode": {
++        "BlockRestriction": {
++          "filter": {
++            "type": "Typed",
++            "type_filters": [
++              "Creature"
++            ],
++            "controller": null,
++            "properties": [
++              {
++                "type": "WithKeyword",
++                "value": "Flying"
++              }
++            ]
++          }
++        }
++      },
+       "affected": {
+         "type": "SelfRef"
+       },
+diff --git a/crates/engine/src/parser/oracle_static/grammar.rs b/crates/engine/src/parser/oracle_static/grammar.rs
+index e20e33b5c9..5315983fae 100644
+--- a/crates/engine/src/parser/oracle_static/grammar.rs
++++ b/crates/engine/src/parser/oracle_static/grammar.rs
+@@ -56,9 +56,11 @@ pub(crate) fn lower_rule_static(
+             .affected(affected)
+             .description(description.to_string()),
+         RuleStaticPredicate::BlockOnlyCreaturesWithFlying => {
+-            StaticDefinition::new(StaticMode::BlockRestriction)
+-                .affected(affected)
+-                .description(description.to_string())
++            StaticDefinition::new(StaticMode::BlockRestriction {
++                filter: crate::types::statics::block_only_creatures_with_flying_filter(),
++            })
++            .affected(affected)
++            .description(description.to_string())
+         }
+         RuleStaticPredicate::Shroud if rule_static_affected_is_player_scope(&affected) => {
+             StaticDefinition::new(StaticMode::Shroud)
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 3726d0a380..de78f03ce9 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -4243,8 +4243,29 @@ fn static_pump_and_goaded_emits_both_defs() {
+ 
+ #[test]
+ fn static_this_creature_can_block_only_creatures_with_flying() {
++    use crate::types::statics::block_only_creatures_with_flying_filter;
++
+     let def = parse_static_line("This creature can block only creatures with flying.").unwrap();
+-    assert_eq!(def.mode, StaticMode::BlockRestriction);
++    assert_eq!(
++        def.mode,
++        StaticMode::BlockRestriction {
++            filter: block_only_creatures_with_flying_filter(),
++        }
++    );
++    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
++}
++
++#[test]
++fn static_this_token_can_block_only_creatures_with_flying() {
++    use crate::types::statics::block_only_creatures_with_flying_filter;
++
++    let def = parse_static_line("This token can block only creatures with flying.").unwrap();
++    assert_eq!(
++        def.mode,
++        StaticMode::BlockRestriction {
++            filter: block_only_creatures_with_flying_filter(),
++        }
++    );
+     assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+ }
+ 
+diff --git a/crates/engine/src/types/statics.rs b/crates/engine/src/types/statics.rs
+index 404fb2b6d2..0818edeab2 100644
+--- a/crates/engine/src/types/statics.rs
++++ b/crates/engine/src/types/statics.rs
+@@ -1157,7 +1157,11 @@ pub enum StaticMode {
+         count: u8,
+     },
+     EmblemStatic,
+-    BlockRestriction,
++    /// CR 509.1b: Blocker-side restriction — this creature can block only
++    /// attackers matching `filter` (Cloud Sprite, Pinnacle Emissary Drone).
++    BlockRestriction {
++        filter: super::ability::TargetFilter,
++    },
+     /// CR 402.2: No maximum hand size.
+     NoMaximumHandSize,
+     /// CR 402.2 + CR 514.1: Maximum hand size modification.
+@@ -1345,6 +1349,7 @@ impl Hash for StaticMode {
+                 BlockExceptionKind::MinBlockers { min } => min.hash(state),
+             },
+             StaticMode::CantBeBlockedBy { .. } => {} // TargetFilter does not implement Hash; discriminant only
++            StaticMode::BlockRestriction { .. } => {} // TargetFilter does not implement Hash; discriminant only
+             StaticMode::AttachmentRestriction { .. } => {} // TargetFilter does not implement Hash; discriminant only
+             StaticMode::CantBeBlockedByMoreThan { max } => max.hash(state),
+             StaticMode::AdditionalLandDrop { count } => count.hash(state),
+@@ -1502,7 +1507,7 @@ impl StaticMode {
+             | StaticMode::MayChooseNotToUntap
+             | StaticMode::AdditionalLandDrop { .. }
+             | StaticMode::EmblemStatic
+-            | StaticMode::BlockRestriction
++            | StaticMode::BlockRestriction { .. }
+             | StaticMode::NoMaximumHandSize
+             | StaticMode::MaximumHandSize { .. }
+             | StaticMode::MayPlayAdditionalLand
+@@ -1745,7 +1750,13 @@ impl fmt::Display for StaticMode {
+                 write!(f, "AdditionalLandDrop({count})")
+             }
+             StaticMode::EmblemStatic => write!(f, "EmblemStatic"),
+-            StaticMode::BlockRestriction => write!(f, "BlockRestriction"),
++            StaticMode::BlockRestriction { filter } => {
++                if *filter == block_only_creatures_with_flying_filter() {
++                    write!(f, "BlockRestriction")
++                } else {
++                    write!(f, "BlockRestriction:Quality({filter:?})")
++                }
++            }
+             StaticMode::NoMaximumHandSize => write!(f, "NoMaximumHandSize"),
+             StaticMode::MaximumHandSize { modification } => {
+                 write!(f, "MaximumHandSize({modification})")
+@@ -2078,7 +2089,9 @@ impl FromStr for StaticMode {
+             "MayChooseNotToUntap" => StaticMode::MayChooseNotToUntap,
+             // AdditionalLandDrop is parameterized — parsed in the `other` branch below
+             "EmblemStatic" => StaticMode::EmblemStatic,
+-            "BlockRestriction" => StaticMode::BlockRestriction,
++            "BlockRestriction" => StaticMode::BlockRestriction {
++                filter: block_only_creatures_with_flying_filter(),
++            },
+             "NoMaximumHandSize" => StaticMode::NoMaximumHandSize,
+             s if s.starts_with("MaximumHandSize(") => {
+                 // MaximumHandSize is data-carrying; FromStr round-trip not required.
+@@ -2303,6 +2316,16 @@ fn parse_static_mode_u32_arg(s: &str, prefix: &str) -> Option<u32> {
+         .ok()
+ }
+ 
++/// CR 509.1b: Canonical attacker filter for "can block only creatures with flying."
++pub fn block_only_creatures_with_flying_filter() -> TargetFilter {
++    use super::ability::{FilterProp, TypedFilter};
++    TargetFilter::Typed(
++        TypedFilter::creature().properties(vec![FilterProp::WithKeyword {
++            value: Keyword::Flying,
++        }]),
++    )
++}
++
+ /// Forward-compatible deserializer for `StaticMode` fields in persisted JSON
+ /// (card-data.json). Handles the common case where a new unit-variant is added
+ /// to the engine but an older WASM binary tries to load card data that contains
+@@ -2335,6 +2358,11 @@ where
+             if let Some(mode) = deserialize_legacy_cost_modify_string(s) {
+                 return Ok(mode);
+             }
++            if s == "BlockRestriction" {
++                return Ok(StaticMode::BlockRestriction {
++                    filter: block_only_creatures_with_flying_filter(),
++                });
++            }
+             // Try the derived deserializer so all known unit variants
+             // (e.g. "SpendManaAsAnyColor", "Flying", …) round-trip correctly.
+             // If the derived impl rejects the string (unknown variant from a newer
+@@ -2412,6 +2440,22 @@ fn deserialize_legacy_modify_cost_object(
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn legacy_block_restriction_string_deserializes_with_flying_filter() {
++        use super::super::ability::StaticDefinition;
++
++        let def: StaticDefinition = serde_json::from_str(
++            r#"{"mode":"BlockRestriction","modifications":[],"affected":{"type":"SelfRef"}}"#,
++        )
++        .expect("legacy card-data unit variant");
++        assert_eq!(
++            def.mode,
++            StaticMode::BlockRestriction {
++                filter: block_only_creatures_with_flying_filter(),
++            }
++        );
++    }
++
+     #[test]
+     fn parse_known_static_modes() {
+         assert_eq!(
+@@ -2529,7 +2573,9 @@ mod tests {
+             StaticMode::AdditionalLandDrop { count: 1 },
+             StaticMode::AdditionalLandDrop { count: 2 },
+             StaticMode::EmblemStatic,
+-            StaticMode::BlockRestriction,
++            StaticMode::BlockRestriction {
++                filter: block_only_creatures_with_flying_filter(),
++            },
+             StaticMode::NoMaximumHandSize,
+             StaticMode::MayPlayAdditionalLand,
+             // Graveyard cast/play permissions
+diff --git a/crates/mtgish-import/src/convert/static_effect.rs b/crates/mtgish-import/src/convert/static_effect.rs
+index 93ade8a1db..5c2d0bc469 100644
+--- a/crates/mtgish-import/src/convert/static_effect.rs
++++ b/crates/mtgish-import/src/convert/static_effect.rs
+@@ -299,14 +299,13 @@ pub fn convert_permanent_rule(
+         P::MustBlock => StaticMode::MustBlock,
+         P::MustBeBlocked => StaticMode::MustBeBlocked,
+         P::CanBlockOnly(filter) if is_creature_with_flying_filter(filter) => {
+-            StaticMode::BlockRestriction
+-        }
+-        P::CanBlockOnly(filter) => {
+-            return Err(ConversionGap::EnginePrerequisiteMissing {
+-                engine_type: "StaticMode::BlockRestriction",
+-                needed_variant: format!("parameterized block-only filter: {filter:?}"),
+-            });
++            StaticMode::BlockRestriction {
++                filter: engine::types::statics::block_only_creatures_with_flying_filter(),
++            }
+         }
++        P::CanBlockOnly(filter) => StaticMode::BlockRestriction {
++            filter: filter::convert(filter)?,
++        },
+         P::CantAttackIfDefendingPlayer(condition) => {
+             return Ok(StaticDefinition::new(StaticMode::CantAttack)
+                 .affected(affected)
+@@ -1009,7 +1008,10 @@ mod tests {
+         )
+         .unwrap();
+ 
+-        assert_eq!(converted.mode, StaticMode::BlockRestriction);
++        assert!(matches!(
++            converted.mode,
++            StaticMode::BlockRestriction { .. }
++        ));
+         assert_eq!(converted.affected, Some(TargetFilter::SelfRef));
+     }
+ 

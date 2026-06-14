@@ -1,0 +1,596 @@
+diff --git a/crates/engine/src/game/ability_utils.rs b/crates/engine/src/game/ability_utils.rs
+index c1743aae8..cca8d4201 100644
+--- a/crates/engine/src/game/ability_utils.rs
++++ b/crates/engine/src/game/ability_utils.rs
+@@ -1540,6 +1540,66 @@ pub(crate) struct MultiTargetBounds {
+     pub max: usize,
+ }
+ 
++/// CR 601.2d: When a spell or ability divides an effect (damage, counters)
++/// among its targets, each chosen target must receive at least one unit. The
++/// pool to divide is therefore an upper bound on how many targets may legally be
++/// chosen — picking more targets than units leaves at least one target with
++/// nothing, which the rules forbid. Returns the resolved pool size for a
++/// distributing ability, peeling any outer "up to" wrapper so the structural
++/// maximum (not the cap) drives the bound. Returns `None` when the pool amount
++/// is not a damage/counter count (e.g. life-distribution stubs that don't
++/// surface a divisible amount), in which case no pool cap applies.
++///
++/// `distribute` is the distribution-unit flag carried on the originating
++/// `AbilityDefinition` / `PendingCast` (the runtime `ResolvedAbility` does not
++/// itself carry it), so callers in the cast/trigger pipeline pass it through.
++pub(crate) fn distribution_pool_cap(
++    state: &GameState,
++    ability: &ResolvedAbility,
++    distribute: Option<&crate::types::game_state::DistributionUnit>,
++) -> Option<usize> {
++    distribute?;
++    let amount = match &ability.effect {
++        Effect::DealDamage { amount, .. } => amount,
++        Effect::PutCounter { count, .. } => count,
++        _ => return None,
++    };
++    // CR 601.2d: "up to N divided as you choose" still divides the *resolved*
++    // amount; peel the cap so the pool is the concrete number to distribute.
++    let (inner, _) = amount.peel_up_to();
++    Some(resolve_quantity_with_targets(state, inner, ability).max(0) as usize)
++}
++
++/// CR 601.2c + CR 601.2d: Truncate `target_slots` so a divided spell offers at
++/// most one slot per unit of its divisible pool. Each chosen target must receive
++/// ≥1 (CR 601.2d), so a pool of N can be split among at most N targets; offering
++/// more slots lets the controller pick a target set that can never be legally
++/// divided (the Shatterskull Smashing X=1 / two-slot softlock, issue #2856).
++///
++/// Required slots (the leading `!optional` prefix) are preserved — only the
++/// optional "up to" tail beyond the pool size is dropped. A no-op when the
++/// ability does not distribute, the pool is not a countable amount, or the pool
++/// already meets/exceeds the slot count (the common case, e.g. Lathiel whose
++/// printed cap already equals the pool).
++pub(crate) fn cap_distribution_target_slots(
++    state: &GameState,
++    ability: &ResolvedAbility,
++    distribute: Option<&crate::types::game_state::DistributionUnit>,
++    target_slots: &mut Vec<TargetSelectionSlot>,
++) {
++    let Some(pool) = distribution_pool_cap(state, ability, distribute) else {
++        return;
++    };
++    let required = target_slots.iter().filter(|slot| !slot.optional).count();
++    // Never drop a required slot: if the pool somehow underruns the structural
++    // minimum, keep the minimum (a malformed spec, not reachable for well-formed
++    // "up to N" distribution where min == 0).
++    let keep = pool.max(required);
++    if target_slots.len() > keep {
++        target_slots.truncate(keep);
++    }
++}
++
+ /// CR 115.1d: A triggered ability's targets are chosen as it is put on the stack.
+ /// CR 601.2c: Resolve a multi-target count after any required quantity choices
+ /// have been announced, then cap optional slots at the live legal-target set
+@@ -1622,11 +1682,22 @@ fn quantity_expr_has_unresolved_variable(
+     }
+ }
+ 
+-pub fn ability_target_legality_needs_chosen_x(ability: &ResolvedAbility) -> bool {
++pub fn ability_target_legality_needs_chosen_x(
++    ability: &ResolvedAbility,
++    distribute: Option<&crate::types::game_state::DistributionUnit>,
++) -> bool {
+     if ability.chosen_x.is_some() {
+         return false;
+     }
+     ability_target_legality_needs_chosen_x_inner(ability)
++        // CR 601.2c + CR 601.2d: A divided spell's legal target count is bounded
++        // by the divisible pool (each target needs ≥1). When that pool is an
++        // X-dependent amount divided among "up to N" targets (Shatterskull
++        // Smashing: "X damage divided among up to two target creatures"), the
++        // effective target ceiling `min(N, X)` can't be computed until X is
++        // announced — so defer target selection to ChooseXValue even though the
++        // printed `multi_target.max` is a fixed value (issue #2856).
++        || ability_distribution_pool_needs_chosen_x(ability, distribute)
+ }
+ 
+ fn ability_target_legality_needs_chosen_x_inner(ability: &ResolvedAbility) -> bool {
+@@ -1676,6 +1747,28 @@ fn quantity_expr_has_unresolved_x(ability: &ResolvedAbility, expr: &QuantityExpr
+     ability.chosen_x.is_none() && expr.contains_x()
+ }
+ 
++/// CR 601.2c + CR 601.2d: True when `ability` divides a damage/counter pool
++/// whose amount still references an unannounced X. The number of targets such a
++/// spell may have is `min(printed cap, pool)`, so the pool — and therefore X —
++/// must be known before target slots are built. Used to route Shatterskull-class
++/// X-divided spells through `ChooseXValue` ahead of target selection even though
++/// their `multi_target.max` is a fixed printed value.
++fn ability_distribution_pool_needs_chosen_x(
++    ability: &ResolvedAbility,
++    distribute: Option<&crate::types::game_state::DistributionUnit>,
++) -> bool {
++    if distribute.is_none() {
++        return false;
++    }
++    let amount = match &ability.effect {
++        Effect::DealDamage { amount, .. } => amount,
++        Effect::PutCounter { count, .. } => count,
++        _ => return false,
++    };
++    let (inner, _) = amount.peel_up_to();
++    quantity_expr_has_unresolved_x(ability, inner)
++}
++
+ /// CR 109.4 + CR 115.1: Returns true if `effect` needs a companion
+ /// `TargetFilter::Player` target slot. This covers filters that reference
+ /// `ControllerRef::TargetPlayer` and restriction effects whose affected player
+@@ -7647,6 +7740,77 @@ mod tests {
+         assert!(slots.iter().all(|slot| slot.optional));
+     }
+ 
++    /// CR 601.2c + CR 601.2d (issue #2856): `cap_distribution_target_slots`
++    /// clamps a divided spell's "up to N" target slots to its divisible pool —
++    /// each chosen target needs ≥1, so a pool of K can be split among at most K
++    /// targets. Exercises the class: pool below cap (clamps), pool at/above cap
++    /// (no-op), no-distribute (no-op), and a non-divisible effect (no-op).
++    #[test]
++    fn cap_distribution_target_slots_clamps_to_divisible_pool() {
++        use crate::types::game_state::DistributionUnit;
++
++        let state = crate::types::game_state::GameState::new_two_player(42);
++        let damage = DistributionUnit::Damage;
++
++        let make = |x: u32| {
++            let mut ability = ResolvedAbility::new(
++                Effect::DealDamage {
++                    amount: QuantityExpr::Ref {
++                        qty: QuantityRef::Variable {
++                            name: "X".to_string(),
++                        },
++                    },
++                    target: TargetFilter::Typed(TypedFilter::creature()),
++                    damage_source: None,
++                },
++                vec![],
++                ObjectId(10),
++                PlayerId(0),
++            );
++            ability.multi_target = Some(crate::types::ability::MultiTargetSpec::fixed(0, 2));
++            ability.set_chosen_x_recursive(x);
++            ability
++        };
++        let two_optional_slots = || {
++            vec![
++                TargetSelectionSlot {
++                    legal_targets: vec![],
++                    optional: true,
++                },
++                TargetSelectionSlot {
++                    legal_targets: vec![],
++                    optional: true,
++                },
++            ]
++        };
++
++        // X = 1: pool of one clamps two "up to two" slots down to one.
++        let mut slots = two_optional_slots();
++        cap_distribution_target_slots(&state, &make(1), Some(&damage), &mut slots);
++        assert_eq!(slots.len(), 1, "X=1 → at most one slot");
++
++        // X = 0: distributes nothing, target count collapses to zero.
++        let mut slots = two_optional_slots();
++        cap_distribution_target_slots(&state, &make(0), Some(&damage), &mut slots);
++        assert_eq!(slots.len(), 0, "X=0 → no slots");
++
++        // X = 2: pool meets the printed cap — both slots survive.
++        let mut slots = two_optional_slots();
++        cap_distribution_target_slots(&state, &make(2), Some(&damage), &mut slots);
++        assert_eq!(slots.len(), 2, "X=2 → printed cap of two retained");
++
++        // X = 5: pool exceeds the printed cap — still capped by the printed two.
++        let mut slots = two_optional_slots();
++        cap_distribution_target_slots(&state, &make(5), Some(&damage), &mut slots);
++        assert_eq!(slots.len(), 2, "pool > cap is a no-op");
++
++        // No distribute flag: never clamp (a non-divided "to each of" multi-target
++        // deals the full amount to every chosen target — CR 601.2d does not apply).
++        let mut slots = two_optional_slots();
++        cap_distribution_target_slots(&state, &make(1), None, &mut slots);
++        assert_eq!(slots.len(), 2, "non-distributing ability is untouched");
++    }
++
+     #[test]
+     fn build_target_slots_resolves_dynamic_multi_target_max() {
+         let mut state = crate::types::game_state::GameState::new_two_player(42);
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index 2b41a3580..d7f1d1dcd 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -8390,8 +8390,13 @@ fn continue_with_prepared(
+ 
+     // CR 601.2b/c/f: When target cardinality depends on an announced X, defer
+     // target selection until that X is chosen from the spell's required
+-    // additional cost or mana cost.
+-    if ability_target_legality_needs_chosen_x(&resolved) {
++    // additional cost or mana cost. CR 601.2d: a divided pool's target count is
++    // also X-bounded (issue #2856), so the distribute flag participates.
++    let prepared_distribute = prepared
++        .ability_def
++        .as_ref()
++        .and_then(|a| a.distribute.clone());
++    if ability_target_legality_needs_chosen_x(&resolved, prepared_distribute.as_ref()) {
+         if let Some(required_cost) =
+             casting_costs::required_additional_cost_can_declare_x(state, player, prepared.object_id)
+         {
+@@ -8443,7 +8448,16 @@ fn continue_with_prepared(
+         }
+     }
+ 
+-    let target_slots = build_target_slots(state, &resolved)?;
++    let mut target_slots = build_target_slots(state, &resolved)?;
++    // CR 601.2c + CR 601.2d: A fixed-amount divided spell (no X to announce, e.g.
++    // "2 damage divided among up to three targets") must likewise offer at most
++    // one slot per divisible unit — each chosen target needs ≥1 (issue #2856).
++    super::ability_utils::cap_distribution_target_slots(
++        state,
++        &resolved,
++        prepared_distribute.as_ref(),
++        &mut target_slots,
++    );
+     if !target_slots.is_empty() {
+         let target_constraints = prepared
+             .ability_def
+@@ -8836,7 +8850,7 @@ pub fn spell_has_legal_targets(
+             }
+         }
+         Err(_) => {
+-            ability_target_legality_needs_chosen_x(&resolved)
++            ability_target_legality_needs_chosen_x(&resolved, ability_def.distribute.as_ref())
+                 && (casting_costs::required_additional_cost_can_declare_x(
+                     &simulated, player, obj.id,
+                 )
+@@ -10976,7 +10990,7 @@ pub fn can_activate_ability_now(
+                 )
+         }
+         Err(_) => {
+-            ability_target_legality_needs_chosen_x(&resolved)
++            ability_target_legality_needs_chosen_x(&resolved, ability_def.distribute.as_ref())
+                 && ability_def.cost.as_ref().is_some_and(|cost| {
+                     casting_costs::extract_x_mana_cost(cost).is_some()
+                         || find_non_self_sacrifice_cost(cost)
+@@ -11199,7 +11213,7 @@ pub fn handle_activate_ability(
+                 let resolved = build_resolved_from_def(mode, source_id, player);
+                 (casting_costs::extract_x_mana_cost(cost).is_some()
+                     || casting_costs::activation_cost_needs_x_choice(&resolved, cost))
+-                    && ability_target_legality_needs_chosen_x(&resolved)
++                    && ability_target_legality_needs_chosen_x(&resolved, mode.distribute.as_ref())
+             })
+         });
+         // CR 602.2b + CR 601.2b/c: When modal activated ability target legality
+diff --git a/crates/engine/src/game/casting_costs.rs b/crates/engine/src/game/casting_costs.rs
+index 5fca7c2e6..5e9755170 100644
+--- a/crates/engine/src/game/casting_costs.rs
++++ b/crates/engine/src/game/casting_costs.rs
+@@ -789,7 +789,7 @@ pub(crate) fn begin_deferred_target_selection(
+     // CR 601.2b + CR 601.2c: modes/X are announced (601.2b) before targets are
+     // chosen (601.2c), since target legality (e.g. "mana value X or less") can
+     // depend on the chosen X.
+-    let (target_slots, mode_labels) = if pending.chosen_modes.is_empty() {
++    let (mut target_slots, mode_labels) = if pending.chosen_modes.is_empty() {
+         (build_target_slots(state, &pending.ability)?, Vec::new())
+     } else {
+         let obj = state.objects.get(&pending.object_id).ok_or_else(|| {
+@@ -836,6 +836,16 @@ pub(crate) fn begin_deferred_target_selection(
+             pending.ability.chosen_x,
+         )?
+     };
++    // CR 601.2c + CR 601.2d: X is now known (deferred selection runs after the
++    // ChooseXValue round-trip), so a divided spell's slot count can be clamped to
++    // its divisible pool — each target needs ≥1, so picking more targets than the
++    // pool can never be legally divided (Shatterskull Smashing X=1, issue #2856).
++    super::ability_utils::cap_distribution_target_slots(
++        state,
++        &pending.ability,
++        pending.distribute.as_ref(),
++        &mut target_slots,
++    );
+     if target_slots.is_empty() {
+         return finish_pending_cost_or_cast(state, player, pending, events);
+     }
+diff --git a/crates/engine/src/game/casting_targets.rs b/crates/engine/src/game/casting_targets.rs
+index a6a86c41f..886d7002b 100644
+--- a/crates/engine/src/game/casting_targets.rs
++++ b/crates/engine/src/game/casting_targets.rs
+@@ -107,7 +107,7 @@ pub(crate) fn handle_select_modes(
+     if pending.activation_ability_index.is_none()
+         && pending.additional_cost_flow.is_none()
+         && cost_has_x(&total_cost)
+-        && ability_target_legality_needs_chosen_x(&resolved)
++        && ability_target_legality_needs_chosen_x(&resolved, pending.distribute.as_ref())
+     {
+         let mut pending_x =
+             PendingCast::new(pending.object_id, pending.card_id, resolved, total_cost);
+diff --git a/crates/engine/src/game/engine.rs b/crates/engine/src/game/engine.rs
+index 77b4f0ae0..ed0199bfd 100644
+--- a/crates/engine/src/game/engine.rs
++++ b/crates/engine/src/game/engine.rs
+@@ -20,8 +20,8 @@ use crate::types::statics::StaticMode;
+ use crate::types::zones::Zone;
+ 
+ use super::ability_utils::{
+-    begin_target_selection_for_ability, build_target_slots, compute_unavailable_modes,
+-    has_legal_target_assignment_for_ability, modal_choice_for_player,
++    begin_target_selection_for_ability, build_target_slots, cap_distribution_target_slots,
++    compute_unavailable_modes, has_legal_target_assignment_for_ability, modal_choice_for_player,
+ };
+ use super::casting;
+ use super::casting_costs;
+@@ -2794,7 +2794,16 @@ fn apply_action(
+                     let mut trial = pending.as_ref().clone();
+                     trial.ability.set_chosen_x_recursive(value);
+                     trial.cost.concretize_x(value);
+-                    let target_slots = build_target_slots(state, &trial.ability)?;
++                    let mut target_slots = build_target_slots(state, &trial.ability)?;
++                    // CR 601.2c + CR 601.2d: clamp a divided spell's slots to the
++                    // (now-known) pool so the legal-assignment probe matches what
++                    // the controller will actually be offered (issue #2856).
++                    cap_distribution_target_slots(
++                        state,
++                        &trial.ability,
++                        trial.distribute.as_ref(),
++                        &mut target_slots,
++                    );
+                     if !target_slots.is_empty()
+                         && !has_legal_target_assignment_for_ability(
+                             state,
+diff --git a/crates/engine/src/game/engine_modes.rs b/crates/engine/src/game/engine_modes.rs
+index eb0c244dd..8c0719650 100644
+--- a/crates/engine/src/game/engine_modes.rs
++++ b/crates/engine/src/game/engine_modes.rs
+@@ -6,8 +6,9 @@ use crate::types::mana::ManaCost;
+ use super::ability_utils::{
+     ability_target_legality_needs_chosen_x, assign_targets_in_chain,
+     auto_select_targets_for_ability, begin_target_selection_for_ability, build_chained_resolved,
+-    build_target_slots_labelled, flatten_targets_in_chain, random_select_targets_for_ability,
+-    record_modal_mode_choices, target_constraints_from_modal, validate_modal_indices,
++    build_target_slots_labelled, cap_distribution_target_slots, flatten_targets_in_chain,
++    random_select_targets_for_ability, record_modal_mode_choices, target_constraints_from_modal,
++    validate_modal_indices,
+ };
+ use super::engine::EngineError;
+ use super::engine_stack;
+@@ -110,14 +111,19 @@ fn handle_activated_mode_choice(
+     // announcement steps. If an activated modal ability's target legality depends
+     // on an {X} activation cost, choose X after modes and before targets, then
+     // resume through the same deferred target-selection path modal spells use so
+-    // per-mode labels and X-dependent legality stay in sync.
+-    if ability_target_legality_needs_chosen_x(&resolved) {
++    // per-mode labels and X-dependent legality stay in sync. CR 601.2d: a chosen
++    // mode that divides an X-dependent pool is likewise X-bounded (issue #2856).
++    let mode_distribute = indices
++        .iter()
++        .find_map(|&i| mode_abilities.get(i).and_then(|m| m.distribute.clone()));
++    if ability_target_legality_needs_chosen_x(&resolved, mode_distribute.as_ref()) {
+         if let Some(cost) = ability_cost.as_ref() {
+             if let Some((mana_cost, remaining)) = casting_costs::extract_x_mana_cost(cost) {
+                 let mut pending_x = PendingCast::new(source_id, CardId(0), resolved, mana_cost);
+                 pending_x.activation_cost = remaining;
+                 pending_x.activation_ability_index = ability_index;
+                 pending_x.target_constraints = target_constraints;
++                pending_x.distribute = mode_distribute.clone();
+                 pending_x.deferred_target_selection = true;
+                 let mut chosen_modes = indices.clone();
+                 chosen_modes.sort_unstable();
+@@ -144,6 +150,7 @@ fn handle_activated_mode_choice(
+             pending_x.activation_cost = remaining;
+             pending_x.activation_ability_index = ability_index;
+             pending_x.target_constraints = target_constraints;
++            pending_x.distribute = mode_distribute.clone();
+             pending_x.deferred_target_selection = true;
+             let mut chosen_modes = indices.clone();
+             chosen_modes.sort_unstable();
+@@ -159,7 +166,7 @@ fn handle_activated_mode_choice(
+     // SAME post-flush state (Finding 4 — never let the two vectors diverge in
+     // length). `resolved.context` is the chained ability's context, reapplied
+     // per-mode by the labelled builder.
+-    let (target_slots, mode_labels) = build_target_slots_labelled(
++    let (mut target_slots, mode_labels) = build_target_slots_labelled(
+         state,
+         &mode_abilities,
+         &indices,
+@@ -169,6 +176,12 @@ fn handle_activated_mode_choice(
+         &resolved.context,
+         resolved.chosen_x,
+     )?;
++    cap_distribution_target_slots(
++        state,
++        &resolved,
++        mode_distribute.as_ref(),
++        &mut target_slots,
++    );
+ 
+     if !target_slots.is_empty() {
+         // CR 115.1 + CR 701.9b: Random-target modal activated abilities — the
+diff --git a/crates/engine/tests/integration/issue_2856_shatterskull_divide_softlock.rs b/crates/engine/tests/integration/issue_2856_shatterskull_divide_softlock.rs
+new file mode 100644
+index 000000000..941aa8bae
+--- /dev/null
++++ b/crates/engine/tests/integration/issue_2856_shatterskull_divide_softlock.rs
+@@ -0,0 +1,167 @@
++//! Issue #2856 — Shatterskull Smashing: divided-damage softlock when X is
++//! smaller than the printed target cap.
++//!
++//! Oracle: "Shatterskull Smashing deals X damage divided as you choose among up
++//! to two target creatures and/or planeswalkers."
++//!
++//! With X = 1 and the printed "up to two" target cap, the controller must NOT be
++//! offered two target slots — CR 601.2d requires each chosen target to receive
++//! at least one of the divided damage, so with only one damage to divide the
++//! effective target ceiling collapses to one (CR 601.2c: a divided spell's
++//! target count is bounded by the amount to divide). The pre-fix engine offered
++//! two slots regardless of X, leaving the player to pick two targets and then
++//! deadlock at `DistributeAmong` (1 damage, two targets, each needs ≥1).
++
++use super::rules::{GameRunner, GameScenario, Phase, WaitingFor, P0, P1};
++use engine::types::ability::TargetRef;
++use engine::types::actions::GameAction;
++use engine::types::game_state::{CastPaymentMode, DistributionUnit};
++use engine::types::identifiers::{CardId, ObjectId};
++use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
++
++const SHATTERSKULL_ORACLE: &str = "Shatterskull Smashing deals X damage divided as you choose among up to two target creatures and/or planeswalkers. If X is 6 or more, Shatterskull Smashing deals twice X damage divided as you choose among them instead.";
++
++fn red_pool(amount: usize) -> Vec<ManaUnit> {
++    (0..amount)
++        .map(|_| ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]))
++        .collect()
++}
++
++/// The number of target slots a divided-damage spell offers must be bounded by
++/// the announced damage pool (X = 1 ⇒ at most one slot), not the printed
++/// "up to two" cap. Otherwise the controller can pick two targets and softlock.
++#[test]
++fn shatterskull_x1_offers_single_target_slot_no_softlock() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    let goblin = scenario.add_creature(P1, "Goblin A", 1, 1).id();
++    let _ogre = scenario.add_creature(P1, "Ogre B", 3, 3).id();
++
++    let spell = scenario
++        .add_spell_to_hand_from_oracle(P0, "Shatterskull Smashing", false, SHATTERSKULL_ORACLE)
++        .with_mana_cost(ManaCost::Cost {
++            shards: vec![ManaCostShard::X, ManaCostShard::Red, ManaCostShard::Red],
++            generic: 0,
++        })
++        .id();
++    let card_id = CardId(spell.0);
++
++    // {X}{R}{R} at X=1 → three red mana.
++    scenario.with_mana_pool(P0, red_pool(3));
++
++    let mut runner = scenario.build();
++
++    runner
++        .act(GameAction::CastSpell {
++            object_id: spell,
++            card_id,
++            targets: vec![],
++            payment_mode: CastPaymentMode::Auto,
++        })
++        .expect("cast announcement should succeed");
++
++    // CR 601.2b/f: X for a divided spell whose target count is bounded by the
++    // pool must be announced before targets are chosen.
++    drive_choose_x(&mut runner, 1);
++
++    // CR 601.2c/d: with X = 1 only a single target slot may be offered.
++    let slot_count = single_target_slot_count(&runner);
++    assert_eq!(
++        slot_count, 1,
++        "X=1 divided among 'up to two' targets must offer exactly one slot (issue #2856 softlock)"
++    );
++
++    // Choosing the one allowed target then resolves to a single DistributeAmong
++    // (or auto-resolves) without deadlock.
++    drive_single_target(&mut runner, goblin);
++    let _ = _ogre;
++
++    // The pipeline must reach a DistributeAmong over exactly one target, or have
++    // already auto-distributed — never a two-target deadlock.
++    if let WaitingFor::DistributeAmong {
++        targets,
++        total,
++        unit,
++        ..
++    } = runner.state().waiting_for.clone()
++    {
++        assert_eq!(total, 1, "damage pool equals X=1");
++        assert_eq!(unit, DistributionUnit::Damage);
++        assert_eq!(targets.len(), 1, "exactly one target to divide among");
++        runner
++            .act(GameAction::DistributeAmong {
++                distribution: targets.iter().map(|t| (t.clone(), 1)).collect(),
++            })
++            .expect("single-target distribution must be legal");
++    }
++
++    runner.advance_until_stack_empty();
++
++    // 1 damage landed on the single chosen creature.
++    let dmg = runner
++        .state()
++        .objects
++        .get(&goblin)
++        .map(|o| o.damage_marked)
++        .unwrap_or(0);
++    assert_eq!(
++        dmg, 1,
++        "all X=1 damage assigned to the single chosen target"
++    );
++    assert!(
++        !matches!(
++            runner.state().waiting_for,
++            WaitingFor::DistributeAmong { .. }
++        ),
++        "must not be stuck waiting on an impossible distribution"
++    );
++}
++
++fn drive_choose_x(runner: &mut GameRunner, x: u32) {
++    for _ in 0..40 {
++        match runner.state().waiting_for.clone() {
++            WaitingFor::ChooseXValue { .. } => {
++                runner
++                    .act(GameAction::ChooseX { value: x })
++                    .expect("ChooseX should succeed");
++                return;
++            }
++            WaitingFor::ManaPayment { .. } => {
++                // Pool-funded auto-pay shouldn't surface here, but pass priority
++                // defensively to keep the harness from hanging.
++                if runner.act(GameAction::PassPriority).is_err() {
++                    return;
++                }
++            }
++            WaitingFor::TargetSelection { .. } => {
++                panic!("X must be announced before targets for a pool-bounded divided spell (issue #2856)");
++            }
++            _ => return,
++        }
++    }
++    panic!("never reached ChooseXValue");
++}
++
++fn single_target_slot_count(runner: &GameRunner) -> usize {
++    match &runner.state().waiting_for {
++        WaitingFor::TargetSelection { target_slots, .. } => target_slots.len(),
++        other => panic!("expected TargetSelection after ChooseX, got {other:?}"),
++    }
++}
++
++fn drive_single_target(runner: &mut GameRunner, target: ObjectId) {
++    let mut guard = 0;
++    while matches!(
++        runner.state().waiting_for,
++        WaitingFor::TargetSelection { .. }
++    ) {
++        guard += 1;
++        assert!(guard < 5, "single-slot target selection must terminate");
++        runner
++            .act(GameAction::ChooseTarget {
++                target: Some(TargetRef::Object(target)),
++            })
++            .expect("ChooseTarget should succeed");
++    }
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 967e3a5a9..433bd818e 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -135,6 +135,7 @@ mod issue_2430_shifting_woodland;
+ mod issue_2431_ultima_tap_land_for_c;
+ mod issue_2435_traumatic_critique;
+ mod issue_2439_wayta_trigger_doubling;
++mod issue_2856_shatterskull_divide_softlock;
+ mod issue_2888_unbreathing_horde_self_prevention;
+ mod issue_2894_spymasters_vault_connive;
+ mod issue_2900_blinkmoth_urn;

@@ -1,0 +1,655 @@
+diff --git a/crates/engine/src/game/effects/conjure.rs b/crates/engine/src/game/effects/conjure.rs
+index ba4c763144..17cea558ab 100644
+--- a/crates/engine/src/game/effects/conjure.rs
++++ b/crates/engine/src/game/effects/conjure.rs
+@@ -1,19 +1,42 @@
+-use crate::game::printed_cards::apply_card_face_to_object;
++use crate::game::layers::compute_current_copiable_values;
++use crate::game::printed_cards::{apply_card_face_to_object, apply_copiable_values};
+ use crate::game::quantity::resolve_quantity_with_targets;
+ use crate::game::zones;
+-use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
++use crate::types::ability::{
++    ConjureSource, CopiableValues, Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter,
++};
++use crate::types::card::CardFace;
+ use crate::types::events::GameEvent;
+ use crate::types::game_state::GameState;
+-use crate::types::identifiers::CardId;
++use crate::types::identifiers::{CardId, ObjectId};
+ use crate::types::zones::Zone;
+ 
++/// The fully-resolved identity of a conjured card for one `ConjureCard` entry.
++enum ConjuredIdentity {
++    /// A specific named card; `face` is its printed `CardFace` from the registry
++    /// (`None` when the card is not in the registry). Boxed to keep the enum
++    /// small (clippy::large_enum_variant).
++    Named {
++        name: String,
++        face: Option<Box<CardFace>>,
++    },
++    /// CR 707.2: a duplicate of a referenced card — the referenced card's current
++    /// copiable values, applied to the conjured card so it has real
++    /// characteristics. Boxed to keep the enum small (clippy::large_enum_variant).
++    Duplicate(Box<CopiableValues>),
++}
++
+ /// Digital-only keyword action (no CR entry): Conjure creates a card from outside
+ /// the game and places it into a specified zone. Unlike tokens, conjured cards are
+ /// "real" cards with full card characteristics (mana value, types, abilities, etc.).
+ ///
+-/// The handler looks up the named card from `state.card_face_registry` (populated
+-/// at game init by `rehydrate_game_from_card_db`) and applies full characteristics
+-/// via `apply_card_face_to_object`.
++/// For a `Named` source the handler looks up the card from
++/// `state.card_face_registry` (populated at game init by
++/// `rehydrate_game_from_card_db`) and applies its printed face via
++/// `apply_card_face_to_object`. For a `Duplicate` source (CR 707.2) it resolves
++/// the referenced card and applies that card's current copiable values via
++/// `apply_copiable_values`, so the conjured card has full characteristics
++/// regardless of whether its name is in the (scoped) registry.
+ pub fn resolve(
+     state: &mut GameState,
+     ability: &ResolvedAbility,
+@@ -32,18 +55,43 @@ pub fn resolve(
+         let count =
+             resolve_quantity_with_targets(state, &conjure_card.count, ability).max(0) as u32;
+ 
+-        // Look up the card face data from the registry (populated at game init).
+-        let card_face = state
+-            .card_face_registry
+-            .get(&conjure_card.name.to_lowercase())
+-            .cloned();
++        // Resolve the conjured card's full identity (CR 707.2):
++        // - `Named`: look up the printed face from the registry by name.
++        // - `Duplicate`: resolve the referenced card (it is in play with a full
++        //   CardFace) and snapshot its *current copiable values* directly, so the
++        //   conjured card carries real characteristics (types, mana cost, P/T,
++        //   abilities) — not just a name. A name->registry round-trip would miss
++        //   here because the registry only preloads statically-named conjures.
++        // An unresolved reference conjures nothing.
++        let identity = match &conjure_card.source {
++            ConjureSource::Named { name } => ConjuredIdentity::Named {
++                name: name.clone(),
++                face: state
++                    .card_face_registry
++                    .get(&name.to_lowercase())
++                    .cloned()
++                    .map(Box::new),
++            },
++            ConjureSource::Duplicate { duplicate_of } => {
++                match resolve_duplicate_reference(state, ability, duplicate_of)
++                    .and_then(|id| compute_current_copiable_values(state, id))
++                {
++                    Some(values) => ConjuredIdentity::Duplicate(Box::new(values)),
++                    None => continue,
++                }
++            }
++        };
++        let card_name = match &identity {
++            ConjuredIdentity::Named { name, .. } => name.clone(),
++            ConjuredIdentity::Duplicate(values) => values.name.clone(),
++        };
+ 
+         for _ in 0..count {
+             let obj_id = zones::create_object(
+                 state,
+                 CardId(0),
+                 ability.controller,
+-                conjure_card.name.clone(),
++                card_name.clone(),
+                 destination,
+             );
+ 
+@@ -51,9 +99,15 @@ pub fn resolve(
+                 // Conjured cards are real cards, not tokens.
+                 obj.is_token = false;
+ 
+-                // Apply full card characteristics from the database if available.
+-                if let Some(ref face) = card_face {
+-                    apply_card_face_to_object(obj, face);
++                // Apply full card characteristics: the printed face for a named
++                // conjure, or the referenced card's copiable values (CR 707.2) for
++                // a duplicate conjure.
++                match &identity {
++                    ConjuredIdentity::Named {
++                        face: Some(face), ..
++                    } => apply_card_face_to_object(obj, face),
++                    ConjuredIdentity::Named { face: None, .. } => {}
++                    ConjuredIdentity::Duplicate(values) => apply_copiable_values(obj, values),
+                 }
+ 
+                 if destination == Zone::Battlefield {
+@@ -108,7 +162,7 @@ pub fn resolve(
+ 
+             events.push(GameEvent::ObjectConjured {
+                 object_id: obj_id,
+-                name: conjure_card.name.clone(),
++                name: card_name.clone(),
+             });
+         }
+     }
+@@ -121,11 +175,25 @@ pub fn resolve(
+     Ok(())
+ }
+ 
++/// CR 707.2: Resolve a duplicate-conjure reference to the name of the card being
++/// copied. The reference is either the inherited parent target ("it" / "that
++/// card") or an explicit target ("target … card exiled with ~"); either way it
++/// resolves to a single object whose name identifies the card to conjure.
++fn resolve_duplicate_reference(
++    state: &GameState,
++    ability: &ResolvedAbility,
++    reference: &TargetFilter,
++) -> Option<ObjectId> {
++    let resolved = crate::game::targeting::resolved_targets(ability, reference, state);
++    let object_ids = crate::game::effects::effect_object_targets(reference, &resolved);
++    object_ids.into_iter().next()
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use crate::types::ability::{ConjureCard, QuantityExpr};
+-    use crate::types::identifiers::ObjectId;
++    use crate::types::ability::{ConjureCard, QuantityExpr, TargetRef};
++    use crate::types::identifiers::{CardId, ObjectId};
+     use crate::types::player::PlayerId;
+ 
+     #[test]
+@@ -134,7 +202,9 @@ mod tests {
+         let ability = ResolvedAbility::new(
+             Effect::Conjure {
+                 cards: vec![ConjureCard {
+-                    name: "Verdant Dread".to_string(),
++                    source: ConjureSource::Named {
++                        name: "Verdant Dread".to_string(),
++                    },
+                     count: QuantityExpr::Fixed { value: 1 },
+                 }],
+                 destination: Zone::Battlefield,
+@@ -168,4 +238,77 @@ mod tests {
+         assert_eq!(state.zone_changes_this_turn[0].from_zone, None);
+         assert_eq!(state.zone_changes_this_turn[0].to_zone, Zone::Battlefield);
+     }
++
++    /// CR 707.2: "conjure a duplicate of <reference>" copies the referenced
++    /// card by name into the destination — a new, distinct real card object.
++    #[test]
++    fn duplicate_conjure_copies_referenced_card_characteristics() {
++        use crate::types::card_type::CoreType;
++
++        let mut state = GameState::new_two_player(7);
++        // A referenced creature card (in exile) with real characteristics — these
++        // must flow into the conjured duplicate (CR 707.2), not just the name.
++        let referenced = crate::game::zones::create_object(
++            &mut state,
++            CardId(5),
++            PlayerId(0),
++            "Grizzly Bears".to_string(),
++            Zone::Exile,
++        );
++        {
++            let obj = state.objects.get_mut(&referenced).unwrap();
++            obj.card_types.core_types.push(CoreType::Creature);
++            obj.base_card_types = obj.card_types.clone();
++            obj.base_power = Some(2);
++            obj.base_toughness = Some(2);
++            obj.power = Some(2);
++            obj.toughness = Some(2);
++        }
++        // The conjure ability inherits the referenced card as its target, so the
++        // anaphoric `ParentTarget` reference resolves to it.
++        let ability = ResolvedAbility::new(
++            Effect::Conjure {
++                cards: vec![ConjureCard {
++                    source: ConjureSource::Duplicate {
++                        duplicate_of: TargetFilter::ParentTarget,
++                    },
++                    count: QuantityExpr::Fixed { value: 1 },
++                }],
++                destination: Zone::Hand,
++                tapped: false,
++            },
++            vec![TargetRef::Object(referenced)],
++            ObjectId(99),
++            PlayerId(0),
++        );
++        let mut events = Vec::new();
++        resolve(&mut state, &ability, &mut events).unwrap();
++
++        // A new card (distinct from the referenced one) is conjured into hand.
++        let conjured_id = *state.players[0]
++            .hand
++            .iter()
++            .find(|id| **id != referenced)
++            .expect("duplicate-conjure should create a card in hand");
++        let conjured = &state.objects[&conjured_id];
++
++        // CR 707.2: the conjured card carries the referenced card's copiable
++        // characteristics — name, types, and P/T — not merely its name.
++        assert_eq!(conjured.name, "Grizzly Bears");
++        assert!(
++            conjured.card_types.core_types.contains(&CoreType::Creature),
++            "conjured duplicate must copy the creature type, got {:?}",
++            conjured.card_types.core_types
++        );
++        assert_eq!(
++            conjured.power,
++            Some(2),
++            "conjured duplicate must copy the referenced card's power"
++        );
++        assert_eq!(conjured.toughness, Some(2));
++        assert!(
++            !conjured.is_token,
++            "conjured cards are real cards, not tokens"
++        );
++    }
+ }
+diff --git a/crates/engine/src/game/effects/spellbook.rs b/crates/engine/src/game/effects/spellbook.rs
+index fec8c4e0e6..caf0da7e62 100644
+--- a/crates/engine/src/game/effects/spellbook.rs
++++ b/crates/engine/src/game/effects/spellbook.rs
+@@ -16,7 +16,7 @@
+ //! `CardFace::metadata.spellbook`); the resolver reads it from the source.
+ 
+ use crate::types::ability::{
+-    ConjureCard, Effect, EffectError, EffectKind, QuantityExpr, ResolvedAbility,
++    ConjureCard, ConjureSource, Effect, EffectError, EffectKind, QuantityExpr, ResolvedAbility,
+ };
+ use crate::types::events::GameEvent;
+ use crate::types::game_state::{GameState, WaitingFor};
+@@ -92,7 +92,9 @@ pub fn complete_draft(
+     let conjure = ResolvedAbility::new(
+         Effect::Conjure {
+             cards: vec![ConjureCard {
+-                name: card.to_string(),
++                source: ConjureSource::Named {
++                    name: card.to_string(),
++                },
+                 count: QuantityExpr::Fixed { value: 1 },
+             }],
+             destination,
+diff --git a/crates/engine/src/game/printed_cards.rs b/crates/engine/src/game/printed_cards.rs
+index c2cdd1a28a..bbdfc6b681 100644
+--- a/crates/engine/src/game/printed_cards.rs
++++ b/crates/engine/src/game/printed_cards.rs
+@@ -1,7 +1,8 @@
+ use crate::database::CardDatabase;
+ use crate::types::ability::{
+-    AbilityCost, AbilityDefinition, ContinuousModification, CopiableValues, CounterSourceRider,
+-    Effect, PtValue, ReplacementDefinition, ReplacementMode, StaticDefinition, TriggerDefinition,
++    AbilityCost, AbilityDefinition, ConjureSource, ContinuousModification, CopiableValues,
++    CounterSourceRider, Effect, PtValue, ReplacementDefinition, ReplacementMode, StaticDefinition,
++    TriggerDefinition,
+ };
+ use crate::types::card::{CardFace, CardLayout, LayoutKind, PrintedCardRef};
+ use crate::types::card_type::CoreType;
+@@ -640,8 +641,13 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
+     match effect {
+         Effect::Intensify { .. } => {}
+         Effect::Conjure { cards, .. } => {
++            // Only named-conjure has a static card name to seed into the face
++            // registry. Duplicate-conjure copies a card already in play (its face
++            // travels on the referenced object), so there is nothing to preload.
+             for conjure_card in cards {
+-                out.push(conjure_card.name.clone());
++                if let ConjureSource::Named { name } = &conjure_card.source {
++                    out.push(name.clone());
++                }
+             }
+         }
+         // A spellbook draft conjures the chosen card, but the list lives on the
+@@ -2140,7 +2146,9 @@ mod tests {
+             AbilityKind::Spell,
+             Effect::Conjure {
+                 cards: vec![ConjureCard {
+-                    name: target_name.to_string(),
++                    source: ConjureSource::Named {
++                        name: target_name.to_string(),
++                    },
+                     count: QuantityExpr::Fixed { value: 1 },
+                 }],
+                 destination,
+@@ -2331,7 +2339,9 @@ mod tests {
+         def.cost = Some(AbilityCost::EffectCost {
+             effect: Box::new(Effect::Conjure {
+                 cards: vec![ConjureCard {
+-                    name: "cost".to_string(),
++                    source: ConjureSource::Named {
++                        name: "cost".to_string(),
++                    },
+                     count: QuantityExpr::Fixed { value: 1 },
+                 }],
+                 destination: Zone::Hand,
+@@ -2342,7 +2352,9 @@ mod tests {
+             cost: AbilityCost::EffectCost {
+                 effect: Box::new(Effect::Conjure {
+                     cards: vec![ConjureCard {
+-                        name: "unless_pay_ability".to_string(),
++                        source: ConjureSource::Named {
++                            name: "unless_pay_ability".to_string(),
++                        },
+                         count: QuantityExpr::Fixed { value: 1 },
+                     }],
+                     destination: Zone::Hand,
+@@ -2509,7 +2521,9 @@ mod tests {
+             cost: AbilityCost::EffectCost {
+                 effect: Box::new(Effect::Conjure {
+                     cards: vec![ConjureCard {
+-                        name: "unless_pay_trigger".to_string(),
++                        source: ConjureSource::Named {
++                            name: "unless_pay_trigger".to_string(),
++                        },
+                         count: QuantityExpr::Fixed { value: 1 },
+                     }],
+                     destination: Zone::Hand,
+@@ -2539,7 +2553,9 @@ mod tests {
+             cost: AbilityCost::EffectCost {
+                 effect: Box::new(Effect::Conjure {
+                     cards: vec![ConjureCard {
+-                        name: "repl_maycost_cost".to_string(),
++                        source: ConjureSource::Named {
++                            name: "repl_maycost_cost".to_string(),
++                        },
+                         count: QuantityExpr::Fixed { value: 1 },
+                     }],
+                     destination: Zone::Hand,
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 568ebf4349..47451e6c18 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -88,7 +88,7 @@ use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
+ use crate::types::ability::{
+     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
+     BounceSelection, CardPlayMode, CastPermissionConstraint, CastingPermission, ChoiceType,
+-    ChooseFromZoneConstraint, Chooser, CombatDamageScope, Comparator, ConjureCard,
++    ChooseFromZoneConstraint, Chooser, CombatDamageScope, Comparator, ConjureCard, ConjureSource,
+     ContinuousModification, ControllerRef, DamageModification, DamageSource,
+     DelayedTriggerCondition, DoubleTarget, Duration, Effect, FilterProp, GameRestriction,
+     IntensityScope, IterationKindBinding, ManaProduction, ManaSpendPermission, MultiTargetSpec,
+@@ -4374,6 +4374,13 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
+         return parsed_clause(effect);
+     }
+ 
++    // Digital-only: "conjure a duplicate of <reference> into/onto zone" — copies a
++    // referenced card. Tried before the named form (disjoint: this requires
++    // "a duplicate of", the other "named ").
++    if let Some(effect) = try_parse_conjure_duplicate(tp) {
++        return parsed_clause(effect);
++    }
++
+     // Digital-only: "conjure a card named X into/onto zone" — Conjure keyword action.
+     if let Some(effect) = try_parse_conjure(tp) {
+         return parsed_clause(effect);
+@@ -4594,7 +4601,9 @@ fn try_parse_conjure(tp: TextPair) -> Option<Effect> {
+     let card_name = &after_named_orig[..card_name_lower.len()];
+ 
+     cards.push(ConjureCard {
+-        name: card_name.to_string(),
++        source: ConjureSource::Named {
++            name: card_name.to_string(),
++        },
+         count,
+     });
+ 
+@@ -4607,7 +4616,9 @@ fn try_parse_conjure(tp: TextPair) -> Option<Effect> {
+         let (next_name_lower, next_zone_rest) = parse_conjure_card_name(after_and)?;
+         let next_name = &after_and_orig[..next_name_lower.len()];
+         cards.push(ConjureCard {
+-            name: next_name.to_string(),
++            source: ConjureSource::Named {
++                name: next_name.to_string(),
++            },
+             count: QuantityExpr::Fixed { value: 1 },
+         });
+         next_zone_rest
+@@ -4630,6 +4641,71 @@ fn try_parse_conjure(tp: TextPair) -> Option<Effect> {
+     })
+ }
+ 
++/// Digital-only keyword action: Parse "conjure a duplicate of {reference} into/onto {zone}".
++/// The reference is either an explicit target ("target creature card exiled with ~")
++/// or an anaphoric pronoun ("it" / "that card") resolving to the parent target.
++/// The conjured card copies the referenced card's copiable characteristics (CR 707.2).
++fn try_parse_conjure_duplicate(tp: TextPair) -> Option<Effect> {
++    // Gate: must start with "conjure a duplicate of " (nom tag dispatch).
++    let (rest, _) = tag::<_, _, OracleError<'_>>("conjure a duplicate of ")
++        .parse(tp.lower)
++        .ok()?;
++
++    // Split the reference text (before) from the trailing zone clause (the
++    // remaining text starting at the " into "/" onto " connector).
++    let (zone_rest, reference_lower) = alt((
++        take_until::<_, _, OracleError<'_>>(" into "),
++        take_until(" onto "),
++    ))
++    .parse(rest)
++    .ok()?;
++
++    // Resolve the reference, but only CLAIM the clause when it is *fully*
++    // modeled — otherwise return None so the card stays a loud
++    // `Effect::Unimplemented` rather than silently dropping a qualifier (a
++    // "swallowed clause", which the coverage-honesty gate rightly rejects).
++    //
++    // "target … card" → an explicit target filter, accepted only if `parse_target`
++    // consumes the entire reference (so e.g. "exiled with ~" can't be dropped).
++    // A bare anaphor ("it" / "that card" / "this card") → the inherited parent
++    // target. Anything else is left loud.
++    let duplicate_of = if tag::<_, _, OracleError<'_>>("target ")
++        .parse(reference_lower)
++        .is_ok()
++    {
++        let (filter, ref_rest) = parse_target(reference_lower);
++        if !ref_rest.trim().is_empty() || matches!(filter, TargetFilter::Any) {
++            return None;
++        }
++        filter
++    } else {
++        match reference_lower.trim() {
++            "it" | "that card" | "this card" => TargetFilter::ParentTarget,
++            _ => return None,
++        }
++    };
++
++    // Parse destination zone and optional "tapped" suffix, then require the
++    // clause to be fully consumed — trailing text would be silently dropped.
++    let (destination, zone_rest) = parse_conjure_zone(zone_rest)?;
++    let (zone_rest, tapped) = match tag::<_, _, OracleError<'_>>(" tapped").parse(zone_rest) {
++        Ok((after, _)) => (after, true),
++        Err(_) => (zone_rest, false),
++    };
++    if !zone_rest.trim().trim_end_matches('.').trim().is_empty() {
++        return None;
++    }
++
++    Some(Effect::Conjure {
++        cards: vec![ConjureCard {
++            source: ConjureSource::Duplicate { duplicate_of },
++            count: QuantityExpr::Fixed { value: 1 },
++        }],
++        destination,
++        tapped,
++    })
++}
++
+ /// Parse the quantity portion of a conjure clause.
+ /// Consumes the quantity and "card(s) " but NOT "named " — the caller handles "named ".
+ /// Returns (QuantityExpr, remaining_lower, remaining_orig).
+@@ -38739,7 +38815,7 @@ mod tests {
+                 tapped,
+             } => {
+                 assert_eq!(cards.len(), 1);
+-                assert_eq!(cards[0].name, "Regal Force");
++                assert_eq!(cards[0].named_name(), Some("Regal Force"));
+                 assert_eq!(cards[0].count, QuantityExpr::Fixed { value: 1 });
+                 assert_eq!(destination, Zone::Battlefield);
+                 assert!(!tapped);
+@@ -38758,7 +38834,7 @@ mod tests {
+                 tapped,
+             } => {
+                 assert_eq!(cards.len(), 1);
+-                assert_eq!(cards[0].name, "Reassembling Skeleton");
++                assert_eq!(cards[0].named_name(), Some("Reassembling Skeleton"));
+                 assert_eq!(cards[0].count, QuantityExpr::Fixed { value: 3 });
+                 assert_eq!(destination, Zone::Graveyard);
+                 assert!(!tapped);
+@@ -38777,7 +38853,7 @@ mod tests {
+                 tapped,
+             } => {
+                 assert_eq!(cards.len(), 1);
+-                assert_eq!(cards[0].name, "Forest");
++                assert_eq!(cards[0].named_name(), Some("Forest"));
+                 assert_eq!(destination, Zone::Battlefield);
+                 assert!(tapped);
+             }
+@@ -38797,9 +38873,9 @@ mod tests {
+                 tapped,
+             } => {
+                 assert_eq!(cards.len(), 2);
+-                assert_eq!(cards[0].name, "Darksteel Ingot");
++                assert_eq!(cards[0].named_name(), Some("Darksteel Ingot"));
+                 assert_eq!(cards[0].count, QuantityExpr::Fixed { value: 1 });
+-                assert_eq!(cards[1].name, "Darksteel Plate");
++                assert_eq!(cards[1].named_name(), Some("Darksteel Plate"));
+                 assert_eq!(cards[1].count, QuantityExpr::Fixed { value: 1 });
+                 assert_eq!(destination, Zone::Hand);
+                 assert!(!tapped);
+@@ -38818,7 +38894,7 @@ mod tests {
+                 tapped,
+             } => {
+                 assert_eq!(cards.len(), 1);
+-                assert_eq!(cards[0].name, "Lightning Bolt");
++                assert_eq!(cards[0].named_name(), Some("Lightning Bolt"));
+                 assert_eq!(cards[0].count, QuantityExpr::Fixed { value: 4 });
+                 assert_eq!(destination, Zone::Library);
+                 assert!(!tapped);
+@@ -38838,7 +38914,7 @@ mod tests {
+                 tapped,
+             } => {
+                 assert_eq!(cards.len(), 1);
+-                assert_eq!(cards[0].name, "Mishra's Foundry");
++                assert_eq!(cards[0].named_name(), Some("Mishra's Foundry"));
+                 assert_eq!(cards[0].count, QuantityExpr::Fixed { value: 2 });
+                 assert_eq!(destination, Zone::Battlefield);
+                 assert!(tapped);
+@@ -38847,6 +38923,65 @@ mod tests {
+         }
+     }
+ 
++    /// CR 707.2: "conjure a duplicate of <anaphoric reference>" copies the
++    /// parent-target card; the reference resolves to `ParentTarget`.
++    #[test]
++    fn conjure_duplicate_anaphoric_into_hand() {
++        let e = parse_effect("conjure a duplicate of that card into your hand");
++        match e {
++            Effect::Conjure {
++                cards,
++                destination,
++                tapped,
++            } => {
++                assert_eq!(cards.len(), 1);
++                assert!(
++                    matches!(
++                        &cards[0].source,
++                        ConjureSource::Duplicate { duplicate_of }
++                            if *duplicate_of == TargetFilter::ParentTarget
++                    ),
++                    "expected Duplicate(ParentTarget), got: {:?}",
++                    cards[0].source
++                );
++                assert_eq!(destination, Zone::Hand);
++                assert!(!tapped);
++            }
++            other => panic!("expected Conjure, got: {other:?}"),
++        }
++    }
++
++    /// CR 707.2: "conjure a duplicate of target … card" — when the target
++    /// reference is fully modeled it parses to a `Duplicate` source carrying that
++    /// target filter; otherwise it is left loud (`Unimplemented`). Either way the
++    /// reference is never silently dropped (no swallowed clause).
++    #[test]
++    fn conjure_duplicate_target_onto_battlefield() {
++        let e = parse_effect("conjure a duplicate of target creature card onto the battlefield");
++        match e {
++            Effect::Conjure {
++                cards, destination, ..
++            } => {
++                assert_eq!(cards.len(), 1);
++                assert!(
++                    matches!(
++                        &cards[0].source,
++                        ConjureSource::Duplicate { duplicate_of }
++                            if *duplicate_of != TargetFilter::ParentTarget
++                                && *duplicate_of != TargetFilter::Any
++                    ),
++                    "a claimed target reference must be a non-trivial Duplicate filter, got: {:?}",
++                    cards[0].source
++                );
++                assert_eq!(destination, Zone::Battlefield);
++            }
++            // Acceptable: target reference not fully modeled, so left loud rather
++            // than silently swallowing the reference.
++            Effect::Unimplemented { .. } => {}
++            other => panic!("expected Conjure or Unimplemented, got: {other:?}"),
++        }
++    }
++
+     // --- strip_mana_value_conditional tests ---
+ 
+     #[test]
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 51a69b315c..34d3223b71 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -5785,16 +5785,46 @@ pub enum DamageSource {
+     TriggeringSource,
+ }
+ 
+-/// A single conjured card entry: card name + quantity.
++/// A single conjured card entry: card source + quantity.
+ /// Used by `Effect::Conjure` to support multi-card conjure patterns
+-/// (e.g., "conjure a card named X and a card named Y into your hand").
++/// (e.g., "conjure a card named X and a card named Y into your hand")
++/// and duplicate-conjure ("conjure a duplicate of that card").
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+ pub struct ConjureCard {
+-    pub name: String,
++    /// Where the conjured card's identity comes from. `#[serde(flatten)]` keeps
++    /// the wire shape backward-compatible: the legacy `{"name": "X"}` form still
++    /// deserializes to `ConjureSource::Named` (and re-serializes identically).
++    #[serde(flatten)]
++    pub source: ConjureSource,
+     #[serde(default = "default_quantity_one")]
+     pub count: QuantityExpr,
+ }
+ 
++/// CR 707.2: Where a conjured card's identity is taken from. Untagged so the
++/// legacy named form (`{"name": "X"}`) and the duplicate form
++/// (`{"duplicate_of": <filter>}`) are distinguished by their disjoint keys.
++#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(untagged)]
++pub enum ConjureSource {
++    /// "conjure a card named X" — a specific card looked up by name.
++    Named { name: String },
++    /// "conjure a duplicate of <reference>" — a real card copying the
++    /// referenced card's copiable characteristics (CR 707.2), resolved at
++    /// resolution time from the ability's target / anaphoric reference.
++    Duplicate { duplicate_of: TargetFilter },
++}
++
++impl ConjureCard {
++    /// The literal card name when this entry is a `Named` source; `None` for a
++    /// `Duplicate` source (whose name is resolved at resolution time).
++    pub fn named_name(&self) -> Option<&str> {
++        match &self.source {
++            ConjureSource::Named { name } => Some(name.as_str()),
++            ConjureSource::Duplicate { .. } => None,
++        }
++    }
++}
++
+ /// Digital-only Alchemy: which cards an `Effect::Intensify` applies to. Every
+ /// scope resolves across ALL zones (a card's intensity follows it everywhere).
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

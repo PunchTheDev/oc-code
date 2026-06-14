@@ -1,0 +1,564 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 8489172e..cca9e34c 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,10 @@ All notable changes to vouch are documented here. Format follows
+ ## [Unreleased]
+ 
+ ### Added
++- Propose-time similarity warnings: `propose_claim` / `kb.propose_claim` return
++  non-blocking `warnings` (`similar_approved`, `similar_pending`) when the
++  embeddings extra is installed. Configurable via `review.similarity_threshold`
++  (default `0.95`). CLI prints warnings to stderr; dry-run included.
+ - `vouch fsck` performs deep consistency checks beyond `vouch doctor`:
+   orphaned embeddings, dangling supersede/contradict chains, decided
+   proposals whose artifact is missing, and FTS5 index-vs-file drift
+diff --git a/docs/multi-agent.md b/docs/multi-agent.md
+index 65c8cdb7..5af5337d 100644
+--- a/docs/multi-agent.md
++++ b/docs/multi-agent.md
+@@ -66,7 +66,9 @@ Two agents will eventually disagree. What it looks like:
+ 
+ - **Duplicate proposals.** Two agents independently propose the same
+   fact. The reviewer sees two pending proposals with similar text.
+-  Approve one, reject the other with reason "duplicate of prop-XYZ".
++  `kb.propose_claim` / `vouch propose-claim` return non-blocking
++  `warnings` (`similar_approved`, `similar_pending`) when embeddings are
++  available — approve one, reject the other with reason "duplicate of prop-XYZ".
+ - **Contradicting claims approved.** Two reviewers approved
+   conflicting claims at different times. Use `vouch contradict A B` to
+   link them; pick a survivor with `vouch supersede`.
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index af86b8c3..a216ef5f 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -638,6 +638,15 @@ def expire(apply: bool, days: int | None, as_json: bool) -> None:
+ # --- proposal-from-CLI shortcuts -----------------------------------------
+ 
+ 
++def _format_similarity_warning(w: dict) -> str:
++    label = w.get("code", "similar")
++    kind = w.get("artifact_kind", "?")
++    aid = w.get("artifact_id", "?")
++    cos = w.get("cosine", 0)
++    snip = w.get("snippet", "")
++    return f"warning: {label} {kind} {aid} (cosine {cos}) — {snip}"
++
++
+ @cli.command(name="propose-claim")
+ @click.option("--text", required=True)
+ @click.option("--source", "sources", multiple=True, required=True,
+@@ -651,12 +660,14 @@ def propose_claim_cmd(text: str, sources: tuple[str, ...], claim_type: str,
+                       tags: tuple[str, ...]) -> None:
+     store = _load_store()
+     with _cli_errors():
+-        pr = propose_claim(
++        result = propose_claim(
+             store, text=text, evidence=list(sources),
+             proposed_by=_whoami(), claim_type=claim_type,
+             confidence=confidence, tags=list(tags), rationale=rationale,
+         )
+-    click.echo(pr.id)
++    click.echo(result.id)
++    for w in result.warnings:
++        _echo(_format_similarity_warning(w), err=True)
+ 
+ 
+ @cli.command(name="propose-page")
+diff --git a/src/vouch/embeddings/similarity.py b/src/vouch/embeddings/similarity.py
+new file mode 100644
+index 00000000..69cf9ade
+--- /dev/null
++++ b/src/vouch/embeddings/similarity.py
+@@ -0,0 +1,163 @@
++"""Propose-time similarity warnings for claim proposals."""
++
++from __future__ import annotations
++
++import logging
++from typing import Any
++
++import yaml
++
++from ..index_db import search_embedding
++from ..models import ProposalKind, ProposalStatus
++from ..storage import KBStore
++
++# Match embeddings/dedup.py — do not import dedup here (it pulls numpy at import time).
++DEFAULT_THRESHOLD = 0.95
++
++_log = logging.getLogger("vouch.embeddings.similarity")
++
++_MAX_WARNINGS_PER_CODE = 3
++_SNIPPET_LEN = 120
++
++
++def similarity_threshold(store: KBStore) -> float:
++    """Resolve `review.similarity_threshold` from config, else dedup default."""
++    try:
++        loaded = yaml.safe_load(store.config_path.read_text())
++        if isinstance(loaded, dict):
++            review = loaded.get("review")
++            if isinstance(review, dict) and review.get("similarity_threshold") is not None:
++                return float(review["similarity_threshold"])
++    except Exception:
++        pass
++    return DEFAULT_THRESHOLD
++
++
++def _snippet(text: str) -> str:
++    one_line = " ".join(text.split())
++    if len(one_line) <= _SNIPPET_LEN:
++        return one_line
++    return one_line[: _SNIPPET_LEN - 1] + "…"
++
++
++def _claim_snippet(store: KBStore, claim_id: str) -> str:
++    try:
++        return _snippet(store.get_claim(claim_id).text)
++    except Exception:
++        return claim_id
++
++
++def find_similar_on_propose(
++    store: KBStore,
++    text: str,
++    *,
++    exclude_claim_id: str | None = None,
++    threshold: float | None = None,
++) -> list[dict[str, Any]]:
++    """Return non-blocking warnings for near-duplicate approved/pending claims."""
++    stripped = text.strip()
++    if not stripped:
++        return []
++
++    thresh = threshold if threshold is not None else similarity_threshold(store)
++
++    try:
++        from . import get_embedder
++
++        embedder = get_embedder()
++        query_vec = embedder.encode(stripped)
++    except Exception as e:
++        _log.debug("propose similarity skipped (no embedder): %s", e)
++        return []
++
++    warnings: list[dict[str, Any]] = []
++    approved = _similar_approved(
++        store, query_vec=query_vec, threshold=thresh,
++        exclude_claim_id=exclude_claim_id,
++    )
++    warnings.extend(approved)
++
++    pending = _similar_pending(
++        store, query_vec=query_vec, embedder=embedder, threshold=thresh,
++    )
++    warnings.extend(pending)
++    return warnings
++
++
++def _similar_approved(
++    store: KBStore,
++    *,
++    query_vec: Any,
++    threshold: float,
++    exclude_claim_id: str | None,
++) -> list[dict[str, Any]]:
++    # Fetch extra rows so filtering excluded ids still leaves enough matches.
++    hits = search_embedding(
++        store.kb_dir,
++        query_vec=query_vec,
++        kinds=("claim",),
++        limit=_MAX_WARNINGS_PER_CODE + 2,
++        min_score=threshold,
++    )
++    out: list[dict[str, Any]] = []
++    for _kind, claim_id, _snip, cosine in hits:
++        if claim_id == exclude_claim_id:
++            continue
++        out.append({
++            "code": "similar_approved",
++            "artifact_kind": "claim",
++            "artifact_id": claim_id,
++            "cosine": round(float(cosine), 4),
++            "snippet": _claim_snippet(store, claim_id),
++        })
++        if len(out) >= _MAX_WARNINGS_PER_CODE:
++            break
++    return out
++
++
++def _similar_pending(
++    store: KBStore,
++    *,
++    query_vec: Any,
++    embedder: Any,
++    threshold: float,
++) -> list[dict[str, Any]]:
++    try:
++        import numpy as np
++    except ImportError:
++        return []
++
++    q = np.asarray(query_vec, dtype=np.float32)
++    qnorm = float(np.linalg.norm(q))
++    if qnorm > 0:
++        q = q / qnorm
++
++    scored: list[tuple[float, str, str]] = []
++    for prop in store.list_proposals(ProposalStatus.PENDING):
++        if prop.kind != ProposalKind.CLAIM:
++            continue
++        ptext = str(prop.payload.get("text", "")).strip()
++        if not ptext:
++            continue
++        try:
++            pvec = np.asarray(embedder.encode(ptext), dtype=np.float32)
++        except Exception:
++            continue
++        pnorm = float(np.linalg.norm(pvec))
++        if pnorm <= 0:
++            continue
++        cos = float(np.dot(q, pvec / pnorm))
++        if cos >= threshold:
++            scored.append((cos, prop.id, ptext))
++
++    scored.sort(key=lambda x: x[0], reverse=True)
++    return [
++        {
++            "code": "similar_pending",
++            "artifact_kind": "proposal",
++            "artifact_id": prop_id,
++            "cosine": round(cos, 4),
++            "snippet": _snippet(ptext),
++        }
++        for cos, prop_id, ptext in scored[:_MAX_WARNINGS_PER_CODE]
++    ]
+diff --git a/src/vouch/jsonl_server.py b/src/vouch/jsonl_server.py
+index 90e22a76..64d9c061 100644
+--- a/src/vouch/jsonl_server.py
++++ b/src/vouch/jsonl_server.py
+@@ -225,7 +225,7 @@ def _h_register_source_from_path(p: dict) -> dict:
+ 
+ 
+ def _h_propose_claim(p: dict) -> dict:
+-    pr = propose_claim(
++    result = propose_claim(
+         _store(),
+         text=p["text"],
+         evidence=list(p["evidence"]),
+@@ -239,8 +239,16 @@ def _h_propose_claim(p: dict) -> dict:
+         dry_run=bool(p.get("dry_run", False)),
+         proposed_by=_agent(),
+     )
+-    return {"proposal_id": pr.id, "status": pr.status.value, "kind": pr.kind.value,
+-            "dry_run": bool(p.get("dry_run", False))}
++    pr = result.proposal
++    out: dict = {
++        "proposal_id": pr.id,
++        "status": pr.status.value,
++        "kind": pr.kind.value,
++        "dry_run": bool(p.get("dry_run", False)),
++    }
++    if result.warnings:
++        out["warnings"] = result.warnings
++    return out
+ 
+ 
+ def _h_propose_page(p: dict) -> dict:
+diff --git a/src/vouch/proposals.py b/src/vouch/proposals.py
+index 051f2abb..a9997fbc 100644
+--- a/src/vouch/proposals.py
++++ b/src/vouch/proposals.py
+@@ -45,6 +45,19 @@ class ExpireResult:
+     expired: list[Proposal] = field(default_factory=list)
+ 
+ 
++@dataclass
++class ProposeClaimResult:
++    """Outcome of `propose_claim` including optional similarity warnings."""
++
++    proposal: Proposal
++    warnings: list[dict[str, Any]] = field(default_factory=list)
++
++    # Backward-compatible accessors — most callers only need `.id`.
++    @property
++    def id(self) -> str:
++        return self.proposal.id
++
++
+ def new_proposal_id() -> str:
+     # Sortable timestamped id: '20260517-143052-<short>'. Sorted listings
+     # naturally show oldest pending first, which matches review intuition.
+@@ -100,7 +113,7 @@ def propose_claim(
+     slug_hint: str | None = None,
+     session_id: str | None = None,
+     dry_run: bool = False,
+-) -> Proposal:
++) -> ProposeClaimResult:
+     if not text.strip():
+         raise ProposalError("claim text is empty")
+     if not evidence:
+@@ -113,20 +126,38 @@ def propose_claim(
+                 store.get_evidence(eid)
+             except ArtifactNotFoundError as e:
+                 raise ProposalError(f"unknown source/evidence id: {eid}") from e
++    claim_id = slug_hint or _slugify(text)
++    claim_text = text.strip()
+     payload = {
+-        "id": slug_hint or _slugify(text),
+-        "text": text.strip(),
++        "id": claim_id,
++        "text": claim_text,
+         "type": claim_type,
+         "confidence": confidence,
+         "evidence": list(evidence),
+         "entities": entities or [],
+         "tags": tags or [],
+     }
+-    return _file_proposal(
++    exclude_claim: str | None = None
++    if (store.kb_dir / "claims" / f"{claim_id}.yaml").exists():
++        exclude_claim = claim_id
++
++    warnings: list[dict[str, Any]] = []
++    try:
++        from .embeddings.similarity import find_similar_on_propose
++
++        warnings = find_similar_on_propose(
++            store, claim_text, exclude_claim_id=exclude_claim,
++        )
++    except ImportError:
++        # Base install has no numpy / embeddings extra — propose still works.
++        pass
++
++    proposal = _file_proposal(
+         store, kind=ProposalKind.CLAIM, payload=payload,
+         proposed_by=proposed_by, session_id=session_id,
+         rationale=rationale, dry_run=dry_run,
+     )
++    return ProposeClaimResult(proposal=proposal, warnings=warnings)
+ 
+ 
+ def propose_page(
+diff --git a/src/vouch/server.py b/src/vouch/server.py
+index e20152e4..8672e25d 100644
+--- a/src/vouch/server.py
++++ b/src/vouch/server.py
+@@ -303,7 +303,7 @@ def kb_propose_claim(
+ ) -> dict[str, Any]:
+     """Propose a new claim. Becomes durable only after `kb_approve`."""
+     try:
+-        pr = propose_claim(
++        result = propose_claim(
+             _store(), text=text, evidence=evidence,
+             claim_type=claim_type, confidence=confidence,
+             entities=entities, tags=tags, rationale=rationale,
+@@ -312,7 +312,7 @@ def kb_propose_claim(
+         )
+     except (ProposalError, ArtifactNotFoundError, ValueError) as e:
+         raise ValueError(str(e)) from e
+-    return _proposal_response(pr, dry_run)
++    return _proposal_response(result, dry_run)
+ 
+ 
+ @mcp.tool()
+@@ -387,8 +387,9 @@ def kb_propose_relation(
+     return _proposal_response(pr, dry_run)
+ 
+ 
+-def _proposal_response(pr, dry_run: bool) -> dict[str, Any]:
+-    return {
++def _proposal_response(result, dry_run: bool) -> dict[str, Any]:
++    pr = result.proposal if hasattr(result, "proposal") else result
++    out: dict[str, Any] = {
+         "proposal_id": pr.id,
+         "status": pr.status.value,
+         "kind": pr.kind.value,
+@@ -398,6 +399,10 @@ def _proposal_response(pr, dry_run: bool) -> dict[str, Any]:
+             if dry_run else "pending human approval via `vouch approve <id>`"
+         ),
+     }
++    warnings = getattr(result, "warnings", None)
++    if warnings:
++        out["warnings"] = warnings
++    return out
+ 
+ 
+ # === review-gate decisions (agents can approve on their own KBs if the
+diff --git a/templates/config.template.yaml b/templates/config.template.yaml
+index 9adbd749..a855aae2 100644
+--- a/templates/config.template.yaml
++++ b/templates/config.template.yaml
+@@ -12,6 +12,7 @@ review:
+   require_citations: true        # claims without citations fail validation
+   approver_role: human           # human | trusted-agent
+   expire_pending_after_days: 90  # GC threshold for stale proposals (0 = never)
++  similarity_threshold: 0.95      # cosine warn on propose (needs embeddings extra)
+ 
+ # Optional per-agent identity overrides. Keyed by VOUCH_AGENT value.
+ agents:
+diff --git a/tests/test_propose_similarity.py b/tests/test_propose_similarity.py
+new file mode 100644
+index 00000000..b2bc4d52
+--- /dev/null
++++ b/tests/test_propose_similarity.py
+@@ -0,0 +1,127 @@
++"""Propose-time similarity warnings."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from vouch.embeddings import register
++from vouch.embeddings.base import DEFAULT_MODEL_NAME
++from vouch.models import Claim
++from vouch.proposals import propose_claim
++from vouch.storage import KBStore
++
++_SIMILAR_TEXT = "Auth uses JWTs in the Authorization header."
++
++
++@pytest.fixture(autouse=True)
++def _mock_embedder() -> None:
++    # MockEmbedder requires numpy. Skip cleanly when CI installs only [dev].
++    pytest.importorskip("numpy")
++    from tests.embeddings._fakes import MockEmbedder
++
++    register(DEFAULT_MODEL_NAME, lambda: MockEmbedder(dim=8))
++
++
++@pytest.fixture
++def store(tmp_path: Path) -> KBStore:
++    return KBStore.init(tmp_path)
++
++
++def test_propose_warns_similar_approved_claim(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    store.put_claim(
++        Claim(id="auth-jwt", text=_SIMILAR_TEXT, evidence=[src.id]),
++    )
++    result = propose_claim(
++        store,
++        text=_SIMILAR_TEXT,
++        evidence=[src.id],
++        proposed_by="agent",
++    )
++    codes = {w["code"] for w in result.warnings}
++    assert "similar_approved" in codes
++    ids = {w["artifact_id"] for w in result.warnings if w["code"] == "similar_approved"}
++    assert "auth-jwt" in ids
++
++
++def test_propose_warns_similar_pending_proposal(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    first = propose_claim(
++        store,
++        text=_SIMILAR_TEXT,
++        evidence=[src.id],
++        proposed_by="agent-a",
++    )
++    assert not first.warnings
++
++    second = propose_claim(
++        store,
++        text=_SIMILAR_TEXT,
++        evidence=[src.id],
++        proposed_by="agent-b",
++    )
++    pending = [w for w in second.warnings if w["code"] == "similar_pending"]
++    assert pending
++    assert pending[0]["artifact_id"] == first.id
++
++
++def test_propose_no_warning_for_unrelated_text(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text="apples and oranges", evidence=[src.id]))
++    result = propose_claim(
++        store, text="zebras run fast in the savanna", evidence=[src.id], proposed_by="agent",
++    )
++    assert result.warnings == []
++
++
++def test_propose_similarity_on_dry_run(store: KBStore) -> None:
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text=_SIMILAR_TEXT, evidence=[src.id]))
++    result = propose_claim(
++        store, text=_SIMILAR_TEXT, evidence=[src.id],
++        proposed_by="agent", dry_run=True,
++    )
++    assert not (store.kb_dir / "proposed" / f"{result.id}.yaml").exists()
++    assert any(w["code"] == "similar_approved" for w in result.warnings)
++
++
++def test_jsonl_propose_claim_includes_warnings(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    from vouch.jsonl_server import handle_request
++
++    src = store.put_source(b"e")
++    store.put_claim(
++        Claim(id="c1", text=_SIMILAR_TEXT, evidence=[src.id]),
++    )
++    monkeypatch.chdir(store.root)
++    resp = handle_request({
++        "id": "1",
++        "method": "kb.propose_claim",
++        "params": {
++            "text": _SIMILAR_TEXT,
++            "evidence": [src.id],
++        },
++    })
++    assert resp["ok"]
++    assert "warnings" in resp["result"]
++    assert any(w["code"] == "similar_approved" for w in resp["result"]["warnings"])
++
++
++def test_propose_similarity_without_embedder(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    src = store.put_source(b"e")
++    store.put_claim(Claim(id="c1", text=_SIMILAR_TEXT, evidence=[src.id]))
++
++    def _no_embedder(name: str | None = None) -> None:
++        raise KeyError("no embedder")
++
++    monkeypatch.setattr("vouch.embeddings.get_embedder", _no_embedder)
++
++    result = propose_claim(
++        store, text=_SIMILAR_TEXT, evidence=[src.id], proposed_by="agent",
++    )
++    assert result.warnings == []
+diff --git a/tests/test_storage.py b/tests/test_storage.py
+index 390ac90b..bcdcaac5 100644
+--- a/tests/test_storage.py
++++ b/tests/test_storage.py
+@@ -263,6 +263,26 @@ def test_propose_claim_rejects_unknown_source(store: KBStore) -> None:
+         propose_claim(store, text="t", evidence=["0" * 64], proposed_by="agent")
+ 
+ 
++def test_propose_claim_survives_similarity_import_error(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Base CI install has no numpy; similarity import must not break propose."""
++    import builtins
++
++    real_import = builtins.__import__
++
++    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
++        if fromlist and "find_similar_on_propose" in fromlist:
++            raise ImportError("similarity unavailable")
++        return real_import(name, globals, locals, fromlist, level)
++
++    monkeypatch.setattr(builtins, "__import__", guarded_import)
++    src = store.put_source(b"e")
++    result = propose_claim(store, text="t", evidence=[src.id], proposed_by="a")
++    assert result.warnings == []
++    assert result.id
++
++
+ def test_propose_claim_dry_run_does_not_persist(store: KBStore) -> None:
+     src = store.put_source(b"e")
+     pr = propose_claim(store, text="hi", evidence=[src.id],

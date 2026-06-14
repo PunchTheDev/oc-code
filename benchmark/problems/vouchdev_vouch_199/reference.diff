@@ -1,0 +1,1662 @@
+diff --git a/docs/provenance.md b/docs/provenance.md
+new file mode 100644
+index 0000000..915aa68
+--- /dev/null
++++ b/docs/provenance.md
+@@ -0,0 +1,97 @@
++# Provenance — `vouch why` / `trace` / `impact`
++
++vouch already records everything needed to explain a claim's existence — the
++session that proposed it, the source it cites, the supersedes chain it sits on,
++the contradiction that demoted it, the page that embeds it as evidence — but it
++is scattered across `audit.log.jsonl`, `relations/`, `evidence/`, `sessions/`
++and the claim file itself. The provenance layer reconstructs a single typed
++directed graph from those artifacts so a reviewer in front of a 500-item queue
++can ask the two obvious questions: *why is this claim here, and what depends on
++it?*
++
++Provenance is **derived state**. Nothing here is a source of truth: every edge
++is rebuilt from durable files, and the `prov_edges` table in `state.db` is a
++disposable cache that `vouch provenance rebuild` reconstructs byte-for-byte. All
++mutations still flow through the existing proposal + lifecycle code paths.
++
++## Edge kinds
++
++The graph is typed. An edge `A --kind--> B` means *A is explained by / depends
++on B*, so `why` walks outward and `impact` walks inward.
++
++| Kind | From → To | Source artifact |
++|------|-----------|-----------------|
++| `cites` | claim → source/evidence | `claim.evidence` |
++| `derivedFrom` | evidence span → source | `evidence.source_id` |
++| `supersedes` | newer claim → older claim | `claim.supersedes` |
++| `supersededBy` | older claim → newer claim | reverse view (query-time) |
++| `contradicts` | claim → claim | `claim.contradicts` |
++| `contradictedBy` | claim → claim | reverse view (query-time) |
++| `embeds` | page → claim | `page.claims` |
++| `proposedIn` | claim → session | approved proposal `session_id` |
++| `approvedBy` | claim → audit event | `proposal.*.approve` log entry |
++
++The two `*By` mirrors are computed at query time by walking inbound, so the
++`prov_edges` cache stays free of duplicate rows — only the seven canonical kinds
++are persisted.
++
++## Commands
++
++```bash
++vouch why <claim_id>                    # backward: cites, session, supersedes, approval
++vouch why <claim_id> --depth 5 --json   # machine-readable provenance tree
++vouch trace <a> --to <b>                # shortest typed path between two artifacts
++vouch impact <claim_id>                 # forward: pages, downstream claims that depend on it
++vouch impact <claim_id> --if archive    # dry-run a lifecycle op; exits non-zero if it breaks something
++vouch graph --session <session_id>      # render the DAG for one agent run as dot/mermaid
++vouch provenance rebuild                # rebuild the prov_edges cache from durable files
++```
++
++- `vouch why` walks edges outward from a claim and prints a tree grouped by edge
++  kind, each leaf carrying its citation target and originating audit timestamp;
++  `--json` emits a stable shape (`schema_version` pinned) suitable for tooling.
++- `vouch impact` walks inward and lists every artifact that points at the
++  target. `--if <archive|contradict|supersede>` dry-runs the lifecycle op
++  against the in-memory graph and reports the breakage list — the **active**
++  pages that would carry a stale reference — without writing. It exits non-zero
++  when the list is non-empty, so it composes into a pre-flight check.
++- `vouch trace` finds the shortest typed-edge path between two artifacts
++  (edges are crossable either way) and prints it, or exits non-zero with
++  `no path` when they are disconnected.
++
++Reviewer output is bare prose + indentation — no curses, no colours by default —
++so it diffs cleanly into a `gh pr comment` or a session log.
++
++## `kb.*` methods
++
++The same surface is reachable over every transport (MCP stdio, JSONL, HTTP):
++
++| Method | Params |
++|--------|--------|
++| `kb.why` | `claim_id`, `depth` |
++| `kb.trace` | `from`, `to` |
++| `kb.impact` | `claim_id`, `depth`, `op` |
++| `kb.graph_export` | `session`, `format` |
++| `kb.provenance_rebuild` | — |
++
++They appear in `kb.capabilities` and pass the JSONL capabilities cross-check.
++
++## The cache
++
++The `prov_edges(src_id, dst_id, kind, event_ts, session_id)` table in `state.db`
++is a derived index, gitignored alongside the rest of the cache. A freshness
++stamp (claim count + page count + audit-event count) lets a cold query decide
++whether the cache can be trusted; when stale, `load_graph` rebuilds it
++transparently. Correctness never depends on the cache — a rebuild is always an
++exact reconstruction of the live in-memory build, which a CI test asserts.
++
++## Out of scope
++
++- A graphical web visualization of the DAG — a natural extension of the
++  `review-ui`, not this.
++- Mutating the graph directly; provenance is derived state.
++- Cross-KB / federated provenance.
++- Embedding-based "semantic neighbors" — provenance edges are strictly the
++  typed, audit-grounded ones.
++- Auto-blocking lifecycle ops based on impact size — `vouch impact` advises, the
++  human still decides.
+diff --git a/src/vouch/capabilities.py b/src/vouch/capabilities.py
+index a4c7533..b321197 100644
+--- a/src/vouch/capabilities.py
++++ b/src/vouch/capabilities.py
+@@ -59,6 +59,11 @@
+     "kb.dedup_scan",
+     "kb.eval_embeddings",
+     "kb.embeddings_stats",
++    "kb.why",
++    "kb.trace",
++    "kb.impact",
++    "kb.graph_export",
++    "kb.provenance_rebuild",
+ ]
+ 
+ 
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index 98e562c..c0dcaed 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -27,6 +27,7 @@
+ from . import metrics as metrics_mod
+ from . import migrations as migrations_mod
+ from . import pr_cache as prc_mod
++from . import provenance as prov_mod
+ from . import sessions as sess_mod
+ from . import stats as stats_mod
+ from . import sync as sync_mod
+@@ -1196,6 +1197,109 @@ def index() -> None:
+     click.echo(f"indexed: {stats}")
+ 
+ 
++# --- provenance: why / trace / impact / graph -----------------------------
++
++
++@cli.command()
++@click.argument("claim_id")
++@click.option("--depth", default=3, show_default=True, type=int,
++              help="How many hops of provenance to expand.")
++@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a tree.")
++def why(claim_id: str, depth: int, as_json: bool) -> None:
++    """Explain why a claim exists: cites, session, supersedes chain, approval.
++
++    \b
++    Examples:
++      vouch why my-claim-id
++      vouch why my-claim-id --depth 5 --json
++    """
++    store = _load_store()
++    with _cli_errors():
++        result = prov_mod.why(store, claim_id=claim_id, depth=depth)
++    if as_json:
++        _emit_json(result)
++        return
++    _echo(prov_mod.render_why(result))
++
++
++@cli.command()
++@click.argument("from_id")
++@click.option("--to", "to_id", required=True, help="The artifact to trace a path to.")
++@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text.")
++def trace(from_id: str, to_id: str, as_json: bool) -> None:
++    """Find the shortest typed-edge path between two artifacts.
++
++    Exits non-zero with `no path` when the two artifacts are disconnected.
++    """
++    store = _load_store()
++    with _cli_errors():
++        result = prov_mod.trace(store, from_id=from_id, to_id=to_id)
++    if as_json:
++        _emit_json(result)
++    else:
++        _echo(prov_mod.render_trace(result))
++    if not result["found"]:
++        sys.exit(1)
++
++
++@cli.command()
++@click.argument("claim_id")
++@click.option("--depth", default=1, show_default=True, type=int,
++              help="How many hops of dependents to expand.")
++@click.option("--if", "if_op", default=None,
++              type=click.Choice([op.value for op in prov_mod.LifecycleOp]),
++              help="Dry-run a lifecycle op and report breakage (exit non-zero if any).")
++@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a tree.")
++def impact(claim_id: str, depth: int, if_op: str | None, as_json: bool) -> None:
++    """Show what depends on a claim, and what breaks if you change it.
++
++    \b
++    Examples:
++      vouch impact my-claim-id
++      vouch impact my-claim-id --if archive
++    """
++    store = _load_store()
++    with _cli_errors():
++        result = prov_mod.impact(store, claim_id=claim_id, depth=depth, op=if_op)
++    if as_json:
++        _emit_json(result)
++    else:
++        _echo(prov_mod.render_impact(result))
++    if if_op is not None and result["blocking"]:
++        sys.exit(1)
++
++
++@cli.command()
++@click.option("--session", default=None, help="Restrict to one agent run's subgraph.")
++@click.option("--format", "fmt", default="dot", show_default=True,
++              type=click.Choice(["dot", "mermaid"]),
++              help="Output format for the DAG.")
++def graph(session: str | None, fmt: str) -> None:
++    """Render the provenance DAG as Graphviz dot or a mermaid flowchart."""
++    store = _load_store()
++    with _cli_errors():
++        text = prov_mod.graph_export(store, session=session, fmt=fmt)
++    click.echo(text, nl=False)
++
++
++@cli.group()
++def provenance() -> None:
++    """Provenance graph cache operations."""
++
++
++@provenance.command("rebuild")
++@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text.")
++def provenance_rebuild(as_json: bool) -> None:
++    """Rebuild the prov_edges cache from durable files (treated as derived state)."""
++    store = _load_store()
++    with _cli_errors():
++        count = prov_mod.rebuild_prov_edges(store)
++    if as_json:
++        _emit_json({"edges": count})
++        return
++    click.echo(f"provenance: rebuilt {count} edges")
++
++
+ @cli.command()
+ @click.option("--threshold", default=0.95, show_default=True, type=float)
+ @click.option("--dry-run/--no-dry-run", default=False)
+diff --git a/src/vouch/index_db.py b/src/vouch/index_db.py
+index 7d02627..24bfe9f 100644
+--- a/src/vouch/index_db.py
++++ b/src/vouch/index_db.py
+@@ -74,6 +74,18 @@
+     cosine          REAL NOT NULL,
+     detected_at     TEXT NOT NULL
+ );
++
++CREATE TABLE IF NOT EXISTS prov_edges (
++    src_id          TEXT NOT NULL,
++    dst_id          TEXT NOT NULL,
++    kind            TEXT NOT NULL,
++    event_ts        TEXT NOT NULL DEFAULT '',
++    session_id      TEXT,
++    PRIMARY KEY (src_id, dst_id, kind)
++);
++
++CREATE INDEX IF NOT EXISTS prov_edges_dst ON prov_edges(dst_id);
++CREATE INDEX IF NOT EXISTS prov_edges_kind ON prov_edges(kind);
+ """
+ 
+ 
+@@ -113,7 +125,9 @@ def reset(kb_dir: Path) -> None:
+             "DELETE FROM embedding_index;"
+             "DELETE FROM query_embedding_cache;"
+             "DELETE FROM embedding_dupes;"
++            "DELETE FROM prov_edges;"
+             "DELETE FROM index_meta WHERE key LIKE 'embedding_%';"
++            "DELETE FROM index_meta WHERE key LIKE 'prov_%';"
+         )
+ 
+ 
+@@ -172,6 +186,49 @@ def index_claim(conn: sqlite3.Connection, *, id: str, text: str,
+     )
+ 
+ 
++# --- provenance edges (derived cache for `vouch why/trace/impact`) --------
++
++
++def clear_prov_edges(conn: sqlite3.Connection) -> None:
++    conn.execute("DELETE FROM prov_edges")
++
++
++def index_prov_edge(
++    conn: sqlite3.Connection, *, src_id: str, dst_id: str, kind: str,
++    event_ts: str = "", session_id: str | None = None,
++) -> None:
++    conn.execute(
++        "INSERT OR REPLACE INTO prov_edges "
++        "(src_id, dst_id, kind, event_ts, session_id) VALUES (?, ?, ?, ?, ?)",
++        (src_id, dst_id, kind, event_ts, session_id),
++    )
++
++
++def read_prov_edges(kb_dir: Path) -> list[tuple[str, str, str, str, str | None]]:
++    """Return all cached provenance edges, deterministically ordered."""
++    with open_db(kb_dir) as conn:
++        rows = conn.execute(
++            "SELECT src_id, dst_id, kind, event_ts, session_id FROM prov_edges "
++            "ORDER BY src_id, dst_id, kind"
++        ).fetchall()
++    return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
++
++
++def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
++    conn.execute(
++        "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?)",
++        (key, value),
++    )
++
++
++def get_meta(kb_dir: Path, key: str) -> str | None:
++    with open_db(kb_dir) as conn:
++        row = conn.execute(
++            "SELECT value FROM index_meta WHERE key = ?", (key,)
++        ).fetchone()
++    return row[0] if row else None
++
++
+ def index_page(conn: sqlite3.Connection, *, id: str, title: str, body: str,
+                type: str, tags: Iterable[str]) -> None:
+     conn.execute("DELETE FROM pages_fts WHERE id = ?", (id,))
+diff --git a/src/vouch/jsonl_server.py b/src/vouch/jsonl_server.py
+index dff9ce1..c0eb2f8 100644
+--- a/src/vouch/jsonl_server.py
++++ b/src/vouch/jsonl_server.py
+@@ -510,6 +510,43 @@ def _h_embeddings_stats(_: dict) -> dict:
+     }
+ 
+ 
++def _h_why(p: dict) -> dict:
++    from . import provenance as prov
++
++    return prov.why(_store(), claim_id=p["claim_id"], depth=int(p.get("depth", 3)))
++
++
++def _h_trace(p: dict) -> dict:
++    from . import provenance as prov
++
++    return prov.trace(_store(), from_id=p["from"], to_id=p["to"])
++
++
++def _h_impact(p: dict) -> dict:
++    from . import provenance as prov
++
++    return prov.impact(
++        _store(),
++        claim_id=p["claim_id"],
++        depth=int(p.get("depth", 1)),
++        op=p.get("op"),
++    )
++
++
++def _h_graph_export(p: dict) -> dict:
++    from . import provenance as prov
++
++    fmt = p.get("format", "dot")
++    graph = prov.graph_export(_store(), session=p.get("session"), fmt=fmt)
++    return {"format": fmt, "graph": graph}
++
++
++def _h_provenance_rebuild(_: dict) -> dict:
++    from . import provenance as prov
++
++    return {"edges": prov.rebuild_prov_edges(_store())}
++
++
+ HANDLERS: dict[str, Callable[[dict], Any]] = {
+     "kb.capabilities": _h_capabilities,
+     "kb.status": _h_status,
+@@ -556,6 +593,11 @@ def _h_embeddings_stats(_: dict) -> dict:
+     "kb.dedup_scan": _h_dedup_scan,
+     "kb.eval_embeddings": _h_eval_embeddings,
+     "kb.embeddings_stats": _h_embeddings_stats,
++    "kb.why": _h_why,
++    "kb.trace": _h_trace,
++    "kb.impact": _h_impact,
++    "kb.graph_export": _h_graph_export,
++    "kb.provenance_rebuild": _h_provenance_rebuild,
+ }
+ 
+ 
+diff --git a/src/vouch/provenance/__init__.py b/src/vouch/provenance/__init__.py
+new file mode 100644
+index 0000000..fdb0f52
+--- /dev/null
++++ b/src/vouch/provenance/__init__.py
+@@ -0,0 +1,57 @@
++"""Provenance DAG for the vouch review gate.
++
++vouch already records everything needed to explain why a claim exists — the
++session that proposed it, the source it cites, the supersedes chain it sits on,
++the contradiction that demoted it, the page that embeds it as evidence — but it
++is scattered across ``audit.log.jsonl``, ``relations/``, ``evidence/``,
++``sessions/`` and the claim file itself. This package reconstructs a single
++typed directed graph from those artifacts and answers three operational
++questions:
++
++* ``why``    — backward: what does this artifact derive from? (cites, session,
++  supersedes chain, contradictions, approval event)
++* ``impact`` — forward: what depends on this artifact, and what breaks if I
++  archive / contradict / supersede it?
++* ``trace``  — the shortest typed-edge path between two artifacts.
++
++The graph is *derived state*. Nothing here is a source of truth: every edge is
++rebuilt from durable files, and the persistent ``prov_edges`` table in
++``state.db`` is a disposable cache that ``vouch provenance rebuild``
++reconstructs byte-for-byte. All mutations still flow through the existing
++proposal + lifecycle code paths.
++"""
++
++from __future__ import annotations
++
++from .cache import load_graph, prov_stamp, rebuild_prov_edges
++from .graph import ProvGraph, build_graph
++from .model import Edge, EdgeKind, NodeKind
++from .query import (
++    LifecycleOp,
++    graph_export,
++    impact,
++    render_impact,
++    render_trace,
++    render_why,
++    trace,
++    why,
++)
++
++__all__ = [
++    "Edge",
++    "EdgeKind",
++    "LifecycleOp",
++    "NodeKind",
++    "ProvGraph",
++    "build_graph",
++    "graph_export",
++    "impact",
++    "load_graph",
++    "prov_stamp",
++    "rebuild_prov_edges",
++    "render_impact",
++    "render_trace",
++    "render_why",
++    "trace",
++    "why",
++]
+diff --git a/src/vouch/provenance/cache.py b/src/vouch/provenance/cache.py
+new file mode 100644
+index 0000000..0debfb3
+--- /dev/null
++++ b/src/vouch/provenance/cache.py
+@@ -0,0 +1,88 @@
++"""Persist and reload the provenance DAG via the ``prov_edges`` table.
++
++The cache is a pure acceleration: :func:`rebuild_prov_edges` serialises exactly
++what :func:`~.graph.build_graph` produces, and :func:`load_graph` returns a graph
++backed by the cache when it is fresh, transparently rebuilding it when the KB has
++changed underneath. A freshness *stamp* (claim count + page count + audit event
++count) is stored alongside the rows so a cold query knows whether the cache can
++be trusted without re-reading every file.
++"""
++
++from __future__ import annotations
++
++from .. import audit, index_db
++from ..storage import KBStore
++from .graph import ProvGraph, build_graph
++from .model import Edge, EdgeKind
++
++_STAMP_KEY = "prov_stamp"
++
++
++def prov_stamp(store: KBStore) -> str:
++    """A cheap fingerprint of the inputs the graph is derived from.
++
++    Counting beats hashing here: it is O(files) without parsing every claim,
++    and any propose/approve/lifecycle action changes at least one of the three
++    counts (the audit log is append-only, so its count is monotonic).
++    """
++    claims = len(store.list_claims())
++    pages = len(store.list_pages())
++    events = audit.count_events(store.kb_dir)
++    return f"{claims}:{pages}:{events}"
++
++
++def rebuild_prov_edges(store: KBStore) -> int:
++    """Rebuild ``prov_edges`` from scratch in one pass. Returns the edge count.
++
++    This is what ``vouch provenance rebuild`` calls. It is the cold-path
++    equivalent of the live graph: identical inputs yield an identical table.
++    """
++    graph = build_graph(store)
++    stamp = prov_stamp(store)
++    with index_db.open_db(store.kb_dir) as conn:
++        index_db.clear_prov_edges(conn)
++        for e in graph.edges:
++            index_db.index_prov_edge(
++                conn,
++                src_id=e.src_id,
++                dst_id=e.dst_id,
++                kind=e.kind.value,
++                event_ts=e.event_ts,
++                session_id=e.session_id,
++            )
++        index_db.set_meta(conn, _STAMP_KEY, stamp)
++    return len(graph.edges)
++
++
++def load_edges(store: KBStore) -> list[Edge]:
++    """Load cached edges as :class:`Edge` objects (deterministically ordered)."""
++    rows = index_db.read_prov_edges(store.kb_dir)
++    return [
++        Edge(
++            src_id=src,
++            dst_id=dst,
++            kind=EdgeKind(kind),
++            event_ts=ts or "",
++            session_id=session,
++        )
++        for (src, dst, kind, ts, session) in rows
++    ]
++
++
++def load_graph(store: KBStore, *, use_cache: bool = True) -> ProvGraph:
++    """Return a provenance graph, using the cache when fresh.
++
++    With ``use_cache=False`` (or a stale/empty cache) the graph is rebuilt from
++    durable files and the cache is refreshed as a side effect, so the next call
++    is hot. Correctness never depends on the cache: a rebuild is always exact.
++    """
++    if not use_cache:
++        return build_graph(store)
++    try:
++        cached_stamp = index_db.get_meta(store.kb_dir, _STAMP_KEY)
++    except Exception:
++        cached_stamp = None
++    if cached_stamp is not None and cached_stamp == prov_stamp(store):
++        return ProvGraph(load_edges(store))
++    rebuild_prov_edges(store)
++    return ProvGraph(load_edges(store))
+diff --git a/src/vouch/provenance/graph.py b/src/vouch/provenance/graph.py
+new file mode 100644
+index 0000000..1f1855a
+--- /dev/null
++++ b/src/vouch/provenance/graph.py
+@@ -0,0 +1,229 @@
++"""Build the provenance DAG from durable artifacts and traverse it.
++
++:func:`build_graph` is the authoritative, always-fresh construction — it reads
++claims, evidence, pages, sessions, approved proposals and the audit log and
++emits the canonical edge set. The :mod:`.cache` layer persists exactly this set
++to ``prov_edges`` and is validated against it.
++"""
++
++from __future__ import annotations
++
++from collections import deque
++from collections.abc import Iterable
++
++from .. import audit
++from ..models import ProposalKind, ProposalStatus
++from ..storage import ArtifactNotFoundError, KBStore
++from .model import Edge, EdgeKind, NodeKind, sort_edges
++
++
++class ProvGraph:
++    """An in-memory typed DAG with outward/inward/undirected traversal."""
++
++    def __init__(
++        self, edges: Iterable[Edge], node_kinds: dict[str, NodeKind] | None = None
++    ) -> None:
++        self.edges: list[Edge] = sort_edges(edges)
++        self._out: dict[str, list[Edge]] = {}
++        self._in: dict[str, list[Edge]] = {}
++        for e in self.edges:
++            self._out.setdefault(e.src_id, []).append(e)
++            self._in.setdefault(e.dst_id, []).append(e)
++        self._node_kinds: dict[str, NodeKind] = dict(node_kinds or {})
++
++    # --- node introspection -------------------------------------------------
++
++    def nodes(self) -> set[str]:
++        return set(self._out) | set(self._in)
++
++    def kind_of(self, node: str) -> NodeKind:
++        """Best-effort node kind, inferred from incident edges when unknown.
++
++        Inference keeps cache-loaded graphs (which carry no explicit kind map)
++        as informative as freshly-built ones.
++        """
++        known = self._node_kinds.get(node)
++        if known is not None:
++            return known
++        for e in self._out.get(node, []):
++            if e.kind in (
++                EdgeKind.CITES,
++                EdgeKind.SUPERSEDES,
++                EdgeKind.CONTRADICTS,
++                EdgeKind.PROPOSED_IN,
++                EdgeKind.APPROVED_BY,
++            ):
++                return NodeKind.CLAIM
++            if e.kind is EdgeKind.DERIVED_FROM:
++                return NodeKind.EVIDENCE
++            if e.kind is EdgeKind.EMBEDS:
++                return NodeKind.PAGE
++        for e in self._in.get(node, []):
++            if e.kind is EdgeKind.EMBEDS:
++                return NodeKind.CLAIM
++            if e.kind is EdgeKind.PROPOSED_IN:
++                return NodeKind.SESSION
++            if e.kind is EdgeKind.APPROVED_BY:
++                return NodeKind.EVENT
++            if e.kind is EdgeKind.DERIVED_FROM:
++                return NodeKind.SOURCE
++            if e.kind is EdgeKind.CITES:
++                return NodeKind.SOURCE
++        return NodeKind.UNKNOWN
++
++    # --- edge access --------------------------------------------------------
++
++    def out_edges(
++        self, node: str, kinds: Iterable[EdgeKind] | None = None
++    ) -> list[Edge]:
++        edges = self._out.get(node, [])
++        if kinds is None:
++            return list(edges)
++        allow = set(kinds)
++        return [e for e in edges if e.kind in allow]
++
++    def in_edges(
++        self, node: str, kinds: Iterable[EdgeKind] | None = None
++    ) -> list[Edge]:
++        edges = self._in.get(node, [])
++        if kinds is None:
++            return list(edges)
++        allow = set(kinds)
++        return [e for e in edges if e.kind in allow]
++
++    # --- traversal ----------------------------------------------------------
++
++    def shortest_path(self, start: str, goal: str) -> list[Edge] | None:
++        """Shortest path between two nodes over an *undirected* view.
++
++        Provenance edges are directed, but "how are these two artifacts
++        related?" is a connectivity question, so an edge is crossable either
++        way. Returns the list of edges along the path (in start->goal order), or
++        ``None`` if disconnected. ``start == goal`` yields an empty path.
++        """
++        if start == goal:
++            return [] if start in self.nodes() else None
++        # BFS; remember the edge we crossed to reach each node.
++        prev: dict[str, tuple[str, Edge]] = {}
++        seen = {start}
++        q: deque[str] = deque([start])
++        while q:
++            node = q.popleft()
++            neighbours: list[tuple[str, Edge]] = [
++                (e.dst_id, e) for e in self._out.get(node, [])
++            ] + [(e.src_id, e) for e in self._in.get(node, [])]
++            for nxt, edge in neighbours:
++                if nxt in seen:
++                    continue
++                seen.add(nxt)
++                prev[nxt] = (node, edge)
++                if nxt == goal:
++                    return _reconstruct(prev, start, goal)
++                q.append(nxt)
++        return None
++
++
++def _reconstruct(
++    prev: dict[str, tuple[str, Edge]], start: str, goal: str
++) -> list[Edge]:
++    chain: list[Edge] = []
++    cur = goal
++    while cur != start:
++        parent, edge = prev[cur]
++        chain.append(edge)
++        cur = parent
++    chain.reverse()
++    return chain
++
++
++def build_graph(store: KBStore) -> ProvGraph:
++    """Reconstruct the full provenance graph from durable files.
++
++    Deterministic: claims and pages are read in sorted order and the audit log
++    in append order, so the emitted edge set is stable across runs — that is
++    what makes the ``prov_edges`` cache verifiable against it.
++    """
++    edges: dict[tuple[str, str, str], Edge] = {}
++    node_kinds: dict[str, NodeKind] = {}
++
++    def add(
++        src: str,
++        dst: str,
++        kind: EdgeKind,
++        ts: str = "",
++        session: str | None = None,
++    ) -> None:
++        key = (src, dst, kind.value)
++        if key not in edges:
++            edges[key] = Edge(src, dst, kind, ts, session)
++
++    claims = store.list_claims()
++    claim_ids = {c.id for c in claims}
++    for c in claims:
++        node_kinds[c.id] = NodeKind.CLAIM
++
++    # claim -> proposing session, from approved claim proposals
++    proposed_in: dict[str, str] = {}
++    for pr in store.list_proposals(ProposalStatus.APPROVED):
++        if pr.kind is ProposalKind.CLAIM and pr.session_id:
++            cid = pr.payload.get("id")
++            if isinstance(cid, str):
++                proposed_in[cid] = pr.session_id
++
++    # claim -> approval audit event, from the append-only log
++    approve_event: dict[str, tuple[str, str]] = {}
++    for ev in audit.read_events(store.kb_dir):
++        if not ev.event.endswith(".approve"):
++            continue
++        ts = ev.created_at.isoformat()
++        for oid in ev.object_ids:
++            if oid in claim_ids:
++                approve_event[oid] = (ev.id, ts)
++
++    for c in claims:
++        c_ts = c.updated_at.isoformat()
++        sess = proposed_in.get(c.id)
++
++        for ref in c.evidence:
++            add(c.id, ref, EdgeKind.CITES, c_ts, sess)
++            try:
++                evd = store.get_evidence(ref)
++            except ArtifactNotFoundError:
++                node_kinds.setdefault(ref, NodeKind.SOURCE)
++            else:
++                node_kinds[ref] = NodeKind.EVIDENCE
++                node_kinds[evd.source_id] = NodeKind.SOURCE
++                add(
++                    ref,
++                    evd.source_id,
++                    EdgeKind.DERIVED_FROM,
++                    evd.created_at.isoformat(),
++                )
++
++        for old in c.supersedes:
++            add(c.id, old, EdgeKind.SUPERSEDES, c_ts, sess)
++        if c.superseded_by:
++            # Mirror of some newer claim's `supersedes`; record canonically
++            # (newer -> older) so the edge exists even if the newer claim file
++            # has not yet been re-read.
++            add(c.superseded_by, c.id, EdgeKind.SUPERSEDES, c_ts)
++
++        for other in c.contradicts:
++            add(c.id, other, EdgeKind.CONTRADICTS, c_ts, sess)
++
++        if sess:
++            node_kinds[sess] = NodeKind.SESSION
++            add(c.id, sess, EdgeKind.PROPOSED_IN, c_ts, sess)
++
++        if c.id in approve_event:
++            eid, ts = approve_event[c.id]
++            node_kinds[eid] = NodeKind.EVENT
++            add(c.id, eid, EdgeKind.APPROVED_BY, ts, sess)
++
++    for p in store.list_pages():
++        node_kinds[p.id] = NodeKind.PAGE
++        p_ts = p.updated_at.isoformat()
++        for cid in p.claims:
++            add(p.id, cid, EdgeKind.EMBEDS, p_ts)
++
++    return ProvGraph(edges.values(), node_kinds)
+diff --git a/src/vouch/provenance/model.py b/src/vouch/provenance/model.py
+new file mode 100644
+index 0000000..b70d247
+--- /dev/null
++++ b/src/vouch/provenance/model.py
+@@ -0,0 +1,108 @@
++"""Typed nodes and edges for the provenance DAG.
++
++Edge orientation is uniform: ``A --kind--> B`` means *A is explained by / derives
++from / depends on B*. So a claim points at the source it cites, the session it
++was proposed in, the audit event that approved it, and the older claim it
++supersedes. ``why`` therefore walks edges *outward* from a node; ``impact`` walks
++them *inward* (who points at me). The two reverse kinds (``supersededBy`` /
++``contradictedBy``) are query-time labels for inbound traversal — only the seven
++canonical kinds in :data:`STORED_KINDS` are ever persisted, which keeps the
++``prov_edges`` cache free of duplicate mirror rows.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterable
++from dataclasses import dataclass
++from enum import StrEnum
++
++
++class EdgeKind(StrEnum):
++    CITES = "cites"  # claim -> source / evidence it cites
++    DERIVED_FROM = "derivedFrom"  # evidence span -> source it quotes
++    SUPERSEDES = "supersedes"  # newer claim -> older claim it replaces
++    SUPERSEDED_BY = "supersededBy"  # reverse view of supersedes (query-time only)
++    CONTRADICTS = "contradicts"  # claim -> claim it contradicts
++    CONTRADICTED_BY = "contradictedBy"  # reverse view (query-time only)
++    EMBEDS = "embeds"  # page -> claim it embeds as evidence
++    PROPOSED_IN = "proposedIn"  # claim -> session it was proposed in
++    APPROVED_BY = "approvedBy"  # claim -> audit event that approved it
++
++
++class NodeKind(StrEnum):
++    CLAIM = "claim"
++    SOURCE = "source"
++    EVIDENCE = "evidence"
++    PAGE = "page"
++    SESSION = "session"
++    EVENT = "event"
++    UNKNOWN = "unknown"
++
++
++#: Edge kinds actually written to the ``prov_edges`` cache. The two ``*By``
++#: mirrors are derived at query time by walking these inbound.
++STORED_KINDS: frozenset[EdgeKind] = frozenset(
++    {
++        EdgeKind.CITES,
++        EdgeKind.DERIVED_FROM,
++        EdgeKind.SUPERSEDES,
++        EdgeKind.CONTRADICTS,
++        EdgeKind.EMBEDS,
++        EdgeKind.PROPOSED_IN,
++        EdgeKind.APPROVED_BY,
++    }
++)
++
++#: "Why is this here" kinds, followed outward from a node by :func:`why`.
++PROVENANCE_KINDS: frozenset[EdgeKind] = frozenset(
++    {
++        EdgeKind.CITES,
++        EdgeKind.DERIVED_FROM,
++        EdgeKind.SUPERSEDES,
++        EdgeKind.CONTRADICTS,
++        EdgeKind.PROPOSED_IN,
++        EdgeKind.APPROVED_BY,
++    }
++)
++
++#: Inbound edge kind -> the label used when it is reported as a dependency.
++REVERSE_LABEL: dict[EdgeKind, EdgeKind] = {
++    EdgeKind.SUPERSEDES: EdgeKind.SUPERSEDED_BY,
++    EdgeKind.CONTRADICTS: EdgeKind.CONTRADICTED_BY,
++}
++
++
++@dataclass(frozen=True)
++class Edge:
++    """One typed, directed provenance edge.
++
++    ``event_ts`` is the ISO-8601 timestamp that grounds the edge in the audit
++    trail (the approval time, the claim's last update, etc.); ``session_id`` is
++    the agent run the edge originated from, when known. Both are best-effort and
++    carried through to the cache so cold queries can group/order without a
++    rebuild.
++    """
++
++    src_id: str
++    dst_id: str
++    kind: EdgeKind
++    event_ts: str = ""
++    session_id: str | None = None
++
++    @property
++    def sort_key(self) -> tuple[str, str, str]:
++        return (self.src_id, self.dst_id, self.kind.value)
++
++    def to_dict(self) -> dict[str, str | None]:
++        return {
++            "src": self.src_id,
++            "dst": self.dst_id,
++            "kind": self.kind.value,
++            "event_ts": self.event_ts,
++            "session_id": self.session_id,
++        }
++
++
++def sort_edges(edges: Iterable[Edge]) -> list[Edge]:
++    """Deterministic edge ordering — the basis for cache/build equivalence."""
++    return sorted(edges, key=lambda e: e.sort_key)
+diff --git a/src/vouch/provenance/query.py b/src/vouch/provenance/query.py
+new file mode 100644
+index 0000000..ea99568
+--- /dev/null
++++ b/src/vouch/provenance/query.py
+@@ -0,0 +1,392 @@
++"""The three operational queries — ``why``, ``impact``, ``trace`` — plus graph
++export. Each returns a stable JSON-able ``dict``/``str`` so the same shape backs
++the CLI, the ``kb.*`` RPC methods and downstream tooling. Human rendering lives
++here too (bare prose + indentation, no colour) so output diffs cleanly into a
++``gh pr comment`` or a session log.
++"""
++
++from __future__ import annotations
++
++from enum import StrEnum
++
++from ..models import PageStatus
++from ..storage import ArtifactNotFoundError, KBStore
++from .cache import load_graph
++from .graph import ProvGraph
++from .model import PROVENANCE_KINDS, REVERSE_LABEL, EdgeKind, NodeKind
++
++SCHEMA_VERSION = 1
++
++
++class LifecycleOp(StrEnum):
++    """Lifecycle operations whose blast radius :func:`impact` can dry-run."""
++
++    ARCHIVE = "archive"
++    CONTRADICT = "contradict"
++    SUPERSEDE = "supersede"
++
++
++def _ensure_known(store: KBStore, graph: ProvGraph, node_id: str) -> None:
++    """Raise a clean not-found instead of silently returning an empty result."""
++    if node_id in graph.nodes():
++        return
++    # Not an edge endpoint anywhere — defer to the store's own error for the
++    # overwhelmingly common case (a mistyped claim id).
++    store.get_claim(node_id)
++
++
++# --- why ------------------------------------------------------------------
++
++
++def _why_node(
++    graph: ProvGraph, node: str, depth: int, path: frozenset[str]
++) -> list[dict[str, object]]:
++    if depth <= 0:
++        return []
++    out: list[dict[str, object]] = []
++    edges = sorted(
++        graph.out_edges(node, PROVENANCE_KINDS),
++        key=lambda e: (e.kind.value, e.dst_id),
++    )
++    for e in edges:
++        cycle = e.dst_id in path
++        entry: dict[str, object] = {
++            "kind": e.kind.value,
++            "target": e.dst_id,
++            "target_kind": graph.kind_of(e.dst_id).value,
++            "event_ts": e.event_ts,
++            "session_id": e.session_id,
++            "cycle": cycle,
++            "children": (
++                []
++                if cycle
++                else _why_node(graph, e.dst_id, depth - 1, path | {e.dst_id})
++            ),
++        }
++        out.append(entry)
++    return out
++
++
++def why(
++    store: KBStore, *, claim_id: str, depth: int = 3, use_cache: bool = True
++) -> dict[str, object]:
++    """Backward provenance: what explains this artifact's existence.
++
++    Walks edges outward (cites, derived-from, supersedes, contradicts,
++    proposed-in, approved-by) up to ``depth`` hops, grouped by kind, each leaf
++    carrying its audit timestamp and originating session.
++    """
++    if depth < 0:
++        raise ValueError("depth must be >= 0")
++    graph = load_graph(store, use_cache=use_cache)
++    _ensure_known(store, graph, claim_id)
++    return {
++        "schema_version": SCHEMA_VERSION,
++        "root": claim_id,
++        "node_kind": graph.kind_of(claim_id).value,
++        "depth": depth,
++        "provenance": _why_node(graph, claim_id, depth, frozenset({claim_id})),
++    }
++
++
++# --- impact ---------------------------------------------------------------
++
++
++def _impact_node(
++    graph: ProvGraph, node: str, depth: int, path: frozenset[str]
++) -> list[dict[str, object]]:
++    if depth <= 0:
++        return []
++    out: list[dict[str, object]] = []
++    edges = sorted(
++        graph.in_edges(node),
++        key=lambda e: (e.kind.value, e.src_id),
++    )
++    for e in edges:
++        cycle = e.src_id in path
++        label = REVERSE_LABEL.get(e.kind, e.kind)
++        entry: dict[str, object] = {
++            "kind": label.value,
++            "source": e.src_id,
++            "source_kind": graph.kind_of(e.src_id).value,
++            "event_ts": e.event_ts,
++            "session_id": e.session_id,
++            "cycle": cycle,
++            "dependents": (
++                []
++                if cycle
++                else _impact_node(graph, e.src_id, depth - 1, path | {e.src_id})
++            ),
++        }
++        out.append(entry)
++    return out
++
++
++def _breakage(
++    store: KBStore, graph: ProvGraph, node: str, op: LifecycleOp
++) -> list[dict[str, object]]:
++    """Artifacts that would carry a stale reference after ``op`` on ``node``.
++
++    For every destructive op the load-bearing breakage is the set of *active*
++    pages that embed the claim: archiving/contradicting/superseding it leaves
++    those live pages pointing at evidence that no longer holds. Draft and
++    already-archived pages are not counted — they are not in front of a reader.
++    """
++    broken: list[dict[str, object]] = []
++    for e in graph.in_edges(node, [EdgeKind.EMBEDS]):
++        try:
++            page = store.get_page(e.src_id)
++        except ArtifactNotFoundError:
++            continue
++        if page.status is PageStatus.ACTIVE:
++            broken.append(
++                {
++                    "id": page.id,
++                    "kind": NodeKind.PAGE.value,
++                    "status": page.status.value,
++                    "via": EdgeKind.EMBEDS.value,
++                    "title": page.title,
++                }
++            )
++    broken.sort(key=lambda b: str(b["id"]))
++    return broken
++
++
++def impact(
++    store: KBStore,
++    *,
++    claim_id: str,
++    depth: int = 1,
++    op: LifecycleOp | str | None = None,
++    use_cache: bool = True,
++) -> dict[str, object]:
++    """Forward impact: what depends on this artifact, and what breaks.
++
++    ``op`` (``archive`` / ``contradict`` / ``supersede``) dry-runs the lifecycle
++    operation against the in-memory graph and reports the breakage list without
++    writing anything. ``blocking`` is true iff that list is non-empty.
++    """
++    if depth < 0:
++        raise ValueError("depth must be >= 0")
++    parsed_op = LifecycleOp(op) if op is not None else None
++    graph = load_graph(store, use_cache=use_cache)
++    _ensure_known(store, graph, claim_id)
++    breakage = (
++        _breakage(store, graph, claim_id, parsed_op) if parsed_op is not None else []
++    )
++    return {
++        "schema_version": SCHEMA_VERSION,
++        "root": claim_id,
++        "node_kind": graph.kind_of(claim_id).value,
++        "depth": depth,
++        "op": parsed_op.value if parsed_op is not None else None,
++        "dependents": _impact_node(graph, claim_id, depth, frozenset({claim_id})),
++        "breakage": breakage,
++        "blocking": bool(breakage),
++    }
++
++
++# --- trace ----------------------------------------------------------------
++
++
++def _path_nodes(start: str, edges: list) -> list[str]:  # type: ignore[type-arg]
++    nodes = [start]
++    cur = start
++    for e in edges:
++        nxt = e.dst_id if e.src_id == cur else e.src_id
++        nodes.append(nxt)
++        cur = nxt
++    return nodes
++
++
++def trace(
++    store: KBStore, *, from_id: str, to_id: str, use_cache: bool = True
++) -> dict[str, object]:
++    """Shortest typed-edge path between two artifacts (edges crossable either
++    way). ``found`` is false with an empty path when they are disconnected."""
++    graph = load_graph(store, use_cache=use_cache)
++    chain = graph.shortest_path(from_id, to_id)
++    if chain is None:
++        return {
++            "schema_version": SCHEMA_VERSION,
++            "from": from_id,
++            "to": to_id,
++            "found": False,
++            "length": 0,
++            "nodes": [],
++            "path": [],
++        }
++    nodes = _path_nodes(from_id, chain)
++    steps: list[dict[str, object]] = []
++    cur = from_id
++    for e in chain:
++        nxt = e.dst_id if e.src_id == cur else e.src_id
++        steps.append(
++            {
++                "from": cur,
++                "to": nxt,
++                "kind": e.kind.value,
++                "reversed": e.src_id != cur,
++            }
++        )
++        cur = nxt
++    return {
++        "schema_version": SCHEMA_VERSION,
++        "from": from_id,
++        "to": to_id,
++        "found": True,
++        "length": len(chain),
++        "nodes": nodes,
++        "path": steps,
++    }
++
++
++# --- graph export ---------------------------------------------------------
++
++
++def _session_subgraph_edges(graph: ProvGraph, session_id: str) -> list:  # type: ignore[type-arg]
++    claim_set = {
++        e.src_id
++        for e in graph.edges
++        if e.kind is EdgeKind.PROPOSED_IN and e.dst_id == session_id
++    }
++    return [
++        e
++        for e in graph.edges
++        if e.src_id in claim_set
++        or e.dst_id in claim_set
++        or e.src_id == session_id
++        or e.dst_id == session_id
++    ]
++
++
++def graph_export(
++    store: KBStore,
++    *,
++    session: str | None = None,
++    fmt: str = "dot",
++    use_cache: bool = True,
++) -> str:
++    """Render the DAG (or one session's subgraph) as Graphviz ``dot`` or
++    ``mermaid`` flowchart text."""
++    if fmt not in ("dot", "mermaid"):
++        raise ValueError(f"unknown graph format: {fmt!r} (use 'dot' or 'mermaid')")
++    graph = load_graph(store, use_cache=use_cache)
++    edges = (
++        _session_subgraph_edges(graph, session) if session is not None else graph.edges
++    )
++    nodes: list[str] = []
++    seen: set[str] = set()
++    for e in edges:
++        for n in (e.src_id, e.dst_id):
++            if n not in seen:
++                seen.add(n)
++                nodes.append(n)
++    nodes.sort()
++    if fmt == "dot":
++        return _to_dot(graph, nodes, edges)
++    return _to_mermaid(graph, nodes, edges)
++
++
++def _dot_escape(text: str) -> str:
++    return text.replace("\\", "\\\\").replace('"', '\\"')
++
++
++def _to_dot(graph: ProvGraph, nodes: list[str], edges: list) -> str:  # type: ignore[type-arg]
++    lines = ["digraph provenance {", "  rankdir=LR;", '  node [shape=box];']
++    for n in nodes:
++        label = f"{n}\\n({graph.kind_of(n).value})"
++        lines.append(f'  "{_dot_escape(n)}" [label="{_dot_escape(label)}"];')
++    for e in edges:
++        lines.append(
++            f'  "{_dot_escape(e.src_id)}" -> "{_dot_escape(e.dst_id)}" '
++            f'[label="{_dot_escape(e.kind.value)}"];'
++        )
++    lines.append("}")
++    return "\n".join(lines) + "\n"
++
++
++def _to_mermaid(graph: ProvGraph, nodes: list[str], edges: list) -> str:  # type: ignore[type-arg]
++    alias = {n: f"n{i}" for i, n in enumerate(nodes)}
++    lines = ["flowchart LR"]
++    for n in nodes:
++        label = f"{n} ({graph.kind_of(n).value})".replace('"', "'")
++        lines.append(f'  {alias[n]}["{label}"]')
++    for e in edges:
++        lines.append(
++            f"  {alias[e.src_id]} -->|{e.kind.value}| {alias[e.dst_id]}"
++        )
++    return "\n".join(lines) + "\n"
++
++
++# --- human rendering ------------------------------------------------------
++
++
++def _render_tree(
++    entries: list[dict[str, object]],
++    indent: int,
++    target_key: str,
++    child_key: str,
++) -> list[str]:
++    lines: list[str] = []
++    pad = "  " * indent
++    for entry in entries:
++        target = entry[target_key]
++        kind = entry["kind"]
++        kind_label = str(entry.get("source_kind") or entry.get("target_kind") or "")
++        ts = entry.get("event_ts") or ""
++        suffix = f"  [{ts}]" if ts else ""
++        if entry.get("cycle"):
++            suffix += "  (cycle)"
++        lines.append(f"{pad}{kind} -> {target} ({kind_label}){suffix}")
++        children = entry.get(child_key) or []
++        if isinstance(children, list) and children:
++            lines.extend(
++                _render_tree(children, indent + 1, target_key, child_key)
++            )
++    return lines
++
++
++def render_why(result: dict[str, object]) -> str:
++    root = result["root"]
++    node_kind = result["node_kind"]
++    lines = [f"why {root} ({node_kind})"]
++    prov = result.get("provenance") or []
++    if not isinstance(prov, list) or not prov:
++        lines.append("  (no recorded provenance)")
++        return "\n".join(lines)
++    lines.extend(_render_tree(prov, 1, "target", "children"))
++    return "\n".join(lines)
++
++
++def render_impact(result: dict[str, object]) -> str:
++    root = result["root"]
++    node_kind = result["node_kind"]
++    lines = [f"impact {root} ({node_kind})"]
++    deps = result.get("dependents") or []
++    if not isinstance(deps, list) or not deps:
++        lines.append("  (nothing depends on this)")
++    else:
++        lines.extend(_render_tree(deps, 1, "source", "dependents"))
++    op = result.get("op")
++    if op:
++        breakage = result.get("breakage") or []
++        if isinstance(breakage, list) and breakage:
++            lines.append(f"would break on {op} ({len(breakage)}):")
++            for b in breakage:
++                lines.append(f"  {b['id']} ({b['kind']}, {b['status']})")
++        else:
++            lines.append(f"no breakage on {op}")
++    return "\n".join(lines)
++
++
++def render_trace(result: dict[str, object]) -> str:
++    if not result["found"]:
++        return f"no path: {result['from']} -> {result['to']}"
++    steps = result.get("path") or []
++    lines = [f"{result['from']} -> {result['to']} ({result['length']} hops)"]
++    if isinstance(steps, list):
++        for s in steps:
++            arrow = "<-" if s.get("reversed") else "->"
++            lines.append(f"  {s['from']} {arrow}[{s['kind']}] {s['to']}")
++    return "\n".join(lines)
+diff --git a/src/vouch/server.py b/src/vouch/server.py
+index ebd37d7..56afa6c 100644
+--- a/src/vouch/server.py
++++ b/src/vouch/server.py
+@@ -689,6 +689,50 @@ def kb_embeddings_stats() -> dict[str, Any]:
+     }
+ 
+ 
++# === provenance (why / trace / impact / graph) ===========================
++
++
++@mcp.tool()
++def kb_why(claim_id: str, *, depth: int = 3) -> dict[str, Any]:
++    """Backward provenance for a claim: cites, session, supersedes, approval.
++
++    depth: how many hops of provenance to expand (default 3).
++    """
++    from . import provenance as prov
++    return prov.why(_store(), claim_id=claim_id, depth=depth)
++
++
++@mcp.tool()
++def kb_trace(from_id: str, to_id: str) -> dict[str, Any]:
++    """Shortest typed-edge path between two artifacts (or found=false)."""
++    from . import provenance as prov
++    return prov.trace(_store(), from_id=from_id, to_id=to_id)
++
++
++@mcp.tool()
++def kb_impact(
++    claim_id: str, *, depth: int = 1, op: str | None = None
++) -> dict[str, Any]:
++    """Forward impact: dependents, and breakage if op (archive/contradict/supersede)."""
++    from . import provenance as prov
++    return prov.impact(_store(), claim_id=claim_id, depth=depth, op=op)
++
++
++@mcp.tool()
++def kb_graph_export(*, session: str | None = None, format: str = "dot") -> dict[str, Any]:
++    """Render the provenance DAG (or one session's subgraph) as dot/mermaid."""
++    from . import provenance as prov
++    graph = prov.graph_export(_store(), session=session, fmt=format)
++    return {"format": format, "graph": graph}
++
++
++@mcp.tool()
++def kb_provenance_rebuild() -> dict[str, Any]:
++    """Rebuild the prov_edges cache from durable files; returns edge count."""
++    from . import provenance as prov
++    return {"edges": prov.rebuild_prov_edges(_store())}
++
++
+ def _current_model_name() -> str:
+     try:
+         from .embeddings import get_embedder
+diff --git a/tests/test_provenance.py b/tests/test_provenance.py
+new file mode 100644
+index 0000000..5f3ecd3
+--- /dev/null
++++ b/tests/test_provenance.py
+@@ -0,0 +1,313 @@
++"""Tests for the provenance DAG: build, why/trace/impact, graph export, the
++prov_edges cache, the CLI surface and the kb.* RPC methods.
++
++The KB built by `_seed` exercises every edge kind the issue calls out: a claim
++proposed in a session, citing a source, superseding an older claim, approved via
++the audit log, and embedded by two live pages plus one draft.
++"""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++from click.testing import CliRunner
++
++from vouch import audit
++from vouch import lifecycle as life
++from vouch import provenance as prov
++from vouch import sessions as sess_mod
++from vouch.capabilities import capabilities
++from vouch.cli import cli
++from vouch.jsonl_server import HANDLERS, handle_request
++from vouch.models import Claim, Page, PageStatus, PageType
++from vouch.proposals import approve, propose_claim
++from vouch.storage import KBStore
++
++
++@pytest.fixture
++def store(tmp_path, monkeypatch) -> KBStore:
++    s = KBStore.init(tmp_path)
++    monkeypatch.chdir(s.root)
++    return s
++
++
++def _approve_event_id(store: KBStore, claim_id: str) -> str:
++    for ev in audit.read_events(store.kb_dir):
++        if ev.event.endswith(".approve") and claim_id in ev.object_ids:
++            return ev.id
++    raise AssertionError(f"no approve event for {claim_id}")
++
++
++def _seed(store: KBStore) -> dict[str, str]:
++    """A small but complete KB. Returns the ids the tests assert against."""
++    src = store.put_source(b"a primary source", title="Source S")
++    sess = sess_mod.session_start(store, agent="agentA", task="seed the KB")
++
++    pr_old = propose_claim(
++        store, text="the older fact", evidence=[src.id], proposed_by="agentA",
++        slug_hint="c-old", session_id=sess.id,
++    )
++    approve(store, pr_old.proposal.id, approved_by="reviewer")
++
++    pr_new = propose_claim(
++        store, text="the newer fact", evidence=[src.id], proposed_by="agentA",
++        slug_hint="c-new", session_id=sess.id,
++    )
++    approve(store, pr_new.proposal.id, approved_by="reviewer")
++    sess_mod.session_end(store, sess.id)
++
++    # c-new supersedes c-old (writes the supersedes relation + claim fields)
++    life.supersede(store, old_claim_id="c-old", new_claim_id="c-new", actor="reviewer")
++
++    # two *active* pages embed c-new (breakage on archive) + one draft (ignored)
++    store.put_page(Page(id="page-alpha", title="Alpha", type=PageType.CONCEPT,
++                        claims=["c-new"], status=PageStatus.ACTIVE))
++    store.put_page(Page(id="page-beta", title="Beta", type=PageType.CONCEPT,
++                        claims=["c-new"], status=PageStatus.ACTIVE))
++    store.put_page(Page(id="page-draft", title="Draft", type=PageType.CONCEPT,
++                        claims=["c-new"], status=PageStatus.DRAFT))
++
++    return {
++        "src": src.id,
++        "session": sess.id,
++        "approve_event": _approve_event_id(store, "c-new"),
++    }
++
++
++# --- acceptance 1: why ----------------------------------------------------
++
++
++def test_why_has_session_source_and_supersedes_branches(store: KBStore) -> None:
++    ids = _seed(store)
++    result = prov.why(store, claim_id="c-new", depth=3)
++
++    assert result["root"] == "c-new"
++    assert result["node_kind"] == "claim"
++    by_kind = {e["kind"]: e for e in result["provenance"]}
++    # all three branches the acceptance names, plus the approval event
++    assert by_kind["cites"]["target"] == ids["src"]
++    assert by_kind["proposedIn"]["target"] == ids["session"]
++    assert by_kind["supersedes"]["target"] == "c-old"
++    assert by_kind["approvedBy"]["target"] == ids["approve_event"]
++    # the approval branch carries the originating audit timestamp
++    assert by_kind["approvedBy"]["event_ts"]
++
++
++def test_why_unknown_claim_raises(store: KBStore) -> None:
++    _seed(store)
++    from vouch.storage import ArtifactNotFoundError
++
++    with pytest.raises(ArtifactNotFoundError):
++        prov.why(store, claim_id="nope")
++
++
++# --- acceptance 2: impact + --if archive ----------------------------------
++
++
++def test_impact_if_archive_lists_active_pages_and_blocks(store: KBStore) -> None:
++    _seed(store)
++    result = prov.impact(store, claim_id="c-new", op="archive")
++
++    broken_ids = sorted(b["id"] for b in result["breakage"])
++    assert broken_ids == ["page-alpha", "page-beta"]  # draft excluded
++    assert result["blocking"] is True
++    assert result["op"] == "archive"
++
++
++def test_impact_without_op_lists_but_does_not_block(store: KBStore) -> None:
++    _seed(store)
++    result = prov.impact(store, claim_id="c-new")
++
++    assert result["op"] is None
++    assert result["blocking"] is False
++    assert result["breakage"] == []
++    # the embedding pages still show up as dependents
++    dep_sources = {d["source"] for d in result["dependents"]}
++    assert {"page-alpha", "page-beta", "page-draft"} <= dep_sources
++
++
++def test_impact_reverse_supersedes_label(store: KBStore) -> None:
++    _seed(store)
++    result = prov.impact(store, claim_id="c-old")
++    labels = {(d["kind"], d["source"]) for d in result["dependents"]}
++    assert ("supersededBy", "c-new") in labels
++
++
++# --- acceptance 3: trace --------------------------------------------------
++
++
++def test_trace_finds_typed_path(store: KBStore) -> None:
++    ids = _seed(store)
++    result = prov.trace(store, from_id="page-alpha", to_id="c-old")
++    assert result["found"] is True
++    # page-alpha --embeds--> c-new --supersedes--> c-old
++    assert result["nodes"] == ["page-alpha", "c-new", "c-old"]
++    kinds = [s["kind"] for s in result["path"]]
++    assert kinds == ["embeds", "supersedes"]
++
++    direct = prov.trace(store, from_id="c-new", to_id=ids["src"])
++    assert direct["found"] is True and direct["length"] == 1
++
++
++def test_trace_no_path_is_not_found(store: KBStore) -> None:
++    _seed(store)
++    result = prov.trace(store, from_id="c-new", to_id="not-an-artifact")
++    assert result["found"] is False
++    assert result["path"] == []
++
++
++# --- acceptance 4: rebuild byte-equivalence -------------------------------
++
++
++def _edge_tuples(edges) -> list[tuple]:
++    return sorted(
++        (e.src_id, e.dst_id, e.kind.value, e.event_ts, e.session_id) for e in edges
++    )
++
++
++def test_rebuild_matches_live_graph(store: KBStore) -> None:
++    _seed(store)
++    live = prov.build_graph(store).edges
++    n = prov.rebuild_prov_edges(store)
++    cached = prov.cache.load_edges(store)
++    assert n == len(live)
++    assert _edge_tuples(cached) == _edge_tuples(live)
++
++
++def test_rebuild_is_idempotent(store: KBStore) -> None:
++    _seed(store)
++    first = prov.rebuild_prov_edges(store)
++    rows1 = _edge_tuples(prov.cache.load_edges(store))
++    second = prov.rebuild_prov_edges(store)
++    rows2 = _edge_tuples(prov.cache.load_edges(store))
++    assert first == second
++    assert rows1 == rows2
++
++
++def test_load_graph_uses_cache_then_refreshes_on_change(store: KBStore) -> None:
++    _seed(store)
++    g1 = prov.load_graph(store)  # builds + caches
++    assert g1.edges
++    # add a new claim -> stamp changes -> load_graph must rebuild and include it
++    src2 = store.put_source(b"second source")
++    store.put_claim(Claim(id="c-extra", text="extra", evidence=[src2.id]))
++    g2 = prov.load_graph(store)
++    assert "c-extra" in g2.nodes()
++
++
++# --- graph export ---------------------------------------------------------
++
++
++def test_graph_export_dot_and_mermaid(store: KBStore) -> None:
++    _seed(store)
++    dot = prov.graph_export(store, fmt="dot")
++    assert dot.startswith("digraph provenance")
++    assert "embeds" in dot and "c-new" in dot
++
++    mer = prov.graph_export(store, fmt="mermaid")
++    assert mer.startswith("flowchart LR")
++
++    with pytest.raises(ValueError):
++        prov.graph_export(store, fmt="svg")
++
++
++def test_graph_export_session_subgraph(store: KBStore) -> None:
++    ids = _seed(store)
++    dot = prov.graph_export(store, session=ids["session"], fmt="dot")
++    assert "c-new" in dot and "c-old" in dot
++
++
++# --- CLI ------------------------------------------------------------------
++
++
++def test_cli_why_json(store: KBStore) -> None:
++    _seed(store)
++    res = CliRunner().invoke(cli, ["why", "c-new", "--json"])
++    assert res.exit_code == 0, res.output
++    data = json.loads(res.output)
++    assert data["root"] == "c-new"
++    assert any(e["kind"] == "supersedes" for e in data["provenance"])
++
++
++def test_cli_impact_if_archive_exits_nonzero(store: KBStore) -> None:
++    _seed(store)
++    res = CliRunner().invoke(cli, ["impact", "c-new", "--if", "archive"])
++    assert res.exit_code == 1, res.output
++    assert "page-alpha" in res.output and "page-beta" in res.output
++
++
++def test_cli_impact_without_op_exits_zero(store: KBStore) -> None:
++    _seed(store)
++    res = CliRunner().invoke(cli, ["impact", "c-new"])
++    assert res.exit_code == 0, res.output
++
++
++def test_cli_trace_no_path_exits_nonzero(store: KBStore) -> None:
++    _seed(store)
++    res = CliRunner().invoke(cli, ["trace", "c-new", "--to", "ghost"])
++    assert res.exit_code == 1, res.output
++    assert "no path" in res.output
++
++
++def test_cli_trace_found(store: KBStore) -> None:
++    _seed(store)
++    res = CliRunner().invoke(cli, ["trace", "page-alpha", "--to", "c-old", "--json"])
++    assert res.exit_code == 0, res.output
++    assert json.loads(res.output)["found"] is True
++
++
++def test_cli_provenance_rebuild(store: KBStore) -> None:
++    _seed(store)
++    res = CliRunner().invoke(cli, ["provenance", "rebuild", "--json"])
++    assert res.exit_code == 0, res.output
++    assert json.loads(res.output)["edges"] > 0
++
++
++def test_cli_graph_dot(store: KBStore) -> None:
++    _seed(store)
++    res = CliRunner().invoke(cli, ["graph", "--format", "dot"])
++    assert res.exit_code == 0, res.output
++    assert res.output.startswith("digraph provenance")
++
++
++# --- kb.* RPC surface -----------------------------------------------------
++
++
++def test_provenance_methods_in_capabilities() -> None:
++    methods = set(capabilities().methods)
++    assert {"kb.why", "kb.trace", "kb.impact", "kb.graph_export",
++            "kb.provenance_rebuild"} <= methods
++    # contract: every advertised method has a JSONL handler
++    assert set(capabilities().methods) == set(HANDLERS.keys())
++
++
++def test_kb_why_over_jsonl(store: KBStore) -> None:
++    _seed(store)
++    resp = handle_request({"id": "1", "method": "kb.why",
++                           "params": {"claim_id": "c-new"}})
++    assert resp["ok"] is True, resp
++    assert resp["result"]["root"] == "c-new"
++
++
++def test_kb_impact_over_jsonl(store: KBStore) -> None:
++    _seed(store)
++    resp = handle_request({"id": "2", "method": "kb.impact",
++                           "params": {"claim_id": "c-new", "op": "archive"}})
++    assert resp["ok"] is True, resp
++    assert resp["result"]["blocking"] is True
++
++
++def test_kb_trace_over_jsonl(store: KBStore) -> None:
++    _seed(store)
++    resp = handle_request({"id": "3", "method": "kb.trace",
++                           "params": {"from": "page-alpha", "to": "c-old"}})
++    assert resp["ok"] is True, resp
++    assert resp["result"]["found"] is True
++
++
++def test_kb_why_missing_param_over_jsonl(store: KBStore) -> None:
++    _seed(store)
++    resp = handle_request({"id": "4", "method": "kb.why", "params": {}})
++    assert resp["ok"] is False
++    assert resp["error"]["code"] == "missing_param"
