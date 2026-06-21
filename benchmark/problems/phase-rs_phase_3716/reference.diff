@@ -1,0 +1,434 @@
+diff --git a/crates/engine/src/game/engine.rs b/crates/engine/src/game/engine.rs
+index f4f68aed88..6c258dd034 100644
+--- a/crates/engine/src/game/engine.rs
++++ b/crates/engine/src/game/engine.rs
+@@ -3903,7 +3903,15 @@ fn apply_action(
+                 &mut events,
+             )
+             .map_err(EngineError::InvalidAction)?;
+-            WaitingFor::Priority { player: p }
++            // CR 707.9 + CR 614.12a: battlefield entry may park on
++            // `CopyTargetChoice` (enter-as-copy) or `ReplacementChoice` (optional
++            // copy / CR 616.1 ordering); preserve the surfaced prompt instead of
++            // clobbering it with Priority.
++            if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
++                WaitingFor::Priority { player: p }
++            } else {
++                state.waiting_for.clone()
++            }
+         }
+         // CR 702.190a: Sneak — cast a spell from hand during declare blockers
+         // by paying the Sneak cost and returning an unblocked attacker.
+diff --git a/crates/engine/src/game/engine_replacement.rs b/crates/engine/src/game/engine_replacement.rs
+index 9fbcbcae21..fb8831130e 100644
+--- a/crates/engine/src/game/engine_replacement.rs
++++ b/crates/engine/src/game/engine_replacement.rs
+@@ -782,6 +782,15 @@ pub(super) fn handle_copy_target_choice(
+     if let Some(waiting_for) = replay_deferred_entry_events(state, source_id, events)? {
+         return Ok(waiting_for);
+     }
++    // CR 702.49c: a ninjutsu entry that deferred `BatchCompletion::NinjutsuPlacement`
++    // while paused on `CopyTargetChoice` must run combat placement after the copy
++    // resolves (mirrors the `ReturnAsAuraTarget` batch drain in engine.rs).
++    if state.pending_batch_deliveries.is_some() {
++        crate::game::zone_pipeline::drain_pending_batch_deliveries(state, events);
++        if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
++            return Ok(state.waiting_for.clone());
++        }
++    }
+     Ok(WaitingFor::Priority {
+         player: state.active_player,
+     })
+diff --git a/crates/engine/src/game/keywords.rs b/crates/engine/src/game/keywords.rs
+index 336fc10522..f8470965ae 100644
+--- a/crates/engine/src/game/keywords.rs
++++ b/crates/engine/src/game/keywords.rs
+@@ -6,7 +6,7 @@ use crate::game::zone_pipeline::{self, ZoneMoveRequest};
+ use crate::parser::oracle_util::parse_subtype;
+ use crate::types::ability::{AbilityCost, CastVariantPaid, NinjutsuVariant};
+ use crate::types::events::GameEvent;
+-use crate::types::game_state::GameState;
++use crate::types::game_state::{GameState, WaitingFor};
+ use crate::types::identifiers::{CardId, ObjectId};
+ use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind, ProtectionTarget};
+ use crate::types::mana::ManaCost;
+@@ -590,6 +590,13 @@ pub fn activate_ninjutsu(
+     // `BatchCompletion::NinjutsuPlacement` so the replacement-choice resume
+     // runs it exactly once after the entry delivers — the old bail skipped it,
+     // leaving the resumed ninja untagged and non-attacking.
++    let ninjutsu_placement = crate::types::game_state::BatchCompletion::NinjutsuPlacement {
++        player,
++        ninjutsu_obj_id,
++        cast_variant: variant.into(),
++        defending_player,
++        attack_target,
++    };
+     match super::zone_pipeline::move_object(
+         state,
+         super::zone_pipeline::ZoneMoveRequest::effect(
+@@ -599,19 +606,19 @@ pub fn activate_ninjutsu(
+         ),
+         events,
+     ) {
+-        super::zone_pipeline::ZoneMoveResult::Done => {}
++        super::zone_pipeline::ZoneMoveResult::Done => {
++            // CR 707.9: `move_object` can return `Done` while the delivery tail
++            // already surfaced `CopyTargetChoice` (enter-as-copy). Defer combat
++            // placement until the copy target resolves — same contract as the
++            // `NeedsChoice` arms below.
++            if ninjutsu_entry_paused_on_mid_entry_choice(state) {
++                super::zone_pipeline::defer_completion_on_pause(state, ninjutsu_placement);
++                return Ok(());
++            }
++        }
+         super::zone_pipeline::ZoneMoveResult::NeedsChoice(_)
+         | super::zone_pipeline::ZoneMoveResult::NeedsAuraAttachmentChoice => {
+-            super::zone_pipeline::defer_completion_on_pause(
+-                state,
+-                crate::types::game_state::BatchCompletion::NinjutsuPlacement {
+-                    player,
+-                    ninjutsu_obj_id,
+-                    cast_variant: variant.into(),
+-                    defending_player,
+-                    attack_target,
+-                },
+-            );
++            super::zone_pipeline::defer_completion_on_pause(state, ninjutsu_placement);
+             return Ok(());
+         }
+     }
+@@ -629,6 +636,20 @@ pub fn activate_ninjutsu(
+     Ok(())
+ }
+ 
++/// CR 614.12a + CR 707.9: True when the ninja's battlefield entry paused on an
++/// interactive mid-entry choice and post-entry ninjutsu work must wait.
++fn ninjutsu_entry_paused_on_mid_entry_choice(state: &GameState) -> bool {
++    matches!(
++        state.waiting_for,
++        WaitingFor::CopyTargetChoice { .. }
++            | WaitingFor::ReplacementChoice { .. }
++            | WaitingFor::EffectZoneChoice { .. }
++            | WaitingFor::ReturnAsAuraTarget { .. }
++            | WaitingFor::ChooseOneOfBranch { .. }
++            | WaitingFor::NamedChoice { .. }
++    )
++}
++
+ /// CR 702.49 + CR 702.49a + CR 702.49c: Post-entry ninjutsu work, run exactly
+ /// once after the ninja's battlefield entry delivers — inline on the
+ /// synchronous path, or from `BatchCompletion::NinjutsuPlacement` when the
+@@ -1597,6 +1618,123 @@ mod tests {
+         );
+     }
+ 
++    /// CR 702.49 + CR 707.9 (issue #3662): Sakashima's Student — ninjutsu entry
++    /// with an optional enter-as-copy replacement must surface `CopyTargetChoice`
++    /// and defer CR 702.49c combat placement until the copy target is chosen.
++    #[test]
++    fn ninjutsu_enter_as_copy_defers_combat_placement_until_copy_resolves() {
++        use crate::game::engine::apply_as_current;
++        use crate::game::zones::create_object;
++        use crate::types::ability::{
++            AbilityDefinition, AbilityKind, ContinuousModification, Effect, ReplacementDefinition,
++            ReplacementMode, TargetFilter, TargetRef, TypeFilter, TypedFilter,
++        };
++        use crate::types::card_type::CoreType;
++        use crate::types::replacements::ReplacementEvent;
++
++        let (mut state, attacker_id, ninja_id) = setup_ninjutsu_scenario();
++
++        let bear_id = create_object(
++            &mut state,
++            CardId(10),
++            PlayerId(1),
++            "Bear".to_string(),
++            Zone::Battlefield,
++        );
++        {
++            let obj = state.objects.get_mut(&bear_id).unwrap();
++            obj.card_types.core_types.push(CoreType::Creature);
++            obj.power = Some(4);
++            obj.toughness = Some(4);
++        }
++
++        {
++            let obj = state.objects.get_mut(&ninja_id).unwrap();
++            obj.replacement_definitions.push(
++                ReplacementDefinition::new(ReplacementEvent::Moved)
++                    .valid_card(TargetFilter::SelfRef)
++                    .destination_zone(Zone::Battlefield)
++                    .mode(ReplacementMode::Optional { decline: None })
++                    .execute(AbilityDefinition::new(
++                        AbilityKind::Spell,
++                        Effect::BecomeCopy {
++                            target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
++                            duration: None,
++                            mana_value_limit: None,
++                            additional_modifications: vec![ContinuousModification::AddSubtype {
++                                subtype: "Ninja".to_string(),
++                            }],
++                        },
++                    )),
++            );
++        }
++
++        state.waiting_for = WaitingFor::Priority {
++            player: PlayerId(0),
++        };
++        state.priority_player = PlayerId(0);
++
++        apply_as_current(
++            &mut state,
++            GameAction::ActivateNinjutsu {
++                ninjutsu_object_id: ninja_id,
++                creature_to_return: attacker_id,
++            },
++        )
++        .expect("ninjutsu activation should succeed");
++
++        assert!(
++            !state
++                .combat
++                .as_ref()
++                .is_some_and(|c| c.attackers.iter().any(|a| a.object_id == ninja_id)),
++            "combat placement must not run before the copy target is chosen"
++        );
++
++        if matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }) {
++            apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
++                .expect("accept enter-as-copy");
++        }
++
++        let WaitingFor::CopyTargetChoice { valid_targets, .. } = state.waiting_for.clone() else {
++            panic!(
++                "expected CopyTargetChoice after ninjutsu entry, got {:?}",
++                state.waiting_for
++            );
++        };
++        assert!(
++            valid_targets.contains(&bear_id),
++            "opponent's Bear must be a legal copy target"
++        );
++
++        apply_as_current(
++            &mut state,
++            GameAction::ChooseTarget {
++                target: Some(TargetRef::Object(bear_id)),
++            },
++        )
++        .expect("choose copy target");
++
++        assert!(
++            state
++                .combat
++                .as_ref()
++                .is_some_and(|c| c.attackers.iter().any(|a| a.object_id == ninja_id)),
++            "ninja must be placed attacking after copy + ninjutsu placement complete"
++        );
++        let ninja = &state.objects[&ninja_id];
++        assert_eq!(ninja.power, Some(4), "ninja must copy Bear's power");
++        assert_eq!(ninja.toughness, Some(4), "ninja must copy Bear's toughness");
++        assert!(
++            ninja.card_types.subtypes.iter().any(|s| s == "Ninja"),
++            "copy exception must retain Ninja subtype"
++        );
++        assert!(
++            ninja.cast_variant_paid.is_some(),
++            "ninjutsu cast-variant tag must be applied after deferred placement"
++        );
++    }
++
+     #[test]
+     fn ninjutsu_returns_attacker_to_hand() {
+         let (mut state, attacker_id, ninja_id) = setup_ninjutsu_scenario();
+diff --git a/crates/engine/src/game/scenario_db.rs b/crates/engine/src/game/scenario_db.rs
+index 4d702dc8a8..a81a9993d3 100644
+--- a/crates/engine/src/game/scenario_db.rs
++++ b/crates/engine/src/game/scenario_db.rs
+@@ -19,10 +19,29 @@ use crate::game::deck_loading::create_object_from_card_face;
+ use crate::game::printed_cards::populate_back_face_if_dfc;
+ use crate::game::scenario::GameScenario;
+ use crate::game::zones::{add_to_zone, remove_from_zone};
++use crate::types::game_state::{GameState, WaitingFor};
+ use crate::types::identifiers::ObjectId;
+ use crate::types::player::PlayerId;
+ use crate::types::zones::Zone;
+ 
++/// Pre-existing-permanent setup: `add_real_card` models a card that entered on a
++/// prior turn, so any deferred as-enters `NamedChoice` / counter-branch prompt
++/// surfaced during the zone pipeline is abandoned without applying a value.
++fn abandon_as_enters_choice_for_scenario_setup(
++    state: &mut GameState,
++    controller: PlayerId,
++) -> bool {
++    if !matches!(
++        state.waiting_for,
++        WaitingFor::NamedChoice { .. } | WaitingFor::ChooseOneOfBranch { .. }
++    ) {
++        return false;
++    }
++    state.deferred_entry_events.clear();
++    state.waiting_for = WaitingFor::Priority { player: controller };
++    true
++}
++
+ /// Extends `GameScenario` with `CardDatabase`-backed card placement.
+ ///
+ /// Methods here use the real parser output stored in the database, so any
+@@ -69,10 +88,17 @@ impl GameScenarioDbExt for GameScenario {
+             let req = crate::game::zone_pipeline::ZoneMoveRequest::effect(id, zone, id);
+             match crate::game::zone_pipeline::move_object(&mut self.state, req, &mut events) {
+                 crate::game::zone_pipeline::ZoneMoveResult::Done => {}
+-                crate::game::zone_pipeline::ZoneMoveResult::NeedsChoice(_)
+-                | crate::game::zone_pipeline::ZoneMoveResult::NeedsAuraAttachmentChoice => {
++                crate::game::zone_pipeline::ZoneMoveResult::NeedsChoice(_) => {
++                    if !abandon_as_enters_choice_for_scenario_setup(&mut self.state, player) {
++                        panic!(
++                            "add_real_card battlefield entry for '{}' paused on an unsupported as-enters choice",
++                            name
++                        );
++                    }
++                }
++                crate::game::zone_pipeline::ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                     panic!(
+-                        "add_real_card battlefield entry for '{}' paused on an as-enters choice",
++                        "add_real_card battlefield entry for '{}' paused on an aura attachment choice",
+                         name
+                     );
+                 }
+diff --git a/crates/engine/src/game/zone_pipeline.rs b/crates/engine/src/game/zone_pipeline.rs
+index efc29add82..26705a0051 100644
+--- a/crates/engine/src/game/zone_pipeline.rs
++++ b/crates/engine/src/game/zone_pipeline.rs
+@@ -1281,8 +1281,11 @@ pub(crate) fn apply_zone_delivery_tail(
+             Some(crate::types::replacements::ReplacementEvent::Moved),
+             events,
+         );
+-        if matches!(waiting_for, Some(WaitingFor::EffectZoneChoice { .. })) {
+-            return replacement_pause_delivery_result(state);
++        if let Some(wf) = waiting_for {
++            if !matches!(wf, WaitingFor::Priority { .. }) {
++                state.waiting_for = wf;
++                return replacement_pause_delivery_result(state);
++            }
+         }
+     }
+     ZoneDeliveryResult::Done
+@@ -1809,11 +1812,17 @@ pub(crate) fn deliver_replaced_zone_change(
+ 
+ fn replacement_pause_delivery_result(state: &GameState) -> ZoneDeliveryResult {
+     match &state.waiting_for {
+-        WaitingFor::ReplacementChoice { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
++        WaitingFor::ReplacementChoice { player, .. }
+         // CR 614.12a: a Devour as-enters sacrifice surfaced its own
+         // `EffectZoneChoice`; carry its chooser so the caller's `park_waiting_for`
+         // doesn't clobber the already-surfaced prompt.
+-        WaitingFor::EffectZoneChoice { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
++        | WaitingFor::EffectZoneChoice { player, .. }
++        // CR 707.9 + CR 614.12a: enter-as-copy and other mid-entry choices
++        // surface their own `WaitingFor` variant with the correct chooser.
++        | WaitingFor::CopyTargetChoice { player, .. }
++        | WaitingFor::ChooseOneOfBranch { player, .. }
++        | WaitingFor::NamedChoice { player, .. }
++        | WaitingFor::ReturnAsAuraTarget { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
+         _ => ZoneDeliveryResult::NeedsChoice(state.active_player),
+     }
+ }
+diff --git a/crates/engine/src/parser/oracle_effect/become_copy_except.rs b/crates/engine/src/parser/oracle_effect/become_copy_except.rs
+index 4e0ad12188..7a436d4ea3 100644
+--- a/crates/engine/src/parser/oracle_effect/become_copy_except.rs
++++ b/crates/engine/src/parser/oracle_effect/become_copy_except.rs
+@@ -67,7 +67,7 @@ use std::str::FromStr;
+ 
+ use crate::parser::oracle_nom::error::OracleError;
+ use nom::branch::alt;
+-use nom::bytes::complete::tag;
++use nom::bytes::complete::{tag, take_until};
+ use nom::character::complete::char;
+ use nom::combinator::{opt, value};
+ use nom::Parser;
+@@ -633,6 +633,23 @@ fn parse_has_this_ability<'a>(
+     ))
+ }
+ 
++/// CR 707.9b + CR 205.1b: suffix after the named type in additive copy-except
++/// bodies — covers both the generic "other types" and the creature-specific
++/// "other creature types" phrasing (Sakashima's Student class).
++fn split_in_addition_type_suffix(input: &str) -> Option<(&str, &str)> {
++    let in_addition_suffix = (
++        tag::<_, _, OracleError<'_>>(" in addition to "),
++        alt((tag("its"), tag("their"), tag("his"), tag("her"))),
++        tag(" other "),
++        opt(tag("creature ")),
++        tag("types"),
++    );
++    let (rest, (type_word, _)) = (take_until(" in addition to "), in_addition_suffix)
++        .parse(input)
++        .ok()?;
++    Some((type_word.trim(), rest))
++}
++
+ /// CR 707.9b + CR 205.1b: "it's a(n) {type_word} in addition to its other
+ /// types", plus the elided-subject form "is a(n) {type_word} in addition to
+ /// its other types" used for non-leading bodies in a comma-anded copy-except
+@@ -662,9 +679,7 @@ fn parse_its_a_type_in_addition(input: &str) -> Option<(&str, ContinuousModifica
+     ))
+     .parse(input)
+     .ok()?;
+-    let (type_word, rest) = nom_primitives::split_once_on(rest, " in addition to its other types")
+-        .ok()
+-        .map(|(_, pair)| pair)?;
++    let (type_word, rest) = split_in_addition_type_suffix(rest)?;
+     let type_word = type_word.trim();
+     if type_word.is_empty() {
+         return None;
+@@ -1432,6 +1447,24 @@ mod tests {
+         )));
+     }
+ 
++    /// CR 707.9b: Sakashima's Student — "it's a Ninja in addition to its other
++    /// creature types" uses the creature-type-specific suffix.
++    #[test]
++    fn its_a_ninja_in_addition_to_other_creature_types_emits_add_subtype() {
++        let (_, mods) = parse_except_clause(
++            ", except it's a Ninja in addition to its other creature types",
++            "Sakashima's Student",
++            &ParseContext::default(),
++        )
++        .unwrap();
++        assert_eq!(
++            mods,
++            vec![ContinuousModification::AddSubtype {
++                subtype: "Ninja".to_string(),
++            }]
++        );
++    }
++
+     /// CR 205.1a + CR 613.1d + CR 707.9d: Myrkul, Lord of Bones — "it's an
+     /// enchantment and loses all other card types" REPLACES the copied core
+     /// card-type set (set-replacement), distinct from the additive "in addition
+diff --git a/crates/engine/tests/integration/frostcliff_siege_anchor_word_modes.rs b/crates/engine/tests/integration/frostcliff_siege_anchor_word_modes.rs
+index 45de5af30d..e8e3fe572c 100644
+--- a/crates/engine/tests/integration/frostcliff_siege_anchor_word_modes.rs
++++ b/crates/engine/tests/integration/frostcliff_siege_anchor_word_modes.rs
+@@ -324,11 +324,16 @@ fn no_choice_persisted_means_neither_linked_ability_functions() {
+     let _f2 = scenario.add_real_card(P0, "Plains", Zone::Library, db);
+     let mut runner = scenario.build();
+ 
++    // `add_real_card` models a pre-existing permanent and abandons any as-enters
++    // `NamedChoice` without persisting a label — the same shape as a copied Siege
++    // that never made the entry choice (CR 614.12c ruling quoted above).
+     assert!(
+-        matches!(runner.state().waiting_for, WaitingFor::NamedChoice { .. }),
+-        "battlefield entry should raise Frostcliff Siege's as-enters choice before this no-choice fixture suppresses it"
++        matches!(
++            runner.state().waiting_for,
++            WaitingFor::Priority { player } if player == P0
++        ),
++        "pre-existing battlefield setup must settle to priority without a label"
+     );
+-    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+ 
+     // CR 614.12c precondition: NO `ChosenAttribute::Label` on the Siege
+     // (simulating a copied/cloned permanent that never made the as-enters

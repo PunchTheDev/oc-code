@@ -1,0 +1,516 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index b8a60c2..4446c3b 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,13 @@ All notable changes to vouch are documented here. Format follows
+ ## [Unreleased]
+ 
+ ### Added
++- `kb.synthesize` — answer-mode retrieval over the review-gated KB. Answers a
++  query in prose from approved claims only, with an inline `[claim_id]`
++  citation behind every sentence, an explicit `gaps` block listing query
++  topics no approved claim covered, and a `synthesis_confidence` grade derived
++  from the cited claims' lifecycle status. Deterministic in v1 (no LLM in the
++  loop). Exposed across the CLI (`vouch synthesize`), MCP (`kb_synthesize`),
++  and JSONL (`kb.synthesize`) surfaces (#222).
+ - Entity-salience retrieval reflex: a per-session, in-memory ring buffer of
+   recent caller queries drives a zero-LLM substring/FTS entity pass that
+   attaches top-K matched claim candidates as `_meta.vouch_salience` on
+diff --git a/PR_BODY.md b/PR_BODY.md
+new file mode 100644
+index 0000000..783ad6f
+--- /dev/null
++++ b/PR_BODY.md
+@@ -0,0 +1,79 @@
++# feat(synthesize): `kb.synthesize` answer-mode retrieval over the review-gated KB
++
++## What changed
++
++Adds `kb.synthesize` — an answer-mode counterpart to `kb.context`. Where
++`kb.context` returns a *ranked list* of relevant items, `kb.synthesize`
++answers a query in prose, but strictly from **approved (durable) claims**,
++with an inline `[claim_id]` citation behind every sentence.
++
++New surface, wired across all three transports that the capabilities test
++keeps in sync:
++
++- `src/vouch/synthesize.py` — `synthesize(store, *, query, depth=3,
++  max_chars=4000, llm=False)`. Walks `build_context_pack(... limit=depth)`,
++  keeps only `claim` items that resolve to a durable claim via
++  `store.get_claim`, and composes a deterministic answer: one short,
++  single-clause sentence per claim, each carrying at least one `[claim_id]`
++  citation. No sentence is emitted that isn't traceable to a claim id.
++  `max_chars` truncates by dropping trailing claims (never by cutting a
++  citation). Returns
++  `{"query", "answer", "claims", "gaps", "_meta": {"synthesis_confidence"}}`.
++  `gaps` lists the query's salient terms for which no approved claim was
++  found (and is the whole answer when nothing matched). `synthesis_confidence`
++  is `high` when every cited claim is `stable`, `medium` when any is
++  `working`/`actionable`, `low` when any is `contested`. `llm=True` raises
++  (reserved for an opt-in generative backend; deterministic synthesis is the
++  v1 default).
++- `src/vouch/capabilities.py` — `kb.synthesize` appended to `METHODS`.
++- `src/vouch/jsonl_server.py` — `_h_synthesize` handler + `HANDLERS` entry.
++- `src/vouch/server.py` — `@mcp.tool() kb_synthesize(query, depth=3,
++  max_chars=4000)`.
++- `src/vouch/cli.py` — `vouch synthesize "<query>" [--depth N] [--max-chars N]`.
++- `CHANGELOG.md` — `### Added` bullet under `## [Unreleased]`.
++
++## Why / root cause
++
++`kb.context` is a retrieval primitive: it ranks and budgets items but leaves
++answer composition (and the discipline of *only* using approved knowledge) to
++the caller. There was no first-class way to ask the KB a question and get a
++prose answer whose every clause is provably backed by a reviewed claim, with
++the uncovered parts of the question surfaced rather than silently dropped.
++`kb.synthesize` fills that gap deterministically — citation-gated by
++construction, so it cannot fabricate an unbacked sentence — and grades its own
++confidence from the lifecycle status of the claims it actually cited.
++
++## Test plan
++
++`tests/test_synthesize.py` covers:
++
++- 3 approved `auth` claims → non-empty answer citing all 3 ids by `[id]`,
++  confidence `high`.
++- A query the KB doesn't cover → `answer == ""`, `claims == []`, `gaps`
++  populated with the query's salient terms.
++- Fuzz/traceability: every sentence in a non-empty answer carries at least one
++  `[id]` citation whose id is in `claims` and resolves via `store.get_claim`.
++- `max_chars` drops trailing claims without cutting a citation
++  (citation count == cited-claim count).
++- Confidence reflects claim status (`working` → medium, `contested` → low).
++- `llm=True` raises the reserved-backend `ValueError`.
++- `kb.synthesize` is in `capabilities().methods` and in the JSONL `HANDLERS`,
++  and is callable via `handle_request` end-to-end.
++
++Verification gate (fresh venv, editable install of this worktree):
++
++```
++$ ./.venv/bin/ruff check src tests
++All checks passed!
++
++$ ./.venv/bin/mypy src
++Success: no issues found in 30 source files
++
++$ ./.venv/bin/python -m pytest -q
++94 passed, 6 skipped in 0.81s
++```
++
++(The 6 skips are pre-existing numpy/embedding-optional tests, unrelated to this
++change.)
++
++Closes #222
+diff --git a/src/vouch/capabilities.py b/src/vouch/capabilities.py
+index 6d8f767..b2e93d5 100644
+--- a/src/vouch/capabilities.py
++++ b/src/vouch/capabilities.py
+@@ -19,6 +19,7 @@
+     "kb.stats",
+     "kb.search",
+     "kb.context",
++    "kb.synthesize",
+     "kb.read_page",
+     "kb.read_claim",
+     "kb.read_entity",
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index 7a18b9a..5fcf71b 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -31,6 +31,7 @@
+ from . import sessions as sess_mod
+ from . import stats as stats_mod
+ from . import sync as sync_mod
++from . import synthesize as synth
+ from . import vault_sync as vault_sync_mod
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+@@ -1378,6 +1379,20 @@ def context(
+     _emit_json(pack)
+ 
+ 
++@cli.command()
++@click.argument("query")
++@click.option("--depth", default=3, show_default=True, type=int)
++@click.option("--max-chars", default=4000, show_default=True, type=int)
++def synthesize(query: str, depth: int, max_chars: int) -> None:
++    """Answer a query from approved claims only, with inline citations."""
++    store = _load_store()
++    with _cli_errors():
++        result = synth.synthesize(
++            store, query=query, depth=depth, max_chars=max_chars,
++        )
++    _emit_json(result)
++
++
+ @cli.command()
+ def index() -> None:
+     """Rebuild state.db from durable files."""
+diff --git a/src/vouch/jsonl_server.py b/src/vouch/jsonl_server.py
+index 109f6f7..b4961bd 100644
+--- a/src/vouch/jsonl_server.py
++++ b/src/vouch/jsonl_server.py
+@@ -26,6 +26,8 @@
+ from pathlib import Path
+ from typing import Any
+ 
++import yaml
++
+ from . import audit, bundle, health, volunteer_context
+ from . import lifecycle as life
+ from . import salience as salience_mod
+@@ -54,6 +56,7 @@
+     KBStore,
+     discover_root,
+ )
++from .synthesize import synthesize
+ 
+ # Per-request actor override. The HTTP transport sets this from the
+ # X-Vouch-Agent header so audit attribution is correct without mutating
+@@ -189,6 +192,16 @@ def _h_context(p: dict) -> dict:
+     return salience_mod.attach_salience(result, store, session_id, cfg)
+ 
+ 
++def _h_synthesize(p: dict) -> dict:
++    return synthesize(
++        _store(),
++        query=p["query"],
++        depth=int(p.get("depth", 3)),
++        max_chars=int(p.get("max_chars", 4000)),
++        llm=bool(p.get("llm", False)),
++    )
++
++
+ def _h_read_page(p: dict) -> dict:
+     return _store().get_page(p["page_id"]).model_dump(mode="json")
+ 
+@@ -601,6 +614,7 @@ def _h_provenance_rebuild(_: dict) -> dict:
+     "kb.stats": _h_stats,
+     "kb.search": _h_search,
+     "kb.context": _h_context,
++    "kb.synthesize": _h_synthesize,
+     "kb.read_page": _h_read_page,
+     "kb.read_claim": _h_read_claim,
+     "kb.read_entity": _h_read_entity,
+diff --git a/src/vouch/server.py b/src/vouch/server.py
+index 99587e9..4a630fe 100644
+--- a/src/vouch/server.py
++++ b/src/vouch/server.py
+@@ -48,6 +48,7 @@
+     KBStore,
+     discover_root,
+ )
++from .synthesize import synthesize
+ 
+ mcp = FastMCP("vouch")
+ 
+@@ -210,6 +211,21 @@ def kb_context(
+     return salience_mod.attach_salience(result, store, session_id, cfg)
+ 
+ 
++@mcp.tool()
++def kb_synthesize(
++    query: str,
++    depth: int = 3,
++    max_chars: int = 4000,
++) -> dict[str, Any]:
++    """Answer a query from approved claims only, with inline `[claim_id]`
++    citations, an explicit gaps block, and a synthesis_confidence grade.
++
++    Unlike `kb_context` (a ranked list), this returns prose where every
++    sentence is traceable to an approved claim.
++    """
++    return synthesize(_store(), query=query, depth=depth, max_chars=max_chars)
++
++
+ @mcp.tool()
+ def kb_read_page(page_id: str) -> dict[str, Any]:
+     """Return a page (title, body, claim ids)."""
+diff --git a/src/vouch/sessions.py b/src/vouch/sessions.py
+index dcebb33..0762e6a 100644
+--- a/src/vouch/sessions.py
++++ b/src/vouch/sessions.py
+@@ -12,7 +12,7 @@
+ import uuid
+ from datetime import UTC, datetime
+ 
+-from . import audit, index_db, volunteer_context
++from . import audit, index_db, salience, volunteer_context
+ from .models import Page, PageType, ProposalStatus, Session
+ from .proposals import approve
+ from .storage import KBStore
+diff --git a/src/vouch/synthesize.py b/src/vouch/synthesize.py
+new file mode 100644
+index 0000000..a45eee7
+--- /dev/null
++++ b/src/vouch/synthesize.py
+@@ -0,0 +1,140 @@
++"""Answer-mode synthesis over the review-gated KB.
++
++`kb.context` returns a *ranked list* of relevant items; `kb.synthesize`
++answers a query in prose, but only from APPROVED (durable) claims, with an
++inline `[claim_id]` citation behind every sentence. It never invents a
++sentence that isn't traceable to a claim, reports the query topics it found
++no claim for in an explicit `gaps` block, and grades its own confidence from
++the lifecycle status of the claims it cited.
++
++The synthesis is deterministic in v1 — there is no LLM in the loop. The
++`llm` flag is reserved so the wire shape is stable when an opt-in generative
++backend lands; passing `llm=True` raises rather than silently degrading.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Literal
++
++from .context import build_context_pack
++from .models import Claim, ClaimStatus
++from .storage import ArtifactNotFoundError, KBStore
++
++Confidence = Literal["high", "medium", "low"]
++
++_STOPWORDS = frozenset(
++    {
++        "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for",
++        "from", "how", "in", "into", "is", "it", "its", "of", "on", "or",
++        "the", "their", "them", "then", "there", "these", "this", "to", "was",
++        "were", "what", "when", "where", "which", "who", "why", "will", "with",
++        "you", "your",
++    }
++)
++
++
++def _salient_terms(query: str) -> list[str]:
++    """Lowercased, de-duplicated, order-preserving content words of the query."""
++    seen: set[str] = set()
++    terms: list[str] = []
++    for raw in query.split():
++        token = "".join(ch for ch in raw.lower() if ch.isalnum())
++        if len(token) < 3 or token in _STOPWORDS or token in seen:
++            continue
++        seen.add(token)
++        terms.append(token)
++    return terms
++
++
++def _clause(text: str) -> str:
++    """One short, single-clause rendering of a claim's text."""
++    clause = text.strip().split("\n", 1)[0].strip()
++    for sep in (". ", "; ", " — ", " - "):
++        head = clause.split(sep, 1)[0]
++        if head:
++            clause = head
++    clause = clause.rstrip(".;,")
++    return clause
++
++
++def _covers(term: str, *claims: Claim) -> bool:
++    return any(term in c.text.lower() for c in claims)
++
++
++def _confidence(statuses: list[ClaimStatus]) -> Confidence:
++    if any(s == ClaimStatus.CONTESTED for s in statuses):
++        return "low"
++    if any(s in (ClaimStatus.WORKING, ClaimStatus.ACTIONABLE) for s in statuses):
++        return "medium"
++    if statuses and all(s == ClaimStatus.STABLE for s in statuses):
++        return "high"
++    return "medium"
++
++
++def synthesize(
++    store: KBStore,
++    *,
++    query: str,
++    depth: int = 3,
++    max_chars: int = 4000,
++    llm: bool = False,
++) -> dict[str, Any]:
++    """Answer `query` from approved claims only, with inline citations.
++
++    Returns a dict with `query`, `answer` (citation-bearing prose, possibly
++    empty), `claims` (the cited claim ids), `gaps` (query topics no approved
++    claim covered) and `_meta.synthesis_confidence`.
++    """
++    if llm:
++        raise ValueError(
++            "llm synthesis backend not configured; "
++            "deterministic synthesis is the default"
++        )
++
++    pack = build_context_pack(store, query=query, limit=depth)
++    items = pack["items"] if isinstance(pack, dict) else pack.items
++
++    approved: list[Claim] = []
++    seen_ids: set[str] = set()
++    for item in items:
++        if (item["type"] if isinstance(item, dict) else item.type) != "claim":
++            continue
++        cid = item["id"] if isinstance(item, dict) else item.id
++        if cid in seen_ids:
++            continue
++        try:
++            claim = store.get_claim(cid)
++        except ArtifactNotFoundError:
++            continue
++        seen_ids.add(cid)
++        approved.append(claim)
++
++    sentences: list[str] = []
++    cited: list[str] = []
++    statuses: list[ClaimStatus] = []
++    used = 0
++    for claim in approved:
++        sentence = f"{_clause(claim.text)} [{claim.id}]."
++        projected = used + len(sentence) + (1 if sentences else 0)
++        if projected > max_chars:
++            break
++        sentences.append(sentence)
++        cited.append(claim.id)
++        statuses.append(claim.status)
++        used = projected
++
++    answer = " ".join(sentences)
++    cited_claims = [c for c in approved if c.id in set(cited)]
++    gaps = [
++        term
++        for term in _salient_terms(query)
++        if not (cited_claims and _covers(term, *cited_claims))
++    ]
++
++    return {
++        "query": query,
++        "answer": answer,
++        "claims": cited,
++        "gaps": gaps,
++        "_meta": {"synthesis_confidence": _confidence(statuses)},
++    }
+diff --git a/tests/test_synthesize.py b/tests/test_synthesize.py
+new file mode 100644
+index 0000000..9d40646
+--- /dev/null
++++ b/tests/test_synthesize.py
+@@ -0,0 +1,123 @@
++"""Answer-mode synthesis — citation traceability and the gaps path."""
++
++from __future__ import annotations
++
++import re
++from pathlib import Path
++
++import pytest
++
++from vouch import capabilities, health, synthesize
++from vouch.jsonl_server import HANDLERS, handle_request
++from vouch.models import Claim, ClaimStatus
++from vouch.storage import KBStore
++
++_CITE = re.compile(r"\[([^\[\]]+)\]")
++
++
++@pytest.fixture
++def store(tmp_path: Path) -> KBStore:
++    return KBStore.init(tmp_path)
++
++
++def _auth_kb(store: KBStore) -> list[str]:
++    src = store.put_source(b"auth design evidence")
++    claims = [
++        Claim(id="c-auth-1", text="auth uses short-lived JWT access tokens",
++              evidence=[src.id], status=ClaimStatus.STABLE),
++        Claim(id="c-auth-2", text="auth refresh tokens rotate on every use",
++              evidence=[src.id], status=ClaimStatus.STABLE),
++        Claim(id="c-auth-3", text="auth sessions expire after thirty minutes idle",
++              evidence=[src.id], status=ClaimStatus.STABLE),
++    ]
++    for c in claims:
++        store.put_claim(c)
++    health.rebuild_index(store)
++    return [c.id for c in claims]
++
++
++def test_synthesize_cites_every_approved_claim(store: KBStore) -> None:
++    ids = _auth_kb(store)
++    result = synthesize.synthesize(store, query="auth", depth=5)
++    assert result["answer"] != ""
++    for cid in ids:
++        assert f"[{cid}]" in result["answer"]
++        assert cid in result["claims"]
++    assert result["_meta"]["synthesis_confidence"] == "high"
++
++
++def test_synthesize_uncovered_query_returns_empty_answer_and_gaps(
++    store: KBStore,
++) -> None:
++    _auth_kb(store)
++    result = synthesize.synthesize(store, query="kubernetes networking topology")
++    assert result["answer"] == ""
++    assert result["claims"] == []
++    assert result["gaps"]
++    assert "kubernetes" in result["gaps"]
++
++
++def test_every_sentence_carries_a_resolvable_citation(store: KBStore) -> None:
++    _auth_kb(store)
++    result = synthesize.synthesize(store, query="auth tokens sessions", depth=5)
++    assert result["answer"]
++    claim_set = set(result["claims"])
++    for sentence in result["answer"].split("]. "):
++        ids = _CITE.findall(sentence + "]")
++        assert ids, f"sentence without citation: {sentence!r}"
++        assert all(i in claim_set for i in ids)
++        for i in ids:
++            assert store.get_claim(i).id == i
++
++
++def test_max_chars_drops_trailing_claims_without_cutting_citations(
++    store: KBStore,
++) -> None:
++    _auth_kb(store)
++    result = synthesize.synthesize(store, query="auth", depth=5, max_chars=60)
++    assert len(result["answer"]) <= 60
++    for cid in result["claims"]:
++        assert f"[{cid}]" in result["answer"]
++    assert result["answer"].count("[") == len(result["claims"])
++
++
++def test_confidence_reflects_claim_status(store: KBStore) -> None:
++    src = store.put_source(b"mixed evidence")
++    store.put_claim(Claim(id="m1", text="payments use stripe",
++                          evidence=[src.id], status=ClaimStatus.WORKING))
++    health.rebuild_index(store)
++    result = synthesize.synthesize(store, query="payments stripe")
++    assert "m1" in result["claims"]
++    assert result["_meta"]["synthesis_confidence"] == "medium"
++
++    src2 = store.put_source(b"contested evidence")
++    store.put_claim(Claim(id="m2", text="billing rounds half-up",
++                          evidence=[src2.id], status=ClaimStatus.CONTESTED))
++    health.rebuild_index(store)
++    contested = synthesize.synthesize(store, query="billing rounds")
++    assert "m2" in contested["claims"]
++    assert contested["_meta"]["synthesis_confidence"] == "low"
++
++
++def test_llm_flag_is_reserved(store: KBStore) -> None:
++    with pytest.raises(ValueError, match="llm synthesis backend not configured"):
++        synthesize.synthesize(store, query="auth", llm=True)
++
++
++def test_capabilities_lists_synthesize() -> None:
++    assert "kb.synthesize" in capabilities.capabilities().methods
++    assert "kb.synthesize" in HANDLERS
++
++
++def test_jsonl_synthesize_handler(store: KBStore, monkeypatch) -> None:
++    ids = _auth_kb(store)
++    monkeypatch.chdir(store.root)
++    resp = handle_request({
++        "id": "s1", "method": "kb.synthesize",
++        "params": {"query": "auth", "depth": 5},
++    })
++    assert resp["ok"]
++    assert resp["result"]["claims"]
++    assert set(resp["result"]["claims"]) <= set(ids)
++    for cid in resp["result"]["claims"]:
++        assert f"[{cid}]" in resp["result"]["answer"]

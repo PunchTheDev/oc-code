@@ -1,0 +1,1266 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c6e5a36e..3e4cb5c5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -86,6 +86,3 @@
+ - Tighten and extend decision-pack regression coverage
+ 
+ - Cover review-requested branches and tier sanitization
+-
+-
+-
+diff --git a/site/troubleshooting.md b/site/troubleshooting.md
+index 787104e7..92d48a12 100644
+--- a/site/troubleshooting.md
++++ b/site/troubleshooting.md
+@@ -65,4 +65,11 @@ If a command returns `429`, retry after the reported `retry-after` value. Expens
+ 
+ ## Stale Decision Pack
+ 
+-If `decision-pack` returns `needs_snapshot_refresh`, Gittensory has enqueued a rebuild. Retry after the queue drains.
++`decision-pack` responses now include a `freshness` field with one of:
++
++- `fresh` — snapshot is within the freshness window; serve as-is.
++- `rebuilding` — snapshot is past the freshness window and a background rebuild is enqueued; the response still contains `topActions` and `repoDecisions` from the last good snapshot. The companion `rebuildEnqueued: true` confirms a job was queued.
++- `stale` — snapshot is past the freshness window and a rebuild could not be enqueued (queue offline). Treat the data as a best-effort fallback and retry shortly.
++- `missing` — no usable snapshot exists. The response status is `needs_snapshot_refresh` and a rebuild has been enqueued when possible.
++
++MCP `gittensory_get_decision_pack` and `agent plan` degrade the same way: a stale snapshot returns usable actions with `freshness: "rebuilding"` and a freshness warning on the agent context snapshot. Retry once the queue drains to pick up a `fresh` pack.
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index de6eeb27..9ac6c363 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -74,8 +74,7 @@ import {
+ } from "../services/agent-orchestrator";
+ import {
+   buildAndPersistContributorDecisionPack,
+-  loadContributorDecisionPack,
+-  loadFreshContributorDecisionPack,
++  loadContributorDecisionPackForServing,
+   repoDecisionFromPack,
+ } from "../services/decision-pack";
+ import {
+@@ -681,46 +680,32 @@ export function createApp() {
+ 
+   app.get("/v1/contributors/:login/decision-pack", async (c) => {
+     const login = c.req.param("login");
+-    const pack = await loadFreshContributorDecisionPack(c.env, login);
+-    if (pack) return c.json(pack);
+-    const stalePack = await loadContributorDecisionPack(c.env, login);
+-    await c.env.JOBS.send({ type: "build-contributor-decision-packs", requestedBy: "api", login });
+-    return c.json(
+-      {
+-        status: "needs_snapshot_refresh",
+-        login,
+-        generatedAt: nowIso(),
+-        reason: stalePack ? "stale_snapshot" : "missing_snapshot",
+-        enqueued: true,
+-        ...(stalePack ? { staleSnapshot: { generatedAt: stalePack.generatedAt, ageSeconds: Math.max(0, Math.floor((Date.now() - Date.parse(stalePack.generatedAt)) / 1000)) } } : {}),
+-        ...(stalePack?.dataQuality ? { dataQuality: stalePack.dataQuality } : {}),
+-      },
+-      202,
+-    );
++    const serving = await loadContributorDecisionPackForServing(c.env, login);
++    if (serving.kind === "ready") return c.json(serving.pack);
++    return c.json(serving.refresh, 202);
+   });
+ 
+   app.get("/v1/contributors/:login/repos/:owner/:repo/decision", async (c) => {
+     const login = c.req.param("login");
+     const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
+-    const pack = await loadFreshContributorDecisionPack(c.env, login);
+-    if (!pack) {
+-      const stalePack = await loadContributorDecisionPack(c.env, login);
+-      await c.env.JOBS.send({ type: "build-contributor-decision-packs", requestedBy: "api", login });
+-      return c.json(
+-        {
+-          status: "needs_snapshot_refresh",
+-          login,
+-          repoFullName: fullName,
+-          generatedAt: nowIso(),
+-          reason: stalePack ? "stale_snapshot" : "missing_snapshot",
+-          enqueued: true,
+-        },
+-        202,
+-      );
++    const serving = await loadContributorDecisionPackForServing(c.env, login);
++    if (serving.kind === "needs_refresh") {
++      return c.json({ ...serving.refresh, repoFullName: fullName }, 202);
+     }
++    const pack = serving.pack;
+     const decision = repoDecisionFromPack(pack, fullName);
+     if (!decision) return c.json({ error: "repo_decision_not_found", login, repoFullName: fullName }, 404);
+-    return c.json({ status: "ready", login, repoFullName: fullName, generatedAt: pack.generatedAt, source: pack.source, decision, dataQuality: pack.dataQuality });
++    return c.json({
++      status: "ready",
++      login,
++      repoFullName: fullName,
++      generatedAt: pack.generatedAt,
++      source: pack.source,
++      freshness: pack.freshness,
++      rebuildEnqueued: pack.rebuildEnqueued,
++      decision,
++      dataQuality: pack.dataQuality,
++    });
+   });
+ 
+   app.post("/v1/preflight/pr", async (c) => {
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index 68b27837..feaa40d4 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -735,6 +735,16 @@ export async function recordAuditEvent(env: Env, event: AuditEventRecord): Promi
+   });
+ }
+ 
++export async function hasRecentAuditEvent(env: Env, actor: string, eventType: string, sinceIso: string): Promise<boolean> {
++  const db = getDb(env.DB);
++  const rows = await db
++    .select({ id: auditEvents.id })
++    .from(auditEvents)
++    .where(and(eq(auditEvents.actor, actor), eq(auditEvents.eventType, eventType), gte(auditEvents.createdAt, sinceIso)))
++    .limit(1);
++  return rows.length > 0;
++}
++
+ export async function recordAiUsageEvent(
+   env: Env,
+   event: {
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index 8a0a7fd1..f85179f4 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -35,7 +35,7 @@ import {
+   preparePrPacketWithAgent,
+   startAgentRun,
+ } from "../services/agent-orchestrator";
+-import { loadFreshContributorDecisionPack, repoDecisionFromPack } from "../services/decision-pack";
++import { loadContributorDecisionPackForServing, repoDecisionFromPack } from "../services/decision-pack";
+ import {
+   buildBountyAdvisory,
+   buildCollisionReport,
+@@ -60,6 +60,12 @@ type ToolPayload = {
+   data: Record<string, unknown>;
+ };
+ 
++function decisionPackSummary(login: string, freshness: string, rebuildEnqueued: boolean): string {
++  if (freshness === "fresh") return `Gittensory decision pack for ${login}.`;
++  if (rebuildEnqueued) return `Gittensory decision pack for ${login} (stale; background rebuild enqueued).`;
++  return `Gittensory decision pack for ${login} (stale; rebuild not enqueued).`;
++}
++
+ const ownerRepoShape = {
+   owner: z.string().min(1),
+   repo: z.string().min(1),
+@@ -509,43 +515,29 @@ export class GittensoryMcp {
+   }
+ 
+   private async getDecisionPack(login: string): Promise<ToolPayload> {
+-    const pack = await loadFreshContributorDecisionPack(this.env, login);
+-    if (pack) {
++    const serving = await loadContributorDecisionPackForServing(this.env, login);
++    if (serving.kind === "ready") {
+       return {
+-        summary: `Gittensory decision pack for ${login}.`,
+-        data: pack as unknown as Record<string, unknown>,
++        summary: decisionPackSummary(login, serving.pack.freshness, serving.pack.rebuildEnqueued),
++        data: serving.pack as unknown as Record<string, unknown>,
+       };
+     }
+-    await this.env.JOBS.send({ type: "build-contributor-decision-packs", requestedBy: "api", login });
+     return {
+       summary: `Gittensory decision pack for ${login} needs a snapshot refresh.`,
+-      data: {
+-        status: "needs_snapshot_refresh",
+-        login,
+-        generatedAt: new Date().toISOString(),
+-        reason: "missing_snapshot",
+-        enqueued: true,
+-      },
++      data: serving.refresh as unknown as Record<string, unknown>,
+     };
+   }
+ 
+   private async explainRepoDecision(input: { login: string; owner: string; repo: string }): Promise<ToolPayload> {
+     const fullName = `${input.owner}/${input.repo}`;
+-    const pack = await loadFreshContributorDecisionPack(this.env, input.login);
+-    if (!pack) {
+-      await this.env.JOBS.send({ type: "build-contributor-decision-packs", requestedBy: "api", login: input.login });
++    const serving = await loadContributorDecisionPackForServing(this.env, input.login);
++    if (serving.kind === "needs_refresh") {
+       return {
+         summary: `Gittensory repo decision for ${input.login} in ${fullName} needs a snapshot refresh.`,
+-        data: {
+-          status: "needs_snapshot_refresh",
+-          login: input.login,
+-          repoFullName: fullName,
+-          generatedAt: new Date().toISOString(),
+-          reason: "missing_snapshot",
+-          enqueued: true,
+-        },
++        data: { ...serving.refresh, repoFullName: fullName } as unknown as Record<string, unknown>,
+       };
+     }
++    const pack = serving.pack;
+     const decision = repoDecisionFromPack(pack, fullName);
+     return {
+       summary: `Gittensory repo decision for ${input.login} in ${fullName}.`,
+@@ -555,6 +547,8 @@ export class GittensoryMcp {
+         repoFullName: fullName,
+         generatedAt: pack.generatedAt,
+         source: pack.source,
++        freshness: pack.freshness,
++        rebuildEnqueued: pack.rebuildEnqueued,
+         decision,
+         dataQuality: pack.dataQuality,
+       },
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index f03f2771..0a42e6fe 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -1022,6 +1022,8 @@ export const ContributorStrategySchema = z
+   })
+   .openapi("ContributorStrategy");
+ 
++export const DecisionPackFreshnessSchema = z.enum(["fresh", "stale", "rebuilding", "missing"]).openapi("DecisionPackFreshness");
++
+ export const ContributorDecisionPackSchema = z
+   .object({
+     status: z.enum(["ready"]),
+@@ -1030,6 +1032,8 @@ export const ContributorDecisionPackSchema = z
+     generatedAt: z.string(),
+     snapshotAgeSeconds: z.number().optional(),
+     stale: z.boolean(),
++    freshness: DecisionPackFreshnessSchema,
++    rebuildEnqueued: z.boolean(),
+     scoringModelSnapshotId: z.string(),
+     profile: z.record(z.unknown()),
+     outcomeHistory: ContributorOutcomeHistorySchema,
+@@ -1053,10 +1057,9 @@ export const DecisionPackRefreshNeededSchema = z
+     login: z.string(),
+     repoFullName: z.string().optional(),
+     generatedAt: z.string(),
+-    reason: z.enum(["missing_snapshot", "stale_snapshot"]),
+-    enqueued: z.boolean(),
+-    staleSnapshot: z.object({ generatedAt: z.string(), ageSeconds: z.number() }).optional(),
+-    dataQuality: z.record(z.unknown()).optional(),
++    reason: z.enum(["missing_snapshot"]),
++    freshness: z.enum(["missing"]),
++    rebuildEnqueued: z.boolean(),
+   })
+   .openapi("DecisionPackRefreshNeeded");
+ 
+@@ -1067,6 +1070,8 @@ export const RepoDecisionResponseSchema = z
+     repoFullName: z.string(),
+     generatedAt: z.string(),
+     source: z.enum(["computed", "snapshot"]),
++    freshness: DecisionPackFreshnessSchema,
++    rebuildEnqueued: z.boolean(),
+     decision: z.record(z.unknown()),
+     dataQuality: z.record(z.unknown()),
+   })
+diff --git a/src/openapi/spec.ts b/src/openapi/spec.ts
+index 0dd578e5..d386c18f 100644
+--- a/src/openapi/spec.ts
++++ b/src/openapi/spec.ts
+@@ -278,18 +278,18 @@ export function buildOpenApiSpec() {
+     path: "/v1/contributors/{login}/decision-pack",
+     responses: {
+       200: {
+-        description: "Canonical private contributor decision pack",
++        description: "Canonical private contributor decision pack. May carry freshness 'stale' or 'rebuilding' when a background rebuild is in progress.",
+         content: { "application/json": { schema: ContributorDecisionPackSchema } },
+       },
+-      202: { description: "Decision pack snapshot is missing or stale", content: { "application/json": { schema: DecisionPackRefreshNeededSchema } } },
++      202: { description: "Decision pack snapshot is missing; a background rebuild has been requested", content: { "application/json": { schema: DecisionPackRefreshNeededSchema } } },
+     },
+   });
+   registry.registerPath({
+     method: "get",
+     path: "/v1/contributors/{login}/repos/{owner}/{repo}/decision",
+     responses: {
+-      200: { description: "Repo-specific contributor decision from decision pack", content: { "application/json": { schema: RepoDecisionResponseSchema } } },
+-      202: { description: "Decision pack snapshot is missing or stale", content: { "application/json": { schema: DecisionPackRefreshNeededSchema } } },
++      200: { description: "Repo-specific contributor decision from decision pack. May carry freshness 'stale' or 'rebuilding'.", content: { "application/json": { schema: RepoDecisionResponseSchema } } },
++      202: { description: "Decision pack snapshot is missing; a background rebuild has been requested", content: { "application/json": { schema: DecisionPackRefreshNeededSchema } } },
+     },
+   });
+   registry.registerPath({
+diff --git a/src/services/agent-orchestrator.ts b/src/services/agent-orchestrator.ts
+index c024edbf..2eb8cfe3 100644
+--- a/src/services/agent-orchestrator.ts
++++ b/src/services/agent-orchestrator.ts
+@@ -20,7 +20,7 @@ import {
+ import { contributorRepoStatsFromGittensor, fetchGittensorContributorSnapshot } from "../gittensor/api";
+ import { fetchPublicContributorProfile } from "../github/public";
+ import { getOrCreateScoringModelSnapshot } from "../scoring/model";
+-import { loadFreshContributorDecisionPack, repoDecisionFromPack, type ContributorDecisionPack, type DecisionAction, type RepoDecision } from "./decision-pack";
++import { loadContributorDecisionPackForServing, repoDecisionFromPack, type ContributorDecisionPack, type DecisionAction, type RepoDecision } from "./decision-pack";
+ import { summarizeAgentBundleWithAi } from "./ai-summaries";
+ import { buildContributorFit, buildContributorOutcomeHistory, buildContributorProfile, buildContributorScoringProfile } from "../signals/engine";
+ import { buildLocalBranchAnalysis, type LocalBranchAnalysis, type LocalBranchAnalysisInput } from "../signals/local-branch";
+@@ -203,16 +203,22 @@ async function attachPrivateAiSummary(env: Env, bundle: AgentRunBundle): Promise
+ async function executeDecisionPackRun(env: Env, run: AgentRunRecord, kind: string): Promise<AgentRunBundle> {
+   const login = String(run.payload.login ?? run.actorLogin);
+   const repoFullName = typeof run.payload.repoFullName === "string" ? run.payload.repoFullName : undefined;
+-  const pack = await loadFreshContributorDecisionPack(env, login);
+-  if (!pack) {
+-    await env.JOBS.send({ type: "build-contributor-decision-packs", requestedBy: "api", login });
++  const serving = await loadContributorDecisionPackForServing(env, login);
++  if (serving.kind === "needs_refresh") {
+     await updateAgentRun(env, run.id, {
+       status: "needs_snapshot_refresh",
+       dataQualityStatus: "unknown",
+-      payload: { ...run.payload, snapshotRefreshEnqueued: true, refreshReason: "missing_or_stale_decision_pack" },
++      payload: {
++        ...run.payload,
++        rebuildEnqueued: serving.refresh.rebuildEnqueued,
++        refreshReason: serving.refresh.rebuildEnqueued ? "missing_decision_pack" : "queue_unavailable",
++        freshness: serving.refresh.freshness,
++      },
+     });
+     return (await getAgentRunBundle(env, run.id))!;
+   }
++  const pack = serving.pack;
++  const isStale = pack.freshness !== "fresh";
+   const decisions = repoFullName ? pack.repoDecisions.filter((decision) => sameRepo(decision.repoFullName, repoFullName)) : pack.repoDecisions;
+   const actions =
+     kind === "explain_blockers"
+@@ -221,10 +227,20 @@ async function executeDecisionPackRun(env: Env, run: AgentRunRecord, kind: strin
+   const contexts = [contextSnapshotFromPack(run.id, pack, decisions)];
+   await replaceAgentActions(env, run.id, actions);
+   await persistAgentContextSnapshot(env, contexts[0]!);
++  const dataQualityStatus = isStale ? "degraded" : pack.dataQuality.signalFidelity.status;
+   await updateAgentRun(env, run.id, {
+     status: "completed",
+-    dataQualityStatus: pack.dataQuality.signalFidelity.status,
+-    payload: { ...run.payload, generatedAt: pack.generatedAt, actionCount: actions.length },
++    dataQualityStatus,
++    payload: {
++      ...run.payload,
++      generatedAt: pack.generatedAt,
++      actionCount: actions.length,
++      freshness: pack.freshness,
++      rebuildEnqueued: pack.rebuildEnqueued,
++      ...(isStale
++        ? { refreshReason: pack.rebuildEnqueued ? "stale_decision_pack" : "stale_decision_pack_queue_unavailable" }
++        : {}),
++    },
+   });
+   return (await getAgentRunBundle(env, run.id))!;
+ }
+@@ -486,7 +502,16 @@ function actionRecord(args: {
+ 
+ function contextSnapshotFromPack(runId: string, pack: ContributorDecisionPack, decisions: RepoDecision[]): AgentContextSnapshotRecord {
+   const fidelity = pack.dataQuality.signalFidelity;
++  const ageSeconds = pack.snapshotAgeSeconds ?? null;
++  const ageNote = ageSeconds !== null ? ` (age ${ageSeconds}s)` : "";
++  const freshnessWarning =
++    pack.freshness === "rebuilding"
++      ? `decision pack is stale${ageNote}; background rebuild enqueued`
++      : pack.freshness === "stale"
++        ? `decision pack is stale${ageNote}; rebuild not enqueued`
++        : null;
+   const warnings = [
++    ...(freshnessWarning ? [freshnessWarning] : []),
+     ...fidelity.partialRepos.map((repo) => `${repo}: partial signal coverage`),
+     ...fidelity.cappedRepos.map((repo) => `${repo}: capped signal coverage`),
+     ...fidelity.staleRepos.map((repo) => `${repo}: stale signal coverage`),
+diff --git a/src/services/decision-pack.ts b/src/services/decision-pack.ts
+index 131ec08d..f847259a 100644
+--- a/src/services/decision-pack.ts
++++ b/src/services/decision-pack.ts
+@@ -1,4 +1,5 @@
+ import {
++  hasRecentAuditEvent,
+   listContributorIssues,
+   listContributorPullRequests,
+   listContributorRepoStats,
+@@ -8,6 +9,7 @@ import {
+   listRepoSyncStates,
+   listSignalSnapshots,
+   persistSignalSnapshot,
++  recordAuditEvent,
+   upsertContributorEvidence,
+   upsertContributorScoringProfile,
+ } from "../db/repositories";
+@@ -31,9 +33,12 @@ import { nowIso } from "../utils/json";
+ 
+ export const CONTRIBUTOR_DECISION_PACK_SIGNAL = "contributor-decision-pack";
+ export const DECISION_PACK_MAX_AGE_MS = 6 * 60 * 60 * 1000;
++export const DECISION_PACK_REBUILD_DEBOUNCE_MS = 15 * 1000;
++const pendingDecisionPackRebuilds = new Map<string, Promise<boolean>>();
+ 
+ export type DecisionRecommendation = "pursue" | "cleanup_first" | "maintainer_lane" | "avoid_for_now" | "watch";
+ export type DecisionActionKind = "cleanup_existing_prs" | "land_existing_prs" | "open_new_direct_pr" | "file_issue_discovery" | "maintainer_lane_improve_repo" | "maintainer_cut_readiness";
++export type DecisionPackFreshness = "fresh" | "stale" | "rebuilding" | "missing";
+ 
+ export type ContributorDecisionPack = {
+   status: "ready";
+@@ -42,6 +47,8 @@ export type ContributorDecisionPack = {
+   generatedAt: string;
+   snapshotAgeSeconds?: number | undefined;
+   stale: boolean;
++  freshness: DecisionPackFreshness;
++  rebuildEnqueued: boolean;
+   scoringModelSnapshotId: string;
+   profile: {
+     login: string;
+@@ -71,15 +78,15 @@ export type DecisionPackRefreshNeeded = {
+   status: "needs_snapshot_refresh";
+   login: string;
+   generatedAt: string;
+-  reason: "missing_snapshot" | "stale_snapshot";
+-  enqueued: boolean;
+-  staleSnapshot?: {
+-    generatedAt: string;
+-    ageSeconds: number;
+-  };
+-  dataQuality?: ContributorDecisionPack["dataQuality"] | undefined;
++  reason: "missing_snapshot";
++  freshness: Extract<DecisionPackFreshness, "missing">;
++  rebuildEnqueued: boolean;
+ };
+ 
++export type ContributorDecisionPackServing =
++  | { kind: "ready"; pack: ContributorDecisionPack }
++  | { kind: "needs_refresh"; refresh: DecisionPackRefreshNeeded };
++
+ export type LanguageMatch = {
+   language: string | null;
+   match: boolean;
+@@ -136,10 +143,78 @@ export async function loadContributorDecisionPack(env: Env, login: string): Prom
+   return withSnapshotMetadata(latest);
+ }
+ 
+-export async function loadFreshContributorDecisionPack(env: Env, login: string, maxAgeMs = DECISION_PACK_MAX_AGE_MS): Promise<ContributorDecisionPack | null> {
+-  const pack = await loadContributorDecisionPack(env, login);
+-  if (!pack) return null;
+-  return pack.stale || snapshotAgeMs(pack.generatedAt) > maxAgeMs ? null : pack;
++export async function loadContributorDecisionPackForServing(
++  env: Env,
++  login: string,
++  options: { maxAgeMs?: number; enqueueRebuild?: boolean } = {},
++): Promise<ContributorDecisionPackServing> {
++  const maxAgeMs = options.maxAgeMs ?? DECISION_PACK_MAX_AGE_MS;
++  const enqueueRebuild = options.enqueueRebuild ?? true;
++  const cached = await loadContributorDecisionPack(env, login);
++  if (!cached) {
++    const rebuildEnqueued = enqueueRebuild ? await tryEnqueueDecisionPackRebuild(env, login) : false;
++    return {
++      kind: "needs_refresh",
++      refresh: {
++        status: "needs_snapshot_refresh",
++        login,
++        generatedAt: nowIso(),
++        reason: "missing_snapshot",
++        freshness: "missing",
++        rebuildEnqueued,
++      },
++    };
++  }
++  const stale = cached.stale || snapshotAgeMs(cached.generatedAt) > maxAgeMs;
++  if (!stale) {
++    return { kind: "ready", pack: { ...cached, freshness: "fresh", rebuildEnqueued: false } };
++  }
++  const rebuildEnqueued = enqueueRebuild ? await tryEnqueueDecisionPackRebuild(env, login) : false;
++  return {
++    kind: "ready",
++    pack: {
++      ...cached,
++      stale: true,
++      freshness: rebuildEnqueued ? "rebuilding" : "stale",
++      rebuildEnqueued,
++    },
++  };
++}
++
++async function tryEnqueueDecisionPackRebuild(env: Env, login: string): Promise<boolean> {
++  const pending = pendingDecisionPackRebuilds.get(login);
++  if (pending) return pending;
++  const sinceIso = new Date(Date.now() - DECISION_PACK_REBUILD_DEBOUNCE_MS).toISOString();
++  if (await hasRecentAuditEvent(env, login, "decision_pack.rebuild_enqueued", sinceIso)) {
++    return true;
++  }
++  const existing = pendingDecisionPackRebuilds.get(login);
++  if (existing) return existing;
++  const rebuild = enqueueDecisionPackRebuild(env, login).finally(() => {
++    pendingDecisionPackRebuilds.delete(login);
++  });
++  pendingDecisionPackRebuilds.set(login, rebuild);
++  return rebuild;
++}
++
++async function enqueueDecisionPackRebuild(env: Env, login: string): Promise<boolean> {
++  try {
++    await env.JOBS.send({ type: "build-contributor-decision-packs", requestedBy: "api", login });
++    await recordAuditEvent(env, {
++      eventType: "decision_pack.rebuild_enqueued",
++      actor: login,
++      outcome: "queued",
++    });
++    return true;
++  } catch (error) {
++    await recordAuditEvent(env, {
++      eventType: "decision_pack.rebuild_enqueue_failed",
++      actor: login,
++      outcome: "error",
++      detail: String(error),
++    });
++    return false;
++  }
+ }
+ 
+ export async function buildAndPersistContributorDecisionPack(env: Env, login: string): Promise<ContributorDecisionPack> {
+@@ -280,6 +355,8 @@ function buildContributorDecisionPack(args: {
+     login: args.login,
+     generatedAt: nowIso(),
+     stale: false,
++    freshness: "fresh",
++    rebuildEnqueued: false,
+     scoringModelSnapshotId: args.scoringModelSnapshotId,
+     profile: {
+       login: args.profile.login,
+@@ -378,11 +455,13 @@ function buildRepoDecision(args: {
+ 
+ function scoreBlockersFor(repoFullName: string, lane: string, roleContext: RoleContext, outcome: ContributorOutcomeHistory["repoOutcomes"][number] | undefined): ScoreBlocker[] {
+   const blockers: ScoreBlocker[] = [];
++  const openPullRequests = outcome?.openPullRequests ?? 0;
++  const closedPullRequestRate = outcome?.closedPullRequestRate ?? 0;
+   if (roleContext.maintainerLane) blockers.push({ code: "maintainer_lane", repoFullName, severity: "info", detail: "Maintainer-lane activity is separate from normal outside-contributor reward evidence." });
+   if (lane === "inactive" || lane === "unknown") blockers.push({ code: "inactive_or_unknown_lane", repoFullName, severity: "critical", detail: "The repo lane is inactive or unknown in the current registry snapshot." });
+   if (lane === "issue_discovery") blockers.push({ code: "issue_discovery_only", repoFullName, severity: "warning", detail: "This repo is issue-discovery-only; direct PR reward/risk reasoning is not applicable." });
+-  if ((outcome?.openPullRequests ?? 0) >= 5) blockers.push({ code: "open_pr_pressure", repoFullName, severity: "critical", detail: `${outcome?.openPullRequests ?? 0} open PR(s) create scoreability and review-pressure risk.` });
+-  if ((outcome?.closedPullRequestRate ?? 0) >= 0.35) blockers.push({ code: "closed_pr_credibility", repoFullName, severity: "warning", detail: `Closed PR rate is ${Math.round((outcome?.closedPullRequestRate ?? 0) * 100)}%.` });
++  if (openPullRequests >= 5) blockers.push({ code: "open_pr_pressure", repoFullName, severity: "critical", detail: `${openPullRequests} open PR(s) create scoreability and review-pressure risk.` });
++  if (closedPullRequestRate >= 0.35) blockers.push({ code: "closed_pr_credibility", repoFullName, severity: "warning", detail: `Closed PR rate is ${Math.round(closedPullRequestRate * 100)}%.` });
+   if (outcome && !outcome.maintainerLane && outcome.credibility > 0 && outcome.credibility < 0.8) blockers.push({ code: "low_credibility", repoFullName, severity: "warning", detail: `Official repo credibility is ${round(outcome.credibility)}.` });
+   return blockers;
+ }
+@@ -544,13 +623,16 @@ function withSnapshotMetadata(snapshot: SignalSnapshotRecord): ContributorDecisi
+   const payload = snapshot.payload as unknown as ContributorDecisionPack;
+   const generatedAt = snapshot.generatedAt ?? payload.generatedAt ?? nowIso();
+   const ageSeconds = Math.max(0, Math.floor(snapshotAgeMs(generatedAt) / 1000));
++  const stale = snapshotAgeMs(generatedAt) > DECISION_PACK_MAX_AGE_MS;
+   return {
+     ...payload,
+     status: "ready",
+     source: "snapshot",
+     generatedAt,
+     snapshotAgeSeconds: ageSeconds,
+-    stale: snapshotAgeMs(generatedAt) > DECISION_PACK_MAX_AGE_MS,
++    stale,
++    freshness: stale ? "stale" : "fresh",
++    rebuildEnqueued: false,
+   };
+ }
+ 
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 51a2009c..8d354a59 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -348,7 +348,13 @@ describe("api routes", () => {
+ 
+     const missingDecisionPack = await app.request("/v1/contributors/oktofeesh1/decision-pack", { headers: apiHeaders(env) }, env);
+     expect(missingDecisionPack.status).toBe(202);
+-    await expect(missingDecisionPack.json()).resolves.toMatchObject({ status: "needs_snapshot_refresh", login: "oktofeesh1", enqueued: true });
++    await expect(missingDecisionPack.json()).resolves.toMatchObject({
++      status: "needs_snapshot_refresh",
++      login: "oktofeesh1",
++      reason: "missing_snapshot",
++      freshness: "missing",
++      rebuildEnqueued: true,
++    });
+ 
+     const builtDecisionPack = await app.request(
+       "/v1/internal/jobs/build-contributor-decision-packs/run",
+@@ -408,7 +414,12 @@ describe("api routes", () => {
+ 
+     const missingRepoDecisionSnapshot = await app.request("/v1/contributors/new-user/repos/entrius/allways-ui/decision", { headers: apiHeaders(env) }, env);
+     expect(missingRepoDecisionSnapshot.status).toBe(202);
+-    await expect(missingRepoDecisionSnapshot.json()).resolves.toMatchObject({ status: "needs_snapshot_refresh", repoFullName: "entrius/allways-ui" });
++    await expect(missingRepoDecisionSnapshot.json()).resolves.toMatchObject({
++      status: "needs_snapshot_refresh",
++      repoFullName: "entrius/allways-ui",
++      freshness: "missing",
++      rebuildEnqueued: true,
++    });
+ 
+     for (const path of [
+       "/v1/contributors/oktofeesh1/opportunities",
+@@ -1139,7 +1150,7 @@ describe("api routes", () => {
+       expect(response.status).toBe(200);
+       const payload = (await mcpJson(response)) as { result: { structuredContent: Record<string, unknown> } };
+       if (name === "gittensory_get_contributor_profile") expect(payload.result.structuredContent).toMatchObject({ login: "unknown-user" });
+-      else expect(payload.result.structuredContent).toMatchObject({ status: "needs_snapshot_refresh", enqueued: true });
++      else expect(payload.result.structuredContent).toMatchObject({ status: "needs_snapshot_refresh", freshness: "missing", rebuildEnqueued: true });
+     }
+ 
+     const missingRepoDecision = await app.request(
+@@ -1615,31 +1626,133 @@ describe("api routes", () => {
+         login: "stale-user",
+         generatedAt: "2026-01-01T00:00:00.000Z",
+         stale: false,
++        freshness: "fresh",
++        rebuildEnqueued: false,
+         scoringModelSnapshotId: "scoring-1",
+         profile: {},
+         outcomeHistory: {},
+         roleContexts: [],
+-        repoDecisions: [],
+-        topActions: [],
++        repoDecisions: [{ repoFullName: "owner/repo", recommendation: "pursue" }],
++        topActions: [{ actionKind: "open_new_direct_pr", repoFullName: "owner/repo", priorityScore: 50 }],
+         cleanupFirst: [],
+-        pursueRepos: [],
++        pursueRepos: [{ repoFullName: "owner/repo", recommendation: "pursue" }],
+         avoidRepos: [],
+         maintainerLaneRepos: [],
+         scoreBlockers: [],
+         dataQuality: { signalFidelity: { status: "degraded" } },
+         summary: "stale",
+-        nextActions: [],
++        nextActions: ["pick a narrow change"],
+       } as never,
+       generatedAt: "2026-01-01T00:00:00.000Z",
+     });
+     const staleDecisionPack = await app.request("/v1/contributors/stale-user/decision-pack", { headers: apiHeaders(env) }, env);
+-    expect(staleDecisionPack.status).toBe(202);
+-    await expect(staleDecisionPack.json()).resolves.toMatchObject({
+-      status: "needs_snapshot_refresh",
+-      reason: "stale_snapshot",
+-      staleSnapshot: { generatedAt: "2026-01-01T00:00:00.000Z" },
++    expect(staleDecisionPack.status).toBe(200);
++    const staleBody = (await staleDecisionPack.json()) as {
++      status: string;
++      freshness: string;
++      rebuildEnqueued: boolean;
++      stale: boolean;
++      generatedAt: string;
++      topActions: unknown[];
++      repoDecisions: unknown[];
++      dataQuality: { signalFidelity: { status: string } };
++    };
++    expect(staleBody).toMatchObject({
++      status: "ready",
++      freshness: "rebuilding",
++      rebuildEnqueued: true,
++      stale: true,
++      generatedAt: "2026-01-01T00:00:00.000Z",
+       dataQuality: { signalFidelity: { status: "degraded" } },
+     });
++    expect(staleBody.topActions.length).toBeGreaterThan(0);
++    expect(staleBody.repoDecisions.length).toBeGreaterThan(0);
++
++    const staleRepoDecision = await app.request("/v1/contributors/stale-user/repos/owner/repo/decision", { headers: apiHeaders(env) }, env);
++    expect(staleRepoDecision.status).toBe(200);
++    await expect(staleRepoDecision.json()).resolves.toMatchObject({
++      status: "ready",
++      login: "stale-user",
++      repoFullName: "owner/repo",
++      freshness: "rebuilding",
++      rebuildEnqueued: true,
++      decision: { repoFullName: "owner/repo", recommendation: "pursue" },
++    });
++
++    const staleMcpQueued = await app.request(
++      "/mcp",
++      {
++        method: "POST",
++        headers: mcpHeaders(env),
++        body: JSON.stringify({
++          jsonrpc: "2.0",
++          id: "stale-mcp-queued",
++          method: "tools/call",
++          params: { name: "gittensory_get_decision_pack", arguments: { login: "stale-user" } },
++        }),
++      },
++      env,
++    );
++    expect(staleMcpQueued.status).toBe(200);
++    const staleMcpQueuedPayload = (await mcpJson(staleMcpQueued)) as { result: { structuredContent: { freshness: string; rebuildEnqueued: boolean }; content: Array<{ text: string }> } };
++    expect(staleMcpQueuedPayload.result.structuredContent).toMatchObject({ freshness: "rebuilding", rebuildEnqueued: true });
++    expect(staleMcpQueuedPayload.result.content[0]?.text).toContain("background rebuild enqueued");
++
++    const queueDownEnv = createTestEnv({
++      JOBS: {
++        async send() {
++          throw new Error("queue offline");
++        },
++      } as unknown as Queue,
++    });
++    await persistSignalSnapshot(queueDownEnv, {
++      id: "stale-mcp-queue-down",
++      signalType: "contributor-decision-pack",
++      targetKey: "mcp-stale-user",
++      payload: {
++        status: "ready",
++        source: "computed",
++        login: "mcp-stale-user",
++        generatedAt: "2026-01-01T00:00:00.000Z",
++        stale: false,
++        freshness: "fresh",
++        rebuildEnqueued: false,
++        scoringModelSnapshotId: "scoring-1",
++        profile: {},
++        outcomeHistory: {},
++        roleContexts: [],
++        repoDecisions: [{ repoFullName: "owner/repo", recommendation: "pursue" }],
++        topActions: [{ actionKind: "open_new_direct_pr", repoFullName: "owner/repo", priorityScore: 50 }],
++        cleanupFirst: [],
++        pursueRepos: [{ repoFullName: "owner/repo", recommendation: "pursue" }],
++        avoidRepos: [],
++        maintainerLaneRepos: [],
++        scoreBlockers: [],
++        dataQuality: { signalFidelity: { status: "complete" } },
++        summary: "stale",
++        nextActions: ["pick a narrow change"],
++      } as never,
++      generatedAt: "2026-01-01T00:00:00.000Z",
++    });
++    const staleMcp = await app.request(
++      "/mcp",
++      {
++        method: "POST",
++        headers: mcpHeaders(queueDownEnv),
++        body: JSON.stringify({
++          jsonrpc: "2.0",
++          id: "stale-mcp-queue-down",
++          method: "tools/call",
++          params: { name: "gittensory_get_decision_pack", arguments: { login: "mcp-stale-user" } },
++        }),
++      },
++      queueDownEnv,
++    );
++    expect(staleMcp.status).toBe(200);
++    const staleMcpPayload = (await mcpJson(staleMcp)) as { result: { structuredContent: { freshness: string; rebuildEnqueued: boolean }; content: Array<{ text: string }> } };
++    expect(staleMcpPayload.result.structuredContent).toMatchObject({ freshness: "stale", rebuildEnqueued: false });
++    expect(staleMcpPayload.result.content[0]?.text).toContain("rebuild not enqueued");
++    expect(staleMcpPayload.result.content[0]?.text).not.toContain("background rebuild enqueued");
+ 
+     await persistSignalSnapshot(env, {
+       id: "fresh-empty-pack",
+diff --git a/test/integration/routes-errors.test.ts b/test/integration/routes-errors.test.ts
+index 02958ffb..f63acef7 100644
+--- a/test/integration/routes-errors.test.ts
++++ b/test/integration/routes-errors.test.ts
+@@ -428,6 +428,12 @@ describe("api route guards and error branches", () => {
+       body: JSON.stringify({ repoFullName: "JSONbored/gittensory" }),
+     }, env);
+     expect(queuedForecasts.status).toBe(202);
++
++    expect((await app.request("/v1/internal/jobs/backfill-pr-details", { method: "POST", headers: internalHeaders(env), body: "{}" }, env)).status).toBe(400);
++    expect((await app.request("/v1/internal/jobs/backfill-pr-details", { method: "POST", headers: internalHeaders(env), body: JSON.stringify({ repoFullName: "" }) }, env)).status).toBe(400);
++    expect((await app.request("/v1/internal/jobs/backfill-pr-details/run", { method: "POST", headers: internalHeaders(env), body: "{}" }, env)).status).toBe(400);
++    expect((await app.request("/v1/internal/jobs/build-contributor-decision-packs", { method: "POST", headers: internalHeaders(env), body: "not-json" }, env)).status).toBe(202);
++    expect((await app.request("/v1/internal/jobs/build-contributor-evidence", { method: "POST", headers: internalHeaders(env), body: "not-json" }, env)).status).toBe(202);
+     expect(queued).toEqual(
+       expect.arrayContaining([
+         expect.objectContaining({ type: "refresh-scoring-model" }),
+diff --git a/test/unit/agent-orchestrator.test.ts b/test/unit/agent-orchestrator.test.ts
+index b2562498..252df115 100644
+--- a/test/unit/agent-orchestrator.test.ts
++++ b/test/unit/agent-orchestrator.test.ts
+@@ -88,8 +88,21 @@ describe("agent orchestrator", () => {
+       updatedAt: nowIso(),
+     };
+     await createAgentRun(interruptedEnv, run);
+-    const failed = await executeAgentRun(interruptedEnv, run.id);
+-    expect(failed.run).toMatchObject({ status: "failed", errorSummary: "agent_run_failed" });
++    const tolerated = await executeAgentRun(interruptedEnv, run.id);
++    expect(tolerated.run).toMatchObject({
++      status: "needs_snapshot_refresh",
++      payload: expect.objectContaining({
++        rebuildEnqueued: false,
++        refreshReason: "queue_unavailable",
++        freshness: "missing",
++      }),
++    });
++    const auditRows = ((await interruptedEnv.DB.prepare("SELECT event_type, actor, outcome FROM audit_events").all()) as { results: Array<{ event_type: string; actor: string | null; outcome: string | null }> }).results;
++    expect(auditRows).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ event_type: "decision_pack.rebuild_enqueue_failed", actor: "oktofeesh1", outcome: "error" }),
++      ]),
++    );
+   });
+ 
+   it("ranks decision-pack actions, persists context snapshots, and sanitizes public summaries", async () => {
+@@ -113,6 +126,53 @@ describe("agent orchestrator", () => {
+     });
+   });
+ 
++  it("serves a stale decision pack as a completed run with degraded data quality and a freshness warning", async () => {
++    const sent: unknown[] = [];
++    const env = createTestEnv({
++      JOBS: {
++        async send(message: unknown) {
++          sent.push(message);
++        },
++      } as unknown as Queue,
++    });
++    const stalePack = decisionPackFixture({
++      generatedAt: "2026-01-01T00:00:00.000Z",
++      dataQuality: {
++        signalFidelity: {
++          status: "complete",
++          repoCount: 1,
++          completeRepos: 1,
++          degradedRepos: 0,
++          blockedRepos: 0,
++          partialRepos: [],
++          cappedRepos: [],
++          staleRepos: [],
++          rateLimitedRepos: [],
++        },
++      } as unknown as ContributorDecisionPack["dataQuality"],
++    });
++    await persistSignalSnapshot(env, {
++      id: "stale-pack-orch",
++      signalType: CONTRIBUTOR_DECISION_PACK_SIGNAL,
++      targetKey: stalePack.login,
++      payload: stalePack as unknown as Record<string, JsonValue>,
++      generatedAt: "2026-01-01T00:00:00.000Z",
++    });
++
++    const bundle = await planNextWork(env, { login: "oktofeesh1", repoFullName: "we-promise/sure" });
++
++    expect(bundle.run).toMatchObject({
++      status: "completed",
++      dataQualityStatus: "degraded",
++      payload: expect.objectContaining({ freshness: "rebuilding", rebuildEnqueued: true, refreshReason: "stale_decision_pack" }),
++    });
++    expect(bundle.actions.length).toBeGreaterThan(0);
++    expect(bundle.contextSnapshots[0]?.freshnessWarnings ?? []).toEqual(
++      expect.arrayContaining([expect.stringMatching(/^decision pack is stale.*background rebuild enqueued$/)]),
++    );
++    expect(sent).toContainEqual({ type: "build-contributor-decision-packs", requestedBy: "api", login: "oktofeesh1" });
++  });
++
+   it("attaches optional Workers AI summaries when enabled", async () => {
+     const env = createTestEnv({
+       AI: { run: vi.fn(async () => ({ response: "Clean up queue pressure before adding more work." })) } as unknown as Ai,
+diff --git a/test/unit/decision-pack.test.ts b/test/unit/decision-pack.test.ts
+index f7eab761..fde0ae1f 100644
+--- a/test/unit/decision-pack.test.ts
++++ b/test/unit/decision-pack.test.ts
+@@ -1,9 +1,9 @@
+-import { describe, expect, it } from "vitest";
++import { describe, expect, it, vi } from "vitest";
+ import { persistSignalSnapshot } from "../../src/db/repositories";
+ import {
+   __decisionPackInternals,
+   loadContributorDecisionPack,
+-  loadFreshContributorDecisionPack,
++  loadContributorDecisionPackForServing,
+   repoDecisionFromPack,
+   type ContributorDecisionPack,
+   type RepoDecision,
+@@ -141,11 +141,9 @@ describe("decision-pack service", () => {
+     });
+ 
+     const loaded = await loadContributorDecisionPack(env, "jsonbored");
+-    expect(loaded).toMatchObject({ source: "snapshot", snapshotAgeSeconds: expect.any(Number), stale: expect.any(Boolean) });
++    expect(loaded).toMatchObject({ source: "snapshot", snapshotAgeSeconds: expect.any(Number), stale: expect.any(Boolean), freshness: "stale", rebuildEnqueued: false });
+     expect(repoDecisionFromPack(loaded!, "jsonbored/AWESOME-CLAUDE")).toMatchObject({ recommendation: "maintainer_lane" });
+     expect(repoDecisionFromPack(loaded!, "missing/repo")).toBeNull();
+-    await expect(loadFreshContributorDecisionPack(env, "jsonbored", 1)).resolves.toBeNull();
+-    await expect(loadFreshContributorDecisionPack(env, "missing", 1)).resolves.toBeNull();
+ 
+     expect(__decisionPackInternals.sanitizeOfficialStats({ gittensor: null } as any)).toBeNull();
+     expect(__decisionPackInternals.sanitizeOfficialStats({ gittensor: { hotkey: "secret", totalMergedPrs: 5 } } as any)).toEqual({ totalMergedPrs: 5 });
+@@ -180,6 +178,342 @@ describe("decision-pack service", () => {
+     expect(__decisionPackInternals.snapshotAgeMs("not-a-date")).toBe(Number.POSITIVE_INFINITY);
+   });
+ 
++  it("serves fresh, stale, and missing decision packs with explicit freshness and rebuild signals", async () => {
++    const sends: Array<Record<string, unknown>> = [];
++    const env = createTestEnv({
++      JOBS: {
++        async send(message: Record<string, unknown>) {
++          sends.push(message);
++        },
++      } as unknown as Queue,
++    });
++
++    const missing = await loadContributorDecisionPackForServing(env, "ghost-user");
++    expect(missing).toMatchObject({
++      kind: "needs_refresh",
++      refresh: { freshness: "missing", reason: "missing_snapshot", rebuildEnqueued: true },
++    });
++    expect(missing.kind === "needs_refresh" && "enqueued" in missing.refresh).toBe(false);
++    expect(sends.at(-1)).toMatchObject({ type: "build-contributor-decision-packs", login: "ghost-user" });
++
++    const stalePackPayload = {
++      status: "ready",
++      source: "computed",
++      login: "stale-user",
++      generatedAt: "2026-01-01T00:00:00.000Z",
++      stale: false,
++      freshness: "fresh",
++      rebuildEnqueued: false,
++      scoringModelSnapshotId: "scoring-1",
++      profile: {},
++      outcomeHistory: {},
++      roleContexts: [],
++      repoDecisions: [{ repoFullName: "owner/repo", recommendation: "pursue" }],
++      topActions: [{ actionKind: "open_new_direct_pr", repoFullName: "owner/repo", priorityScore: 50 }],
++      cleanupFirst: [],
++      pursueRepos: [{ repoFullName: "owner/repo", recommendation: "pursue" }],
++      avoidRepos: [],
++      maintainerLaneRepos: [],
++      scoreBlockers: [],
++      dataQuality: { signalFidelity: { status: "complete", partialRepos: [], cappedRepos: [], staleRepos: [], rateLimitedRepos: [] } },
++      summary: "stale fixture",
++      nextActions: ["pick a narrow change"],
++    } as unknown as ContributorDecisionPack;
++
++    await persistSignalSnapshot(env, {
++      id: "stale-serving",
++      signalType: "contributor-decision-pack",
++      targetKey: "stale-user",
++      payload: stalePackPayload as unknown as Record<string, never>,
++      generatedAt: "2026-01-01T00:00:00.000Z",
++    });
++
++    const stale = await loadContributorDecisionPackForServing(env, "stale-user");
++    expect(stale.kind).toBe("ready");
++    if (stale.kind === "ready") {
++      expect(stale.pack.freshness).toBe("rebuilding");
++      expect(stale.pack.rebuildEnqueued).toBe(true);
++      expect(stale.pack.stale).toBe(true);
++      expect(stale.pack.topActions.length).toBeGreaterThan(0);
++      expect(stale.pack.repoDecisions.length).toBeGreaterThan(0);
++    }
++    expect(sends.filter((s) => s.login === "stale-user")).toHaveLength(1);
++
++    const staleNoEnqueue = await loadContributorDecisionPackForServing(env, "stale-user", { enqueueRebuild: false });
++    expect(staleNoEnqueue.kind).toBe("ready");
++    if (staleNoEnqueue.kind === "ready") {
++      expect(staleNoEnqueue.pack.freshness).toBe("stale");
++      expect(staleNoEnqueue.pack.rebuildEnqueued).toBe(false);
++    }
++    expect(sends.filter((s) => s.login === "stale-user")).toHaveLength(1);
++
++    await persistSignalSnapshot(env, {
++      id: "fresh-serving",
++      signalType: "contributor-decision-pack",
++      targetKey: "fresh-user",
++      payload: {
++        ...stalePackPayload,
++        login: "fresh-user",
++        generatedAt: new Date(Date.now() - 60_000).toISOString(),
++      } as unknown as Record<string, never>,
++      generatedAt: new Date(Date.now() - 60_000).toISOString(),
++    });
++
++    const sendsBefore = sends.length;
++    const fresh = await loadContributorDecisionPackForServing(env, "fresh-user");
++    expect(fresh.kind).toBe("ready");
++    if (fresh.kind === "ready") {
++      expect(fresh.pack.freshness).toBe("fresh");
++      expect(fresh.pack.rebuildEnqueued).toBe(false);
++      expect(fresh.pack.stale).toBe(false);
++    }
++    expect(sends.length).toBe(sendsBefore);
++
++    const enqueueErrorEnv = createTestEnv({
++      JOBS: {
++        async send() {
++          throw new Error("queue down");
++        },
++      } as unknown as Queue,
++    });
++    const missingNoEnqueue = await loadContributorDecisionPackForServing(enqueueErrorEnv, "any-user");
++    expect(missingNoEnqueue).toMatchObject({
++      kind: "needs_refresh",
++      refresh: { freshness: "missing", rebuildEnqueued: false },
++    });
++  });
++
++  it("does not call broad contributor or repo listers on the serving path", async () => {
++    const env = createTestEnv();
++    const broadListers = await import("../../src/db/repositories");
++    const spies = [
++      vi.spyOn(broadListers, "listContributorPullRequests"),
++      vi.spyOn(broadListers, "listContributorIssues"),
++      vi.spyOn(broadListers, "listContributorRepoStats"),
++      vi.spyOn(broadListers, "listRepositories"),
++      vi.spyOn(broadListers, "listRepoSyncStates"),
++      vi.spyOn(broadListers, "listRepoSyncSegments"),
++      vi.spyOn(broadListers, "listLatestRepoGithubTotalsSnapshots"),
++    ];
++
++    await loadContributorDecisionPackForServing(env, "ghost-user");
++
++    await persistSignalSnapshot(env, {
++      id: "perf-stale-pack",
++      signalType: "contributor-decision-pack",
++      targetKey: "perf-user",
++      payload: {
++        status: "ready",
++        source: "computed",
++        login: "perf-user",
++        generatedAt: "2026-01-01T00:00:00.000Z",
++        stale: false,
++        freshness: "fresh",
++        rebuildEnqueued: false,
++        scoringModelSnapshotId: "scoring-1",
++        profile: {},
++        outcomeHistory: {},
++        roleContexts: [],
++        repoDecisions: [],
++        topActions: [],
++        cleanupFirst: [],
++        pursueRepos: [],
++        avoidRepos: [],
++        maintainerLaneRepos: [],
++        scoreBlockers: [],
++        dataQuality: { signalFidelity: { status: "degraded" } },
++        summary: "stale",
++        nextActions: [],
++      } as unknown as Record<string, never>,
++      generatedAt: "2026-01-01T00:00:00.000Z",
++    });
++    await loadContributorDecisionPackForServing(env, "perf-user");
++
++    for (const spy of spies) {
++      expect(spy).not.toHaveBeenCalled();
++      spy.mockRestore();
++    }
++  });
++
++  it("debounces repeated stale-pack rebuild requests via the audit log", async () => {
++    const sends: Array<Record<string, unknown>> = [];
++    let releaseSend!: () => void;
++    let markSendStarted!: () => void;
++    const sendStarted = new Promise<void>((resolve) => {
++      markSendStarted = resolve;
++    });
++    const sendReleased = new Promise<void>((resolve) => {
++      releaseSend = resolve;
++    });
++    const env = createTestEnv({
++      JOBS: {
++        async send(message: Record<string, unknown>) {
++          sends.push(message);
++          markSendStarted();
++          await sendReleased;
++        },
++      } as unknown as Queue,
++    });
++    await persistSignalSnapshot(env, {
++      id: "debounce-stale",
++      signalType: "contributor-decision-pack",
++      targetKey: "hot-user",
++      payload: {
++        status: "ready",
++        source: "computed",
++        login: "hot-user",
++        generatedAt: "2026-01-01T00:00:00.000Z",
++        stale: false,
++        freshness: "fresh",
++        rebuildEnqueued: false,
++        scoringModelSnapshotId: "scoring-1",
++        profile: {},
++        outcomeHistory: {},
++        roleContexts: [],
++        repoDecisions: [],
++        topActions: [],
++        cleanupFirst: [],
++        pursueRepos: [],
++        avoidRepos: [],
++        maintainerLaneRepos: [],
++        scoreBlockers: [],
++        dataQuality: { signalFidelity: { status: "complete" } },
++        summary: "stale",
++        nextActions: [],
++      } as unknown as Record<string, never>,
++      generatedAt: "2026-01-01T00:00:00.000Z",
++    });
++
++    const first = loadContributorDecisionPackForServing(env, "hot-user");
++    const racing = Array.from({ length: 3 }, () => loadContributorDecisionPackForServing(env, "hot-user"));
++    await sendStarted;
++    const joined = Array.from({ length: 2 }, () => loadContributorDecisionPackForServing(env, "hot-user"));
++    releaseSend();
++    const results = await Promise.all([first, ...racing, ...joined]);
++    for (const result of results) {
++      expect(result.kind).toBe("ready");
++      if (result.kind === "ready") {
++        expect(result.pack.freshness).toBe("rebuilding");
++        expect(result.pack.rebuildEnqueued).toBe(true);
++      }
++    }
++    expect(sends.filter((s) => s.login === "hot-user")).toHaveLength(1);
++
++    const afterAuditDebounce = await loadContributorDecisionPackForServing(env, "hot-user");
++    expect(afterAuditDebounce).toMatchObject({ kind: "ready", pack: { freshness: "rebuilding", rebuildEnqueued: true } });
++    expect(sends.filter((s) => s.login === "hot-user")).toHaveLength(1);
++  });
++
++  it("returns freshness:missing with rebuildEnqueued:false when enqueueRebuild is disabled and no snapshot exists", async () => {
++    const sends: Array<Record<string, unknown>> = [];
++    const env = createTestEnv({
++      JOBS: {
++        async send(message: Record<string, unknown>) {
++          sends.push(message);
++        },
++      } as unknown as Queue,
++    });
++    const result = await loadContributorDecisionPackForServing(env, "ghost", { enqueueRebuild: false });
++    expect(result.kind).toBe("needs_refresh");
++    if (result.kind === "needs_refresh") {
++      expect(result.refresh.rebuildEnqueued).toBe(false);
++      expect(result.refresh.freshness).toBe("missing");
++    }
++    expect(sends).toHaveLength(0);
++  });
++
++  it("covers scoreBlockersFor and withSnapshotMetadata fallback branches", () => {
++    const noOutcomeBlockers = __decisionPackInternals.scoreBlockersFor("owner/x", "direct_pr", { maintainerLane: false } as any, undefined);
++    expect(noOutcomeBlockers.map((b) => b.code)).not.toContain("open_pr_pressure");
++    expect(noOutcomeBlockers.map((b) => b.code)).not.toContain("closed_pr_credibility");
++    expect(noOutcomeBlockers.map((b) => b.code)).not.toContain("low_credibility");
++
++    const belowThresholdBlockers = __decisionPackInternals.scoreBlockersFor(
++      "owner/healthy",
++      "direct_pr",
++      { maintainerLane: false } as any,
++      { openPullRequests: 1, closedPullRequestRate: 0.1, credibility: 1, maintainerLane: false } as any,
++    );
++    expect(belowThresholdBlockers.map((b) => b.code)).not.toEqual(expect.arrayContaining(["open_pr_pressure", "closed_pr_credibility", "low_credibility"]));
++
++    const fellbackToNow = __decisionPackInternals.withSnapshotMetadata({
++      id: "snap-both-null",
++      signalType: "contributor-decision-pack",
++      targetKey: "user",
++      generatedAt: null,
++      payload: { status: "ready", source: "computed", login: "user", repoDecisions: [], topActions: [] } as any,
++    });
++    expect(typeof fellbackToNow.generatedAt).toBe("string");
++    expect(fellbackToNow.generatedAt.length).toBeGreaterThan(0);
++  });
++
++  it("records non-Error queue failures with String(error) detail", async () => {
++    const env = createTestEnv({
++      JOBS: {
++        async send() {
++          throw "queue offline string";
++        },
++      } as unknown as Queue,
++    });
++    const result = await loadContributorDecisionPackForServing(env, "string-throw-user");
++    expect(result.kind).toBe("needs_refresh");
++    if (result.kind === "needs_refresh") {
++      expect(result.refresh.rebuildEnqueued).toBe(false);
++    }
++    const rows = ((await env.DB.prepare("SELECT detail FROM audit_events WHERE event_type='decision_pack.rebuild_enqueue_failed'").all()) as { results: Array<{ detail: string }> }).results;
++    expect(rows[0]?.detail).toContain("queue offline string");
++  });
++
++  it("returns freshness:stale with rebuildEnqueued:false when a stale pack is served and the queue throws", async () => {
++    const env = createTestEnv({
++      JOBS: {
++        async send() {
++          throw new Error("queue offline");
++        },
++      } as unknown as Queue,
++    });
++    await persistSignalSnapshot(env, {
++      id: "stale-queue-down",
++      signalType: "contributor-decision-pack",
++      targetKey: "queue-down-user",
++      payload: {
++        status: "ready",
++        source: "computed",
++        login: "queue-down-user",
++        generatedAt: "2026-01-01T00:00:00.000Z",
++        stale: false,
++        freshness: "fresh",
++        rebuildEnqueued: false,
++        scoringModelSnapshotId: "scoring-1",
++        profile: {},
++        outcomeHistory: {},
++        roleContexts: [],
++        repoDecisions: [{ repoFullName: "owner/r", recommendation: "pursue" }],
++        topActions: [{ actionKind: "open_new_direct_pr", repoFullName: "owner/r", priorityScore: 1 }],
++        cleanupFirst: [],
++        pursueRepos: [],
++        avoidRepos: [],
++        maintainerLaneRepos: [],
++        scoreBlockers: [],
++        dataQuality: { signalFidelity: { status: "complete" } },
++        summary: "stale",
++        nextActions: [],
++      } as unknown as Record<string, never>,
++      generatedAt: "2026-01-01T00:00:00.000Z",
++    });
++
++    const result = await loadContributorDecisionPackForServing(env, "queue-down-user");
++    expect(result.kind).toBe("ready");
++    if (result.kind === "ready") {
++      expect(result.pack.freshness).toBe("stale");
++      expect(result.pack.rebuildEnqueued).toBe(false);
++      expect(result.pack.topActions.length).toBeGreaterThan(0);
++    }
++    const auditRows = ((await env.DB.prepare("SELECT event_type FROM audit_events").all()) as { results: Array<{ event_type: string }> }).results;
++    expect(auditRows.map((r) => r.event_type)).toContain("decision_pack.rebuild_enqueue_failed");
++    expect(auditRows.map((r) => r.event_type)).not.toContain("decision_pack.rebuild_enqueued");
++  });
++
+   it("builds a snapshot-style decision pack with maintainer, cleanup, pursue, watch, and avoid lanes", () => {
+     const profile = {
+       login: "jsonbored",
+diff --git a/test/unit/github-commands.test.ts b/test/unit/github-commands.test.ts
+index 206e2dde..a9ed70e2 100644
+--- a/test/unit/github-commands.test.ts
++++ b/test/unit/github-commands.test.ts
+@@ -73,7 +73,7 @@ describe("GitHub mention commands", () => {
+           mode: "copilot",
+           status: "completed",
+           dataQualityStatus: "complete",
+-          payload: {},
++          payload: { freshness: "rebuilding", rebuildEnqueued: true },
+         },
+         actions: [
+           {
+@@ -96,6 +96,8 @@ describe("GitHub mention commands", () => {
+     });
+     expect(body).toContain("<!-- gittensory-agent-command -->");
+     expect(body).toContain("Scope: this repository#12");
++    expect(body).not.toContain("Decision snapshot is stale");
++    expect(body).not.toContain("background rebuild");
+     expect(body).not.toMatch(/wallet|hotkey|coldkey|estimated score|reward estimate|payout|farming|raw trust score|reviewability|private ranking/i);
+     expect(body).not.toMatch(/private context,\s*private context/i);
+     expect(sanitizePublicComment("wallet hotkey payout reviewability private ranking")).not.toMatch(
+@@ -212,6 +214,30 @@ describe("GitHub mention commands", () => {
+     });
+     expect(refresh).toContain("**Blocker snapshot refresh**");
+ 
++    const duplicateRefresh = buildPublicAgentCommandComment({
++      command: parseGittensoryMentionCommand("@gittensory duplicate-check")!,
++      repo: null,
++      issue: { number: 33, title: "PR", state: "open", pull_request: {} },
++      pullRequest: null,
++      actorKind: "author",
++      bundle: {
++        run: {
++          id: "run-duplicate-refresh",
++          objective: "refresh",
++          actorLogin: "oktofeesh1",
++          surface: "github_comment",
++          mode: "copilot",
++          status: "needs_snapshot_refresh",
++          dataQualityStatus: "unknown",
++          payload: {},
++        },
++        actions: [],
++        contextSnapshots: [],
++        summary: "refresh",
++      },
++    });
++    expect(duplicateRefresh).toContain("**Duplicate-check snapshot refresh**");
++
+     const empty = buildPublicAgentCommandComment({
+       command: parseGittensoryMentionCommand("@gittensory next-action")!,
+       repo: null,

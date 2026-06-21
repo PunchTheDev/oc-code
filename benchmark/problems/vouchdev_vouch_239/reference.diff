@@ -1,0 +1,458 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e097e6b..b8a60c2 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,12 @@ All notable changes to vouch are documented here. Format follows
+ ## [Unreleased]
+ 
+ ### Added
++- Entity-salience retrieval reflex: a per-session, in-memory ring buffer of
++  recent caller queries drives a zero-LLM substring/FTS entity pass that
++  attaches top-K matched claim candidates as `_meta.vouch_salience` on
++  `kb_context` read responses. Config-gated via `retrieval.reflex`
++  (`enabled`/`window`/`top_k`); the buffer is never persisted and resets on
++  `session_end` (#223).
+ - `vouch eval recall <queries.jsonl>` — score `kb.context` retrieval against a
+   labeled query set with pure-Python P@k / R@k / MRR / nDCG, compare against a
+   committed `eval/baseline.json`, and fail CI on a P@5 regression beyond
+diff --git a/src/vouch/jsonl_server.py b/src/vouch/jsonl_server.py
+index 1d0202e..109f6f7 100644
+--- a/src/vouch/jsonl_server.py
++++ b/src/vouch/jsonl_server.py
+@@ -28,6 +28,7 @@
+ 
+ from . import audit, bundle, health, volunteer_context
+ from . import lifecycle as life
++from . import salience as salience_mod
+ from . import sessions as sess_mod
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+@@ -157,11 +158,25 @@ def _h_search(p: dict) -> dict:
+     }
+ 
+ 
++def _load_cfg(store: KBStore) -> dict:
++    try:
++        loaded = yaml.safe_load((store.kb_dir / "config.yaml").read_text())
++    except Exception:
++        return {}
++    return loaded if isinstance(loaded, dict) else {}
++
+ 
+ def _h_context(p: dict) -> dict:
+-    return build_context_pack(  # type: ignore[return-value]
+-        _store(),
+-        query=p["task"],
++    store = _store()
++    query = p["task"]
++    cfg = _load_cfg(store)
++    session_id = p.get("session_id")
++    if session_id:
++        _, window, _ = salience_mod.reflex_cfg(cfg)
++        salience_mod.record_query(session_id, query, window=window)
++    result: dict = build_context_pack(  # type: ignore[assignment]
++        store,
++        query=query,
+         limit=int(p.get("limit", 10)),
+         max_chars=int(p["max_chars"]) if p.get("max_chars") is not None else None,
+         min_items=int(p.get("min_items", 0)),
+@@ -171,6 +186,7 @@ def _h_context(p: dict) -> dict:
+         project=p.get("project"),
+         agent=p.get("agent"),
+     )
++    return salience_mod.attach_salience(result, store, session_id, cfg)
+ 
+ 
+ def _h_read_page(p: dict) -> dict:
+diff --git a/src/vouch/salience.py b/src/vouch/salience.py
+new file mode 100644
+index 0000000..a6038f7
+--- /dev/null
++++ b/src/vouch/salience.py
+@@ -0,0 +1,199 @@
++"""Entity-salience retrieval reflex — auto-prefetch claim candidates.
++
++Keeps a per-session, in-memory ring buffer of the recent query strings a
++caller passed to the read path. On each read it runs a zero-LLM entity pass
++(substring match on entity name/aliases, plus FTS via the existing index
++when available) over the buffered queries and attaches the top-K matched
++entities — with the claims that reference them — as ``_meta.vouch_salience``.
++
++Design constraints (issue #223):
++  - zero LLM calls — substring + FTS only;
++  - per-session state only, keyed by ``session_id``;
++  - the ring buffer is NEVER written to disk;
++  - buffers expire after 30 minutes of inactivity.
++
++Config (read defensively from ``.vouch/config.yaml``, like the rest of the
++codebase — no pydantic Config model):
++  - ``retrieval.reflex.enabled`` (default True)
++  - ``retrieval.reflex.window`` (default 8)
++  - ``retrieval.reflex.top_k`` (default 3)
++"""
++
++from __future__ import annotations
++
++import sqlite3
++import time
++from collections import deque
++from dataclasses import dataclass, field
++from typing import Any
++
++from . import index_db
++from .storage import KBStore
++
++DEFAULT_WINDOW = 8
++DEFAULT_TOP_K = 3
++_EXPIRY_SECONDS = 30 * 60
++
++
++@dataclass
++class _SessionBuffer:
++    queries: deque[str]
++    last_active: float = field(default_factory=time.monotonic)
++
++
++# Module-level in-memory state. Keyed by session_id. Never persisted.
++_BUFFERS: dict[str, _SessionBuffer] = {}
++
++
++def _expire_stale(now: float) -> None:
++    stale = [
++        sid for sid, buf in _BUFFERS.items()
++        if now - buf.last_active > _EXPIRY_SECONDS
++    ]
++    for sid in stale:
++        del _BUFFERS[sid]
++
++
++def record_query(session_id: str, query: str, *, window: int = DEFAULT_WINDOW) -> None:
++    """Append ``query`` to this session's in-memory ring buffer."""
++    query = (query or "").strip()
++    if not session_id or not query:
++        return
++    now = time.monotonic()
++    _expire_stale(now)
++    window = max(1, window)
++    buf = _BUFFERS.get(session_id)
++    if buf is None or buf.queries.maxlen != window:
++        existing = list(buf.queries) if buf is not None else []
++        buf = _SessionBuffer(queries=deque(existing, maxlen=window))
++        _BUFFERS[session_id] = buf
++    buf.queries.append(query)
++    buf.last_active = now
++
++
++def reset_session(session_id: str) -> None:
++    """Clear a session's buffer — called when the session ends."""
++    _BUFFERS.pop(session_id, None)
++
++
++def _buffered_queries(session_id: str) -> list[str]:
++    now = time.monotonic()
++    _expire_stale(now)
++    buf = _BUFFERS.get(session_id)
++    if buf is None:
++        return []
++    buf.last_active = now
++    return list(buf.queries)
++
++
++def _fts_entity_ids(store: KBStore, query: str) -> list[str]:
++    """Entity ids the FTS index matches for ``query`` (best-effort)."""
++    try:
++        hits = index_db.search(store.kb_dir, query, limit=50)
++    except sqlite3.Error:
++        return []
++    return [hid for kind, hid, _snip, _score in hits if kind == "entity"]
++
++
++def _substring_entity_ids(entities: list[Any], query: str) -> list[str]:
++    """Entity ids whose name or any alias appears in ``query`` (or vice versa)."""
++    q = query.casefold()
++    matched: list[str] = []
++    for ent in entities:
++        needles = [ent.name, *ent.aliases]
++        for needle in needles:
++            n = (needle or "").casefold()
++            if n and (n in q or q in n):
++                matched.append(ent.id)
++                break
++    return matched
++
++
++def compute_salience(
++    store: KBStore, session_id: str, *, top_k: int = DEFAULT_TOP_K
++) -> list[dict]:
++    """Rank buffered-query entity matches; return top-K salience records.
++
++    Each record is ``{"entity_id", "claim_count", "top_claim_id"}`` where
++    ``claim_count`` is the number of claims referencing the entity and
++    ``top_claim_id`` is the highest-relevance claim (or None).
++    """
++    queries = _buffered_queries(session_id)
++    if not queries:
++        return []
++
++    entities = store.list_entities()
++    if not entities:
++        return []
++    by_id = {ent.id: ent for ent in entities}
++
++    # Score entities by how many buffered queries match them (substring + FTS).
++    scores: dict[str, int] = {}
++    for query in queries:
++        hits = set(_substring_entity_ids(entities, query))
++        hits.update(eid for eid in _fts_entity_ids(store, query) if eid in by_id)
++        for eid in hits:
++            scores[eid] = scores.get(eid, 0) + 1
++
++    if not scores:
++        return []
++
++    # Claims referencing each matched entity, by claim id (for stable picking).
++    claims_by_entity: dict[str, list[str]] = {}
++    for claim in store.list_claims():
++        for eid in claim.entities:
++            if eid in scores:
++                claims_by_entity.setdefault(eid, []).append(claim.id)
++
++    ranked = sorted(
++        scores,
++        key=lambda eid: (scores[eid], len(claims_by_entity.get(eid, [])), eid),
++        reverse=True,
++    )
++
++    out: list[dict] = []
++    for eid in ranked[: max(0, top_k)]:
++        claim_ids = sorted(claims_by_entity.get(eid, []))
++        out.append({
++            "entity_id": eid,
++            "claim_count": len(claim_ids),
++            "top_claim_id": claim_ids[0] if claim_ids else None,
++        })
++    return out
++
++
++def reflex_cfg(cfg: dict) -> tuple[bool, int, int]:
++    """Read ``retrieval.reflex`` config defensively. Returns (enabled, window, top_k)."""
++    retrieval = cfg.get("retrieval") if isinstance(cfg, dict) else None
++    reflex = retrieval.get("reflex") if isinstance(retrieval, dict) else None
++    if not isinstance(reflex, dict):
++        reflex = {}
++
++    enabled = reflex.get("enabled", True)
++    enabled = bool(enabled) if isinstance(enabled, bool) else True
++
++    window = reflex.get("window", DEFAULT_WINDOW)
++    window = window if isinstance(window, int) and window > 0 else DEFAULT_WINDOW
++
++    top_k = reflex.get("top_k", DEFAULT_TOP_K)
++    top_k = top_k if isinstance(top_k, int) and top_k > 0 else DEFAULT_TOP_K
++
++    return enabled, window, top_k
++
++
++def attach_salience(
++    result: dict, store: KBStore, session_id: str | None, cfg: dict
++) -> dict:
++    """Attach ``_meta.vouch_salience`` to ``result`` when the reflex applies.
++
++    No-op (returns ``result`` unchanged, no field added) when the reflex is
++    disabled, no ``session_id`` is given, or the session buffer is empty.
++    """
++    enabled, _window, top_k = reflex_cfg(cfg)
++    if not enabled or not session_id:
++        return result
++    salience = compute_salience(store, session_id, top_k=top_k)
++    if not salience:
++        return result
++    result.setdefault("_meta", {})["vouch_salience"] = salience
++    return result
+diff --git a/src/vouch/server.py b/src/vouch/server.py
+index 7d3efe7..99587e9 100644
+--- a/src/vouch/server.py
++++ b/src/vouch/server.py
+@@ -16,10 +16,12 @@
+ from pathlib import Path
+ from typing import Any
+ 
++import yaml
+ from mcp.server.fastmcp import FastMCP
+ 
+ from . import audit, bundle, health, volunteer_context
+ from . import lifecycle as life
++from . import salience as salience_mod
+ from . import sessions as sess_mod
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+@@ -171,6 +173,14 @@ def _to_dicts(h: list[tuple[str, str, str, float]], used: str) -> dict[str, Any]
+     raise ValueError(f"unknown backend: {backend}")
+ 
+ 
++def _load_cfg(store: KBStore) -> dict[str, Any]:
++    try:
++        loaded = yaml.safe_load((store.kb_dir / "config.yaml").read_text())
++    except Exception:
++        return {}
++    return loaded if isinstance(loaded, dict) else {}
++
++
+ @mcp.tool()
+ def kb_context(
+     task: str,
+@@ -178,15 +188,26 @@ def kb_context(
+     max_chars: int | None = None,
+     min_items: int = 0,
+     require_citations: bool = False,
++    session_id: str | None = None,
+     project: str | None = None,
+     agent: str | None = None,
+ ) -> dict[str, Any]:
+-    """Build a ContextPack ready to inject into an agent prompt."""
+-    return build_context_pack(  # type: ignore[return-value]
+-        _store(), query=task, limit=limit, max_chars=max_chars,
++    """Build a ContextPack ready to inject into an agent prompt.
++
++    When ``session_id`` is given, the entity-salience reflex records the query
++    and may attach ``_meta.vouch_salience`` (see ``salience`` module).
++    """
++    store = _store()
++    cfg = _load_cfg(store)
++    if session_id:
++        _, window, _ = salience_mod.reflex_cfg(cfg)
++        salience_mod.record_query(session_id, task, window=window)
++    result: dict[str, Any] = build_context_pack(  # type: ignore[assignment]
++        store, query=task, limit=limit, max_chars=max_chars,
+         min_items=min_items, require_citations=require_citations,
+         project=project, agent=agent,
+     )
++    return salience_mod.attach_salience(result, store, session_id, cfg)
+ 
+ 
+ @mcp.tool()
+diff --git a/src/vouch/sessions.py b/src/vouch/sessions.py
+index 6a39d8b..dcebb33 100644
+--- a/src/vouch/sessions.py
++++ b/src/vouch/sessions.py
+@@ -39,6 +39,7 @@ def session_start(store: KBStore, *, agent: str, task: str | None = None,
+ 
+ def session_end(store: KBStore, session_id: str, *, note: str | None = None) -> Session:
+     sess = store.get_session(session_id)
++    salience.reset_session(session_id)
+     if sess.ended_at is not None:
+         return sess  # idempotent
+     sess.ended_at = datetime.now(UTC)
+diff --git a/tests/test_salience.py b/tests/test_salience.py
+new file mode 100644
+index 0000000..bfd47c6
+--- /dev/null
++++ b/tests/test_salience.py
+@@ -0,0 +1,107 @@
++"""Entity-salience retrieval reflex — issue #223."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from vouch import health, salience
++from vouch.models import Claim, Entity, EntityType
++from vouch.storage import KBStore
++
++
++@pytest.fixture(autouse=True)
++def _clean_buffers() -> None:
++    salience._BUFFERS.clear()
++    yield
++    salience._BUFFERS.clear()
++
++
++@pytest.fixture
++def store(tmp_path: Path) -> KBStore:
++    kb = KBStore.init(tmp_path)
++    kb.put_entity(Entity(id="jwt", name="JWT", type=EntityType.CONCEPT))
++    src = kb.put_source(b"auth notes")
++    kb.put_claim(Claim(id="c1", text="auth uses JWT", evidence=[src.id], entities=["jwt"]))
++    health.rebuild_index(kb)
++    return kb
++
++
++def _write_reflex_cfg(store: KBStore, **reflex: object) -> None:
++    import yaml
++    cfg = {"retrieval": {"reflex": reflex}}
++    (store.kb_dir / "config.yaml").write_text(yaml.safe_dump(cfg))
++
++
++def test_record_then_compute_highlights_entity(store: KBStore) -> None:
++    for _ in range(3):
++        salience.record_query("sess-1", "jwt")
++    out = salience.compute_salience(store, "sess-1")
++    assert out
++    rec = out[0]
++    assert rec["entity_id"] == "jwt"
++    assert rec["claim_count"] == 1
++    assert rec["top_claim_id"] == "c1"
++
++
++def test_attach_adds_meta_when_enabled(store: KBStore) -> None:
++    for _ in range(3):
++        salience.record_query("sess-1", "jwt")
++    cfg = {"retrieval": {"reflex": {"enabled": True}}}
++    result = salience.attach_salience({}, store, "sess-1", cfg)
++    assert result["_meta"]["vouch_salience"][0]["entity_id"] == "jwt"
++
++
++def test_handler_attaches_salience_on_next_context_call(store: KBStore, monkeypatch) -> None:
++    from vouch import jsonl_server
++
++    monkeypatch.setattr(jsonl_server, "_store", lambda: store)
++    for _ in range(3):
++        jsonl_server._h_context({"task": "jwt", "session_id": "sess-1"})
++    result = jsonl_server._h_context({"task": "jwt", "session_id": "sess-1"})
++    salient = result["_meta"]["vouch_salience"]
++    assert any(rec["entity_id"] == "jwt" for rec in salient)
++
++
++def test_disabled_in_config_omits_field(store: KBStore, monkeypatch) -> None:
++    from vouch import jsonl_server
++
++    _write_reflex_cfg(store, enabled=False)
++    monkeypatch.setattr(jsonl_server, "_store", lambda: store)
++    for _ in range(3):
++        jsonl_server._h_context({"task": "jwt", "session_id": "sess-1"})
++    result = jsonl_server._h_context({"task": "jwt", "session_id": "sess-1"})
++    assert "vouch_salience" not in result.get("_meta", {})
++
++
++def test_stateless_call_has_no_salience(store: KBStore, monkeypatch) -> None:
++    from vouch import jsonl_server
++
++    monkeypatch.setattr(jsonl_server, "_store", lambda: store)
++    result = jsonl_server._h_context({"task": "jwt"})
++    assert "vouch_salience" not in result.get("_meta", {})
++
++
++def test_reset_session_clears_buffer(store: KBStore) -> None:
++    salience.record_query("sess-1", "jwt")
++    assert salience.compute_salience(store, "sess-1")
++    salience.reset_session("sess-1")
++    assert salience.compute_salience(store, "sess-1") == []
++
++
++def test_session_end_resets_buffer(tmp_path: Path) -> None:
++    from vouch import sessions
++
++    kb = KBStore.init(tmp_path)
++    sess = sessions.session_start(kb, agent="a", task="t")
++    salience.record_query(sess.id, "jwt")
++    assert sess.id in salience._BUFFERS
++    sessions.session_end(kb, sess.id)
++    assert sess.id not in salience._BUFFERS
++
++
++def test_window_bounds_buffer(store: KBStore) -> None:
++    for i in range(20):
++        salience.record_query("sess-1", f"q{i}", window=8)
++    assert len(salience._BUFFERS["sess-1"].queries) == 8

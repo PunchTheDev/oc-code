@@ -1,0 +1,626 @@
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 172002bd..3f892bde 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -192,10 +192,18 @@ import {
+   buildPreflightResult,
+   buildQueueHealth,
+   buildRegistryChangeReport,
++  buildContributorOpportunities,
++  buildPublicReadinessScore,
+   type ContributorOutcomeHistory,
++  type IssueQualityReport,
+   type PullRequestMaintainerPacket,
+   type RoleContext,
+ } from "../signals/engine";
++import {
++  buildExtensionIssueFit,
++  buildExtensionIssueBadges,
++  buildExtensionPrStatus,
++} from "../signals/extension-contributor-context";
+ import { attachDataQuality, buildCoreSignalFidelity, buildFreshnessSloReport, buildRepoDataQuality, buildSignalFidelity } from "../signals/data-quality";
+ import { buildContributorOpenPrMonitor } from "../signals/contributor-open-pr-monitor";
+ import { buildPullRequestReviewability, type PullRequestReviewability } from "../signals/reward-risk";
+@@ -689,6 +697,10 @@ export function createApp() {
+     if (!identity) return c.json({ error: "unauthorized" }, 401);
+     if (identity.kind === "session" && !canSessionAccessPath(c.env, identity, c.req.path)) return c.json({ error: "insufficient_role" }, 403);
+     if (isExtensionScopedSession(identity) && c.req.path !== EXTENSION_PULL_CONTEXT_PATH) return c.json({ error: "insufficient_scope" }, 403);
++    // Contributor extension tokens are STRICTLY self-only: like the pull-context token above, they are
++    // confined to their own surface and may not reach any other path (control-panel /v1/app/*, the
++    // session-mint endpoint, etc.). Without this they would be LESS confined than the maintainer token.
++    if (isExtensionContributorScopedSession(identity) && !isExtensionContributorContextPath(c.req.path)) return c.json({ error: "insufficient_scope" }, 403);
+     return next();
+   });
+ 
+@@ -844,15 +856,22 @@ export function createApp() {
+   app.post("/v1/auth/extension/session", async (c) => {
+     const identity = await authenticateRequestIdentity(c);
+     if (!identity || identity.kind !== "session") return c.json({ error: "browser_session_required" }, 403);
+-    if (isExtensionScopedSession(identity)) return c.json({ error: "browser_session_required" }, 403);
++    // An extension token (maintainer OR contributor scope) may not mint another — only a full browser
++    // session can. Without covering the contributor scope here, a contributor token could self-renew an
++    // unbounded, effectively non-revocable chain of sessions.
++    if (isExtensionScopedSession(identity) || isExtensionContributorScopedSession(identity)) return c.json({ error: "browser_session_required" }, 403);
+     const roleSummary = await loadControlPanelRoleSummary(c.env, identity.actor);
+-    if (!roleSummary.roles.some((role) => role === "maintainer" || role === "owner" || role === "operator")) return c.json({ error: "insufficient_role" }, 403);
++    // Maintainers (own/installed a repo, or operators) get the maintainer pull-context scope; everyone
++    // else gets the strictly self-only contributor scope (#556). Either way the session is minted from a
++    // verified browser sign-in, so a non-maintainer can only ever read its OWN contributor data.
++    const isMaintainer = roleSummary.roles.some((role) => role === "maintainer" || role === "owner" || role === "operator");
++    const scope = isMaintainer ? EXTENSION_PULL_CONTEXT_SCOPE : EXTENSION_CONTRIBUTOR_CONTEXT_SCOPE;
+     const githubUser = identity.session.githubUserId === undefined ? { login: identity.session.login } : { login: identity.session.login, id: identity.session.githubUserId };
+     const { token, session } = await createSessionForGitHubUser(
+       c.env,
+       githubUser,
+       {
+-        scopes: [EXTENSION_PULL_CONTEXT_SCOPE],
++        scopes: [scope],
+         metadata: {
+           source: "browser_extension",
+           parentSessionId: identity.session.id,
+@@ -862,7 +881,7 @@ export function createApp() {
+     await recordRouteProductUsage(c, {
+       surface: "browser_extension",
+       eventName: "extension_session_created",
+-      role: "maintainer",
++      role: isMaintainer ? "maintainer" : "contributor",
+       identity,
+       sessionId: session.id,
+       outcome: "success",
+@@ -2191,6 +2210,88 @@ export function createApp() {
+     return c.json(buildLocalDiffPreflightResult(parsed.data, repo, issues, pullRequests, bounties, issueQuality?.report));
+   });
+ 
++  // ─── Extension contributor-context endpoints (#556) ─────────────────────────────────────────────
++  // Self-only (requireContributorAccess: actor === login), public-safe, scores returned as BANDS.
++  // The coarse path allowlist (canSessionAccessPath) only lets the contributor scope reach these paths.
++  app.get("/v1/extension/contributors/:login/issue-fit", async (c) => {
++    const login = c.req.param("login");
++    const unauthorized = await requireContributorAccess(c, login);
++    if (unauthorized) return unauthorized;
++    const owner = c.req.query("owner") ?? "";
++    const repoName = c.req.query("repo") ?? "";
++    const issueNumber = Number(c.req.query("issueNumber") ?? "");
++    if (!owner || !repoName || !Number.isInteger(issueNumber) || issueNumber <= 0) return c.json({ error: "valid_owner_repo_issue_required" }, 400);
++    const repoFullName = `${owner}/${repoName}`;
++    const [context, repo, issues, pullRequests, bounties, issueQuality] = await Promise.all([
++      loadContributorFastContext(c.env, login),
++      getRepository(c.env, repoFullName),
++      listIssues(c.env, repoFullName),
++      listPullRequests(c.env, repoFullName),
++      listBountiesByRepo(c.env, repoFullName),
++      loadOrComputeIssueQualityResponse(c.env, repoFullName),
++    ]);
++    if (!repo) return c.json({ error: "repo_not_found" }, 404);
++    const opportunities = buildContributorOpportunities(context.profile, [repo], issues, pullRequests, bounties, issueQualityMap(repoFullName, issueQuality?.report));
++    const opportunity = opportunities.find((entry) => entry.issueNumber === issueNumber);
++    if (!opportunity) return c.json({ repoFullName, issueNumber, eligible: false, reason: "Issue is not an open, unclaimed outside-contributor target right now." }, 200);
++    return c.json({ eligible: true, ...buildExtensionIssueFit(opportunity) });
++  });
++
++  app.get("/v1/extension/contributors/:login/issue-badges", async (c) => {
++    const login = c.req.param("login");
++    const unauthorized = await requireContributorAccess(c, login);
++    if (unauthorized) return unauthorized;
++    const owner = c.req.query("owner") ?? "";
++    const repoName = c.req.query("repo") ?? "";
++    if (!owner || !repoName) return c.json({ error: "valid_owner_repo_required" }, 400);
++    const repoFullName = `${owner}/${repoName}`;
++    const [context, repo, issues, pullRequests, bounties, issueQuality] = await Promise.all([
++      loadContributorFastContext(c.env, login),
++      getRepository(c.env, repoFullName),
++      listIssues(c.env, repoFullName),
++      listPullRequests(c.env, repoFullName),
++      listBountiesByRepo(c.env, repoFullName),
++      loadOrComputeIssueQualityResponse(c.env, repoFullName),
++    ]);
++    if (!repo) return c.json({ error: "repo_not_found" }, 404);
++    const opportunities = buildContributorOpportunities(context.profile, [repo], issues, pullRequests, bounties, issueQualityMap(repoFullName, issueQuality?.report));
++    return c.json({ repoFullName, badges: buildExtensionIssueBadges(opportunities, repoFullName) });
++  });
++
++  app.get("/v1/extension/contributors/:login/pr-status", async (c) => {
++    const login = c.req.param("login");
++    const unauthorized = await requireContributorAccess(c, login);
++    if (unauthorized) return unauthorized;
++    const owner = c.req.query("owner") ?? "";
++    const repoName = c.req.query("repo") ?? "";
++    const pullNumber = Number(c.req.query("pullNumber") ?? "");
++    if (!owner || !repoName || !Number.isInteger(pullNumber) || pullNumber <= 0) return c.json({ error: "valid_owner_repo_pull_required" }, 400);
++    const repoFullName = `${owner}/${repoName}`;
++    const [repo, issues, pullRequests, bounties, issueQuality] = await Promise.all([
++      getRepository(c.env, repoFullName),
++      listIssues(c.env, repoFullName),
++      listPullRequests(c.env, repoFullName),
++      listBountiesByRepo(c.env, repoFullName),
++      loadOrComputeIssueQualityResponse(c.env, repoFullName),
++    ]);
++    const pr = pullRequests.find((entry) => entry.number === pullNumber);
++    if (!pr) return c.json({ error: "pull_request_not_found" }, 404);
++    // Self-only on the PR itself: a contributor reads only their OWN PR's status.
++    if ((pr.authorLogin ?? "").toLowerCase() !== login.toLowerCase()) return c.json({ error: "forbidden_contributor" }, 403);
++    const preflight = buildPreflightResult(
++      { repoFullName, contributorLogin: login, title: pr.title, body: pr.body ?? undefined, labels: pr.labels, linkedIssues: pr.linkedIssues, authorAssociation: pr.authorAssociation ?? undefined },
++      repo,
++      issues,
++      pullRequests,
++      bounties,
++      issueQuality?.report,
++    );
++    const collisions = buildCollisionReport(repoFullName, issues, pullRequests);
++    const queueHealth = buildQueueHealth(repo, issues, pullRequests, collisions);
++    const readiness = buildPublicReadinessScore({ pr, preflight, queueHealth });
++    return c.json(buildExtensionPrStatus({ repoFullName, pullNumber, readiness }));
++  });
++
+   app.post("/v1/local/branch-analysis", async (c) => {
+     const body = await c.req.json().catch(() => null);
+     const parsed = localBranchAnalysisSchema.safeParse(body);
+@@ -4078,6 +4179,11 @@ const EXTENSION_PULL_CONTEXT_SCOPE = "extension:pull_context";
+ const LINT_PR_TEXT_PATH = "/v1/lint/pr-text";
+ const LINT_SLOP_RISK_PATH = "/v1/lint/slop-risk";
+ const LINT_ISSUE_SLOP_PATH = "/v1/lint/issue-slop";
++// Contributor (miner) side of the extension (#556). Minted for NON-maintainer sign-ins; strictly
++// self-only — a token may only reach `/v1/extension/contributors/<self>/*`, enforced by the coarse
++// path check below plus `requireContributorAccess` (actor === login) in every handler.
++const EXTENSION_CONTRIBUTOR_CONTEXT_SCOPE = "extension:contributor_context";
++const EXTENSION_CONTRIBUTOR_CONTEXT_PATH = /^\/v1\/extension\/contributors\/[^/]+\/[^/]+$/;
+ 
+ type ProtectedRouteContext = {
+   env: Env;
+@@ -4089,6 +4195,19 @@ function isExtensionScopedSession(identity: AuthIdentity): boolean {
+   return identity.kind === "session" && identity.session.scopes.includes(EXTENSION_PULL_CONTEXT_SCOPE);
+ }
+ 
++function isExtensionContributorScopedSession(identity: AuthIdentity): boolean {
++  return identity.kind === "session" && identity.session.scopes.includes(EXTENSION_CONTRIBUTOR_CONTEXT_SCOPE);
++}
++
++function isExtensionContributorContextPath(path: string): boolean {
++  return EXTENSION_CONTRIBUTOR_CONTEXT_PATH.test(path);
++}
++
++// Wrap a single repo's issue-quality report in the by-repo map buildContributorOpportunities expects.
++function issueQualityMap(repoFullName: string, report: IssueQualityReport | undefined): Map<string, IssueQualityReport> | undefined {
++  return report ? new Map([[repoFullName, report]]) : undefined;
++}
++
+ // ─── Authorization model (the miner ⊕ maintainer boundary) ──────────────────────────────────────
+ // Identity is per-LOGIN; authority is per-REPO. Two independent axes a single session can hold at once:
+ //   • MINER (gittensor contributor): may read ONLY its own contributor/miner data — enforced by
+@@ -4120,6 +4239,9 @@ function canSessionAccessPath(env: Env, identity: Extract<AuthIdentity, { kind:
+   if (isRepoContributorIssueDraftGeneratePath(path)) return true;
+   if (path === LINT_PR_TEXT_PATH || path === LINT_SLOP_RISK_PATH || path === LINT_ISSUE_SLOP_PATH) return true;
+   if (path === EXTENSION_PULL_CONTEXT_PATH && isExtensionScopedSession(identity)) return true;
++  // Contributor extension scope reaches only `/v1/extension/contributors/<login>/*`; the handler's
++  // requireContributorAccess then enforces actor === login (self-only).
++  if (isExtensionContributorContextPath(path) && isExtensionContributorScopedSession(identity)) return true;
+   return false;
+ }
+ 
+@@ -4423,4 +4545,5 @@ export const __routesInternals = {
+   buildExtensionPrivateBlockers,
+   ensureExtensionPublicSafeText,
+   authenticateRequestIdentity,
++  issueQualityMap,
+ };
+diff --git a/src/signals/extension-contributor-context.ts b/src/signals/extension-contributor-context.ts
+new file mode 100644
+index 00000000..4fa82396
+--- /dev/null
++++ b/src/signals/extension-contributor-context.ts
+@@ -0,0 +1,128 @@
++import type { ContributorOpportunity, PublicReadinessScore } from "./engine";
++
++// ─── Contributor-context payloads for the browser extension (#556) ───────────────────────────────
++// The contributor (miner) side of the extension overlay. Every payload here is PUBLIC-SAFE and self-
++// scoped: a miner token reads only its OWN data (enforced at the route via requireContributorAccess),
++// numeric private scores are returned as BANDS never raw numbers, and all free-form text is re-checked
++// against the forbidden-private-term list before it leaves the server. No UI — just the data shapes the
++// rebuilt extension (and any client) renders.
++
++/** Public-safe band for a contributor's own-PR readiness — the raw 0-100 readiness score is private; the
++ *  overlay only ever sees the band. Mirrors the fit ("good"/"caution"/"hold") and slop band ideas. */
++export type ContributorReadinessBand = "strong" | "developing" | "early";
++
++export function contributorReadinessBand(total: number): ContributorReadinessBand {
++  if (total >= 70) return "strong";
++  if (total >= 45) return "developing";
++  return "early";
++}
++
++// Defense-in-depth public-safe redaction for any free-form text that reaches the contributor overlay.
++// The upstream builders are already contributor-facing, but every string is re-checked here and any
++// forbidden private term (reward/wallet/key material/raw trust score/etc.) is redacted rather than
++// leaked. Kept local (no import) so this module stays cycle-free and the API never 500s on a stray term.
++const FORBIDDEN_EXTENSION_TERMS =
++  /\b(?:rewards?|payouts?|farming|wallets?|hotkeys?|coldkeys?|seed[-\s]?phrases?|mnemonics?|private[-\s]?keys?|raw[-\s]?trust(?:[-\s]?scores?)?|trust[-\s]?scores?|score[-\s]?(?:estimate|preview|prediction)s?|estimated[-\s]?scores?|scoreability|private[-\s]?reviewability|reviewability[-\s]?internals?|private[-\s]?rankings?)\b/gi;
++
++export function redactExtensionText(text: string): string {
++  return text.replace(FORBIDDEN_EXTENSION_TERMS, "[redacted]").replace(/\s+/g, " ").trim();
++}
++
++// ── issue-fit: "is this issue a good one for me to pick up?" ──────────────────────────────────────
++
++export type ExtensionIssueFit = {
++  repoFullName: string;
++  issueNumber: number;
++  title: string;
++  /** Fit band — already a band on the opportunity, never a raw score. */
++  fit: ContributorOpportunity["fit"];
++  multiplierTier: ContributorOpportunity["multiplierTier"];
++  availability: ContributorOpportunity["availability"];
++  lane: ContributorOpportunity["lane"];
++  reasons: string[];
++  warnings: string[];
++};
++
++export function buildExtensionIssueFit(opportunity: ContributorOpportunity): ExtensionIssueFit {
++  return {
++    repoFullName: opportunity.repoFullName,
++    issueNumber: opportunity.issueNumber ?? 0,
++    title: redactExtensionText(opportunity.title),
++    fit: opportunity.fit,
++    multiplierTier: opportunity.multiplierTier,
++    availability: opportunity.availability,
++    lane: opportunity.lane,
++    reasons: opportunity.reasons.map(redactExtensionText),
++    warnings: opportunity.warnings.map(redactExtensionText),
++  };
++}
++
++// ── issue-list badges: per-issue fit badges for an issue-list overlay ─────────────────────────────
++
++export type ExtensionIssueBadge = {
++  issueNumber: number;
++  title: string;
++  fit: ContributorOpportunity["fit"];
++  multiplierTier: ContributorOpportunity["multiplierTier"];
++  availability: ContributorOpportunity["availability"];
++};
++
++export function buildExtensionIssueBadges(opportunities: ContributorOpportunity[], repoFullName: string): ExtensionIssueBadge[] {
++  return opportunities
++    .filter((opportunity) => opportunity.repoFullName.toLowerCase() === repoFullName.toLowerCase() && opportunity.issueNumber !== undefined)
++    .map((opportunity) => ({
++      issueNumber: opportunity.issueNumber as number,
++      title: redactExtensionText(opportunity.title),
++      fit: opportunity.fit,
++      multiplierTier: opportunity.multiplierTier,
++      availability: opportunity.availability,
++    }));
++}
++
++// ── own-PR preflight + review status ──────────────────────────────────────────────────────────────
++
++/** Per-readiness-component band, so the overlay can render a checklist without seeing component scores. */
++export type ExtensionReadinessComponentBand = "met" | "partial" | "unmet";
++
++export type ExtensionPrStatusComponent = {
++  key: PublicReadinessScore["components"][number]["key"];
++  label: string;
++  band: ExtensionReadinessComponentBand;
++  evidence: string;
++  action: string;
++};
++
++export type ExtensionPrStatus = {
++  repoFullName: string;
++  pullNumber: number;
++  /** Overall readiness band — the raw total is never exposed. */
++  readinessBand: ContributorReadinessBand;
++  reviewStatus: "ready_for_review" | "in_progress" | "needs_attention";
++  components: ExtensionPrStatusComponent[];
++};
++
++function componentBand(score: number, max: number): ExtensionReadinessComponentBand {
++  if (max <= 0) return "unmet";
++  const ratio = score / max;
++  if (ratio >= 0.85) return "met";
++  if (ratio >= 0.5) return "partial";
++  return "unmet";
++}
++
++export function buildExtensionPrStatus(args: { repoFullName: string; pullNumber: number; readiness: PublicReadinessScore }): ExtensionPrStatus {
++  const band = contributorReadinessBand(args.readiness.total);
++  const reviewStatus = band === "strong" ? "ready_for_review" : band === "developing" ? "in_progress" : "needs_attention";
++  return {
++    repoFullName: args.repoFullName,
++    pullNumber: args.pullNumber,
++    readinessBand: band,
++    reviewStatus,
++    components: args.readiness.components.map((component) => ({
++      key: component.key,
++      label: redactExtensionText(component.label),
++      band: componentBand(component.score, component.max),
++      evidence: redactExtensionText(component.evidence),
++      action: redactExtensionText(component.action),
++    })),
++  };
++}
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 60ed7901..afaf6672 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -2003,7 +2003,22 @@ describe("api routes", () => {
+     expect((await app.request("/v1/app/analytics/mcp-compatibility", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+     expect((await app.request("/v1/app/analytics/weekly-value-report", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+     expect((await app.request("/v1/contributors/new-user/decision-pack", { headers: unknownHeaders }, unknownEnv)).status).toBe(403);
+-    expect((await app.request("/v1/auth/extension/session", { method: "POST", headers: unknownHeaders }, unknownEnv)).status).toBe(403);
++    // A non-maintainer sign-in now mints a strictly self-only CONTRIBUTOR extension scope (#556), not 403.
++    const newUserExtensionSession = await app.request("/v1/auth/extension/session", { method: "POST", headers: unknownHeaders }, unknownEnv);
++    expect(newUserExtensionSession.status).toBe(201);
++    const newUserExtensionBody = (await newUserExtensionSession.json()) as { token: string; scopes: string[] };
++    expect(newUserExtensionBody.scopes).toEqual(["extension:contributor_context"]);
++    const newUserExtBearer = { authorization: `Bearer ${newUserExtensionBody.token}` };
++    // Self-only: the contributor scope can reach its OWN contributor path but not another login's.
++    expect((await app.request("/v1/extension/contributors/new-user/issue-badges?owner=octo&repo=demo", { headers: newUserExtBearer }, unknownEnv)).status).not.toBe(403);
++    expect((await app.request("/v1/extension/contributors/someone-else/issue-badges?owner=octo&repo=demo", { headers: newUserExtBearer }, unknownEnv)).status).toBe(403);
++    // The contributor scope cannot reach the maintainer-only extension pull-context path at all.
++    expect((await app.request("/v1/extension/pull-context?owner=octo&repo=demo&pullNumber=1", { headers: newUserExtBearer }, unknownEnv)).status).toBe(403);
++    // A contributor extension token is confined to its own surface: it cannot reach the control panel
++    // (would expose platform-wide data) and cannot re-mint itself into an unbounded session chain.
++    expect((await app.request("/v1/app/overview", { headers: newUserExtBearer }, unknownEnv)).status).toBe(403);
++    expect((await app.request("/v1/app/roles", { headers: newUserExtBearer }, unknownEnv)).status).toBe(403);
++    expect((await app.request("/v1/auth/extension/session", { method: "POST", headers: newUserExtBearer }, unknownEnv)).status).toBe(403);
+ 
+     const ownerEnv = createTestEnv({ ADMIN_GITHUB_LOGINS: "jsonbored" });
+     await upsertInstallation(ownerEnv, {
+@@ -3564,6 +3579,108 @@ describe("api routes", () => {
+     expect(operatorWeeklyReportMarkdownText).not.toMatch(FORBIDDEN_PUBLIC_REPORT_TERMS);
+   });
+ 
++  it("serves self-only, public-safe contributor extension context: issue-fit, badges, pr-status (#556)", async () => {
++    const app = createApp();
++    const env = createTestEnv();
++    // External profile/snapshot fetches resolve to empty so loadContributorFastContext uses seeded D1 data.
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
++      const url = input.toString();
++      if (url.includes("api.github.com/users/")) return Response.json({ login: "contributor-dev", public_repos: 1, followers: 0 });
++      return new Response("not found", { status: 404 });
++    });
++    await persistRegistrySnapshot(
++      env,
++      normalizeRegistryPayload(
++        { "octo/demo": { emission_share: 0.02, issue_discovery_share: 0, label_multipliers: {}, trusted_label_pipeline: false } },
++        { kind: "raw-github", url: "fixture://registry" },
++        "2026-06-14T00:00:00.000Z",
++      ),
++    );
++    await upsertRepositoryFromGitHub(env, { name: "demo", full_name: "octo/demo", private: false, owner: { login: "octo" }, default_branch: "main" });
++    await upsertIssueFromGitHub(env, "octo/demo", { number: 7, title: "Add cursor pagination to the labels endpoint", state: "open", html_url: "https://github.com/octo/demo/issues/7", user: { login: "octo" }, labels: [{ name: "feature" }], body: "Pagination is missing." });
++    // An open, unlinked issue with no PR claiming it -- this surfaces as an actual contributor opportunity
++    // (issue #7 is excluded because PR #12 below links it), so issue-fit returns eligible: true.
++    await upsertIssueFromGitHub(env, "octo/demo", { number: 8, title: "Document the labels endpoint response shape", state: "open", html_url: "https://github.com/octo/demo/issues/8", user: { login: "octo" }, labels: [{ name: "feature" }], body: "The labels endpoint response shape is undocumented." });
++    await upsertPullRequestFromGitHub(env, "octo/demo", { number: 12, title: "Add cursor pagination", state: "open", html_url: "https://github.com/octo/demo/pull/12", user: { login: "contributor-dev" }, labels: [], body: "Fixes #7", head: { sha: "abc123", ref: "feat" }, base: { ref: "main" } });
++    await upsertPullRequestFromGitHub(env, "octo/demo", { number: 13, title: "Someone else's PR", state: "open", html_url: "https://github.com/octo/demo/pull/13", user: { login: "other-dev" }, labels: [], head: { sha: "def456", ref: "x" }, base: { ref: "main" } });
++    // contributor-dev's own PR with NO body -- exercises the body-defaulting path in the pr-status handler.
++    await upsertPullRequestFromGitHub(env, "octo/demo", { number: 14, title: "Tidy labels output", state: "open", html_url: "https://github.com/octo/demo/pull/14", user: { login: "contributor-dev" }, labels: [], head: { sha: "aaa111", ref: "tidy" }, base: { ref: "main" } });
++    // A PR with no author -- exercises the authorLogin-defaulting path of the self-only PR guard (→ 403).
++    await upsertPullRequestFromGitHub(env, "octo/demo", { number: 15, title: "Authorless PR", state: "open", html_url: "https://github.com/octo/demo/pull/15", labels: [], head: { sha: "bbb222", ref: "ghost" }, base: { ref: "main" } });
++
++    // A non-maintainer mints a CONTRIBUTOR-scoped extension session.
++    const { token: browserToken } = await createSessionForGitHubUser(env, { login: "contributor-dev", id: 555 });
++    const session = await app.request("/v1/auth/extension/session", { method: "POST", headers: { cookie: `gittensory_session=${browserToken}`, "content-type": "application/json" } }, env);
++    expect(session.status).toBe(201);
++    const sessionBody = (await session.json()) as { token: string; scopes: string[] };
++    expect(sessionBody.scopes).toEqual(["extension:contributor_context"]);
++    const bearer = { authorization: `Bearer ${sessionBody.token}` };
++
++    const fit = await app.request("/v1/extension/contributors/contributor-dev/issue-fit?owner=octo&repo=demo&issueNumber=7", { headers: bearer }, env);
++    expect(fit.status).toBe(200);
++    const fitBody = (await fit.json()) as { eligible: boolean; fit?: string };
++    expect(JSON.stringify(fitBody)).not.toMatch(FORBIDDEN_PUBLIC_REPORT_TERMS);
++    if (fitBody.eligible) expect(["good", "caution", "hold"]).toContain(fitBody.fit);
++
++    // The unlinked, open issue #8 IS a real contributor opportunity → eligible: true with a fit band.
++    const eligibleFit = await app.request("/v1/extension/contributors/contributor-dev/issue-fit?owner=octo&repo=demo&issueNumber=8", { headers: bearer }, env);
++    expect(eligibleFit.status).toBe(200);
++    const eligibleFitBody = (await eligibleFit.json()) as { eligible: boolean; issueNumber: number; fit?: string };
++    expect(eligibleFitBody.eligible).toBe(true);
++    expect(eligibleFitBody.issueNumber).toBe(8);
++    expect(["good", "caution", "hold"]).toContain(eligibleFitBody.fit);
++    expect(JSON.stringify(eligibleFitBody)).not.toMatch(/"(?:score|total|max)":/);
++    expect(JSON.stringify(eligibleFitBody)).not.toMatch(FORBIDDEN_PUBLIC_REPORT_TERMS);
++
++    const badges = await app.request("/v1/extension/contributors/contributor-dev/issue-badges?owner=octo&repo=demo", { headers: bearer }, env);
++    expect(badges.status).toBe(200);
++    const badgesBody = (await badges.json()) as { badges: unknown[] };
++    expect(Array.isArray(badgesBody.badges)).toBe(true);
++    expect(JSON.stringify(badgesBody)).not.toMatch(FORBIDDEN_PUBLIC_REPORT_TERMS);
++
++    const prStatus = await app.request("/v1/extension/contributors/contributor-dev/pr-status?owner=octo&repo=demo&pullNumber=12", { headers: bearer }, env);
++    expect(prStatus.status).toBe(200);
++    const prStatusBody = (await prStatus.json()) as { readinessBand: string; reviewStatus: string };
++    expect(["strong", "developing", "early"]).toContain(prStatusBody.readinessBand);
++    expect(["ready_for_review", "in_progress", "needs_attention"]).toContain(prStatusBody.reviewStatus);
++    // Band-not-number: no raw score/total/max keys leak to the contributor overlay.
++    expect(JSON.stringify(prStatusBody)).not.toMatch(/"(?:score|total|max)":/);
++    expect(JSON.stringify(prStatusBody)).not.toMatch(FORBIDDEN_PUBLIC_REPORT_TERMS);
++
++    // The contributor's OWN bodyless PR still resolves to a public-safe readiness band (body defaults cleanly).
++    const bodylessPrStatus = await app.request("/v1/extension/contributors/contributor-dev/pr-status?owner=octo&repo=demo&pullNumber=14", { headers: bearer }, env);
++    expect(bodylessPrStatus.status).toBe(200);
++    const bodylessPrStatusBody = (await bodylessPrStatus.json()) as { readinessBand: string };
++    expect(["strong", "developing", "early"]).toContain(bodylessPrStatusBody.readinessBand);
++
++    // Self-only on the PR: a contributor cannot read another author's PR even in their own scope.
++    expect((await app.request("/v1/extension/contributors/contributor-dev/pr-status?owner=octo&repo=demo&pullNumber=13", { headers: bearer }, env)).status).toBe(403);
++    // An authorless PR can never match the requesting contributor → self-only guard returns 403.
++    expect((await app.request("/v1/extension/contributors/contributor-dev/pr-status?owner=octo&repo=demo&pullNumber=15", { headers: bearer }, env)).status).toBe(403);
++    // issue-fit is self-only too: another login's path is rejected before any data is read.
++    expect((await app.request("/v1/extension/contributors/someone-else/issue-fit?owner=octo&repo=demo&issueNumber=8", { headers: bearer }, env)).status).toBe(403);
++    // Missing PR → 404.
++    expect((await app.request("/v1/extension/contributors/contributor-dev/pr-status?owner=octo&repo=demo&pullNumber=999", { headers: bearer }, env)).status).toBe(404);
++    // Validation 400s — exercise every guard operand (missing owner / repo / non-integer / non-positive).
++    expect((await app.request("/v1/extension/contributors/contributor-dev/issue-fit?owner=octo&repo=demo", { headers: bearer }, env)).status).toBe(400);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/issue-fit?repo=demo&issueNumber=7", { headers: bearer }, env)).status).toBe(400);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/issue-fit?owner=octo&issueNumber=7", { headers: bearer }, env)).status).toBe(400);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/issue-fit?owner=octo&repo=demo&issueNumber=abc", { headers: bearer }, env)).status).toBe(400);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/issue-fit?owner=octo&repo=demo&issueNumber=0", { headers: bearer }, env)).status).toBe(400);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/issue-badges?owner=octo", { headers: bearer }, env)).status).toBe(400);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/issue-badges?repo=demo", { headers: bearer }, env)).status).toBe(400);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/pr-status?owner=octo&repo=demo", { headers: bearer }, env)).status).toBe(400);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/pr-status?repo=demo&pullNumber=12", { headers: bearer }, env)).status).toBe(400);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/pr-status?owner=octo&pullNumber=12", { headers: bearer }, env)).status).toBe(400);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/pr-status?owner=octo&repo=demo&pullNumber=abc", { headers: bearer }, env)).status).toBe(400);
++    // Repo not found → 404.
++    expect((await app.request("/v1/extension/contributors/contributor-dev/issue-fit?owner=no&repo=such&issueNumber=1", { headers: bearer }, env)).status).toBe(404);
++    expect((await app.request("/v1/extension/contributors/contributor-dev/issue-badges?owner=no&repo=such", { headers: bearer }, env)).status).toBe(404);
++    // Cross-login self-only: 403 regardless of valid data.
++    expect((await app.request("/v1/extension/contributors/someone-else/pr-status?owner=octo&repo=demo&pullNumber=12", { headers: bearer }, env)).status).toBe(403);
++    vi.unstubAllGlobals();
++  });
++
+   it("serves bounded private skipped PR audit exports with scoped access and redaction", async () => {
+     const app = createApp();
+     const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "operator" });
+diff --git a/test/unit/extension-contributor-context.test.ts b/test/unit/extension-contributor-context.test.ts
+new file mode 100644
+index 00000000..ada9c821
+--- /dev/null
++++ b/test/unit/extension-contributor-context.test.ts
+@@ -0,0 +1,123 @@
++import { describe, expect, it } from "vitest";
++import {
++  buildExtensionIssueBadges,
++  buildExtensionIssueFit,
++  buildExtensionPrStatus,
++  contributorReadinessBand,
++  redactExtensionText,
++} from "../../src/signals/extension-contributor-context";
++import type { ContributorOpportunity, PublicReadinessScore } from "../../src/signals/engine";
++
++const FORBIDDEN_PUBLIC_TERMS = /wallet|hotkey|coldkey|mnemonic|reward|payout|farming|raw trust|trust score|scoreability|reviewability internals|private ranking/i;
++
++function opportunity(over: Partial<ContributorOpportunity> = {}): ContributorOpportunity {
++  return {
++    repoFullName: "octo/demo",
++    issueNumber: 7,
++    title: "Add cursor pagination to the labels endpoint",
++    fit: "good",
++    score: 82,
++    lane: "direct_pr",
++    multiplierTier: "maintainer_created",
++    availability: "ready",
++    reasons: ["Maintainer-created issue with the biggest multiplier.", "You have touched this repo before."],
++    warnings: [],
++    ...over,
++  };
++}
++
++function readiness(total: number, over: Partial<PublicReadinessScore> = {}): PublicReadinessScore {
++  return {
++    total,
++    components: [
++      { key: "traceability", label: "Traceability", score: 15, max: 15, evidence: "Linked issue #7.", action: "No action." },
++      { key: "validation", label: "Validation", score: 14, max: 25, evidence: "Some tests described.", action: "Add focused tests." },
++      { key: "pr_state", label: "PR state", score: 3, max: 10, evidence: "PR is closed.", action: "Reopen if still relevant." },
++    ],
++    ...over,
++  };
++}
++
++describe("contributorReadinessBand", () => {
++  it("maps the raw score to a public band, never exposing the number", () => {
++    expect(contributorReadinessBand(100)).toBe("strong");
++    expect(contributorReadinessBand(70)).toBe("strong");
++    expect(contributorReadinessBand(69)).toBe("developing");
++    expect(contributorReadinessBand(45)).toBe("developing");
++    expect(contributorReadinessBand(44)).toBe("early");
++    expect(contributorReadinessBand(0)).toBe("early");
++  });
++});
++
++describe("redactExtensionText", () => {
++  it("redacts forbidden private terms and collapses whitespace", () => {
++    expect(redactExtensionText("Your reward and trust score are high")).not.toMatch(FORBIDDEN_PUBLIC_TERMS);
++    expect(redactExtensionText("hotkey wallet payout")).toBe("[redacted] [redacted] [redacted]");
++    expect(redactExtensionText("  clean   text  ")).toBe("clean text");
++  });
++
++  it("leaves safe text untouched", () => {
++    expect(redactExtensionText("Maintainer-created issue, good fit.")).toBe("Maintainer-created issue, good fit.");
++  });
++});
++
++describe("buildExtensionIssueFit", () => {
++  it("returns the fit band (not a raw score) plus public-safe reasons", () => {
++    const fit = buildExtensionIssueFit(opportunity());
++    expect(fit).toMatchObject({ repoFullName: "octo/demo", issueNumber: 7, fit: "good", multiplierTier: "maintainer_created", availability: "ready" });
++    expect(fit).not.toHaveProperty("score");
++    expect(JSON.stringify(fit)).not.toMatch(FORBIDDEN_PUBLIC_TERMS);
++  });
++
++  it("redacts a forbidden term that slips into a reason or title", () => {
++    const fit = buildExtensionIssueFit(opportunity({ title: "reward farming issue", reasons: ["You can payout here"] }));
++    expect(JSON.stringify(fit)).not.toMatch(FORBIDDEN_PUBLIC_TERMS);
++  });
++
++  it("defaults a missing issue number to 0", () => {
++    expect(buildExtensionIssueFit(opportunity({ issueNumber: undefined })).issueNumber).toBe(0);
++  });
++});
++
++describe("buildExtensionIssueBadges", () => {
++  it("returns per-issue badges scoped to the repo, with bands not scores", () => {
++    const badges = buildExtensionIssueBadges(
++      [opportunity({ issueNumber: 7 }), opportunity({ issueNumber: 8, fit: "caution" }), opportunity({ repoFullName: "other/repo", issueNumber: 9 })],
++      "octo/demo",
++    );
++    expect(badges.map((badge) => badge.issueNumber)).toEqual([7, 8]);
++    expect(badges.every((badge) => !("score" in badge))).toBe(true);
++    expect(badges[1]!.fit).toBe("caution");
++    expect(JSON.stringify(badges)).not.toMatch(FORBIDDEN_PUBLIC_TERMS);
++  });
++
++  it("matches the repo case-insensitively and drops opportunities without an issue number", () => {
++    const badges = buildExtensionIssueBadges([opportunity({ issueNumber: undefined }), opportunity({ issueNumber: 7 })], "OCTO/Demo");
++    expect(badges.map((badge) => badge.issueNumber)).toEqual([7]);
++  });
++});
++
++describe("buildExtensionPrStatus", () => {
++  it("returns an overall band + per-component bands, never raw scores", () => {
++    const status = buildExtensionPrStatus({ repoFullName: "octo/demo", pullNumber: 12, readiness: readiness(72) });
++    expect(status.readinessBand).toBe("strong");
++    expect(status.reviewStatus).toBe("ready_for_review");
++    expect(JSON.stringify(status)).not.toMatch(/"score"|"total"|"max"/);
++    expect(status.components.map((component) => component.band)).toEqual(["met", "partial", "unmet"]);
++    expect(JSON.stringify(status)).not.toMatch(FORBIDDEN_PUBLIC_TERMS);
++  });
++
++  it("maps developing/early bands to the matching review status", () => {
++    expect(buildExtensionPrStatus({ repoFullName: "octo/demo", pullNumber: 1, readiness: readiness(50) }).reviewStatus).toBe("in_progress");
++    expect(buildExtensionPrStatus({ repoFullName: "octo/demo", pullNumber: 1, readiness: readiness(20) }).reviewStatus).toBe("needs_attention");
++  });
++
++  it("treats a zero-max component as unmet without dividing by zero", () => {
++    const status = buildExtensionPrStatus({
++      repoFullName: "octo/demo",
++      pullNumber: 1,
++      readiness: readiness(80, { components: [{ key: "queue_pressure", label: "Queue pressure", score: 0, max: 0, evidence: "n/a", action: "n/a" }] }),
++    });
++    expect(status.components[0]!.band).toBe("unmet");
++  });
++});
+diff --git a/test/unit/routes-extension.test.ts b/test/unit/routes-extension.test.ts
+index 6ecba99f..55e6b361 100644
+--- a/test/unit/routes-extension.test.ts
++++ b/test/unit/routes-extension.test.ts
+@@ -61,6 +61,15 @@ describe("extension packet helper internals", () => {
+     expect(markdown).not.toMatch(/private reviewability|trust score|reward estimate|payout|\/100/i);
+   });
+ 
++  it("wraps a single repo's issue-quality report in a by-repo map, and yields undefined when absent", () => {
++    const report = { generatedAt: "2026-06-14T00:00:00.000Z", issues: [] } as never;
++    const map = __routesInternals.issueQualityMap("octo/demo", report);
++    expect(map).toBeInstanceOf(Map);
++    expect(map?.get("octo/demo")).toBe(report);
++    // Defensive branch: no report → undefined (so buildContributorOpportunities skips quality adjustment).
++    expect(__routesInternals.issueQualityMap("octo/demo", undefined)).toBeUndefined();
++  });
++
+   it("authenticates request identity from browser session cookie fallback", async () => {
+     const env = createTestEnv();
+     const { token } = await createSessionForGitHubUser(env, { login: "jsonbored", id: 7 });

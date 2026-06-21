@@ -1,0 +1,393 @@
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index d2247b2e..c5058984 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -200,6 +200,7 @@ import { buildPullRequestReviewability, type PullRequestReviewability } from "..
+ import { buildLocalBranchAnalysis, findCurrentBranchPullRequest } from "../signals/local-branch";
+ import { buildPredictedGateVerdict } from "../rules/predicted-gate";
+ import { buildMaintainerActivationPreview, recommendedAdvisoryActivationSettings } from "../services/maintainer-activation";
++import { buildMaintainerQualityDashboard, isMaintainerQualityDataStale } from "../services/maintainer-quality-dashboard";
+ import { MAX_LOCAL_SCORER_WARNING_CHARS, MAX_LOCAL_SCORER_WARNING_COUNT } from "../signals/local-scorer-diagnostics";
+ import { compileFocusManifestPolicy } from "../signals/focus-manifest";
+ import { loadRepoFocusManifest, upsertRepoFocusManifest } from "../signals/focus-manifest-loader";
+@@ -1000,6 +1001,26 @@ export function createApp() {
+     const openPullRequests = (
+       await Promise.all(repositories.slice(0, 12).map((repo) => listOpenPullRequests(c.env, repo.fullName).then((rows) => rows.map((pull) => ({ repoFullName: repo.fullName, pull })))))
+     ).flat();
++    // Quality dashboard (#557): shape cached repo data into queue-health bands, duplicate trends, and
++    // top contributors by quality band — scoped to this maintainer's repos. Reads CACHED issue/PR data
++    // (no GitHub fetch), but does derive the collision/queue signals per load; the build is capped to
++    // QUALITY_DASHBOARD_REPO_CAP repos and `truncated` discloses when there are more. The `stale` flag
++    // reflects how fresh the underlying repo sync is.
++    const QUALITY_DASHBOARD_REPO_CAP = 12;
++    const qualityRepos = repositories.slice(0, QUALITY_DASHBOARD_REPO_CAP);
++    const [qualityRepoInputs, allSyncStates] = await Promise.all([
++      Promise.all(
++        qualityRepos.map(async (repo) => {
++          const [issues, pullRequests] = await Promise.all([listIssues(c.env, repo.fullName), listPullRequests(c.env, repo.fullName)]);
++          return { repo, issues, pullRequests };
++        }),
++      ),
++      listRepoSyncStates(c.env),
++    ]);
++    const qualityRepoNames = new Set(qualityRepos.map((repo) => repo.fullName.toLowerCase()));
++    const scopedSyncCompletions = allSyncStates.filter((state) => qualityRepoNames.has(state.repoFullName.toLowerCase())).map((state) => state.lastCompletedAt);
++    const qualityStale = isMaintainerQualityDataStale({ lastCompletedAts: scopedSyncCompletions, repoCount: qualityRepos.length, nowMs: Date.parse(nowIso()) });
++    const qualityDashboard = buildMaintainerQualityDashboard({ repos: qualityRepoInputs, generatedAt: nowIso(), stale: qualityStale, repoTotal: repositories.length });
+     return c.json({
+       generatedAt: nowIso(),
+       installations,
+@@ -1021,6 +1042,7 @@ export function createApp() {
+         slop: typeof pull.slopRisk === "number" && pull.slopBand ? { risk: pull.slopRisk, band: pull.slopBand } : null,
+       })),
+       settingsPreview: buildMaintainerSettingsPreview(),
++      qualityDashboard,
+     });
+   });
+ 
+diff --git a/src/services/maintainer-quality-dashboard.ts b/src/services/maintainer-quality-dashboard.ts
+new file mode 100644
+index 00000000..41c352f1
+--- /dev/null
++++ b/src/services/maintainer-quality-dashboard.ts
+@@ -0,0 +1,143 @@
++import { buildCollisionReport, buildQueueHealth, type QueueHealth } from "../signals/engine";
++import type { IssueRecord, PullRequestRecord, RepositoryRecord } from "../types";
++
++// ─── Maintainer quality dashboard (#557) ─────────────────────────────────────────────────────────
++// The non-visual data service behind the maintainer quality dashboard (#539 renders it). Shapes
++// ALREADY-cached repo data (issues + PRs) into queue-health bands, duplicate/collision trends, quality
++// signals, and top contributors by QUALITY BAND. Public-safe: contributor quality is a BAND, never a
++// raw credibility/reward number; only observable counts (open PRs, duplicate clusters) are exposed.
++
++export type MaintainerQualityRepoInput = {
++  repo: RepositoryRecord;
++  issues: IssueRecord[];
++  pullRequests: PullRequestRecord[];
++};
++
++export type ContributorQualityBand = "strong" | "developing" | "early";
++
++export type MaintainerRepoQuality = {
++  repoFullName: string;
++  /** Queue-burden band (low/medium/high/critical) — the raw burden score stays private. */
++  queueBand: QueueHealth["level"];
++  openPrCount: number;
++  duplicateClusters: number;
++  highRiskDuplicates: number;
++};
++
++export type MaintainerTopContributor = {
++  login: string;
++  /** Deterministic quality band from the share of the author's open PRs that are "clean" (linked to a
++   *  REAL cached issue and not in a high-risk duplicate cluster). A band, never a raw quality/credibility
++   *  number. "strong" additionally requires a minimum PR volume so one PR can't game the ranking. */
++  band: ContributorQualityBand;
++  openPrCount: number;
++};
++
++export type MaintainerQualityDashboard = {
++  generatedAt: string;
++  /** True when the underlying cached data is older than the freshness target. */
++  stale: boolean;
++  /** Total scoped repos vs how many were actually shaped (the per-load build is capped). `truncated`
++   *  flags when the maintainer has more repos than were summarized, so the counts read honestly. */
++  repoTotal: number;
++  shapedRepoCount: number;
++  truncated: boolean;
++  repoQuality: MaintainerRepoQuality[];
++  topContributors: MaintainerTopContributor[];
++  /** Aggregate counts across the SHAPED repos' open PRs — observable facts, not private scores. */
++  qualitySignals: { openPrs: number; duplicatePrRisk: number; missingLinkedIssue: number };
++  summary: string;
++};
++
++const MAX_TOP_CONTRIBUTORS = 10;
++const DEFAULT_STALE_MS = 6 * 60 * 60 * 1000;
++// A single clean PR is not enough signal to call a contributor "strong" — require a minimum volume so the
++// band can't be gamed by one PR (and "clean" itself requires a link to a REAL cached issue; see below).
++const MIN_PRS_FOR_STRONG = 2;
++
++/** Cheap freshness check: the dashboard shapes cached data, so it's "stale" when the most recent repo
++ *  sync among the scoped repos is older than the target (or there is no completed sync at all). With no
++ *  scoped repos there is nothing to be stale about. */
++export function isMaintainerQualityDataStale(args: { lastCompletedAts: Array<string | null | undefined>; repoCount: number; nowMs: number; maxAgeMs?: number }): boolean {
++  if (args.repoCount === 0) return false;
++  const newest = args.lastCompletedAts.reduce((best, value) => {
++    const parsed = typeof value === "string" ? Date.parse(value) : Number.NaN;
++    return Number.isFinite(parsed) ? Math.max(best, parsed) : best;
++  }, 0);
++  return newest === 0 || args.nowMs - newest > (args.maxAgeMs ?? DEFAULT_STALE_MS);
++}
++
++function contributorQualityBand(cleanRatio: number, openPrCount: number): ContributorQualityBand {
++  if (cleanRatio >= 0.8 && openPrCount >= MIN_PRS_FOR_STRONG) return "strong";
++  if (cleanRatio >= 0.4) return "developing";
++  return "early";
++}
++
++export function buildMaintainerQualityDashboard(args: { repos: MaintainerQualityRepoInput[]; generatedAt: string; stale?: boolean; repoTotal?: number }): MaintainerQualityDashboard {
++  const repoQuality: MaintainerRepoQuality[] = [];
++  const contributorTotals = new Map<string, { open: number; clean: number }>();
++  let openPrs = 0;
++  let duplicatePrRisk = 0;
++  let missingLinkedIssue = 0;
++
++  for (const { repo, issues, pullRequests } of args.repos) {
++    const openPullRequests = pullRequests.filter((pr) => pr.state === "open");
++    const collisions = buildCollisionReport(repo.fullName, issues, pullRequests);
++    const queueHealth = buildQueueHealth(repo, issues, pullRequests, collisions);
++    // "Duplicate PR risk" means a PR overlaps ANOTHER PR — a high-risk cluster with 2+ pull requests.
++    // A cluster of an issue + its single correctly-linking PR is NOT a duplicate (that's healthy linkage),
++    // so it must not count against the contributor's clean ratio.
++    const highRiskPrNumbers = new Set(
++      collisions.clusters
++        .filter((cluster) => cluster.risk === "high" && cluster.items.filter((item) => item.type === "pull_request").length >= 2)
++        .flatMap((cluster) => cluster.items.filter((item) => item.type === "pull_request").map((item) => item.number)),
++    );
++    // A PR only counts as "linked" for the quality band when it references a REAL cached issue — a body
++    // that says "Closes #999999" (nonexistent) must not inflate the contributor's clean ratio.
++    const realIssueNumbers = new Set(issues.map((issue) => issue.number));
++
++    repoQuality.push({
++      repoFullName: repo.fullName,
++      queueBand: queueHealth.level,
++      openPrCount: openPullRequests.length,
++      duplicateClusters: collisions.summary.clusterCount,
++      highRiskDuplicates: collisions.summary.highRiskCount,
++    });
++
++    for (const pr of openPullRequests) {
++      openPrs += 1;
++      const inHighRiskCluster = highRiskPrNumbers.has(pr.number);
++      if (pr.linkedIssues.length === 0) missingLinkedIssue += 1;
++      if (inHighRiskCluster) duplicatePrRisk += 1;
++      const linkedToRealIssue = pr.linkedIssues.some((number) => realIssueNumbers.has(number));
++      const author = pr.authorLogin ?? "unknown";
++      const tally = contributorTotals.get(author) ?? { open: 0, clean: 0 };
++      tally.open += 1;
++      if (linkedToRealIssue && !inHighRiskCluster) tally.clean += 1;
++      contributorTotals.set(author, tally);
++    }
++  }
++
++  const topContributors: MaintainerTopContributor[] = [...contributorTotals.entries()]
++    // Every tallied contributor has at least one open PR, so `open` is always >= 1 here.
++    .map(([login, tally]) => ({ login, band: contributorQualityBand(tally.clean / tally.open, tally.open), openPrCount: tally.open }))
++    .sort((left, right) => right.openPrCount - left.openPrCount || left.login.localeCompare(right.login))
++    .slice(0, MAX_TOP_CONTRIBUTORS);
++
++  const shapedRepoCount = args.repos.length;
++  const repoTotal = Math.max(args.repoTotal ?? shapedRepoCount, shapedRepoCount);
++  const truncated = repoTotal > shapedRepoCount;
++  const summary = `Shaped ${shapedRepoCount} of ${repoTotal} scoped repo(s); ${openPrs} open PR(s); ${duplicatePrRisk} in a high-risk duplicate cluster; ${missingLinkedIssue} without a linked issue.`;
++
++  return {
++    generatedAt: args.generatedAt,
++    stale: args.stale ?? false,
++    repoTotal,
++    shapedRepoCount,
++    truncated,
++    repoQuality,
++    topContributors,
++    qualitySignals: { openPrs, duplicatePrRisk, missingLinkedIssue },
++    summary,
++  };
++}
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 6040de34..928dde59 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -1691,8 +1691,21 @@ describe("api routes", () => {
+     }
+     const res = await app.request("/v1/app/maintainer-dashboard", { headers: apiHeaders(env) }, env);
+     expect(res.status).toBe(200);
+-    const body = (await res.json()) as { metrics: Array<{ label: string; value: number }> };
++    const body = (await res.json()) as {
++      metrics: Array<{ label: string; value: number }>;
++      qualityDashboard: { generatedAt: string; stale: boolean; repoQuality: Array<{ repoFullName: string; queueBand: string }>; topContributors: Array<{ login: string; band: string }>; qualitySignals: { openPrs: number }; summary: string };
++    };
+     expect(body.metrics.find((metric) => metric.label === "Open PRs cached")?.value).toBe(8);
++    // Quality dashboard (#557): shaped, scoped, public-safe trend/outcome data with bands not raw scores.
++    expect(body.qualityDashboard.generatedAt).toEqual(expect.any(String));
++    expect(typeof body.qualityDashboard.stale).toBe("boolean");
++    expect(body.qualityDashboard.repoQuality.length).toBeGreaterThan(0);
++    expect(body.qualityDashboard.repoQuality.every((entry) => ["low", "medium", "high", "critical"].includes(entry.queueBand))).toBe(true);
++    expect(body.qualityDashboard.topContributors.every((entry) => ["strong", "developing", "early"].includes(entry.band))).toBe(true);
++    expect(body.qualityDashboard.qualitySignals.openPrs).toBeGreaterThanOrEqual(0);
++    expect(body.qualityDashboard.summary).toContain("open PR(s)");
++    expect(JSON.stringify(body.qualityDashboard)).not.toMatch(FORBIDDEN_PUBLIC_REPORT_TERMS);
++    expect(JSON.stringify(body.qualityDashboard)).not.toMatch(/"burdenScore"|"credibility"/);
+   });
+ 
+   it("counts cached open PRs from sync states beyond the latest 500 rows", async () => {
+diff --git a/test/unit/maintainer-quality-dashboard.test.ts b/test/unit/maintainer-quality-dashboard.test.ts
+new file mode 100644
+index 00000000..bffb3d8d
+--- /dev/null
++++ b/test/unit/maintainer-quality-dashboard.test.ts
+@@ -0,0 +1,164 @@
++import { describe, expect, it } from "vitest";
++import { buildMaintainerQualityDashboard, isMaintainerQualityDataStale, type MaintainerQualityRepoInput } from "../../src/services/maintainer-quality-dashboard";
++import type { IssueRecord, PullRequestRecord, RepositoryRecord } from "../../src/types";
++
++const FORBIDDEN_PUBLIC_TERMS = /wallet|hotkey|coldkey|mnemonic|reward|payout|farming|raw trust|trust score|scoreability|credibility|private ranking/i;
++
++function repo(fullName: string): RepositoryRecord {
++  return {
++    fullName,
++    owner: fullName.split("/")[0]!,
++    name: fullName.split("/")[1]!,
++    isInstalled: true,
++    isRegistered: true,
++    isPrivate: false,
++    registryConfig: { repo: fullName, emissionShare: 0.02, issueDiscoveryShare: 0, labelMultipliers: {}, maintainerCut: 0, raw: {} },
++  };
++}
++
++function pr(number: number, over: Partial<PullRequestRecord> = {}): PullRequestRecord {
++  return {
++    repoFullName: "octo/demo",
++    number,
++    title: `PR ${number}`,
++    state: "open",
++    authorLogin: "alice",
++    authorAssociation: "NONE",
++    headSha: `sha${number}`,
++    labels: [],
++    linkedIssues: [number + 100],
++    ...over,
++  };
++}
++
++function issue(number: number): IssueRecord {
++  return { repoFullName: "octo/demo", number, title: `Issue ${number}`, state: "open", authorLogin: "maintainer", authorAssociation: "OWNER", labels: [], linkedPrs: [] };
++}
++
++// Default: PRs pr(1)/pr(2) link issues #101/#102, which exist here — so they are genuinely "clean".
++function input(over: Partial<MaintainerQualityRepoInput> = {}): MaintainerQualityRepoInput {
++  return { repo: repo("octo/demo"), issues: [issue(101), issue(102)], pullRequests: [pr(1), pr(2)], ...over };
++}
++
++describe("buildMaintainerQualityDashboard", () => {
++  it("shapes per-repo queue bands, duplicate trends, and aggregate quality signals (no raw private scores)", () => {
++    const dashboard = buildMaintainerQualityDashboard({ repos: [input()], generatedAt: "2026-06-14T00:00:00.000Z" });
++    expect(dashboard.generatedAt).toBe("2026-06-14T00:00:00.000Z");
++    expect(dashboard.stale).toBe(false);
++    expect(dashboard.repoQuality).toHaveLength(1);
++    expect(dashboard.repoQuality[0]).toMatchObject({ repoFullName: "octo/demo", openPrCount: 2 });
++    expect(["low", "medium", "high", "critical"]).toContain(dashboard.repoQuality[0]!.queueBand);
++    expect(dashboard.qualitySignals).toMatchObject({ openPrs: 2, missingLinkedIssue: 0 });
++    expect(JSON.stringify(dashboard)).not.toMatch(FORBIDDEN_PUBLIC_TERMS);
++    // The per-repo queue burden score is private — only the band is exposed.
++    expect(JSON.stringify(dashboard)).not.toMatch(/"burdenScore"/);
++  });
++
++  it("counts PRs without a linked issue toward the missing-linked-issue signal", () => {
++    const dashboard = buildMaintainerQualityDashboard({
++      repos: [input({ pullRequests: [pr(1, { linkedIssues: [] }), pr(2, { linkedIssues: [5] })] })],
++      generatedAt: "2026-06-14T00:00:00.000Z",
++    });
++    expect(dashboard.qualitySignals.missingLinkedIssue).toBe(1);
++  });
++
++  it("ranks top contributors by open PR count and assigns a quality band (never a raw number)", () => {
++    const dashboard = buildMaintainerQualityDashboard({
++      repos: [
++        input({
++          pullRequests: [
++            pr(1, { authorLogin: "alice", linkedIssues: [101] }),
++            pr(2, { authorLogin: "alice", linkedIssues: [102] }),
++            pr(3, { authorLogin: "bob", linkedIssues: [] }),
++          ],
++        }),
++      ],
++      generatedAt: "2026-06-14T00:00:00.000Z",
++    });
++    expect(dashboard.topContributors[0]).toMatchObject({ login: "alice", openPrCount: 2, band: "strong" });
++    expect(dashboard.topContributors.find((entry) => entry.login === "bob")).toMatchObject({ band: "early", openPrCount: 1 });
++    // Bands only — no raw clean-ratio/credibility number leaks.
++    expect(dashboard.topContributors.every((entry) => ["strong", "developing", "early"].includes(entry.band))).toBe(true);
++    expect(JSON.stringify(dashboard.topContributors)).not.toMatch(/"cleanRatio"|"score"/);
++  });
++
++  it("ignores closed PRs and handles an empty/missing-author repo deterministically", () => {
++    const dashboard = buildMaintainerQualityDashboard({
++      repos: [
++        input({ pullRequests: [pr(1, { state: "closed" }), pr(2, { authorLogin: null, linkedIssues: [] })] }),
++        { repo: repo("octo/empty"), issues: [], pullRequests: [] },
++      ],
++      generatedAt: "2026-06-14T00:00:00.000Z",
++    });
++    expect(dashboard.qualitySignals.openPrs).toBe(1);
++    expect(dashboard.topContributors).toEqual([{ login: "unknown", band: "early", openPrCount: 1 }]);
++    expect(dashboard.repoQuality.map((entry) => entry.repoFullName)).toEqual(["octo/demo", "octo/empty"]);
++    expect(dashboard.summary).toContain("Shaped 2 of 2 scoped repo(s)");
++    expect(dashboard.truncated).toBe(false);
++  });
++
++  it("does not let a fake/nonexistent issue link inflate a contributor to 'strong' (gameability guard)", () => {
++    // Two PRs, both linking a NONEXISTENT issue (#999999) — not real, so neither counts as clean.
++    const gamed = buildMaintainerQualityDashboard({
++      repos: [input({ issues: [issue(101)], pullRequests: [pr(1, { authorLogin: "mallory", linkedIssues: [999999] }), pr(2, { authorLogin: "mallory", linkedIssues: [999999] })] })],
++      generatedAt: "2026-06-14T00:00:00.000Z",
++    });
++    expect(gamed.topContributors[0]).toMatchObject({ login: "mallory", band: "early", openPrCount: 2 });
++
++    // A single genuinely-clean PR is "developing", never "strong" (min-volume guard).
++    const single = buildMaintainerQualityDashboard({
++      repos: [input({ issues: [issue(101)], pullRequests: [pr(1, { authorLogin: "carol", linkedIssues: [101] })] })],
++      generatedAt: "2026-06-14T00:00:00.000Z",
++    });
++    expect(single.topContributors[0]).toMatchObject({ login: "carol", band: "developing", openPrCount: 1 });
++  });
++
++  it("counts genuine duplicate PRs (2+ on the same issue) as high-risk and not clean", () => {
++    // Two PRs both linking issue #101 → a real duplicate cluster (2 pull requests) → both high-risk.
++    const dashboard = buildMaintainerQualityDashboard({
++      repos: [input({ issues: [issue(101)], pullRequests: [pr(1, { authorLogin: "dave", linkedIssues: [101] }), pr(2, { authorLogin: "dave", linkedIssues: [101] })] })],
++      generatedAt: "2026-06-14T00:00:00.000Z",
++    });
++    expect(dashboard.qualitySignals.duplicatePrRisk).toBe(2);
++    expect(dashboard.repoQuality[0]!.highRiskDuplicates).toBeGreaterThan(0);
++    // Both PRs are in a high-risk duplicate cluster → neither counts clean → not "strong".
++    expect(dashboard.topContributors[0]).toMatchObject({ login: "dave", band: "early", openPrCount: 2 });
++  });
++
++  it("discloses truncation when there are more scoped repos than were shaped", () => {
++    const dashboard = buildMaintainerQualityDashboard({ repos: [input()], generatedAt: "2026-06-14T00:00:00.000Z", repoTotal: 50 });
++    expect(dashboard).toMatchObject({ repoTotal: 50, shapedRepoCount: 1, truncated: true });
++    expect(dashboard.summary).toContain("Shaped 1 of 50 scoped repo(s)");
++    // repoTotal can never be reported below the number actually shaped.
++    expect(buildMaintainerQualityDashboard({ repos: [input(), input()], generatedAt: "x", repoTotal: 1 }).repoTotal).toBe(2);
++  });
++
++  it("honors the stale flag and an empty repo set", () => {
++    expect(buildMaintainerQualityDashboard({ repos: [], generatedAt: "2026-06-14T00:00:00.000Z", stale: true }).stale).toBe(true);
++    const empty = buildMaintainerQualityDashboard({ repos: [], generatedAt: "2026-06-14T00:00:00.000Z" });
++    expect(empty.repoQuality).toEqual([]);
++    expect(empty.topContributors).toEqual([]);
++    expect(empty.qualitySignals).toEqual({ openPrs: 0, duplicatePrRisk: 0, missingLinkedIssue: 0 });
++  });
++});
++
++describe("isMaintainerQualityDataStale", () => {
++  const now = Date.parse("2026-06-14T12:00:00.000Z");
++
++  it("is not stale when there are no scoped repos", () => {
++    expect(isMaintainerQualityDataStale({ lastCompletedAts: [], repoCount: 0, nowMs: now })).toBe(false);
++  });
++
++  it("is stale when no completed sync exists for the scoped repos", () => {
++    expect(isMaintainerQualityDataStale({ lastCompletedAts: [null, undefined, "not-a-date"], repoCount: 2, nowMs: now })).toBe(true);
++  });
++
++  it("uses the most recent sync and respects the freshness window", () => {
++    // Newest sync 1h ago → fresh; an additional older entry must not flip it stale.
++    expect(isMaintainerQualityDataStale({ lastCompletedAts: ["2026-06-10T00:00:00.000Z", "2026-06-14T11:00:00.000Z"], repoCount: 1, nowMs: now })).toBe(false);
++    // Newest sync 8h ago → stale.
++    expect(isMaintainerQualityDataStale({ lastCompletedAts: ["2026-06-14T04:00:00.000Z"], repoCount: 1, nowMs: now })).toBe(true);
++    // Custom window.
++    expect(isMaintainerQualityDataStale({ lastCompletedAts: ["2026-06-14T11:00:00.000Z"], repoCount: 1, nowMs: now, maxAgeMs: 30 * 60 * 1000 })).toBe(true);
++  });
++});

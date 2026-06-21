@@ -1,0 +1,858 @@
+diff --git a/crates/engine/src/game/ability_utils.rs b/crates/engine/src/game/ability_utils.rs
+index fd1fb62697..18cc1c2181 100644
+--- a/crates/engine/src/game/ability_utils.rs
++++ b/crates/engine/src/game/ability_utils.rs
+@@ -1419,6 +1419,31 @@ fn collect_target_slots(
+         return Ok(());
+     }
+ 
++    // CR 701.12a: ExchangeLifeTotals carries two distinct per-slot player filters.
++    // Context-ref filters (Controller / "you") are filled by the resolver from
++    // ability.controller and don't require a player choice. Surface one slot per
++    // non-context-ref filter, in declaration order. (Keep in sync with
++    // `build_target_slot_specs` or the slot-count invariant at ~408 fires.)
++    if let Effect::ExchangeLifeTotals { player_a, player_b } = &ability.effect {
++        for filter in [player_a, player_b] {
++            if filter.is_context_ref() {
++                continue;
++            }
++            let legal_targets =
++                legal_targets_for_ability_filter(state, ability, filter, &acc.slots);
++            if legal_targets.is_empty() && !ability.optional_targeting {
++                return Err(EngineError::ActionNotAllowed(
++                    "No legal targets available".to_string(),
++                ));
++            }
++            acc.push(TargetSelectionSlot {
++                legal_targets,
++                optional: ability.optional_targeting,
++            });
++        }
++        return Ok(());
++    }
++
+     if let Effect::MoveCounters {
+         source,
+         target,
+@@ -2503,6 +2528,25 @@ fn collect_target_slot_specs(
+         return;
+     }
+ 
++    // CR 701.12a: Mirror the ExchangeLifeTotals branch in `collect_target_slots`
++    // so per-slot specs match the surfaced TargetSelectionSlots one-for-one
++    // (context-ref slots like Controller are auto-resolved and not surfaced).
++    if let Effect::ExchangeLifeTotals { player_a, player_b } = &ability.effect {
++        for filter in [player_a, player_b] {
++            if filter.is_context_ref() {
++                continue;
++            }
++            let id = TargetInstanceId(*next_instance);
++            *next_instance += 1;
++            specs.push(TargetSlotSpec {
++                filter: filter.clone(),
++                optional: ability.optional_targeting,
++                instance: id,
++            });
++        }
++        return;
++    }
++
+     if let Effect::MoveCounters {
+         source,
+         target,
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index f90d3dabf5..6e8a645903 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -2087,6 +2087,10 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+                 },
+             ));
+         }
++        Effect::ExchangeLifeTotals { player_a, player_b } => {
++            d.push(("player_a".into(), fmt_target(player_a)));
++            d.push(("player_b".into(), fmt_target(player_b)));
++        }
+         Effect::ChangeZone {
+             origin,
+             destination,
+diff --git a/crates/engine/src/game/effects/exchange_life_totals.rs b/crates/engine/src/game/effects/exchange_life_totals.rs
+new file mode 100644
+index 0000000000..2352252a67
+--- /dev/null
++++ b/crates/engine/src/game/effects/exchange_life_totals.rs
+@@ -0,0 +1,226 @@
++use crate::game::effects::life::{apply_damage_life_loss, apply_life_gain};
++use crate::game::static_abilities::{player_has_cant_gain_life, player_has_cant_lose_life};
++use crate::game::targeting::resolve_effect_player_ref;
++use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility, TargetRef};
++use crate::types::events::GameEvent;
++use crate::types::game_state::GameState;
++use crate::types::player::PlayerId;
++
++/// CR 701.12a: Two players exchange life totals (Soul Conduit, Axis of
++/// Mortality, Magus of the Mirror, Mirror Universe).
++///
++/// Both players' life totals swap simultaneously. Per CR 701.12c each player
++/// gains or loses the amount of life necessary to equal the other player's
++/// previous life total (a gain/loss, not a raw set), and per CR 701.12a it is
++/// all-or-nothing: if EITHER player's required life change is forbidden (CR
++/// 119.7 can't-gain when rising, CR 119.8 can't-lose when falling), no part of
++/// the exchange occurs.
++///
++/// Player resolution per slot:
++/// - A context-ref filter (`Controller` for "you") resolves to the ability's
++///   controller and consumes no declared target.
++/// - Any other filter (`Player` for "target player", an opponent filter for
++///   "target opponent") consumes one `TargetRef::Player` from `ability.targets`
++///   in declaration order — mirroring the dual-target slot surfacing in
++///   `ability_utils`.
++pub fn resolve(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    let Effect::ExchangeLifeTotals { player_a, player_b } = &ability.effect else {
++        // Dispatcher in effects/mod.rs only routes ExchangeLifeTotals here.
++        return Ok(());
++    };
++
++    let resolved_kind = EffectKind::from(&ability.effect);
++    let emit_noop = |events: &mut Vec<GameEvent>| {
++        events.push(GameEvent::EffectResolved {
++            kind: resolved_kind,
++            source_id: ability.source_id,
++        });
++    };
++
++    // Resolve each player slot in declaration order. Non-context-ref filters
++    // consume the next declared `TargetRef::Player`; context-refs (Controller)
++    // resolve from the ability directly and consume no target.
++    let mut declared_players = ability.targets.iter().filter_map(|t| match t {
++        TargetRef::Player(pid) => Some(*pid),
++        TargetRef::Object(_) => None,
++    });
++    let mut resolve_slot = |filter: &_| -> Option<PlayerId> {
++        if crate::types::ability::TargetFilter::is_context_ref(filter) {
++            resolve_effect_player_ref(state, ability, filter)
++        } else {
++            declared_players.next()
++        }
++    };
++
++    let Some(pid_a) = resolve_slot(player_a) else {
++        // CR 701.12a: can't complete — no part occurs.
++        emit_noop(events);
++        return Ok(());
++    };
++    let Some(pid_b) = resolve_slot(player_b) else {
++        emit_noop(events);
++        return Ok(());
++    };
++
++    // CR 701.12b analog: a player exchanging life totals with themselves does
++    // nothing.
++    if pid_a == pid_b {
++        emit_noop(events);
++        return Ok(());
++    }
++
++    // CR 701.12a: capture BOTH previous values before any mutation.
++    let life_a = state
++        .players
++        .iter()
++        .find(|p| p.id == pid_a)
++        .ok_or(EffectError::PlayerNotFound)?
++        .life;
++    let life_b = state
++        .players
++        .iter()
++        .find(|p| p.id == pid_b)
++        .ok_or(EffectError::PlayerNotFound)?
++        .life;
++
++    // CR 119.7 / CR 119.8 + CR 701.12a: All-or-nothing pre-check. Player A moves
++    // toward life_b, player B toward life_a. If EITHER change is forbidden
++    // (can't-gain when rising, can't-lose when falling), no part occurs.
++    let blocked = |state: &GameState, pid: PlayerId, from: i32, to: i32| -> bool {
++        match to.cmp(&from) {
++            std::cmp::Ordering::Greater => player_has_cant_gain_life(state, pid),
++            std::cmp::Ordering::Less => player_has_cant_lose_life(state, pid),
++            std::cmp::Ordering::Equal => false,
++        }
++    };
++    if blocked(state, pid_a, life_a, life_b) || blocked(state, pid_b, life_b, life_a) {
++        emit_noop(events);
++        return Ok(());
++    }
++
++    // CR 701.12c: each player gains or loses the difference to equal the other's
++    // previous total (a gain/loss, not a set). Both diffs are computed from the
++    // pre-swap snapshot so the swap is simultaneous.
++    let diff_a = life_b - life_a;
++    let diff_b = life_a - life_b;
++    for (pid, diff) in [(pid_a, diff_a), (pid_b, diff_b)] {
++        let deferred = match diff.signum() {
++            1 => apply_life_gain(state, pid, diff as u32, events).err(),
++            -1 => apply_damage_life_loss(state, pid, (-diff) as u32, events).err(),
++            _ => None,
++        };
++        if deferred.is_some() {
++            // CR 614.7: a competing replacement required a player choice; the
++            // helper installed the WaitingFor and the resume path completes
++            // resolution.
++            return Ok(());
++        }
++    }
++
++    events.push(GameEvent::EffectResolved {
++        kind: resolved_kind,
++        source_id: ability.source_id,
++    });
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::game::zones::create_object;
++    use crate::types::ability::{ControllerRef, StaticDefinition, TargetFilter, TypedFilter};
++    use crate::types::identifiers::CardId;
++    use crate::types::statics::StaticMode;
++    use crate::types::zones::Zone;
++
++    fn exchange_ability(targets: Vec<TargetRef>) -> ResolvedAbility {
++        ResolvedAbility::new(
++            Effect::ExchangeLifeTotals {
++                player_a: TargetFilter::Player,
++                player_b: TargetFilter::Player,
++            },
++            targets,
++            crate::types::identifiers::ObjectId(100),
++            PlayerId(0),
++        )
++    }
++
++    /// CR 701.12c + CR 701.12a: a straight swap. P0=20, P1=5 → P0=5, P1=20.
++    /// Fails (stays 20/5) if the resolver is a no-op.
++    #[test]
++    fn exchange_life_totals_swaps() {
++        let mut state = GameState::new_two_player(42);
++        state.players[0].life = 20;
++        state.players[1].life = 5;
++
++        let ability = exchange_ability(vec![
++            TargetRef::Player(PlayerId(0)),
++            TargetRef::Player(PlayerId(1)),
++        ]);
++        let mut events = Vec::new();
++        resolve(&mut state, &ability, &mut events).unwrap();
++
++        assert_eq!(state.players[0].life, 5);
++        assert_eq!(state.players[1].life, 20);
++    }
++
++    /// CR 701.12a + CR 119.7: All-or-nothing. P1 can't gain life and the swap
++    /// would raise P1 (5 → 20), so NO part of the exchange occurs — both totals
++    /// stay unchanged.
++    #[test]
++    fn exchange_life_totals_blocked_when_cant_gain_does_nothing() {
++        let mut state = GameState::new_two_player(99);
++        state.players[0].life = 20;
++        state.players[1].life = 5;
++
++        // Player 1 can't gain life.
++        let lock = create_object(
++            &mut state,
++            CardId(901),
++            PlayerId(1),
++            "Lock".to_string(),
++            Zone::Battlefield,
++        );
++        state
++            .objects
++            .get_mut(&lock)
++            .unwrap()
++            .static_definitions
++            .push(
++                StaticDefinition::new(StaticMode::CantGainLife).affected(TargetFilter::Typed(
++                    TypedFilter::default().controller(ControllerRef::You),
++                )),
++            );
++
++        let ability = exchange_ability(vec![
++            TargetRef::Player(PlayerId(0)),
++            TargetRef::Player(PlayerId(1)),
++        ]);
++        let mut events = Vec::new();
++        resolve(&mut state, &ability, &mut events).unwrap();
++
++        // CR 701.12a: neither side changes.
++        assert_eq!(state.players[0].life, 20);
++        assert_eq!(state.players[1].life, 5);
++    }
++
++    /// CR 701.12b analog: a player exchanging with themselves does nothing.
++    #[test]
++    fn exchange_life_totals_same_player_is_noop() {
++        let mut state = GameState::new_two_player(7);
++        state.players[0].life = 13;
++
++        let ability = exchange_ability(vec![
++            TargetRef::Player(PlayerId(0)),
++            TargetRef::Player(PlayerId(0)),
++        ]);
++        let mut events = Vec::new();
++        resolve(&mut state, &ability, &mut events).unwrap();
++
++        assert_eq!(state.players[0].life, 13);
++    }
++}
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index 24a71b7284..77cb08cf46 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -96,6 +96,7 @@ pub mod exchange_control;
+ // `intensify.rs`, so `intensify.rs` stays implementation-only).
+ pub mod cloak;
+ pub mod exchange_life;
++pub mod exchange_life_totals;
+ pub mod exile_from_top_until;
+ pub mod exile_top;
+ pub mod exploit;
+@@ -2510,6 +2511,7 @@ pub fn resolve_effect(
+         Effect::CollectEvidence { .. } => collect_evidence::resolve(state, ability, events),
+         Effect::SetLifeTotal { .. } => life::resolve_set_life_total(state, ability, events),
+         Effect::ExchangeLifeWithStat { .. } => exchange_life::resolve(state, ability, events),
++        Effect::ExchangeLifeTotals { .. } => exchange_life_totals::resolve(state, ability, events),
+         Effect::SetDayNight { to } => {
+             crate::game::day_night::resolve_set_day_night(state, *to, events);
+             Ok(())
+diff --git a/crates/engine/src/game/printed_cards.rs b/crates/engine/src/game/printed_cards.rs
+index 85a0854c0c..eaabff093f 100644
+--- a/crates/engine/src/game/printed_cards.rs
++++ b/crates/engine/src/game/printed_cards.rs
+@@ -888,6 +888,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
+         | Effect::GainLife { .. }
+         | Effect::LoseLife { .. }
+         | Effect::ExchangeLifeWithStat { .. }
++        | Effect::ExchangeLifeTotals { .. }
+         // CR 701.26a/b: all tap/untap scopes are leaf effects here.
+         | Effect::SetTapState { .. }
+         | Effect::RemoveCounter { .. }
+diff --git a/crates/engine/src/game/trigger_index.rs b/crates/engine/src/game/trigger_index.rs
+index acb511cfee..c2d5303c2a 100644
+--- a/crates/engine/src/game/trigger_index.rs
++++ b/crates/engine/src/game/trigger_index.rs
+@@ -856,7 +856,8 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
+         // exchange emits LifeChanged/PowerToughnessChanged handled by their own
+         // event arms (ExchangeLifeWithStat). No-op here.
+         | EffectKind::CastCopyOfCard
+-        | EffectKind::ExchangeLifeWithStat => {}
++        | EffectKind::ExchangeLifeWithStat
++        | EffectKind::ExchangeLifeTotals => {}
+     }
+ }
+ 
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index 0a1ba9c1b0..0ef9ff628c 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -6086,6 +6086,32 @@ pub(super) fn parse_imperative_family_ast(
+         return Some(ImperativeFamilyAst::GainKeyword(Effect::EndCombatPhase));
+     }
+ 
++    // CR 701.12a: "two target players exchange life totals" (Soul Conduit, Axis
++    // of Mortality). The subject ("two target players") precedes the verb, so
++    // `first_word` is "two"/"target"/"have" rather than a verb keyword —
++    // intercept it as an anchored whole-phrase production before the first-word
++    // dispatch. Accept three optional leading wrinkles:
++    //   - "have " — the causative construction from "you may have <players>
++    //     exchange ..." (Axis of Mortality), which keeps its full surface form.
++    //   - "two " — the cardinality quantifier, which may already be stripped
++    //     upstream by `strip_any_number_quantifier`.
++    // Both players are `Player` targets.
++    if all_consuming(terminated(
++        preceded(
++            (opt(tag::<_, _, OracleError<'_>>("have ")), opt(tag("two "))),
++            tag("target players exchange life totals"),
++        ),
++        opt(tag(".")),
++    ))
++    .parse(lower.trim())
++    .is_ok()
++    {
++        return Some(ImperativeFamilyAst::ExchangeLifeTotals {
++            player_a: TargetFilter::Player,
++            player_b: TargetFilter::Player,
++        });
++    }
++
+     // CR 500.8: Additional step/phase effects can appear in various sentence structures
+     // ("there is an additional combat phase", "after this phase, there is an additional...").
+     // Intercept early regardless of first_word.
+@@ -6736,6 +6762,12 @@ pub(super) fn parse_imperative_family_ast(
+         // Both shapes lower to ExchangeControl { target_a, target_b }; in the
+         // quantified case both filters are identical.
+         "exchange" => {
++            // CR 701.12a: player-to-player "exchange life totals" (Soul Conduit,
++            // Axis of Mortality, Magus of the Mirror, Mirror Universe) — checked
++            // before the life-with-stat shape since both begin "exchange life".
++            if let Some((player_a, player_b)) = try_parse_exchange_life_totals(lower) {
++                return Some(ImperativeFamilyAst::ExchangeLifeTotals { player_a, player_b });
++            }
+             // CR 701.12a: "exchange <player>'s life total with ~'s power/toughness"
+             // (Tree of Perdition, Tree of Redemption, Evra) — checked before
+             // "exchange control of" since the two shapes share only the verb.
+@@ -7012,6 +7044,33 @@ fn parse_exchange_life_player(input: &str) -> Option<(&str, TargetFilter)> {
+     .ok()
+ }
+ 
++/// CR 701.12a: Player-to-player "exchange life totals", verb-initial shape:
++/// "exchange life totals with target opponent" / "... target player" — the
++/// controller (`Controller`) exchanges with that opponent/player (Magus of the
++/// Mirror, Mirror Universe). The subject-initial "two target players exchange
++/// life totals" shape (Soul Conduit, Axis of Mortality) is intercepted earlier
++/// in `parse_imperative_family_ast` because its first word is not a verb.
++/// Returns `(player_a, player_b)` or `None` for unrecognised shapes.
++fn try_parse_exchange_life_totals(lower: &str) -> Option<(TargetFilter, TargetFilter)> {
++    // "exchange life totals with <target opponent | target player>".
++    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("exchange life totals with ").parse(lower) {
++        let (rest, other) = alt((
++            value(
++                TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
++                tag::<_, _, OracleError<'_>>("target opponent"),
++            ),
++            value(TargetFilter::Player, tag("target player")),
++        ))
++        .parse(rest)
++        .ok()?;
++        if rest.trim().trim_end_matches(['.', ';']).trim().is_empty() {
++            return Some((TargetFilter::Controller, other));
++        }
++    }
++
++    None
++}
++
+ /// CR 701.12a: Extract the two per-slot target filters from the "<...>" body of
+ /// "exchange control of <...>". Returns `None` for unrecognised shapes so the
+ /// caller can fall through (no Effect is emitted) rather than silently dropping
+@@ -7870,6 +7929,12 @@ fn lower_imperative_family_effect(ast: ImperativeFamilyAst) -> Effect {
+         ImperativeFamilyAst::ExchangeLifeWithStat { player, stat } => {
+             Effect::ExchangeLifeWithStat { player, stat }
+         }
++        // CR 701.12a: Two players exchange life totals. The two player filters
++        // come from the parser; resolution reads ability.targets in declaration
++        // order for any non-context-ref slots.
++        ImperativeFamilyAst::ExchangeLifeTotals { player_a, player_b } => {
++            Effect::ExchangeLifeTotals { player_a, player_b }
++        }
+         // CR 509.1c: Must be blocked — grant transient MustBeBlocked static via GenericEffect.
+         // Uses AddStaticMode so the mode propagates through the layer system to
+         // static_definitions, where combat.rs checks it.
+@@ -13550,4 +13615,77 @@ mod tests {
+             "expected optional: false for 'then planeswalk'"
+         );
+     }
++
++    /// CR 701.12a: Soul Conduit / Axis of Mortality body — "two target players
++    /// exchange life totals" lowers to ExchangeLifeTotals{Player, Player}.
++    #[test]
++    fn two_target_players_exchange_life_totals_parses() {
++        let def = super::super::parse_effect_chain(
++            "Two target players exchange life totals.",
++            AbilityKind::Activated,
++        );
++        match &*def.effect {
++            Effect::ExchangeLifeTotals { player_a, player_b } => {
++                assert_eq!(*player_a, TargetFilter::Player);
++                assert_eq!(*player_b, TargetFilter::Player);
++            }
++            other => panic!("expected ExchangeLifeTotals, got {other:?}"),
++        }
++    }
++
++    /// CR 701.12a: Axis of Mortality causative body — "have two target players
++    /// exchange life totals" (from "you may have …") lowers to
++    /// ExchangeLifeTotals{Player, Player}.
++    #[test]
++    fn have_two_target_players_exchange_life_totals_parses() {
++        let def = super::super::parse_effect_chain(
++            "Have two target players exchange life totals.",
++            AbilityKind::Spell,
++        );
++        match &*def.effect {
++            Effect::ExchangeLifeTotals { player_a, player_b } => {
++                assert_eq!(*player_a, TargetFilter::Player);
++                assert_eq!(*player_b, TargetFilter::Player);
++            }
++            other => panic!("expected ExchangeLifeTotals, got {other:?}"),
++        }
++    }
++
++    /// CR 701.12a: Magus of the Mirror / Mirror Universe body — "exchange life
++    /// totals with target opponent" lowers to ExchangeLifeTotals{Controller,
++    /// Typed(Opponent)}.
++    #[test]
++    fn exchange_life_totals_with_target_opponent_parses() {
++        let def = super::super::parse_effect_chain(
++            "Exchange life totals with target opponent.",
++            AbilityKind::Activated,
++        );
++        match &*def.effect {
++            Effect::ExchangeLifeTotals { player_a, player_b } => {
++                assert_eq!(*player_a, TargetFilter::Controller);
++                assert_eq!(
++                    *player_b,
++                    TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
++                );
++            }
++            other => panic!("expected ExchangeLifeTotals, got {other:?}"),
++        }
++    }
++
++    /// CR 701.12a: "exchange life totals with target player" form lowers to
++    /// ExchangeLifeTotals{Controller, Player}.
++    #[test]
++    fn exchange_life_totals_with_target_player_parses() {
++        let def = super::super::parse_effect_chain(
++            "Exchange life totals with target player.",
++            AbilityKind::Activated,
++        );
++        match &*def.effect {
++            Effect::ExchangeLifeTotals { player_a, player_b } => {
++                assert_eq!(*player_a, TargetFilter::Controller);
++                assert_eq!(*player_b, TargetFilter::Player);
++            }
++            other => panic!("expected ExchangeLifeTotals, got {other:?}"),
++        }
++    }
+ }
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 5a4ee2db87..f2f2adf354 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -3946,6 +3946,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
+         | Effect::Seek { .. }
+         | Effect::SetLifeTotal { .. }
+         | Effect::ExchangeLifeWithStat { .. }
++        | Effect::ExchangeLifeTotals { .. }
+         | Effect::SetDayNight { .. }
+         | Effect::GiveControl { .. }
+         | Effect::RemoveFromCombat { .. }
+diff --git a/crates/engine/src/parser/oracle_ir/ast.rs b/crates/engine/src/parser/oracle_ir/ast.rs
+index 76561c461b..7da3f190f4 100644
+--- a/crates/engine/src/parser/oracle_ir/ast.rs
++++ b/crates/engine/src/parser/oracle_ir/ast.rs
+@@ -452,6 +452,14 @@ pub(crate) enum ImperativeFamilyAst {
+         player: TargetFilter,
+         stat: PtStat,
+     },
++    /// CR 701.12a: Two players exchange life totals (Soul Conduit, Axis of
++    /// Mortality, Magus of the Mirror, Mirror Universe). `player_a`/`player_b`
++    /// select each player (`Controller` for "you", an opponent filter for "target
++    /// opponent", `Player` for "target player").
++    ExchangeLifeTotals {
++        player_a: TargetFilter,
++        player_b: TargetFilter,
++    },
+     /// CR 509.1c: Must be blocked this turn if able.
+     MustBeBlocked,
+     Investigate,
+diff --git a/crates/engine/src/parser/swallow_check.rs b/crates/engine/src/parser/swallow_check.rs
+index 91396b91c3..4da65114be 100644
+--- a/crates/engine/src/parser/swallow_check.rs
++++ b/crates/engine/src/parser/swallow_check.rs
+@@ -1918,6 +1918,22 @@ fn detect_condition_if(
+     if stripped.contains("if you don't") && any_replacement_has_may_cost_decline(parsed) {
+         return;
+     }
++    // CR 608.2c: "If you [lost/gained] life this way, draw that many cards"
++    // (Mister Negative). "[lost/gained] life this way" is a result-reference to
++    // the life the controller lost/gained from the preceding effect, and "that
++    // many" lowers the dependent draw to `count: EventContextAmount`. The
++    // conditional is jointly represented by the event-context quantity —
++    // drawing zero when zero life changed is exactly the no-op the "if" guards —
++    // so the leading "if" is a representation marker, not a swallowed condition.
++    // Mirrors the Screaming Nemesis "dealt damage this way" exemption above.
++    // allow-noncombinator: swallow detector marker scan on classified text
++    if (stripped.contains("lost life this way") || stripped.contains("gained life this way"))
++        && stripped.contains("that many") // allow-noncombinator: swallow detector marker scan on classified text
++        && ast_json.contains("EventContextAmount")
++    // allow-noncombinator: structural AST-shape JSON probe
++    {
++        return;
++    }
+     // CR 117.6 / 702.8: A `SpellCastingOption` with `cost: Some(_)` encodes
+     // the "if you pay [cost]" surcharge gate inline (Ghitu Fire, Rout-class
+     // "as though it had flash if you pay X" cycle). The "if" is a cost
+@@ -3302,6 +3318,28 @@ mod tests {
+         assert!(!has_swallowed_detector(&parsed, "Condition_If"));
+     }
+ 
++    /// CR 608.2c: Mister Negative's "If you lost life this way, draw that many
++    /// cards" rider — the "lost life this way" result-reference and "that many"
++    /// draw quantity are jointly represented by `Draw { count:
++    /// EventContextAmount }`, so the leading "if" must NOT be reported as a
++    /// swallowed condition.
++    #[test]
++    fn condition_if_accepts_lost_life_this_way_draw_that_many() {
++        let parsed = parse_named(
++            "Vigilance, lifelink\n\
++             When this creature enters, you may exchange life totals with target opponent. \
++             If you lost life this way, draw that many cards.",
++            "Mister Negative",
++            &["Creature"],
++        );
++
++        assert!(
++            !has_swallowed_detector(&parsed, "Condition_If"),
++            "lost-life-this-way result-reference draw must not report a swallowed condition: {:?}",
++            parsed.parse_warnings
++        );
++    }
++
+     #[test]
+     fn duration_this_turn_accepts_life_loss_turn_history_condition() {
+         let parsed = parse(
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 937ceb54da..422581b0a0 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -9027,6 +9027,15 @@ pub enum Effect {
+         player: TargetFilter,
+         stat: PtStat,
+     },
++    /// CR 701.12a: Two players exchange life totals. player_a/player_b each select a
++    /// player (Controller for "you", Opponent filter for "target opponent", Player
++    /// for "target player"). Both swap simultaneously, all-or-nothing.
++    ExchangeLifeTotals {
++        #[serde(default = "default_target_filter_any")]
++        player_a: TargetFilter,
++        #[serde(default = "default_target_filter_any")]
++        player_b: TargetFilter,
++    },
+     /// CR 730.1: Set the game's day/night designation.
+     /// Triggers daybound/nightbound transformations on all relevant permanents.
+     SetDayNight {
+@@ -10023,6 +10032,9 @@ impl Effect {
+             | Effect::MadnessCast { .. }
+             | Effect::GiftDelivery { .. }
+             | Effect::ExchangeControl { .. }
++            // CR 701.12a: player targets (player_a/player_b) are surfaced as
++            // dual target slots by ability_utils, not by `target_filter()`.
++            | Effect::ExchangeLifeTotals { .. }
+             // CR 601.2a: candidates gathered by `filter`/`zones` at resolution,
+             // no player-selectable target slot.
+             | Effect::FreeCastFromZones { .. }
+@@ -10267,6 +10279,7 @@ impl Effect {
+             | Effect::Endure { .. }
+             | Effect::ExchangeControl { .. }
+             | Effect::ExchangeLifeWithStat { .. }
++            | Effect::ExchangeLifeTotals { .. }
+             | Effect::ExileFromTopUntil { .. }
+             | Effect::ExileResolvingSpellInsteadOfGraveyard
+             | Effect::FlipCoin { .. }
+@@ -10468,6 +10481,7 @@ impl Effect {
+             | Effect::Endure { .. }
+             | Effect::ExchangeControl { .. }
+             | Effect::ExchangeLifeWithStat { .. }
++            | Effect::ExchangeLifeTotals { .. }
+             | Effect::ExileFromTopUntil { .. }
+             | Effect::ExileResolvingSpellInsteadOfGraveyard
+             | Effect::FlipCoin { .. }
+@@ -10697,6 +10711,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
+         Effect::Seek { .. } => "Seek",
+         Effect::SetLifeTotal { .. } => "SetLifeTotal",
+         Effect::ExchangeLifeWithStat { .. } => "ExchangeLifeWithStat",
++        Effect::ExchangeLifeTotals { .. } => "ExchangeLifeTotals",
+         Effect::SetDayNight { .. } => "SetDayNight",
+         Effect::GiveControl { .. } => "GiveControl",
+         Effect::RemoveFromCombat { .. } => "RemoveFromCombat",
+@@ -10896,6 +10911,7 @@ pub enum EffectKind {
+     Seek,
+     SetLifeTotal,
+     ExchangeLifeWithStat,
++    ExchangeLifeTotals,
+     SetDayNight,
+     GiveControl,
+     RemoveFromCombat,
+@@ -11110,6 +11126,7 @@ impl From<&Effect> for EffectKind {
+             Effect::Seek { .. } => EffectKind::Seek,
+             Effect::SetLifeTotal { .. } => EffectKind::SetLifeTotal,
+             Effect::ExchangeLifeWithStat { .. } => EffectKind::ExchangeLifeWithStat,
++            Effect::ExchangeLifeTotals { .. } => EffectKind::ExchangeLifeTotals,
+             Effect::SetDayNight { .. } => EffectKind::SetDayNight,
+             Effect::GiveControl { .. } => EffectKind::GiveControl,
+             Effect::RemoveFromCombat { .. } => EffectKind::RemoveFromCombat,
+diff --git a/crates/engine/tests/integration/exchange_life_totals_cards.rs b/crates/engine/tests/integration/exchange_life_totals_cards.rs
+new file mode 100644
+index 0000000000..a5b2e62e8e
+--- /dev/null
++++ b/crates/engine/tests/integration/exchange_life_totals_cards.rs
+@@ -0,0 +1,125 @@
++//! Full-card coverage for issue #3486 — player-to-player "exchange life totals"
++//! (CR 701.12a). Real Oracle text from AtomicCards.json, driven through the
++//! activation + resolution pipeline.
++//!
++//! - Soul Conduit: "{6}, {T}: Two target players exchange life totals."
++//!   (ExchangeLifeTotals{Player, Player}).
++//! - Mirror Universe: "{T}, Sacrifice this artifact: Exchange life totals with
++//!   target opponent. Activate only during your upkeep."
++//!   (ExchangeLifeTotals{Controller, Typed(Opponent)}).
++
++use engine::game::scenario::{GameScenario, P0, P1};
++use engine::types::ability::TargetRef;
++use engine::types::actions::GameAction;
++use engine::types::game_state::WaitingFor;
++use engine::types::identifiers::ObjectId;
++use engine::types::mana::{ManaType, ManaUnit};
++use engine::types::phase::Phase;
++
++const SOUL_CONDUIT_ORACLE: &str = "{6}, {T}: Two target players exchange life totals.";
++const MIRROR_UNIVERSE_ORACLE: &str =
++    "{T}, Sacrifice this artifact: Exchange life totals with target opponent. \
++     Activate only during your upkeep.";
++
++/// CR 701.12c + CR 701.12a: Soul Conduit's activated ability swaps two target
++/// players' life totals. P0=20, P1=5 → P0=5, P1=20.
++#[test]
++fn soul_conduit_swaps_two_target_players_life_totals() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    scenario.with_life(P0, 20).with_life(P1, 5);
++    // {6} generic: fund the controller's pool with six colorless mana (source
++    // auto-tap isn't modeled by the activation driver).
++    scenario.with_mana_pool(
++        P0,
++        (0..6)
++            .map(|_| ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]))
++            .collect(),
++    );
++    let conduit = scenario
++        .add_creature(P0, "Soul Conduit", 0, 0)
++        .from_oracle_text(SOUL_CONDUIT_ORACLE)
++        .as_artifact()
++        .id();
++
++    let mut runner = scenario.build();
++
++    // Drive activation manually: the two `Player` slots must receive DISTINCT
++    // players (P0 then P1, in declaration order). The fluent `AbilityActivation`
++    // driver reuses the same first-matching declared player for every slot, so
++    // it can't express two distinct same-filter player slots — choose each slot
++    // explicitly here.
++    runner
++        .act(GameAction::ActivateAbility {
++            source_id: conduit,
++            ability_index: 0,
++        })
++        .expect("begin Soul Conduit activation");
++
++    // Pay {6} from the funded pool, then choose P0 and P1 for the two slots.
++    let players = [P0, P1];
++    let mut next_player = 0usize;
++    for _ in 0..16 {
++        match &runner.state().waiting_for {
++            WaitingFor::ManaPayment { .. } => {
++                runner
++                    .act(GameAction::PassPriority)
++                    .expect("finalize {6} payment from pool");
++            }
++            WaitingFor::TargetSelection { .. } => {
++                let pid = players[next_player];
++                next_player += 1;
++                runner
++                    .act(GameAction::ChooseTarget {
++                        target: Some(TargetRef::Player(pid)),
++                    })
++                    .expect("choose target player");
++            }
++            WaitingFor::Priority { .. } => break,
++            other => panic!("unexpected Soul Conduit activation prompt: {other:?}"),
++        }
++    }
++
++    runner.advance_until_stack_empty();
++
++    assert_eq!(
++        runner.state().players[0].life,
++        5,
++        "P0's life should become P1's former total"
++    );
++    assert_eq!(
++        runner.state().players[1].life,
++        20,
++        "P1's life should become P0's former total"
++    );
++}
++
++/// CR 701.12c + CR 701.12a: Mirror Universe's {T},Sac ability (during the
++/// controller's upkeep) swaps the controller's and a target opponent's life
++/// totals. P0=3, P1=18 → P0=18, P1=3.
++#[test]
++fn mirror_universe_swaps_controller_with_target_opponent() {
++    let mut scenario = GameScenario::new();
++    // "Activate only during your upkeep" — P0 is the active player by default.
++    scenario.at_phase(Phase::Upkeep);
++    scenario.with_life(P0, 3).with_life(P1, 18);
++    let mirror = scenario
++        .add_creature(P0, "Mirror Universe", 0, 0)
++        .from_oracle_text(MIRROR_UNIVERSE_ORACLE)
++        .as_artifact()
++        .id();
++
++    let mut runner = scenario.build();
++    let outcome = runner.activate(mirror, 0).target_player(P1).resolve();
++
++    assert_eq!(
++        outcome.state().players[0].life,
++        18,
++        "controller's life should become the opponent's former total"
++    );
++    assert_eq!(
++        outcome.state().players[1].life,
++        3,
++        "opponent's life should become the controller's former total"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index daa256c114..a38ecc47be 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -67,6 +67,7 @@ mod emrakul_control_turn_crash;
+ mod engine_invariants;
+ mod enlightened_tutor_regression;
+ mod evelyn_regression;
++mod exchange_life_totals_cards;
+ mod exhibition_tidecaller_target_player_mill;
+ mod export_runtime_canaries;
+ mod exquisite_blood_routing;
+diff --git a/crates/phase-ai/src/policies/effect_classify.rs b/crates/phase-ai/src/policies/effect_classify.rs
+index a28e91093a..d126651b4a 100644
+--- a/crates/phase-ai/src/policies/effect_classify.rs
++++ b/crates/phase-ai/src/policies/effect_classify.rs
+@@ -193,7 +193,8 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
+         | Effect::GiftDelivery { .. }
+         | Effect::Suspect { .. }
+         | Effect::GivePlayerCounter { .. }
+-        | Effect::ExchangeControl { .. } => EffectPolarity::Contextual,
++        | Effect::ExchangeControl { .. }
++        | Effect::ExchangeLifeTotals { .. } => EffectPolarity::Contextual,
+         _ => EffectPolarity::Contextual,
+     }
+ }
+diff --git a/crates/phase-ai/src/policies/redundancy_avoidance.rs b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+index d4d57212b1..9c3de6f701 100644
+--- a/crates/phase-ai/src/policies/redundancy_avoidance.rs
++++ b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+@@ -581,6 +581,9 @@ fn redundancy_delta(
+         // between a player's life and the source's stat — no static redundancy
+         // signal (it never "does nothing" the way a duplicate keyword grant does).
+         | Effect::ExchangeLifeWithStat { .. }
++        // CR 701.12a: ExchangeLifeTotals's value depends on the live gap between
++        // the two players' life totals — no static redundancy signal.
++        | Effect::ExchangeLifeTotals { .. }
+         // CR 701.51 + CR 701.52: Attraction open/visit — deck state dependent.
+         | Effect::OpenAttractions { .. }
+         | Effect::RollToVisitAttractions

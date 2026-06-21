@@ -1,0 +1,528 @@
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentEvent.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentEvent.kt
+index f9d637f..4fe65f0 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentEvent.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentEvent.kt
+@@ -250,6 +250,27 @@ sealed class AgentEvent(
+         }
+     }
+ 
++    /**
++     * Signals that a successful run was captured as a reusable workflow trace
++     * (issue #289). It carries no sensitive payload — only the run id and the
++     * number of captured steps.
++     */
++    data class TraceRecorded(
++        val runId: String,
++        val stepCount: Int,
++        override val id: String = nextId(),
++        override val timestampMillis: Long = System.currentTimeMillis()
++    ) : AgentEvent(id, timestampMillis) {
++        override val type = AgentEventType.TRACE_RECORDED
++
++        override fun payload(redactSensitive: Boolean): Map<String, Any?> {
++            return mapOf(
++                "run_id" to runId,
++                "step_count" to stepCount
++            )
++        }
++    }
++
+     companion object {
+         private var sequence = 0L
+ 
+@@ -340,5 +361,6 @@ enum class AgentEventType(val wireName: String) {
+     CLARIFICATION("clarification"),
+     FINAL_ANSWER("final_answer"),
+     RUN_CANCELLED("run_cancelled"),
+-    SKILL_ACTIVE("skill_active")
++    SKILL_ACTIVE("skill_active"),
++    TRACE_RECORDED("trace_recorded")
+ }
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt
+index 641a1dd..ea43dd2 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentRunDetailFormatter.kt
+@@ -419,6 +419,7 @@ object AgentRunDetailFormatter {
+             is AgentEvent.FinalAnswer -> AgentRunStepStatus.COMPLETE
+             is AgentEvent.RunCancelled -> AgentRunStepStatus.BLOCKED
+             is AgentEvent.SkillActive -> AgentRunStepStatus.INFO
++            is AgentEvent.TraceRecorded -> AgentRunStepStatus.INFO
+         }
+     }
+ 
+@@ -439,6 +440,7 @@ object AgentRunDetailFormatter {
+             is AgentEvent.FinalAnswer -> "Final answer"
+             is AgentEvent.RunCancelled -> "Run cancelled"
+             is AgentEvent.SkillActive -> "Skill scope: ${event.title}"
++            is AgentEvent.TraceRecorded -> "Workflow trace recorded"
+         }
+     }
+ 
+@@ -468,6 +470,7 @@ object AgentRunDetailFormatter {
+                 appendLine("risk: ${payload.getString("risk")}")
+                 append("reason: ${payload.getString("reason")}")
+             }
++            is AgentEvent.TraceRecorded -> "${payload.getInt("step_count")} step(s) captured"
+         }
+     }
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/agent/AgentStepTimelineBuilder.kt b/app/src/main/java/dev/touchpilot/app/agent/AgentStepTimelineBuilder.kt
+index a7f73eb..0ba33b7 100644
+--- a/app/src/main/java/dev/touchpilot/app/agent/AgentStepTimelineBuilder.kt
++++ b/app/src/main/java/dev/touchpilot/app/agent/AgentStepTimelineBuilder.kt
+@@ -43,6 +43,7 @@ class AgentStepTimelineBuilder {
+             is AgentEvent.Clarification -> onClarification(event)
+             is AgentEvent.RunCancelled -> onRunCancelled(event)
+             is AgentEvent.SkillActive -> Unit
++            is AgentEvent.TraceRecorded -> Unit
+         }
+     }
+ 
+diff --git a/app/src/main/java/dev/touchpilot/app/runtime/AgentRunController.kt b/app/src/main/java/dev/touchpilot/app/runtime/AgentRunController.kt
+index 2c8be1f..817cfc1 100644
+--- a/app/src/main/java/dev/touchpilot/app/runtime/AgentRunController.kt
++++ b/app/src/main/java/dev/touchpilot/app/runtime/AgentRunController.kt
+@@ -20,6 +20,8 @@ import dev.touchpilot.app.androidcontrol.AccessibilityBridge
+ import dev.touchpilot.app.security.SensitiveTextRedactor
+ import dev.touchpilot.app.security.ToolApprovalRequest
+ import dev.touchpilot.app.tools.ToolExecutionLog
++import dev.touchpilot.app.workflow.WorkflowTrace
++import dev.touchpilot.app.workflow.WorkflowTraceStore
+ import dev.touchpilot.app.ui.chat.ApprovalState
+ import dev.touchpilot.app.ui.chat.ChatEvent
+ import java.util.concurrent.CountDownLatch
+@@ -40,6 +42,7 @@ class AgentRunController(
+     private var pendingClarification: PendingClarification? = null
+     private var cancellationSignal: AtomicBoolean = AtomicBoolean(false)
+     private val mutableRunHistory = mutableListOf<AgentRunRecord>()
++    private val workflowTraceStore = WorkflowTraceStore()
+ 
+     var runState: AgentRunState = AgentRunState.IDLE
+         private set
+@@ -47,6 +50,10 @@ class AgentRunController(
+     val runHistory: List<AgentRunRecord>
+         get() = mutableRunHistory
+ 
++    /** Workflow traces captured from successful runs this session (issue #289). */
++    val workflowTraces: List<WorkflowTrace>
++        get() = workflowTraceStore.all()
++
+     fun startFromChat(task: String) {
+         val pending = pendingClarification
+         val originalTask = pending?.originalTask
+@@ -325,6 +332,7 @@ class AgentRunController(
+                     message = doneDetail,
+                     status = "complete"
+                 )
++                captureWorkflowTrace(record)
+             }
+             else -> {
+                 conversation += ChatEvent.Agent(
+@@ -342,6 +350,28 @@ class AgentRunController(
+         showChat()
+     }
+ 
++    /**
++     * Captures a successful run as a reusable [WorkflowTrace] (issue #289).
++     * Non-successful runs (errors, blocks, no tool actions) yield no trace, so
++     * this is a no-op for them. The trace stays in-memory for the session.
++     */
++    private fun captureWorkflowTrace(record: AgentRunRecord) {
++        val trace = WorkflowTrace.from(record) ?: return
++        workflowTraceStore.record(trace)
++        val recorded = AgentEvent.TraceRecorded(runId = trace.runId, stepCount = trace.steps.size)
++        ToolExecutionLog.recordAction(
++            name = "workflow_trace_recorded",
++            result = "Captured a ${trace.steps.size}-step workflow trace.",
++            status = "complete",
++            source = currentProviderMode().toLogSource(),
++            details = recorded.toJson(redactSensitive = true).toString(),
++        )
++        conversation += ChatEvent.Agent(
++            "Workflow captured.",
++            "${trace.steps.size} step(s) recorded — this run can be saved as a workflow.",
++        )
++    }
++
+     private fun setRunState(state: AgentRunState) {
+         runState = state
+         showChat()
+diff --git a/app/src/main/java/dev/touchpilot/app/workflow/WorkflowTrace.kt b/app/src/main/java/dev/touchpilot/app/workflow/WorkflowTrace.kt
+new file mode 100644
+index 0000000..fd4deca
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/workflow/WorkflowTrace.kt
+@@ -0,0 +1,126 @@
++package dev.touchpilot.app.workflow
++
++import dev.touchpilot.app.agent.AgentRunRecord
++import dev.touchpilot.app.agent.AgentStepStopReason
++import dev.touchpilot.app.agent.AgentStepType
++import dev.touchpilot.app.security.SensitiveTextRedactor
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * A captured recording of a successful agent run, kept as the raw input for a
++ * future workflow definition (issue #289).
++ *
++ * It is **derived** from the existing [AgentRunRecord] rather than captured
++ * through a parallel pipeline, so there is a single source of truth for what the
++ * run did. Only runs that completed successfully and performed at least one tool
++ * action produce a trace; informational, clarification, blocked, failed, and
++ * cancelled runs return null.
++ *
++ * Redaction happens at capture time: tool arguments, results, and verification
++ * reasons are already redacted inside the run's [dev.touchpilot.app.agent.AgentStep]s,
++ * and the task string is redacted here. No raw secret enters a stored trace.
++ */
++data class WorkflowTrace(
++    val runId: String,
++    val task: String,
++    val capturedAtMillis: Long,
++    val steps: List<WorkflowTraceStep>,
++    val screenSignals: List<WorkflowTraceScreenSignal>,
++) {
++    fun toJson(): JSONObject {
++        return JSONObject().apply {
++            put("run_id", runId)
++            put("task", task)
++            put("captured_at_millis", capturedAtMillis)
++            put("steps", JSONArray().apply { steps.forEach { put(it.toJson()) } })
++            put("screen_signals", JSONArray().apply { screenSignals.forEach { put(it.toJson()) } })
++        }
++    }
++
++    companion object {
++        /**
++         * Derives a trace from a completed, successful run, or null when the run
++         * is not a capturable workflow (no result, error, non-completed stop
++         * reason, or no tool actions).
++         */
++        fun from(record: AgentRunRecord): WorkflowTrace? {
++            val result = record.result ?: return null
++            if (record.errorMessage != null) return null
++            if (result.stopReason != AgentStepStopReason.COMPLETED) return null
++
++            val steps = result.steps
++                .filter { it.type == AgentStepType.ACT && it.toolCall != null }
++                .map { step ->
++                    val call = step.toolCall!!
++                    WorkflowTraceStep(
++                        index = step.sequenceNumber,
++                        tool = call.tool,
++                        args = call.args,
++                        succeeded = call.result?.ok ?: false,
++                        verification = step.verification?.let {
++                            WorkflowTraceVerification(status = it.status, reason = it.reason)
++                        },
++                    )
++                }
++            if (steps.isEmpty()) return null
++
++            val screenSignals = record.screenRecords.map {
++                WorkflowTraceScreenSignal(
++                    phase = it.phase,
++                    nodeCount = it.nodeCount,
++                    containsSensitiveContent = it.containsSensitiveContent,
++                )
++            }
++
++            return WorkflowTrace(
++                runId = record.id,
++                task = SensitiveTextRedactor.redact(record.task),
++                capturedAtMillis = record.completedAtMillis,
++                steps = steps,
++                screenSignals = screenSignals,
++            )
++        }
++    }
++}
++
++/** One replayable tool action from the captured run. Arguments are pre-redacted. */
++data class WorkflowTraceStep(
++    val index: Int,
++    val tool: String,
++    val args: Map<String, String>,
++    val succeeded: Boolean,
++    val verification: WorkflowTraceVerification?,
++) {
++    fun toJson(): JSONObject = JSONObject().apply {
++        put("index", index)
++        put("tool", tool)
++        put("args", JSONObject(args))
++        put("succeeded", succeeded)
++        put("verification", verification?.toJson() ?: JSONObject.NULL)
++    }
++}
++
++/** Verification outcome recorded for a step, used later to express expected state. */
++data class WorkflowTraceVerification(
++    val status: String,
++    val reason: String,
++) {
++    fun toJson(): JSONObject = JSONObject().apply {
++        put("status", status)
++        put("reason", reason)
++    }
++}
++
++/** Coarse screen-context signal captured at a run phase (e.g. "initial", "final"). */
++data class WorkflowTraceScreenSignal(
++    val phase: String,
++    val nodeCount: Int,
++    val containsSensitiveContent: Boolean,
++) {
++    fun toJson(): JSONObject = JSONObject().apply {
++        put("phase", phase)
++        put("node_count", nodeCount)
++        put("contains_sensitive_content", containsSensitiveContent)
++    }
++}
+diff --git a/app/src/main/java/dev/touchpilot/app/workflow/WorkflowTraceStore.kt b/app/src/main/java/dev/touchpilot/app/workflow/WorkflowTraceStore.kt
+new file mode 100644
+index 0000000..474c604
+--- /dev/null
++++ b/app/src/main/java/dev/touchpilot/app/workflow/WorkflowTraceStore.kt
+@@ -0,0 +1,21 @@
++package dev.touchpilot.app.workflow
++
++/**
++ * In-memory, session-scoped store of captured [WorkflowTrace]s (issue #289).
++ * Recording the same run again replaces the prior trace, so a run maps to at
++ * most one trace. Cross-session (SQLite) persistence is a deliberate follow-on.
++ */
++class WorkflowTraceStore {
++    private val traces = mutableListOf<WorkflowTrace>()
++
++    fun record(trace: WorkflowTrace) {
++        traces.removeAll { it.runId == trace.runId }
++        traces += trace
++    }
++
++    fun all(): List<WorkflowTrace> = traces.toList()
++
++    fun forRun(runId: String): WorkflowTrace? = traces.lastOrNull { it.runId == runId }
++
++    val size: Int get() = traces.size
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt b/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt
+index 48d79bb..afffad7 100644
+--- a/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt
++++ b/app/src/test/java/dev/touchpilot/app/agent/AgentRunDetailFormatterTest.kt
+@@ -354,6 +354,16 @@ class AgentRunDetailFormatterTest {
+         assertEquals("Error: Agent failed: timeout", AgentRunDetailFormatter.deriveStopReason(record))
+     }
+ 
++    @Test
++    fun formatsTraceRecordedEvent() {
++        val record = sampleRecord(events = listOf(AgentEvent.TraceRecorded(runId = "run-1", stepCount = 3)))
++
++        val step = AgentRunDetailFormatter.formatSteps(record).single { it.title == "Workflow trace recorded" }
++
++        assertEquals(AgentRunStepStatus.INFO, step.status)
++        assertContains(step.detail, "3 step(s) captured")
++    }
++
+     private fun sampleRecord(
+         events: List<AgentEvent> = emptyList(),
+         steps: List<AgentStep> = emptyList(),
+diff --git a/app/src/test/java/dev/touchpilot/app/workflow/WorkflowTraceStoreTest.kt b/app/src/test/java/dev/touchpilot/app/workflow/WorkflowTraceStoreTest.kt
+new file mode 100644
+index 0000000..47bb37b
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/workflow/WorkflowTraceStoreTest.kt
+@@ -0,0 +1,40 @@
++package dev.touchpilot.app.workflow
++
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNull
++
++class WorkflowTraceStoreTest {
++    private fun trace(runId: String, steps: Int = 1) = WorkflowTrace(
++        runId = runId,
++        task = "task",
++        capturedAtMillis = 0L,
++        steps = (1..steps).map { WorkflowTraceStep(it, "tap", emptyMap(), succeeded = true, verification = null) },
++        screenSignals = emptyList(),
++    )
++
++    @Test
++    fun recordsAndListsInOrder() {
++        val store = WorkflowTraceStore()
++        store.record(trace("run-1"))
++        store.record(trace("run-2"))
++
++        assertEquals(2, store.size)
++        assertEquals(listOf("run-1", "run-2"), store.all().map { it.runId })
++    }
++
++    @Test
++    fun recordingSameRunReplacesPriorTrace() {
++        val store = WorkflowTraceStore()
++        store.record(trace("run-1", steps = 1))
++        store.record(trace("run-1", steps = 3))
++
++        assertEquals(1, store.size)
++        assertEquals(3, store.forRun("run-1")?.steps?.size)
++    }
++
++    @Test
++    fun forRunReturnsNullWhenAbsent() {
++        assertNull(WorkflowTraceStore().forRun("missing"))
++    }
++}
+diff --git a/app/src/test/java/dev/touchpilot/app/workflow/WorkflowTraceTest.kt b/app/src/test/java/dev/touchpilot/app/workflow/WorkflowTraceTest.kt
+new file mode 100644
+index 0000000..a20cdd3
+--- /dev/null
++++ b/app/src/test/java/dev/touchpilot/app/workflow/WorkflowTraceTest.kt
+@@ -0,0 +1,147 @@
++package dev.touchpilot.app.workflow
++
++import dev.touchpilot.app.agent.AgentRunRecord
++import dev.touchpilot.app.agent.AgentRunResult
++import dev.touchpilot.app.agent.AgentScreenRecord
++import dev.touchpilot.app.agent.AgentStep
++import dev.touchpilot.app.agent.AgentStepFactory
++import dev.touchpilot.app.agent.AgentStepStopReason
++import dev.touchpilot.app.agent.AgentStepVerification
++import dev.touchpilot.app.security.SensitiveTextRedactor
++import dev.touchpilot.app.tools.ToolResult
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++
++class WorkflowTraceTest {
++
++    private fun actStep(seq: Int, tool: String, args: Map<String, String>, ok: Boolean = true): AgentStep =
++        AgentStepFactory.act(
++            sequenceNumber = seq,
++            tool = tool,
++            args = args,
++            source = "local_router",
++            result = ToolResult(ok = ok, message = if (ok) "ok" else "failed"),
++        )
++
++    private fun record(
++        steps: List<AgentStep>,
++        stopReason: AgentStepStopReason? = AgentStepStopReason.COMPLETED,
++        errorMessage: String? = null,
++        task: String = "open settings and tap wifi",
++        screenRecords: List<AgentScreenRecord> = emptyList(),
++        result: AgentRunResult? = AgentRunResult(
++            transcript = "t",
++            finalAnswer = "done",
++            steps = steps,
++            stopReason = stopReason,
++        ),
++    ): AgentRunRecord = AgentRunRecord(
++        id = "run-1",
++        task = task,
++        startedAtMillis = 1_000L,
++        completedAtMillis = 2_000L,
++        result = result,
++        errorMessage = errorMessage,
++        screenRecords = screenRecords,
++    )
++
++    @Test
++    fun derivesTraceFromSuccessfulRunWithToolActions() {
++        val steps = listOf(
++            actStep(1, "open_app", mapOf("target" to "Settings")),
++            actStep(2, "tap", mapOf("text" to "Wi-Fi")),
++        )
++        val screens = listOf(
++            AgentScreenRecord(0, "initial", 1_000L, "{}", 3, false),
++            AgentScreenRecord(1, "final", 2_000L, "{}", 5, false),
++        )
++
++        val trace = WorkflowTrace.from(record(steps, screenRecords = screens))!!
++
++        assertEquals("run-1", trace.runId)
++        assertEquals(2_000L, trace.capturedAtMillis)
++        assertEquals(listOf("open_app", "tap"), trace.steps.map { it.tool })
++        assertEquals("Settings", trace.steps[0].args["target"])
++        assertTrue(trace.steps.all { it.succeeded })
++        assertEquals(listOf("initial", "final"), trace.screenSignals.map { it.phase })
++    }
++
++    @Test
++    fun capturesVerificationOutcome() {
++        val verified = actStep(1, "tap", mapOf("text" to "Wi-Fi"))
++            .copy(verification = AgentStepVerification(status = "passed", reason = "Wi-Fi visible"))
++
++        val trace = WorkflowTrace.from(record(listOf(verified)))!!
++
++        assertEquals("passed", trace.steps[0].verification?.status)
++        assertEquals("Wi-Fi visible", trace.steps[0].verification?.reason)
++    }
++
++    @Test
++    fun ignoresNonActStepsButKeepsActSteps() {
++        val steps = listOf(
++            AgentStepFactory.observe(sequenceNumber = 1, inputSummary = "obs", outputSummary = "screen"),
++            actStep(2, "tap", mapOf("text" to "Wi-Fi")),
++            AgentStepFactory.stop(
++                sequenceNumber = 3,
++                reason = AgentStepStopReason.COMPLETED,
++                outputSummary = "done",
++            ),
++        )
++
++        val trace = WorkflowTrace.from(record(steps))!!
++
++        assertEquals(listOf("tap"), trace.steps.map { it.tool })
++    }
++
++    @Test
++    fun skipsRunsWithoutToolActions() {
++        val onlyStop = listOf(
++            AgentStepFactory.stop(
++                sequenceNumber = 1,
++                reason = AgentStepStopReason.COMPLETED,
++                outputSummary = "done",
++            ),
++        )
++        assertNull(WorkflowTrace.from(record(onlyStop)))
++    }
++
++    @Test
++    fun skipsNonCompletedRuns() {
++        val steps = listOf(actStep(1, "tap", mapOf("text" to "Send")))
++        assertNull(WorkflowTrace.from(record(steps, stopReason = AgentStepStopReason.POLICY_BLOCKED)))
++    }
++
++    @Test
++    fun skipsErroredRuns() {
++        val steps = listOf(actStep(1, "tap", mapOf("text" to "OK")))
++        assertNull(WorkflowTrace.from(record(steps, errorMessage = "boom")))
++    }
++
++    @Test
++    fun skipsRunsWithoutResult() {
++        assertNull(WorkflowTrace.from(record(emptyList(), result = null)))
++    }
++
++    @Test
++    fun redactsTaskAtCapture() {
++        val raw = "my password is hunter2"
++        val trace = WorkflowTrace.from(record(listOf(actStep(1, "tap", mapOf("text" to "OK"))), task = raw))!!
++        // Redaction is applied at capture, not at display time.
++        assertEquals(SensitiveTextRedactor.redact(raw), trace.task)
++    }
++
++    @Test
++    fun serializesToJson() {
++        val trace = WorkflowTrace.from(
++            record(listOf(actStep(1, "open_app", mapOf("target" to "Settings")))),
++        )!!
++        val json = trace.toJson()
++
++        assertEquals("run-1", json.getString("run_id"))
++        assertEquals(1, json.getJSONArray("steps").length())
++        assertEquals("open_app", json.getJSONArray("steps").getJSONObject(0).getString("tool"))
++    }
++}

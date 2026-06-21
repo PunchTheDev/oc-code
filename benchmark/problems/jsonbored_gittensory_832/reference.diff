@@ -1,0 +1,369 @@
+diff --git a/src/scoring/model.ts b/src/scoring/model.ts
+index 86f028c6..c427b230 100644
+--- a/src/scoring/model.ts
++++ b/src/scoring/model.ts
+@@ -3,6 +3,7 @@ import {
+   persistScoringModelSnapshot,
+ } from "../db/repositories";
+ import { getLatestRegistrySnapshot } from "../registry/sync";
++import { syncUnmodeledScoringConstantDrift } from "../upstream/unmodeled-scoring-drift";
+ import type { JsonValue, ScoringModelSnapshotRecord } from "../types";
+ import { errorMessage, nowIso } from "../utils/json";
+ 
+@@ -101,6 +102,11 @@ export async function refreshScoringModelSnapshot(env: Env): Promise<ScoringMode
+     },
+   };
+   await persistScoringModelSnapshot(env, snapshot);
++  if (constantsResult.ok) {
++    await syncUnmodeledScoringConstantDrift(env, {
++      unmodeledConstants: findUnmodeledUpstreamConstants(constantsResult.value),
++    });
++  }
+   return snapshot;
+ }
+ 
+@@ -128,13 +134,16 @@ export function parsePythonNumberConstants(source: string, options: { knownOnly?
+  * staleness visible: if upstream adds a scoring dimension, an operator sees it instead of the gate
+  * silently drifting behind. Detection only — it does not change any score.
+  */
+-export function findUnmodeledUpstreamConstants(source: string): string[] {
+-  const all = parsePythonNumberConstants(source, { knownOnly: false });
+-  return Object.keys(all)
++export function findUnmodeledConstantKeys(allConstants: Record<string, number>): string[] {
++  return Object.keys(allConstants)
+     .filter((name) => !SCORING_CONSTANT_NAMES.has(name))
+     .sort();
+ }
+ 
++export function findUnmodeledUpstreamConstants(source: string): string[] {
++  return findUnmodeledConstantKeys(parsePythonNumberConstants(source, { knownOnly: false }));
++}
++
+ /**
+  * Owner-controlled global gate for applying upstream time-decay to score previews (#703). Default OFF: the
+  * roadmap deferral requires the owner to review a before/after ranking diff before enabling. Even when on,
+diff --git a/src/upstream/ruleset.ts b/src/upstream/ruleset.ts
+index 6be4a99f..1ab48170 100644
+--- a/src/upstream/ruleset.ts
++++ b/src/upstream/ruleset.ts
+@@ -10,7 +10,8 @@ import {
+   upsertUpstreamDriftReport,
+ } from "../db/repositories";
+ import { normalizeRegistryPayload } from "../registry/normalize";
+-import { detectActiveModel, parsePythonNumberConstants } from "../scoring/model";
++import { detectActiveModel, findUnmodeledConstantKeys, parsePythonNumberConstants } from "../scoring/model";
++import { syncUnmodeledScoringConstantDrift } from "./unmodeled-scoring-drift";
+ import type {
+   JsonValue,
+   RegistryDriftSurface,
+@@ -201,6 +202,14 @@ export async function refreshUpstreamDrift(env: Env): Promise<{ sources: Upstrea
+   const ruleset = await buildUpstreamRulesetSnapshot(env, sources);
+   const drift = await buildUpstreamDriftReport(ruleset, (await listLatestUpstreamRulesetSnapshots(env, 2))[1] ?? null);
+   if (drift) await upsertUpstreamDriftReport(env, drift);
++  const constantsSource = sources.find((source) => source.sourceKey === "constants");
++  if (constantsSource && constantsSource.status !== "error") {
++    await syncUnmodeledScoringConstantDrift(env, {
++      unmodeledConstants: findUnmodeledConstantKeys(numericRecord(constantsSource.parsed.constants)),
++      currentRulesetId: ruleset.id,
++      source: { repo: ruleset.sourceRepo, ref: ruleset.sourceRef, commitSha: ruleset.commitSha ?? null },
++    });
++  }
+   await recordAuditEvent(env, {
+     eventType: "upstream.drift_detected",
+     outcome: drift ? "completed" : "success",
+diff --git a/src/upstream/unmodeled-scoring-drift.ts b/src/upstream/unmodeled-scoring-drift.ts
+new file mode 100644
+index 00000000..71005c8f
+--- /dev/null
++++ b/src/upstream/unmodeled-scoring-drift.ts
+@@ -0,0 +1,81 @@
++import {
++  getLatestUpstreamRulesetSnapshot,
++  listUpstreamDriftReports,
++  upsertUpstreamDriftReport,
++} from "../db/repositories";
++import type { UpstreamDriftArea, UpstreamDriftReportRecord, UpstreamDriftSeverity } from "../types";
++import { sha256Hex } from "../utils/crypto";
++import { nowIso } from "../utils/json";
++
++const UNMODELED_SCORING_CONSTANTS_FINGERPRINT_SEED = "gittensory:upstream:unmodeled_scoring_constants:v1";
++const SCORING_MODEL_FOLLOW_UP = ["src/scoring/model.ts", "src/upstream/ruleset.ts", "test/unit/upstream-ruleset.test.ts"];
++
++export async function unmodeledScoringConstantsFingerprint(): Promise<string> {
++  return sha256Hex(UNMODELED_SCORING_CONSTANTS_FINGERPRINT_SEED);
++}
++
++export async function syncUnmodeledScoringConstantDrift(
++  env: Env,
++  args: {
++    unmodeledConstants: string[];
++    currentRulesetId?: string | null;
++    source?: { repo: string; ref: string; commitSha?: string | null };
++  },
++): Promise<UpstreamDriftReportRecord | null> {
++  const fingerprint = await unmodeledScoringConstantsFingerprint();
++  const existing = (await listUpstreamDriftReports(env, 50)).find((report) => report.fingerprint === fingerprint) ?? null;
++  const now = nowIso();
++
++  if (args.unmodeledConstants.length === 0) {
++    if (!existing || existing.status === "resolved") return existing;
++    const resolved: UpstreamDriftReportRecord = {
++      ...existing,
++      status: "resolved",
++      severity: "low",
++      summary: "All upstream scoring constants are modeled in gittensory.",
++      updatedAt: now,
++      payload: {
++        ...existing.payload,
++        kind: "unmodeled_scoring_constants",
++        unmodeledUpstreamConstants: [],
++        resolvedAt: now,
++      },
++    };
++    await upsertUpstreamDriftReport(env, resolved);
++    return resolved;
++  }
++
++  const rulesetId = args.currentRulesetId ?? (await getLatestUpstreamRulesetSnapshot(env))?.id ?? null;
++  const source = args.source ?? {
++    repo: env.GITTENSOR_UPSTREAM_REPO || "entrius/gittensor",
++    ref: env.GITTENSOR_UPSTREAM_REF || "test",
++    commitSha: null,
++  };
++  const unmodeled = [...args.unmodeledConstants].sort();
++  const summary = `Upstream defines ${unmodeled.length} scoring constant(s) gittensory does not model: ${unmodeled.slice(0, 12).join(", ")}${unmodeled.length > 12 ? ", …" : ""}`;
++  const severity: UpstreamDriftSeverity = unmodeled.length >= 3 ? "high" : "medium";
++  const affectedAreas: UpstreamDriftArea[] = ["scoring_model"];
++  const report: UpstreamDriftReportRecord = {
++    id: existing?.id ?? crypto.randomUUID(),
++    fingerprint,
++    severity,
++    status: "open",
++    summary,
++    affectedAreas,
++    previousRulesetId: existing?.previousRulesetId ?? null,
++    currentRulesetId: rulesetId,
++    issueNumber: existing?.issueNumber ?? null,
++    issueUrl: existing?.issueUrl ?? null,
++    payload: {
++      kind: "unmodeled_scoring_constants",
++      unmodeledUpstreamConstants: unmodeled,
++      changes: [`${unmodeled.length} upstream scoring constant(s) are not modeled in gittensory`],
++      source,
++      recommendedFollowUp: SCORING_MODEL_FOLLOW_UP,
++    },
++    generatedAt: existing?.generatedAt ?? now,
++    updatedAt: now,
++  };
++  await upsertUpstreamDriftReport(env, report);
++  return report;
++}
+diff --git a/test/unit/scoring.test.ts b/test/unit/scoring.test.ts
+index fc05c097..ff8ce49c 100644
+--- a/test/unit/scoring.test.ts
++++ b/test/unit/scoring.test.ts
+@@ -1,7 +1,8 @@
+ import { afterEach, describe, expect, it, vi } from "vitest";
+-import { getLatestScoringModelSnapshot } from "../../src/db/repositories";
++import { getLatestScoringModelSnapshot, listUpstreamDriftReports } from "../../src/db/repositories";
+ import { DEFAULT_SCORING_CONSTANTS, detectActiveModel, findUnmodeledUpstreamConstants, isTimeDecayEnabled, parsePythonNumberConstants, refreshScoringModelSnapshot } from "../../src/scoring/model";
+ import { buildScorePreview, calculateTimeDecay, makeScorePreviewRecord, resolveTimeDecay } from "../../src/scoring/preview";
++import { unmodeledScoringConstantsFingerprint } from "../../src/upstream/unmodeled-scoring-drift";
+ import type { ScorePreviewInput } from "../../src/scoring/preview";
+ import type { RepositoryRecord, ScoringModelSnapshotRecord } from "../../src/types";
+ import { createTestEnv } from "../helpers/d1";
+@@ -146,7 +147,10 @@ MAX_CODE_DENSITY_MULTIPLIER = 1.15
+   });
+ 
+   it("warns on the snapshot when upstream defines an unmodeled scoring dimension", async () => {
+-    const env = createTestEnv();
++    const env = createTestEnv({
++      GITTENSOR_UPSTREAM_REPO: "custom/upstream",
++      GITTENSOR_UPSTREAM_REF: "staging",
++    });
+     vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+       const url = input.toString();
+       if (url.includes("constants.py")) return new Response("SRC_TOK_SATURATION_SCALE = 58.0\nNOVELTY_BONUS_SCALAR = 3\n");
+@@ -158,6 +162,15 @@ MAX_CODE_DENSITY_MULTIPLIER = 1.15
+ 
+     expect(refreshed.warnings.join(" ")).toMatch(/does not yet model.*NOVELTY_BONUS_SCALAR/);
+     expect(refreshed.payload.constants).toMatchObject({ unmodeledUpstreamConstants: ["NOVELTY_BONUS_SCALAR"] });
++    const fingerprint = await unmodeledScoringConstantsFingerprint();
++    expect((await listUpstreamDriftReports(env, 10)).find((report) => report.fingerprint === fingerprint)).toMatchObject({
++      status: "open",
++      affectedAreas: ["scoring_model"],
++      payload: expect.objectContaining({
++        unmodeledUpstreamConstants: ["NOVELTY_BONUS_SCALAR"],
++        source: { repo: "custom/upstream", ref: "staging", commitSha: null },
++      }),
++    });
+   });
+ 
+   it("uses saturation math as the active private preview model", () => {
+diff --git a/test/unit/unmodeled-scoring-drift.test.ts b/test/unit/unmodeled-scoring-drift.test.ts
+new file mode 100644
+index 00000000..8d24e597
+--- /dev/null
++++ b/test/unit/unmodeled-scoring-drift.test.ts
+@@ -0,0 +1,105 @@
++import { describe, expect, it } from "vitest";
++import { listUpstreamDriftReports, updateUpstreamDriftReportIssue } from "../../src/db/repositories";
++import { syncUnmodeledScoringConstantDrift, unmodeledScoringConstantsFingerprint } from "../../src/upstream/unmodeled-scoring-drift";
++import { createTestEnv } from "../helpers/d1";
++
++describe("unmodeled scoring constant drift", () => {
++  it("opens a stable-fingerprint drift report for unmodeled upstream constants", async () => {
++    const env = createTestEnv();
++    const fingerprint = await unmodeledScoringConstantsFingerprint();
++    const report = await syncUnmodeledScoringConstantDrift(env, {
++      unmodeledConstants: ["NOVELTY_BONUS_SCALAR", "EXTRA_WEIGHT"],
++      source: { repo: "entrius/gittensor", ref: "test", commitSha: "abc123" },
++    });
++
++    expect(report).toMatchObject({
++      fingerprint,
++      status: "open",
++      severity: "medium",
++      affectedAreas: ["scoring_model"],
++      summary: expect.stringContaining("NOVELTY_BONUS_SCALAR"),
++      payload: expect.objectContaining({
++        kind: "unmodeled_scoring_constants",
++        unmodeledUpstreamConstants: ["EXTRA_WEIGHT", "NOVELTY_BONUS_SCALAR"],
++      }),
++    });
++    expect(await listUpstreamDriftReports(env, 5)).toContainEqual(expect.objectContaining({ fingerprint, status: "open" }));
++  });
++
++  it("escalates severity when many constants are unmodeled", async () => {
++    const env = createTestEnv();
++    const report = await syncUnmodeledScoringConstantDrift(env, {
++      unmodeledConstants: ["A", "B", "C"],
++    });
++    expect(report?.severity).toBe("high");
++  });
++
++  it("resolves the drift report when all constants are modeled", async () => {
++    const env = createTestEnv();
++    const fingerprint = await unmodeledScoringConstantsFingerprint();
++    await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: ["NOVELTY_BONUS_SCALAR"] });
++    const resolved = await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: [] });
++    expect(resolved).toMatchObject({ fingerprint, status: "resolved" });
++  });
++
++  it("preserves linked issue metadata across unmodeled updates", async () => {
++    const env = createTestEnv();
++    const fingerprint = await unmodeledScoringConstantsFingerprint();
++    await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: ["ALPHA"] });
++    await updateUpstreamDriftReportIssue(env, fingerprint, {
++      number: 811,
++      url: "https://github.com/JSONbored/gittensory/issues/811",
++    });
++    const updated = await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: ["ALPHA", "BETA"] });
++    expect(updated).toMatchObject({
++      issueNumber: 811,
++      issueUrl: "https://github.com/JSONbored/gittensory/issues/811",
++      payload: expect.objectContaining({ unmodeledUpstreamConstants: ["ALPHA", "BETA"] }),
++    });
++  });
++
++  it("uses upstream env defaults when source metadata is omitted", async () => {
++    const env = createTestEnv({
++      GITTENSOR_UPSTREAM_REPO: "entrius/gittensor",
++      GITTENSOR_UPSTREAM_REF: "staging",
++    });
++    const report = await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: ["ALPHA"] });
++    expect(report?.payload.source).toEqual({
++      repo: "entrius/gittensor",
++      ref: "staging",
++      commitSha: null,
++    });
++  });
++
++  it("falls back to baked-in upstream repo/ref when env overrides are empty", async () => {
++    const env = createTestEnv({ GITTENSOR_UPSTREAM_REPO: "", GITTENSOR_UPSTREAM_REF: "" });
++    const report = await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: ["ALPHA"] });
++    expect(report?.payload.source).toEqual({
++      repo: "entrius/gittensor",
++      ref: "test",
++      commitSha: null,
++    });
++  });
++
++  it("returns null when resolving with no prior drift report", async () => {
++    const env = createTestEnv();
++    expect(await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: [] })).toBeNull();
++  });
++
++  it("returns an already-resolved report without rewriting it", async () => {
++    const env = createTestEnv();
++    const fingerprint = await unmodeledScoringConstantsFingerprint();
++    await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: ["ALPHA"] });
++    await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: [] });
++    const again = await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: [] });
++    expect(again).toMatchObject({ fingerprint, status: "resolved" });
++  });
++
++  it("truncates long unmodeled-constant lists in the summary", async () => {
++    const env = createTestEnv();
++    const names = Array.from({ length: 13 }, (_, index) => `CONST_${index}`);
++    const report = await syncUnmodeledScoringConstantDrift(env, { unmodeledConstants: names });
++    expect(report?.summary).toMatch(/, …$/);
++    expect(report?.severity).toBe("high");
++  });
++});
+diff --git a/test/unit/upstream-ruleset.test.ts b/test/unit/upstream-ruleset.test.ts
+index ac6951f0..52b6a28d 100644
+--- a/test/unit/upstream-ruleset.test.ts
++++ b/test/unit/upstream-ruleset.test.ts
+@@ -52,6 +52,51 @@ describe("upstream ruleset drift tracking", () => {
+     });
+   });
+ 
++  it("opens an upstream drift report when upstream defines scoring constants gittensory does not model", async () => {
++    vi.useFakeTimers({ toFake: ["Date"] });
++    vi.setSystemTime(new Date("2026-05-30T00:00:00.000Z"));
++    const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "token" });
++    const files = fixtures("58", 0.01);
++    files["gittensor/constants.py"] += "\nNOVELTY_BONUS_SCALAR = 3\n";
++    vi.stubGlobal("fetch", upstreamFetch(files));
++
++    await refreshUpstreamDrift(env);
++    const reports = await listUpstreamDriftReports(env, 10);
++    const status = await loadUpstreamStatus(env);
++
++    expect(reports).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({
++          status: "open",
++          severity: "medium",
++          affectedAreas: ["scoring_model"],
++          summary: expect.stringContaining("NOVELTY_BONUS_SCALAR"),
++          payload: expect.objectContaining({
++            kind: "unmodeled_scoring_constants",
++            unmodeledUpstreamConstants: ["NOVELTY_BONUS_SCALAR"],
++          }),
++        }),
++      ]),
++    );
++    expect(status).toMatchObject({
++      status: "drift_detected",
++      openReportCount: 1,
++      affectedAreas: ["scoring_model"],
++    });
++  });
++
++  it("skips unmodeled-constant drift sync when the constants source fetch failed", async () => {
++    const env = createTestEnv();
++    vi.stubGlobal("fetch", upstreamFetch(fixtures("58", 0.01)));
++    await refreshUpstreamSourceSnapshots(env);
++
++    vi.stubGlobal("fetch", upstreamFailedFetch());
++    const result = await refreshUpstreamDrift(env);
++
++    expect(result.sources.find((source) => source.sourceKey === "constants")?.status).toBe("error");
++    expect((await listUpstreamDriftReports(env, 10)).some((report) => report.payload.kind === "unmodeled_scoring_constants")).toBe(false);
++  });
++
+   it("detects high-severity scoring and registry drift between semantic rulesets", async () => {
+     vi.useFakeTimers({ toFake: ["Date"] });
+     const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "token" });

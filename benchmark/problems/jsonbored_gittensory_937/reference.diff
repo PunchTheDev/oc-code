@@ -1,0 +1,493 @@
+diff --git a/apps/gittensory-ui/public/openapi.json b/apps/gittensory-ui/public/openapi.json
+index a282fa0d..e715a834 100644
+--- a/apps/gittensory-ui/public/openapi.json
++++ b/apps/gittensory-ui/public/openapi.json
+@@ -14943,6 +14943,82 @@
+           }
+         ]
+       }
++    },
++    "/v1/repos/{owner}/{repo}/agent/audit-feed": {
++      "get": {
++        "responses": {
++          "200": {
++            "description": "Maintainer-scoped agent audit feed (#784): executed actions + approval-queue decisions, newest first, public-safe action posture only. Supports ?since=ISO-8601&limit=1-200.",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "type": "object",
++                  "properties": {
++                    "repoFullName": {
++                      "type": "string"
++                    },
++                    "events": {
++                      "type": "array",
++                      "items": {
++                        "type": "object",
++                        "properties": {
++                          "eventType": {
++                            "type": "string"
++                          },
++                          "pullNumber": {
++                            "type": "number",
++                            "nullable": true
++                          },
++                          "outcome": {
++                            "type": "string"
++                          },
++                          "actor": {
++                            "type": "string",
++                            "nullable": true
++                          },
++                          "detail": {
++                            "type": "string",
++                            "nullable": true
++                          },
++                          "createdAt": {
++                            "type": "string"
++                          }
++                        },
++                        "required": [
++                          "eventType",
++                          "pullNumber",
++                          "outcome",
++                          "actor",
++                          "detail",
++                          "createdAt"
++                        ]
++                      }
++                    }
++                  },
++                  "required": [
++                    "repoFullName",
++                    "events"
++                  ]
++                }
++              }
++            }
++          },
++          "400": {
++            "description": "Malformed since (not ISO-8601) or limit (not an integer in 1-200)"
++          },
++          "403": {
++            "description": "Insufficient role"
++          }
++        },
++        "security": [
++          {
++            "GittensoryBearer": []
++          },
++          {
++            "GittensorySessionCookie": []
++          }
++        ]
++      }
+     }
+   },
+   "servers": [
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 2ef368e7..651dcbda 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -42,6 +42,7 @@ import {
+   getRepoQueueTrendSnapshot,
+   getRepositorySettings,
+   getPendingAgentAction,
++  listAgentAuditEvents,
+   listPendingAgentActions,
+   recordAuditEvent,
+   getContributorEvidence,
+@@ -2064,6 +2065,31 @@ export function createApp() {
+     return c.json(result);
+   });
+ 
++  // #784 audit feed: the agent's executed actions + approval-queue decisions for this repo. Maintainer-scoped,
++  // read-only, public-safe (action posture only — no trust/score metadata). `?since=ISO&limit=N` (max 200).
++  app.get("/v1/repos/:owner/:repo/agent/audit-feed", async (c) => {
++    const fullName = `${c.req.param("owner")}/${c.req.param("repo")}`;
++    const gate = await requireRepoMaintainer(c, fullName);
++    /* v8 ignore next -- unauthorized requests are rejected by the auth middleware before reaching the handler. */
++    if (gate instanceof Response) return gate;
++    const since = c.req.query("since");
++    if (since !== undefined && Number.isNaN(Date.parse(since))) return c.json({ error: "invalid_since", detail: "since must be an ISO-8601 timestamp" }, 400);
++    const limitParam = c.req.query("limit");
++    let limit: number | undefined;
++    if (limitParam !== undefined) {
++      const parsed = Number(limitParam);
++      if (!Number.isInteger(parsed) || parsed < 1 || parsed > 200) return c.json({ error: "invalid_limit", detail: "limit must be an integer between 1 and 200" }, 400);
++      limit = parsed;
++    }
++    const events = await listAgentAuditEvents(c.env, {
++      repoFullName: fullName,
++      ...(since !== undefined ? { sinceIso: since } : {}),
++      ...(limit !== undefined ? { limit } : {}),
++    });
++    // Defense-in-depth: the free-form `detail` is the only unbounded string — scrub it before it leaves on a public surface.
++    return c.json({ repoFullName: fullName, events: events.map((event) => ({ ...event, detail: event.detail === null ? null : sanitizePublicComment(event.detail) })) });
++  });
++
+   // Maintainer activation demo (#701): a repo-specific "here's what Gittensory would have surfaced" preview
+   // over recent PRs, plus a one-click advisory ramp. Maintainer-scoped + per-repo. Deterministic (no AI run).
+   app.get("/v1/repos/:owner/:repo/activation-preview", async (c) => {
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index 9993f75c..84425a91 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -2032,6 +2032,49 @@ export async function listPrVisibilitySkipAuditEvents(
+   return { limit, hasMore: items.length > limit, items: items.slice(0, limit) };
+ }
+ 
++// #784 audit feed: the agent's own action history for a repo — both executed actions (`agent.action.<class>`)
++// and approval-queue decisions (`agent.pending_action.accepted|rejected`). Repo-scoped via the `repo#pr`
++// targetKey prefix range (mirrors listPrVisibilitySkipAuditEvents). Read-only; private trust/score metadata
++// is never selected, only the public-safe action posture.
++export type AgentAuditEvent = {
++  eventType: string;
++  pullNumber: number | null;
++  outcome: string;
++  actor: string | null;
++  detail: string | null;
++  createdAt: string;
++};
++
++export async function listAgentAuditEvents(
++  env: Env,
++  options: { repoFullName: string; sinceIso?: string | undefined; limit?: number | undefined },
++): Promise<AgentAuditEvent[]> {
++  const limit = clampInteger(options.limit ?? 50, 1, 200);
++  // Match exactly `repo#<...>` keys: lower bound `repo#`, upper bound `repo#` + the max code point, which
++  // sorts past any value that can follow the `#` — robust against delimiter-adjacent edge cases.
++  const prefix = `${options.repoFullName.toLowerCase()}#`;
++  const upperBound = `${options.repoFullName.toLowerCase()}#\uffff`;
++  const conditions: SQL[] = [
++    sql`(${auditEvents.eventType} like 'agent.action.%' or ${auditEvents.eventType} like 'agent.pending_action.%')`,
++    sql`lower(${auditEvents.targetKey}) >= ${prefix} and lower(${auditEvents.targetKey}) < ${upperBound}`,
++  ];
++  if (options.sinceIso) conditions.push(gte(auditEvents.createdAt, options.sinceIso));
++  const rows = await getDb(env.DB)
++    .select({ eventType: auditEvents.eventType, targetKey: auditEvents.targetKey, outcome: auditEvents.outcome, actor: auditEvents.actor, detail: auditEvents.detail, createdAt: auditEvents.createdAt })
++    .from(auditEvents)
++    .where(and(...conditions))
++    .orderBy(desc(auditEvents.createdAt), desc(auditEvents.id))
++    .limit(limit);
++  return rows.map((row) => ({
++    eventType: row.eventType,
++    pullNumber: parsePullRequestTargetKey(row.targetKey)?.pullNumber ?? null,
++    outcome: row.outcome,
++    actor: row.actor,
++    detail: row.detail,
++    createdAt: row.createdAt,
++  }));
++}
++
+ export async function getFreshOfficialMinerDetection(env: Env, login: string, now = nowIso()): Promise<OfficialGittensorMinerDetection | null> {
+   const [row] = await getDb(env.DB).select().from(officialMinerDetections).where(and(eq(officialMinerDetections.login, login.toLowerCase()), gte(officialMinerDetections.expiresAt, now))).limit(1);
+   return row ? toOfficialMinerDetection(row) : null;
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index a834cc13..cf77d60f 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -21,6 +21,7 @@ import {
+   getRepository,
+   getRepositorySettings,
+   getRepoQueueTrendSnapshot,
++  listAgentAuditEvents,
+   listCheckSummaries,
+   listPendingAgentActions,
+   listContributorRepoStats,
+@@ -47,6 +48,7 @@ import { decidePendingAgentAction } from "../services/agent-approval-queue";
+ import { buildNotificationFeed } from "../notifications/service";
+ import { contributorRepoStatsFromGittensor, fetchGittensorContributorSnapshot } from "../gittensor/api";
+ import { getRepositoryCollaboratorPermission } from "../github/app";
++import { sanitizePublicComment } from "../github/commands";
+ import { fetchPublicContributorProfile } from "../github/public";
+ import { listLatestRegistrySnapshots } from "../registry/sync";
+ import { getOrCreateScoringModelSnapshot, isTimeDecayEnabled } from "../scoring/model";
+@@ -411,6 +413,30 @@ const decidePendingActionOutputSchema = {
+   action: pendingActionEntrySchema.optional(),
+ };
+ 
++// #784 (MCP slice) — the agent audit feed: executed actions + approval decisions for a repo.
++const auditFeedShape = {
++  owner: z.string().min(1),
++  repo: z.string().min(1),
++  since: z.string().datetime({ offset: true }).optional(),
++  limit: z.number().int().positive().max(200).optional(),
++};
++
++const auditFeedOutputSchema = {
++  repoFullName: z.string().optional(),
++  events: z
++    .array(
++      z.object({
++        eventType: z.string(),
++        pullNumber: z.number().nullable(),
++        outcome: z.string(),
++        actor: z.string().nullable(),
++        detail: z.string().nullable(),
++        createdAt: z.string(),
++      }),
++    )
++    .optional(),
++};
++
+ const focusManifestInputSchema = z
+   .record(z.string(), z.unknown())
+   .refine((manifest) => isJsonByteLengthWithinLimit(manifest, MAX_FOCUS_MANIFEST_BYTES), {
+@@ -1319,6 +1345,17 @@ export class GittensoryMcp {
+       async (input) => this.toolResult(await this.decidePendingAction(input)),
+     );
+ 
++    server.registerTool(
++      "gittensory_get_agent_audit_feed",
++      {
++        description:
++          "Return a repo's agent audit feed: executed actions (agent.action.*) and approval-queue decisions (accepted/rejected), newest first. Read-only and public-safe (action posture only). Maintainer access required.",
++        inputSchema: auditFeedShape,
++        outputSchema: auditFeedOutputSchema,
++      },
++      async (input) => this.toolResult(await this.getAgentAuditFeed(input)),
++    );
++
+     server.registerTool(
+       "gittensory_explain_score_breakdown",
+       {
+@@ -2250,6 +2287,23 @@ export class GittensoryMcp {
+     };
+   }
+ 
++  // #784 — the agent audit feed: executed actions + approval decisions for a repo, newest first.
++  // Maintainer-manage scoped; read-only and public-safe (action posture only — no trust/score metadata).
++  private async getAgentAuditFeed(input: z.infer<z.ZodObject<typeof auditFeedShape>>): Promise<ToolPayload> {
++    const fullName = `${input.owner}/${input.repo}`;
++    await this.requireRepoManageAccess(fullName);
++    const events = await listAgentAuditEvents(this.env, {
++      repoFullName: fullName,
++      ...(input.since !== undefined ? { sinceIso: input.since } : {}),
++      ...(input.limit !== undefined ? { limit: input.limit } : {}),
++    });
++    return {
++      summary: `${events.length} recent agent audit event(s) for ${fullName}.`,
++      // Defense-in-depth: scrub the only free-form field (`detail`) before it leaves on a public-safe tool result.
++      data: { repoFullName: fullName, events: events.map((event) => ({ ...event, detail: event.detail === null ? null : sanitizePublicComment(event.detail) })) },
++    };
++  }
++
+   private async explainScoreBreakdown(input: z.infer<z.ZodObject<typeof scorePreviewShape>>): Promise<ToolPayload> {
+     if (!input.contributorLogin) throw new Error("contributorLogin is required for score breakdown.");
+     this.requireContributorAccess(input.contributorLogin);
+diff --git a/src/openapi/spec.ts b/src/openapi/spec.ts
+index 76920ef8..9828fe25 100644
+--- a/src/openapi/spec.ts
++++ b/src/openapi/spec.ts
+@@ -410,6 +410,34 @@ export function buildOpenApiSpec() {
+       403: { description: "Insufficient role" },
+     },
+   });
++  registry.registerPath({
++    method: "get",
++    path: "/v1/repos/{owner}/{repo}/agent/audit-feed",
++    responses: {
++      200: {
++        description: "Maintainer-scoped agent audit feed (#784): executed actions + approval-queue decisions, newest first, public-safe action posture only. Supports ?since=ISO-8601&limit=1-200.",
++        content: {
++          "application/json": {
++            schema: z.object({
++              repoFullName: z.string(),
++              events: z.array(
++                z.object({
++                  eventType: z.string(),
++                  pullNumber: z.number().nullable(),
++                  outcome: z.string(),
++                  actor: z.string().nullable(),
++                  detail: z.string().nullable(),
++                  createdAt: z.string(),
++                }),
++              ),
++            }),
++          },
++        },
++      },
++      400: { description: "Malformed since (not ISO-8601) or limit (not an integer in 1-200)" },
++      403: { description: "Insufficient role" },
++    },
++  });
+   registry.registerPath({
+     method: "get",
+     path: "/v1/app/self-dogfood/registration-pack",
+diff --git a/test/unit/mcp-automation-state.test.ts b/test/unit/mcp-automation-state.test.ts
+index 646d8a62..90e25fc0 100644
+--- a/test/unit/mcp-automation-state.test.ts
++++ b/test/unit/mcp-automation-state.test.ts
+@@ -3,7 +3,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+ import { beforeEach, describe, expect, it, vi } from "vitest";
+ import { GittensoryMcp } from "../../src/mcp/server";
+ import { getRepositoryCollaboratorPermission } from "../../src/github/app";
+-import { createPendingAgentActionIfAbsent, getPendingAgentAction, listPendingAgentActions, upsertInstallation, upsertPullRequestFromGitHub, upsertRepositoryFromGitHub, upsertRepositorySettings } from "../../src/db/repositories";
++import { createPendingAgentActionIfAbsent, getPendingAgentAction, listPendingAgentActions, recordAuditEvent, upsertInstallation, upsertPullRequestFromGitHub, upsertRepositoryFromGitHub, upsertRepositorySettings } from "../../src/db/repositories";
+ import type { AuthIdentity } from "../../src/auth/security";
+ import { createTestEnv } from "../helpers/d1";
+ 
+@@ -274,3 +274,72 @@ describe("MCP gittensory_decide_pending_action (#784)", () => {
+     expect((await getPendingAgentAction(env, action.id))?.status).toBe("pending");
+   });
+ });
++
++describe("MCP gittensory_get_agent_audit_feed (#784)", () => {
++  async function seedAudit(env: Env) {
++    await recordAuditEvent(env, { eventType: "agent.action.merge", actor: "gittensory", targetKey: "owner/repo#7", outcome: "completed", detail: "merged", createdAt: "2026-06-18T10:00:00.000Z" });
++    await recordAuditEvent(env, { eventType: "agent.pending_action.rejected", actor: "owner", targetKey: "owner/repo#8", outcome: "completed", detail: "rejected merge", createdAt: "2026-06-18T11:00:00.000Z" });
++    await recordAuditEvent(env, { eventType: "github_app.pr_visibility_skipped", actor: "x", targetKey: "owner/repo#9", outcome: "completed", createdAt: "2026-06-18T12:00:00.000Z" });
++    await recordAuditEvent(env, { eventType: "agent.action.label", actor: "gittensory", targetKey: "other/repo#1", outcome: "completed", createdAt: "2026-06-18T13:00:00.000Z" });
++  }
++
++  it("surfaces this repo's agent action + decision events newest-first, excluding non-agent and other-repo events", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" } }, 5);
++    await seedAudit(env);
++    const client = await connect(env);
++    const result = await client.callTool({ name: "gittensory_get_agent_audit_feed", arguments: { owner: "owner", repo: "repo" } });
++    expect(result.isError).toBeFalsy();
++    const data = result.structuredContent as { repoFullName: string; events: Array<{ eventType: string; pullNumber: number | null; outcome: string }> };
++    expect(data.repoFullName).toBe("owner/repo");
++    expect(data.events.map((event) => event.eventType)).toEqual(["agent.pending_action.rejected", "agent.action.merge"]);
++    expect(data.events[0]).toMatchObject({ pullNumber: 8, outcome: "completed" });
++  });
++
++  it("honors the since filter and the limit", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" } }, 5);
++    await seedAudit(env);
++    const client = await connect(env);
++    const since = await client.callTool({ name: "gittensory_get_agent_audit_feed", arguments: { owner: "owner", repo: "repo", since: "2026-06-18T10:30:00.000Z" } });
++    expect((since.structuredContent as { events: unknown[] }).events).toHaveLength(1);
++    const limited = await client.callTool({ name: "gittensory_get_agent_audit_feed", arguments: { owner: "owner", repo: "repo", limit: 1 } });
++    expect((limited.structuredContent as { events: unknown[] }).events).toHaveLength(1);
++  });
++
++  it("forbids a session without live write access", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" } }, 5);
++    await seedAudit(env);
++    mockedPermission.mockResolvedValue("read");
++    const client = await connect(env, { kind: "session", actor: "rando" } as AuthIdentity);
++    const result = await client.callTool({ name: "gittensory_get_agent_audit_feed", arguments: { owner: "owner", repo: "repo" } });
++    expect(result.isError).toBe(true);
++    expect(JSON.stringify(result)).toMatch(/write access/i);
++  });
++
++  it("rejects a malformed since (non ISO-8601) and an over-cap limit via schema validation", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" } }, 5);
++    const client = await connect(env);
++    const badSince = await client.callTool({ name: "gittensory_get_agent_audit_feed", arguments: { owner: "owner", repo: "repo", since: "not-a-date" } });
++    expect(badSince.isError).toBe(true);
++    const badLimit = await client.callTool({ name: "gittensory_get_agent_audit_feed", arguments: { owner: "owner", repo: "repo", limit: 500 } });
++    expect(badLimit.isError).toBe(true);
++  });
++
++  it("scrubs forbidden terms from the free-form detail and preserves a null detail", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" } }, 5);
++    await recordAuditEvent(env, { eventType: "agent.action.merge", actor: "gittensory", targetKey: "owner/repo#7", outcome: "completed", detail: "reward estimate leaked", createdAt: "2026-06-18T10:00:00.000Z" });
++    await recordAuditEvent(env, { eventType: "agent.action.label", actor: "gittensory", targetKey: "owner/repo#8", outcome: "completed", createdAt: "2026-06-18T09:00:00.000Z" });
++    const client = await connect(env);
++    const result = await client.callTool({ name: "gittensory_get_agent_audit_feed", arguments: { owner: "owner", repo: "repo" } });
++    const data = result.structuredContent as { events: Array<{ pullNumber: number | null; detail: string | null }> };
++    const merge = data.events.find((event) => event.pullNumber === 7);
++    const label = data.events.find((event) => event.pullNumber === 8);
++    expect(merge?.detail).not.toMatch(/reward/i);
++    expect(merge?.detail).toContain("private context");
++    expect(label?.detail).toBeNull();
++  });
++});
+diff --git a/test/unit/routes-agent-approval.test.ts b/test/unit/routes-agent-approval.test.ts
+index 7cdce5f5..ab39a2c7 100644
+--- a/test/unit/routes-agent-approval.test.ts
++++ b/test/unit/routes-agent-approval.test.ts
+@@ -13,7 +13,7 @@ vi.mock("../../src/github/labels", () => ({
+ import { mergePullRequest } from "../../src/github/pr-actions";
+ import { createSessionForGitHubUser } from "../../src/auth/security";
+ import { createApp } from "../../src/api/routes";
+-import { createPendingAgentActionIfAbsent, getPendingAgentAction, upsertInstallation, upsertPullRequestFromGitHub, upsertRepositorySettings } from "../../src/db/repositories";
++import { createPendingAgentActionIfAbsent, getPendingAgentAction, recordAuditEvent, upsertInstallation, upsertPullRequestFromGitHub, upsertRepositorySettings } from "../../src/db/repositories";
+ import { createTestEnv } from "../helpers/d1";
+ 
+ const app = createApp();
+@@ -113,3 +113,76 @@ describe("agent approval-queue routes (#779)", () => {
+     expect(again.status).toBe(409);
+   });
+ });
++
++describe("agent audit-feed route (#784)", () => {
++  async function seedAudit(env: Env) {
++    await recordAuditEvent(env, { eventType: "agent.action.merge", actor: "gittensory", targetKey: "owner/repo#7", outcome: "completed", detail: "merged", createdAt: "2026-06-18T10:00:00.000Z" });
++    await recordAuditEvent(env, { eventType: "agent.pending_action.rejected", actor: "owner", targetKey: "owner/repo#8", outcome: "completed", detail: "rejected merge", createdAt: "2026-06-18T11:00:00.000Z" });
++    // excluded: a non-agent event on this repo, and an agent event on a different repo.
++    await recordAuditEvent(env, { eventType: "github_app.pr_visibility_skipped", actor: "x", targetKey: "owner/repo#9", outcome: "completed", createdAt: "2026-06-18T12:00:00.000Z" });
++    await recordAuditEvent(env, { eventType: "agent.action.label", actor: "gittensory", targetKey: "other/repo#1", outcome: "completed", createdAt: "2026-06-18T13:00:00.000Z" });
++  }
++
++  it("returns this repo's agent action + decision events newest-first, excluding non-agent and other-repo events", async () => {
++    const env = createTestEnv();
++    await seedAudit(env);
++    const res = await app.request("/v1/repos/owner/repo/agent/audit-feed", { headers: headers(env) }, env);
++    expect(res.status).toBe(200);
++    const body = (await res.json()) as { repoFullName: string; events: Array<{ eventType: string; pullNumber: number | null; outcome: string }> };
++    expect(body.repoFullName).toBe("owner/repo");
++    expect(body.events.map((event) => event.eventType)).toEqual(["agent.pending_action.rejected", "agent.action.merge"]);
++    expect(body.events[0]).toMatchObject({ pullNumber: 8, outcome: "completed" });
++  });
++
++  it("honors the since filter and the limit", async () => {
++    const env = createTestEnv();
++    await seedAudit(env);
++    const since = await app.request("/v1/repos/owner/repo/agent/audit-feed?since=2026-06-18T10:30:00.000Z", { headers: headers(env) }, env);
++    expect(((await since.json()) as { events: unknown[] }).events).toHaveLength(1); // only the 11:00 reject
++    const limited = await app.request("/v1/repos/owner/repo/agent/audit-feed?limit=1", { headers: headers(env) }, env);
++    expect(((await limited.json()) as { events: unknown[] }).events).toHaveLength(1);
++  });
++
++  it("requires authentication and forbids a non-operator session", async () => {
++    const env = createTestEnv();
++    await seedAudit(env);
++    const noauth = await app.request("/v1/repos/owner/repo/agent/audit-feed", {}, env);
++    expect([401, 403]).toContain(noauth.status);
++    const { token } = await createSessionForGitHubUser(env, { login: "rando", id: 555 });
++    const forbidden = await app.request("/v1/repos/owner/repo/agent/audit-feed", { headers: { authorization: `Bearer ${token}` } }, env);
++    expect([401, 403]).toContain(forbidden.status);
++  });
++
++  it("reports a null pullNumber for an agent event whose targetKey has no numeric PR", async () => {
++    const env = createTestEnv();
++    await recordAuditEvent(env, { eventType: "agent.action.label", actor: "gittensory", targetKey: "owner/repo#manual", outcome: "completed", createdAt: "2026-06-18T09:00:00.000Z" });
++    const res = await app.request("/v1/repos/owner/repo/agent/audit-feed", { headers: headers(env) }, env);
++    const body = (await res.json()) as { events: Array<{ pullNumber: number | null }> };
++    expect(body.events).toHaveLength(1);
++    expect(body.events[0]?.pullNumber).toBeNull();
++  });
++
++  it("rejects a malformed since with 400", async () => {
++    const env = createTestEnv();
++    const res = await app.request("/v1/repos/owner/repo/agent/audit-feed?since=not-a-date", { headers: headers(env) }, env);
++    expect(res.status).toBe(400);
++    await expect(res.json()).resolves.toMatchObject({ error: "invalid_since" });
++  });
++
++  it("rejects an out-of-range or non-integer limit with 400", async () => {
++    const env = createTestEnv();
++    for (const bad of ["0", "201", "abc", "1.5"]) {
++      const res = await app.request(`/v1/repos/owner/repo/agent/audit-feed?limit=${bad}`, { headers: headers(env) }, env);
++      expect(res.status, `limit=${bad}`).toBe(400);
++    }
++  });
++
++  it("scrubs forbidden terms from the free-form detail before returning", async () => {
++    const env = createTestEnv();
++    await recordAuditEvent(env, { eventType: "agent.action.merge", actor: "gittensory", targetKey: "owner/repo#7", outcome: "completed", detail: "reward estimate leaked", createdAt: "2026-06-18T10:00:00.000Z" });
++    const res = await app.request("/v1/repos/owner/repo/agent/audit-feed", { headers: headers(env) }, env);
++    const body = (await res.json()) as { events: Array<{ detail: string | null }> };
++    expect(body.events[0]?.detail).not.toMatch(/reward/i);
++    expect(body.events[0]?.detail).toContain("private context");
++  });
++});

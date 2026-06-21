@@ -1,0 +1,1134 @@
+diff --git a/crates/engine/src/game/effects/choose_from_zone.rs b/crates/engine/src/game/effects/choose_from_zone.rs
+index 7d8d39f89d..bd625472b7 100644
+--- a/crates/engine/src/game/effects/choose_from_zone.rs
++++ b/crates/engine/src/game/effects/choose_from_zone.rs
+@@ -45,6 +45,17 @@ pub fn resolve(
+             _ => return Err(EffectError::MissingParam("ChooseFromZone".to_string())),
+         };
+ 
++    // CR 101.4 + CR 608.2c: "For each player, choose ... in that player's zone"
++    // iterates every player in APNAP order, parking one choice per player and
++    // accumulating each pick into the chain's tracked set. Routed here before
++    // the single-pool path so the per-player prompts never collapse into one
++    // candidate scan. Building block for Breach the Multiverse.
++    if matches!(zone_owner, ZoneOwner::EachPlayer) {
++        let players = crate::game::players::apnap_order(state);
++        // No pick has accumulated yet — the first one must start a fresh set.
++        return prompt_next_each_player(state, ability, players, false, events);
++    }
++
+     let cards = resolve_candidate_cards(
+         state,
+         ability,
+@@ -85,6 +96,161 @@ pub fn resolve(
+     Ok(())
+ }
+ 
++/// CR 101.4 + CR 608.2c: Park the next eligible player's `ChooseFromZoneChoice`
++/// for a `ChooseFromZone { zone_owner: EachPlayer }` iteration, stashing the
++/// players still to be prompted in `pending_per_player_zone_choice`. Players
++/// whose zone holds no matching candidate are skipped (CR 608.2c — there's
++/// nothing to choose). When no eligible player remains, the iteration is
++/// disposed (the parked `pending_continuation` then runs). Drives both the
++/// initial call from `resolve` and each resumed call from
++/// `drain_pending_per_player_zone_choice`.
++fn prompt_next_each_player(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    mut remaining_players: Vec<PlayerId>,
++    accumulated: bool,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    let (count, zone, additional_zones, filter, chooser, up_to, constraint) = match &ability.effect
++    {
++        Effect::ChooseFromZone {
++            count,
++            zone,
++            additional_zones,
++            filter,
++            chooser,
++            up_to,
++            constraint,
++            ..
++        } => (
++            *count as usize,
++            *zone,
++            additional_zones.clone(),
++            filter.clone(),
++            *chooser,
++            *up_to,
++            constraint.clone(),
++        ),
++        _ => return Err(EffectError::MissingParam("ChooseFromZone".to_string())),
++    };
++
++    while let Some(owner) = remaining_players.first().copied() {
++        remaining_players.remove(0);
++
++        let cards = collect_player_zone_cards(
++            state,
++            ability,
++            owner,
++            zone,
++            &additional_zones,
++            filter.as_ref(),
++        );
++        if cards.is_empty() || count == 0 {
++            continue;
++        }
++
++        let clamped_count = count.min(cards.len());
++        // CR 101.4 + CR 608.2c: For "for each player, choose ...", the spell's controller is
++        // the chooser regardless of whose zone is scanned (Breach the
++        // Multiverse). `Chooser::Opponent` would route to an opponent; honor it.
++        let choosing_player = resolve_chooser(state, ability, chooser);
++
++        state.waiting_for = WaitingFor::ChooseFromZoneChoice {
++            player: choosing_player,
++            cards,
++            count: clamped_count,
++            up_to,
++            constraint,
++            source_id: ability.source_id,
++        };
++        state.pending_per_player_zone_choice =
++            Some(crate::types::game_state::PendingPerPlayerZoneChoice {
++                ability: Box::new(ability.clone()),
++                remaining_players,
++                accumulated,
++            });
++        return Ok(());
++    }
++
++    // CR 608.2c: No player had an eligible card — emit the resolution event so the
++    // parked continuation ("put those cards onto the battlefield") still runs.
++    events.push(GameEvent::EffectResolved {
++        kind: EffectKind::ChooseFromZone,
++        source_id: ability.source_id,
++    });
++    Ok(())
++}
++
++/// CR 101.4 + CR 608.2c: Resume a per-player `ChooseFromZone { EachPlayer }`
++/// iteration after the current player's pick resolves. Accumulates the chosen
++/// cards into the resolution chain's tracked set (a fresh set on the first
++/// pick, extended on each subsequent pick) so a downstream "put those cards
++/// onto the battlefield" reads exactly the cards chosen across all players,
++/// then prompts the next eligible player. Mirrors
++/// `vote::drain_pending_vote_ballot_iteration`.
++pub(crate) fn drain_pending_per_player_zone_choice(
++    state: &mut GameState,
++    chosen: &[ObjectId],
++    events: &mut Vec<GameEvent>,
++) {
++    let Some(pending) = state.pending_per_player_zone_choice.take() else {
++        return;
++    };
++
++    let crate::types::game_state::PendingPerPlayerZoneChoice {
++        ability,
++        remaining_players,
++        accumulated,
++    } = pending;
++
++    // CR 603.7 + CR 608.2c: The FIRST pick of this per-player iteration STARTS a
++    // fresh chosen-card set. It must NOT extend an earlier producer's tracked
++    // set — Breach the Multiverse mills first (publishing a "Milled" set), so
++    // extending here would reanimate the milled cards alongside the chosen ones
++    // ("those cards" = the chosen cards only, CR 608.2c). `publish_fresh_tracked_set`
++    // allocates a new set and rebinds `chain_tracked_set_id`, overwriting the
++    // milled binding. Every LATER pick extends that fresh set so all players'
++    // chosen cards unify under one "those cards" reference. The Cyberman / impulse
++    // "milled this way" path is unaffected — it never uses this per-player drain.
++    let accumulated = if chosen.is_empty() {
++        accumulated
++    } else if accumulated {
++        super::publish_tracked_set(state, chosen.to_vec());
++        true
++    } else {
++        super::publish_fresh_tracked_set(state, chosen.to_vec());
++        true
++    };
++
++    let _ = prompt_next_each_player(state, &ability, remaining_players, accumulated, events);
++}
++
++/// CR 101.4: Candidate cards in a SINGLE player's zone(s) for a per-player
++/// iteration, applying the effect's filter. Unlike `collect_direct_zone_cards`,
++/// the owner is supplied explicitly (the iterating player), so the tracked-set
++/// short-circuit in `resolve_candidate_cards` is bypassed — each player's
++/// graveyard is scanned independently.
++fn collect_player_zone_cards(
++    state: &GameState,
++    ability: &ResolvedAbility,
++    owner: PlayerId,
++    zone: Zone,
++    additional_zones: &[Zone],
++    filter: Option<&TargetFilter>,
++) -> Vec<ObjectId> {
++    let filter_ctx = FilterContext::from_ability(ability);
++    let mut zones = Vec::with_capacity(1 + additional_zones.len());
++    zones.push(zone);
++    zones.extend_from_slice(additional_zones);
++    zones
++        .into_iter()
++        .flat_map(|zone| object_ids_in_player_zone(state, owner, zone))
++        .filter(|id| {
++            filter.is_none_or(|filter| matches_target_filter(state, *id, filter, &filter_ctx))
++        })
++        .collect()
++}
++
+ /// CR 608.2c + CR 608.2d + CR 603.7: Resolve the candidate card pool for a
+ /// tracked-set pick.
+ ///
+@@ -197,6 +363,12 @@ fn resolve_zone_owner(
+             .ok_or_else(|| EffectError::MissingParam("ChooseFromZone opponent".to_string())),
+         // CR 701.38d: The scoped player (voter) supplies the zone.
+         ZoneOwner::ScopedPlayer => Ok(ability.scoped_player.unwrap_or(ability.controller)),
++        // CR 101.4: `EachPlayer` resolves a *set* of zone owners, not one — it
++        // is handled by `prompt_next_each_player`, which scans each player's
++        // zone directly via `collect_direct_zone_cards` and never routes here.
++        ZoneOwner::EachPlayer => Err(EffectError::MissingParam(
++            "ChooseFromZone EachPlayer resolves per-player, not via single owner".to_string(),
++        )),
+     }
+ }
+ 
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index a6cabdaaa4..3c9d74a250 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -488,6 +488,15 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
+     if waits_for_resolution_choice(&state.waiting_for) {
+         return;
+     }
++    // CR 101.4 + CR 608.2c: A `ChooseFromZone { EachPlayer }` iteration that is
++    // still mid-flight (more players to prompt) must not let the parked
++    // continuation ("put those cards onto the battlefield") run until every
++    // player's graveyard pick has accumulated into the tracked set. The
++    // per-player drain re-parks the next prompt; this guard ensures the
++    // continuation waits for the whole sweep (Breach the Multiverse).
++    if state.pending_per_player_zone_choice.is_some() {
++        return;
++    }
+     if let Some(cont) = state.pending_continuation.take() {
+         let PendingContinuation { chain, parent_kind } = cont;
+         let source_id = chain.source_id;
+diff --git a/crates/engine/src/game/engine_resolution_choices.rs b/crates/engine/src/game/engine_resolution_choices.rs
+index 9229511e8e..3515751726 100644
+--- a/crates/engine/src/game/engine_resolution_choices.rs
++++ b/crates/engine/src/game/engine_resolution_choices.rs
+@@ -2054,6 +2054,25 @@ pub(super) fn handle_resolution_choice(
+                 .map(|cont| cont.chain.controller)
+                 .unwrap_or(player);
+             set_priority(state, priority_player);
++            // CR 101.4 + CR 608.2c: A per-player `ChooseFromZone { EachPlayer }`
++            // iteration does NOT partition this player's pick into the
++            // continuation's target slots — each pick is accumulated into the
++            // chain's tracked set by `drain_pending_per_player_zone_choice`, and
++            // the continuation ("put those cards onto the battlefield") reads
++            // that tracked set. Hand the choice straight to the drain so it can
++            // accumulate and prompt the next player (Breach the Multiverse).
++            if state.pending_per_player_zone_choice.is_some() {
++                effects::choose_from_zone::drain_pending_per_player_zone_choice(
++                    state, &chosen, events,
++                );
++                // Only after every player has been prompted (the drain leaves no
++                // pending iteration and is no longer waiting on a choice) does
++                // the parked continuation run.
++                effects::drain_pending_continuation(state, events);
++                return Ok(ResolutionChoiceOutcome::WaitingFor(
++                    state.waiting_for.clone(),
++                ));
++            }
+             if let Some(cont) = state.pending_continuation.as_mut() {
+                 cont.chain.targets = chosen.iter().map(|&id| TargetRef::Object(id)).collect();
+                 // CR 700.2 + CR 608.2c: The "unchosen" partition is forwarded
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index 00416554c8..72205d02a2 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -2790,6 +2790,51 @@ fn try_parse_choose_from_zone(lower: &str, ctx: &mut ParseContext) -> Option<Cho
+     })
+ }
+ 
++/// CR 101.4 + CR 608.2c: "For each player, choose a `<filter>` card in that
++/// player's `<zone>`" — the spell's controller picks one card from EVERY
++/// player's zone in APNAP order, accumulating the picks for a downstream "put
++/// those cards onto the battlefield" reanimation. The leading "for each player,"
++/// is stripped here (the chain splitter keeps the prefix attached because the
++/// comma-delimited body is the clause), then the shared `try_parse_choose_from_zone`
++/// combinator extracts the filter + zone from "that player's `<zone>`"; the
++/// per-player iteration is encoded by overriding `zone_owner` to `EachPlayer`.
++/// Building block for Breach the Multiverse (issue #3302).
++pub(super) fn parse_for_each_player_choose_from_zone(
++    lower: &str,
++    ctx: &mut ParseContext,
++) -> Option<ChooseImperativeAst> {
++    type E<'a> = OracleError<'a>;
++
++    let (_, body) = preceded(
++        alt((tag::<_, _, E>("for each player, "), tag("for each player "))),
++        rest,
++    )
++    .parse(lower)
++    .ok()?;
++
++    // The body's zone reference is "that player's <zone>", which
++    // `parse_choose_zone_connector` maps to `TargetedPlayer`; the "for each
++    // player" prefix promotes it to per-player iteration (`EachPlayer`).
++    match try_parse_choose_from_zone(body, ctx)? {
++        ChooseImperativeAst::FromZone {
++            count,
++            zones,
++            zone_owner: ZoneOwner::TargetedPlayer,
++            filter,
++            chooser,
++            up_to,
++        } => Some(ChooseImperativeAst::FromZone {
++            count,
++            zones,
++            zone_owner: ZoneOwner::EachPlayer,
++            filter,
++            chooser,
++            up_to,
++        }),
++        _ => None,
++    }
++}
++
+ fn strip_choose_article(input: &str) -> Option<&str> {
+     type E<'a> = OracleError<'a>;
+ 
+@@ -4001,7 +4046,11 @@ pub(super) fn lower_imperative_ast(ast: ImperativeAst) -> Effect {
+     }
+ }
+ 
+-pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst> {
++pub(super) fn parse_put_ast(
++    text: &str,
++    lower: &str,
++    ctx: &mut ParseContext,
++) -> Option<PutImperativeAst> {
+     tag::<_, _, OracleError<'_>>("put ").parse(lower).ok()?;
+ 
+     if nom_on_lower(text, lower, |input| {
+@@ -4131,18 +4180,36 @@ pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst>
+                 up_to,
+                 enter_with_counters,
+                 ..
+-            } => Some(PutImperativeAst::ZoneChange {
+-                origin,
+-                destination,
+-                target,
+-                enters_under,
+-                enter_tapped: enter_tapped.is_tapped(),
+-                enter_transformed,
+-                enters_attacking,
+-                up_to,
+-                choice_count: choice_count.map(Box::new),
+-                enter_with_counters,
+-            }),
++            } => {
++                // CR 608.2c + CR 400.7: A bare "put those cards / put them onto
++                // the battlefield" anaphor names a tracked set whose members
++                // never moved as part of THIS clause, so the clause text gives
++                // no origin (`infer_origin_zone` → None). When a producer clause
++                // earlier in the chain published the set's source zone
++                // (`pending_tracked_set_origin`, e.g. Breach the Multiverse's
++                // graveyard choose), bind it here. An impulse/cascade producer
++                // leaves the context unset, so the exile default in
++                // `lower_put_ast` still governs those reanimations.
++                let origin = match (&origin, &target) {
++                    (
++                        None,
++                        TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. },
++                    ) => ctx.pending_tracked_set_origin.or(origin),
++                    _ => origin,
++                };
++                Some(PutImperativeAst::ZoneChange {
++                    origin,
++                    destination,
++                    target,
++                    enters_under,
++                    enter_tapped: enter_tapped.is_tapped(),
++                    enter_transformed,
++                    enters_attacking,
++                    up_to,
++                    choice_count: choice_count.map(Box::new),
++                    enter_with_counters,
++                })
++            }
+             _ => None,
+         };
+     }
+@@ -4208,10 +4275,22 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
+             ) && enter_with_counters.is_empty()
+             {
+                 Effect::ChangeZoneAll {
+-                    origin: Some(Zone::Exile),
++                    // CR 608.2c + CR 400.7: A tracked-set / impulse mass move
++                    // defaults to scanning Exile (cascade, impulse-draw, and the
++                    // `ExiledBySource` class all leave their members in exile).
++                    // When the producer published a non-exile source zone
++                    // (Breach the Multiverse's graveyard choose stamps
++                    // `origin: Some(Graveyard)` in `parse_put_ast`), honor it so
++                    // the chosen cards are read out of the right zone.
++                    origin: origin.or(Some(Zone::Exile)),
+                     destination,
+                     target,
+-                    enters_under: None,
++                    // CR 110.2a: Preserve the parsed entering-controller override
++                    // ("put those cards onto the battlefield UNDER YOUR CONTROL"
++                    // → Some(You) for Breach the Multiverse). Impulse/cascade
++                    // text carries no such phrase, so `enters_under` stays None
++                    // for them — identical to the prior hardcoded default.
++                    enters_under,
+                     enter_tapped: crate::types::zones::EtbTapState::from_legacy_bool(enter_tapped),
+                     enter_with_counters: vec![],
+                     face_down_profile: None,
+@@ -6688,13 +6767,13 @@ pub(super) fn parse_imperative_family_ast(
+                 .or_else(|| {
+                     parse_zone_counter_ast(text, lower, ctx)
+                         .map(ImperativeFamilyAst::ZoneCounter)
+-                        .or_else(|| parse_put_ast(text, lower).map(ImperativeFamilyAst::Put))
++                        .or_else(|| parse_put_ast(text, lower, ctx).map(ImperativeFamilyAst::Put))
+                 })
+         }
+         // "put" → counter (step 2) first, then zone-change (step 12)
+         "put" => parse_zone_counter_ast(text, lower, ctx)
+             .map(ImperativeFamilyAst::ZoneCounter)
+-            .or_else(|| parse_put_ast(text, lower).map(ImperativeFamilyAst::Put)),
++            .or_else(|| parse_put_ast(text, lower, ctx).map(ImperativeFamilyAst::Put)),
+ 
+         // "remove" → "remove from combat" (CR 506.4) → counter removal (step 2)
+         "remove" => parse_remove_from_combat_ast(lower, ctx) // allow-noncombinator: pre-existing match dispatch, only threading ctx through
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 6d405120ae..c809f75146 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -4387,6 +4387,15 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
+         }
+     }
+ 
++    // CR 101.4 + CR 608.2c: "For each player, choose a <filter> card in that
++    // player's <zone>" — the controller picks one card from EVERY player's zone
++    // (Breach the Multiverse). Lowers to `ChooseFromZone { zone_owner:
++    // EachPlayer }`, which parks one choice per player and accumulates the picks
++    // into the chain tracked set for a downstream "put those cards" reanimation.
++    if let Some(ast) = imperative::parse_for_each_player_choose_from_zone(tp.lower, ctx) {
++        return parsed_clause(imperative::lower_choose_ast(ast));
++    }
++
+     if tp.lower == "start your engines!" || tp.lower == "start your engines" {
+         return parsed_clause(Effect::StartYourEngines {
+             player_scope: PlayerFilter::Controller,
+@@ -15921,6 +15930,11 @@ pub(crate) fn parse_effect_chain_ir(
+         .map_or(text, |(_, body)| *body);
+     let full_text = text; // bind AFTER the strip so diagnostics track the parsed chunks
+     ctx.effect_chain_full_lower = Some(full_text.to_ascii_lowercase());
++    // CR 608.2c: A tracked-set source-zone binding is scoped to the chain that
++    // publishes it. The per-chunk `chunk_ctx` re-seeds `pending_tracked_set_origin`
++    // from the `chain_pending_tracked_set_origin` loop-local (initialized to
++    // None) each iteration, so a binding from one chain can never leak into the
++    // next; the outer `ctx` field is left untouched here.
+     // CR 701.42a: The meld effect clause "exile them, then meld them into
+     // [result]" is a single atomic instruction whose ", then " comma would
+     // otherwise be split into two clauses by `split_clause_sequence`. Intercept
+@@ -16006,6 +16020,14 @@ pub(crate) fn parse_effect_chain_ir(
+     // made in earlier chunks. Seeded into each `chunk_ctx` and read back after.
+     let mut chain_chosen_player_count: u8 = 0;
+     let mut chain_chosen_player_scope: Option<ControllerRef> = None;
++    // CR 608.2c + CR 400.7: Chain-spanning source zone of a "choose card(s) in
++    // <zone>" producer, carried to a following "put those cards onto the
++    // battlefield" consumer so the `TrackedSet` move scans the right zone
++    // (Breach the Multiverse: graveyard, not the impulse-default exile). Like
++    // the chosen-player locals, the per-chunk `chunk_ctx` is rebuilt fresh each
++    // iteration, so this loop-local seeds each `chunk_ctx.pending_tracked_set_origin`
++    // and is refreshed from the finalized `ChooseFromZone` clause after parse.
++    let mut chain_pending_tracked_set_origin: Option<crate::types::zones::Zone> = None;
+     // CR 608.2e + CR 109.5: Sticky across chunks of a "For each opponent who
+     // doesn't, <body>" decline-consequence sentence. Set true on the chunk that
+     // carries the "for each opponent who doesn't" prefix; every chunk while
+@@ -17503,6 +17525,11 @@ pub(crate) fn parse_effect_chain_ir(
+             parent_target_available,
+             effect_chain_full_lower: ctx.effect_chain_full_lower.clone(),
+             parent_target_is_chosen,
++            // CR 608.2c + CR 400.7: seed the zone published by an earlier
++            // "choose card(s) in <zone>" producer so this chunk's "put those
++            // cards onto the battlefield" anaphor binds its `TrackedSet` move to
++            // that origin instead of the impulse-default exile.
++            pending_tracked_set_origin: chain_pending_tracked_set_origin,
+             ..Default::default()
+         };
+         let ctx = &mut chunk_ctx;
+@@ -17784,6 +17811,20 @@ pub(crate) fn parse_effect_chain_ir(
+         // carries the caster default (Controller). Per D-04, this is parse-time
+         // pronoun resolution that belongs in IR production.
+         let mut clause = clause;
++        // CR 608.2c + CR 400.7: Carry the source zone of a "choose card(s) in
++        // <zone>" producer forward to the NEXT chunk. The chosen cards stay in
++        // that zone until a downstream "put those cards onto the battlefield"
++        // anaphor moves them, so the consumer's `TrackedSet` move must scan THIS
++        // zone — not the impulse-default exile. Derived from the finalized
++        // `ChooseFromZone` clause's own `zone`, so it covers the whole class
++        // (Breach the Multiverse and any future "choose in <zone> … put those
++        // cards" chain), never a single hardcoded card. Any chunk that is not
++        // itself such a producer clears it, so the binding never leaks past the
++        // immediately-following consumer.
++        chain_pending_tracked_set_origin = match &clause.effect {
++            Effect::ChooseFromZone { zone, .. } => Some(*zone),
++            _ => None,
++        };
+         if let Some(target) = &for_each_reference_target {
+             bind_search_library_for_each_antecedent(&mut clause.effect, target, &text_no_qty_lower);
+         }
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 2b5dbfe5c0..d912ac5ef4 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -6802,6 +6802,144 @@ mod tests {
+         assert_eq!(profile.subtypes, vec!["Cyberman".to_string()]);
+     }
+ 
++    /// CR 400.7 + CR 608.2c + CR 110.2a + CR 205.1b: Breach the Multiverse's
++    /// full four-clause text must assemble into a `Mill → ChooseFromZone{
++    /// zone_owner: EachPlayer, filter: creature-or-planeswalker } →
++    /// ChangeZoneAll{ origin: Graveyard, enters_under: You, target: tracked-set }
++    /// → GenericEffect(AddSubtype("Phyrexian"))` chain — with NO `Unimplemented`.
++    /// Clause 1 (Mill) already parsed before this fix; clauses 2-4 were dropped.
++    #[test]
++    fn breach_multiverse_assembles_per_player_reanimation_chain() {
++        use super::super::parse_effect_chain;
++        use crate::types::ability::ZoneOwner;
++
++        let def = parse_effect_chain(
++            "Each player mills ten cards. For each player, choose a creature or planeswalker card in that player's graveyard. Put those cards onto the battlefield under your control. Then each creature you control becomes a Phyrexian in addition to its other types.",
++            AbilityKind::Spell,
++        );
++
++        let mut effects: Vec<&AbilityDefinition> = Vec::new();
++        let mut node = Some(&def);
++        while let Some(d) = node {
++            effects.push(d);
++            node = d.sub_ability.as_deref();
++        }
++
++        // No clause may fall through to Unimplemented.
++        for d in &effects {
++            assert!(
++                !matches!(&*d.effect, Effect::Unimplemented { .. }),
++                "no clause may be Unimplemented, got {:?}",
++                d.effect
++            );
++        }
++
++        // Clause 1: the ten-card mill survives untouched.
++        assert!(
++            effects
++                .iter()
++                .any(|d| matches!(&*d.effect, Effect::Mill { .. })),
++            "clause 1 mill must remain in the chain, chain was {:?}",
++            effects.iter().map(|d| &d.effect).collect::<Vec<_>>()
++        );
++
++        // Clause 2: per-player graveyard choice (controller chooses one
++        // creature-or-planeswalker card from EACH player's graveyard).
++        let choose = effects
++            .iter()
++            .find(|d| matches!(&*d.effect, Effect::ChooseFromZone { .. }))
++            .unwrap_or_else(|| {
++                panic!(
++                    "clause 2 must lower to ChooseFromZone, chain was {:?}",
++                    effects.iter().map(|d| &d.effect).collect::<Vec<_>>()
++                )
++            });
++        let Effect::ChooseFromZone {
++            count,
++            zone,
++            zone_owner,
++            filter,
++            chooser,
++            ..
++        } = &*choose.effect
++        else {
++            unreachable!()
++        };
++        assert_eq!(*count, 1, "one card per player");
++        assert_eq!(*zone, Zone::Graveyard);
++        assert_eq!(
++            *zone_owner,
++            ZoneOwner::EachPlayer,
++            "BLOCKER: 'for each player ... in that player's graveyard' must iterate every player"
++        );
++        assert_eq!(
++            *chooser,
++            Chooser::Controller,
++            "the spell's controller chooses"
++        );
++        let filter = filter
++            .as_ref()
++            .expect("clause 2 filter must restrict to creature/planeswalker cards");
++        // The filter must admit a creature AND a planeswalker (Or/Typed over both).
++        assert!(
++            matches!(filter, TargetFilter::Or { .. } | TargetFilter::Typed(_)),
++            "filter must be a creature-or-planeswalker type filter, got {filter:?}"
++        );
++
++        // Clause 3: "put those cards onto the battlefield under your control"
++        // must bind the tracked set from clause 2 and enter under the controller.
++        let put = effects
++            .iter()
++            .find(|d| matches!(&*d.effect, Effect::ChangeZoneAll { .. }))
++            .unwrap_or_else(|| {
++                panic!(
++                    "clause 3 must lower to ChangeZoneAll, chain was {:?}",
++                    effects.iter().map(|d| &d.effect).collect::<Vec<_>>()
++                )
++            });
++        let Effect::ChangeZoneAll {
++            origin,
++            destination,
++            target,
++            enters_under,
++            ..
++        } = &*put.effect
++        else {
++            unreachable!()
++        };
++        assert_eq!(*origin, Some(Zone::Graveyard), "scan the graveyards");
++        assert_eq!(*destination, Zone::Battlefield);
++        assert_eq!(*enters_under, Some(ControllerRef::You));
++        assert!(
++            matches!(
++                target,
++                TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. }
++            ),
++            "'those cards' must bind the clause-2 tracked set, got {target:?}"
++        );
++
++        // Clause 4: "each creature you control becomes a Phyrexian in addition
++        // to its other types" → GenericEffect granting AddSubtype("Phyrexian").
++        let phyrexian = effects.iter().any(|d| match &*d.effect {
++            Effect::GenericEffect {
++                static_abilities, ..
++            } => static_abilities.iter().any(|sa| {
++                sa.modifications.iter().any(|m| {
++                    matches!(
++                        m,
++                        ContinuousModification::AddSubtype { subtype } if subtype == "Phyrexian"
++                    )
++                })
++            }),
++            _ => false,
++        });
++        assert!(
++            phyrexian,
++            "clause 4 must grant AddSubtype(\"Phyrexian\"), chain was {:?}",
++            effects.iter().map(|d| &d.effect).collect::<Vec<_>>()
++        );
++    }
++
+     /// CR 708.2a: A bare "put all creature cards milled this way onto the
+     /// battlefield face down." with no trailing characteristics sentence keeps
+     /// the default vanilla 2/2 profile.
+diff --git a/crates/engine/src/parser/oracle_ir/context.rs b/crates/engine/src/parser/oracle_ir/context.rs
+index 0aa56d21d6..bdf5c42b99 100644
+--- a/crates/engine/src/parser/oracle_ir/context.rs
++++ b/crates/engine/src/parser/oracle_ir/context.rs
+@@ -106,6 +106,19 @@ pub(crate) struct ParseContext {
+     /// `ExileFromTopUntil` referent (Territorial Bruntar) that
+     /// `parent_target_available` would otherwise include.
+     pub parent_target_is_chosen: bool,
++    /// CR 608.2c + CR 400.7: Source zone of the tracked set that a downstream
++    /// "put those cards / put them onto the battlefield" anaphor (a
++    /// `TargetFilter::TrackedSet`) must scan. Set by a producer clause that
++    /// publishes its set from a NON-exile zone — e.g.
++    /// `parse_for_each_player_choose_from_zone` derives `Some(Graveyard)` from
++    /// the parsed `ChooseFromZone { zone: Graveyard }` so Breach the
++    /// Multiverse's reanimation reads the chosen cards out of the graveyard
++    /// rather than the impulse-default exile. Consumed by `parse_put_ast` when
++    /// it lowers a `TrackedSet` put-onto-battlefield whose own clause text named
++    /// no explicit origin; an impulse/cascade producer leaves this `None`, so
++    /// the lowering keeps the exile default. Reset per effect chain in
++    /// `parse_effect_chain_ir`.
++    pub pending_tracked_set_origin: Option<Zone>,
+     /// CR 701.42a: The partner card name extracted from a meld instigator's
+     /// own/control gate ("if you both own and control [self] and a [type] named
+     /// [partner], exile them, then meld them into [result]"). The gate is parsed
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index c6c3e194d6..6de17b908d 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -57,6 +57,13 @@ pub enum ZoneOwner {
+     /// pool is "permanents owned by the voter". For Battlefield, filters
+     /// by `obj.owner` (ownership) rather than `obj.controller` (control).
+     ScopedPlayer,
++    /// CR 101.4 + CR 608.2c: Every player owns a referenced zone, iterated in
++    /// APNAP order. A `ChooseFromZone { zone_owner: EachPlayer }` parks one
++    /// choice per player, drawing candidates from THAT player's zone, and
++    /// accumulates each pick into the resolution chain's tracked object set.
++    /// Building block for Breach the Multiverse ("For each player, choose a
++    /// creature or planeswalker card in that player's graveyard").
++    EachPlayer,
+ }
+ 
+ /// CR 101.4: Who selects permanents in a multi-player category choice effect
+@@ -15292,6 +15299,37 @@ where
+ mod tests {
+     use super::*;
+ 
++    /// CR 101.4 + CR 608.2c (issue #3302): `ZoneOwner::EachPlayer` is a shared
++    /// serialized engine type (card-data export, WASM/IPC transport). A
++    /// serialize→deserialize round-trip must reproduce the exact variant so a
++    /// Breach the Multiverse `ChooseFromZone { zone_owner: EachPlayer }` survives
++    /// the wire. Every variant is checked so adding `EachPlayer` did not perturb
++    /// the others' tags.
++    #[test]
++    fn zone_owner_serde_round_trips_each_variant() {
++        for owner in [
++            ZoneOwner::Controller,
++            ZoneOwner::TargetedPlayer,
++            ZoneOwner::Opponent,
++            ZoneOwner::ScopedPlayer,
++            ZoneOwner::EachPlayer,
++        ] {
++            let json = serde_json::to_string(&owner).expect("ZoneOwner serializes");
++            let round_tripped: ZoneOwner =
++                serde_json::from_str(&json).expect("ZoneOwner deserializes");
++            assert_eq!(round_tripped, owner, "round-trip must preserve {owner:?}");
++        }
++        // The new variant's external tag is its identifier (default enum repr).
++        assert_eq!(
++            serde_json::to_string(&ZoneOwner::EachPlayer).unwrap(),
++            "\"EachPlayer\""
++        );
++        assert_eq!(
++            serde_json::from_str::<ZoneOwner>("\"EachPlayer\"").unwrap(),
++            ZoneOwner::EachPlayer
++        );
++    }
++
+     /// #506: `AbilityCost::consumes_source` classifies a self-discard cost
+     /// (cycling, Channel) as source-consuming so the UI confirms a lone such
+     /// action instead of auto-firing it.
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index e6f277ed09..5f3fec8f94 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -1047,6 +1047,33 @@ pub struct PendingChooseOneOf {
+     pub remaining_players: Vec<PlayerId>,
+ }
+ 
++/// CR 101.4 + CR 608.2c: Per-player `ChooseFromZone { zone_owner: EachPlayer }`
++/// iteration state. A single chooser (the spell's controller) picks one card
++/// from EACH player's zone in APNAP order; this stashes the players not yet
++/// prompted while the current player's `WaitingFor::ChooseFromZoneChoice` is
++/// outstanding. Created when the first player's choice is parked, drained after
++/// each pick accumulates into the resolution chain's tracked set, and disposed
++/// once every player has been prompted — at which point the parked
++/// `pending_continuation` (e.g. "put those cards onto the battlefield") runs.
++/// Building block for Breach the Multiverse.
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub struct PendingPerPlayerZoneChoice {
++    /// The `Effect::ChooseFromZone` ability whose per-player body repeats. Its
++    /// `zone`/`filter`/`count`/`chooser` describe each player's prompt.
++    pub ability: Box<ResolvedAbility>,
++    /// Players not yet prompted, in APNAP order.
++    pub remaining_players: Vec<PlayerId>,
++    /// CR 603.7 + CR 608.2c: Whether a pick from THIS per-player iteration has
++    /// already started its fresh chosen-card tracked set. The first non-empty
++    /// pick must START a fresh set (so the chosen cards do NOT merge with an
++    /// earlier producer's set — e.g. Breach the Multiverse's preceding mill,
++    /// whose milled cards would otherwise reanimate alongside the chosen ones);
++    /// every later pick EXTENDS that fresh set. `false` until the first pick is
++    /// published, then `true` for the remainder of the iteration.
++    #[serde(default)]
++    pub accumulated: bool,
++}
++
+ /// CR 701.38d + CR 608.2c: Stores the remaining voters whose per-ballot
+ /// interactive body has not yet been resolved. Created when the first
+ /// ballot's ChooseFromZone parks WaitingFor::ChooseFromZoneChoice; drained
+@@ -6103,6 +6130,13 @@ pub struct GameState {
+     /// before `pending_repeat_iteration`.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub pending_vote_ballot_iteration: Option<PendingVoteBallotIteration>,
++    /// CR 101.4 + CR 608.2c: Per-player `ChooseFromZone { EachPlayer }`
++    /// iteration paused by the current player's interactive choice. Drained
++    /// alongside `pending_vote_ballot_iteration`, BEFORE `pending_continuation`
++    /// runs, so every player's graveyard pick accumulates into the chain's
++    /// tracked set before "put those cards onto the battlefield" resolves.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub pending_per_player_zone_choice: Option<PendingPerPlayerZoneChoice>,
+ 
+     /// CR 122.5: Pending atomic counter moves selected during a resolution-time
+     /// distribution prompt. Drained before normal pending continuations so
+@@ -7006,6 +7040,7 @@ impl GameState {
+             pending_repeat_until: None,
+             pending_choose_one_of: None,
+             pending_vote_ballot_iteration: None,
++            pending_per_player_zone_choice: None,
+             pending_counter_moves: None,
+             pending_batch_deliveries: None,
+             pending_counter_additions: None,
+@@ -7475,6 +7510,7 @@ impl PartialEq for GameState {
+             && self.pending_repeat_until == other.pending_repeat_until
+             && self.pending_choose_one_of == other.pending_choose_one_of
+             && self.pending_vote_ballot_iteration == other.pending_vote_ballot_iteration
++            && self.pending_per_player_zone_choice == other.pending_per_player_zone_choice
+             && self.pending_counter_moves == other.pending_counter_moves
+             && self.pending_batch_deliveries == other.pending_batch_deliveries
+             && self.pending_counter_additions == other.pending_counter_additions
+diff --git a/crates/engine/tests/integration/issue_3302_breach_multiverse.rs b/crates/engine/tests/integration/issue_3302_breach_multiverse.rs
+new file mode 100644
+index 0000000000..b550f30317
+--- /dev/null
++++ b/crates/engine/tests/integration/issue_3302_breach_multiverse.rs
+@@ -0,0 +1,333 @@
++//! Integration test for GitHub issue #3302 — Breach the Multiverse's per-player
++//! reanimation chain.
++//!
++//! Printed Oracle text:
++//!   "Each player mills ten cards. For each player, choose a creature or
++//!    planeswalker card in that player's graveyard. Put those cards onto the
++//!    battlefield under your control. Then each creature you control becomes a
++//!    Phyrexian in addition to its other types."
++//!
++//! The spell's controller (the caster) chooses ONE creature/planeswalker card
++//! from EACH player's graveyard, those chosen cards enter the battlefield under
++//! the caster's control, and every creature the caster controls becomes a
++//! Phyrexian.
++//!
++//! This file drives the REAL `apply` pipeline in a 2-player game: Breach is cast
++//! for free from the caster's hand, the mill + per-player choose loop park
++//! interactive `ChooseFromZoneChoice` prompts, each pick is answered via a real
++//! `GameAction::SelectCards`, and every observable (zone, controller, subtype)
++//! is engine-produced.
++//!
++//! The scenario is built to discriminate two distinct bugs:
++//!   * Clause-3 ORIGIN: "those cards" must be scanned from the GRAVEYARD (where
++//!     the choose left them), not the impulse-default exile. A wrong origin
++//!     leaves the chosen creatures in the graveyard (no reanimation).
++//!   * Tracked-set EXTEND-vs-FRESH (CR 608.2c + CR 603.7): clause 1 mills cards
++//!     (publishing a "Milled" tracked set). The FIRST per-player pick must START
++//!     a FRESH chosen-card set, NOT extend the milled set — otherwise the milled
++//!     creatures reanimate alongside the chosen ones ("those cards" = the chosen
++//!     cards only). Each graveyard therefore holds an EXTRA creature and a milled
++//!     creature that must REMAIN behind.
++//!
++//! CR 400.7: a card stays in its current zone until an effect moves it.
++//! CR 608.2c: "those cards" refers to the cards chosen in the preceding clause.
++//! CR 110.2a: "under your control" sets the entering object's controller.
++//! CR 205.1b: "becomes a Phyrexian" adds the Phyrexian creature subtype.
++
++use engine::game::scenario::{GameRunner, GameScenario};
++use engine::types::actions::GameAction;
++use engine::types::card_type::CoreType;
++use engine::types::game_state::{CastPaymentMode, WaitingFor};
++use engine::types::identifiers::ObjectId;
++use engine::types::phase::Phase;
++use engine::types::player::PlayerId;
++use engine::types::zones::Zone;
++
++const BREACH_ORACLE: &str = "Each player mills ten cards. For each player, choose a creature or \
++     planeswalker card in that player's graveyard. Put those cards onto the battlefield under \
++     your control. Then each creature you control becomes a Phyrexian in addition to its other \
++     types.";
++
++const P0: PlayerId = PlayerId(0);
++const P1: PlayerId = PlayerId(1);
++
++fn zone_of(runner: &GameRunner, id: ObjectId) -> Zone {
++    runner
++        .state()
++        .objects
++        .get(&id)
++        .expect("object present")
++        .zone
++}
++
++fn controller_of(runner: &GameRunner, id: ObjectId) -> PlayerId {
++    runner
++        .state()
++        .objects
++        .get(&id)
++        .expect("object present")
++        .controller
++}
++
++fn is_creature(runner: &GameRunner, id: ObjectId) -> bool {
++    runner
++        .state()
++        .objects
++        .get(&id)
++        .expect("object present")
++        .card_types
++        .core_types
++        .contains(&CoreType::Creature)
++}
++
++fn has_subtype(runner: &GameRunner, id: ObjectId, subtype: &str) -> bool {
++    runner
++        .state()
++        .objects
++        .get(&id)
++        .expect("object present")
++        .card_types
++        .subtypes
++        .iter()
++        .any(|s| s.eq_ignore_ascii_case(subtype))
++}
++
++/// Mark a library/graveyard card as a Creature so it is a legal candidate (and,
++/// for milled cards, a wrong-reanimation tripwire) for Breach's choose filter.
++fn make_creature(runner: &mut GameRunner, id: ObjectId) {
++    let obj = runner
++        .state_mut()
++        .objects
++        .get_mut(&id)
++        .expect("object present");
++    if !obj.card_types.core_types.contains(&CoreType::Creature) {
++        obj.card_types.core_types.push(CoreType::Creature);
++    }
++    obj.base_card_types = obj.card_types.clone();
++}
++
++/// Drive the runner forward (passing priority / declaring no attackers/blockers)
++/// until it pauses on a `ChooseFromZoneChoice`, or the stack empties.
++fn advance_to_choice_or_empty(runner: &mut GameRunner) {
++    for _ in 0..200 {
++        match &runner.state().waiting_for {
++            WaitingFor::ChooseFromZoneChoice { .. } => return,
++            WaitingFor::Priority { .. } => {
++                if runner.state().stack.is_empty() {
++                    return;
++                }
++                if runner.act(GameAction::PassPriority).is_err() {
++                    return;
++                }
++            }
++            WaitingFor::DeclareAttackers { .. } => {
++                let _ = runner.act(GameAction::DeclareAttackers {
++                    attacks: vec![],
++                    bands: vec![],
++                });
++            }
++            WaitingFor::DeclareBlockers { .. } => {
++                let _ = runner.act(GameAction::DeclareBlockers {
++                    assignments: vec![],
++                });
++            }
++            _ => return,
++        }
++    }
++}
++
++/// Answer the current per-player `ChooseFromZoneChoice` by selecting `pick`,
++/// after asserting the prompt is scoped to the caster and offers `pick`.
++fn answer_pick(runner: &mut GameRunner, expected_chooser: PlayerId, pick: ObjectId) {
++    match &runner.state().waiting_for {
++        WaitingFor::ChooseFromZoneChoice {
++            player,
++            cards,
++            count,
++            ..
++        } => {
++            assert_eq!(
++                *player, expected_chooser,
++                "the spell's controller makes every per-player pick"
++            );
++            assert_eq!(*count, 1, "exactly one card per player");
++            assert!(
++                cards.contains(&pick),
++                "the intended pick {pick:?} must be a legal candidate; offered {cards:?}"
++            );
++        }
++        other => panic!("expected ChooseFromZoneChoice, got {other:?}"),
++    }
++    runner
++        .act(GameAction::SelectCards { cards: vec![pick] })
++        .expect("selecting one legal creature must succeed");
++}
++
++/// CR 400.7 + CR 608.2c + CR 110.2a + CR 205.1b: Breach reanimates exactly the
++/// chosen creature from each player's graveyard under the caster's control as a
++/// Phyrexian; every non-chosen card (extra creatures, instants, milled
++/// creatures) stays in its graveyard.
++#[test]
++fn breach_reanimates_only_chosen_cards_under_caster_as_phyrexian() {
++    let mut scenario = GameScenario::new_n_player(2, 3302);
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Each player's library has ten cards so "mills ten cards" fully resolves.
++    // One milled card per player is a CREATURE — the wrong-reanimation tripwire
++    // for the milled-vs-chosen tracked-set bug.
++    for &pid in &[P0, P1] {
++        scenario.with_library_top(
++            pid,
++            &[
++                "Mill 1",
++                "Mill 2",
++                "Mill 3",
++                "Mill 4",
++                "Mill 5",
++                "Mill 6",
++                "Mill 7",
++                "Mill 8",
++                "Mill 9",
++                "Milled Creature",
++            ],
++        );
++    }
++
++    // Pre-seed each graveyard: one creature to CHOOSE, one EXTRA creature that
++    // must stay, and one instant that must stay.
++    let p0_chosen = scenario
++        .add_creature_to_graveyard(P0, "P0 Chosen", 2, 2)
++        .id();
++    let p0_extra = scenario
++        .add_creature_to_graveyard(P0, "P0 Extra", 3, 3)
++        .id();
++    let p0_instant = scenario.add_spell_to_graveyard(P0, "P0 Bolt", true).id();
++
++    let p1_chosen = scenario
++        .add_creature_to_graveyard(P1, "P1 Chosen", 4, 4)
++        .id();
++    let p1_extra = scenario
++        .add_creature_to_graveyard(P1, "P1 Extra", 5, 5)
++        .id();
++    let p1_instant = scenario.add_spell_to_graveyard(P1, "P1 Bolt", true).id();
++
++    // Breach the Multiverse in the caster's (P0) hand, parsed from real Oracle
++    // text. No mana cost is set, so it casts for free.
++    let breach = scenario
++        .add_spell_to_hand_from_oracle(P0, "Breach the Multiverse", false, BREACH_ORACLE)
++        .id();
++
++    let mut runner = scenario.build();
++
++    // The milled creatures land in each graveyard once the mill resolves; mark
++    // them as creatures up front so they are filter-legal candidates that the
++    // chosen-set bug could wrongly reanimate. They are at library index 9 (the
++    // bottom of the seeded top-ten), so capture them by object id now.
++    let p0_milled_creature = *runner
++        .state()
++        .players
++        .iter()
++        .find(|p| p.id == P0)
++        .unwrap()
++        .library
++        .last()
++        .expect("P0 library has cards");
++    let p1_milled_creature = *runner
++        .state()
++        .players
++        .iter()
++        .find(|p| p.id == P1)
++        .unwrap()
++        .library
++        .last()
++        .expect("P1 library has cards");
++    make_creature(&mut runner, p0_milled_creature);
++    make_creature(&mut runner, p1_milled_creature);
++
++    // Cast Breach for free.
++    let card_id = runner.state().objects[&breach].card_id;
++    runner
++        .act(GameAction::CastSpell {
++            object_id: breach,
++            card_id,
++            targets: vec![],
++            payment_mode: CastPaymentMode::Auto,
++        })
++        .expect("casting Breach must be accepted");
++
++    // Resolve: mill ten per player, then the per-player choose loop parks.
++    advance_to_choice_or_empty(&mut runner);
++
++    // The milled creatures must now be in the respective graveyards (proof the
++    // mill ran and that they are choose-filter-legal candidates).
++    assert_eq!(zone_of(&runner, p0_milled_creature), Zone::Graveyard);
++    assert_eq!(zone_of(&runner, p1_milled_creature), Zone::Graveyard);
++
++    // Answer each player's pick (caster chooses). APNAP order from P0 means P0's
++    // graveyard is prompted first, then P1's.
++    answer_pick(&mut runner, P0, p0_chosen);
++    advance_to_choice_or_empty(&mut runner);
++    answer_pick(&mut runner, P0, p1_chosen);
++
++    runner.advance_until_stack_empty();
++
++    // CR 400.7 + CR 110.2a: exactly the two chosen creatures are on the
++    // battlefield under the CASTER's (P0) control.
++    for chosen in [p0_chosen, p1_chosen] {
++        assert_eq!(
++            zone_of(&runner, chosen),
++            Zone::Battlefield,
++            "the chosen creature {chosen:?} must be reanimated"
++        );
++        assert_eq!(
++            controller_of(&runner, chosen),
++            P0,
++            "the reanimated creature {chosen:?} must enter under the caster's control"
++        );
++        // CR 205.1b: every creature the caster controls becomes a Phyrexian.
++        assert!(
++            has_subtype(&runner, chosen, "Phyrexian"),
++            "the reanimated creature {chosen:?} must become a Phyrexian"
++        );
++    }
++
++    // CR 608.2c + CR 603.7: the milled-vs-chosen discriminator. The milled
++    // creatures must NOT have been swept up by "those cards" — they stay in
++    // their graveyards.
++    assert_eq!(
++        zone_of(&runner, p0_milled_creature),
++        Zone::Graveyard,
++        "P0's milled creature must NOT reanimate (it was milled, not chosen)"
++    );
++    assert_eq!(
++        zone_of(&runner, p1_milled_creature),
++        Zone::Graveyard,
++        "P1's milled creature must NOT reanimate (it was milled, not chosen)"
++    );
++
++    // The non-chosen extra creatures and the instants stay in their graveyards.
++    for stay in [p0_extra, p1_extra, p0_instant, p1_instant] {
++        assert_eq!(
++            zone_of(&runner, stay),
++            Zone::Graveyard,
++            "non-chosen card {stay:?} must remain in its graveyard"
++        );
++    }
++    // The instants are not creatures, so they never gain Phyrexian even if they
++    // somehow re-entered — a belt-and-suspenders guard on the filter.
++    assert!(!is_creature(&runner, p0_instant));
++    assert!(!is_creature(&runner, p1_instant));
++
++    // The chain completed with no stall.
++    assert!(
++        runner.state().stack.is_empty(),
++        "Breach's chain must fully resolve"
++    );
++    assert!(
++        !matches!(
++            runner.state().waiting_for,
++            WaitingFor::ChooseFromZoneChoice { .. }
++        ),
++        "no per-player choice should remain pending"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 69dcd6694b..16299ad273 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -216,6 +216,7 @@ mod issue_3127_reveal_otherwise_graveyard;
+ mod issue_3245_abhorrent_oculus_manifest_dread;
+ mod issue_3285_face_down_public_zone;
+ mod issue_3295_scrapwork_mutt_unearth_zone;
++mod issue_3302_breach_multiverse;
+ mod issue_3311_manifest_dread_land;
+ mod issue_3320_peregrine_drake_untap_prompt;
+ mod issue_3321_volcanic_spite_optional;

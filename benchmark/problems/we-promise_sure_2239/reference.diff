@@ -1,0 +1,451 @@
+diff --git a/app/models/recurring_transaction/identifier.rb b/app/models/recurring_transaction/identifier.rb
+index bcb6656d4..9a443df3d 100644
+--- a/app/models/recurring_transaction/identifier.rb
++++ b/app/models/recurring_transaction/identifier.rb
+@@ -72,7 +72,12 @@ def identify_recurring_patterns
+         end
+       end
+ 
+-      # Create or update RecurringTransaction records
++      # Create or update RecurringTransaction records. Load existing rows once
++      # so a busy family does not issue one lookup per detected pattern.
++      existing_recurring_transactions_by_key = family.recurring_transactions
++        .to_a
++        .index_by { |recurring| recurring_transaction_lookup_key(recurring) }
++
+       recurring_patterns.each do |pattern|
+         # Build find conditions based on whether it's merchant-based or name-based
+         find_conditions = {
+@@ -90,12 +95,14 @@ def identify_recurring_patterns
+         end
+ 
+         begin
+-          recurring_transaction = family.recurring_transactions.find_or_initialize_by(find_conditions)
++          lookup_key = recurring_transaction_lookup_key(find_conditions)
++          recurring_transaction = existing_recurring_transactions_by_key[lookup_key] ||
++                                  family.recurring_transactions.build(find_conditions)
+ 
+           # Handle manual recurring transactions specially
+           if recurring_transaction.persisted? && recurring_transaction.manual?
+-            # Update variance for manual recurring transactions
+-            update_manual_recurring_variance(recurring_transaction, pattern)
++            # Manual recurring variance is recalculated once in the batch pass
++            # after automatic pattern updates finish.
+             next
+           end
+ 
+@@ -119,6 +126,7 @@ def identify_recurring_patterns
+           )
+ 
+           recurring_transaction.save!
++          existing_recurring_transactions_by_key[lookup_key] = recurring_transaction
+         rescue ActiveRecord::RecordNotUnique
+           # Race condition: another process created the same record between find and save.
+           # Retry with find to get the existing record and update it.
+@@ -127,7 +135,8 @@ def identify_recurring_patterns
+ 
+           # Skip manual recurring transactions
+           if recurring_transaction.manual?
+-            update_manual_recurring_variance(recurring_transaction, pattern)
++            # Manual recurring variance is recalculated once in the batch pass
++            # after automatic pattern updates finish.
+             next
+           end
+ 
+@@ -153,21 +162,19 @@ def identify_recurring_patterns
+     # both endpoints rather than the single-account name/merchant match
+     # the helper performs. Issue #1590 tracks the proper Cleaner-aware
+     # matching for recurring transfers.
+-    def update_manual_recurring_transactions(since_date)
+-      family.recurring_transactions
+-            .where(manual: true, status: "active", destination_account_id: nil)
+-            .find_each do |recurring|
+-        # Find matching transactions in the recent period
+-        matching_entries = RecurringTransaction.find_matching_transaction_entries(
+-          family: family,
+-          merchant_id: recurring.merchant_id,
+-          name: recurring.name,
+-          currency: recurring.currency,
+-          expected_day: recurring.expected_day_of_month,
+-          lookback_months: 6,
+-          account: recurring.account
+-        )
++    def update_manual_recurring_transactions(_since_date)
++      manual_recurring_transactions = family.recurring_transactions
++        .where(manual: true, status: "active", destination_account_id: nil)
++        .includes(:account)
++        .to_a
++
++      matching_entries_by_recurring_id = matching_entries_by_manual_recurring_id(
++        manual_recurring_transactions,
++        lookback_months: 6
++      )
+ 
++      manual_recurring_transactions.each do |recurring|
++        matching_entries = matching_entries_by_recurring_id.fetch(recurring.id, [])
+         next if matching_entries.empty?
+ 
+         # Extract amounts and dates from all matching entries
+@@ -186,38 +193,69 @@ def update_manual_recurring_transactions(since_date)
+       end
+     end
+ 
+-    # Update variance for a manual recurring transaction when pattern is found
+-    def update_manual_recurring_variance(recurring_transaction, pattern)
+-      # Check if this transaction's date is more recent
+-      if pattern[:last_occurrence_date] > recurring_transaction.last_occurrence_date
+-        # Find all matching transactions to recalculate variance
+-        matching_entries = RecurringTransaction.find_matching_transaction_entries(
+-          family: family,
+-          merchant_id: recurring_transaction.merchant_id,
+-          name: recurring_transaction.name,
+-          currency: recurring_transaction.currency,
+-          expected_day: recurring_transaction.expected_day_of_month,
+-          lookback_months: 6,
+-          account: recurring_transaction.account
+-        )
++    private
++      def recurring_transaction_lookup_key(recurring_or_attributes)
++        # Keep this aligned with the non-transfer recurring transaction unique
++        # indexes. Automatic recurring rows are amount-scoped; variable manual
++        # amounts are tracked separately in expected_amount_*.
++        amount = recurring_or_attributes.respond_to?(:amount) ? recurring_or_attributes.amount : recurring_or_attributes[:amount]
++        currency = recurring_or_attributes.respond_to?(:currency) ? recurring_or_attributes.currency : recurring_or_attributes[:currency]
++        account_id = recurring_or_attributes.respond_to?(:account_id) ? recurring_or_attributes.account_id : recurring_or_attributes[:account_id]
++        merchant_id = recurring_or_attributes.respond_to?(:merchant_id) ? recurring_or_attributes.merchant_id : recurring_or_attributes[:merchant_id]
++        name = recurring_or_attributes.respond_to?(:name) ? recurring_or_attributes.name : recurring_or_attributes[:name]
++
++        identifier_type = merchant_id.present? ? :merchant : :name
++        identifier_value = merchant_id.presence || name
++
++        [ amount, currency, account_id, identifier_type, identifier_value ]
++      end
+ 
+-        # Update if we have any matching transactions
+-        if matching_entries.any?
+-          matching_amounts = matching_entries.map(&:amount)
++      def matching_entries_by_manual_recurring_id(recurring_transactions, lookback_months:)
++        return {} if recurring_transactions.empty?
++
++        lookback_date = lookback_months.months.ago.to_date
++        currencies = recurring_transactions.map(&:currency).uniq
++        account_ids = recurring_transactions.filter_map(&:account_id).uniq
++
++        entries = family.entries
++          .joins("INNER JOIN transactions ON transactions.id = entries.entryable_id AND entries.entryable_type = 'Transaction'")
++          .where(entries: { entryable_type: "Transaction", currency: currencies })
++          .where("entries.date >= ?", lookback_date)
++          .select("entries.*, transactions.merchant_id AS transaction_merchant_id")
++          .order(date: :desc)
++
++        # Legacy manual rows without account_id can match any account in the
++        # family, so only push account filtering into SQL when every row is
++        # account-scoped.
++        if account_ids.any? && recurring_transactions.all? { |recurring| recurring.account_id.present? }
++          entries = entries.where(entries: { account_id: account_ids })
++        end
+ 
+-          recurring_transaction.update!(
+-            expected_amount_min: matching_amounts.min,
+-            expected_amount_max: matching_amounts.max,
+-            expected_amount_avg: matching_amounts.sum / matching_amounts.size,
+-            occurrence_count: matching_amounts.size,
+-            last_occurrence_date: pattern[:last_occurrence_date],
+-            next_expected_date: calculate_next_expected_date(pattern[:last_occurrence_date], recurring_transaction.expected_day_of_month)
+-          )
++        candidate_entries = entries.to_a
++
++        recurring_transactions.to_h do |recurring|
++          [
++            recurring.id,
++            candidate_entries.select { |entry| manual_recurring_matches_entry?(recurring, entry) }
++          ]
++        end
++      end
++
++      def manual_recurring_matches_entry?(recurring, entry)
++        return false unless entry.currency == recurring.currency
++        return false if recurring.account_id.present? && entry.account_id != recurring.account_id
++
++        expected_day = [ recurring.expected_day_of_month, entry.date.end_of_month.day ].min
++        day = entry.date.day
++        return false if circular_distance(day, expected_day) > 2
++
++        if recurring.merchant_id.present?
++          entry.read_attribute("transaction_merchant_id") == recurring.merchant_id
++        else
++          entry.name == recurring.name
+         end
+       end
+-    end
+ 
+-    private
+       # Check if days cluster together (within ~5 days variance)
+       # Uses circular distance to handle month-boundary wrapping (e.g., 28, 29, 30, 31, 1, 2)
+       def days_cluster_together?(days)
+diff --git a/test/models/recurring_transaction/identifier_test.rb b/test/models/recurring_transaction/identifier_test.rb
+index 2b0149886..55268e05a 100644
+--- a/test/models/recurring_transaction/identifier_test.rb
++++ b/test/models/recurring_transaction/identifier_test.rb
+@@ -209,6 +209,225 @@ def setup
+     assert recurring.last_occurrence_date >= 2.months.ago.to_date
+   end
+ 
++  test "identifies name patterns without per-pattern recurring transaction lookups" do
++    account = @family.accounts.first
++    names = Array.new(4) { |index| "Performance Subscription #{index}" }
++
++    names.each_with_index do |name, index|
++      create_name_pattern_entries(
++        account: account,
++        name: name,
++        amount: 40 + index,
++        day: 5
++      )
++    end
++
++    queries = capture_sql_queries do
++      assert_equal names.size, @identifier.identify_recurring_patterns
++    end
++
++    recurring_lookup_queries = queries.grep(
++      /SELECT "recurring_transactions"\.\* FROM "recurring_transactions" WHERE .*"recurring_transactions"\."name" = .*LIMIT/
++    )
++
++    assert_empty recurring_lookup_queries
++    assert_equal names.size, @family.recurring_transactions.where(name: names).count
++  end
++
++  test "keeps automatic recurring lookup amount-scoped" do
++    account = @family.accounts.first
++    name = "Tiered Performance Subscription"
++
++    recurring_transactions = [ 40, 55 ].map do |amount|
++      create_name_pattern_entries(
++        account: account,
++        name: name,
++        amount: amount,
++        day: 5
++      )
++
++      @family.recurring_transactions.create!(
++        account: account,
++        name: name,
++        amount: amount,
++        currency: "USD",
++        expected_day_of_month: 5,
++        last_occurrence_date: 4.months.ago.to_date,
++        next_expected_date: 1.month.from_now.to_date,
++        occurrence_count: 1,
++        status: "active"
++      )
++    end
++
++    queries = nil
++    assert_no_difference -> { @family.recurring_transactions.count } do
++      queries = capture_sql_queries do
++        @identifier.identify_recurring_patterns
++      end
++    end
++
++    recurring_lookup_queries = queries.grep(
++      /SELECT "recurring_transactions"\.\* FROM "recurring_transactions" WHERE .*"recurring_transactions"\."name" = .*LIMIT/
++    )
++
++    assert_empty recurring_lookup_queries
++    recurring_transactions.each do |recurring|
++      assert_equal 3, recurring.reload.occurrence_count
++    end
++  end
++
++  test "updates manual recurring variance without per-recurring entry lookups" do
++    account = @family.accounts.first
++    names = Array.new(4) { |index| "Manual Performance Subscription #{index}" }
++
++    recurring_transactions = names.each_with_index.map do |name, index|
++      create_name_pattern_entries(
++        account: account,
++        name: name,
++        amount: 50 + index,
++        day: 6
++      )
++
++      @family.recurring_transactions.create!(
++        account: account,
++        name: name,
++        amount: 50 + index,
++        currency: "USD",
++        expected_day_of_month: 6,
++        last_occurrence_date: 4.months.ago.to_date,
++        next_expected_date: 1.month.from_now.to_date,
++        occurrence_count: 1,
++        status: "active",
++        manual: true
++      )
++    end
++
++    queries = nil
++    assert_no_difference -> { @family.recurring_transactions.count } do
++      queries = capture_sql_queries do
++        @identifier.identify_recurring_patterns
++      end
++    end
++
++    entry_lookup_queries = queries.grep(
++      /FROM "entries".*AND "entries"\."name" = .*ORDER BY "entries"\."date" DESC/
++    )
++
++    assert_empty entry_lookup_queries
++    recurring_transactions.each do |recurring|
++      assert_equal 3, recurring.reload.occurrence_count
++    end
++  end
++
++  test "updates manual recurring variance across 1 to 31 month boundary" do
++    travel_to Date.new(2026, 6, 7) do
++      account = @family.accounts.first
++      name = "Boundary Performance Subscription"
++      recurring = @family.recurring_transactions.create!(
++        account: account,
++        name: name,
++        amount: 72,
++        currency: "USD",
++        expected_day_of_month: 1,
++        last_occurrence_date: 3.months.ago.to_date,
++        next_expected_date: 1.month.from_now.to_date,
++        occurrence_count: 0,
++        status: "active",
++        manual: true
++      )
++
++      transaction = Transaction.create!(
++        category: categories(:food_and_drink)
++      )
++      account.entries.create!(
++        date: Date.new(2026, 5, 31),
++        amount: 72,
++        currency: "USD",
++        name: name,
++        entryable: transaction
++      )
++
++      assert_no_difference -> { @family.recurring_transactions.count } do
++        @identifier.identify_recurring_patterns
++      end
++
++      recurring.reload
++      assert_equal 1, recurring.occurrence_count
++      assert_equal 72, recurring.expected_amount_min
++      assert_equal Date.new(2026, 5, 31), recurring.last_occurrence_date
++    end
++  end
++
++  test "updates manual recurring variance for expected end of month in February" do
++    account = @family.accounts.first
++
++    travel_to Date.new(2026, 3, 7) do
++      name = "Non Leap Boundary Subscription"
++      recurring = @family.recurring_transactions.create!(
++        account: account,
++        name: name,
++        amount: 82,
++        currency: "USD",
++        expected_day_of_month: 31,
++        last_occurrence_date: 3.months.ago.to_date,
++        next_expected_date: 1.month.from_now.to_date,
++        occurrence_count: 0,
++        status: "active",
++        manual: true
++      )
++
++      transaction = Transaction.create!(
++        category: categories(:food_and_drink)
++      )
++      account.entries.create!(
++        date: Date.new(2026, 2, 28),
++        amount: 82,
++        currency: "USD",
++        name: name,
++        entryable: transaction
++      )
++
++      @identifier.identify_recurring_patterns
++
++      recurring.reload
++      assert_equal 1, recurring.occurrence_count
++      assert_equal Date.new(2026, 2, 28), recurring.last_occurrence_date
++    end
++
++    travel_to Date.new(2024, 3, 7) do
++      name = "Leap Boundary Subscription"
++      recurring = @family.recurring_transactions.create!(
++        account: account,
++        name: name,
++        amount: 92,
++        currency: "USD",
++        expected_day_of_month: 31,
++        last_occurrence_date: 3.months.ago.to_date,
++        next_expected_date: 1.month.from_now.to_date,
++        occurrence_count: 0,
++        status: "active",
++        manual: true
++      )
++
++      transaction = Transaction.create!(
++        category: categories(:food_and_drink)
++      )
++      account.entries.create!(
++        date: Date.new(2024, 2, 29),
++        amount: 92,
++        currency: "USD",
++        name: name,
++        entryable: transaction
++      )
++
++      @identifier.identify_recurring_patterns
++
++      recurring.reload
++      assert_equal 1, recurring.occurrence_count
++      assert_equal Date.new(2024, 2, 29), recurring.last_occurrence_date
++    end
++  end
++
+   test "circular_distance calculates correct distance for days near month boundary" do
+     # Test wrapping: day 31 to day 1 should be distance 1 (31 -> 1 is one day forward)
+     distance = @identifier.send(:circular_distance, 31, 1)
+@@ -246,4 +465,35 @@ def setup
+     days = [ 1, 15, 30 ]
+     assert_not @identifier.send(:days_cluster_together?, days)
+   end
++
++  private
++    def create_name_pattern_entries(account:, name:, amount:, day:)
++      [ 0, 1, 2 ].each do |months_ago|
++        transaction = Transaction.create!(
++          category: categories(:food_and_drink)
++        )
++        account.entries.create!(
++          date: months_ago.months.ago.beginning_of_month + (day - 1).days,
++          amount: amount,
++          currency: "USD",
++          name: name,
++          entryable: transaction
++        )
++      end
++    end
++
++    def capture_sql_queries
++      queries = []
++      callback = lambda do |_name, _started, _finished, _unique_id, payload|
++        next if payload[:name].in?([ "SCHEMA", "TRANSACTION" ])
++
++        queries << payload[:sql].squish
++      end
++
++      ActiveSupport::Notifications.subscribed(callback, "sql.active_record") do
++        yield
++      end
++
++      queries
++    end
+ end

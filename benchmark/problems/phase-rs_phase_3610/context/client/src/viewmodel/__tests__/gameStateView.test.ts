@@ -1,0 +1,334 @@
+import { describe, expect, it } from "vitest";
+
+import type { GameAction, GameObject, GameState, PlayerId } from "../../adapter/types";
+import {
+  getCastableZoneViewerTarget,
+  getOpponentIds,
+  getSeatCount,
+  getWaitingForObjectChoiceIds,
+  isFaceDownExileCardVisibleToViewer,
+  isOneOnOne,
+} from "../gameStateView";
+
+// Test fixtures only populate the fields these helpers actually read.
+// Cast through `unknown` so we don't have to hand-construct the full
+// hundreds-of-fields GameState surface.
+function makeState(seatOrder: PlayerId[], eliminated: PlayerId[] = []): GameState {
+  return {
+    seat_order: seatOrder,
+    eliminated_players: eliminated,
+    players: seatOrder.map((id) => ({ id })),
+  } as unknown as GameState;
+}
+
+describe("getSeatCount", () => {
+  it("returns the seat_order length for a 2-player game", () => {
+    expect(getSeatCount(makeState([0, 1]))).toBe(2);
+  });
+
+  it("returns the seat_order length for a 4-player game", () => {
+    expect(getSeatCount(makeState([0, 1, 2, 3]))).toBe(4);
+  });
+
+  it("stays stable after eliminations (seat_order is not pruned)", () => {
+    expect(getSeatCount(makeState([0, 1, 2, 3], [1, 2]))).toBe(4);
+  });
+
+  it("falls back to players.length when seat_order is absent", () => {
+    const state = { players: [{ id: 0 }, { id: 1 }, { id: 2 }] } as unknown as GameState;
+    expect(getSeatCount(state)).toBe(3);
+  });
+
+  it("returns 0 for a null state", () => {
+    expect(getSeatCount(null)).toBe(0);
+  });
+});
+
+describe("isOneOnOne", () => {
+  // The bug that motivates this helper: GameBoard and OpponentHud derived
+  // "is this 1v1?" from different inputs (live opponents vs. seat count).
+  // In a 4-player Commander game with two eliminations, the derivations
+  // disagreed and the multi-tab rail got crammed into the 1v1 inline-pill
+  // slot. These cases lock the boundary so that can't recur.
+
+  it("is true for a fresh 2-player game", () => {
+    expect(isOneOnOne(makeState([0, 1]))).toBe(true);
+  });
+
+  it("is false for a fresh 4-player game", () => {
+    expect(isOneOnOne(makeState([0, 1, 2, 3]))).toBe(false);
+  });
+
+  it("stays false for a 4-player game with 1 live opponent (regression case)", () => {
+    // Player 0's perspective: opponents 1 and 2 eliminated, only 3 alive.
+    expect(isOneOnOne(makeState([0, 1, 2, 3], [1, 2]))).toBe(false);
+  });
+
+  it("stays false for a 4-player game with all opponents eliminated", () => {
+    expect(isOneOnOne(makeState([0, 1, 2, 3], [1, 2, 3]))).toBe(false);
+  });
+
+  it("stays true for a 2-player game with the opponent eliminated", () => {
+    // GameOver mounts on the same state — the helper just needs to not
+    // flip layouts on the way there.
+    expect(isOneOnOne(makeState([0, 1], [1]))).toBe(true);
+  });
+
+  it("returns false for a null state", () => {
+    expect(isOneOnOne(null)).toBe(false);
+  });
+});
+
+describe("getWaitingForObjectChoiceIds", () => {
+  it("returns valid_tokens for PopulateChoice", () => {
+    expect(
+      getWaitingForObjectChoiceIds({
+        type: "PopulateChoice",
+        data: { player: 0, source_id: 1, valid_tokens: [10, 11] },
+      }),
+    ).toEqual([10, 11]);
+  });
+
+  // PairChoice is modal-resolved (PairChoiceModal dispatches ChoosePair), so it
+  // must NOT seed board-clickable object glow. The engine rejects ChooseTarget
+  // for PairChoice, so a board click would dead-end. Mirrors CrewVehicle /
+  // StationTarget / SaddleMount, which are likewise absent here.
+  it("returns [] for PairChoice (modal-only, not board-clickable)", () => {
+    expect(
+      getWaitingForObjectChoiceIds({
+        type: "PairChoice",
+        data: { player: 0, source_id: 1, choices: [20, 21, 22] },
+      }),
+    ).toEqual([]);
+  });
+});
+
+describe("getCastableZoneViewerTarget", () => {
+  const castAction: GameAction = {
+    type: "CastSpell",
+    data: { object_id: 7, card_id: 700, targets: [] },
+  };
+  const activateAction: GameAction = {
+    type: "ActivateAbility",
+    data: { source_id: 7, ability_index: 0 },
+  };
+
+  function makeGraveyardObject(id: number): GameObject {
+    return {
+      id,
+      card_id: 700 + id,
+      owner: 0,
+      controller: 0,
+      zone: "Graveyard",
+      tapped: false,
+      face_down: false,
+      flipped: false,
+      transformed: false,
+      damage_marked: 0,
+      dealt_deathtouch_damage: false,
+      attached_to: null,
+      attachments: [],
+      counters: {},
+      name: `Spell ${id}`,
+      power: null,
+      toughness: null,
+      loyalty: null,
+      card_types: { supertypes: [], core_types: ["Instant"], subtypes: [] },
+      mana_cost: { type: "Cost", shards: ["Red"], generic: 0 },
+      keywords: ["Retrace"],
+      abilities: [],
+      trigger_definitions: [],
+      replacement_definitions: [],
+      static_definitions: [],
+      color: ["Red"],
+      base_power: null,
+      base_toughness: null,
+      base_keywords: ["Retrace"],
+      base_color: ["Red"],
+      timestamp: 1,
+      entered_battlefield_turn: null,
+    } as GameObject;
+  }
+
+  it("returns the graveyard pile when Priority surfaces cast actions there", () => {
+    const objects = {
+      7: makeGraveyardObject(7),
+      8: makeGraveyardObject(8),
+    };
+    expect(
+      getCastableZoneViewerTarget(
+        { type: "Priority", data: { player: 0 } },
+        objects,
+        {
+          "7": [castAction],
+          "8": [{ ...castAction, data: { ...castAction.data, object_id: 8 } }],
+        },
+      ),
+    ).toEqual({ zone: "graveyard", playerId: 0, objectIds: [7, 8] });
+  });
+
+  it("returns stable object ids for castable pile identity", () => {
+    const objects = {
+      7: makeGraveyardObject(7),
+      8: makeGraveyardObject(8),
+    };
+    expect(
+      getCastableZoneViewerTarget(
+        { type: "Priority", data: { player: 0 } },
+        objects,
+        {
+          "8": [{ ...castAction, data: { ...castAction.data, object_id: 8 } }],
+          "7": [castAction],
+        },
+      )?.objectIds,
+    ).toEqual([7, 8]);
+  });
+
+  it("returns null when castable cards span multiple zone piles", () => {
+    const objects = {
+      7: makeGraveyardObject(7),
+      9: { ...makeGraveyardObject(9), zone: "Exile" as const, owner: 0 },
+    };
+    expect(
+      getCastableZoneViewerTarget(
+        { type: "Priority", data: { player: 0 } },
+        objects,
+        {
+          "7": [castAction],
+          "9": [{ ...castAction, data: { ...castAction.data, object_id: 9 } }],
+        },
+      ),
+    ).toBeNull();
+  });
+
+  it("returns null outside Priority", () => {
+    const objects = { 7: makeGraveyardObject(7) };
+    expect(
+      getCastableZoneViewerTarget(
+        { type: "CastingVariantChoice", data: { player: 0, object_id: 7, card_id: 700, options: [] } },
+        objects,
+        { "7": [castAction] },
+      ),
+    ).toBeNull();
+  });
+
+  it("ignores graveyard objects without play or cast actions", () => {
+    const objects = { 7: makeGraveyardObject(7) };
+    expect(
+      getCastableZoneViewerTarget(
+        { type: "Priority", data: { player: 0 } },
+        objects,
+        { "7": [activateAction] },
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("getOpponentIds", () => {
+  it("excludes the perspective player and eliminated players", () => {
+    expect(getOpponentIds(makeState([0, 1, 2, 3], [2]), 0)).toEqual([1, 3]);
+  });
+
+  it("returns an empty array in a 2-player game with the opponent eliminated", () => {
+    // This is the regression edge case the 1v1 branch in GameBoard now
+    // guards against — `opponents[0]` is undefined here, and the layout
+    // must not index `gameState.players[undefined]`.
+    expect(getOpponentIds(makeState([0, 1], [1]), 0)).toEqual([]);
+  });
+});
+
+// Issue #2889: single-player renders the raw, unredacted state, so a
+// Hideaway/Foretell face-down exile's real `name`/`printed_ref` sit on the
+// object regardless of viewer. This helper is the client-side half of the
+// engine's `hidden_facedown_exile_ids` look-permission gate
+// (crates/engine/src/game/visibility.rs, CR 406.3 + CR 702.75a + CR 702.143e).
+describe("isFaceDownExileCardVisibleToViewer", () => {
+  function faceDownObject(overrides: Partial<GameObject> = {}): GameObject {
+    return {
+      id: 2,
+      card_id: 200,
+      owner: 1,
+      controller: 1,
+      zone: "Exile",
+      tapped: false,
+      face_down: true,
+      flipped: false,
+      transformed: false,
+      damage_marked: 0,
+      dealt_deathtouch_damage: false,
+      attached_to: null,
+      attachments: [],
+      counters: {},
+      name: "Ghalta, Primal Hunter",
+      power: null,
+      toughness: null,
+      loyalty: null,
+      card_types: { supertypes: [], core_types: ["Creature"], subtypes: [] },
+      mana_cost: { type: "Cost", shards: [], generic: 0 },
+      keywords: [],
+      abilities: [],
+      trigger_definitions: [],
+      replacement_definitions: [],
+      static_definitions: [],
+      color: [],
+      base_power: null,
+      base_toughness: null,
+      base_keywords: [],
+      base_color: [],
+      timestamp: 1,
+      entered_battlefield_turn: null,
+      ...overrides,
+    };
+  }
+
+  function stateWithSourceAndExiled(
+    source: GameObject,
+    exiled: GameObject,
+    kind: string,
+  ): GameState {
+    return {
+      objects: { [source.id]: source, [exiled.id]: exiled },
+      exile_links: [{ exiled_id: exiled.id, source_id: source.id, kind }],
+    } as unknown as GameState;
+  }
+
+  it("is false for a card that isn't face down", () => {
+    const obj = faceDownObject({ face_down: false });
+    expect(isFaceDownExileCardVisibleToViewer({ objects: {} } as GameState, obj, 1)).toBe(false);
+  });
+
+  it("is true for the controller of the Hideaway permanent that exiled it", () => {
+    const source: GameObject = { ...faceDownObject(), id: 1, zone: "Battlefield", face_down: false };
+    const exiled = faceDownObject();
+    const state = stateWithSourceAndExiled(source, exiled, "HideawayLookable");
+    expect(isFaceDownExileCardVisibleToViewer(state, exiled, 1)).toBe(true);
+  });
+
+  it("is false for an opponent of the Hideaway permanent's controller", () => {
+    const source: GameObject = { ...faceDownObject(), id: 1, zone: "Battlefield", face_down: false };
+    const exiled = faceDownObject();
+    const state = stateWithSourceAndExiled(source, exiled, "HideawayLookable");
+    expect(isFaceDownExileCardVisibleToViewer(state, exiled, 0)).toBe(false);
+  });
+
+  it("is false for a plain TrackedBySource link even for the source's controller", () => {
+    // Bomat Courier ("(You can't look at it.)") tracks its face-down exile by
+    // source for later retrieval but grants no look-permission.
+    const source: GameObject = { ...faceDownObject(), id: 1, zone: "Battlefield", face_down: false };
+    const exiled = faceDownObject();
+    const state = stateWithSourceAndExiled(source, exiled, "TrackedBySource");
+    expect(isFaceDownExileCardVisibleToViewer(state, exiled, 1)).toBe(false);
+  });
+
+  it("is true for the owner of a foretold card", () => {
+    const exiled = faceDownObject({ owner: 0, controller: 0, foretold: true });
+    const state = { objects: { [exiled.id]: exiled }, exile_links: [] } as unknown as GameState;
+    expect(isFaceDownExileCardVisibleToViewer(state, exiled, 0)).toBe(true);
+  });
+
+  it("is false for an opponent of a foretold card's owner", () => {
+    const exiled = faceDownObject({ owner: 0, controller: 0, foretold: true });
+    const state = { objects: { [exiled.id]: exiled }, exile_links: [] } as unknown as GameState;
+    expect(isFaceDownExileCardVisibleToViewer(state, exiled, 1)).toBe(false);
+  });
+});

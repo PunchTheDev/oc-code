@@ -1,0 +1,2012 @@
+diff --git a/crates/engine/src/ai_support/candidates.rs b/crates/engine/src/ai_support/candidates.rs
+index baf96f741b..ea39a85a23 100644
+--- a/crates/engine/src/ai_support/candidates.rs
++++ b/crates/engine/src/ai_support/candidates.rs
+@@ -4937,6 +4937,7 @@ mod tests {
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+ 
+         let actions = candidate_actions_broad(&state);
+diff --git a/crates/engine/src/game/cost_payability.rs b/crates/engine/src/game/cost_payability.rs
+index bb7e123e4e..d852df4cbf 100644
+--- a/crates/engine/src/game/cost_payability.rs
++++ b/crates/engine/src/game/cost_payability.rs
+@@ -54,7 +54,8 @@ pub(crate) fn target_filter_has_pitch_bound_x(filter: &TargetFilter) -> bool {
+         TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
+             target_filter_has_pitch_bound_x(filter)
+         }
+-        TargetFilter::None
++        TargetFilter::ExiledCardByIndex { .. }
++        | TargetFilter::None
+         | TargetFilter::Any
+         | TargetFilter::Player
+         | TargetFilter::Controller
+@@ -104,6 +105,7 @@ pub(crate) fn relax_pitch_bound_x_filter(filter: &TargetFilter) -> TargetFilter
+                 .collect(),
+             ..tf.clone()
+         }),
++        TargetFilter::ExiledCardByIndex { .. } => filter.clone(),
+         TargetFilter::Or { filters } => TargetFilter::Or {
+             filters: filters.iter().map(relax_pitch_bound_x_filter).collect(),
+         },
+diff --git a/crates/engine/src/game/costs.rs b/crates/engine/src/game/costs.rs
+index 2e4b48c5ab..96f0eacad4 100644
+--- a/crates/engine/src/game/costs.rs
++++ b/crates/engine/src/game/costs.rs
+@@ -42,7 +42,9 @@
+ 
+ use std::collections::HashSet;
+ 
+-use crate::types::ability::{AbilityCost, EffectKind, TargetFilter, REMOVE_COUNTER_COST_ALL};
++use crate::types::ability::{
++    AbilityCost, EffectKind, TargetFilter, TypedFilter, REMOVE_COUNTER_COST_ALL,
++};
+ use crate::types::events::GameEvent;
+ use crate::types::game_state::{GameState, WaitingFor};
+ use crate::types::identifiers::ObjectId;
+@@ -56,11 +58,104 @@ use super::casting::{
+     pay_effect_mana_cost,
+ };
+ use super::engine::EngineError;
++use super::filter::FilterContext;
+ use super::life_costs::can_pay_life_cost;
+ use super::quantity::{resolve_quantity, resolve_quantity_with_targets};
+ use super::speed::{effective_speed, set_speed};
+ use crate::types::ability::ResolvedAbility;
+ 
++/// Helper to find eligible cards for exile cost payment at resolution.
++/// Returns cards in the specified zone matching the filter, excluding the source.
++fn find_eligible_exile_targets(
++    state: &GameState,
++    player: PlayerId,
++    source_id: ObjectId,
++    zone: Zone,
++    filter: Option<&TargetFilter>,
++) -> Vec<ObjectId> {
++    let ctx = FilterContext::from_source(state, source_id);
++    let player_state = state.players.get(player.0 as usize);
++
++    match zone {
++        Zone::Graveyard => {
++            // CR 406.6: Check if the filter is controller-scoped. When the filter
++            // has controller: None (unrestricted "graveyards"), scan all players'
++            // graveyards. When controller: Some(ControllerRef::You) ("your graveyard"),
++            // scan only the payer's graveyard.
++            let is_unrestricted = filter.is_none_or(|f| {
++                matches!(
++                    f,
++                    TargetFilter::Typed(TypedFilter {
++                        controller: None,
++                        ..
++                    })
++                )
++            });
++
++            if is_unrestricted {
++                // Scan all players' graveyards
++                state
++                    .players
++                    .iter()
++                    .flat_map(|p| p.graveyard.iter().copied())
++                    .filter(|&id| {
++                        id != source_id
++                            && filter.is_none_or(|f| {
++                                super::filter::matches_target_filter(state, id, f, &ctx)
++                            })
++                    })
++                    .collect()
++            } else {
++                // Scan only the payer's graveyard (controller-scoped)
++                player_state
++                    .map(|p| {
++                        p.graveyard
++                            .iter()
++                            .copied()
++                            .filter(|&id| {
++                                id != source_id
++                                    && filter.is_none_or(|f| {
++                                        super::filter::matches_target_filter(state, id, f, &ctx)
++                                    })
++                            })
++                            .collect()
++                    })
++                    .unwrap_or_default()
++            }
++        }
++        Zone::Hand => player_state
++            .map(|p| {
++                p.hand
++                    .iter()
++                    .copied()
++                    .filter(|&id| {
++                        id != source_id
++                            && filter.is_none_or(|f| {
++                                super::filter::matches_target_filter(state, id, f, &ctx)
++                            })
++                    })
++                    .collect()
++            })
++            .unwrap_or_default(),
++        Zone::Battlefield => state
++            .battlefield
++            .iter()
++            .copied()
++            .filter(|&id| {
++                state
++                    .objects
++                    .get(&id)
++                    .map(|obj| obj.controller == player)
++                    .unwrap_or(false)
++                    && id != source_id
++                    && filter
++                        .is_none_or(|f| super::filter::matches_target_filter(state, id, f, &ctx))
++            })
++            .collect(),
++        _ => Vec::new(),
++    }
++}
++
+ /// Selects the payment regime for `pay_ability_cost_inner`. The two variants
+ /// capture the only CR-confirmed differences between activation-time and
+ /// resolution-time payment (unification plan §2):
+@@ -535,6 +630,71 @@ fn pay_ability_cost_inner(
+             }
+             super::zones::move_to_zone(state, source_id, Zone::Exile, events);
+         }
++        // CR 406.6: Non-self exile cost at resolution time (e.g., The Mimeoplasm's
++        // "exile two creature cards from graveyards"). The interactive choice is
++        // surfaced via WaitingFor::EffectZoneChoice with is_cost_payment: true.
++        AbilityCost::Exile {
++            count,
++            zone,
++            filter,
++        } if !matches!(filter, Some(TargetFilter::SelfRef))
++            && matches!(scope, PaymentScope::Resolution { .. }) =>
++        {
++            let count = *count as usize;
++            let effective_zone = zone.unwrap_or(Zone::Graveyard);
++            let eligible = find_eligible_exile_targets(
++                state,
++                player,
++                source_id,
++                effective_zone,
++                filter.as_ref(),
++            );
++            if eligible.len() < count {
++                return Ok(payment_failed("not enough cards to exile"));
++            }
++            if count == 0 {
++                // CR 118.12: record the (zero) paid count for downstream chain
++                // steps that read `QuantityRef::EventContextAmount`.
++                state.last_effect_count = Some(0);
++                return Ok(PaymentOutcome::Paid);
++            }
++            // Forced-choice fast path: when the eligible set exactly
++            // fills the requirement there is no choice to surface, so the
++            // exile executes immediately.
++            if eligible.len() == count {
++                for card_id in eligible {
++                    super::zones::move_to_zone(state, card_id, Zone::Exile, events);
++                    super::exile_links::push_exiled_with_source_this_turn(
++                        state, card_id, source_id,
++                    );
++                }
++                state.last_effect_count = Some(count as i32);
++            } else {
++                state.waiting_for = WaitingFor::EffectZoneChoice {
++                    player,
++                    cards: eligible,
++                    count,
++                    min_count: 0,
++                    up_to: false,
++                    source_id,
++                    effect_kind: crate::types::ability::EffectKind::PayCost,
++                    zone: effective_zone,
++                    destination: Some(Zone::Exile),
++                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
++                    enter_transformed: false,
++                    enters_under_player: None,
++                    enters_attacking: false,
++                    owner_library: false,
++                    track_exiled_by_source: true,
++                    face_down_profile: None,
++                    count_param: 0,
++                    is_cost_payment: true,
++                };
++                return Ok(PaymentOutcome::Paused {
++                    remaining_cost: None,
++                });
++            }
++        }
+         // CR 702.167a: Craft's materials are exiled by the interactive
+         // `WaitingFor::PayCost { kind: ExileMaterials }` detour before this
+         // resume runs, so this arm is an idempotent no-op (mirrors the non-self
+@@ -950,6 +1110,10 @@ fn supported_at_resolution(cost: &AbilityCost) -> bool {
+             self_scope: DiscardSelfScope::FromHand,
+             ..
+         } => true,
++        // CR 406.6: Non-self exile cost at resolution time (e.g., The Mimeoplasm's
++        // "exile two creature cards from graveyards"). The interactive choice is
++        // surfaced via WaitingFor::PayCost before this resume runs.
++        AbilityCost::Exile { filter, .. } if !matches!(filter, Some(TargetFilter::SelfRef)) => true,
+         AbilityCost::Discard { .. }
+         | AbilityCost::Tap
+         | AbilityCost::Untap
+@@ -1041,6 +1205,26 @@ fn can_pay_resolution(
+                 find_eligible_discard_targets(state, payer, ability.source_id, filter.as_ref());
+             eligible.len() >= count
+         }
++        // CR 406.6: Non-self exile cost at resolution time (e.g., The Mimeoplasm's
++        // "exile two creature cards from graveyards"). The interactive choice is
++        // surfaced via WaitingFor::EffectZoneChoice.
++        AbilityCost::Exile {
++            count,
++            zone,
++            filter,
++            ..
++        } if !matches!(filter, Some(TargetFilter::SelfRef)) => {
++            let count = *count as usize;
++            let effective_zone = zone.unwrap_or(Zone::Graveyard);
++            let eligible = find_eligible_exile_targets(
++                state,
++                payer,
++                ability.source_id,
++                effective_zone,
++                filter.as_ref(),
++            );
++            eligible.len() >= count
++        }
+         // CR 117 + CR 118.3: Composite is payable iff every sub-cost is payable.
+         AbilityCost::Composite { costs } => costs
+             .iter()
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index f90d3dabf5..d5d4467963 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -394,6 +394,7 @@ fn fmt_target(filter: &TargetFilter) -> String {
+         TargetFilter::ScopedPlayer => "scoped player".into(),
+         TargetFilter::SelfRef => "self".into(),
+         TargetFilter::SourceOrPaired => "source or paired creature".into(),
++        TargetFilter::ExiledCardByIndex { index } => format!("exiled card {index}"),
+         TargetFilter::StackAbility { tag: Some(tag), .. } => format!("{tag:?} ability on stack"),
+         TargetFilter::StackAbility {
+             controller: None,
+@@ -1162,6 +1163,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
+             },
+         },
+         QuantityRef::CardsExiledBySource => "cards exiled with source".into(),
++        QuantityRef::ExiledCardPower { index } => format!("power of exiled card {index}"),
+         QuantityRef::ZoneCardCount {
+             zone,
+             card_types,
+@@ -5686,6 +5688,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
+         QuantityRef::Devotion { .. } => ("Devotion", Handled),
+         QuantityRef::DistinctCardTypes { .. } => ("DistinctCardTypes", Handled),
+         QuantityRef::CardsExiledBySource => ("CardsExiledBySource", Handled),
++        QuantityRef::ExiledCardPower { .. } => ("ExiledCardPower", Handled),
+         QuantityRef::ZoneCardCount { .. } => ("ZoneCardCount", Handled),
+         QuantityRef::BasicLandTypeCount { .. } => ("BasicLandTypeCount", Handled),
+         QuantityRef::DistinctColorsAmongPermanents { .. } => {
+diff --git a/crates/engine/src/game/effects/blight.rs b/crates/engine/src/game/effects/blight.rs
+index a5b8601a9f..de5cebef99 100644
+--- a/crates/engine/src/game/effects/blight.rs
++++ b/crates/engine/src/game/effects/blight.rs
+@@ -76,6 +76,7 @@ pub fn resolve(
+         // CR 708.2a: Blight places -1/-1 counters; no face-down entry.
+         face_down_profile: None,
+         count_param: count,
++        is_cost_payment: false,
+     };
+ 
+     Ok(())
+diff --git a/crates/engine/src/game/effects/bounce.rs b/crates/engine/src/game/effects/bounce.rs
+index 6a0c5b0c0c..5f595cb5cc 100644
+--- a/crates/engine/src/game/effects/bounce.rs
++++ b/crates/engine/src/game/effects/bounce.rs
+@@ -233,6 +233,7 @@ pub fn resolve(
+                     // CR 708.2a: bounce returns cards face up; no face-down entry.
+                     face_down_profile: None,
+                     count_param: 0,
++                    is_cost_payment: false,
+                 };
+                 return Ok(());
+             }
+@@ -321,6 +322,7 @@ pub fn resolve(
+                     // CR 708.2a: bounce returns cards face up; no face-down entry.
+                     face_down_profile: None,
+                     count_param: 0,
++                    is_cost_payment: false,
+                 };
+                 return Ok(());
+             }
+@@ -492,6 +494,7 @@ pub fn resolve_all(
+                 // CR 708.2a: bounce returns cards face up; no face-down entry.
+                 face_down_profile: None,
+                 count_param: 0,
++                is_cost_payment: false,
+             };
+             return Ok(());
+         }
+diff --git a/crates/engine/src/game/effects/cast_from_zone.rs b/crates/engine/src/game/effects/cast_from_zone.rs
+index 799de4b31f..77179efce9 100644
+--- a/crates/engine/src/game/effects/cast_from_zone.rs
++++ b/crates/engine/src/game/effects/cast_from_zone.rs
+@@ -63,6 +63,7 @@ fn open_private_zone_cast_selection(
+         // CR 708.2a: cast-from-zone selection is not a face-down entry.
+         face_down_profile: None,
+         count_param: 0,
++        is_cost_payment: false,
+     };
+     Ok(())
+ }
+diff --git a/crates/engine/src/game/effects/change_zone.rs b/crates/engine/src/game/effects/change_zone.rs
+index 696f7571c7..ffbd57dd19 100644
+--- a/crates/engine/src/game/effects/change_zone.rs
++++ b/crates/engine/src/game/effects/change_zone.rs
+@@ -551,6 +551,7 @@ pub fn resolve(
+             // resolves the choice.
+             face_down_profile: face_down_profile.clone(),
+             count_param: 0,
++            is_cost_payment: false,
+         };
+         // EffectResolved is emitted by the EffectZoneChoice handler after the player chooses
+         // (matching the DiscardChoice pattern — single authority for the event).
+@@ -6517,6 +6518,7 @@ mod tests {
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+ 
+         let _ = apply_as_current(
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index 24a71b7284..e1ce6b79c6 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -7580,6 +7580,7 @@ mod tests {
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+ 
+         crate::game::engine::apply(
+@@ -11721,6 +11722,7 @@ mod tests {
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+         state.pending_continuation =
+             Some(PendingContinuation::new(Box::new(ResolvedAbility::new(
+@@ -11757,6 +11759,7 @@ mod tests {
+                 track_exiled_by_source: false,
+                 face_down_profile: None,
+                 count_param: 0,
++                is_cost_payment: false,
+             },
+             GameAction::SelectCards {
+                 cards: vec![second],
+diff --git a/crates/engine/src/game/effects/put_on_top.rs b/crates/engine/src/game/effects/put_on_top.rs
+index 9c1926decf..04b651bf0f 100644
+--- a/crates/engine/src/game/effects/put_on_top.rs
++++ b/crates/engine/src/game/effects/put_on_top.rs
+@@ -114,6 +114,7 @@ pub fn resolve(
+                     // CR 708.2a: library-position selection is not a face-down entry.
+                     face_down_profile: None,
+                     count_param: 0,
++                    is_cost_payment: false,
+                 };
+                 return Ok(());
+             }
+diff --git a/crates/engine/src/game/effects/sacrifice.rs b/crates/engine/src/game/effects/sacrifice.rs
+index 56535cba58..aba9db9fc2 100644
+--- a/crates/engine/src/game/effects/sacrifice.rs
++++ b/crates/engine/src/game/effects/sacrifice.rs
+@@ -311,6 +311,7 @@ pub fn resolve(
+             // CR 708.2a: sacrifice selection is not a face-down entry.
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+ 
+         // EffectResolved is emitted by the EffectZoneChoice handler after the player chooses
+diff --git a/crates/engine/src/game/effects/tap_untap.rs b/crates/engine/src/game/effects/tap_untap.rs
+index df5cafdd4e..cc660da8f5 100644
+--- a/crates/engine/src/game/effects/tap_untap.rs
++++ b/crates/engine/src/game/effects/tap_untap.rs
+@@ -249,6 +249,7 @@ fn prompt_resolution_tap_untap_choice(
+         // CR 708.2a: tap/untap selection is not a face-down entry.
+         face_down_profile: None,
+         count_param: 0,
++        is_cost_payment: false,
+     };
+     true
+ }
+diff --git a/crates/engine/src/game/engine.rs b/crates/engine/src/game/engine.rs
+index c9f440b7c1..783b5c9087 100644
+--- a/crates/engine/src/game/engine.rs
++++ b/crates/engine/src/game/engine.rs
+@@ -17902,6 +17902,7 @@ Echo—Discard a card. (At the beginning of your upkeep, if this came under your
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+         state.pending_continuation = Some(crate::types::game_state::PendingContinuation::new(
+             Box::new(ResolvedAbility::new(
+@@ -17971,6 +17972,7 @@ Echo—Discard a card. (At the beginning of your upkeep, if this came under your
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+ 
+         let result = apply_as_current(
+@@ -18016,6 +18018,7 @@ Echo—Discard a card. (At the beginning of your upkeep, if this came under your
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+ 
+         let result = apply_as_current(&mut state, GameAction::SelectCards { cards: vec![] });
+diff --git a/crates/engine/src/game/engine_replacement.rs b/crates/engine/src/game/engine_replacement.rs
+index b8f191b442..c44557839e 100644
+--- a/crates/engine/src/game/engine_replacement.rs
++++ b/crates/engine/src/game/engine_replacement.rs
+@@ -914,12 +914,28 @@ pub(super) fn apply_post_replacement_effect(
+         if valid_targets.is_empty() {
+             return None;
+         }
+-        return Some(WaitingFor::CopyTargetChoice {
+-            player: controller,
+-            source_id,
+-            valid_targets,
+-            max_mana_value,
+-        });
++        // CR 607.2a: For ExiledCardByIndex (The Mimeoplasm), the target is already
++        // determined by the index - no choice prompt needed. Directly resolve the copy.
++        if matches!(target, TargetFilter::ExiledCardByIndex { .. }) {
++            let targets = valid_targets
++                .into_iter()
++                .map(TargetRef::Object)
++                .collect::<Vec<_>>();
++            let resolved =
++                build_resolved_from_def_with_targets(real_work, source_id, controller, targets);
++            let _ = effects::resolve_ability_chain(state, &resolved, events, 0);
++            return match &state.waiting_for {
++                WaitingFor::Priority { .. } => None,
++                wf => Some(wf.clone()),
++            };
++        } else {
++            return Some(WaitingFor::CopyTargetChoice {
++                player: controller,
++                source_id,
++                valid_targets,
++                max_mana_value,
++            });
++        }
+     }
+ 
+     // CR 614.1c: The injected `Object(source)` target is the source-as-SelfRef
+@@ -1299,6 +1315,25 @@ fn find_copy_targets(
+     controller: PlayerId,
+     max_mana_value: Option<u32>,
+ ) -> Vec<ObjectId> {
++    // CR 607.2a: Special handling for ExiledCardByIndex (The Mimeoplasm).
++    // This filter resolves to a specific card exiled by the source, indexed by order.
++    // We resolve it directly rather than scanning a zone.
++    if let TargetFilter::ExiledCardByIndex { index } = filter {
++        let exiled_cards = state.cards_exiled_with_source_this_turn.get(&source_id);
++        if let Some(&card_id) = exiled_cards.and_then(|cards| cards.get(*index as usize)) {
++            // Check mana value constraint if present
++            if let Some(max) = max_mana_value {
++                if let Some(obj) = state.objects.get(&card_id) {
++                    if obj.mana_cost.mana_value() > max {
++                        return vec![];
++                    }
++                }
++            }
++            return vec![card_id];
++        }
++        return vec![];
++    }
++
+     // CR 400.1 + CR 707.9: Clone replacements default to scanning the battlefield,
+     // but extensions like Superior Spider-Man's Mind Swap (CR 707.9b) copy a card
+     // from any graveyard. The filter carries the source zone via `FilterProp::InZone`;
+diff --git a/crates/engine/src/game/engine_resolution_choices.rs b/crates/engine/src/game/engine_resolution_choices.rs
+index 3515751726..6cdac65729 100644
+--- a/crates/engine/src/game/engine_resolution_choices.rs
++++ b/crates/engine/src/game/engine_resolution_choices.rs
+@@ -2441,6 +2441,7 @@ pub(super) fn handle_resolution_choice(
+                 track_exiled_by_source,
+                 face_down_profile,
+                 count_param,
++                is_cost_payment,
+             },
+             GameAction::SelectCards { cards: chosen },
+         ) => {
+@@ -2594,7 +2595,16 @@ pub(super) fn handle_resolution_choice(
+                         match effects::change_zone::process_one_zone_move(
+                             state, &ctx, *card_id, events,
+                         ) {
+-                            effects::change_zone::ZoneMoveResult::Done => {}
++                            effects::change_zone::ZoneMoveResult::Done => {
++                                // CR 118.3: When this is a cost-payment exile (e.g., Mimeoplasm),
++                                // populate the exile-link index map so the continuation can
++                                // reference exiled cards by position (ExiledCardByIndex, ExiledCardPower).
++                                if is_cost_payment && dest_zone == Zone::Exile {
++                                    super::exile_links::push_exiled_with_source_this_turn(
++                                        state, *card_id, source_id,
++                                    );
++                                }
++                            }
+                             effects::change_zone::ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                                 state.pending_change_zone_iteration =
+                                     Some(crate::types::game_state::PendingChangeZoneIteration {
+@@ -2789,6 +2799,129 @@ pub(super) fn handle_resolution_choice(
+                         ));
+                     }
+                 }
++                // CR 118.3: Cost-payment exile (e.g., Mimeoplasm) uses the same
++                // zone-move logic as ChangeZone, but with is_cost_payment always true.
++                EffectKind::PayCost => {
++                    let dest_zone = destination.ok_or_else(|| {
++                        EngineError::InvalidAction(
++                            "EffectZoneChoice missing destination for cost payment".to_string(),
++                        )
++                    })?;
++                    let ctx = effects::change_zone::ChangeZoneIterationCtx {
++                        source_id,
++                        controller: player,
++                        origin: Some(zone),
++                        destination: dest_zone,
++                        enter_transformed,
++                        enter_tapped,
++                        enters_under_player,
++                        enters_attacking,
++                        enter_with_counters: vec![],
++                        duration: None,
++                        track_exiled_by_source,
++                        face_down_profile: face_down_profile.clone(),
++                        library_placement: None,
++                    };
++                    let events_before_effect = events.len();
++                    let chosen_ids: Vec<_> = chosen.to_vec();
++                    for (i, card_id) in chosen_ids.iter().enumerate() {
++                        match effects::change_zone::process_one_zone_move(
++                            state, &ctx, *card_id, events,
++                        ) {
++                            effects::change_zone::ZoneMoveResult::Done => {
++                                // CR 118.3: Populate the exile-link index map for cost-payment exile
++                                if dest_zone == Zone::Exile {
++                                    super::exile_links::push_exiled_with_source_this_turn(
++                                        state, *card_id, source_id,
++                                    );
++                                }
++                            }
++                            effects::change_zone::ZoneMoveResult::NeedsAuraAttachmentChoice => {
++                                state.pending_change_zone_iteration =
++                                    Some(crate::types::game_state::PendingChangeZoneIteration {
++                                        remaining: chosen_ids[i + 1..].to_vec(),
++                                        source_id: ctx.source_id,
++                                        controller: ctx.controller,
++                                        origin: ctx.origin,
++                                        destination: ctx.destination,
++                                        enter_transformed: ctx.enter_transformed,
++                                        enter_tapped: ctx.enter_tapped,
++                                        enters_under_player: ctx.enters_under_player,
++                                        enters_attacking: ctx.enters_attacking,
++                                        enter_with_counters: ctx.enter_with_counters.clone(),
++                                        duration: ctx.duration.clone(),
++                                        track_exiled_by_source: ctx.track_exiled_by_source,
++                                        moved_count: None,
++                                        face_down_profile: ctx.face_down_profile.clone(),
++                                        library_placement: ctx.library_placement.clone(),
++                                        effect_kind,
++                                    });
++                                state.waiting_for =
++                                    super::replacement::replacement_choice_waiting_for(
++                                        player, state,
++                                    );
++                                return Ok(action_result_outcome(
++                                    events,
++                                    state.waiting_for.clone(),
++                                ));
++                            }
++                            effects::change_zone::ZoneMoveResult::NeedsChoice(choice_player) => {
++                                state.pending_change_zone_iteration =
++                                    Some(crate::types::game_state::PendingChangeZoneIteration {
++                                        remaining: chosen_ids[i + 1..].to_vec(),
++                                        source_id: ctx.source_id,
++                                        controller: ctx.controller,
++                                        origin: ctx.origin,
++                                        destination: ctx.destination,
++                                        enter_transformed: ctx.enter_transformed,
++                                        enter_tapped: ctx.enter_tapped,
++                                        enters_under_player: ctx.enters_under_player,
++                                        enters_attacking: ctx.enters_attacking,
++                                        enter_with_counters: ctx.enter_with_counters.clone(),
++                                        duration: ctx.duration.clone(),
++                                        track_exiled_by_source: ctx.track_exiled_by_source,
++                                        moved_count: None,
++                                        face_down_profile: ctx.face_down_profile.clone(),
++                                        library_placement: ctx.library_placement.clone(),
++                                        effect_kind,
++                                    });
++                                state.waiting_for =
++                                    super::replacement::replacement_choice_waiting_for(
++                                        choice_player,
++                                        state,
++                                    );
++                                return Ok(action_result_outcome(
++                                    events,
++                                    state.waiting_for.clone(),
++                                ));
++                            }
++                        }
++                    }
++                    let events_after_move = events.len();
++                    // CR 614.12a: this `EffectZoneChoice` was the interactive payment of an
++                    // optional `MayCost` replacement's accept (e.g. Mimeoplasm's
++                    // "exile two creature cards from graveyards"). The cost is
++                    // now paid, so resume the parked replacement with the accept index —
++                    // `continue_replacement` sees `may_cost_paid: true`, pays any
++                    // `may_cost_remaining`, and finishes entering the permanent.
++                    if state
++                        .pending_replacement
++                        .as_ref()
++                        .is_some_and(|pending| pending.may_cost_paid)
++                    {
++                        let waiting_for =
++                            super::engine_replacement::handle_replacement_choice(state, 0, events)?;
++                        if let Some(outcome) = batch_or_drain_observer_triggers(
++                            state,
++                            events,
++                            events_before_effect,
++                            events_after_move,
++                        ) {
++                            return Ok(outcome);
++                        }
++                        return Ok(ResolutionChoiceOutcome::WaitingFor(waiting_for));
++                    }
++                }
+                 other => {
+                     return Err(EngineError::InvalidAction(format!(
+                         "EffectZoneChoice unsupported for {other:?}"
+diff --git a/crates/engine/src/game/exile_links.rs b/crates/engine/src/game/exile_links.rs
+index 3658d88d71..d11c3b4e5c 100644
+--- a/crates/engine/src/game/exile_links.rs
++++ b/crates/engine/src/game/exile_links.rs
+@@ -85,6 +85,13 @@ pub(crate) fn push_with_kind(
+ /// exiled cards to feed `StaticMode::ExileCastPermission` should call this
+ /// helper alongside the link push.
+ ///
++/// CR 607.2a: The ordering of cards in `cards_exiled_with_source_this_turn[source_id]`
++/// is guaranteed to match the order they were exiled (via `Vec::push`). This is
++/// an ENGINE INVARIANT, not a CR rule — the Vec::push convention ensures
++/// first-in-first-out ordering for indexed access. This is critical for effects
++/// like The Mimeoplasm that distinguish "the first card exiled this way" from
++/// "the second card exiled this way" using indexed access.
++///
+ /// Idempotent: a duplicate `(source_id, exiled_id)` pair is dropped, mirroring
+ /// `push_tracked_by_source`.
+ pub(crate) fn push_exiled_with_source_this_turn(
+diff --git a/crates/engine/src/game/filter.rs b/crates/engine/src/game/filter.rs
+index 533abfa049..9cc9198160 100644
+--- a/crates/engine/src/game/filter.rs
++++ b/crates/engine/src/game/filter.rs
+@@ -76,6 +76,7 @@ pub(crate) fn affected_filter_uses_object_population(filter: &TargetFilter) -> b
+         | TargetFilter::TrackedSet { .. }
+         | TargetFilter::TrackedSetFiltered { .. }
+         | TargetFilter::ExiledBySource
++        | TargetFilter::ExiledCardByIndex { .. }
+         | TargetFilter::TriggeringSpellController
+         | TargetFilter::TriggeringSpellOwner
+         | TargetFilter::TriggeringPlayer
+@@ -266,6 +267,7 @@ pub(crate) fn entered_object_perturbs_affected_filter(
+         | TargetFilter::TrackedSet { .. }
+         | TargetFilter::TrackedSetFiltered { .. }
+         | TargetFilter::ExiledBySource
++        | TargetFilter::ExiledCardByIndex { .. }
+         | TargetFilter::TriggeringSpellController
+         | TargetFilter::TriggeringSpellOwner
+         | TargetFilter::TriggeringPlayer
+@@ -1623,6 +1625,17 @@ fn filter_inner_for_object(
+                 .iter()
+                 .any(|entry| entry.exiled_id == object_id)
+         }
++        // CR 607.2a: References a specific card exiled by the source, indexed by order.
++        // Used by The Mimeoplasm to distinguish "the first card exiled this way" from
++        // "the second card exiled this way". ENGINE INVARIANT: The ordering is
++        // guaranteed by Vec::push in push_exiled_with_source_this_turn.
++        TargetFilter::ExiledCardByIndex { index } => {
++            // Look up the source's exile list and check if object_id matches the indexed position
++            let exiled_cards = state.cards_exiled_with_source_this_turn.get(&source_id);
++            exiled_cards
++                .and_then(|cards| cards.get(*index as usize))
++                .is_some_and(|&card_id| card_id == object_id)
++        }
+         // CR 603.7c: Event-context references resolve to players, not objects.
+         TargetFilter::TriggeringSpellController
+         | TargetFilter::TriggeringSpellOwner
+@@ -1865,6 +1878,7 @@ fn zone_change_filter_inner(
+         | TargetFilter::TrackedSet { .. }
+         | TargetFilter::TrackedSetFiltered { .. }
+         | TargetFilter::ExiledBySource
++        | TargetFilter::ExiledCardByIndex { .. }
+         | TargetFilter::TriggeringSpellController
+         | TargetFilter::TriggeringSpellOwner
+         | TargetFilter::TriggeringPlayer
+@@ -2096,6 +2110,7 @@ pub fn spell_record_matches_filter(
+         | TargetFilter::TrackedSet { .. }
+         | TargetFilter::TrackedSetFiltered { .. }
+         | TargetFilter::ExiledBySource
++        | TargetFilter::ExiledCardByIndex { .. }
+         | TargetFilter::TriggeringSpellController
+         | TargetFilter::TriggeringSpellOwner
+         | TargetFilter::TriggeringPlayer
+@@ -2336,6 +2351,7 @@ fn spell_object_matches_filter_inner(
+         | TargetFilter::TrackedSet { .. }
+         | TargetFilter::TrackedSetFiltered { .. }
+         | TargetFilter::ExiledBySource
++        | TargetFilter::ExiledCardByIndex { .. }
+         | TargetFilter::TriggeringSpellController
+         | TargetFilter::TriggeringSpellOwner
+         | TargetFilter::TriggeringPlayer
+diff --git a/crates/engine/src/game/quantity.rs b/crates/engine/src/game/quantity.rs
+index 7a3ca95705..0ae4e2b62d 100644
+--- a/crates/engine/src/game/quantity.rs
++++ b/crates/engine/src/game/quantity.rs
+@@ -287,6 +287,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
+         | QuantityRef::SelfManaValue
+         | QuantityRef::TargetZoneCardCount { .. }
+         | QuantityRef::CardsExiledBySource
++        | QuantityRef::ExiledCardPower { .. }
+         | QuantityRef::ZoneCardCount { .. }
+         | QuantityRef::TrackedSetSize
+         | QuantityRef::FilteredTrackedSetSize { .. }
+@@ -463,6 +464,7 @@ fn entered_object_perturbs_quantity_ref(
+         | QuantityRef::SelfManaValue
+         | QuantityRef::TargetZoneCardCount { .. }
+         | QuantityRef::CardsExiledBySource
++        | QuantityRef::ExiledCardPower { .. }
+         | QuantityRef::ZoneCardCount { .. }
+         | QuantityRef::TrackedSetSize
+         | QuantityRef::FilteredTrackedSetSize { .. }
+@@ -1662,6 +1664,18 @@ fn resolve_ref(
+         QuantityRef::CardsExiledBySource => usize_to_i32_saturating(
+             crate::game::players::linked_exile_cards_for_source(state, source_id).len(),
+         ),
++        // CR 607.2a: The power of a specific card exiled by the source, indexed by order.
++        // ENGINE INVARIANT: The ordering is guaranteed by Vec::push in push_exiled_with_source_this_turn.
++        QuantityRef::ExiledCardPower { index } => {
++            let exiled_cards = state.cards_exiled_with_source_this_turn.get(&source_id);
++            match exiled_cards.and_then(|cards| cards.get(*index as usize)) {
++                Some(&card_id) => {
++                    let card = state.objects.get(&card_id);
++                    card.and_then(|obj| obj.power).unwrap_or(0)
++                }
++                None => 0,
++            }
++        }
+         // CR 604.3: Count cards in a zone matching optional type filters.
+         QuantityRef::ZoneCardCount {
+             zone,
+diff --git a/crates/engine/src/game/replacement.rs b/crates/engine/src/game/replacement.rs
+index 313793d304..186dbdb2e8 100644
+--- a/crates/engine/src/game/replacement.rs
++++ b/crates/engine/src/game/replacement.rs
+@@ -410,6 +410,45 @@ fn replacement_cost_description(cost: &AbilityCost) -> String {
+             }
+         },
+         AbilityCost::Discard { .. } => "Discard a card".to_string(),
++        AbilityCost::Exile {
++            count,
++            zone,
++            filter,
++            ..
++        } => {
++            let zone_str = match zone {
++                Some(Zone::Graveyard) => {
++                    // CR 406.6: Check if the filter is controller-scoped. When the filter
++                    // has controller: None (unrestricted "graveyards"), use "from graveyards".
++                    // When controller: Some(ControllerRef::You) ("your graveyard"), use
++                    // "from your graveyard".
++                    let is_unrestricted = filter.as_ref().is_none_or(|f| {
++                        matches!(
++                            f,
++                            crate::types::ability::TargetFilter::Typed(
++                                crate::types::ability::TypedFilter {
++                                    controller: None,
++                                    ..
++                                }
++                            )
++                        )
++                    });
++                    if is_unrestricted {
++                        "from graveyards"
++                    } else {
++                        "from your graveyard"
++                    }
++                }
++                Some(Zone::Hand) => "from your hand",
++                Some(Zone::Battlefield) => "from the battlefield",
++                _ => "",
++            };
++            if *count == 1 {
++                format!("Exile a card {zone_str}")
++            } else {
++                format!("Exile {count} cards {zone_str}")
++            }
++        }
+         // CR 702.24a: Delegate the label to the base cost so a "for each
+         // counter" wrapper inherits its base's prompt phrasing (e.g.,
+         // "Pay 1 life" → "Pay 1 life" for the per-counter scaling). The
+@@ -420,7 +459,6 @@ fn replacement_cost_description(cost: &AbilityCost) -> String {
+         | AbilityCost::Tap
+         | AbilityCost::Untap
+         | AbilityCost::Loyalty { .. }
+-        | AbilityCost::Exile { .. }
+         | AbilityCost::ExileMaterials { .. }
+         | AbilityCost::CollectEvidence { .. }
+         | AbilityCost::TapCreatures { .. }
+@@ -675,6 +713,47 @@ fn pay_replacement_may_cost(
+                 Ok(crate::game::costs::PaymentOutcome::Failed { .. }) | Err(_) => false,
+             }
+         }
++        // CR 406.6: Non-self exile cost paid as the replacement is applied
++        // (The Mimeoplasm's "exile two creature cards from graveyards"). This
++        // follows the same pattern as Discard: the resolution authority handles
++        // the interactive choice via `WaitingFor::EffectZoneChoice` with is_cost_payment: true.
++        AbilityCost::Exile { filter, .. } if !matches!(filter, Some(TargetFilter::SelfRef)) => {
++            let ability = ResolvedAbility::new(
++                crate::types::ability::Effect::PayCost {
++                    cost: cost.clone(),
++                    scale: None,
++                    payer: TargetFilter::Controller,
++                },
++                Vec::new(),
++                source_id,
++                player,
++            );
++            let prior_waiting_for = state.waiting_for.clone();
++            match crate::game::costs::pay_ability_cost_for_resolution(
++                state, player, cost, &ability, events,
++            ) {
++                Ok(crate::game::costs::PaymentOutcome::Paid) => {
++                    if state.waiting_for != prior_waiting_for
++                        && matches!(
++                            state.waiting_for,
++                            WaitingFor::EffectZoneChoice {
++                                is_cost_payment: true,
++                                ..
++                            }
++                        )
++                    {
++                        return MayCostOutcome::PausedForChoice {
++                            remaining_cost: None,
++                        };
++                    }
++                    true
++                }
++                Ok(crate::game::costs::PaymentOutcome::Paused { remaining_cost }) => {
++                    return MayCostOutcome::PausedForChoice { remaining_cost };
++                }
++                Ok(crate::game::costs::PaymentOutcome::Failed { .. }) | Err(_) => false,
++            }
++        }
+         _ => crate::game::casting::pay_ability_cost(state, player, source_id, cost, events).is_ok(),
+     };
+     if paid {
+diff --git a/crates/engine/src/game/trigger_matchers.rs b/crates/engine/src/game/trigger_matchers.rs
+index 8d2a12d40d..5126bbd5f3 100644
+--- a/crates/engine/src/game/trigger_matchers.rs
++++ b/crates/engine/src/game/trigger_matchers.rs
+@@ -734,6 +734,7 @@ pub(super) fn target_filter_matches_object(
+         | TargetFilter::TriggeringPlayer
+         | TargetFilter::TriggeringSource
+         | TargetFilter::DefendingPlayer
++        | TargetFilter::ExiledCardByIndex { .. }
+         | TargetFilter::ParentTarget
+         | TargetFilter::ParentTargetSlot { .. }
+         | TargetFilter::ParentTargetController
+diff --git a/crates/engine/src/game/triggers.rs b/crates/engine/src/game/triggers.rs
+index d5cca40d41..867365af07 100644
+--- a/crates/engine/src/game/triggers.rs
++++ b/crates/engine/src/game/triggers.rs
+@@ -19293,6 +19293,7 @@ pub mod tests {
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+ 
+         crate::game::engine::apply_as_current(
+diff --git a/crates/engine/src/game/visibility.rs b/crates/engine/src/game/visibility.rs
+index ac02fd99e9..2f36a58dc4 100644
+--- a/crates/engine/src/game/visibility.rs
++++ b/crates/engine/src/game/visibility.rs
+@@ -526,6 +526,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
+         track_exiled_by_source,
+         ref face_down_profile,
+         count_param,
++        is_cost_payment: _,
+     } = state.waiting_for
+     {
+         if !can_view_private_for_player(player) && zone == Zone::Hand {
+@@ -549,6 +550,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
+                 // not private hand info — pass them through the redaction.
+                 face_down_profile: face_down_profile.clone(),
+                 count_param,
++                is_cost_payment: false,
+             };
+         }
+     }
+diff --git a/crates/engine/src/parser/oracle_replacement.rs b/crates/engine/src/parser/oracle_replacement.rs
+index f5efbeab55..5592e88629 100644
+--- a/crates/engine/src/parser/oracle_replacement.rs
++++ b/crates/engine/src/parser/oracle_replacement.rs
+@@ -97,6 +97,12 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
+         return Some(def);
+     }
+ 
++    // --- The Mimeoplasm: "As ~ enters, you may exile N cards from graveyards. If you do, ..." ---
++    // Check before other "as enters" patterns to ensure it matches correctly
++    if let Some(def) = parse_as_enters_exile_from_graveyards(&norm_lower, &normalized, &text) {
++        return Some(def);
++    }
++
+     // --- "~ enters prepared." ---
+     // CR 722.3a: "enters prepared" gives the entering permanent the prepared
+     // designation as part of the entry event, not through a triggered ability.
+@@ -796,6 +802,110 @@ fn parse_self_enters_pay_cost_replacement(
+     )
+ }
+ 
++/// CR 614.1a + CR 614.12: The Mimeoplasm — "As ~ enters, you may exile N cards
++/// from graveyards. If you do, it enters as a copy of one of those cards with a
++/// number of additional +1/+1 counters on it equal to the power of the other card."
++///
++/// Emits a `ReplacementMode::MayCost` on the `Moved` event: the accept-cost is
++/// the parsed `AbilityCost::Exile` from graveyards; the "If you do" continuation
++/// is the copy + counter placement effect chain. No decline branch — the permanent
++/// enters normally (no exile, no copy, no counters) if declined.
++fn parse_as_enters_exile_from_graveyards(
++    norm_lower: &str,
++    normalized: &str,
++    original_text: &str,
++) -> Option<ReplacementDefinition> {
++    // Prefix: "as ~ enters, you may exile "
++    let ((), after_prefix) = nom_on_lower(normalized, norm_lower, |i| {
++        value(
++            (),
++            preceded(
++                tag("as "),
++                alt((
++                    tag("~ enters, you may exile "),
++                    tag("this creature enters, you may exile "),
++                )),
++            ),
++        )
++        .parse(i)
++    })?;
++
++    // Isolate the cost body from the "If you do" continuation
++    let after_prefix_lower = after_prefix.to_lowercase();
++    let (cost_body, _tail) =
++        split_once_on_lower(after_prefix, &after_prefix_lower, ". if you do, ")?;
++
++    // Parse the exile cost manually to handle "from graveyards" (plural)
++    // Pattern: "[count] [type] card(s) from graveyards"
++    let cost_body_lower = cost_body.trim().to_lowercase();
++    let (count, filter_text) =
++        parse_number(&cost_body_lower).unwrap_or((1, cost_body_lower.trim()));
++
++    // Strip the "from graveyards" suffix to extract the type filter.
++    // filter_text is already lowercase (slice of cost_body_lower).
++    // Use take_until + alt to consume up to and including the zone suffix.
++    let parsed: nom::IResult<&str, (&str, &str)> = pair(
++        take_until(" from graveyard"),
++        alt((tag(" from graveyards"), tag(" from graveyard"))),
++    )
++    .parse(filter_text);
++    let Ok(("", (filter_text, _))) = parsed else {
++        return None;
++    };
++
++    // Parse the type filter (e.g., "creature")
++    let (filter, remainder) = parse_type_phrase(filter_text.trim());
++    if !remainder.trim().is_empty() {
++        return None;
++    }
++
++    let cost = AbilityCost::Exile {
++        count,
++        zone: Some(Zone::Graveyard),
++        filter: Some(filter),
++    };
++
++    // CR 607.2a: Manually construct the continuation for Mimeoplasm-style effects.
++    // The continuation text "it enters as a copy of one of those cards, except it has
++    // the other card's power and toughness as +1/+1 counters" must be lowered to:
++    // - BecomeCopy targeting the first exiled card (ExiledCardByIndex { index: 0 })
++    // - PutCounter with count = second exiled card's power (ExiledCardPower { index: 1 })
++    // This cannot use parse_effect_chain because the generic parser lowers this
++    // pattern to CopySpell (which copies spells on the stack, not exiled cards).
++    let continuation = crate::types::ability::AbilityDefinition::new(
++        crate::types::ability::AbilityKind::Spell,
++        crate::types::ability::Effect::BecomeCopy {
++            target: crate::types::ability::TargetFilter::ExiledCardByIndex { index: 0 },
++            duration: None,
++            mana_value_limit: None,
++            additional_modifications: vec![],
++        },
++    )
++    .sub_ability(crate::types::ability::AbilityDefinition::new(
++        crate::types::ability::AbilityKind::Spell,
++        crate::types::ability::Effect::PutCounter {
++            counter_type: crate::types::counter::CounterType::Plus1Plus1,
++            count: crate::types::ability::QuantityExpr::Ref {
++                qty: crate::types::ability::QuantityRef::ExiledCardPower { index: 1 },
++            },
++            target: crate::types::ability::TargetFilter::SelfRef,
++        },
++    ));
++
++    Some(
++        ReplacementDefinition::new(ReplacementEvent::Moved)
++            .mode(ReplacementMode::MayCost {
++                cost,
++                decline: None, // No decline branch — enters normally if declined
++            })
++            .execute(continuation)
++            .valid_card(TargetFilter::SelfRef)
++            // CR 614.1c: battlefield-entry-scoped (see destination-gate note above).
++            .destination_zone(Zone::Battlefield)
++            .description(original_text.to_string()),
++    )
++}
++
+ /// Case-insensitive replacement of card name and self-referencing phrases with "~".
+ fn replace_self_refs(text: &str, card_name: &str) -> String {
+     normalize_card_name_refs(text, card_name)
+@@ -6944,6 +7054,37 @@ mod tests {
+         }
+     }
+ 
++    /// CR 614.1a + CR 614.12: The Mimeoplasm — "As ~ enters, you may exile two
++    /// creature cards from graveyards. If you do, it enters as a copy of one of
++    /// those cards with a number of additional +1/+1 counters on it equal to the
++    /// power of the other card."
++    #[test]
++    fn mimeoplasm_exile_from_graveyards_replacement() {
++        let def = parse_replacement_line(
++            "As ~ enters, you may exile two creature cards from graveyards. If you do, \
++             it enters as a copy of one of those cards with a number of additional +1/+1 \
++             counters on it equal to the power of the other card.",
++            "The Mimeoplasm",
++        )
++        .expect("The Mimeoplasm should parse as a replacement");
++        assert_eq!(def.event, ReplacementEvent::Moved);
++        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
++        match &def.mode {
++            ReplacementMode::MayCost { cost, decline } => {
++                assert!(
++                    matches!(cost, AbilityCost::Exile { count, zone, filter } if *count == 2 && *zone == Some(Zone::Graveyard) && filter.is_some()),
++                    "expected Exile count 2 from Graveyard, got {cost:?}"
++                );
++                assert!(decline.is_none(), "The Mimeoplasm has no decline branch");
++            }
++            other => panic!("expected MayCost, got {other:?}"),
++        }
++        // Verify the continuation effect is present in execute
++        let execute = def.execute.as_ref().expect("execute must be present");
++        // The continuation should be the copy + counter placement effect
++        assert!(!matches!(&*execute.effect, Effect::Unimplemented { .. }));
++    }
++
+     #[test]
+     fn rewrite_parent_target_controller_flips_top_level_draw_target() {
+         let mut def = AbilityDefinition::new(
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 937ceb54da..f6dfa9d132 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -3135,9 +3135,17 @@ pub enum TargetFilter {
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         caused_by: Option<ThisWayCause>,
+     },
+-    /// CR 610.3: Cards exiled by a specific source via "exile until ~ leaves" links.
++    /// CR 607.2a: Cards exiled by a specific source via "exile until ~ leaves" links.
+     /// Resolves via relational `state.exile_links` lookup, not intrinsic object properties.
+     ExiledBySource,
++    /// CR 607.2b: References a specific card exiled by the source, indexed by order.
++    /// Used by The Mimeoplasm to distinguish "the first card exiled this way" from
++    /// "the second card exiled this way". The index is 0-based and corresponds to
++    /// the order in `state.cards_exiled_with_source_this_turn[source_id]`.
++    /// ENGINE INVARIANT: The ordering is guaranteed by Vec::push in push_exiled_with_source_this_turn.
++    ExiledCardByIndex {
++        index: u32,
++    },
+     /// CR 603.7c: Resolves to the controller of the spell/ability that triggered this.
+     TriggeringSpellController,
+     /// CR 603.7c: Resolves to the owner of the spell/ability that triggered this.
+@@ -3676,6 +3684,9 @@ pub enum QuantityRef {
+     /// with ~" conditional statics (Veteran Survivor, etc.) — composes with
+     /// `StaticCondition::QuantityComparison` rather than requiring a dedicated variant.
+     CardsExiledBySource,
++    /// CR 607.2b: The power of a specific card exiled by the source, indexed by order.
++    /// Used by The Mimeoplasm to read the second exiled card's power for counter placement.
++    ExiledCardPower { index: u32 },
+     /// CR 604.3: Count cards in a zone matching optional type filters.
+     /// Empty card_types means all cards. Multiple entries = OR (any match).
+     /// "creature cards in your graveyard" → zone=Graveyard, card_types=[Creature], scope=Controller
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index 70bc8961c6..422ac4cb59 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -3102,6 +3102,11 @@ pub enum WaitingFor {
+         /// Zero for all non-blight EffectZoneChoice uses.
+         #[serde(default)]
+         count_param: u32,
++        /// CR 118.3: When true, this choice is for a cost payment (e.g., exile cost)
++        /// rather than effect resolution. Cost-payment choices require special
++        /// handling for exile-link tracking (push_exiled_with_source_this_turn).
++        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
++        is_cost_payment: bool,
+     },
+     /// Player chooses which drawn-this-turn hand cards to put on top of their
+     /// library. Each unchosen required card is kept by paying life.
+@@ -8150,6 +8155,7 @@ mod tests {
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         }));
+         variants.push(Box::new(WaitingFor::DefilerPayment {
+             player: PlayerId(0),
+@@ -8397,6 +8403,7 @@ mod tests {
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+         let json = serde_json::to_string(&wf).unwrap();
+         let deserialized: WaitingFor = serde_json::from_str(&json).unwrap();
+@@ -8498,6 +8505,7 @@ mod tests {
+                 ward: None,
+             }),
+             count_param: 0,
++            is_cost_payment: false,
+         };
+         let json = serde_json::to_string(&wf).expect("serialize");
+         // Modern shape must be emitted, NOT the legacy bool field.
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 38ccda3b95..9967fa93fe 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -283,6 +283,7 @@ mod memory_plunder_free_cast_2884;
+ mod militant_angel_attacked_opponents;
+ mod mill_double_redirect_choice_continuation;
+ mod mill_rest_in_peace_redirect;
++mod mimeoplasm_interactive_exile;
+ mod mindblade_render_warrior_intervening_if_2867;
+ mod mogg_war_marshal_echo_dies_trigger;
+ mod morophon_chosen_type_1653;
+diff --git a/crates/engine/tests/integration/mimeoplasm_interactive_exile.rs b/crates/engine/tests/integration/mimeoplasm_interactive_exile.rs
+new file mode 100644
+index 0000000000..e1fb576ce3
+--- /dev/null
++++ b/crates/engine/tests/integration/mimeoplasm_interactive_exile.rs
+@@ -0,0 +1,514 @@
++//! The Mimeoplasm interactive exile path test.
++//!
++//! Tests the PayCost arm in engine_resolution_choices.rs by verifying
++//! that EffectKind::PayCost is handled correctly for cost-payment exile.
++//!
++//! This test directly exercises the PayCost arm by calling
++//! apply_as_current with a manually constructed EffectZoneChoice
++//! with PayCost, bypassing the need for the full Mimeoplasm replacement
++//! pipeline to be functional.
++
++use engine::game::scenario::{GameScenario, P0};
++use engine::game::zones;
++use engine::types::ability::{EffectKind, ReplacementMode};
++use engine::types::actions::GameAction;
++use engine::types::game_state::WaitingFor;
++use engine::types::identifiers::ObjectId;
++use engine::types::zones::EtbTapState;
++use engine::types::zones::Zone;
++use engine::types::Phase;
++
++#[test]
++fn mimeoplasm_replacement_parsed_from_oracle() {
++    // Verify that the Mimeoplasm replacement is correctly parsed from Oracle text
++    let mut scenario = GameScenario::new();
++
++    let mimeoplasm_id = scenario
++        .add_creature_to_hand_from_oracle(
++            P0,
++            "Mimeoplasm Test",
++            5, 5,
++            "As ~ enters, you may exile two creature cards from graveyards. If you do, ~ enters as a copy of one of them, except it has +1/+1 counters equal to the other's power.",
++        )
++        .id();
++
++    let runner = scenario.build();
++
++    // Verify the replacement was parsed and installed
++    let mimeoplasm_obj = runner.state().objects.get(&mimeoplasm_id).unwrap();
++    assert!(
++        !mimeoplasm_obj.replacement_definitions.is_empty(),
++        "Mimeoplasm should have replacement definitions parsed from Oracle text"
++    );
++
++    // Verify it's a MayCost replacement
++    let repl = &mimeoplasm_obj.replacement_definitions[0];
++    assert!(
++        matches!(repl.mode, ReplacementMode::MayCost { .. }),
++        "Mimeoplasm replacement should be MayCost mode"
++    );
++
++    println!(
++        "Mimeoplasm replacement parsed successfully: {:?}",
++        repl.mode
++    );
++}
++
++#[test]
++fn mimeoplasm_cast_triggers_replacement() {
++    // Test that casting Mimeoplasm with graveyard creatures triggers the replacement
++    // and surfaces the exile cost choice. This verifies the replacement pipeline
++    // correctly identifies and offers the MayCost replacement, and that the
++    // replacement continuation is applied after the cost is paid.
++
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Add 3 creatures to P0's graveyard
++    let _bears_id = scenario
++        .add_creature_to_graveyard(P0, "Grizzly Bears", 2, 2)
++        .id();
++    let _giant_id = scenario
++        .add_creature_to_graveyard(P0, "Hill Giant", 3, 3)
++        .id();
++    let _angel_id = scenario
++        .add_creature_to_graveyard(P0, "Serra Angel", 4, 4)
++        .id();
++
++    // Add Mimeoplasm to hand
++    let mimeoplasm_id = scenario
++        .add_creature_to_hand_from_oracle(
++            P0,
++            "Mimeoplasm Test",
++            5, 5,
++            "As ~ enters, you may exile two creature cards from graveyards. If you do, ~ enters as a copy of one of them, except it has +1/+1 counters equal to the other's power.",
++        )
++        .id();
++
++    // Add mana to cast it
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Green);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Green);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
++
++    let mut runner = scenario.build();
++
++    // Verify graveyard has 3 creatures
++    assert_eq!(runner.state().players[0].graveyard.len(), 3);
++
++    // Cast Mimeoplasm
++    let _outcome = runner.cast(mimeoplasm_id).resolve();
++
++    // Check if we hit a replacement choice (not just priority)
++    match &runner.state().waiting_for {
++        WaitingFor::ReplacementChoice { .. } => {
++            println!("SUCCESS: Replacement choice surfaced as expected");
++        }
++        WaitingFor::Priority { .. } => {
++            println!("FAILURE: No replacement choice - replacement did not fire");
++            println!("Final state: {:?}", runner.state().waiting_for);
++            panic!("Replacement should have fired but didn't");
++        }
++        other => {
++            println!("UNEXPECTED waiting_for state: {:?}", other);
++            panic!("Unexpected waiting_for state");
++        }
++    }
++
++    // Accept the replacement choice (index 0 = pay cost, index 1 = decline)
++    runner
++        .act(GameAction::ChooseReplacement { index: 0 })
++        .expect("Accept replacement should succeed");
++
++    // Now we should be at EffectZoneChoice for the exile cost
++    match &runner.state().waiting_for {
++        WaitingFor::EffectZoneChoice { cards, count, .. } => {
++            println!(
++                "SUCCESS: EffectZoneChoice surfaced with {} cards, need to select {}",
++                cards.len(),
++                count
++            );
++            // Select the first two cards
++            let selected = cards.iter().take(*count).copied().collect::<Vec<_>>();
++            runner
++                .act(GameAction::SelectCards { cards: selected })
++                .expect("SelectCards should succeed");
++        }
++        other => {
++            println!(
++                "UNEXPECTED waiting_for after accepting replacement: {:?}",
++                other
++            );
++            panic!("Expected EffectZoneChoice after accepting replacement");
++        }
++    }
++
++    // After the exile cost is paid, the replacement continuation should apply
++    // and Mimeoplasm should enter the battlefield
++    let state = runner.state();
++    println!("Final waiting_for: {:?}", state.waiting_for);
++    println!("Battlefield objects: {:?}", state.battlefield);
++    println!("Graveyard count: {}", state.players[0].graveyard.len());
++    println!("Exile count: {}", state.exile.len());
++    println!("Stack count: {}", state.stack.len());
++
++    // Verify cards were exiled (PayCost arm worked)
++    assert_eq!(
++        state.players[0].graveyard.len(),
++        1,
++        "Two cards should have been exiled, leaving 1 in graveyard"
++    );
++    assert!(
++        state.exile.len() >= 2,
++        "At least 2 cards should be in exile"
++    );
++
++    // Verify Mimeoplasm is on the battlefield (replacement continuation applied)
++    // After accepting the replacement, Mimeoplasm copies the first exiled card
++    let mimeoplasm_on_battlefield = state.battlefield.iter().any(|&id| {
++        state
++            .objects
++            .get(&id)
++            .is_some_and(|obj| obj.name == "Grizzly Bears" || obj.name == "Mimeoplasm Test")
++    });
++    assert!(
++        mimeoplasm_on_battlefield,
++        "Mimeoplasm should be on the battlefield after replacement continuation"
++    );
++
++    println!("SUCCESS: Full replacement → exile-choice → battlefield flow completed");
++}
++
++#[test]
++fn mimeoplasm_full_end_to_end_copy_and_counters() {
++    // Discriminating test that verifies the full Mimeoplasm flow:
++    // - Cast Mimeoplasm with ≥3 creatures in graveyards (force interactive choice)
++    // - Exile two creatures with distinct power/toughness (2/2 and 4/4)
++    // - Assert the resulting permanent's name equals the first exiled card's name
++    // - Assert the permanent has +1/+1 counters equal to the second exiled card's power
++
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Add 3 creatures to P0's graveyard with distinct power/toughness
++    let bears_id = scenario
++        .add_creature_to_graveyard(P0, "Grizzly Bears", 2, 2)
++        .id();
++    let giant_id = scenario
++        .add_creature_to_graveyard(P0, "Hill Giant", 3, 3)
++        .id();
++    let _angel_id = scenario
++        .add_creature_to_graveyard(P0, "Serra Angel", 4, 4)
++        .id();
++
++    // Add Mimeoplasm to hand
++    let mimeoplasm_id = scenario
++        .add_creature_to_hand_from_oracle(
++            P0,
++            "Mimeoplasm Test",
++            5, 5,
++            "As ~ enters, you may exile two creature cards from graveyards. If you do, ~ enters as a copy of one of them, except it has +1/+1 counters equal to the other's power.",
++        )
++        .id();
++
++    // Add mana to cast it
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Green);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Green);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
++
++    let mut runner = scenario.build();
++
++    // Verify graveyard has 3 creatures
++    assert_eq!(runner.state().players[0].graveyard.len(), 3);
++
++    // Cast Mimeoplasm
++    let _outcome = runner.cast(mimeoplasm_id).resolve();
++
++    // Accept the replacement choice (index 0 = pay cost)
++    runner
++        .act(GameAction::ChooseReplacement { index: 0 })
++        .expect("Accept replacement should succeed");
++
++    // Select the first two cards (Bears and Giant) for exile
++    // This will make Mimeoplasm copy Bears (index 0) and get counters equal to Giant's power (3)
++    match &runner.state().waiting_for {
++        WaitingFor::EffectZoneChoice { .. } => {
++            let selected = vec![bears_id, giant_id];
++            runner
++                .act(GameAction::SelectCards { cards: selected })
++                .expect("SelectCards should succeed");
++        }
++        other => {
++            panic!("Expected EffectZoneChoice, got {:?}", other);
++        }
++    }
++
++    // Verify the outcome
++    let state = runner.state();
++
++    // Verify cards were exiled
++    assert_eq!(
++        state.players[0].graveyard.len(),
++        1,
++        "Two cards should have been exiled, leaving 1 in graveyard"
++    );
++    assert!(
++        state.exile.len() >= 2,
++        "At least 2 cards should be in exile"
++    );
++
++    // Verify Mimeoplasm is on the battlefield
++    // The Mimeoplasm should be the object that was cast (mimeoplasm_id), now on battlefield
++    let mimeoplasm_obj = state.objects.get(&mimeoplasm_id);
++    assert!(
++        mimeoplasm_obj.is_some_and(|obj| obj.zone == Zone::Battlefield),
++        "Mimeoplasm should be on the battlefield"
++    );
++
++    let mimeoplasm_obj = mimeoplasm_obj.expect("Mimeoplasm object should exist");
++
++    // The permanent should have copied Grizzly Bears (the first exiled card at index 0)
++    assert_eq!(
++        mimeoplasm_obj.name, "Grizzly Bears",
++        "Mimeoplasm should have copied the first exiled card (Grizzly Bears)"
++    );
++
++    // Verify the permanent has +1/+1 counters equal to the second exiled card's power
++    // Hill Giant has power 3, so we should have 3 +1/+1 counters
++    let plus_one_counters = mimeoplasm_obj
++        .counters
++        .iter()
++        .filter(|(counter_type, _count)| {
++            **counter_type == engine::types::counter::CounterType::Plus1Plus1
++        })
++        .map(|(_counter_type, count)| *count)
++        .sum::<u32>();
++    assert_eq!(
++        plus_one_counters, 3,
++        "Mimeoplasm should have 3 +1/+1 counters (equal to Hill Giant's power)"
++    );
++
++    println!("SUCCESS: Full end-to-end test passed - copy and counters verified");
++}
++
++#[test]
++fn mimeoplasm_exiles_from_opponent_graveyard() {
++    // Discriminating test that verifies Mimeoplasm can exile from any player's graveyard,
++    // not just the controller's. This is critical for Commander where Mimeoplasm's
++    // primary use case is exiling opponents' creatures.
++
++    let p1 = engine::game::scenario::P1;
++
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Add a creature to P1's graveyard (opponent's graveyard)
++    let opponent_bears_id = scenario
++        .add_creature_to_graveyard(p1, "Grizzly Bears", 2, 2)
++        .id();
++
++    // Add a creature to P0's graveyard (controller's graveyard)
++    let controller_giant_id = scenario
++        .add_creature_to_graveyard(P0, "Hill Giant", 3, 3)
++        .id();
++
++    // Add a third creature to P0's graveyard to prevent forced-choice fast path
++    let _controller_angel_id = scenario
++        .add_creature_to_graveyard(P0, "Serra Angel", 4, 4)
++        .id();
++
++    // Add Mimeoplasm to P0's hand
++    let mimeoplasm_id = scenario
++        .add_creature_to_hand_from_oracle(
++            P0,
++            "Mimeoplasm Test",
++            5, 5,
++            "As ~ enters, you may exile two creature cards from graveyards. If you do, ~ enters as a copy of one of them, except it has +1/+1 counters equal to the other's power.",
++        )
++        .id();
++
++    // Add mana to cast it
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Blue);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Green);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Green);
++    scenario.add_basic_land(P0, engine::types::mana::ManaColor::Black);
++
++    let mut runner = scenario.build();
++
++    // Verify graveyards have the expected cards
++    assert_eq!(runner.state().players[0].graveyard.len(), 2);
++    assert_eq!(runner.state().players[1].graveyard.len(), 1);
++
++    // Cast Mimeoplasm
++    let _outcome = runner.cast(mimeoplasm_id).resolve();
++
++    // Accept the replacement choice (index 0 = pay cost)
++    runner
++        .act(GameAction::ChooseReplacement { index: 0 })
++        .expect("Accept replacement should succeed");
++
++    // Verify that both cards (from both graveyards) are eligible for exile
++    match &runner.state().waiting_for {
++        WaitingFor::EffectZoneChoice { cards, .. } => {
++            // Should have 3 cards available: 2 from P0's graveyard, 1 from P1's graveyard
++            assert_eq!(
++                cards.len(),
++                3,
++                "Should have 3 eligible cards from both graveyards"
++            );
++            assert!(
++                cards.contains(&opponent_bears_id),
++                "Opponent's creature should be eligible for exile"
++            );
++            assert!(
++                cards.contains(&controller_giant_id),
++                "Controller's creature should be eligible for exile"
++            );
++
++            // Select the opponent's creature and the controller's creature
++            let selected = vec![opponent_bears_id, controller_giant_id];
++            runner
++                .act(GameAction::SelectCards { cards: selected })
++                .expect("SelectCards should succeed");
++        }
++        other => {
++            panic!("Expected EffectZoneChoice, got {:?}", other);
++        }
++    }
++
++    // Verify the outcome
++    let state = runner.state();
++
++    // Verify cards were exiled from both graveyards
++    assert_eq!(
++        state.players[0].graveyard.len(),
++        1,
++        "Controller's graveyard should have 1 card remaining (Angel) after exile"
++    );
++    assert_eq!(
++        state.players[1].graveyard.len(),
++        0,
++        "Opponent's graveyard should be empty after exile"
++    );
++    assert!(
++        state.exile.len() >= 2,
++        "At least 2 cards should be in exile"
++    );
++
++    // Verify Mimeoplasm is on the battlefield
++    let mimeoplasm_obj = state.objects.get(&mimeoplasm_id);
++    assert!(
++        mimeoplasm_obj.is_some_and(|obj| obj.zone == Zone::Battlefield),
++        "Mimeoplasm should be on the battlefield"
++    );
++
++    let mimeoplasm_obj = mimeoplasm_obj.expect("Mimeoplasm object should exist");
++
++    // The permanent should have copied the opponent's Grizzly Bears (index 0)
++    assert_eq!(
++        mimeoplasm_obj.name, "Grizzly Bears",
++        "Mimeoplasm should have copied the opponent's Grizzly Bears"
++    );
++
++    // Verify the permanent has +1/+1 counters equal to the controller's Hill Giant's power (3)
++    let plus_one_counters = mimeoplasm_obj
++        .counters
++        .iter()
++        .filter(|(counter_type, _count)| {
++            **counter_type == engine::types::counter::CounterType::Plus1Plus1
++        })
++        .map(|(_counter_type, count)| *count)
++        .sum::<u32>();
++    assert_eq!(
++        plus_one_counters, 3,
++        "Mimeoplasm should have 3 +1/+1 counters (equal to Hill Giant's power)"
++    );
++
++    println!("SUCCESS: Opponent graveyard exile test passed");
++}
++
++#[test]
++fn paycost_arm_exiles_cards_via_apply_as_current() {
++    // This test directly exercises the PayCost arm by:
++    // 1. Setting up a GameState with 3 cards in graveyard
++    // 2. Manually setting WaitingFor::EffectZoneChoice with PayCost
++    // 3. Calling apply_as_current with SelectCards
++    // 4. Verifying the cards are exiled (not just selected)
++    //
++    // This test will fail if the PayCost arm is removed, because
++    // apply_as_current would return "EffectZoneChoice unsupported
++    // for PayCost" from the catch-all.
++
++    let mut scenario = GameScenario::new();
++
++    // Add 3 creatures to P0's battlefield, then move to graveyard
++    let bears_id = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
++    let giant_id = scenario.add_creature(P0, "Hill Giant", 3, 3).id();
++    let angel_id = scenario.add_creature(P0, "Serra Angel", 4, 4).id();
++
++    let mut runner = scenario.build();
++
++    // Move them to graveyard
++    let mut events = vec![];
++    zones::move_to_zone(runner.state_mut(), bears_id, Zone::Graveyard, &mut events);
++    zones::move_to_zone(runner.state_mut(), giant_id, Zone::Graveyard, &mut events);
++    zones::move_to_zone(runner.state_mut(), angel_id, Zone::Graveyard, &mut events);
++
++    // Verify they're in graveyard
++    let state = runner.state();
++    assert_eq!(state.players[0].graveyard.len(), 3);
++
++    // Manually set WaitingFor::EffectZoneChoice with PayCost
++    {
++        let state = runner.state_mut();
++        state.waiting_for = WaitingFor::EffectZoneChoice {
++            player: P0,
++            cards: vec![bears_id, giant_id, angel_id],
++            count: 2,
++            min_count: 0,
++            up_to: false,
++            source_id: ObjectId(100),
++            effect_kind: EffectKind::PayCost,
++            zone: Zone::Graveyard,
++            destination: Some(Zone::Exile),
++            enter_tapped: EtbTapState::Unspecified,
++            enter_transformed: false,
++            enters_under_player: None,
++            enters_attacking: false,
++            owner_library: false,
++            track_exiled_by_source: true,
++            face_down_profile: None,
++            count_param: 0,
++            is_cost_payment: true,
++        };
++    }
++
++    // Call apply_as_current with SelectCards
++    let result = runner.act(GameAction::SelectCards {
++        cards: vec![bears_id, giant_id],
++    });
++
++    // This will fail with "EffectZoneChoice unsupported for PayCost" if the PayCost arm is missing
++    assert!(
++        result.is_ok(),
++        "apply_as_current should succeed with PayCost arm"
++    );
++
++    // Verify the cards were exiled (not just selected)
++    let state = runner.state();
++    assert_eq!(
++        state.players[0].graveyard.len(),
++        1, // Only Serra Angel should remain
++        "Two cards should have been exiled, leaving 1 in graveyard"
++    );
++
++    // Verify the exiled cards are in exile zone
++    assert!(
++        state.exile.len() >= 2,
++        "At least 2 cards should be in exile"
++    );
++}
+diff --git a/crates/mtgish-import/src/convert/condition.rs b/crates/mtgish-import/src/convert/condition.rs
+index 91461ad326..328dfdd697 100644
+--- a/crates/mtgish-import/src/convert/condition.rs
++++ b/crates/mtgish-import/src/convert/condition.rs
+@@ -1072,6 +1072,7 @@ fn target_filter_variant_name(f: &TargetFilter) -> &'static str {
+         TargetFilter::SpecificPlayer { .. } => "SpecificPlayer",
+         TargetFilter::Neighbor { .. } => "Neighbor",
+         TargetFilter::AttachedTo => "AttachedTo",
++        TargetFilter::ExiledCardByIndex { .. } => "ExiledCardByIndex",
+         TargetFilter::LastCreated => "LastCreated",
+         TargetFilter::LastRevealed => "LastRevealed",
+         TargetFilter::CostPaidObject => "CostPaidObject",
+diff --git a/crates/mtgish-import/src/convert/quantity.rs b/crates/mtgish-import/src/convert/quantity.rs
+index b15981e536..37f9a0d21f 100644
+--- a/crates/mtgish-import/src/convert/quantity.rs
++++ b/crates/mtgish-import/src/convert/quantity.rs
+@@ -109,6 +109,26 @@ pub fn convert(g: &GameNumber) -> ConvResult<QuantityExpr> {
+             ),
+         },
+ 
++        // CR 406.6: The power of a specific card exiled by the source.
++        // Used by The Mimeoplasm to read the second exiled card's power.
++        GameNumber::PowerOfExiledCard(card_in_exile) => {
++            let index = match &**card_in_exile {
++                CardInExile::TheFirstCardExiledThisWay => 0,
++                CardInExile::TheSecondCardExiledThisWay => 1,
++                _ => {
++                    return Err(ConversionGap::EnginePrerequisiteMissing {
++                        engine_type: "QuantityRef",
++                        needed_variant: format!(
++                            "PowerOfExiledCard with CardInExile: {card_in_exile:?}"
++                        ),
++                    });
++                }
++            };
++            QuantityExpr::Ref {
++                qty: QuantityRef::ExiledCardPower { index },
++            }
++        }
++
+         // CR 601.2h + CR 202.2: Sunburst / Converge.
+         GameNumber::TheNumberOfColorsOfManaSpentToCastSpell(spell) => match &**spell {
+             Spell::ThisSpell => mana_spent_quantity(
+@@ -1494,6 +1514,21 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn power_of_exiled_card_converts_to_exiled_card_power() {
++        let converted = convert(&GameNumber::PowerOfExiledCard(Box::new(
++            CardInExile::TheSecondCardExiledThisWay,
++        )))
++        .unwrap();
++
++        assert_eq!(
++            converted,
++            QuantityExpr::Ref {
++                qty: QuantityRef::ExiledCardPower { index: 1 },
++            }
++        );
++    }
++
+     #[test]
+     fn total_noncombat_damage_dealt_to_opponents_this_turn_maps_to_damage_ledger() {
+         let converted = convert(&GameNumber::TotalNoncombatDamageDealtToPlayersThisTurn(
+diff --git a/crates/mtgish-import/src/convert/replacement.rs b/crates/mtgish-import/src/convert/replacement.rs
+index 06cac274c5..a7b200895e 100644
+--- a/crates/mtgish-import/src/convert/replacement.rs
++++ b/crates/mtgish-import/src/convert/replacement.rs
+@@ -27,7 +27,7 @@ use crate::convert::quantity;
+ use crate::convert::result::{ConvResult, ConversionGap};
+ use crate::convert::static_effect;
+ use crate::schema::types::{
+-    Condition, CopyEffect, CopyEffects, CounterType, DamageRecipientsList, Expiration,
++    CardInExile, Condition, CopyEffect, CopyEffects, CounterType, DamageRecipientsList, Expiration,
+     FutureReplacableEventWouldDealDamage, GameNumber, Permanent, Permanents, Player, Players,
+     ReplacableEventWouldDealDamage, ReplacableEventWouldDraw, ReplacableEventWouldEnter,
+     ReplacableEventWouldGainLife, ReplacableEventWouldPutCounters,
+@@ -1405,6 +1405,85 @@ fn convert_enter_cost(cost: &ReplacementActionWouldEnterCost) -> ConvResult<Abil
+         ReplacementActionWouldEnterCost::PayLife(amount) => AbilityCost::PayLife {
+             amount: quantity::convert(amount)?,
+         },
++        ReplacementActionWouldEnterCost::ExileTwoCardsFromAmongPlayersGraveyards(
++            cards,
++            players,
++        ) => {
++            let controller = players_to_controller(players)?;
++            // Convert CardsInGraveyard to a basic filter - for now, just use creature cards
++            let card_filter = match cards {
++                crate::schema::types::CardsInGraveyard::IsCardtype(
++                    crate::schema::types::CardType::Creature,
++                ) => TargetFilter::Typed(TypedFilter::creature()),
++                _ => {
++                    return Err(ConversionGap::EnginePrerequisiteMissing {
++                        engine_type: "AbilityCost",
++                        needed_variant: format!("CardsInGraveyard variant: {cards:?}"),
++                    });
++                }
++            };
++            // Combine the card filter with the controller constraint from Players
++            let filter = match controller {
++                ControllerRef::You => {
++                    // "from among players' graveyards" when Players = You means "your graveyard"
++                    Some(TargetFilter::And {
++                        filters: vec![
++                            card_filter,
++                            TargetFilter::Typed(
++                                TypedFilter::default()
++                                    .controller(ControllerRef::You)
++                                    .properties(vec![FilterProp::InZone {
++                                        zone: Zone::Graveyard,
++                                    }]),
++                            ),
++                        ],
++                    })
++                }
++                ControllerRef::Opponent => {
++                    // "from among players' graveyards" when Players = Opponent means "opponents' graveyards"
++                    Some(TargetFilter::And {
++                        filters: vec![
++                            card_filter,
++                            TargetFilter::Typed(
++                                TypedFilter::default()
++                                    .controller(ControllerRef::Opponent)
++                                    .properties(vec![FilterProp::InZone {
++                                        zone: Zone::Graveyard,
++                                    }]),
++                            ),
++                        ],
++                    })
++                }
++                ControllerRef::TargetPlayer => {
++                    // Targeted player scope - defer to interactive selection
++                    Some(TargetFilter::And {
++                        filters: vec![
++                            card_filter,
++                            TargetFilter::Typed(
++                                TypedFilter::default()
++                                    .controller(ControllerRef::TargetPlayer)
++                                    .properties(vec![FilterProp::InZone {
++                                        zone: Zone::Graveyard,
++                                    }]),
++                            ),
++                        ],
++                    })
++                }
++                _ => {
++                    // Other scopes (ScopedPlayer, ParentTargetController, etc.) not expected for this cost
++                    return Err(ConversionGap::MalformedIdiom {
++                        idiom: "ExileTwoCardsFromAmongPlayersGraveyards",
++                        path: String::new(),
++                        detail: format!("Unsupported Players axis: {controller:?}"),
++                    });
++                }
++            };
++            AbilityCost::Exile {
++                count: 2,
++                zone: Some(Zone::Graveyard),
++                filter,
++            }
++        }
+         other => {
+             return Err(ConversionGap::EnginePrerequisiteMissing {
+                 engine_type: "AbilityCost",
+@@ -1946,12 +2025,23 @@ fn build_replacement_exec(
+         // `Unless` and `MayActions` are handled by the early-return guards above.
+         A::Unless(_, _) => unreachable!("Unless handled by early-return guard"),
+         A::MayActions(_) => unreachable!("MayActions handled by early-return guard"),
++        // CR 707.2: Enter as a copy of a specific card exiled by the source.
++        // Used by The Mimeoplasm to copy the first exiled card.
++        A::EnterAsCopyOfExiled(card_in_exile, copy_effects) => {
++            let target = convert_card_in_exile_to_target_filter(card_in_exile)?;
++            let additional_modifications = convert_copy_effects(copy_effects)?;
++            Effect::BecomeCopy {
++                target,
++                duration: None,
++                mana_value_limit: None,
++                additional_modifications,
++            }
++        }
+         // CR 707.x / CR 614.12: Remaining copy-source zones plus face-down /
+         // transformed / attached / attacking / blocking modifier shapes need
+         // dedicated engine primitives or converter-side source filters.
+         A::EnterAsACopyOfACardInAPlayersGraveyard(_, _, _)
+         | A::EnterAsACopyOfACardInExile(_, _)
+-        | A::EnterAsCopyOfExiled(_, _)
+         | A::EntersAsFaceDownArtifactCreature(_, _)
+         | A::EntersAsFaceDownCreatureWithAbilitiesAndNotedName(_, _, _)
+         | A::EntersAsFaceDownLand(_)
+@@ -2009,6 +2099,17 @@ fn build_replacement_exec(
+ /// `Effect::BecomeCopy.additional_modifications` channel. Unsupported
+ /// "keep original characteristic" shapes strict-fail because they need a
+ /// source-relative override primitive, not a no-op.
++fn convert_card_in_exile_to_target_filter(card: &CardInExile) -> ConvResult<TargetFilter> {
++    match card {
++        CardInExile::TheFirstCardExiledThisWay => Ok(TargetFilter::ExiledCardByIndex { index: 0 }),
++        CardInExile::TheSecondCardExiledThisWay => Ok(TargetFilter::ExiledCardByIndex { index: 1 }),
++        _ => Err(ConversionGap::EnginePrerequisiteMissing {
++            engine_type: "TargetFilter",
++            needed_variant: format!("CardInExile variant: {card:?}"),
++        }),
++    }
++}
++
+ fn convert_copy_effects(effects: &CopyEffects) -> ConvResult<Vec<ContinuousModification>> {
+     let list = match effects {
+         CopyEffects::NoCopyEffects => return Ok(Vec::new()),
+@@ -3123,9 +3224,10 @@ mod tests {
+ 
+     use super::*;
+     use crate::schema::types::{
+-        CardType, Condition, CopyEffect, CopyEffects, FutureReplacableEventWouldDealDamage,
+-        GameNumber, Permanent, Permanents, ReplacementActionWouldDealDamage,
+-        ReplacementActionWouldEnter, Rule, SingleDamageSource, SuperType,
++        CardInExile, CardType, Condition, CopyEffect, CopyEffects,
++        FutureReplacableEventWouldDealDamage, GameNumber, Permanent, Permanents, Player, Players,
++        ReplacementActionWouldDealDamage, ReplacementActionWouldEnter, Rule, SingleDamageSource,
++        SuperType,
+     };
+ 
+     #[test]
+@@ -3565,4 +3667,57 @@ mod tests {
+                 })
+         )));
+     }
++
++    #[test]
++    fn exile_two_cards_from_graveyards_cost_converts_to_exile_cost() {
++        use crate::schema::types::{CardType, CardsInGraveyard, Player, Players};
++
++        let cost = ReplacementActionWouldEnterCost::ExileTwoCardsFromAmongPlayersGraveyards(
++            CardsInGraveyard::IsCardtype(CardType::Creature),
++            Box::new(Players::SinglePlayer(Box::new(Player::You))),
++        );
++        let result = convert_enter_cost(&cost);
++        assert!(result.is_ok());
++        let ability_cost = result.unwrap();
++        assert!(matches!(
++            ability_cost,
++            AbilityCost::Exile {
++                count: 2,
++                zone: Some(Zone::Graveyard),
++                filter: Some(_),
++            }
++        ));
++    }
++
++    #[test]
++    fn enter_as_copy_of_exiled_converts_to_become_copy_with_indexed_filter() {
++        use crate::schema::types::CopyEffects;
++
++        let action = ReplacementActionWouldEnter::EnterAsCopyOfExiled(
++            CardInExile::TheFirstCardExiledThisWay,
++            CopyEffects::NoCopyEffects,
++        );
++        let def = build_replacement_exec(&action, &TargetFilter::SelfRef)
++            .unwrap()
++            .2;
++        assert!(matches!(
++            &*def.effect,
++            Effect::BecomeCopy {
++                target: TargetFilter::ExiledCardByIndex { index: 0 },
++                ..
++            }
++        ));
++    }
++
++    #[test]
++    fn card_in_exile_to_target_filter_maps_indices_correctly() {
++        assert!(matches!(
++            convert_card_in_exile_to_target_filter(&CardInExile::TheFirstCardExiledThisWay),
++            Ok(TargetFilter::ExiledCardByIndex { index: 0 })
++        ));
++        assert!(matches!(
++            convert_card_in_exile_to_target_filter(&CardInExile::TheSecondCardExiledThisWay),
++            Ok(TargetFilter::ExiledCardByIndex { index: 1 })
++        ));
++    }
+ }
+diff --git a/crates/server-core/src/filter.rs b/crates/server-core/src/filter.rs
+index 97e74a68e6..8a2feb847e 100644
+--- a/crates/server-core/src/filter.rs
++++ b/crates/server-core/src/filter.rs
+@@ -343,6 +343,7 @@ mod tests {
+             track_exiled_by_source: false,
+             face_down_profile: None,
+             count_param: 0,
++            is_cost_payment: false,
+         };
+ 
+         let filtered = filter_state_for_player(&state, PlayerId(1));

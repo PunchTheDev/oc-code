@@ -1,0 +1,443 @@
+diff --git a/docs/operations.md b/docs/operations.md
+index 9541012e..bb010097 100644
+--- a/docs/operations.md
++++ b/docs/operations.md
+@@ -47,6 +47,14 @@ Tensorplex `subnet-docs`, and Taopedia articles. Set `GITHUB_TOKEN` or
+ refreshes; scheduled sync and publish workflows already pass `GITHUB_TOKEN`
+ from GitHub Actions.
+ 
++Discovery also probes every known base origin (discovered project websites
++plus existing `subnet-api`/`docs` surfaces) for an OpenAPI/Swagger spec at
++conventional paths, registering an `openapi` candidate only on a validated
++document. These are read-only `GET`s with a per-request timeout, a 2 MiB body
++cap, and the private-IP/unsafe-URL block, run at concurrency 8 and
++short-circuiting on the first hit per origin — so each refresh makes live
++requests to all known origins.
++
+ Live health probes are only written when explicitly enabled:
+ 
+ ```bash
+diff --git a/scripts/discover-candidates.mjs b/scripts/discover-candidates.mjs
+index 26c13282..7c832039 100644
+--- a/scripts/discover-candidates.mjs
++++ b/scripts/discover-candidates.mjs
+@@ -8,6 +8,8 @@ import {
+   loadProviders,
+   loadSubnets,
+   nativeDisplayName,
++  OPENAPI_PROBE_PATHS,
++  probeOpenApiSpec,
+   readJson,
+   README_KIND_LIMITS,
+   README_LINK_LIMIT,
+@@ -53,6 +55,17 @@ const netuidsWithProjectDocs = new Set(
+     )
+     .map((overlay) => overlay.netuid),
+ );
++// Subnets that already expose an `openapi` surface — nothing to auto-discover.
++const netuidsWithOpenapi = new Set(
++  existingOverlays
++    .filter((overlay) =>
++      (overlay.surfaces || []).some((surface) => surface.kind === "openapi"),
++    )
++    .map((overlay) => overlay.netuid),
++);
++// Body cap for an OpenAPI spec probe — generous enough for real specs while
++// bounding what a hostile path can stream back into the discovery process.
++const OPENAPI_SPEC_PROBE_MAX_BYTES = 2 * 1024 * 1024;
+ const candidatesByKey = new Map();
+ const candidateIds = new Set();
+ const warnings = [];
+@@ -68,6 +81,13 @@ await discoverUniversalTaoMarketCapDashboards();
+ await discoverUniversalBackpropFinanceDashboards();
+ await discoverUniversalTaostatsMetagraphDashboards();
+ await discoverUniversalSubnetRadarDashboards();
++// OpenAPI auto-discovery probes already-known API/docs surfaces (local overlay
++// data) plus the discovered project websites, so it runs UNCONDITIONALLY —
++// independent of whether the flaky third-party index sources fell back to
++// restore mode — and before the website pass so a probe-confirmed spec wins the
++// de-dupe over the blind common-path guess (addCommonApiPathCandidates) for the
++// same URL. It is always freshly probed, so it is not part of the restore set.
++await discoverOpenApiSpecs();
+ if (restoredProviders.size === 0) {
+   await discoverFromGithubReadmes();
+   await discoverFromProjectWebsites();
+@@ -762,6 +782,115 @@ function addCommonApiPathCandidates(candidate, root) {
+   }
+ }
+ 
++// #1004 — actively probe conventional OpenAPI/Swagger paths on each known base
++// origin and register an `openapi` candidate only when a path returns a VALID
++// spec document. Unlike the blind common-path guesses (addCommonApiPathCandidates),
++// these are confirmed by a safe, body-capped probe, so they enter at `medium`
++// confidence and feed the same verification + promotion + snapshot-openapi
++// pipeline as every other candidate.
++async function discoverOpenApiSpecs() {
++  await mapLimit(collectOpenApiBaseOrigins(), 8, async (target) => {
++    const match = await probeOpenApiSpec(
++      target.origin,
++      OPENAPI_PROBE_PATHS,
++      fetchOpenApiCandidate,
++    );
++    if (!match) {
++      return;
++    }
++    let hostSlug;
++    try {
++      hostSlug = slugify(new URL(target.origin).hostname);
++    } catch {
++      hostSlug = slugify(target.origin);
++    }
++    addCandidate({
++      id: `sn-${target.netuid}-openapi-probe-${hostSlug}`,
++      netuid: target.netuid,
++      name: `${displayNameForNetuid(target.netuid)} OpenAPI schema`,
++      kind: "openapi",
++      url: match.url,
++      source_url: target.origin,
++      source_type: "openapi-probe",
++      source_tier: "provider-claimed",
++      confidence: "medium",
++      provider: target.provider,
++      review_notes:
++        "OpenAPI/Swagger document confirmed by a safe probe (validated spec structure) at a conventional path. Requires maintainer review before promotion.",
++    });
++  });
++}
++
++// Distinct (netuid, provider, origin) base origins worth probing for a spec: the
++// project websites we have discovered plus any API/docs surfaces already known
++// for the subnet (specs frequently live on an `api.` subdomain, not the
++// marketing site). Subnets that already expose an `openapi` surface are skipped,
++// and a candidate with no resolvable provider is dropped (provider is required).
++function collectOpenApiBaseOrigins() {
++  const seen = new Set();
++  const targets = [];
++  const add = (netuid, provider, rawUrl) => {
++    if (netuid == null || !provider || netuidsWithOpenapi.has(netuid)) {
++      return;
++    }
++    const normalized = normalizePublicUrl(rawUrl);
++    if (!normalized) {
++      return;
++    }
++    let origin;
++    try {
++      const parsed = new URL(normalized);
++      if (isGenericHost(parsed.hostname)) {
++        return;
++      }
++      origin = parsed.origin;
++    } catch {
++      return;
++    }
++    const key = `${netuid}:${origin}`;
++    if (seen.has(key)) {
++      return;
++    }
++    seen.add(key);
++    targets.push({ netuid, provider, origin });
++  };
++
++  for (const candidate of candidatesByKey.values()) {
++    if (candidate.kind === "website") {
++      add(candidate.netuid, candidate.provider, candidate.url);
++    }
++  }
++  for (const overlay of existingOverlays) {
++    const provider = selectOverlayProvider(overlay);
++    for (const surface of overlay.surfaces || []) {
++      if (surface.kind === "subnet-api" || surface.kind === "docs") {
++        add(overlay.netuid, provider, surface.url);
++      }
++    }
++  }
++  return targets;
++}
++
++// Safe, body-capped JSON fetch for the spec probe: returns the parsed document
++// or null on any non-200, oversized, non-JSON, or unsafe/blocked response.
++// Delegates to fetchText, which enforces the timeout, byte cap, and
++// private-IP/unsafe-URL block (via fetchWithSafeRedirects).
++async function fetchOpenApiCandidate(url) {
++  const result = await fetchText(url, {
++    accept: "application/json",
++    maxBytes: OPENAPI_SPEC_PROBE_MAX_BYTES,
++    warn: false,
++  });
++  if (!result || result.status_code !== 200 || !result.text) {
++    return null;
++  }
++  try {
++    return JSON.parse(result.text);
++  } catch {
++    return null;
++  }
++}
++
+ function isCommunityDocsProvider(provider) {
+   return ["taopedia-articles", "tensorplex-subnet-docs"].includes(provider);
+ }
+diff --git a/scripts/lib.mjs b/scripts/lib.mjs
+index 7c4102c8..8924d783 100644
+--- a/scripts/lib.mjs
++++ b/scripts/lib.mjs
+@@ -1108,6 +1108,74 @@ export function isHtmlContentType(value) {
+     .includes("html");
+ }
+ 
++// Conventional, read-only paths where a subnet or provider commonly exposes a
++// machine-readable OpenAPI 3.x (or legacy Swagger 2.0) document. Auto-discovery
++// (#1004) probes these on each known base origin to surface callable APIs the
++// registry can then validate, capture, and promote.
++export const OPENAPI_PROBE_PATHS = Object.freeze([
++  "/openapi.json",
++  "/swagger.json",
++  "/swagger/v1/swagger.json",
++  "/docs/openapi.json",
++  "/api/openapi.json",
++  "/api/v1/openapi.json",
++  "/v1/openapi.json",
++  "/.well-known/openapi.json",
++]);
++
++// Structural check that a parsed JSON value is a genuine OpenAPI/Swagger
++// document — not merely some JSON served at /openapi.json. Requires the version
++// marker plus the `info` and `paths` objects every spec carries, so a stray
++// config or error body never registers as a callable API. Pure + side-effect
++// free, so it is exhaustively unit-testable.
++export function isOpenApiDocument(body) {
++  if (!body || typeof body !== "object" || Array.isArray(body)) {
++    return false;
++  }
++  const version =
++    typeof body.openapi === "string"
++      ? body.openapi
++      : typeof body.swagger === "string"
++        ? body.swagger
++        : null;
++  // OpenAPI reports "3.x.y"; Swagger reports "2.0". Reject anything else.
++  if (!version || !/^[23]\.\d/.test(version)) {
++    return false;
++  }
++  const isPlainObject = (value) =>
++    Boolean(value) && typeof value === "object" && !Array.isArray(value);
++  return isPlainObject(body.info) && isPlainObject(body.paths);
++}
++
++// Probe an ordered list of candidate spec paths on `origin`, returning the first
++// whose body is a valid OpenAPI/Swagger document as `{ url, document }`, or null
++// if none match. `fetcher(url)` owns all network + safety concerns (timeout,
++// body cap, private-IP/unsafe-URL block) and returns the parsed JSON body or
++// null; keeping it injectable leaves this orchestration pure and mock-driven in
++// tests. A fetcher that throws is treated as a miss for that path, so one bad
++// path never aborts the sweep.
++export async function probeOpenApiSpec(origin, paths, fetcher) {
++  let base;
++  try {
++    base = new URL(origin);
++  } catch {
++    return null;
++  }
++  for (const specPath of paths) {
++    const url = new URL(specPath, base).toString();
++    let body;
++    try {
++      body = await fetcher(url);
++    } catch {
++      continue;
++    }
++    if (isOpenApiDocument(body)) {
++      return { url, document: body };
++    }
++  }
++  return null;
++}
++
+ export function buildTimestamp() {
+   return process.env.METAGRAPH_BUILD_TIMESTAMP || "1970-01-01T00:00:00.000Z";
+ }
+diff --git a/tests/openapi-discovery.test.mjs b/tests/openapi-discovery.test.mjs
+new file mode 100644
+index 00000000..cdaade68
+--- /dev/null
++++ b/tests/openapi-discovery.test.mjs
+@@ -0,0 +1,178 @@
++// Unit tests for the OpenAPI auto-discovery core (#1004): the pure spec
++// validator and the path-sweep orchestrator that the discover-candidates script
++// drives with a real safe-fetch. Both live in scripts/lib.mjs so the probing
++// logic is exercised here with mocked fetchers (no network).
++import assert from "node:assert/strict";
++import { describe, test } from "vitest";
++import {
++  OPENAPI_PROBE_PATHS,
++  isOpenApiDocument,
++  probeOpenApiSpec,
++} from "../scripts/lib.mjs";
++
++describe("isOpenApiDocument", () => {
++  test("accepts a minimal OpenAPI 3.x document", () => {
++    assert.equal(
++      isOpenApiDocument({
++        openapi: "3.1.0",
++        info: { title: "x", version: "1" },
++        paths: {},
++      }),
++      true,
++    );
++  });
++
++  test("accepts a legacy Swagger 2.0 document", () => {
++    assert.equal(
++      isOpenApiDocument({
++        swagger: "2.0",
++        info: { title: "x", version: "1" },
++        paths: { "/a": {} },
++      }),
++      true,
++    );
++  });
++
++  test("rejects non-objects and arrays", () => {
++    for (const value of [
++      null,
++      undefined,
++      42,
++      "openapi",
++      [],
++      [{ openapi: "3.0.0" }],
++    ]) {
++      assert.equal(isOpenApiDocument(value), false);
++    }
++  });
++
++  test("rejects an absent, wrong, or non-string version marker", () => {
++    assert.equal(isOpenApiDocument({ info: {}, paths: {} }), false);
++    assert.equal(
++      isOpenApiDocument({ openapi: "1.0", info: {}, paths: {} }),
++      false,
++    );
++    assert.equal(isOpenApiDocument({ openapi: 3, info: {}, paths: {} }), false);
++    assert.equal(
++      isOpenApiDocument({ swagger: "abc", info: {}, paths: {} }),
++      false,
++    );
++  });
++
++  test("rejects when info or paths is missing or not a plain object", () => {
++    assert.equal(isOpenApiDocument({ openapi: "3.0.0", paths: {} }), false);
++    assert.equal(isOpenApiDocument({ openapi: "3.0.0", info: {} }), false);
++    assert.equal(
++      isOpenApiDocument({ openapi: "3.0.0", info: {}, paths: [] }),
++      false,
++    );
++    assert.equal(
++      isOpenApiDocument({ openapi: "3.0.0", info: null, paths: {} }),
++      false,
++    );
++  });
++});
++
++describe("probeOpenApiSpec", () => {
++  const spec = {
++    openapi: "3.0.0",
++    info: { title: "t", version: "1" },
++    paths: {},
++  };
++
++  test("returns the first path that yields a valid spec and stops there", async () => {
++    const seen = [];
++    const fetcher = async (url) => {
++      seen.push(url);
++      return url.endsWith("/api/openapi.json") ? spec : null;
++    };
++    const result = await probeOpenApiSpec(
++      "https://api.example.com",
++      OPENAPI_PROBE_PATHS,
++      fetcher,
++    );
++    assert.ok(result);
++    assert.equal(result.url, "https://api.example.com/api/openapi.json");
++    assert.deepEqual(result.document, spec);
++    // Short-circuits on the hit — never probes the paths after it.
++    assert.equal(seen.at(-1), "https://api.example.com/api/openapi.json");
++    assert.ok(!seen.includes("https://api.example.com/v1/openapi.json"));
++  });
++
++  test("returns null when no path yields a valid spec", async () => {
++    const fetcher = async () => ({ not: "a spec" });
++    const result = await probeOpenApiSpec(
++      "https://example.com",
++      OPENAPI_PROBE_PATHS,
++      fetcher,
++    );
++    assert.equal(result, null);
++  });
++
++  test("treats a throwing fetcher as a miss for that path", async () => {
++    const fetcher = async (url) => {
++      if (url === "https://example.com/openapi.json") {
++        throw new Error("boom");
++      }
++      return url.endsWith("/swagger.json")
++        ? { swagger: "2.0", info: {}, paths: {} }
++        : null;
++    };
++    const result = await probeOpenApiSpec(
++      "https://example.com",
++      OPENAPI_PROBE_PATHS,
++      fetcher,
++    );
++    assert.ok(result);
++    assert.equal(result.url, "https://example.com/swagger.json");
++  });
++
++  test("returns null for an unparseable origin without fetching", async () => {
++    let called = false;
++    const fetcher = async () => {
++      called = true;
++      return spec;
++    };
++    const result = await probeOpenApiSpec(
++      "not a url",
++      OPENAPI_PROBE_PATHS,
++      fetcher,
++    );
++    assert.equal(result, null);
++    assert.equal(called, false);
++  });
++
++  test("joins each path against the origin", async () => {
++    const urls = [];
++    const fetcher = async (url) => {
++      urls.push(url);
++      return null;
++    };
++    await probeOpenApiSpec("https://example.com", ["/openapi.json"], fetcher);
++    assert.deepEqual(urls, ["https://example.com/openapi.json"]);
++  });
++});
++
++describe("OPENAPI_PROBE_PATHS", () => {
++  test("covers the conventional OpenAPI/Swagger spec locations", () => {
++    for (const probePath of [
++      "/openapi.json",
++      "/swagger.json",
++      "/swagger/v1/swagger.json",
++      "/docs/openapi.json",
++      "/api/openapi.json",
++      "/api/v1/openapi.json",
++      "/v1/openapi.json",
++      "/.well-known/openapi.json",
++    ]) {
++      assert.ok(
++        OPENAPI_PROBE_PATHS.includes(probePath),
++        `missing probe path ${probePath}`,
++      );
++    }
++  });
++
++  test("is frozen so the probe set cannot be mutated at runtime", () => {
++    assert.ok(Object.isFrozen(OPENAPI_PROBE_PATHS));
++  });
++});

@@ -1,0 +1,969 @@
+diff --git a/packages/gittensory-mcp/bin/gittensory-mcp.js b/packages/gittensory-mcp/bin/gittensory-mcp.js
+index 41a4f4f5..b2e81929 100755
+--- a/packages/gittensory-mcp/bin/gittensory-mcp.js
++++ b/packages/gittensory-mcp/bin/gittensory-mcp.js
+@@ -600,6 +600,20 @@ server.registerTool(
+   },
+ );
+ 
++server.registerTool(
++  "gittensory_remediation_plan",
++  {
++    description: "Analyze the current git branch and return an ordered public-safe remediation checklist with rerun conditions.",
++    inputSchema: currentBranchShape,
++  },
++  async (input) => {
++    const workspaceInput = await withClientWorkspaceRoots(input);
++    const payload = buildBranchAnalysisPayload({ ...workspaceInput, cwd: resolveWorkspaceCwd(workspaceInput).cwd });
++    const { localScorerStatus: _localScorerStatus, ...body } = payload;
++    return toolResult("Gittensory remediation plan.", await apiPost("/v1/local/remediation-plan", body));
++  },
++);
++
+ server.registerTool(
+   "gittensory_prepare_pr_packet",
+   {
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 4a4f920b..172002bd 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -131,6 +131,7 @@ import {
+   preflightBranchWithAgent,
+   startAgentRun,
+ } from "../services/agent-orchestrator";
++import { buildRemediationPlan } from "../services/remediation-plan";
+ import { explainScoreBreakdown } from "../services/score-breakdown";
+ import { buildMcpClientTelemetry } from "../services/client-telemetry";
+ import {
+@@ -2265,6 +2266,59 @@ export function createApp() {
+     return c.json(response);
+   });
+ 
++  app.post("/v1/local/remediation-plan", async (c) => {
++    const body = await c.req.json().catch(() => null);
++    const parsed = localBranchAnalysisSchema.safeParse(body);
++    if (!parsed.success) return c.json({ error: "invalid_local_branch_analysis_request", issues: parsed.error.issues }, 400);
++    const unauthorized = await requireContributorAccess(c, parsed.data.login);
++    if (unauthorized) return unauthorized;
++    const [context, repo, issues, pullRequests, recentMergedPullRequests, bounties, snapshot, issueQuality, repoManifest] = await Promise.all([
++      loadContributorFastContext(c.env, parsed.data.login),
++      getRepository(c.env, parsed.data.repoFullName),
++      listIssues(c.env, parsed.data.repoFullName),
++      listPullRequests(c.env, parsed.data.repoFullName),
++      listRecentMergedPullRequests(c.env, parsed.data.repoFullName),
++      listBountiesByRepo(c.env, parsed.data.repoFullName),
++      getOrCreateScoringModelSnapshot(c.env),
++      loadOrComputeIssueQualityResponse(c.env, parsed.data.repoFullName),
++      loadRepoFocusManifest(c.env, parsed.data.repoFullName),
++    ]);
++    const fit = buildContributorFit(context.profile, context.repositories, [], [], context.syncStates, context.repoStats);
++    const scoringProfile = buildContributorScoringProfile({ login: parsed.data.login, fit, scoringSnapshot: snapshot });
++    const checkSummaries = await loadCheckSummariesForPullRequests(c.env, parsed.data.repoFullName, parsed.data, pullRequests);
++    const analysisInput = parsed.data.focusManifest !== undefined || !repoManifest.present
++      ? parsed.data
++      : { ...parsed.data, focusManifest: repoManifest as unknown };
++    const analysis = buildLocalBranchAnalysis({
++      input: analysisInput,
++      repo,
++      issues,
++      pullRequests,
++      contributorPullRequests: context.contributorPullRequests,
++      recentMergedPullRequests,
++      bounties,
++      repositories: context.repositories,
++      checkSummaries,
++      profile: context.profile,
++      outcomeHistory: context.outcomeHistory,
++      scoringSnapshot: snapshot,
++      scoringProfile,
++      issueQuality: issueQuality?.report,
++      gittensorSnapshot: context.gittensorSnapshot,
++    });
++    return c.json(
++      buildRemediationPlan({
++        login: analysis.login,
++        repoFullName: analysis.repoFullName,
++        branchQualityBlockers: analysis.branchQualityBlockers,
++        accountStateBlockers: analysis.accountStateBlockers,
++        scoreBlockers: analysis.scoreBlockers,
++        recommendedRerunCondition: analysis.recommendedRerunCondition,
++        localFindings: analysis.localFindings,
++      }),
++    );
++  });
++
+   app.post("/v1/agent/runs", async (c) => {
+     const body = await c.req.json().catch(() => null);
+     const parsed = agentRunSchema.safeParse(body);
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index ec0c4396..be4d4bf0 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -52,6 +52,7 @@ import {
+ } from "../services/agent-orchestrator";
+ import { loadContributorDecisionPackForServing, repoDecisionFromPack } from "../services/decision-pack";
+ import { buildPublicPrBodyDraft } from "../services/pr-body-draft";
++import { buildRemediationPlan } from "../services/remediation-plan";
+ import { explainScoreBreakdown } from "../services/score-breakdown";
+ import { loadOrComputeIssueQualityResponse } from "../services/issue-quality";
+ import { loadOrComputeBurdenForecastResponse } from "../services/burden-forecast";
+@@ -533,6 +534,14 @@ const checkBeforeStartOutputSchema = {
+   report: z.unknown().optional(),
+ };
+ 
++const remediationPlanOutputSchema = {
++  repoFullName: z.string().optional(),
++  login: z.string().optional(),
++  summary: z.string().optional(),
++  recommendedRerunCondition: z.string().optional(),
++  items: z.unknown().optional(),
++};
++
+ const scoreBreakdownOutputSchema = {
+   repoFullName: z.string().optional(),
+   scoreabilityStatus: z.string().optional(),
+@@ -1087,6 +1096,17 @@ export class GittensoryMcp {
+       async (input) => this.toolResult(await this.localBranchSlice(input, "scoreBlockers")),
+     );
+ 
++    server.registerTool(
++      "gittensory_remediation_plan",
++      {
++        description:
++          "Turn local branch blocker lists into an ordered, deduplicated public-safe remediation checklist with rerun conditions. Metadata only.",
++        inputSchema: localBranchAnalysisShape,
++        outputSchema: remediationPlanOutputSchema,
++      },
++      async (input) => this.toolResult(await this.remediationPlan(input)),
++    );
++
+     server.registerTool(
+       "gittensory_prepare_pr_packet",
+       {
+@@ -1906,6 +1926,23 @@ export class GittensoryMcp {
+     };
+   }
+ 
++  private async remediationPlan(input: z.infer<z.ZodObject<typeof localBranchAnalysisShape>>): Promise<ToolPayload> {
++    const analysis = await this.analyzeLocalBranch(input);
++    const plan = buildRemediationPlan({
++      login: analysis.login,
++      repoFullName: analysis.repoFullName,
++      branchQualityBlockers: analysis.branchQualityBlockers,
++      accountStateBlockers: analysis.accountStateBlockers,
++      scoreBlockers: analysis.scoreBlockers,
++      recommendedRerunCondition: analysis.recommendedRerunCondition,
++      localFindings: analysis.localFindings,
++    });
++    return {
++      summary: `Gittensory remediation plan for ${analysis.login} in ${analysis.repoFullName}.`,
++      data: plan as unknown as Record<string, unknown>,
++    };
++  }
++
+   private async draftPrBody(input: z.infer<z.ZodObject<typeof localBranchAnalysisShape>>): Promise<ToolPayload> {
+     const analysis = await this.analyzeLocalBranch(input);
+     const draft = buildPublicPrBodyDraft(analysis);
+diff --git a/src/services/remediation-plan.ts b/src/services/remediation-plan.ts
+new file mode 100644
+index 00000000..2bdd6ed8
+--- /dev/null
++++ b/src/services/remediation-plan.ts
+@@ -0,0 +1,163 @@
++import { sanitizePublicComment } from "../github/commands";
++
++export type RemediationPlanSource = "account_state" | "branch_quality" | "score";
++
++export type RemediationPlanItem = {
++  rank: number;
++  source: RemediationPlanSource;
++  step: string;
++  rerunCondition: string;
++  impact: "high" | "medium";
++};
++
++export type RemediationPlan = {
++  repoFullName: string;
++  login: string;
++  summary: string;
++  recommendedRerunCondition: string;
++  items: RemediationPlanItem[];
++};
++
++export type RemediationPlanInput = {
++  login: string;
++  repoFullName: string;
++  branchQualityBlockers: string[];
++  accountStateBlockers: string[];
++  scoreBlockers: string[];
++  recommendedRerunCondition: string;
++  localFindings?: Array<{
++    code: string;
++    severity: "info" | "warning" | "critical";
++    title: string;
++    detail: string;
++    action?: string | undefined;
++  }>;
++};
++
++const FORBIDDEN_PATTERN =
++  /\b(reward\w*|wallet|hotkey|coldkey|mnemonic|farming|payout|ranking|raw[-_\s]?trust|trust[-_\s]?score|private[-_\s]?reviewability|reviewability)\b|\/Users\/|\/home\/|\/tmp\/|[A-Z]:[\\/]Users[\\/]/i;
++
++const SOURCE_PRIORITY: Record<RemediationPlanSource, number> = {
++  account_state: 0,
++  branch_quality: 1,
++  score: 2,
++};
++
++function publicSafeText(value: string): string {
++  const sanitized = sanitizePublicComment(value).trim();
++  if (!sanitized || FORBIDDEN_PATTERN.test(sanitized) || /^(?:private context\s*)+$/i.test(sanitized)) return "";
++  return sanitized;
++}
++
++function publicSafeRerunCondition(condition: string): string {
++  const sanitized = publicSafeText(condition);
++  if (!sanitized) return "Rerun after branch, base, or PR state changes before opening or submitting.";
++  return /eligibility|multiplier|scoreability|score/i.test(sanitized)
++    ? "Refresh linked issue and base branch metadata before submission."
++    : sanitized;
++}
++
++function normalizeKey(value: string): string {
++  return value.trim().toLowerCase().replace(/\s+/g, " ");
++}
++
++function actionForFinding(findings: RemediationPlanInput["localFindings"], title: string): string | undefined {
++  const match = findings?.find((finding) => normalizeKey(finding.title) === normalizeKey(title));
++  return match?.action ? publicSafeText(match.action) : undefined;
++}
++
++function rerunForAccountBlocker(blocker: string, fallback: string): string {
++  if (/open PR|concurrent|threshold/i.test(blocker)) {
++    return publicSafeRerunCondition("Rerun after pending PRs merge/close or open PR count is within the allowance.");
++  }
++  if (/credibility|history|maturity/i.test(blocker)) {
++    return publicSafeRerunCondition("Rerun after account/queue maturity blockers clear.");
++  }
++  return publicSafeRerunCondition(fallback);
++}
++
++function rerunForBranchBlocker(blocker: string, fallback: string): string {
++  if (/stale|fetch origin|base/i.test(blocker)) {
++    return publicSafeRerunCondition("Run `git fetch origin` and rerun branch analysis against the refreshed base.");
++  }
++  if (/validation|test|check/i.test(blocker)) {
++    return publicSafeRerunCondition("Rerun after fixing branch-quality blockers or adding explicit validation evidence.");
++  }
++  if (/linked issue|duplicate|eligibility/i.test(blocker)) {
++    return publicSafeRerunCondition("Refresh linked issue and base branch metadata before submission.");
++  }
++  return publicSafeRerunCondition(fallback);
++}
++
++function stepFromBlocker(source: RemediationPlanSource, blocker: string, findings: RemediationPlanInput["localFindings"]): string {
++  const findingAction = actionForFinding(findings, blocker);
++  if (findingAction) return findingAction;
++  const sanitized = publicSafeText(blocker);
++  if (sanitized) return sanitized;
++  if (source === "account_state") return "Clear account or queue maturity blockers before opening more work.";
++  if (source === "branch_quality") return "Resolve branch-quality findings before submission.";
++  return "Resolve scoreability blockers before relying on this preview.";
++}
++
++function impactFor(source: RemediationPlanSource, blocker: string): "high" | "medium" {
++  if (source === "account_state") return "high";
++  if (/GitHub checks|validation failed|maintainer-blocked|duplicate|ineligible/i.test(blocker)) return "high";
++  return source === "branch_quality" ? "high" : "medium";
++}
++
++function collectItems(input: RemediationPlanInput): Array<Omit<RemediationPlanItem, "rank">> {
++  const seen = new Set<string>();
++  const items: Array<Omit<RemediationPlanItem, "rank">> = [];
++  const push = (source: RemediationPlanSource, blocker: string) => {
++    const key = normalizeKey(blocker);
++    if (!key || seen.has(key)) return;
++    const step = stepFromBlocker(source, blocker, input.localFindings);
++    if (!step) return;
++    seen.add(key);
++    const rerunCondition =
++      source === "account_state"
++        ? rerunForAccountBlocker(blocker, input.recommendedRerunCondition)
++        : source === "branch_quality"
++          ? rerunForBranchBlocker(blocker, input.recommendedRerunCondition)
++          : publicSafeRerunCondition(input.recommendedRerunCondition);
++    items.push({
++      source,
++      step,
++      rerunCondition,
++      impact: impactFor(source, blocker),
++    });
++  };
++
++  for (const blocker of input.accountStateBlockers) push("account_state", blocker);
++  for (const blocker of input.branchQualityBlockers) push("branch_quality", blocker);
++  for (const blocker of input.scoreBlockers) push("score", blocker);
++
++  items.sort(
++    (left, right) =>
++      SOURCE_PRIORITY[left.source] - SOURCE_PRIORITY[right.source] ||
++      Number(right.impact === "high") - Number(left.impact === "high") ||
++      left.step.localeCompare(right.step),
++  );
++  return items;
++}
++
++/**
++ * Turn local branch blocker lists into an ordered, deduplicated remediation checklist.
++ * Steps and rerun conditions are public-safe for PR-body reuse.
++ */
++export function buildRemediationPlan(input: RemediationPlanInput): RemediationPlan {
++  const ordered = collectItems(input);
++  const items = ordered.map((item, index) => ({ ...item, rank: index + 1 }));
++  const summary =
++    items.length === 0
++      ? "No blockers detected; rerun after any branch, base, or PR state changes before opening or submitting."
++      : `${items.length} remediation step(s) ordered by impact; start with ${items[0]?.step ?? "the first listed item"}.`;
++
++  return {
++    repoFullName: input.repoFullName,
++    login: input.login,
++    summary: publicSafeText(summary),
++    recommendedRerunCondition: publicSafeRerunCondition(input.recommendedRerunCondition),
++    items,
++  };
++}
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 07092158..60ed7901 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -1277,6 +1277,38 @@ describe("api routes", () => {
+     });
+     expect(JSON.stringify(localBranchPayload.prPacket)).not.toMatch(/reward|score|wallet|hotkey|farming|payout|ranking|trust score/i);
+ 
++    const remediationPlan = await app.request(
++      "/v1/local/remediation-plan",
++      {
++        method: "POST",
++        headers: apiHeaders(env),
++        body: JSON.stringify({
++          login: "oktofeesh1",
++          repoFullName: "entrius/allways-ui",
++          baseRef: "origin/test",
++          headRef: "fix-cache",
++          branchName: "fix-cache-reconnect",
++          title: "Fix dashboard cache refresh after reconnect",
++          body: "Fixes #7",
++          labels: ["bug"],
++          changedFiles: [
++            { path: "src/cache.ts", additions: 42, deletions: 4, status: "modified" },
++            { path: "test/cache.test.ts", additions: 20, deletions: 0, status: "added" },
++          ],
++          validation: [{ command: "npm test -- cache", status: "failed", summary: "cache regression failed" }],
++          localScorer: { mode: "external_command", sourceTokenScore: 42, totalTokenScore: 66, sourceLines: 44, testTokenScore: 20 },
++          branchEligibility: { status: "eligible", source: "github_metadata", checkedAt: "2026-05-30T00:00:00.000Z" },
++        }),
++      },
++      env,
++    );
++    expect(remediationPlan.status).toBe(200);
++    await expect(remediationPlan.json()).resolves.toMatchObject({
++      login: "oktofeesh1",
++      repoFullName: "entrius/allways-ui",
++      items: expect.arrayContaining([expect.objectContaining({ rank: 1, step: expect.any(String), rerunCondition: expect.any(String) })]),
++    });
++
+     const localBranchWithMcpToken = await app.request(
+       "/v1/local/branch-analysis",
+       {
+@@ -1499,6 +1531,42 @@ describe("api routes", () => {
+     );
+     expect(noContributorScorePreview.status).toBe(200);
+ 
++    const scoreBreakdown = await app.request(
++      "/v1/scoring/explain-breakdown",
++      {
++        method: "POST",
++        headers: apiHeaders(env),
++        body: JSON.stringify({
++          repoFullName: "entrius/allways-ui",
++          contributorLogin: "oktofeesh1",
++          sourceTokenScore: 42,
++          totalTokenScore: 60,
++          sourceLines: 40,
++          openPrCount: 1,
++          linkedIssueMode: "standard",
++        }),
++      },
++      env,
++    );
++    expect(scoreBreakdown.status).toBe(200);
++    await expect(scoreBreakdown.json()).resolves.toMatchObject({
++      repoFullName: "entrius/allways-ui",
++      components: expect.arrayContaining([expect.objectContaining({ component: expect.any(String), lever: expect.any(String) })]),
++      highestLeverageLever: expect.objectContaining({ component: expect.any(String), lever: expect.any(String) }),
++    });
++
++    const missingContributorBreakdown = await app.request(
++      "/v1/scoring/explain-breakdown",
++      {
++        method: "POST",
++        headers: apiHeaders(env),
++        body: JSON.stringify({ repoFullName: "entrius/allways-ui", sourceTokenScore: 42 }),
++      },
++      env,
++    );
++    expect(missingContributorBreakdown.status).toBe(400);
++    await expect(missingContributorBreakdown.json()).resolves.toMatchObject({ error: "contributor_login_required" });
++
+     for (const [signalType, payload] of [
+       ["queue-health", { repoFullName: "entrius/allways-ui", signals: { openPullRequests: 2 } }],
+       ["config-quality", { repoFullName: "entrius/allways-ui", notObservedConfiguredLabels: ["refactor"] }],
+@@ -4481,6 +4549,7 @@ describe("api routes", () => {
+     expect(toolNames).toContain("gittensory_rank_local_next_actions");
+     expect(toolNames).toContain("gittensory_compare_local_variants");
+     expect(toolNames).toContain("gittensory_explain_local_blockers");
++    expect(toolNames).toContain("gittensory_remediation_plan");
+     expect(toolNames).toContain("gittensory_prepare_pr_packet");
+     expect(toolNames).toContain("gittensory_agent_plan_next_work");
+     expect(toolNames).toContain("gittensory_agent_start_run");
+diff --git a/test/integration/routes-errors.test.ts b/test/integration/routes-errors.test.ts
+index 7d30557c..fcab4022 100644
+--- a/test/integration/routes-errors.test.ts
++++ b/test/integration/routes-errors.test.ts
+@@ -252,7 +252,7 @@ describe("api route guards and error branches", () => {
+       branchName: "feature/private-work",
+       changedFiles: [{ path: "src/private.ts", additions: 4, deletions: 1, status: "modified" }],
+     };
+-    for (const path of ["/v1/local/branch-analysis", "/v1/agent/preflight-branch", "/v1/agent/prepare-pr-packet"] as const) {
++    for (const path of ["/v1/local/branch-analysis", "/v1/local/remediation-plan", "/v1/agent/preflight-branch", "/v1/agent/prepare-pr-packet"] as const) {
+       const response = await app.request(path, { method: "POST", headers: sessionHeaders, body: JSON.stringify(victimBranchPayload) }, env);
+       expect(response.status).toBe(403);
+       await expect(response.json()).resolves.toMatchObject({ error: "forbidden_contributor" });
+@@ -531,6 +531,7 @@ describe("api route guards and error branches", () => {
+     expect((await app.request("/v1/preflight/pr", { method: "POST", headers: apiHeaders(env), body: "{}" }, env)).status).toBe(400);
+     expect((await app.request("/v1/preflight/local-diff", { method: "POST", headers: apiHeaders(env), body: "{}" }, env)).status).toBe(400);
+     expect((await app.request("/v1/local/branch-analysis", { method: "POST", headers: apiHeaders(env), body: "{}" }, env)).status).toBe(400);
++    expect((await app.request("/v1/local/remediation-plan", { method: "POST", headers: apiHeaders(env), body: "{}" }, env)).status).toBe(400);
+     expect((await app.request("/v1/agent/runs/missing-run", { headers: apiHeaders(env) }, env)).status).toBe(404);
+     expect((await app.request("/v1/agent/runs", { headers: apiHeaders(env) }, env)).status).toBe(400);
+     expect((await app.request("/v1/agent/runs", { method: "POST", headers: apiHeaders(env), body: "{}" }, env)).status).toBe(400);
+diff --git a/test/unit/mcp-output-schemas.test.ts b/test/unit/mcp-output-schemas.test.ts
+index cb2a69f6..009a15e2 100644
+--- a/test/unit/mcp-output-schemas.test.ts
++++ b/test/unit/mcp-output-schemas.test.ts
+@@ -24,6 +24,7 @@ const TOOLS_WITH_OUTPUT_SCHEMA = [
+   "gittensory_get_registry_changes",
+   "gittensory_get_upstream_drift",
+   "gittensory_local_status",
++  "gittensory_remediation_plan",
+   "gittensory_explain_score_breakdown",
+ ];
+ 
+@@ -185,6 +186,29 @@ describe("MCP tool calls return schema-valid structured content", () => {
+     expect(JSON.stringify(data)).not.toMatch(/hotkey|coldkey|wallet|payout|reward/i);
+   });
+ 
++  it("gittensory_remediation_plan returns validated structured content", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "demo", full_name: "octo/demo", private: false, owner: { login: "octo" }, default_branch: "main" });
++    const { client } = await connectTestClient(env);
++    const result = await client.callTool({
++      name: "gittensory_remediation_plan",
++      arguments: {
++        login: "octo",
++        repoFullName: "octo/demo",
++        branchName: "feat/demo",
++        title: "Demo branch",
++        changedFiles: [{ path: "src/demo.ts", additions: 10, deletions: 1 }],
++        validation: [{ command: "npm test", status: "failed" }],
++      },
++    });
++    expect(result.isError).toBeFalsy();
++    const data = result.structuredContent as Record<string, unknown>;
++    expect(data.repoFullName).toBe("octo/demo");
++    expect(data.login).toBe("octo");
++    expect(Array.isArray(data.items)).toBe(true);
++    expect(typeof data.summary).toBe("string");
++  });
++
+   it("gittensory_explain_score_breakdown returns validated structured content", async () => {
+     const env = createTestEnv();
+     await upsertRepositoryFromGitHub(env, { name: "demo", full_name: "octo/demo", private: false, owner: { login: "octo" }, default_branch: "main" });
+@@ -208,6 +232,17 @@ describe("MCP tool calls return schema-valid structured content", () => {
+     expect(data.highestLeverageLever).toBeTruthy();
+   });
+ 
++  it("gittensory_explain_score_breakdown requires contributorLogin", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "demo", full_name: "octo/demo", private: false, owner: { login: "octo" }, default_branch: "main" });
++    const { client } = await connectTestClient(env);
++    const result = await client.callTool({
++      name: "gittensory_explain_score_breakdown",
++      arguments: { repoFullName: "octo/demo", sourceTokenScore: 40, totalTokenScore: 60, sourceLines: 80 },
++    });
++    expect(result.isError).toBe(true);
++  });
++
+   it("gittensory_lint_pr_text returns a deterministic verdict and fixes", async () => {
+     const { client } = await connectTestClient();
+     const weak = await client.callTool({ name: "gittensory_lint_pr_text", arguments: { commitMessages: ["wip"], prBody: "" } });
+diff --git a/test/unit/remediation-plan.test.ts b/test/unit/remediation-plan.test.ts
+new file mode 100644
+index 00000000..21103d8e
+--- /dev/null
++++ b/test/unit/remediation-plan.test.ts
+@@ -0,0 +1,279 @@
++import { describe, expect, it } from "vitest";
++import { buildRemediationPlan } from "../../src/services/remediation-plan";
++
++const FORBIDDEN = /\b(wallet|hotkey|coldkey|mnemonic|farming|payout|raw[-_\s]?trust)\b/i;
++
++describe("buildRemediationPlan", () => {
++  it("returns an ordered, deduplicated checklist with rerun conditions", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: ["Open PR count exceeds the current allowance (6/2)."],
++      branchQualityBlockers: ["Local validation failed", "GitHub checks need attention"],
++      scoreBlockers: ["Local validation failed", "Repo is not registered for Gittensor scoring"],
++      recommendedRerunCondition: "Rerun after fixing branch-quality blockers or adding explicit validation/linked-context evidence.",
++      localFindings: [
++        {
++          code: "failed_local_validation",
++          severity: "warning",
++          title: "Local validation failed",
++          detail: "1 validation command failed.",
++          action: "Fix validation before asking maintainers to review.",
++        },
++      ],
++    });
++
++    expect(plan.items.length).toBeGreaterThan(0);
++    expect(plan.items[0]?.source).toBe("account_state");
++    expect(plan.items[0]?.impact).toBe("high");
++    const steps = plan.items.map((item) => item.step);
++    expect(new Set(steps).size).toBe(steps.length);
++    expect(steps[0]).toBe("Open PR count exceeds the current allowance (6/2).");
++    expect(steps).toContain("Fix validation before asking maintainers to review.");
++    for (const item of plan.items) {
++      expect(item.rerunCondition.length).toBeGreaterThan(0);
++      expect(item.rank).toBeGreaterThan(0);
++    }
++    expect(JSON.stringify(plan)).not.toMatch(FORBIDDEN);
++  });
++
++  it("deduplicates overlapping branch-quality and score blockers", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: [],
++      branchQualityBlockers: ["Local validation failed", "Local validation failed"],
++      scoreBlockers: ["Local validation failed", "GitHub checks need attention"],
++      recommendedRerunCondition: "Rerun after fixing branch-quality blockers or adding explicit validation/linked-context evidence.",
++      localFindings: [
++        {
++          code: "failed_local_validation",
++          severity: "warning",
++          title: "Local validation failed",
++          detail: "1 validation command failed.",
++          action: "Fix validation before asking maintainers to review.",
++        },
++      ],
++    });
++
++    expect(plan.items).toHaveLength(2);
++    expect(plan.items[0]?.step).toBe("Fix validation before asking maintainers to review.");
++    expect(plan.items.map((item) => item.step)).toEqual(["Fix validation before asking maintainers to review.", "GitHub checks need attention"]);
++  });
++
++  it("returns a public-safe empty-state plan when no blockers are present", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      branchQualityBlockers: [],
++      accountStateBlockers: [],
++      scoreBlockers: [],
++      recommendedRerunCondition: "Rerun after any branch, base, or PR state changes before opening/submitting.",
++    });
++
++    expect(plan.items).toEqual([]);
++    expect(plan.summary).toMatch(/No blockers detected/i);
++    expect(plan.recommendedRerunCondition).toMatch(/branch, base, or PR state changes/i);
++    expect(JSON.stringify(plan)).not.toMatch(FORBIDDEN);
++  });
++
++  it("sanitizes scoreability language from rerun conditions", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: [],
++      branchQualityBlockers: ["Branch eligibility blocks linked-issue assumptions"],
++      scoreBlockers: [],
++      recommendedRerunCondition: "Rerun after branch/base eligibility metadata confirms eligibility or after linked issue assumptions change.",
++    });
++
++    expect(plan.recommendedRerunCondition).toMatch(/linked issue and base branch metadata/i);
++    expect(plan.recommendedRerunCondition).not.toMatch(/scoreability|multiplier/i);
++  });
++
++  it("maps blocker-specific rerun conditions and fallback steps", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: ["Open PR count exceeds threshold", "Contributor credibility history is still maturing"],
++      branchQualityBlockers: ["Local branch base is stale", "Linked issue is duplicate-prone", "GitHub checks need attention"],
++      scoreBlockers: ["wallet hotkey payout"],
++      recommendedRerunCondition: "Rerun after any branch, base, or PR state changes before opening/submitting.",
++    });
++
++    expect(plan.items.find((item) => item.source === "account_state" && /Open PR/i.test(item.step))?.rerunCondition).toMatch(/pending PRs merge\/close/i);
++    expect(plan.items.find((item) => /maturing/i.test(item.step))?.rerunCondition).toMatch(/account\/queue maturity blockers clear/i);
++    expect(plan.items.find((item) => /stale/i.test(item.step))?.rerunCondition).toMatch(/git fetch origin/i);
++    expect(plan.items.find((item) => /duplicate-prone/i.test(item.step))?.rerunCondition).toMatch(/linked issue and base branch metadata/i);
++    expect(plan.items.find((item) => /GitHub checks/i.test(item.step))?.rerunCondition).toMatch(/validation evidence/i);
++    expect(plan.items.find((item) => item.source === "score")?.step).toBe("Resolve scoreability blockers before relying on this preview.");
++    expect(JSON.stringify(plan)).not.toMatch(/\bwallet\b|\bhotkey\b|\bpayout\b/i);
++  });
++
++  it("covers fallback rerun and step branches for sanitized-only input", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: ["Repository allocation is inactive"],
++      branchQualityBlockers: ["wallet hotkey payout"],
++      scoreBlockers: [""],
++      recommendedRerunCondition: "scoreability multiplier eligibility score preview",
++    });
++
++    expect(plan.items.find((item) => item.source === "account_state")?.step).toBe("Repository allocation is inactive");
++    expect(plan.items.find((item) => item.source === "branch_quality")?.step).toBe("Resolve branch-quality findings before submission.");
++    expect(plan.recommendedRerunCondition).toMatch(/linked issue and base branch metadata/i);
++    expect(plan.summary).toMatch(/2 remediation step/i);
++  });
++
++  it("falls back when recommended rerun text is fully redacted", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: [],
++      branchQualityBlockers: ["Needs cleanup"],
++      scoreBlockers: [],
++      recommendedRerunCondition: "wallet hotkey payout reward farming",
++    });
++
++    expect(plan.recommendedRerunCondition).toMatch(/branch, base, or PR state changes/i);
++  });
++
++  it("uses account-state fallback copy when a blocker is fully redacted", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: ["wallet hotkey payout"],
++      branchQualityBlockers: [],
++      scoreBlockers: ["reward farming score preview"],
++      recommendedRerunCondition: "Rerun after any branch, base, or PR state changes before opening/submitting.",
++    });
++
++    expect(plan.items).toEqual([
++      expect.objectContaining({
++        source: "account_state",
++        step: "Clear account or queue maturity blockers before opening more work.",
++      }),
++      expect.objectContaining({
++        source: "score",
++        step: "Resolve scoreability blockers before relying on this preview.",
++      }),
++    ]);
++  });
++
++  it("skips blockers whose finding action and text are fully redacted", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: [],
++      branchQualityBlockers: ["wallet hotkey payout"],
++      scoreBlockers: [],
++      recommendedRerunCondition: "Rerun after any branch, base, or PR state changes before opening/submitting.",
++      localFindings: [
++        {
++          code: "forbidden_action",
++          severity: "warning",
++          title: "wallet hotkey payout",
++          detail: "forbidden detail",
++          action: "wallet hotkey payout",
++        },
++      ],
++    });
++
++    expect(plan.items).toEqual([
++      expect.objectContaining({
++        source: "branch_quality",
++        step: "Resolve branch-quality findings before submission.",
++      }),
++    ]);
++  });
++
++  it("falls back to public-safe copy when every blocker string is fully redacted", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: ["wallet hotkey payout"],
++      branchQualityBlockers: ["reward farming score preview"],
++      scoreBlockers: ["ranking raw trust score"],
++      recommendedRerunCondition: "wallet hotkey payout reward farming",
++    });
++
++    expect(plan.items).toEqual([
++      expect.objectContaining({ source: "account_state", step: "Clear account or queue maturity blockers before opening more work." }),
++      expect.objectContaining({ source: "branch_quality", step: "Resolve branch-quality findings before submission." }),
++      expect.objectContaining({ source: "score", step: "Resolve scoreability blockers before relying on this preview." }),
++    ]);
++    expect(plan.recommendedRerunCondition).toMatch(/branch, base, or PR state changes/i);
++  });
++
++  it("uses score-source rerun conditions and medium impact for generic score blockers", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: [],
++      branchQualityBlockers: [],
++      scoreBlockers: ["Branch preview confidence is low"],
++      recommendedRerunCondition: "Rerun after local validation passes.",
++    });
++
++    expect(plan.items).toEqual([
++      expect.objectContaining({
++        source: "score",
++        impact: "medium",
++        rerunCondition: "Rerun after local validation passes.",
++      }),
++    ]);
++  });
++
++  it("strips local filesystem paths from public remediation steps", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: [],
++      branchQualityBlockers: ["/Users/miner/project/src/demo.ts"],
++      scoreBlockers: [],
++      recommendedRerunCondition: "Rerun after any branch, base, or PR state changes before opening/submitting.",
++    });
++
++    expect(plan.items[0]?.step).toBe("Resolve branch-quality findings before submission.");
++  });
++
++  it("skips blank blocker entries during deduplication", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: ["   "],
++      branchQualityBlockers: [],
++      scoreBlockers: [],
++      recommendedRerunCondition: "Rerun after any branch, base, or PR state changes before opening/submitting.",
++    });
++
++    expect(plan.items).toEqual([]);
++  });
++
++  it("uses the recommended rerun condition for generic account-state blockers", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: ["Repository allocation is inactive"],
++      branchQualityBlockers: [],
++      scoreBlockers: [],
++      recommendedRerunCondition: "Rerun after registration completes.",
++    });
++
++    expect(plan.items[0]?.rerunCondition).toBe("Rerun after registration completes.");
++  });
++
++  it("uses the recommended rerun condition for generic branch-quality blockers", () => {
++    const plan = buildRemediationPlan({
++      login: "miner",
++      repoFullName: "octo/demo",
++      accountStateBlockers: [],
++      branchQualityBlockers: ["Needs cleanup"],
++      scoreBlockers: [],
++      recommendedRerunCondition: "Rerun after docs are updated.",
++    });
++
++    expect(plan.items[0]?.rerunCondition).toBe("Rerun after docs are updated.");
++  });
++});
+diff --git a/test/unit/routes-remediation-plan.test.ts b/test/unit/routes-remediation-plan.test.ts
+new file mode 100644
+index 00000000..143b67ca
+--- /dev/null
++++ b/test/unit/routes-remediation-plan.test.ts
+@@ -0,0 +1,118 @@
++import { describe, expect, it } from "vitest";
++import { createApp } from "../../src/api/routes";
++import { createSessionForGitHubUser } from "../../src/auth/security";
++import { upsertInstallation, upsertRepositoryFromGitHub } from "../../src/db/repositories";
++import { upsertRepoFocusManifest } from "../../src/signals/focus-manifest-loader";
++import { createTestEnv } from "../helpers/d1";
++
++const PATH = "/v1/local/remediation-plan";
++
++function apiHeaders(env: Env): Record<string, string> {
++  return {
++    authorization: `Bearer ${env.GITTENSORY_API_TOKEN}`,
++    "content-type": "application/json",
++  };
++}
++
++function branchPayload(login: string, repoFullName: string, extra?: Record<string, unknown>) {
++  return {
++    login,
++    repoFullName,
++    branchName: "feat/demo",
++    changedFiles: [{ path: "src/demo.ts", additions: 10, deletions: 1 }],
++    validation: [{ command: "npm test", status: "failed" }],
++    ...extra,
++  };
++}
++
++async function seedRepo(env: Env, owner: string, name: string, installationId: number): Promise<void> {
++  await upsertInstallation(env, {
++    installation: {
++      id: installationId,
++      account: { login: owner, id: installationId, type: "User" },
++      repository_selection: "selected",
++      permissions: { metadata: "read", contents: "read" },
++      events: ["repository"],
++    },
++  });
++  await upsertRepositoryFromGitHub(
++    env,
++    { name, full_name: `${owner}/${name}`, private: false, owner: { login: owner } },
++    installationId,
++  );
++}
++
++describe("remediation-plan route", () => {
++  it("returns 400 for invalid local branch analysis payloads", async () => {
++    const app = createApp();
++    const env = createTestEnv();
++    const response = await app.request(PATH, { method: "POST", headers: apiHeaders(env), body: "{}" }, env);
++    expect(response.status).toBe(400);
++    await expect(response.json()).resolves.toMatchObject({ error: "invalid_local_branch_analysis_request" });
++  });
++
++  it("returns forbidden_contributor when a session login does not match the payload login", async () => {
++    const app = createApp();
++    const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "attacker" });
++    await seedRepo(env, "owner", "private-repo", 301);
++    const { token } = await createSessionForGitHubUser(env, { login: "attacker", id: 7 });
++    const response = await app.request(
++      PATH,
++      {
++        method: "POST",
++        headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
++        body: JSON.stringify(branchPayload("victim", "owner/private-repo")),
++      },
++      env,
++    );
++    expect(response.status).toBe(403);
++    await expect(response.json()).resolves.toMatchObject({ error: "forbidden_contributor" });
++  });
++
++  it("honors caller-supplied focusManifest instead of loading the repo manifest", async () => {
++    const app = createApp();
++    const env = createTestEnv();
++    await seedRepo(env, "miner", "demo", 301);
++    const response = await app.request(
++      PATH,
++      {
++        method: "POST",
++        headers: apiHeaders(env),
++        body: JSON.stringify(
++          branchPayload("oktofeesh1", "miner/demo", {
++            focusManifest: { present: true, wantedPaths: ["src/"], source: "caller" },
++          }),
++        ),
++      },
++      env,
++    );
++    expect(response.status).toBe(200);
++    await expect(response.json()).resolves.toMatchObject({
++      login: "oktofeesh1",
++      repoFullName: "miner/demo",
++      items: expect.any(Array),
++    });
++  });
++
++  it("falls back to the persisted repo manifest when the caller omits focusManifest", async () => {
++    const app = createApp();
++    const env = createTestEnv();
++    await seedRepo(env, "miner", "demo", 301);
++    await upsertRepoFocusManifest(env, "miner/demo", { wantedPaths: ["src/"], blockedPaths: ["dist/"] });
++    const response = await app.request(
++      PATH,
++      {
++        method: "POST",
++        headers: apiHeaders(env),
++        body: JSON.stringify(branchPayload("oktofeesh1", "miner/demo")),
++      },
++      env,
++    );
++    expect(response.status).toBe(200);
++    await expect(response.json()).resolves.toMatchObject({
++      login: "oktofeesh1",
++      repoFullName: "miner/demo",
++      summary: expect.any(String),
++    });
++  });
++});
+diff --git a/test/unit/score-breakdown.test.ts b/test/unit/score-breakdown.test.ts
+index 0b483dab..56a19a35 100644
+--- a/test/unit/score-breakdown.test.ts
++++ b/test/unit/score-breakdown.test.ts
+@@ -209,4 +209,45 @@ describe("explainScoreBreakdown", () => {
+     expect(breakdown.highestLeverageLever.reason).toMatch(/reducer|optimization lever/i);
+     expect(breakdown.highestLeverageLever.component).toMatch(/credibilityMultiplier|issueMultiplier|reviewPenaltyMultiplier/);
+   });
++
++  it("marks eligible linked issues with a multiplier boost as full strength", () => {
++    const preview = buildScorePreview({
++      repo,
++      snapshot,
++      input: {
++        repoFullName: repo.fullName,
++        sourceTokenScore: 80,
++        totalTokenScore: 120,
++        sourceLines: 60,
++        openPrCount: 0,
++        existingContributorTokenScore: 1200,
++        credibility: 1,
++        linkedIssueMode: "maintainer",
++        linkedIssueContext: { status: "validated", source: "official_mirror", issueNumbers: [7], solvedByPullRequests: [99] },
++      },
++    });
++
++    const breakdown = explainScoreBreakdown(preview);
++    expect(breakdown.components.find((entry) => entry.component === "issueMultiplier")).toMatchObject({ band: "full" });
++  });
++
++  it("blocks near-zero multipliers that are not quite zero", () => {
++    const preview = buildScorePreview({
++      repo,
++      snapshot,
++      input: {
++        repoFullName: repo.fullName,
++        sourceTokenScore: 80,
++        totalTokenScore: 90,
++        sourceLines: 50,
++        openPrCount: 20,
++        existingContributorTokenScore: 50,
++        credibility: 0.005,
++      },
++    });
++
++    const breakdown = explainScoreBreakdown(preview);
++    expect(breakdown.components.find((entry) => entry.component === "credibilityMultiplier")).toMatchObject({ band: "blocked" });
++    expect(breakdown.components.find((entry) => entry.component === "openPrMultiplier")).toMatchObject({ band: "blocked" });
++  });
+ });

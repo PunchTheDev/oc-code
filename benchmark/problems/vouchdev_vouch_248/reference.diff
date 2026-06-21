@@ -1,0 +1,656 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 4446c3b..25fabe5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -14,6 +14,11 @@ All notable changes to vouch are documented here. Format follows
+   from the cited claims' lifecycle status. Deterministic in v1 (no LLM in the
+   loop). Exposed across the CLI (`vouch synthesize`), MCP (`kb_synthesize`),
+   and JSONL (`kb.synthesize`) surfaces (#222).
++- `_meta.vouch_trust` on every dict-shaped kb.* response: `{remote, caller_kind,
++  auth_subject}` so clients can detect remote confinement and surface it in
++  their UI. HTTP MCP calls report `remote: true, caller_kind: mcp_http`; CLI
++  `--json` reports `remote: false, caller_kind: cli`. Bearer-authenticated
++  HTTP calls include a stable token fingerprint as `auth_subject` (#233).
+ - Entity-salience retrieval reflex: a per-session, in-memory ring buffer of
+   recent caller queries drives a zero-LLM substring/FTS entity pass that
+   attaches top-K matched claim candidates as `_meta.vouch_salience` on
+diff --git a/README.md b/README.md
+index 2c069c7..c4a71ae 100644
+--- a/README.md
++++ b/README.md
+@@ -276,6 +276,36 @@ The JSONL transport reads one envelope per line on stdin, writes one per line on
+ 
+ Errors come back with `ok:false` and a structured `error.code` (`method_not_found`, `missing_param`, `invalid_request`, `internal_error`).
+ 
++Every successful `kb.*` result that is object-shaped carries read-only trust metadata so clients can detect remote confinement:
++
++```json
++{
++  "id": "r1",
++  "ok": true,
++  "result": {
++    "backend": "fts5",
++    "hits": [],
++    "_meta": {
++      "vouch_trust": {
++        "remote": false,
++        "caller_kind": "jsonl",
++        "auth_subject": null
++      }
++    }
++  }
++}
++```
++
++| Transport | `remote` | `caller_kind` | `auth_subject` |
++|-----------|----------|---------------|----------------|
++| JSONL stdio | `false` | `jsonl` | `null` |
++| HTTP `/rpc` | `true` | `jsonl_http` | bearer fingerprint when authenticated |
++| MCP stdio | `false` | `mcp_stdio` | `null` |
++| HTTP `/mcp` | `true` | `mcp_http` | bearer fingerprint when authenticated |
++| CLI `--json` | `false` | `cli` | `null` |
++
++The block is server-attached metadata — client mutations are ignored. Array-shaped read results (e.g. `kb.list_claims`) pass through unchanged; trust rides on dict-shaped responses only (#233).
++
+ ## Portable bundles
+ 
+ ```bash
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index 5fcf71b..f6f4298 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -32,6 +32,7 @@
+ from . import stats as stats_mod
+ from . import sync as sync_mod
+ from . import synthesize as synth
++from . import trust as trust_mod
+ from . import vault_sync as vault_sync_mod
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+@@ -103,6 +104,9 @@ def _whoami() -> str:
+ 
+ 
+ def _emit_json(obj) -> None:
++    with trust_mod.trust_context(trust_mod.CLI):
++        if isinstance(obj, dict):
++            obj = trust_mod.attach_trust(obj)
+     click.echo(json.dumps(obj, indent=2, default=str, sort_keys=True))
+ 
+ 
+diff --git a/src/vouch/http_server.py b/src/vouch/http_server.py
+index 0cd1003..19ffdfc 100644
+--- a/src/vouch/http_server.py
++++ b/src/vouch/http_server.py
+@@ -50,7 +50,7 @@
+ from collections.abc import AsyncIterator, Iterable
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Any
++from typing import Any, cast
+ 
+ import uvicorn
+ import yaml
+@@ -60,9 +60,10 @@
+ from starlette.requests import Request
+ from starlette.responses import JSONResponse
+ from starlette.routing import Route
+-from starlette.types import ASGIApp
++from starlette.types import ASGIApp, Receive, Send
+ 
+ from . import jsonl_server
++from . import trust as trust_mod
+ from .capabilities import capabilities as build_caps
+ 
+ log = logging.getLogger(__name__)
+@@ -201,8 +202,14 @@ async def _rpc(request: Request) -> JSONResponse:
+ 
+     agent = request.headers.get("X-Vouch-Agent")
+     reset = jsonl_server._actor.set(agent) if agent else None
++    bearer = trust_mod.matched_bearer_token(
++        request.headers.get("authorization"),
++        tuple(getattr(request.app.state, "vouch_bearer_tokens", ()) or ()),
++    )
++    trust = trust_mod.with_auth_subject(trust_mod.JSONL_HTTP, bearer)
+     try:
+-        response = jsonl_server.handle_request(envelope)
++        with trust_mod.trust_context(trust):
++            response = jsonl_server.handle_request(envelope)
+     finally:
+         if reset is not None:
+             jsonl_server._actor.reset(reset)
+@@ -248,6 +255,33 @@ async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+         return await call_next(request)
+ 
+ 
++class _McpTrustASGI:
++    """ASGI wrapper that sets ``vouch_trust`` for the full MCP request lifetime."""
++
++    def __init__(self, app: ASGIApp, *, accepted: tuple[str, ...]) -> None:
++        self._app = app
++        self._accepted = accepted
++
++    async def __call__(self, scope: dict, receive: Receive, send: Send) -> None:
++        if scope.get("type") != "http":
++            await self._app(scope, receive, send)
++            return
++        headers = {
++            k.decode("latin-1").lower(): v.decode("latin-1")
++            for k, v in scope.get("headers", [])
++        }
++        bearer = trust_mod.matched_bearer_token(
++            headers.get("authorization"),
++            self._accepted,
++        )
++        trust = trust_mod.with_auth_subject(trust_mod.MCP_HTTP, bearer)
++        token = trust_mod.set_trust_context(trust)
++        try:
++            await self._app(scope, receive, send)
++        finally:
++            trust_mod.reset_trust_context(token)
++
++
+ # --- ASGI app builder -----------------------------------------------------
+ 
+ 
+@@ -311,7 +345,8 @@ def make_app(
+         security_settings=vouch_server.mcp.settings.transport_security,
+         retry_interval=getattr(vouch_server.mcp, "_retry_interval", None),
+     )
+-    mcp_asgi: ASGIApp = StreamableHTTPASGIApp(session_manager)
++    mcp_inner = StreamableHTTPASGIApp(session_manager)
++    mcp_asgi = cast(ASGIApp, _McpTrustASGI(mcp_inner, accepted=tuple(accepted)))
+ 
+     routes: list = [
+         Route("/healthz", _healthz, methods=["GET"]),
+@@ -329,11 +364,13 @@ async def _lifespan(_app: Starlette) -> AsyncIterator[None]:
+         async with session_manager.run():
+             yield
+ 
+-    return Starlette(
++    app = Starlette(
+         routes=routes,
+         middleware=[Middleware(BearerMiddleware, accepted=accepted)],
+         lifespan=_lifespan,
+     )
++    app.state.vouch_bearer_tokens = tuple(accepted)
++    return app
+ 
+ 
+ # --- uvicorn wrapper that quacks like a stdlib HTTP server ----------------
+diff --git a/src/vouch/jsonl_server.py b/src/vouch/jsonl_server.py
+index b4961bd..5d5cd1a 100644
+--- a/src/vouch/jsonl_server.py
++++ b/src/vouch/jsonl_server.py
+@@ -32,6 +32,7 @@
+ from . import lifecycle as life
+ from . import salience as salience_mod
+ from . import sessions as sess_mod
++from . import trust as trust_mod
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+ from .context import build_context_pack
+@@ -677,7 +678,11 @@ def handle_request(envelope: dict) -> dict:
+         }
+     try:
+         result = HANDLERS[method](params)
+-        return {"id": req_id, "ok": True, "result": result}
++        return {
++            "id": req_id,
++            "ok": True,
++            "result": trust_mod.finish_kb_result(result),
++        }
+     except KeyError as e:
+         return {
+             "id": req_id, "ok": False,
+@@ -702,6 +707,7 @@ def handle_request(envelope: dict) -> dict:
+ def run_jsonl(stdin=None, stdout=None) -> None:
+     """Read one request per line, write one response per line."""
+     configure_logging()
++    trust_mod.set_stdio_default(trust_mod.JSONL_STDIO)
+     stdin = stdin or sys.stdin
+     stdout = stdout or sys.stdout
+     for line in stdin:
+diff --git a/src/vouch/server.py b/src/vouch/server.py
+index 4a630fe..e452221 100644
+--- a/src/vouch/server.py
++++ b/src/vouch/server.py
+@@ -23,6 +23,7 @@
+ from . import lifecycle as life
+ from . import salience as salience_mod
+ from . import sessions as sess_mod
++from . import trust as trust_mod
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+ from .context import build_context_pack
+@@ -827,7 +828,11 @@ def _current_model_name() -> str:
+         return ""
+ 
+ 
++trust_mod.install_mcp_trust_wrappers(mcp)
++
++
+ def run_stdio() -> None:
+     """Entry point used by `vouch serve`."""
+     configure_logging()
++    trust_mod.set_stdio_default(trust_mod.MCP_STDIO)
+     mcp.run()
+diff --git a/src/vouch/trust.py b/src/vouch/trust.py
+new file mode 100644
+index 0000000..3bda4e8
+--- /dev/null
++++ b/src/vouch/trust.py
+@@ -0,0 +1,211 @@
++"""Trust metadata on kb.* responses (#233).
++
++Every kb.* result carries ``_meta.vouch_trust`` so clients can see the trust
++state the call was evaluated under — remote confinement, transport kind, and
++an optional authenticated subject. The block is server-attached read-only
++metadata (same role as gbrain's ``_meta.brain_hot_memory``): opt-in to render,
++never authoritative over the KB payload.
++
++Transport entry points set the active :class:`VouchTrust` via a
++:class:`contextvars.ContextVar` before dispatch; :func:`finish_kb_result`
++stamps dict-shaped results on the way out.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import hmac
++import inspect
++from collections.abc import Callable, Iterator
++from contextlib import contextmanager
++from contextvars import ContextVar, Token
++from dataclasses import dataclass
++from typing import Any, Literal, TypeVar
++
++CallerKind = Literal["cli", "jsonl", "jsonl_http", "mcp_stdio", "mcp_http"]
++
++# kb.* methods whose primary job is reading durable KB state. Used by tests and
++# adapters that want to assert ``_meta.vouch_trust`` is present on every read
++# response over the JSONL transport.
++READ_METHODS: tuple[str, ...] = (
++    "kb.capabilities",
++    "kb.status",
++    "kb.stats",
++    "kb.search",
++    "kb.context",
++    "kb.read_page",
++    "kb.read_claim",
++    "kb.read_entity",
++    "kb.read_relation",
++    "kb.list_pages",
++    "kb.list_claims",
++    "kb.list_entities",
++    "kb.list_relations",
++    "kb.list_sources",
++    "kb.list_pending",
++    "kb.audit",
++    "kb.why",
++    "kb.trace",
++    "kb.impact",
++    "kb.graph_export",
++    "kb.embeddings_stats",
++    "kb.lint",
++    "kb.doctor",
++    "kb.export_check",
++    "kb.import_check",
++    "kb.volunteer_context",
++)
++
++# Minimal params that let each read handler succeed against an empty init KB.
++READ_METHOD_DEFAULT_PARAMS: dict[str, dict[str, Any]] = {
++    "kb.search": {"query": "test", "limit": 1},
++    "kb.context": {"task": "test", "limit": 1},
++    "kb.read_page": {"page_id": "__missing__"},
++    "kb.read_claim": {"claim_id": "__missing__"},
++    "kb.read_entity": {"entity_id": "__missing__"},
++    "kb.read_relation": {"relation_id": "__missing__"},
++    "kb.audit": {"limit": 1},
++    "kb.why": {"claim_id": "__missing__"},
++    "kb.trace": {"claim_id": "__missing__"},
++    "kb.impact": {"claim_id": "__missing__"},
++    "kb.export_check": {"bundle_path": "__missing__"},
++    "kb.import_check": {"bundle_path": "__missing__"},
++    "kb.volunteer_context": {"session_id": "__missing__"},
++}
++
++
++@dataclass(frozen=True)
++class VouchTrust:
++    """Resolved trust state for one kb.* call."""
++
++    remote: bool
++    caller_kind: CallerKind
++    auth_subject: str | None
++
++    def as_meta_block(self) -> dict[str, Any]:
++        return {
++            "remote": self.remote,
++            "caller_kind": self.caller_kind,
++            "auth_subject": self.auth_subject,
++        }
++
++
++# Presets — one per transport entry point.
++CLI = VouchTrust(remote=False, caller_kind="cli", auth_subject=None)
++JSONL_STDIO = VouchTrust(remote=False, caller_kind="jsonl", auth_subject=None)
++JSONL_HTTP = VouchTrust(remote=True, caller_kind="jsonl_http", auth_subject=None)
++MCP_STDIO = VouchTrust(remote=False, caller_kind="mcp_stdio", auth_subject=None)
++MCP_HTTP = VouchTrust(remote=True, caller_kind="mcp_http", auth_subject=None)
++
++_active: ContextVar[VouchTrust | None] = ContextVar("vouch_trust", default=None)
++_stdio_default: VouchTrust = JSONL_STDIO
++
++
++def set_stdio_default(trust: VouchTrust) -> None:
++    """Process-wide fallback when no request-scoped trust is set (stdio MCP)."""
++    global _stdio_default
++    _stdio_default = trust
++
++
++def current() -> VouchTrust:
++    return _active.get() or _stdio_default
++
++
++def reset_trust_context(token: Token) -> None:
++    _active.reset(token)
++
++
++def set_trust_context(trust: VouchTrust) -> Token:
++    return _active.set(trust)
++
++
++@contextmanager
++def trust_context(trust: VouchTrust) -> Iterator[None]:
++    token = set_trust_context(trust)
++    try:
++        yield
++    finally:
++        reset_trust_context(token)
++
++
++def auth_subject_for_token(token: str) -> str:
++    """Stable identifier for a bearer token without echoing the secret."""
++    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
++
++
++def matched_bearer_token(
++    authorization: str | None,
++    accepted: tuple[str, ...],
++) -> str | None:
++    """Return the accepted token that matched ``Authorization``, if any."""
++    if not authorization or not accepted:
++        return None
++    for tok in accepted:
++        if hmac.compare_digest(authorization, f"Bearer {tok}"):
++            return tok
++    return None
++
++
++def with_auth_subject(trust: VouchTrust, token: str | None) -> VouchTrust:
++    if token is None:
++        return trust
++    return VouchTrust(
++        remote=trust.remote,
++        caller_kind=trust.caller_kind,
++        auth_subject=auth_subject_for_token(token),
++    )
++
++
++def attach_trust(result: dict[str, Any]) -> dict[str, Any]:
++    """Attach ``_meta.vouch_trust`` to a dict-shaped kb.* result."""
++    result.setdefault("_meta", {})["vouch_trust"] = current().as_meta_block()
++    return result
++
++
++def finish_kb_result(result: Any) -> Any:
++    """Stamp trust metadata on dict-shaped tool results; pass others through."""
++    if isinstance(result, dict):
++        return attach_trust(result)
++    return result
++
++
++_F = TypeVar("_F", bound=Callable[..., Any])
++
++
++def wrap_tool_fn(fn: _F) -> _F:
++    """Wrap a sync or async MCP tool so dict results carry ``_meta.vouch_trust``."""
++    if inspect.iscoroutinefunction(fn):
++
++        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
++            return finish_kb_result(await fn(*args, **kwargs))
++
++        async_wrapper.__name__ = fn.__name__
++        async_wrapper.__doc__ = fn.__doc__
++        return async_wrapper  # type: ignore[return-value]
++
++    def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
++        return finish_kb_result(fn(*args, **kwargs))
++
++    sync_wrapper.__name__ = fn.__name__
++    sync_wrapper.__doc__ = fn.__doc__
++    return sync_wrapper  # type: ignore[return-value]
++
++
++def install_mcp_trust_wrappers(mcp: Any) -> None:
++    """Patch every registered FastMCP tool to stamp trust metadata on exit."""
++    for tool in mcp._tool_manager.list_tools():
++        wrapped = wrap_tool_fn(tool.fn)
++        tool.fn = wrapped  # pydantic model allows mutation on fn field
++
++
++def assert_vouch_trust(result: Any, *, expected: VouchTrust | None = None) -> None:
++    """Test helper — assert ``_meta.vouch_trust`` shape (and optional exact match)."""
++    assert isinstance(result, dict), f"expected dict result, got {type(result)!r}"
++    meta = result.get("_meta") or {}
++    block = meta.get("vouch_trust")
++    assert isinstance(block, dict), "missing _meta.vouch_trust"
++    assert isinstance(block.get("remote"), bool)
++    assert isinstance(block.get("caller_kind"), str)
++    assert block.get("auth_subject") is None or isinstance(block["auth_subject"], str)
++    if expected is not None:
++        assert block == expected.as_meta_block()
+diff --git a/tests/test_trust.py b/tests/test_trust.py
+new file mode 100644
+index 0000000..848d614
+--- /dev/null
++++ b/tests/test_trust.py
+@@ -0,0 +1,197 @@
++"""``_meta.vouch_trust`` on kb.* responses (#233)."""
++
++from __future__ import annotations
++
++import json
++import subprocess
++import sys
++from collections.abc import Iterator
++from pathlib import Path
++
++import pytest
++
++from vouch import trust as trust_mod
++from vouch.jsonl_server import handle_request
++from vouch.models import Claim
++from vouch.storage import KBStore
++
++
++@pytest.fixture
++def store(tmp_path: Path) -> KBStore:
++    s = KBStore.init(tmp_path)
++    src = s.put_source(b"evidence")
++    s.put_claim(Claim(id="c1", text="JWT rotation policy", evidence=[src.id]))
++    return s
++
++
++@pytest.fixture(autouse=True)
++def _jsonl_trust_default() -> Iterator[None]:
++    trust_mod.set_stdio_default(trust_mod.JSONL_STDIO)
++    yield
++
++
++# --- unit: trust module ----------------------------------------------------
++
++
++def test_auth_subject_fingerprints_without_echoing_secret() -> None:
++    fp = trust_mod.auth_subject_for_token("super-secret-token")
++    assert fp != "super-secret-token"
++    assert len(fp) == 16
++    assert trust_mod.auth_subject_for_token("super-secret-token") == fp
++
++
++def test_matched_bearer_token_constant_time_membership() -> None:
++    assert trust_mod.matched_bearer_token("Bearer alpha", ("alpha", "beta")) == "alpha"
++    assert trust_mod.matched_bearer_token("Bearer beta", ("alpha", "beta")) == "beta"
++    assert trust_mod.matched_bearer_token("Bearer gamma", ("alpha", "beta")) is None
++    assert trust_mod.matched_bearer_token(None, ("alpha",)) is None
++
++
++def test_attach_trust_preserves_existing_meta() -> None:
++    with trust_mod.trust_context(trust_mod.CLI):
++        out = trust_mod.attach_trust({"_meta": {"vouch_salience": []}, "hits": []})
++    assert out["_meta"]["vouch_salience"] == []
++    assert out["_meta"]["vouch_trust"]["caller_kind"] == "cli"
++    assert out["_meta"]["vouch_trust"]["remote"] is False
++
++
++def test_finish_kb_result_skips_non_dicts() -> None:
++    with trust_mod.trust_context(trust_mod.JSONL_STDIO):
++        assert trust_mod.finish_kb_result([{"id": "x"}]) == [{"id": "x"}]
++
++
++# --- JSONL: every dict-shaped read carries trust -------------------------
++
++
++READ_DICT_CASES: tuple[tuple[str, dict], ...] = (
++    ("kb.capabilities", {}),
++    ("kb.status", {}),
++    ("kb.stats", {}),
++    ("kb.search", {"query": "JWT", "limit": 3}),
++    ("kb.context", {"task": "JWT", "limit": 3}),
++    ("kb.lint", {}),
++    ("kb.doctor", {}),
++    ("kb.graph_export", {}),
++)
++
++
++@pytest.mark.parametrize(("method", "params"), READ_DICT_CASES)
++def test_jsonl_read_responses_carry_vouch_trust(
++    store: KBStore,
++    monkeypatch: pytest.MonkeyPatch,
++    method: str,
++    params: dict,
++) -> None:
++    monkeypatch.chdir(store.root)
++    resp = handle_request({"id": "t", "method": method, "params": params})
++    assert resp["ok"], resp
++    trust_mod.assert_vouch_trust(resp["result"])
++    assert resp["result"]["_meta"]["vouch_trust"]["caller_kind"] == "jsonl"
++    assert resp["result"]["_meta"]["vouch_trust"]["remote"] is False
++
++
++def test_jsonl_read_claim_carries_trust(store: KBStore, monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.chdir(store.root)
++    resp = handle_request({
++        "id": "t",
++        "method": "kb.read_claim",
++        "params": {"claim_id": "c1"},
++    })
++    assert resp["ok"]
++    trust_mod.assert_vouch_trust(resp["result"])
++
++
++def test_jsonl_http_trust_preset() -> None:
++    with trust_mod.trust_context(trust_mod.JSONL_HTTP):
++        block = trust_mod.attach_trust({})["_meta"]["vouch_trust"]
++    assert block == {
++        "remote": True,
++        "caller_kind": "jsonl_http",
++        "auth_subject": None,
++    }
++
++
++def test_jsonl_http_bearer_auth_subject() -> None:
++    trust = trust_mod.with_auth_subject(trust_mod.JSONL_HTTP, "fleet-alpha")
++    with trust_mod.trust_context(trust):
++        block = trust_mod.attach_trust({})["_meta"]["vouch_trust"]
++    assert block["auth_subject"] == trust_mod.auth_subject_for_token("fleet-alpha")
++
++
++def test_mcp_http_trust_on_tool_result(store: KBStore, monkeypatch: pytest.MonkeyPatch) -> None:
++    """Acceptance: HTTP-MCP surfaces remote mcp_http (via tool wrapper + context)."""
++    from vouch.server import mcp
++
++    monkeypatch.chdir(store.root)
++    tool = mcp._tool_manager.get_tool("kb_status")
++    assert tool is not None
++    with trust_mod.trust_context(trust_mod.MCP_HTTP):
++        result = tool.fn()
++    trust_mod.assert_vouch_trust(result)
++    assert result["_meta"]["vouch_trust"] == {
++        "remote": True,
++        "caller_kind": "mcp_http",
++        "auth_subject": None,
++    }
++
++
++def test_mcp_stdio_trust_on_tool_result(store: KBStore, monkeypatch: pytest.MonkeyPatch) -> None:
++    from vouch.server import mcp
++
++    monkeypatch.chdir(store.root)
++    tool = mcp._tool_manager.get_tool("kb_search")
++    assert tool is not None
++    with trust_mod.trust_context(trust_mod.MCP_STDIO):
++        result = tool.fn("JWT", limit=3)
++    assert result["_meta"]["vouch_trust"]["caller_kind"] == "mcp_stdio"
++    assert result["_meta"]["vouch_trust"]["remote"] is False
++
++
++# --- CLI -------------------------------------------------------------------
++
++
++def test_cli_status_json_surfaces_cli_trust(
++    store: KBStore,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.chdir(store.root)
++    proc = subprocess.run(
++        [sys.executable, "-m", "vouch.cli", "status", "--json"],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert proc.returncode == 0, proc.stderr
++    body = json.loads(proc.stdout)
++    trust_mod.assert_vouch_trust(body)
++    assert body["_meta"]["vouch_trust"] == {
++        "remote": False,
++        "caller_kind": "cli",
++        "auth_subject": None,
++    }
++
++
++def test_read_methods_constant_covers_declared_reads() -> None:
++    """READ_METHODS stays aligned with capabilities — drift means a test gap."""
++    from vouch.capabilities import METHODS
++
++    read_prefixes = ("kb.read_", "kb.list_", "kb.search", "kb.context", "kb.status")
++    declared_reads = {
++        m for m in METHODS
++        if m.startswith(read_prefixes) or m in {
++            "kb.capabilities",
++            "kb.stats",
++            "kb.audit",
++            "kb.why",
++            "kb.trace",
++            "kb.impact",
++            "kb.graph_export",
++            "kb.embeddings_stats",
++            "kb.lint",
++            "kb.doctor",
++            "kb.export_check",
++            "kb.import_check",
++            "kb.volunteer_context",
++        }
++    }
++    assert set(trust_mod.READ_METHODS) <= declared_reads

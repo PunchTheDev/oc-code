@@ -1,0 +1,770 @@
+diff --git a/crates/engine/src/game/ability_utils.rs b/crates/engine/src/game/ability_utils.rs
+index 1f4a6ffef..eaa41e464 100644
+--- a/crates/engine/src/game/ability_utils.rs
++++ b/crates/engine/src/game/ability_utils.rs
+@@ -1699,6 +1699,56 @@ fn collect_target_slots(
+                 optional: ability.optional_targeting,
+             });
+         }
++    } else if let Effect::EachDealsDamageEqualToPower { sources, recipient } = &ability.effect {
++        // CR 115.1d + CR 115.1: "Up to two target creatures you control each deal
++        // damage equal to their power to target creature." `target_filter()`
++        // returns None for this effect, so surface both axes here.
++        //
++        // ORDER IS LOAD-BEARING: the variable-count SOURCE slots are declared
++        // first (Oracle text order), then the single mandatory RECIPIENT slot
++        // last. The resolver (`deal_damage::resolve_each_deals_equal_to_power`)
++        // reads `ability.targets` as `[source.., recipient]`, treating the final
++        // object target as the recipient.
++        if ability.target_choice_timing == TargetChoiceTiming::Stack {
++            // CR 601.2c + CR 115.1d: the source count ("up to two" → 0..=2, or
++            // "two" → exactly 2) lives in the ability's `multi_target` spec.
++            let source_legal =
++                legal_targets_for_ability_filter(state, ability, sources, &acc.slots);
++            if let Some(spec) = ability.multi_target.as_ref() {
++                let bounds = resolve_multi_target_bounds(state, ability, spec, source_legal.len())?;
++                for slot_index in 0..bounds.max {
++                    acc.push(TargetSelectionSlot {
++                        legal_targets: source_legal.clone(),
++                        optional: slot_index >= bounds.min,
++                    });
++                }
++            } else {
++                // No spec means a single mandatory source (defensive — the parser
++                // always attaches an "up to two"/"two" spec for this effect).
++                if source_legal.is_empty() {
++                    return Err(EngineError::ActionNotAllowed(
++                        "No legal targets available".to_string(),
++                    ));
++                }
++                acc.push(TargetSelectionSlot {
++                    legal_targets: source_legal,
++                    optional: false,
++                });
++            }
++
++            // CR 115.1: the recipient is exactly one mandatory target.
++            let recipient_legal =
++                legal_targets_for_ability_filter(state, ability, recipient, &acc.slots);
++            if recipient_legal.is_empty() {
++                return Err(EngineError::ActionNotAllowed(
++                    "No legal targets available".to_string(),
++                ));
++            }
++            acc.push(TargetSelectionSlot {
++                legal_targets: recipient_legal,
++                optional: false,
++            });
++        }
+     } else {
+         if is_per_opponent_target_fanout(ability) {
+             collect_per_opponent_target_fanout_slots(state, ability, acc)?;
+@@ -2829,6 +2879,44 @@ fn collect_target_slot_specs(
+                 instance: id,
+             });
+         }
++    } else if let Effect::EachDealsDamageEqualToPower { sources, recipient } = &ability.effect {
++        // CR 115.1d + CR 115.1: Mirror the `collect_target_slots` branch
++        // one-for-one — the variable-count SOURCE slots first (sharing one
++        // instance per CR 115.3 so the same creature can't fill two source
++        // slots), then the single mandatory RECIPIENT slot (its own instance).
++        if ability.target_choice_timing == TargetChoiceTiming::Stack {
++            let source_legal = legal_targets_for_ability_filter(state, ability, sources, &[]);
++            if let Some(spec) = ability.multi_target.as_ref() {
++                if let Ok(bounds) =
++                    resolve_multi_target_bounds(state, ability, spec, source_legal.len())
++                {
++                    let id = TargetInstanceId(*next_instance);
++                    *next_instance += 1;
++                    for slot_index in 0..bounds.max {
++                        specs.push(TargetSlotSpec {
++                            filter: sources.clone(),
++                            optional: slot_index >= bounds.min,
++                            instance: id,
++                        });
++                    }
++                }
++            } else {
++                let id = TargetInstanceId(*next_instance);
++                *next_instance += 1;
++                specs.push(TargetSlotSpec {
++                    filter: sources.clone(),
++                    optional: false,
++                    instance: id,
++                });
++            }
++            let id = TargetInstanceId(*next_instance);
++            *next_instance += 1;
++            specs.push(TargetSlotSpec {
++                filter: recipient.clone(),
++                optional: false,
++                instance: id,
++            });
++        }
+     } else {
+         if is_per_opponent_target_fanout(ability) {
+             collect_per_opponent_target_fanout_specs(state, ability, specs, next_instance);
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index bc99224b2..d1aaaef1c 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -1871,6 +1871,10 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+             d.push(("amount".into(), fmt_quantity(amount)));
+             d.push(("target".into(), fmt_target(target)));
+         }
++        Effect::EachDealsDamageEqualToPower { sources, recipient } => {
++            d.push(("sources".into(), fmt_target(sources)));
++            d.push(("recipient".into(), fmt_target(recipient)));
++        }
+         Effect::SearchOutsideGame {
+             filter,
+             count,
+diff --git a/crates/engine/src/game/effects/deal_damage.rs b/crates/engine/src/game/effects/deal_damage.rs
+index 2796c3d64..2a2ed10af 100644
+--- a/crates/engine/src/game/effects/deal_damage.rs
++++ b/crates/engine/src/game/effects/deal_damage.rs
+@@ -1375,6 +1375,155 @@ pub fn resolve_each_player(
+     Ok(())
+ }
+ 
++/// CR 120.1 + CR 120.3: "Up to two target creatures you control each deal damage
++/// equal to their power to target creature" (Band Together, Allies at Last,
++/// Friendly Rivalry, Graceful Takedown). Combo Attack's "your team controls"
++/// (Two-Headed Giant team scope, CR 810) is out of scope and fails closed.
++///
++/// Each chosen source creature deals damage equal to ITS OWN power to the single
++/// recipient, with that source creature as the damage source (CR 120.1). The
++/// per-source `DamageContext` is built from each source object so its keywords
++/// (deathtouch, lifelink, …) and identity travel with its damage. Power is read
++/// from the live object, falling back to last known information (CR 113.7a) when
++/// a source has left the battlefield between announcement and resolution.
++///
++/// Target layout: the source slots are surfaced first (0..=2) and the recipient
++/// slot last by `ability_utils::collect_target_slots`, so `ability.targets` is
++/// `[source.., recipient]`. The recipient is the final object target; every
++/// earlier object target is a source.
++pub fn resolve_each_deals_equal_to_power(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    if !matches!(ability.effect, Effect::EachDealsDamageEqualToPower { .. }) {
++        return Err(EffectError::MissingParam(
++            "EachDealsDamageEqualToPower".to_string(),
++        ));
++    }
++
++    // CR 115.1: collect the chosen object targets in declaration order.
++    let object_targets: Vec<ObjectId> = ability
++        .targets
++        .iter()
++        .filter_map(|t| match t {
++            TargetRef::Object(id) => Some(*id),
++            TargetRef::Player(_) => None,
++        })
++        .collect();
++
++    // The recipient is the last object target; the sources are the rest. With
++    // zero sources chosen ("up to two" → 0) there is exactly one object target
++    // (the recipient) and no damage is dealt. Fewer than one object target means
++    // the recipient became illegal and the spell did nothing (CR 608.2b).
++    let Some((&recipient_id, source_ids)) = object_targets.split_last() else {
++        events.push(GameEvent::EffectResolved {
++            kind: EffectKind::from(&ability.effect),
++            source_id: ability.source_id,
++        });
++        return Ok(());
++    };
++
++    for (i, &source_id) in source_ids.iter().enumerate() {
++        // CR 113.7a + CR 208.3: power from the live object, falling back to LKI
++        // when the source left the battlefield after targets were chosen.
++        let power = object_power_with_lki(state, source_id);
++        if power <= 0 {
++            continue;
++        }
++        // CR 120.1: each source creature is the source of its own damage.
++        let ctx = DamageContext::from_source(state, source_id)
++            .unwrap_or_else(|| DamageContext::fallback(source_id, ability.controller));
++        match apply_damage_to_target(
++            state,
++            &ctx,
++            TargetRef::Object(recipient_id),
++            power as u32,
++            false,
++            events,
++        )? {
++            DamageResult::Applied(_) => {}
++            DamageResult::NeedsChoice => {
++                // CR 120.3 + CR 616.1e: This source's damage paused for a
++                // replacement choice. Each remaining source deals its own power
++                // from its own object, so stash one continuation node per
++                // remaining source (each carrying its own `source_id`), then the
++                // parent sub_ability tail.
++                stash_remaining_each_deals_chain(
++                    state,
++                    ability,
++                    &source_ids[i + 1..],
++                    recipient_id,
++                );
++                mark_pending_continuation_parent(state, EffectKind::EachDealsDamageEqualToPower);
++                return Ok(());
++            }
++        }
++    }
++
++    events.push(GameEvent::EffectResolved {
++        kind: EffectKind::from(&ability.effect),
++        source_id: ability.source_id,
++    });
++
++    Ok(())
++}
++
++/// CR 208.3 + CR 113.7a: A creature's power from current state, falling back to
++/// Last Known Information when the object has left the battlefield. Mirrors the
++/// `ObjectScope::Source` arm of `quantity::resolve_object_pt`.
++fn object_power_with_lki(state: &GameState, id: ObjectId) -> i32 {
++    state
++        .objects
++        .get(&id)
++        .and_then(|obj| obj.power)
++        .or_else(|| state.lki_cache.get(&id).and_then(|lki| lki.power))
++        .unwrap_or(0)
++}
++
++/// CR 120.1 + CR 616.1e: Build one continuation node per remaining source after a
++/// replacement choice paused mid-resolution. Each node deals that source's power
++/// to the recipient with that source creature as the damage source (its own
++/// `source_id`). The parent's sub_ability tail is appended last so any downstream
++/// chain resumes once the choice resolves.
++fn stash_remaining_each_deals_chain(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    remaining_sources: &[ObjectId],
++    recipient_id: ObjectId,
++) {
++    let mut head: Option<ResolvedAbility> = None;
++    for &source_id in remaining_sources {
++        let power = object_power_with_lki(state, source_id);
++        if power <= 0 {
++            continue;
++        }
++        let node = build_remaining_damage_node(
++            source_id,
++            ability.controller,
++            TargetRef::Object(recipient_id),
++            power as u32,
++        );
++        match head.as_mut() {
++            Some(h) => append_to_sub_chain(h, node),
++            None => head = Some(node),
++        }
++    }
++    match head {
++        Some(mut h) => {
++            if let Some(sub) = ability.sub_ability.as_ref() {
++                append_to_sub_chain(&mut h, sub.as_ref().clone());
++            }
++            append_to_pending_continuation(state, Some(Box::new(h)));
++        }
++        None => {
++            if let Some(sub) = ability.sub_ability.as_ref() {
++                append_to_pending_continuation(state, Some(Box::new(sub.as_ref().clone())));
++            }
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1405,6 +1554,60 @@ mod tests {
+         )
+     }
+ 
++    /// CR 120.1 + CR 120.3: Band Together — casting "Up to two target creatures
++    /// you control each deal damage equal to their power to another target
++    /// creature" with a 3/2 and a 2/2 source each deals its own power (3 and 2)
++    /// to a single recipient, which therefore takes 5 marked damage. Each source
++    /// is its own damage source (CR 120.1); the recipient is the last target.
++    #[test]
++    fn band_together_two_sources_deal_combined_power_to_recipient() {
++        use crate::game::scenario::{GameScenario, P0, P1};
++        use crate::types::mana::{ManaType, ManaUnit};
++        use crate::types::phase::Phase;
++
++        const BAND_TOGETHER: &str = "Up to two target creatures you control each deal damage equal to their power to another target creature.";
++
++        let mut scenario = GameScenario::new();
++        scenario.at_phase(Phase::PreCombatMain);
++        let src_a = scenario.add_creature(P0, "Striker A", 3, 2).id();
++        let src_b = scenario.add_creature(P0, "Striker B", 2, 2).id();
++        // CR 120.3e: a 0/9 recipient survives 5 marked damage, so the marked
++        // total is directly observable post-resolution.
++        let recipient = scenario.add_creature(P1, "Big Wall", 0, 9).id();
++        let spell = scenario
++            .add_spell_to_hand_from_oracle(P0, "Band Together", false, BAND_TOGETHER)
++            .id();
++        // Fund the pool generously; the source/recipient choice is the only
++        // interaction under test.
++        scenario.with_mana_pool(
++            P0,
++            vec![ManaUnit::new(ManaType::Colorless, ObjectId(9_999), false, vec![]); 6],
++        );
++        let mut runner = scenario.build();
++        {
++            let state = runner.state_mut();
++            state.active_player = P0;
++            state.priority_player = P0;
++        }
++
++        // CR 601.2c: source slots first (src_a, src_b), recipient slot last.
++        let outcome = runner
++            .cast(spell)
++            .target_objects(&[src_a, src_b, recipient])
++            .resolve();
++
++        // CR 120.1 + CR 120.3e: 3 (Striker A) + 2 (Striker B) = 5 marked on the
++        // recipient.
++        assert_eq!(
++            outcome.damage_marked(recipient),
++            5,
++            "recipient should take each source's power (3 + 2) = 5"
++        );
++        // CR 120.1: the sources are not damaged (one-directional, unlike fight).
++        assert_eq!(outcome.damage_marked(src_a), 0);
++        assert_eq!(outcome.damage_marked(src_b), 0);
++    }
++
+     /// CR 122.1c: damage to a permanent with a shield counter is prevented and
+     /// one shield counter is removed (non-combat / single-source path).
+     #[test]
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index 83aace396..a1860f691 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -2500,6 +2500,9 @@ pub fn resolve_effect(
+         Effect::StartYourEngines { .. } => speed_effects::resolve_start(state, ability, events),
+         Effect::ChangeSpeed { .. } => speed_effects::resolve_change_speed(state, ability, events),
+         Effect::DealDamage { .. } => deal_damage::resolve(state, ability, events),
++        Effect::EachDealsDamageEqualToPower { .. } => {
++            deal_damage::resolve_each_deals_equal_to_power(state, ability, events)
++        }
+         Effect::Draw { .. } => draw::resolve(state, ability, events),
+         Effect::Pump { .. } => pump::resolve(state, ability, events),
+         Effect::PairWith { .. } => pair_with::resolve(state, ability, events),
+diff --git a/crates/engine/src/game/printed_cards.rs b/crates/engine/src/game/printed_cards.rs
+index c1dce7e4e..585932c3c 100644
+--- a/crates/engine/src/game/printed_cards.rs
++++ b/crates/engine/src/game/printed_cards.rs
+@@ -891,6 +891,9 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
+         Effect::StartYourEngines { .. }
+         | Effect::ChangeSpeed { .. }
+         | Effect::DealDamage { .. }
++        // CR 120.1: leaf effect — the source/recipient filters carry no nested
++        // ability or effect to walk.
++        | Effect::EachDealsDamageEqualToPower { .. }
+         | Effect::Draw { .. }
+         | Effect::Pump { .. }
+         | Effect::PairWith { .. }
+diff --git a/crates/engine/src/game/trigger_index.rs b/crates/engine/src/game/trigger_index.rs
+index 69487cac7..323f9a01d 100644
+--- a/crates/engine/src/game/trigger_index.rs
++++ b/crates/engine/src/game/trigger_index.rs
+@@ -692,6 +692,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
+         EffectKind::StartYourEngines
+         | EffectKind::ChangeSpeed
+         | EffectKind::DealDamage
++        | EffectKind::EachDealsDamageEqualToPower
+         | EffectKind::Draw
+         | EffectKind::Pump
+         | EffectKind::PairWith
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 5de60a5d4..356e70547 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -134,7 +134,10 @@ use self::sequence::{
+     parse_followup_continuation_ast, parse_intrinsic_continuation_ast, split_clause_sequence,
+     try_parse_repeat_process_for_keywords, try_parse_same_is_true_continuation,
+ };
+-use self::subject::{try_parse_subject_predicate_ast, try_parse_targeted_controller_gain_life};
++use self::subject::{
++    try_parse_each_deals_damage_equal_to_power, try_parse_subject_predicate_ast,
++    try_parse_targeted_controller_gain_life,
++};
+ use crate::parser::oracle_ir::ast::*;
+ pub(crate) use crate::parser::oracle_ir::context::ParseContext;
+ use crate::parser::oracle_ir::effect_chain::{ClauseIr, EffectChainIr, SpecialClause};
+@@ -4547,6 +4550,21 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
+         return clause;
+     }
+ 
++    // CR 810: the "two target creatures your team controls each deal damage equal
++    // to their power to target creature" shape (Combo Attack). Two-Headed Giant
++    // team control is not the caster's controller, so this is unmodeled and
++    // `try_parse_each_deals_damage_equal_to_power` returns an explicit
++    // `Unimplemented`. Intercept it HERE, before the generic exactly-two-targets
++    // parser further down would mis-accept the leading "two target creatures …" as
++    // a bare `TargetOnly` clause. The supported "you control" variants return the
++    // real `EachDealsDamageEqualToPower` effect (not `Unimplemented`) and fall
++    // through to their dedicated dispatch in `lower_imperative_clause`.
++    if let Some(clause) = try_parse_each_deals_damage_equal_to_power(text) {
++        if matches!(clause.effect, Effect::Unimplemented { .. }) {
++            return clause;
++        }
++    }
++
+     // CR 608.2c: Deconjugate bare third-person verbs that appear after ", then" splits
+     // where the subject carried over from the previous clause.
+     // E.g., "draws seven cards" → "draw seven cards" (from "Each player discards
+@@ -8939,6 +8957,14 @@ fn lower_imperative_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectCl
+         return clause;
+     }
+ 
++    // CR 120.1 + CR 115.1d: "Up to two target creatures you control each deal
++    // damage equal to their power to target creature." The targeted source set
++    // and the recipient must both be preserved as independent targets, so this
++    // runs before generic subject stripping / damage-compound splitting.
++    if let Some(clause) = try_parse_each_deals_damage_equal_to_power(text) {
++        return clause;
++    }
++
+     // CR 121.1 + CR 615.5: "{verb} cards equal to {quantity}" inside a
+     // subject-aware predicate (e.g. "the source's controller draws cards equal
+     // to the damage prevented this way" — Swans of Bryn Argoll). Mirrors the
+@@ -21109,6 +21135,77 @@ mod tests {
+     use super::*;
+     use crate::parser::parse_oracle_text;
+ 
++    // CR 120.1 + CR 115.1d: "Up to two target creatures you control each deal
++    // damage equal to their power to target creature" (Band Together) parses to
++    // `EachDealsDamageEqualToPower` with a you-control creature source filter and
++    // a creature recipient, and an "up to two" (0..=2) multi-target spec.
++    #[test]
++    fn each_deals_damage_equal_to_power_up_to_two() {
++        use crate::types::ability::ControllerRef;
++        let def = parse_effect_chain(
++            "Up to two target creatures you control each deal damage equal to their power to another target creature.",
++            AbilityKind::Spell,
++        );
++        let Effect::EachDealsDamageEqualToPower { sources, recipient } = &*def.effect else {
++            panic!("expected EachDealsDamageEqualToPower, got {:?}", def.effect);
++        };
++        // CR 115.1: the source set is a creature controlled by the caster.
++        let TargetFilter::Typed(tf) = sources else {
++            panic!("expected Typed source filter, got {sources:?}");
++        };
++        assert!(tf.type_filters.contains(&TypeFilter::Creature));
++        assert_eq!(tf.controller, Some(ControllerRef::You));
++        // CR 115.1: the recipient is a creature ("another target creature").
++        assert!(matches!(recipient, TargetFilter::Typed(rt)
++            if rt.type_filters.contains(&TypeFilter::Creature)));
++        // CR 115.1d: "up to two" → 0..=2.
++        assert_eq!(def.multi_target, Some(MultiTargetSpec::fixed(0, 2)));
++    }
++
++    // CR 120.1: The in-scope cards' damage lines parse to the new effect (not
++    // `Unimplemented`), with the recipient's controller restriction carried on
++    // the recipient filter. Combo Attack ("Two target creatures *your team*
++    // controls") is intentionally out of scope — the Two-Headed Giant team scope
++    // is a separate, niche axis and is left as a known gap rather than mismodeled.
++    #[test]
++    fn each_deals_damage_equal_to_power_all_in_scope_cards() {
++        let lines = [
++            // Allies at Last
++            "Up to two target creatures you control each deal damage equal to their power to target creature an opponent controls.",
++            // Band Together
++            "Up to two target creatures you control each deal damage equal to their power to another target creature.",
++            // Friendly Rivalry / Graceful Takedown
++            "Up to two target creatures you control each deal damage equal to their power to target creature you don't control.",
++        ];
++        for line in lines {
++            let effect = parse_effect(line);
++            assert!(
++                matches!(effect, Effect::EachDealsDamageEqualToPower { .. }),
++                "line did not parse to EachDealsDamageEqualToPower: {line:?} -> {effect:?}"
++            );
++        }
++    }
++
++    // CR 810: Combo Attack's "two target creatures *your team* controls" must
++    // FAIL CLOSED (Unimplemented), not silently collapse to "you control" —
++    // Two-Headed Giant team control is not the caster's controller, so parsing
++    // it as one-player targeting would damage the wrong objects. Guards against
++    // re-introducing the team→you normalization.
++    #[test]
++    fn each_deals_damage_team_scope_fails_closed_not_mistargeted() {
++        let effect = parse_effect(
++            "Two target creatures your team controls each deal damage equal to their power to target creature.",
++        );
++        assert!(
++            !matches!(effect, Effect::EachDealsDamageEqualToPower { .. }),
++            "team-scope source must not be parsed as the each-deals effect, got {effect:?}"
++        );
++        assert!(
++            matches!(effect, Effect::Unimplemented { .. }),
++            "team-scope line must fall through to Unimplemented, got {effect:?}"
++        );
++    }
++
+     // CR 701.20a: a comma+or disjunctive reveal-until filter list ("X card, a Y,
+     // or a Z card") must split into an Or of three distinct filters. Building
+     // block exercised with a non-WHO 3-element list; An Unearthly Child is the
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 04dfb8bed..7b0b7d5f5 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -4011,6 +4011,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
+         | Effect::EpicCopy { .. }
+         | Effect::ChangeSpeed { .. }
+         | Effect::DealDamage { .. }
++        | Effect::EachDealsDamageEqualToPower { .. }
+         | Effect::Draw { .. }
+         | Effect::Pump { .. }
+         | Effect::PairWith { .. }
+diff --git a/crates/engine/src/parser/oracle_effect/subject.rs b/crates/engine/src/parser/oracle_effect/subject.rs
+index c328ffcb9..156d660b5 100644
+--- a/crates/engine/src/parser/oracle_effect/subject.rs
++++ b/crates/engine/src/parser/oracle_effect/subject.rs
+@@ -49,6 +49,16 @@ pub(super) fn try_parse_subject_predicate_ast(
+         return None;
+     }
+ 
++    // CR 120.1 + CR 115.1d: defer the "up to two target creatures you control each
++    // deal damage equal to their power to target creature" shape to the imperative
++    // path, which preserves both the targeted source set and the recipient as
++    // independent targets. Splitting it into subject + imperative-fallback here
++    // would drop the per-source damage semantics. (The team-scope variant fails
++    // closed to `Unimplemented` earlier, in `parse_effect_clause_inner`.)
++    if try_parse_each_deals_damage_equal_to_power(text).is_some() {
++        return None;
++    }
++
+     // CR 702.3b: "can attack [this turn] as though it didn't have defender" —
+     // must intercept before continuous clause parsing which would incorrectly
+     // extract "defender" as an AddKeyword from "didn't have defender".
+@@ -3616,6 +3626,105 @@ pub(super) fn try_parse_targeted_controller_gain_life(text: &str) -> Option<Pars
+     }))
+ }
+ 
++/// CR 120.1 + CR 120.3 + CR 115.1d: "Up to two target creatures you control each
++/// deal damage equal to their power to target creature [restriction]." (Band
++/// Together, Allies at Last, Combo Attack, Friendly Rivalry, Graceful Takedown.)
++///
++/// The subject ("[up to two|two|one or two] target creatures you control" /
++/// "two target creatures your team controls") is a TARGETED source set — its
++/// count bound becomes the ability's `multi_target` spec and its per-object
++/// legality the `sources` filter. The "to <target creature>" tail is the single
++/// recipient. Produces `Effect::EachDealsDamageEqualToPower { sources, recipient }`
++/// with the count spec carried on the returned clause's `multi_target`.
++///
++/// Subject preservation matters: the sources are not the ability source (the
++/// spell), and the recipient is a second, independent target — so this must be
++/// recognized before generic subject stripping flattens the sentence.
++pub(super) fn try_parse_each_deals_damage_equal_to_power(text: &str) -> Option<ParsedEffectClause> {
++    let lower = text.to_lowercase();
++    // CR 115.1d: the source-count quantifier. "two" → exactly 2; "up to two" →
++    // 0..=2; "one or two" → 1..=2. Each axis is one `tag()` alternative.
++    let (after_count, multi_target) = parse_each_deals_source_count(lower.as_str())?;
++
++    // CR 115.1: the source set, as a TARGETED creature filter. "your team
++    // controls" (Two-Headed Giant team scope, CR 810) is intentionally NOT
++    // collapsed to "you control": a team is not the caster's controller, so a
++    // card that uses it (Combo Attack) must fail closed rather than mis-target a
++    // single player's creatures. `parse_target` does not consume the non-standard
++    // "your team controls" controller phrase, so it stays in `after_sources` and
++    // the verb-phrase `tag` below rejects the line (-> Unimplemented).
++    let (sources, after_sources) = parse_target(after_count);
++    if !target_filter_is_targeted_creature(&sources) {
++        return None;
++    }
++
++    // CR 120.1: the verb phrase. Each chosen source deals damage equal to its own
++    // power. `parse()` returns `(remaining, output)` — bind the remaining text.
++    let after_sources_trimmed = after_sources.trim_start();
++    let after_verb = match tag::<_, _, OracleError<'_>>("each deal damage equal to their power to ")
++        .parse(after_sources_trimmed)
++    {
++        Ok((rest, _)) => rest,
++        // CR 810: the team-up shape carrying an unmodelable "your team controls"
++        // source scope (Combo Attack). `parse_target` leaves "your team controls
++        // …" in the remainder, so the verb tag above misses. Fail CLOSED to a
++        // DETERMINISTIC `Unimplemented` rather than returning `None`: `None` would
++        // let a generic target-only fallback non-deterministically accept the
++        // leading "two target creatures …" as a bare `TargetOnly` clause (the
++        // fallback order is HashMap-seed dependent).
++        Err(_)
++            if tag::<_, _, OracleError<'_>>(
++                "your team controls each deal damage equal to their power to ",
++            )
++            .parse(after_sources_trimmed)
++            .is_ok() =>
++        {
++            return Some(super::parsed_clause(Effect::unimplemented("deal", text)));
++        }
++        Err(_) => return None,
++    };
++
++    // CR 115.1: the single recipient creature ("target creature", "target
++    // creature an opponent controls", "another target creature", "target
++    // creature you don't control").
++    let (recipient, _rest) = parse_target(after_verb);
++    if !target_filter_is_targeted_creature(&recipient) {
++        return None;
++    }
++
++    Some(ParsedEffectClause {
++        multi_target: Some(multi_target),
++        ..super::parsed_clause(Effect::EachDealsDamageEqualToPower { sources, recipient })
++    })
++}
++
++/// CR 115.1d: Parse the leading source-count quantifier of the team-up damage
++/// line and return the remaining text plus the `MultiTargetSpec` it encodes.
++/// "up to two" → 0..=2, "one or two" → 1..=2, "two" → exactly 2.
++fn parse_each_deals_source_count(lower: &str) -> Option<(&str, MultiTargetSpec)> {
++    alt((
++        map(tag::<_, _, OracleError<'_>>("up to two "), |_| {
++            MultiTargetSpec::fixed(0, 2)
++        }),
++        map(tag("one or two "), |_| MultiTargetSpec::fixed(1, 2)),
++        map(tag("two "), |_| MultiTargetSpec::fixed(2, 2)),
++    ))
++    .parse(lower)
++    .ok()
++}
++
++/// CR 115.1: True when `filter` is a "target creature" object filter (the
++/// `target` keyword present, restricted to creatures). Guards both the source
++/// set and the recipient of the team-up damage line so non-creature or
++/// non-targeted phrases fall through to the generic parser.
++fn target_filter_is_targeted_creature(filter: &TargetFilter) -> bool {
++    matches!(filter, TargetFilter::Typed(tf)
++    if tf.type_filters.iter().any(|t| matches!(
++        t,
++        crate::types::ability::TypeFilter::Creature
++    )))
++}
++
+ /// Parse `~ <predicate-verb>` at the start of input, succeeding only when the
+ /// first word after `~ ` deconjugates to a registered [`PREDICATE_VERBS`]
+ /// entry. Used as the single authority for validating the tilde-subject form
+diff --git a/crates/engine/src/parser/swallow_check.rs b/crates/engine/src/parser/swallow_check.rs
+index 04f88e5f8..98f090a5c 100644
+--- a/crates/engine/src/parser/swallow_check.rs
++++ b/crates/engine/src/parser/swallow_check.rs
+@@ -1378,6 +1378,11 @@ fn detect_dynamic_qty(
+     // `"Variable"`/`"Multiply"`/etc.
+     let dynamic_markers: &[&str] = &[
+         "\"type\":\"Ref\"",
++        // CR 120.1: "each deal damage equal to their power" — the per-source
++        // power is an implicit dynamic quantity carried by the effect variant
++        // itself (no separate QuantityExpr field), so the variant name is the
++        // coverage marker. Band Together / Allies at Last class.
++        "EachDealsDamageEqualToPower",
+         "\"type\":\"Multiply\"",
+         "\"type\":\"DivideRounded\"",
+         "\"type\":\"Offset\"",
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 1da29a03e..7af11399b 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -7003,6 +7003,33 @@ pub enum Effect {
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         damage_source: Option<DamageSource>,
+     },
++    /// CR 120.1 + CR 120.3: "Team-up" damage — each of up to two chosen source
++    /// creatures (controlled by the caster / their team) deals damage equal to
++    /// ITS OWN power to a single recipient creature, with each source creature
++    /// as the damage source (CR 120.1: the object dealing the damage is its
++    /// source). Both axes are TARGETED: the source set is "up to two target
++    /// creatures you control" (CR 115.1d, 0..=2) and the recipient is one
++    /// "target creature" (CR 115.1). Distinct from `DealDamage` because the
++    /// amount and the damage source vary per source object — a single
++    /// `DealDamage { amount, damage_source }` cannot express N independent
++    /// (power, source) pairs aimed at one recipient.
++    ///
++    /// Covers Band Together, Allies at Last, Friendly Rivalry, and Graceful
++    /// Takedown — the count ("up to two") and the recipient's controller
++    /// restriction are encoded in `sources` / `recipient` filters plus the
++    /// ability's `multi_target` spec. Combo Attack ("two target creatures *your
++    /// team* controls") is out of scope: the Two-Headed Giant team scope (CR
++    /// 810) has no model, so it fails closed to `Unimplemented` rather than
++    /// mis-targeting a single player's creatures.
++    EachDealsDamageEqualToPower {
++        /// CR 115.1d: The targeted source creatures ("up to two target creatures
++        /// you control"). The count bound (0..=2 or exactly 2) lives in the
++        /// ability's `multi_target` spec; this filter pins the per-object
++        /// legality (creature you control).
++        sources: TargetFilter,
++        /// CR 115.1: The single targeted recipient that each source damages.
++        recipient: TargetFilter,
++    },
+     /// CR 121.1: Draw a card.
+     /// CR 115.1 + CR 601.2c: When `target` is `TargetFilter::Player` (or any
+     /// other non-context-ref filter), the drawing player is chosen during spell
+@@ -10305,6 +10332,11 @@ impl Effect {
+             | Effect::MadnessCast { .. }
+             | Effect::GiftDelivery { .. }
+             | Effect::ExchangeControl { .. }
++            // CR 115.1d + CR 115.1: the source set and the recipient are surfaced
++            // as dual target slots by `ability_utils::collect_target_slots` (the
++            // "up to two" sources slot is driven by the ability's `multi_target`
++            // spec, the recipient is one mandatory slot), not by `target_filter()`.
++            | Effect::EachDealsDamageEqualToPower { .. }
+             // CR 701.12a: player targets (player_a/player_b) are surfaced as
+             // dual target slots by ability_utils, not by `target_filter()`.
+             | Effect::ExchangeLifeTotals { .. }
+@@ -10479,6 +10511,7 @@ impl Effect {
+             | Effect::Attach { .. }
+             | Effect::UnattachAll { .. }
+             | Effect::Fight { .. }
++            | Effect::EachDealsDamageEqualToPower { .. }
+             | Effect::Bounce { .. }
+             | Effect::Explore
+             | Effect::ExploreAll { .. }
+@@ -10684,6 +10717,7 @@ impl Effect {
+             | Effect::Attach { .. }
+             | Effect::UnattachAll { .. }
+             | Effect::Fight { .. }
++            | Effect::EachDealsDamageEqualToPower { .. }
+             | Effect::Bounce { .. }
+             | Effect::Explore
+             | Effect::ExploreAll { .. }
+@@ -10818,6 +10852,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
+         Effect::StartYourEngines { .. } => "StartYourEngines",
+         Effect::ChangeSpeed { .. } => "ChangeSpeed",
+         Effect::DealDamage { .. } => "DealDamage",
++        Effect::EachDealsDamageEqualToPower { .. } => "EachDealsDamageEqualToPower",
+         Effect::Draw { .. } => "Draw",
+         Effect::Pump { .. } => "Pump",
+         Effect::PairWith { .. } => "PairWith",
+@@ -11027,6 +11062,7 @@ pub enum EffectKind {
+     StartYourEngines,
+     ChangeSpeed,
+     DealDamage,
++    EachDealsDamageEqualToPower,
+     Draw,
+     Pump,
+     PairWith,
+@@ -11235,6 +11271,7 @@ impl From<&Effect> for EffectKind {
+             Effect::StartYourEngines { .. } => EffectKind::StartYourEngines,
+             Effect::ChangeSpeed { .. } => EffectKind::ChangeSpeed,
+             Effect::DealDamage { .. } => EffectKind::DealDamage,
++            Effect::EachDealsDamageEqualToPower { .. } => EffectKind::EachDealsDamageEqualToPower,
+             Effect::Draw { .. } => EffectKind::Draw,
+             Effect::Pump { .. } => EffectKind::Pump,
+             Effect::PairWith { .. } => EffectKind::PairWith,
+diff --git a/crates/phase-ai/src/policies/redundancy_avoidance.rs b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+index 8b0af7eea..ee628fa0b 100644
+--- a/crates/phase-ai/src/policies/redundancy_avoidance.rs
++++ b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+@@ -391,6 +391,7 @@ fn redundancy_delta(
+         | Effect::UnattachAll { .. }
+         | Effect::Surveil { .. }
+         | Effect::Fight { .. }
++        | Effect::EachDealsDamageEqualToPower { .. }
+         | Effect::Explore
+         | Effect::ExploreAll { .. }
+         | Effect::Investigate

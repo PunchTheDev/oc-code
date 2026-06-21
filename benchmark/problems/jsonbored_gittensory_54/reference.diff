@@ -1,0 +1,779 @@
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 9ac6c363..e99ebd1d 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -34,6 +34,7 @@ import {
+   listPullRequestFiles,
+   listPullRequestReviews,
+   listRecentMergedPullRequests,
++  listLatestSignalSnapshotsByTarget,
+   listRepoLabels,
+   listRepoSyncSegments,
+   listRepoSyncStates,
+@@ -97,7 +98,7 @@ import {
+   buildQueueHealth,
+   buildRegistryChangeReport,
+ } from "../signals/engine";
+-import { attachDataQuality, buildCoreSignalFidelity, buildRepoDataQuality, buildSignalFidelity } from "../signals/data-quality";
++import { attachDataQuality, buildCoreSignalFidelity, buildFreshnessSloReport, buildRepoDataQuality, buildSignalFidelity } from "../signals/data-quality";
+ import { buildPullRequestReviewability } from "../signals/reward-risk";
+ import { buildLocalBranchAnalysis } from "../signals/local-branch";
+ import { buildRepoSettingsPreview } from "../signals/settings-preview";
+@@ -397,20 +398,25 @@ export function createApp() {
+   });
+ 
+   app.get("/v1/sync/status", async (c) => {
+-    const [snapshot, repositories, segments, totals, detailStates, installations, rateLimits] = await Promise.all([
++    const [snapshot, scoringSnapshot, repositories, segments, totals, detailStates, installations, rateLimits, signalSnapshots, bounties] = await Promise.all([
+       getLatestRegistrySnapshot(c.env),
++      getLatestScoringModelSnapshot(c.env),
+       listRepoSyncStates(c.env),
+       listRepoSyncSegments(c.env),
+       listLatestRepoGithubTotalsSnapshots(c.env),
+       listAllPullRequestDetailSyncStates(c.env),
+       listInstallationHealth(c.env),
+       listLatestGitHubRateLimitObservations(c.env, 20),
++      listLatestSignalSnapshotsByTarget(c.env),
++      listBounties(c.env),
+     ]);
+     const repoCount = snapshot?.repoCount ?? repositories.length;
+     const coreSignalFidelity = buildCoreSignalFidelity(repoCount, repositories, segments, totals, detailStates);
++    const freshnessSlo = buildFreshnessSloReport({ registrySnapshot: snapshot, scoringSnapshot, repoCount, syncStates: repositories, totals, segments, signalSnapshots, bounties });
+     return c.json({
+       generatedAt: nowIso(),
+       signalFidelity: buildSignalFidelity(repoCount, repositories, segments),
++      freshnessSlo,
+       coreSignalFidelity,
+       historyCoverage: coreSignalFidelity.historyCoverage,
+       refreshingRepos: coreSignalFidelity.refreshingRepos,
+@@ -425,7 +431,7 @@ export function createApp() {
+   });
+ 
+   app.get("/v1/readiness", async (c) => {
+-    const [snapshot, scoringSnapshot, syncStates, syncSegments, totals, detailStates, installations, installationHealth, rateLimits] = await Promise.all([
++    const [snapshot, scoringSnapshot, syncStates, syncSegments, totals, detailStates, installations, installationHealth, rateLimits, signalSnapshots, bounties] = await Promise.all([
+       getLatestRegistrySnapshot(c.env),
+       getLatestScoringModelSnapshot(c.env),
+       listRepoSyncStates(c.env),
+@@ -435,10 +441,13 @@ export function createApp() {
+       listInstallations(c.env),
+       listInstallationHealth(c.env),
+       listLatestGitHubRateLimitObservations(c.env, 20),
++      listLatestSignalSnapshotsByTarget(c.env),
++      listBounties(c.env),
+     ]);
+     const repoCount = snapshot?.repoCount ?? syncStates.length;
+     const signalFidelity = buildSignalFidelity(repoCount, syncStates, syncSegments);
+     const coreSignalFidelity = buildCoreSignalFidelity(repoCount, syncStates, syncSegments, totals, detailStates);
++    const freshnessSlo = buildFreshnessSloReport({ registrySnapshot: snapshot, scoringSnapshot, repoCount, syncStates, totals, segments: syncSegments, signalSnapshots, bounties });
+     const statusCounts = syncStates.reduce<Record<string, number>>((counts, state) => {
+       counts[state.status] = (counts[state.status] ?? 0) + 1;
+       return counts;
+@@ -459,6 +468,7 @@ export function createApp() {
+       ...(signalFidelity.cappedRepos.length > 0 ? [`${signalFidelity.cappedRepos.length} repo sync(s) hit local pagination caps; signal fidelity is degraded.`] : []),
+       ...(signalFidelity.rateLimitedRepos.length > 0 ? [`${signalFidelity.rateLimitedRepos.length} repo sync(s) encountered GitHub rate limiting.`] : []),
+       ...(signalFidelity.staleRepos.length > 0 ? [`${signalFidelity.staleRepos.length} repo sync(s) are stale.`] : []),
++      ...(freshnessSlo.status !== "fresh" ? [`Freshness SLO is ${freshnessSlo.status}; ${freshnessSlo.warnings.length} stale, missing, or blocked signal source(s) need repair.`] : []),
+       ...(installationHealth.some((health) => health.status !== "healthy") ? ["One or more GitHub App installations need attention."] : []),
+     ];
+     const ready = Boolean(snapshot) && Boolean(c.env.INTERNAL_JOB_TOKEN) && Boolean(c.env.GITTENSORY_API_TOKEN);
+@@ -469,7 +479,8 @@ export function createApp() {
+         Boolean(c.env.GITHUB_PUBLIC_TOKEN) &&
+         missingSyncCount === 0 &&
+         failingSyncs.length === 0 &&
+-        coreSignalFidelity.status === "complete"
++        coreSignalFidelity.status === "complete" &&
++        freshnessSlo.launchBlockingCount === 0
+       : false;
+     return c.json({
+       status: ready ? "ready" : "needs_attention",
+@@ -477,6 +488,7 @@ export function createApp() {
+       ready,
+       readyForPublicReview,
+       signalFidelity,
++      freshnessSlo,
+       coreSignalFidelity,
+       historyCoverage: coreSignalFidelity.historyCoverage,
+       partialRepos: signalFidelity.partialRepos,
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index feaa40d4..303ad10e 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -1414,6 +1414,38 @@ export async function listSignalSnapshots(env: Env, signalType: string, targetKe
+   return rows.map(toSignalSnapshotRecord);
+ }
+ 
++export async function listLatestSignalSnapshotsByTarget(env: Env): Promise<SignalSnapshotRecord[]> {
++  const { results } = await env.DB.prepare(
++    `
++      SELECT id, signal_type, target_key, repo_full_name, payload_json, generated_at
++      FROM (
++        SELECT
++          id,
++          signal_type,
++          target_key,
++          repo_full_name,
++          payload_json,
++          generated_at,
++          row_number() OVER (
++            PARTITION BY signal_type, target_key
++            ORDER BY generated_at DESC, id DESC
++          ) AS snapshot_rank
++        FROM signal_snapshots
++      )
++      WHERE snapshot_rank = 1
++      ORDER BY signal_type, target_key
++    `,
++  ).all<{ id: string; signal_type: string; target_key: string; repo_full_name: string | null; payload_json: string; generated_at: string }>();
++  return results.map((row) => ({
++    id: row.id,
++    signalType: row.signal_type,
++    targetKey: row.target_key,
++    repoFullName: row.repo_full_name,
++    payload: parseJson<Record<string, never>>(row.payload_json, {}),
++    generatedAt: row.generated_at,
++  }));
++}
++
+ export async function createAgentRun(env: Env, run: AgentRunRecord): Promise<void> {
+   const db = getDb(env.DB);
+   await db.insert(agentRuns).values({
+diff --git a/src/openapi/schemas.ts b/src/openapi/schemas.ts
+index 0a42e6fe..94f047e9 100644
+--- a/src/openapi/schemas.ts
++++ b/src/openapi/schemas.ts
+@@ -665,6 +665,18 @@ export const SyncStatusSchema = z
+   .object({
+     generatedAt: z.string(),
+     signalFidelity: SignalFidelitySchema,
++    freshnessSlo: z.object({
++      status: z.enum(["fresh", "degraded", "blocked"]),
++      generatedAt: z.string(),
++      staleCount: z.number(),
++      degradedCount: z.number(),
++      blockedCount: z.number(),
++      missingCount: z.number(),
++      launchBlockingCount: z.number(),
++      repairRecommended: z.boolean(),
++      items: z.array(z.object({ area: z.string(), targetKey: z.string(), status: z.string(), launchBlocking: z.boolean(), ageSeconds: z.number().optional(), sloSeconds: z.number(), breachSeconds: z.number().optional(), observedAt: z.string().nullable().optional(), summary: z.string() })),
++      warnings: z.array(z.string()),
++    }),
+     coreSignalFidelity: CoreSignalFidelitySchema,
+     historyCoverage: z.enum(["sampled", "counts_only", "full"]),
+     refreshingRepos: z.array(z.string()),
+@@ -685,6 +697,18 @@ export const ReadinessSchema = z
+     ready: z.boolean(),
+     readyForPublicReview: z.boolean(),
+     signalFidelity: SignalFidelitySchema,
++    freshnessSlo: z.object({
++      status: z.enum(["fresh", "degraded", "blocked"]),
++      generatedAt: z.string(),
++      staleCount: z.number(),
++      degradedCount: z.number(),
++      blockedCount: z.number(),
++      missingCount: z.number(),
++      launchBlockingCount: z.number(),
++      repairRecommended: z.boolean(),
++      items: z.array(z.object({ area: z.string(), targetKey: z.string(), status: z.string(), launchBlocking: z.boolean(), ageSeconds: z.number().optional(), sloSeconds: z.number(), breachSeconds: z.number().optional(), observedAt: z.string().nullable().optional(), summary: z.string() })),
++      warnings: z.array(z.string()),
++    }),
+     coreSignalFidelity: CoreSignalFidelitySchema,
+     historyCoverage: z.enum(["sampled", "counts_only", "full"]),
+     partialRepos: z.array(z.string()),
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index c655f36a..15c0640a 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -12,6 +12,7 @@ import {
+   listContributorRepoStats,
+   listIssues,
+   listIssueSignalSample,
++  listLatestSignalSnapshotsByTarget,
+   listOtherOpenPullRequests,
+   listOpenPullRequests,
+   listPullRequests,
+@@ -57,6 +58,10 @@ import { buildIssueAdvisory, buildPullRequestAdvisory } from "../rules/advisory"
+ import { getOrCreateScoringModelSnapshot, refreshScoringModelSnapshot } from "../scoring/model";
+ import { buildAndPersistContributorDecisionPack } from "../services/decision-pack";
+ import { executeAgentRun, explainBlockersWithAgent, planNextWork } from "../services/agent-orchestrator";
++import {
++  buildFreshnessSloReport,
++  freshnessAuditMetadata,
++} from "../signals/data-quality";
+ import {
+   buildBurdenForecast,
+   buildCollisionEdges,
+@@ -202,7 +207,7 @@ async function fanOutRepoSignalSnapshotJobs(env: Env, requestedBy: "schedule" |
+ }
+ 
+ async function repairDataFidelity(env: Env, requestedBy: "schedule" | "api" | "test"): Promise<void> {
+-  const [repositories, segments] = await Promise.all([listRepositories(env), listRepoSyncSegments(env)]);
++  const [repositories, segments, signalSnapshots] = await Promise.all([listRepositories(env), listRepoSyncSegments(env), listLatestSignalSnapshotsByTarget(env)]);
+   const requiredSegments = new Set(["labels", "open_issues", "open_pull_requests"]);
+   const segmentsByRepo = new Map<string, Set<string>>();
+   for (const segment of segments) {
+@@ -213,6 +218,7 @@ async function repairDataFidelity(env: Env, requestedBy: "schedule" | "api" | "t
+     }
+   }
+   const registeredRepos = repositories.filter((repo) => repo.isRegistered);
++  const freshnessSlo = buildFreshnessSloReport({ repoCount: registeredRepos.length, segments, signalSnapshots });
+   const repairs = [];
+   const signalRefreshes = [];
+   for (const repo of registeredRepos) {
+@@ -247,8 +253,14 @@ async function repairDataFidelity(env: Env, requestedBy: "schedule" | "api" | "t
+   ]);
+   await recordAuditEvent(env, {
+     eventType: "sync.fidelity_repair",
+-    outcome: repairs.length > 0 ? "queued" : "completed",
+-    metadata: { requestedBy, repairCount: repairs.length, signalRefreshCount: signalRefreshes.length, repairs: repairs.slice(0, 25) },
++    outcome: repairs.length > 0 || freshnessSlo.repairRecommended ? "queued" : "completed",
++    metadata: { requestedBy, repairCount: repairs.length, signalRefreshCount: signalRefreshes.length, repairs: repairs.slice(0, 25), freshnessSlo: freshnessAuditMetadata(freshnessSlo) },
++  });
++  await recordAuditEvent(env, {
++    eventType: "signals.freshness_slo",
++    outcome: freshnessSlo.repairRecommended ? "queued" : "completed",
++    detail: freshnessSlo.status,
++    metadata: { requestedBy, ...freshnessAuditMetadata(freshnessSlo) },
+   });
+ }
+ 
+diff --git a/src/signals/data-quality.ts b/src/signals/data-quality.ts
+index 0102288e..bb7608a6 100644
+--- a/src/signals/data-quality.ts
++++ b/src/signals/data-quality.ts
+@@ -1,7 +1,17 @@
+-import type { DataQuality, PullRequestDetailSyncStateRecord, RepoGithubTotalsSnapshotRecord, RepoSyncSegmentRecord, RepoSyncStateRecord } from "../types";
++import type { BountyRecord, DataQuality, PullRequestDetailSyncStateRecord, RegistrySnapshot, RepoGithubTotalsSnapshotRecord, RepoSyncSegmentRecord, RepoSyncStateRecord, ScoringModelSnapshotRecord, SignalSnapshotRecord } from "../types";
+ import { nowIso } from "../utils/json";
+ 
+ const DEFAULT_STALE_MS = 7 * 24 * 60 * 60 * 1000;
++const FRESHNESS_SLO_MS = {
++  registry: DEFAULT_STALE_MS,
++  scoring_model: DEFAULT_STALE_MS,
++  github_totals: DEFAULT_STALE_MS,
++  repo_segments: DEFAULT_STALE_MS,
++  decision_pack: 6 * 60 * 60 * 1000,
++  bounty_data: 24 * 60 * 60 * 1000,
++  signal_snapshot: 12 * 60 * 60 * 1000,
++};
++const LAUNCH_BLOCKING_FRESHNESS_AREAS = new Set<keyof typeof FRESHNESS_SLO_MS>(["registry", "scoring_model", "github_totals", "repo_segments"]);
+ const COMPLETE_SEGMENT_STATUSES = new Set<RepoSyncSegmentRecord["status"]>(["complete", "not_modified", "sampled"]);
+ const BLOCKING_SEGMENT_STATUSES = new Set<RepoSyncSegmentRecord["status"]>(["error", "rate_limited", "waiting_rate_limit", "skipped"]);
+ const REQUIRED_OPEN_SEGMENTS = new Set<RepoSyncSegmentRecord["segment"]>(["metadata", "labels", "open_issues", "open_pull_requests", "pull_request_files", "pull_request_reviews", "check_summaries"]);
+@@ -31,6 +41,80 @@ export type CoreSignalFidelity = {
+   historyCoverage: "sampled" | "counts_only" | "full";
+ };
+ 
++export type FreshnessSloReport = {
++  status: "fresh" | "degraded" | "blocked";
++  generatedAt: string;
++  staleCount: number;
++  degradedCount: number;
++  blockedCount: number;
++  missingCount: number;
++  launchBlockingCount: number;
++  repairRecommended: boolean;
++  items: Array<{ area: keyof typeof FRESHNESS_SLO_MS; targetKey: string; status: "fresh" | "stale" | "degraded" | "blocked" | "missing"; launchBlocking: boolean; ageSeconds?: number; sloSeconds: number; breachSeconds?: number; observedAt?: string | null; summary: string }>;
++  warnings: string[];
++};
++
++export function buildFreshnessSloReport(args: {
++  registrySnapshot?: RegistrySnapshot | null;
++  scoringSnapshot?: ScoringModelSnapshotRecord | null;
++  repoCount?: number;
++  syncStates?: RepoSyncStateRecord[];
++  totals?: RepoGithubTotalsSnapshotRecord[];
++  segments?: RepoSyncSegmentRecord[];
++  signalSnapshots?: SignalSnapshotRecord[];
++  bounties?: BountyRecord[];
++  expectedDecisionPackKeys?: string[];
++  nowMs?: number;
++}): FreshnessSloReport {
++  const nowMs = args.nowMs ?? Date.now();
++  const items: FreshnessSloReport["items"] = [];
++  const add = (area: keyof typeof FRESHNESS_SLO_MS, targetKey: string, observedAt: string | null | undefined, forced?: "blocked" | "degraded" | "missing") => {
++    const observedMs = observedAt ? Date.parse(observedAt) : NaN;
++    const validObservedAt = observedAt && Number.isFinite(observedMs) ? observedAt : null;
++    const ageSeconds = validObservedAt ? Math.max(0, Math.floor((nowMs - observedMs) / 1000)) : undefined;
++    const status = forced ?? (!validObservedAt ? "missing" : ageSeconds !== undefined && ageSeconds * 1000 > FRESHNESS_SLO_MS[area] ? "stale" : "fresh");
++    const launchBlocking = status !== "fresh" && LAUNCH_BLOCKING_FRESHNESS_AREAS.has(area);
++    items.push({ area, targetKey, status, launchBlocking, ...(ageSeconds !== undefined ? { ageSeconds, breachSeconds: Math.max(0, ageSeconds - Math.floor(FRESHNESS_SLO_MS[area] / 1000)) } : {}), sloSeconds: Math.floor(FRESHNESS_SLO_MS[area] / 1000), observedAt: validObservedAt, summary: `${area}:${targetKey} is ${status}` });
++  };
++  if ("registrySnapshot" in args) add("registry", "latest", args.registrySnapshot?.fetchedAt);
++  if ("scoringSnapshot" in args) add("scoring_model", "latest", args.scoringSnapshot?.fetchedAt);
++  if ("totals" in args && (args.repoCount ?? 0) > 0) add("github_totals", "registered_repos", oldest(args.totals?.map((total) => total.fetchedAt)), args.totals?.length ? undefined : "missing");
++  if ((args.repoCount ?? 0) > 0) {
++    const segmentBlocked = args.segments?.some((segment) => BLOCKING_SEGMENT_STATUSES.has(segment.status) && !hasEffectiveSegmentCoverage(segment)) || args.syncStates?.some((state) => ["error", "skipped", "rate_limited"].includes(state.status));
++    const segmentDegraded = args.syncStates?.some((state) => !["success", "never_synced"].includes(state.status));
++    add("repo_segments", "registered_repos", oldest(args.segments?.map((segment) => segment.completedAt ?? segment.updatedAt)), segmentBlocked ? "blocked" : segmentDegraded ? "degraded" : args.segments?.length ? undefined : "missing");
++  }
++  for (const [key, snapshots] of groupBy(args.signalSnapshots ?? [], (snapshot) => `${snapshot.signalType}\0${snapshot.targetKey}`)) {
++    const type = snapshots[0]?.signalType ?? key;
++    const targetKey = snapshots[0]?.targetKey ?? type;
++    add(type === "contributor-decision-pack" ? "decision_pack" : "signal_snapshot", targetKey ?? type, newest(snapshots.map((snapshot) => snapshot.generatedAt)));
++  }
++  for (const key of args.expectedDecisionPackKeys ?? []) {
++    if (!items.some((item) => item.area === "decision_pack" && item.targetKey === key)) add("decision_pack", key, null, "missing");
++  }
++  if (args.bounties?.length) add("bounty_data", "all_bounties", oldest(args.bounties.map((bounty) => bounty.updatedAt ?? bounty.discoveredAt)));
++  const staleCount = items.filter((item) => item.status === "stale").length;
++  const degradedCount = items.filter((item) => item.status === "degraded").length;
++  const blockedCount = items.filter((item) => item.status === "blocked").length;
++  const missingCount = items.filter((item) => item.status === "missing").length;
++  const launchBlockingCount = items.filter((item) => item.launchBlocking).length;
++  const status = blockedCount > 0 ? "blocked" : staleCount + degradedCount + missingCount > 0 ? "degraded" : "fresh";
++  return { status, generatedAt: nowIso(), staleCount, degradedCount, blockedCount, missingCount, launchBlockingCount, repairRecommended: status !== "fresh", items, warnings: items.filter((item) => item.status !== "fresh").map((item) => item.summary) };
++}
++
++export function freshnessAuditMetadata(report: FreshnessSloReport) {
++  return {
++    status: report.status,
++    staleCount: report.staleCount,
++    degradedCount: report.degradedCount,
++    blockedCount: report.blockedCount,
++    missingCount: report.missingCount,
++    launchBlockingCount: report.launchBlockingCount,
++    repairRecommended: report.repairRecommended,
++    affectedAreas: [...new Set(report.items.filter((item) => item.status !== "fresh").map((item) => item.area))],
++  };
++}
++
+ export function buildRepoDataQuality(
+   repoFullName: string,
+   syncState: RepoSyncStateRecord | null | undefined,
+@@ -260,6 +344,23 @@ function groupByRepo<T extends { repoFullName: string }>(records: T[]): Map<stri
+   return grouped;
+ }
+ 
++function groupBy<T>(records: T[], keyFor: (record: T) => string): Map<string, T[]> {
++  const grouped = new Map<string, T[]>();
++  for (const record of records) {
++    const key = keyFor(record);
++    grouped.set(key, [...(grouped.get(key) ?? []), record]);
++  }
++  return grouped;
++}
++
++function oldest(values: Array<string | null | undefined> | undefined): string | null | undefined {
++  return values?.filter((value): value is string => Boolean(value && Number.isFinite(Date.parse(value)))).sort()[0];
++}
++
++function newest(values: Array<string | null | undefined> | undefined): string | null | undefined {
++  return values?.filter((value): value is string => Boolean(value && Number.isFinite(Date.parse(value)))).sort().at(-1);
++}
++
+ function isCompleteCount(segment: RepoSyncSegmentRecord | undefined, expected: number | null | undefined): boolean {
+   return Boolean(segment && hasCompleteCountCoverage(segment, expected) && hasUsableRequiredSegmentCoverage(segment, expected));
+ }
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 8d354a59..edd5f32d 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -770,6 +770,7 @@ describe("api routes", () => {
+     await expect(readiness.json()).resolves.toMatchObject({
+       status: "ready",
+       readyForPublicReview: true,
++      freshnessSlo: { status: "fresh", repairRecommended: false },
+       secrets: { githubPublicToken: true },
+       githubBackfill: { failingSyncs: [] },
+       warnings: [],
+@@ -833,6 +834,7 @@ describe("api routes", () => {
+     expect(missingSnapshotReadiness.status).toBe(200);
+     await expect(missingSnapshotReadiness.json()).resolves.toMatchObject({
+       readyForPublicReview: false,
++      freshnessSlo: { status: "degraded", missingCount: expect.any(Number), repairRecommended: true },
+       warnings: expect.arrayContaining([
+         "Registry snapshot is missing.",
+         "Scoring model snapshot is missing. Run refresh-scoring-model before public review.",
+@@ -840,6 +842,34 @@ describe("api routes", () => {
+       ]),
+     });
+ 
++    const staleEnv = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
++    await persistRegistrySnapshot(
++      staleEnv,
++      normalizeRegistryPayload(
++        { "entrius/allways-ui": { emission_share: 0.01, issue_discovery_share: 0, label_multipliers: {}, trusted_label_pipeline: false } },
++        { kind: "raw-github", url: "fixture://stale-registry" },
++        "2026-05-01T00:00:00.000Z",
++      ),
++    );
++    await persistScoringModelSnapshot(staleEnv, {
++      id: "stale-scoring",
++      sourceKind: "test",
++      sourceUrl: "fixture://stale-scoring",
++      fetchedAt: "2026-05-01T00:00:00.000Z",
++      activeModel: "current_density_model",
++      constants: {},
++      programmingLanguages: {},
++      warnings: [],
++      payload: {},
++    });
++    const staleReadiness = await app.request("/v1/readiness", { headers: apiHeaders(staleEnv) }, staleEnv);
++    expect(staleReadiness.status).toBe(200);
++    await expect(staleReadiness.json()).resolves.toMatchObject({
++      readyForPublicReview: false,
++      freshnessSlo: { status: "degraded", staleCount: expect.any(Number), launchBlockingCount: expect.any(Number), repairRecommended: true },
++      warnings: expect.arrayContaining([expect.stringContaining("Freshness SLO is degraded")]),
++    });
++
+     const missingSyncEnv = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
+     await persistRegistrySnapshot(
+       missingSyncEnv,
+@@ -857,6 +887,51 @@ describe("api routes", () => {
+     });
+   });
+ 
++  it("keeps optional stale signal snapshots visible without blocking public review readiness", async () => {
++    const app = createApp();
++    const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
++    await seedSignalData(env);
++    const nowMs = Date.now();
++    await persistSignalSnapshot(env, {
++      id: "stale-queue-health-entrius",
++      signalType: "queue-health",
++      targetKey: "entrius/allways-ui",
++      repoFullName: "entrius/allways-ui",
++      payload: {},
++      generatedAt: new Date(nowMs - 13 * 60 * 60 * 1000).toISOString(),
++    });
++    for (let index = 0; index < 250; index += 1) {
++      await persistSignalSnapshot(env, {
++        id: `fresh-queue-health-${index}`,
++        signalType: "queue-health",
++        targetKey: `owner/repo-${index}`,
++        repoFullName: `owner/repo-${index}`,
++        payload: {},
++        generatedAt: new Date(nowMs - index * 1000).toISOString(),
++      });
++    }
++
++    const readiness = await app.request("/v1/readiness", { headers: apiHeaders(env) }, env);
++    expect(readiness.status).toBe(200);
++    const payload = await readiness.json() as {
++      readyForPublicReview: boolean;
++      freshnessSlo: { status: string; launchBlockingCount: number; items: Array<{ area: string; targetKey: string; status: string; launchBlocking: boolean }> };
++      warnings: string[];
++    };
++
++    expect(payload.readyForPublicReview).toBe(true);
++    expect(payload.freshnessSlo).toMatchObject({
++      status: "degraded",
++      launchBlockingCount: 0,
++    });
++    expect(payload.freshnessSlo.items).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ area: "signal_snapshot", targetKey: "entrius/allways-ui", status: "stale", launchBlocking: false }),
++      ]),
++    );
++    expect(payload.warnings).toEqual(expect.arrayContaining([expect.stringContaining("Freshness SLO is degraded")]));
++  });
++
+   it("exposes capped and rate-limited sync segments in readiness and sync status", async () => {
+     const app = createApp();
+     const env = createTestEnv({ GITHUB_PUBLIC_TOKEN: "public-token" });
+diff --git a/test/unit/data-quality.test.ts b/test/unit/data-quality.test.ts
+index d3b6d045..aac5a4f4 100644
+--- a/test/unit/data-quality.test.ts
++++ b/test/unit/data-quality.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "vitest";
+-import { buildCoreSignalFidelity, buildRepoDataQuality, buildSignalFidelity } from "../../src/signals/data-quality";
++import { buildCoreSignalFidelity, buildFreshnessSloReport, buildRepoDataQuality, buildSignalFidelity, freshnessAuditMetadata } from "../../src/signals/data-quality";
+ import type { PullRequestDetailSyncStateRecord, RepoGithubTotalsSnapshotRecord, RepoSyncSegmentRecord, RepoSyncStateRecord } from "../../src/types";
+ 
+ describe("sync data quality", () => {
+@@ -91,6 +91,21 @@ describe("sync data quality", () => {
+     });
+   });
+ 
++  it("falls back to repo sync completion time when segment completion is missing", () => {
++    const quality = buildRepoDataQuality(
++      "owner/repo",
++      repoState({ lastCompletedAt: "2026-05-01T00:00:00.000Z" }),
++      [segment({ segment: "open_issues", completedAt: undefined })],
++      { nowMs: Date.parse("2026-05-25T00:00:00.000Z") },
++    );
++
++    expect(quality).toMatchObject({
++      status: "degraded",
++      stale: true,
++      staleSegments: ["open_issues"],
++    });
++  });
++
+   it("treats explicit stale segment status as stale even without an old timestamp", () => {
+     const quality = buildRepoDataQuality(
+       "owner/repo",
+@@ -163,6 +178,190 @@ describe("sync data quality", () => {
+     expect(fidelity.nextRecoverableAt).toBeUndefined();
+   });
+ 
++  it("summarizes freshness SLOs and redacts audit metadata to counts and areas", () => {
++    const report = buildFreshnessSloReport({
++      registrySnapshot: { id: "registry", fetchedAt: "2026-05-20T00:00:00.000Z", generatedAt: "2026-05-20T00:00:00.000Z", source: { kind: "raw-github", url: "fixture://registry" }, repoCount: 1, totalEmissionShare: 0.01, warnings: [], repositories: [] },
++      scoringSnapshot: null,
++      repoCount: 1,
++      totals: [{ id: "totals", repoFullName: "owner/repo", openIssuesTotal: 1, openPullRequestsTotal: 1, mergedPullRequestsTotal: 0, closedUnmergedPullRequestsTotal: 0, labelsTotal: 1, sourceKind: "test", fetchedAt: "2026-05-25T00:00:00.000Z", payload: {} }],
++      segments: [segment({ repoFullName: "owner/repo", segment: "open_issues", status: "rate_limited", completedAt: "2026-05-25T00:00:00.000Z" })],
++      signalSnapshots: [{ id: "pack", signalType: "contributor-decision-pack", targetKey: "alice", payload: {}, generatedAt: "2026-05-24T00:00:00.000Z" }],
++      nowMs: Date.parse("2026-05-28T00:00:00.000Z"),
++    });
++
++    expect(report).toMatchObject({
++      status: "blocked",
++      repairRecommended: true,
++      staleCount: expect.any(Number),
++      blockedCount: 1,
++      missingCount: 1,
++      warnings: expect.arrayContaining([expect.stringContaining("registry"), expect.stringContaining("repo_segments")]),
++    });
++    expect(freshnessAuditMetadata(report)).toEqual({
++      status: "blocked",
++      staleCount: report.staleCount,
++      degradedCount: report.degradedCount,
++      blockedCount: report.blockedCount,
++      missingCount: report.missingCount,
++      launchBlockingCount: 3,
++      repairRecommended: true,
++      affectedAreas: expect.arrayContaining(["registry", "repo_segments", "decision_pack", "scoring_model"]),
++    });
++  });
++
++  it("marks supplied freshness sources fresh when observations are inside their SLOs", () => {
++    const report = buildFreshnessSloReport({
++      registrySnapshot: { id: "registry", fetchedAt: "2026-05-25T00:00:00.000Z", generatedAt: "2026-05-25T00:00:00.000Z", source: { kind: "raw-github", url: "fixture://registry" }, repoCount: 1, totalEmissionShare: 0.01, warnings: [], repositories: [] },
++      scoringSnapshot: { id: "scoring", sourceKind: "test", sourceUrl: "fixture://scoring", fetchedAt: "2026-05-25T00:00:00.000Z", activeModel: "current_density_model", constants: {}, programmingLanguages: {}, warnings: [], payload: {} },
++      repoCount: 1,
++      syncStates: [repoState()],
++      totals: [totals()],
++      segments: [segment()],
++      signalSnapshots: [
++        { id: "decision", signalType: "contributor-decision-pack", targetKey: "oktofeesh1", payload: {}, generatedAt: "2026-05-25T00:00:00.000Z" },
++        { id: "queue", signalType: "queue-health", targetKey: "owner/repo", payload: {}, generatedAt: "2026-05-25T00:00:00.000Z" },
++      ],
++      bounties: [{ id: "bounty", repoFullName: "owner/repo", issueNumber: 1, status: "open", payload: {}, discoveredAt: "2026-05-25T00:00:00.000Z", updatedAt: "2026-05-25T00:00:00.000Z" }],
++      expectedDecisionPackKeys: ["oktofeesh1"],
++      nowMs: Date.parse("2026-05-25T01:00:00.000Z"),
++    });
++
++    expect(report).toMatchObject({
++      status: "fresh",
++      staleCount: 0,
++      degradedCount: 0,
++      blockedCount: 0,
++      missingCount: 0,
++      launchBlockingCount: 0,
++      repairRecommended: false,
++      warnings: [],
++    });
++    expect(report.items.map((item) => item.area).sort()).toEqual(["bounty_data", "decision_pack", "github_totals", "registry", "repo_segments", "scoring_model", "signal_snapshot"]);
++  });
++
++  it("degrades freshness when repo segments are active and totals are missing", () => {
++    const report = buildFreshnessSloReport({
++      repoCount: 1,
++      syncStates: [repoState({ status: "partial" })],
++      totals: [],
++      segments: [segment()],
++      nowMs: Date.parse("2026-05-25T01:00:00.000Z"),
++    });
++
++    expect(report).toMatchObject({
++      status: "degraded",
++      degradedCount: 1,
++      missingCount: 1,
++      warnings: expect.arrayContaining(["github_totals:registered_repos is missing", "repo_segments:registered_repos is degraded"]),
++    });
++  });
++
++  it("treats malformed freshness timestamps as missing observations", () => {
++    const report = buildFreshnessSloReport({
++      signalSnapshots: [{ id: "queue", signalType: "queue-health", targetKey: "owner/repo", payload: {}, generatedAt: "not-a-date" }],
++      nowMs: Date.parse("2026-05-25T01:00:00.000Z"),
++    });
++
++    expect(report).toMatchObject({
++      status: "degraded",
++      missingCount: 1,
++      launchBlockingCount: 0,
++      warnings: ["signal_snapshot:owner/repo is missing"],
++    });
++    expect(report.items[0]).toMatchObject({ area: "signal_snapshot", observedAt: null, status: "missing" });
++  });
++
++  it("does not degrade when optional bounties and decision packs are absent without expected targets", () => {
++    expect(
++      buildFreshnessSloReport({
++        signalSnapshots: [],
++        bounties: [],
++        nowMs: Date.parse("2026-05-25T01:00:00.000Z"),
++      }),
++    ).toMatchObject({
++      status: "fresh",
++      missingCount: 0,
++      launchBlockingCount: 0,
++      repairRecommended: false,
++      items: [],
++      warnings: [],
++    });
++  });
++
++  it("tracks signal freshness per target and uses each target's latest observation", () => {
++    const report = buildFreshnessSloReport({
++      signalSnapshots: [
++        { id: "old-a", signalType: "queue-health", targetKey: "owner/a", payload: {}, generatedAt: "2026-05-24T00:00:00.000Z" },
++        { id: "new-a", signalType: "queue-health", targetKey: "owner/a", payload: {}, generatedAt: "2026-05-25T00:30:00.000Z" },
++        { id: "old-b", signalType: "queue-health", targetKey: "owner/b", payload: {}, generatedAt: "2026-05-24T00:00:00.000Z" },
++      ],
++      nowMs: Date.parse("2026-05-25T01:00:00.000Z"),
++    });
++
++    expect(report).toMatchObject({
++      status: "degraded",
++      staleCount: 1,
++      launchBlockingCount: 0,
++      repairRecommended: true,
++    });
++    expect(report.items).toEqual(
++      expect.arrayContaining([
++        expect.objectContaining({ area: "signal_snapshot", targetKey: "owner/a", status: "fresh", observedAt: "2026-05-25T00:30:00.000Z", launchBlocking: false }),
++        expect.objectContaining({ area: "signal_snapshot", targetKey: "owner/b", status: "stale", observedAt: "2026-05-24T00:00:00.000Z", launchBlocking: false }),
++      ]),
++    );
++  });
++
++  it("keeps sparse freshness inputs scoped to explicitly observed sources", () => {
++    const totalsOnly = buildFreshnessSloReport({
++      totals: [totals()],
++      nowMs: Date.parse("2026-05-25T01:00:00.000Z"),
++    });
++    const missingSegments = buildFreshnessSloReport({
++      repoCount: 1,
++      syncStates: [repoState({ status: "never_synced" })],
++      segments: [],
++      nowMs: Date.parse("2026-05-25T01:00:00.000Z"),
++    });
++    const discoveredBounty = buildFreshnessSloReport({
++      bounties: [{ id: "bounty", repoFullName: "owner/repo", issueNumber: 1, status: "open", payload: {}, discoveredAt: "2026-05-25T00:30:00.000Z" }],
++      nowMs: Date.parse("2026-05-25T01:00:00.000Z"),
++    });
++
++    expect(totalsOnly.items).toEqual([]);
++    expect(missingSegments).toMatchObject({
++      status: "degraded",
++      missingCount: 1,
++      warnings: ["repo_segments:registered_repos is missing"],
++    });
++    expect(discoveredBounty).toMatchObject({ status: "fresh", repairRecommended: false });
++    expect(discoveredBounty.items[0]).toMatchObject({ area: "bounty_data", ageSeconds: 1800, observedAt: "2026-05-25T00:30:00.000Z" });
++  });
++
++  it("degrades core fidelity when a registered repo has no segment coverage yet", () => {
++    expect(buildCoreSignalFidelity(1, [repoState()], [], [], [])).toMatchObject({
++      status: "degraded",
++      incompleteRepos: ["owner/repo"],
++      degradedRepos: 1,
++    });
++  });
++
++  it("uses segment expected counts for rate-limited core checks before totals exist", () => {
++    expect(
++      buildCoreSignalFidelity(
++        1,
++        [repoState({ status: "rate_limited" })],
++        [segment({ segment: "open_issues", status: "waiting_rate_limit", fetchedCount: 1, expectedCount: 2, rateLimitResetAt: "2026-05-27T00:00:00.000Z" })],
++        [],
++        [],
++      ),
++    ).toMatchObject({
++      status: "blocked",
++      incompleteRepos: ["owner/repo"],
++      waitingForRateLimitRepos: ["owner/repo"],
++    });
++  });
++
+   it("does not block repo fidelity when a rate-limited segment already has complete stored coverage", () => {
+     const recoveredSegment = segment({
+       repoFullName: "owner/recovered",
+diff --git a/test/unit/queue.test.ts b/test/unit/queue.test.ts
+index 2ab7263b..c62355c6 100644
+--- a/test/unit/queue.test.ts
++++ b/test/unit/queue.test.ts
+@@ -9,6 +9,7 @@ import {
+   listPullRequests,
+   listRepoSyncStates,
+   listSignalSnapshots,
++  persistSignalSnapshot,
+   upsertRepoSyncSegment,
+   upsertInstallation,
+   upsertPullRequestFromGitHub,
+@@ -273,7 +274,67 @@ describe("queue processors", () => {
+       metadata_json: string;
+     }>();
+     expect(audit?.outcome).toBe("completed");
+-    expect(JSON.parse(audit?.metadata_json ?? "{}")).toMatchObject({ repairCount: 0, signalRefreshCount: 2 });
++    expect(JSON.parse(audit?.metadata_json ?? "{}")).toMatchObject({ repairCount: 0, signalRefreshCount: 2, freshnessSlo: { status: "fresh", repairRecommended: false } });
++    const sloAudit = await env.DB.prepare("select detail, outcome, metadata_json from audit_events where event_type = ?").bind("signals.freshness_slo").first<{
++      detail: string;
++      outcome: string;
++      metadata_json: string;
++    }>();
++    expect(sloAudit).toMatchObject({ detail: "fresh", outcome: "completed" });
++    expect(JSON.parse(sloAudit?.metadata_json ?? "{}")).toMatchObject({ status: "fresh", affectedAreas: [] });
++    expect(sloAudit?.metadata_json).not.toMatch(/JSONbored|we-promise|github|token|secret/i);
++  });
++
++  it("queues signal repair and emits alertable audit state when freshness SLOs breach", async () => {
++    const sent: Array<{ message: import("../../src/types").JobMessage; options?: QueueSendOptions }> = [];
++    const env = createTestEnv({
++      JOBS: {
++        async send(message: import("../../src/types").JobMessage, options?: QueueSendOptions) {
++          sent.push(options ? { message, options } : { message });
++        },
++      } as unknown as Queue,
++    });
++    await persistRegistrySnapshot(
++      env,
++      normalizeRegistryPayload(
++        { "JSONbored/gittensory": { emission_share: 0.01, issue_discovery_share: 0, label_multipliers: {}, trusted_label_pipeline: false } },
++        { kind: "raw-github", url: "fixture://registry" },
++        "2026-05-25T00:00:00.000Z",
++      ),
++    );
++    await upsertRepoSyncSegment(env, completeSegment("JSONbored/gittensory", "labels"));
++    await upsertRepoSyncSegment(env, completeSegment("JSONbored/gittensory", "open_issues"));
++    await upsertRepoSyncSegment(env, completeSegment("JSONbored/gittensory", "open_pull_requests"));
++    await persistSignalSnapshot(env, {
++      id: "stale-queue-health",
++      signalType: "queue-health",
++      targetKey: "JSONbored/gittensory",
++      repoFullName: "JSONbored/gittensory",
++      payload: {},
++      generatedAt: new Date(Date.now() - 13 * 60 * 60 * 1000).toISOString(),
++    });
++
++    await processJob(env, { type: "repair-data-fidelity", requestedBy: "api" });
++
++    expect(sent).toEqual([{ message: expect.objectContaining({ type: "generate-signal-snapshots", repoFullName: "JSONbored/gittensory" }) }]);
++    const repairAudit = await env.DB.prepare("select outcome, metadata_json from audit_events where event_type = ?").bind("sync.fidelity_repair").first<{
++      outcome: string;
++      metadata_json: string;
++    }>();
++    expect(repairAudit?.outcome).toBe("queued");
++    expect(JSON.parse(repairAudit?.metadata_json ?? "{}")).toMatchObject({
++      repairCount: 0,
++      signalRefreshCount: 1,
++      freshnessSlo: { status: "degraded", repairRecommended: true, affectedAreas: ["signal_snapshot"], launchBlockingCount: 0 },
++    });
++    const sloAudit = await env.DB.prepare("select detail, outcome, metadata_json from audit_events where event_type = ?").bind("signals.freshness_slo").first<{
++      detail: string;
++      outcome: string;
++      metadata_json: string;
++    }>();
++    expect(sloAudit).toMatchObject({ detail: "degraded", outcome: "queued" });
++    expect(JSON.parse(sloAudit?.metadata_json ?? "{}")).toMatchObject({ status: "degraded", affectedAreas: ["signal_snapshot"], launchBlockingCount: 0 });
++    expect(sloAudit?.metadata_json).not.toMatch(/JSONbored|gittensory|token|secret/i);
+   });
+ 
+   it("fans out signal snapshot generation instead of doing all repo work inline", async () => {

@@ -1,0 +1,89 @@
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index 5d94002c..04567a9b 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -1312,20 +1312,24 @@ function toIssueWatchSubscription(row: typeof issueWatchSubscriptions.$inferSele
+ }
+ 
+ /** Subscribe a miner to a repo's new grabbable issues; idempotent on (login, repo) — re-subscribing just
+- *  updates the label filter. `labels` ([]=any) are lowercased for case-insensitive matching at delivery. */
++ *  updates the label filter. `login`, `repoFullName`, and `labels` ([]=any) are all lowercased so matching
++ *  is case-insensitive: GitHub repo names are case-insensitive, and the delivery lookup keys off the
++ *  webhook's canonical `repository.full_name`, so a watch stored under a different casing must still match. */
+ export async function upsertIssueWatchSubscription(env: Env, input: { login: string; repoFullName: string; labels?: string[] | undefined }): Promise<IssueWatchSubscription> {
+   const db = getDb(env.DB);
+   const login = input.login.toLowerCase();
++  const repoFullName = input.repoFullName.toLowerCase();
+   const labels = [...new Set((input.labels ?? []).map((label) => label.toLowerCase().trim()).filter(Boolean))];
+   await db
+     .insert(issueWatchSubscriptions)
+-    .values({ id: crypto.randomUUID(), login, repoFullName: input.repoFullName, labelsJson: jsonString(labels), updatedAt: nowIso() })
++    .values({ id: crypto.randomUUID(), login, repoFullName, labelsJson: jsonString(labels), updatedAt: nowIso() })
+     .onConflictDoUpdate({ target: [issueWatchSubscriptions.login, issueWatchSubscriptions.repoFullName], set: { labelsJson: jsonString(labels), updatedAt: nowIso() } });
+   const [row] = await db
+     .select()
+     .from(issueWatchSubscriptions)
+-    .where(and(eq(issueWatchSubscriptions.login, login), eq(issueWatchSubscriptions.repoFullName, input.repoFullName)));
+-  return row ? toIssueWatchSubscription(row) : { login, repoFullName: input.repoFullName, labels };
++    .where(and(eq(issueWatchSubscriptions.login, login), eq(issueWatchSubscriptions.repoFullName, repoFullName)));
++  /* v8 ignore next -- the row always exists immediately after the upsert above; the literal is a type-safety fallback. */
++  return row ? toIssueWatchSubscription(row) : { login, repoFullName, labels };
+ }
+ 
+ export async function listIssueWatchSubscriptionsForLogin(env: Env, login: string): Promise<IssueWatchSubscription[]> {
+@@ -1337,19 +1341,17 @@ export async function listIssueWatchSubscriptionsForLogin(env: Env, login: strin
+ /** Returns whether a watch existed and was removed (so the caller can report it accurately). */
+ export async function deleteIssueWatchSubscription(env: Env, login: string, repoFullName: string): Promise<boolean> {
+   const db = getDb(env.DB);
+-  const existing = await db
+-    .select({ id: issueWatchSubscriptions.id })
+-    .from(issueWatchSubscriptions)
+-    .where(and(eq(issueWatchSubscriptions.login, login.toLowerCase()), eq(issueWatchSubscriptions.repoFullName, repoFullName)));
++  const where = and(eq(issueWatchSubscriptions.login, login.toLowerCase()), eq(issueWatchSubscriptions.repoFullName, repoFullName.toLowerCase()));
++  const existing = await db.select({ id: issueWatchSubscriptions.id }).from(issueWatchSubscriptions).where(where);
+   if (existing.length === 0) return false;
+-  await db.delete(issueWatchSubscriptions).where(and(eq(issueWatchSubscriptions.login, login.toLowerCase()), eq(issueWatchSubscriptions.repoFullName, repoFullName)));
++  await db.delete(issueWatchSubscriptions).where(where);
+   return true;
+ }
+ 
+ /** All miners watching a repo — the candidate recipients when a new grabbable issue opens there. */
+ export async function listIssueWatchersForRepo(env: Env, repoFullName: string): Promise<IssueWatchSubscription[]> {
+   const db = getDb(env.DB);
+-  const rows = await db.select().from(issueWatchSubscriptions).where(eq(issueWatchSubscriptions.repoFullName, repoFullName)).limit(5000);
++  const rows = await db.select().from(issueWatchSubscriptions).where(eq(issueWatchSubscriptions.repoFullName, repoFullName.toLowerCase())).limit(5000);
+   return rows.map(toIssueWatchSubscription);
+ }
+ 
+diff --git a/test/unit/issue-watch.test.ts b/test/unit/issue-watch.test.ts
+index 171faf05..98bfb785 100644
+--- a/test/unit/issue-watch.test.ts
++++ b/test/unit/issue-watch.test.ts
+@@ -50,6 +50,27 @@ describe("issue-watch subscriptions (CRUD)", () => {
+     expect(await deleteIssueWatchSubscription(env, "miner", "owner/repo")).toBe(false); // already gone
+     expect(await listIssueWatchSubscriptionsForLogin(env, "miner")).toHaveLength(0);
+   });
++
++  it("matches the watched repo case-insensitively (GitHub repo names are case-insensitive)", async () => {
++    const env = createTestEnv();
++    // owner/repo is a tracked PUBLIC repo, so the visibility-aware fan-out gate (#742) admits any watcher.
++    await upsertRepositoryFromGitHub(env, { name: "repo", full_name: "owner/repo", private: false, owner: { login: "owner" }, default_branch: "main" }, 100);
++    // Subscribe with non-canonical casing — the webhook delivers the canonical `repository.full_name`,
++    // so the stored repo must still match it (and be normalized for display + idempotency).
++    await upsertIssueWatchSubscription(env, { login: "alice", repoFullName: "Owner/Repo" });
++    expect((await listIssueWatchSubscriptionsForLogin(env, "alice"))[0]!.repoFullName).toBe("owner/repo");
++
++    // Delivery-side lookup uses the canonical webhook casing and still finds the watcher.
++    expect(await listIssueWatchersForRepo(env, "owner/repo")).toHaveLength(1);
++    const events = await detectIssueWatchEvents(env, "owner/repo", issue({ number: 21, authorLogin: "maintainer" }));
++    expect(events.map((e) => e.recipientLogin)).toEqual(["alice"]);
++
++    // Re-subscribing under yet another casing is idempotent (no duplicate row), and unwatch is case-insensitive.
++    await upsertIssueWatchSubscription(env, { login: "alice", repoFullName: "OWNER/REPO", labels: ["bug"] });
++    expect(await listIssueWatchSubscriptionsForLogin(env, "alice")).toHaveLength(1);
++    expect(await deleteIssueWatchSubscription(env, "alice", "owner/REPO")).toBe(true);
++    expect(await listIssueWatchersForRepo(env, "owner/repo")).toHaveLength(0);
++  });
+ });
+ 
+ describe("detectIssueWatchEvents", () => {
