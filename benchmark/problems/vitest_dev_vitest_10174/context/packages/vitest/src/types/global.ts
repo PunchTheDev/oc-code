@@ -1,0 +1,129 @@
+import type { PromisifyAssertion, Tester } from '@vitest/expect'
+import type { Plugin as PrettyFormatPlugin } from '@vitest/pretty-format'
+import type { SnapshotState } from '@vitest/snapshot'
+import type { BenchResult } from '../runtime/benchmark'
+import type { Test } from '../runtime/runner/types'
+
+interface SnapshotMatcher<T> {
+  <U extends { [P in keyof T]: any }>(
+    snapshot: Partial<U>,
+    hint?: string
+  ): void
+  (hint?: string): void
+}
+
+interface InlineSnapshotMatcher<T> {
+  <U extends { [P in keyof T]: any }>(
+    properties: Partial<U>,
+    snapshot?: string,
+    hint?: string
+  ): void
+  (hint?: string): void
+}
+
+declare module 'vitest' {
+  interface MatcherState {
+    environment: string
+    snapshotState: SnapshotState
+    task?: Readonly<Test>
+  }
+
+  interface ExpectPollOptions {
+    interval?: number
+    timeout?: number
+    message?: string
+  }
+
+  interface ExpectStatic {
+    assert: Chai.AssertStatic
+    unreachable: (message?: string) => never
+    soft: <T>(actual: T, message?: string) => Assertion<T>
+    poll: <T>(
+      actual: (options: { signal: AbortSignal }) => T,
+      options?: ExpectPollOptions,
+    ) => PromisifyAssertion<Awaited<T>>
+    addEqualityTesters: (testers: Array<Tester>) => void
+    assertions: (expected: number) => void
+    hasAssertions: () => void
+    addSnapshotSerializer: (plugin: PrettyFormatPlugin) => void
+  }
+
+  interface Assertion<T> {
+    // Snapshots are extended in @vitest/snapshot and are not part of @vitest/expect
+    matchSnapshot: SnapshotMatcher<T>
+    toMatchSnapshot: SnapshotMatcher<T>
+    toMatchInlineSnapshot: InlineSnapshotMatcher<T>
+
+    /**
+     * Checks that an error thrown by a function matches a previously recorded snapshot.
+     *
+     * @param hint - Optional custom error message.
+     *
+     * @example
+     * expect(functionWithError).toThrowErrorMatchingSnapshot();
+     */
+    toThrowErrorMatchingSnapshot: (hint?: string) => void
+
+    /**
+     * Checks that an error thrown by a function matches an inline snapshot within the test file.
+     * Useful for keeping snapshots close to the test code.
+     *
+     * @param snapshot - Optional inline snapshot string to match.
+     * @param hint - Optional custom error message.
+     *
+     * @example
+     * const throwError = () => { throw new Error('Error occurred') };
+     * expect(throwError).toThrowErrorMatchingInlineSnapshot(`"Error occurred"`);
+     */
+    toThrowErrorMatchingInlineSnapshot: (
+      snapshot?: string,
+      hint?: string,
+    ) => void
+
+    /**
+     * Compares the received value to a snapshot saved in a specified file.
+     * Useful for cases where snapshot content is large or needs to be shared across tests.
+     *
+     * @param filepath - Path to the snapshot file.
+     * @param hint - Optional custom error message.
+     *
+     * @example
+     * await expect(largeData).toMatchFileSnapshot('path/to/snapshot.json');
+     */
+    toMatchFileSnapshot: (filepath: string, hint?: string) => Promise<void>
+
+    /**
+     * Asserts that a benchmark result is faster than another benchmark result.
+     * Compares mean latency — lower is faster.
+     *
+     * @example
+     * const result = await bench.compare(
+     *   bench('lib1', () => { lib1() }),
+     *   bench('lib2', () => { lib2() }),
+     * )
+     * expect(result.get('lib1')).toBeFasterThan(result.get('lib2'))
+     * expect(result.get('lib1')).toBeFasterThan(result.get('lib2'), { delta: 0.1 })
+     */
+    toBeFasterThan: (
+      expected: BenchResult,
+      options?: { delta?: number },
+    ) => void
+
+    /**
+     * Asserts that a benchmark result is slower than another benchmark result.
+     * Compares mean latency — higher is slower.
+     *
+     * @example
+     * const result = await bench.compare(
+     *   bench('lib1', () => { lib1() }),
+     *   bench('lib2', () => { lib2() }),
+     * )
+     * expect(result.get('lib2')).toBeSlowerThan(result.get('lib1'))
+     * expect(result.get('lib2')).toBeSlowerThan(result.get('lib1'), { delta: 0.2 })
+     */
+    toBeSlowerThan: (
+      expected: BenchResult,
+      options?: { delta?: number },
+    ) => void
+  }
+}

@@ -1,0 +1,382 @@
+diff --git a/memory/src/memory/service.py b/memory/src/memory/service.py
+index 17c226b..592f47f 100644
+--- a/memory/src/memory/service.py
++++ b/memory/src/memory/service.py
+@@ -14,6 +14,7 @@
+ from qdrant_client.models import Distance, PointStruct, VectorParams
+ 
+ from activelearning import BaseService, get_embedding_service
++from activelearning.embeddings import is_zero_vector
+ from activelearning.subjects import Subjects
+ 
+ from memory.models import Episode, MemoryQuery, MemoryResult
+@@ -82,6 +83,13 @@ async def store_episode(self, episode: Episode) -> str:
+         """
+         # Generate embedding
+         embedding = await self._embed_text(episode.summary)
++        embed_ok = not is_zero_vector(embedding)
++        if not embed_ok:
++            self.logger.warning(
++                "Skipping Qdrant vector storage for episode %s: embedding unavailable "
++                "(episode stored in SQLite only)",
++                episode.id,
++            )
+ 
+         # Store in SQLite using Database helper
+         await self.database.insert(
+@@ -90,29 +98,30 @@ async def store_episode(self, episode: Episode) -> str:
+                 "id": episode.id,
+                 "trace_id": episode.trace_id,
+                 "timestamp": episode.timestamp,
+-                "embedding_ref": episode.id,  # Points to Qdrant point ID
++                "embedding_ref": episode.id if embed_ok else None,
+                 "semantic_tags": json.dumps(episode.tags),
+                 "utility_score": episode.utility_score,
+                 "data": json.dumps(episode.data),
+             },
+         )
+ 
+-        # Store embedding in Qdrant
+-        await self._qdrant.upsert(
+-            collection_name=COLLECTION_NAME,
+-            points=[
+-                PointStruct(
+-                    id=episode.id,
+-                    vector=embedding,
+-                    payload={
+-                        "trace_id": episode.trace_id,
+-                        "timestamp": episode.timestamp,
+-                        "tags": episode.tags,
+-                        "summary": episode.summary,
+-                    },
+-                )
+-            ],
+-        )
++        # Store embedding in Qdrant (skip sentinel zero vectors)
++        if embed_ok:
++            await self._qdrant.upsert(
++                collection_name=COLLECTION_NAME,
++                points=[
++                    PointStruct(
++                        id=episode.id,
++                        vector=embedding,
++                        payload={
++                            "trace_id": episode.trace_id,
++                            "timestamp": episode.timestamp,
++                            "tags": episode.tags,
++                            "summary": episode.summary,
++                        },
++                    )
++                ],
++            )
+ 
+         self.logger.debug(f"Stored episode: {episode.id}")
+         return episode.id
+@@ -136,6 +145,11 @@ async def recall_by_similarity(
+         """
+         # Generate query embedding
+         embedding = await self._embed_text(query)
++        if is_zero_vector(embedding):
++            self.logger.warning(
++                "Similarity recall skipped: embedding unavailable for query",
++            )
++            return []
+ 
+         # Search Qdrant
+         results = await self._qdrant.search(
+diff --git a/memory/tests/test_zero_vector_recall.py b/memory/tests/test_zero_vector_recall.py
+new file mode 100644
+index 0000000..2e94aea
+--- /dev/null
++++ b/memory/tests/test_zero_vector_recall.py
+@@ -0,0 +1,45 @@
++"""Tests for memory recall when embeddings fail with a zero-vector sentinel."""
++
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from activelearning.embeddings import zero_vector
++from memory.models import Episode
++from memory.service import EMBEDDING_DIMENSIONS, MemoryService
++
++
++@pytest.mark.asyncio
++async def test_recall_by_similarity_returns_empty_on_zero_vector():
++    service = MemoryService.__new__(MemoryService)
++    service.logger = MagicMock()
++    service._embed_text = AsyncMock(return_value=zero_vector(EMBEDDING_DIMENSIONS))
++    service._qdrant = MagicMock()
++    service._qdrant.search = AsyncMock()
++
++    results = await service.recall_by_similarity("unavailable embedding")
++
++    assert results == []
++    service._qdrant.search.assert_not_called()
++    service.logger.warning.assert_called_once()
++
++
++@pytest.mark.asyncio
++async def test_store_episode_skips_qdrant_on_zero_vector():
++    service = MemoryService.__new__(MemoryService)
++    service.logger = MagicMock()
++    service.database = MagicMock()
++    service.database.insert = AsyncMock()
++    service._embed_text = AsyncMock(return_value=zero_vector(EMBEDDING_DIMENSIONS))
++    service._qdrant = MagicMock()
++    service._qdrant.upsert = AsyncMock()
++
++    episode = Episode(trace_id="trace-1", summary="embedding backend down")
++    episode_id = await service.store_episode(episode)
++
++    assert episode_id == episode.id
++    service.database.insert.assert_awaited_once()
++    inserted = service.database.insert.await_args.args[1]
++    assert inserted["embedding_ref"] is None
++    service._qdrant.upsert.assert_not_called()
++    service.logger.warning.assert_called_once()
+diff --git a/sdk/src/activelearning/embeddings.py b/sdk/src/activelearning/embeddings.py
+index c05158f..0540b00 100644
+--- a/sdk/src/activelearning/embeddings.py
++++ b/sdk/src/activelearning/embeddings.py
+@@ -20,6 +20,18 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++def zero_vector(dimensions: int) -> list[float]:
++    """Return a zero embedding of the requested dimensionality."""
++    if dimensions <= 0:
++        raise ValueError("Embedding dimensions must be a positive integer")
++    return [0.0] * dimensions
++
++
++def is_zero_vector(vector: list[float]) -> bool:
++    """True when every component is zero (embedding failure sentinel)."""
++    return bool(vector) and all(v == 0.0 for v in vector)
++
++
+ class EmbeddingService(_OllamaSession):
+     """
+     Generates text embeddings using Ollama's embedding model.
+@@ -79,14 +91,45 @@ async def embed_text(self, text: str) -> list[float]:
+             ) as response:
+                 if response.status != 200:
+                     error_text = await response.text()
+-                    raise RuntimeError(f"Ollama embedding error: {error_text}")
++                    logger.error(
++                        "Embedding backend returned HTTP %s: %s",
++                        response.status,
++                        error_text,
++                        extra={"cache_key": cache_key[:8], "model": self.model},
++                    )
++                    return self._zero_vector()
+ 
+                 result = await response.json()
+-                embedding = result["embedding"]
++                embedding = result.get("embedding")
++                if not isinstance(embedding, list):
++                    logger.error(
++                        "Embedding backend returned invalid payload",
++                        extra={"cache_key": cache_key[:8], "model": self.model},
++                    )
++                    return self._zero_vector()
++                if len(embedding) != self.dimensions:
++                    logger.error(
++                        "Embedding dimension mismatch: expected %d, got %d",
++                        self.dimensions,
++                        len(embedding),
++                        extra={"cache_key": cache_key[:8], "model": self.model},
++                    )
++                    return self._zero_vector()
++                if not all(isinstance(v, (int, float)) for v in embedding):
++                    logger.error(
++                        "Embedding payload contains non-numeric components",
++                        extra={"cache_key": cache_key[:8], "model": self.model},
++                    )
++                    return self._zero_vector()
++                embedding = [float(v) for v in embedding]
+ 
+-        except aiohttp.ClientError as e:
+-            logger.error(f"Failed to get embedding: {e}")
+-            raise RuntimeError(f"Embedding service unavailable: {e}") from e
++        except Exception as e:
++            logger.error(
++                "Failed to get embedding: %s",
++                e,
++                extra={"cache_key": cache_key[:8], "model": self.model},
++            )
++            return self._zero_vector()
+ 
+         # Cache the result
+         self._add_to_cache(cache_key, embedding)
+@@ -106,6 +149,10 @@ async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+         # For now, we process sequentially with caching
+         return [await self.embed_text(t) for t in texts]
+ 
++    def _zero_vector(self) -> list[float]:
++        """Sentinel vector returned when embedding generation fails."""
++        return zero_vector(self.dimensions)
++
+     def _cache_key(self, text: str) -> str:
+         """Generate cache key for text."""
+         return hashlib.sha256(text.encode()).hexdigest()[:16]
+diff --git a/sdk/tests/test_embeddings.py b/sdk/tests/test_embeddings.py
+new file mode 100644
+index 0000000..bd93dcc
+--- /dev/null
++++ b/sdk/tests/test_embeddings.py
+@@ -0,0 +1,154 @@
++"""Tests for embedding failure handling and zero-vector sentinels."""
++
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from activelearning.embeddings import (
++    EmbeddingService,
++    is_zero_vector,
++    zero_vector,
++)
++
++
++class TestZeroVectorHelpers:
++    def test_zero_vector_dimensions(self):
++        assert zero_vector(4) == [0.0, 0.0, 0.0, 0.0]
++
++    def test_is_zero_vector_true(self):
++        assert is_zero_vector([0.0, 0.0]) is True
++
++    def test_is_zero_vector_false_for_nonempty(self):
++        assert is_zero_vector([0.0, 0.1]) is False
++
++    def test_is_zero_vector_false_for_empty(self):
++        assert is_zero_vector([]) is False
++
++    def test_zero_vector_rejects_non_positive_dimensions(self):
++        with pytest.raises(ValueError, match="positive integer"):
++            zero_vector(0)
++        with pytest.raises(ValueError, match="positive integer"):
++            zero_vector(-1)
++
++
++@pytest.mark.asyncio
++async def test_embed_text_returns_zero_vector_on_http_error():
++    service = EmbeddingService(dimensions=8)
++
++    mock_response = MagicMock()
++    mock_response.status = 500
++    mock_response.text = AsyncMock(return_value="server error")
++    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
++    mock_response.__aexit__ = AsyncMock(return_value=False)
++
++    mock_session = MagicMock()
++    mock_session.post = MagicMock(return_value=mock_response)
++    service._get_session = AsyncMock(return_value=mock_session)
++
++    result = await service.embed_text("hello world")
++
++    assert result == zero_vector(8)
++    assert is_zero_vector(result)
++
++
++@pytest.mark.asyncio
++async def test_embed_text_returns_zero_vector_on_network_error():
++    service = EmbeddingService(dimensions=16)
++    service._get_session = AsyncMock(side_effect=ConnectionError("refused"))
++
++    result = await service.embed_text("offline query")
++
++    assert result == zero_vector(16)
++
++
++@pytest.mark.asyncio
++async def test_embed_text_returns_zero_vector_on_dimension_mismatch():
++    service = EmbeddingService(dimensions=4)
++
++    mock_response = MagicMock()
++    mock_response.status = 200
++    mock_response.json = AsyncMock(return_value={"embedding": [0.1, 0.2]})
++    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
++    mock_response.__aexit__ = AsyncMock(return_value=False)
++
++    mock_session = MagicMock()
++    mock_session.post = MagicMock(return_value=mock_response)
++    service._get_session = AsyncMock(return_value=mock_session)
++
++    result = await service.embed_text("wrong size")
++
++    assert result == zero_vector(4)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("payload", [{}, {"embedding": "not-a-list"}])
++async def test_embed_text_returns_zero_vector_on_invalid_payload_type(payload):
++    service = EmbeddingService(dimensions=4)
++
++    mock_response = MagicMock()
++    mock_response.status = 200
++    mock_response.json = AsyncMock(return_value=payload)
++    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
++    mock_response.__aexit__ = AsyncMock(return_value=False)
++
++    mock_session = MagicMock()
++    mock_session.post = MagicMock(return_value=mock_response)
++    service._get_session = AsyncMock(return_value=mock_session)
++
++    result = await service.embed_text("bad payload")
++
++    assert result == zero_vector(4)
++    assert is_zero_vector(result)
++
++
++@pytest.mark.asyncio
++async def test_embed_text_returns_zero_vector_on_non_numeric_components():
++    service = EmbeddingService(dimensions=3)
++
++    mock_response = MagicMock()
++    mock_response.status = 200
++    mock_response.json = AsyncMock(return_value={"embedding": [0.1, "bad", 0.3]})
++    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
++    mock_response.__aexit__ = AsyncMock(return_value=False)
++
++    mock_session = MagicMock()
++    mock_session.post = MagicMock(return_value=mock_response)
++    service._get_session = AsyncMock(return_value=mock_session)
++
++    result = await service.embed_text("non-numeric")
++
++    assert result == zero_vector(3)
++
++
++@pytest.mark.asyncio
++async def test_embed_text_does_not_cache_zero_vector_on_failure():
++    service = EmbeddingService(dimensions=4)
++    service._get_session = AsyncMock(side_effect=RuntimeError("boom"))
++
++    await service.embed_text("fail once")
++    await service.embed_text("fail once")
++
++    service._get_session.assert_awaited()
++    assert service._get_session.await_count == 2
++
++
++@pytest.mark.asyncio
++async def test_embed_text_caches_successful_embedding():
++    service = EmbeddingService(dimensions=3)
++
++    mock_response = MagicMock()
++    mock_response.status = 200
++    mock_response.json = AsyncMock(return_value={"embedding": [0.1, 0.2, 0.3]})
++    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
++    mock_response.__aexit__ = AsyncMock(return_value=False)
++
++    mock_session = MagicMock()
++    mock_session.post = MagicMock(return_value=mock_response)
++    service._get_session = AsyncMock(return_value=mock_session)
++
++    first = await service.embed_text("cache me")
++    second = await service.embed_text("cache me")
++
++    assert first == [0.1, 0.2, 0.3]
++    assert second == first
++    assert service._get_session.await_count == 1

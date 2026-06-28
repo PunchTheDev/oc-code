@@ -1,0 +1,901 @@
+diff --git a/crates/phase-ai/src/config.rs b/crates/phase-ai/src/config.rs
+index c5debe671c..94e4232443 100644
+--- a/crates/phase-ai/src/config.rs
++++ b/crates/phase-ai/src/config.rs
+@@ -299,6 +299,13 @@ pub struct PolicyPenalties {
+     /// value clears the loss), so this demotes rather than vetoes.
+     #[serde(default = "default_opponent_chalice_counter_penalty")]
+     pub opponent_chalice_counter_penalty: f64,
++    /// CR 119.3 / CR 702.15a: Bonus for casting a lifegain *source* (lifelink or
++    /// "you gain N life") in a deck that has lifegain payoffs — each life-gain
++    /// event feeds those payoffs. Consumed by `LifegainPayoffPolicy`, which is
++    /// payoff-gated so this never applies to incidental lifegain in non-lifegain
++    /// decks.
++    #[serde(default = "default_lifegain_source_bonus")]
++    pub lifegain_source_bonus: f64,
+ }
+ 
+ impl Default for PolicyPenalties {
+@@ -340,6 +347,7 @@ impl Default for PolicyPenalties {
+             combo_progress_next_turn_bonus: default_combo_progress_next_turn_bonus(),
+             own_chalice_counter_penalty: default_own_chalice_counter_penalty(),
+             opponent_chalice_counter_penalty: default_opponent_chalice_counter_penalty(),
++            lifegain_source_bonus: default_lifegain_source_bonus(),
+         }
+     }
+ }
+@@ -404,6 +412,9 @@ fn default_own_chalice_counter_penalty() -> f64 {
+ fn default_opponent_chalice_counter_penalty() -> f64 {
+     -4.0
+ }
++fn default_lifegain_source_bonus() -> f64 {
++    0.4
++}
+ 
+ /// Policy penalty fields present in the active CMA-ES `--group penalties`
+ /// vector. Adding a `PolicyPenalties` field requires listing it here or in
+@@ -449,7 +460,10 @@ pub const ACTIVE_POLICY_PENALTY_FIELDS: &[&str] = &[
+ 
+ /// Policy penalties intentionally not present in an active CMA-ES parameter
+ /// vector yet.
+-pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[];
++pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[(
++    "lifegain_source_bonus",
++    "new LifegainPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
++)];
+ 
+ /// Full AI configuration combining difficulty, search, and evaluation settings.
+ #[derive(Debug, Clone)]
+diff --git a/crates/phase-ai/src/features/lifegain.rs b/crates/phase-ai/src/features/lifegain.rs
+new file mode 100644
+index 0000000000..87b8bbcfd0
+--- /dev/null
++++ b/crates/phase-ai/src/features/lifegain.rs
+@@ -0,0 +1,183 @@
++//! Lifegain-matters feature — structural detection over a deck's typed AST.
++//!
++//! Parser AST verification — VERIFIED:
++//! - `Keyword::Lifelink` at `keywords.rs:487` (CR 702.15a): a lifelink source
++//!   makes its controller gain life on damage.
++//! - `Effect::GainLife { amount, player }` at `ability.rs` (CR 119.3): "you gain
++//!   N life" when `player` resolves to the controller.
++//! - `TriggerMode::LifeGained` at `triggers.rs:313` (CR 603.6a): "whenever you
++//!   gain life, …" — the lifegain *payoff*.
++//!
++//! No parser remediation required — lifegain-matters cards classify structurally
++//! using the existing typed AST; never by card name.
++//!
++//! Why this is not redundant with existing handling: `eval.rs::lifelink_mult`
++//! gives a flat per-creature lifelink bonus and `redundancy_avoidance` actively
++//! *penalizes* gaining life at a high life total — neither recognizes a deck
++//! whose payoffs convert each life-gain event into advantage. This axis fills
++//! that gap; the companion policy is payoff-gated so non-lifegain decks (and the
++//! redundancy penalty) are unaffected.
++
++use engine::game::DeckEntry;
++use engine::types::ability::{
++    AbilityDefinition, ControllerRef, Effect, TargetFilter, TriggerDefinition,
++};
++use engine::types::card::CardFace;
++use engine::types::card_type::CoreType;
++use engine::types::keywords::Keyword;
++use engine::types::triggers::TriggerMode;
++
++use crate::ability_chain::collect_chain_effects;
++use crate::features::commitment;
++
++/// Commitment floor below which `LifegainPayoffPolicy` opts out.
++pub const COMMITMENT_FLOOR: f32 = 0.30;
++
++/// CR 119 / CR 702.15a: Per-deck lifegain-matters classification.
++///
++/// Populated once per game from `DeckEntry` data. Detection is structural over
++/// `CardFace.keywords`, `CardFace.abilities`, and `CardFace.triggers` — never by
++/// card name. The companion `LifegainPayoffPolicy` consumes this to value
++/// casting lifegain sources when the deck contains payoffs.
++#[derive(Debug, Clone, Default)]
++pub struct LifegainFeature {
++    /// Cards that gain *you* life — lifelink, or a "you gain N life" effect.
++    /// CR 702.15a / CR 119.3. The fuel a lifegain-matters deck runs on.
++    pub source_count: u32,
++    /// Cards that REWARD gaining life — a `LifeGained` trigger ("whenever you
++    /// gain life, …"). CR 603.6a. The intent signal: a pile of incidental
++    /// lifegain without payoffs is not a lifegain-MATTERS deck.
++    pub payoff_count: u32,
++    /// `0.0..=1.0` — how central the lifegain-matters plan is to this deck.
++    /// Driven primarily by payoff density; sources are supporting fuel. Consumed
++    /// by `LifegainPayoffPolicy::activation` as the scaling knob.
++    pub commitment: f32,
++}
++
++/// Structural detection — walks each `DeckEntry`'s `CardFace` AST and counts
++/// lifegain sources and lifegain payoffs.
++pub fn detect(deck: &[DeckEntry]) -> LifegainFeature {
++    if deck.is_empty() {
++        return LifegainFeature::default();
++    }
++
++    let mut source_count = 0u32;
++    let mut payoff_count = 0u32;
++    let mut total_nonland = 0u32;
++
++    for entry in deck {
++        let face = &entry.card;
++        if !face.card_type.core_types.contains(&CoreType::Land) {
++            total_nonland = total_nonland.saturating_add(entry.count);
++        }
++        if is_lifegain_source(face) {
++            source_count = source_count.saturating_add(entry.count);
++        }
++        if is_lifegain_payoff(face) {
++            payoff_count = payoff_count.saturating_add(entry.count);
++        }
++    }
++
++    // Payoffs are the intent signal; sources are fuel. Weights mirror the
++    // calibrated artifacts axis: a *single* incidental payoff in a ~40–60-nonland
++    // deck stays below `COMMITMENT_FLOOR` (≈0.12–0.18) — it takes roughly three
++    // payoff-equivalents to activate. Sources contribute little on their own
++    // (incidental lifelink/gain-life is common in non-lifegain decks), and the
++    // policy is additionally payoff-gated so sources alone never activate it.
++    let commitment = commitment::weighted_sum(&[
++        (
++            0.12,
++            commitment::density_per_60(payoff_count, total_nonland),
++        ),
++        (
++            0.03,
++            commitment::density_per_60(source_count, total_nonland),
++        ),
++    ]);
++
++    LifegainFeature {
++        source_count,
++        payoff_count,
++        commitment,
++    }
++}
++
++/// A lifegain *source*: lifelink, or an effect (in an ability or trigger chain)
++/// that makes you gain life. CR 702.15a / CR 119.3.
++fn is_lifegain_source(face: &CardFace) -> bool {
++    if is_lifegain_source_parts(&face.keywords, &chain_effects(&face.abilities)) {
++        return true;
++    }
++    // "At the beginning of your upkeep, you gain 1 life" and similar trigger-borne
++    // sources. CR 603.6a.
++    face.triggers.iter().any(is_lifegain_source_trigger)
++}
++
++/// A lifegain *payoff*: a `LifeGained` trigger ("whenever you gain life, …").
++/// CR 603.6a.
++fn is_lifegain_payoff(face: &CardFace) -> bool {
++    face.triggers.iter().any(trigger_rewards_your_lifegain)
++}
++
++/// Single authority for the "these *parts* make a lifegain source" check —
++/// lifelink (CR 702.15a) or a controller-scoped `GainLife` effect (CR 119.3).
++/// Shared by deck-time `CardFace` detection ([`is_lifegain_source`]) and the
++/// live-game `LifegainPayoffPolicy` so the two never drift. Operates on a
++/// keyword slice + an effect slice so it applies equally to a `CardFace` and a
++/// `GameObject`.
++pub(crate) fn is_lifegain_source_parts(keywords: &[Keyword], effects: &[&Effect]) -> bool {
++    keywords.contains(&Keyword::Lifelink) || effects.iter().any(effect_gains_you_life)
++}
++
++/// True when a trigger's executed effect chain makes the controller gain life.
++/// Shared with the live policy so trigger-borne sources such as Soul Warden
++/// variants are valued the same way they are detected at deck-analysis time.
++pub(crate) fn is_lifegain_source_trigger(trigger: &TriggerDefinition) -> bool {
++    trigger.execute.as_ref().is_some_and(|exec| {
++        collect_chain_effects(exec)
++            .iter()
++            .any(effect_gains_you_life)
++    })
++}
++
++/// True when a `LifeGained` trigger rewards the source controller's lifegain.
++/// Opponent-only life-gain triggers punish or react to opponents; they are not
++/// payoffs for the AI's own lifegain plan.
++fn trigger_rewards_your_lifegain(trigger: &TriggerDefinition) -> bool {
++    trigger.mode == TriggerMode::LifeGained
++        && !filter_is_opponent_scoped(trigger.valid_target.as_ref())
++}
++
++fn filter_is_opponent_scoped(filter: Option<&TargetFilter>) -> bool {
++    let Some(filter) = filter else {
++        return false;
++    };
++    match filter {
++        TargetFilter::Typed(typed) => matches!(typed.controller, Some(ControllerRef::Opponent)),
++        TargetFilter::Or { filters } => filters.iter().all(|f| filter_is_opponent_scoped(Some(f))),
++        TargetFilter::And { filters } => filters.iter().any(|f| filter_is_opponent_scoped(Some(f))),
++        _ => false,
++    }
++}
++
++/// True if the effect makes you (the controller) gain life. CR 119.3. Opponent-
++/// scoped gain ("target opponent gains 2 life") does not count as your source.
++fn effect_gains_you_life(effect: &&Effect) -> bool {
++    matches!(
++        effect,
++        Effect::GainLife { player, .. } if target_filter_is_you(player)
++    )
++}
++
++/// CR 119.3: "you gain N life" — the controller-scoped gain. A targeted/other
++/// player gain ("target player/opponent gains life") is not a reliable source
++/// of *your* lifegain, so only `Controller` counts.
++fn target_filter_is_you(filter: &TargetFilter) -> bool {
++    matches!(filter, TargetFilter::Controller)
++}
++
++/// Flatten a slice of abilities into the effects reachable through their
++/// sub-ability chains (the effect set the source predicate inspects).
++fn chain_effects(abilities: &[AbilityDefinition]) -> Vec<&Effect> {
++    abilities.iter().flat_map(collect_chain_effects).collect()
++}
+diff --git a/crates/phase-ai/src/features/mod.rs b/crates/phase-ai/src/features/mod.rs
+index ad8eb4da28..22371b5f40 100644
+--- a/crates/phase-ai/src/features/mod.rs
++++ b/crates/phase-ai/src/features/mod.rs
+@@ -11,6 +11,7 @@ pub mod aristocrats;
+ pub mod commitment;
+ pub mod control;
+ pub mod landfall;
++pub mod lifegain;
+ pub mod mana_ramp;
+ pub mod plus_one_counters;
+ pub mod spellslinger_prowess;
+@@ -24,6 +25,7 @@ pub use aggro_pressure::AggroPressureFeature;
+ pub use aristocrats::AristocratsFeature;
+ pub use control::ControlFeature;
+ pub use landfall::LandfallFeature;
++pub use lifegain::LifegainFeature;
+ pub use mana_ramp::ManaRampFeature;
+ pub use plus_one_counters::PlusOneCountersFeature;
+ pub use spellslinger_prowess::SpellslingerProwessFeature;
+@@ -46,6 +48,7 @@ pub struct DeckFeatures {
+     pub archetype: DeckArchetype,
+     pub strategy: StrategyProfile,
+     pub landfall: LandfallFeature,
++    pub lifegain: LifegainFeature,
+     pub mana_ramp: ManaRampFeature,
+     pub tribal: TribalFeature,
+     pub control: ControlFeature,
+@@ -82,6 +85,7 @@ impl DeckFeatures {
+             archetype,
+             strategy,
+             landfall: landfall::detect(deck),
++            lifegain: lifegain::detect(deck),
+             mana_ramp: mana_ramp::detect(deck),
+             tribal: tribal::detect(deck),
+             control: control::detect(deck),
+diff --git a/crates/phase-ai/src/features/tests/lifegain.rs b/crates/phase-ai/src/features/tests/lifegain.rs
+new file mode 100644
+index 0000000000..557f7df59a
+--- /dev/null
++++ b/crates/phase-ai/src/features/tests/lifegain.rs
+@@ -0,0 +1,209 @@
++//! Tests for the lifegain-matters feature detector. Live in a sibling test
++//! module (declared from `features/tests/mod.rs`) so `features/lifegain.rs`
++//! stays implementation-only and SOURCE-classified.
++//!
++//! Detection is verified structurally — every test builds a `CardFace` AST and
++//! asserts the detector's counts. No card-name classification is used.
++
++use engine::game::DeckEntry;
++use engine::types::ability::{
++    AbilityDefinition, AbilityKind, ControllerRef, Effect, QuantityExpr, TargetFilter,
++    TriggerDefinition, TypedFilter,
++};
++use engine::types::card::CardFace;
++use engine::types::card_type::{CardType, CoreType};
++use engine::types::keywords::Keyword;
++use engine::types::triggers::TriggerMode;
++
++use crate::features::lifegain::{detect, is_lifegain_source_parts, COMMITMENT_FLOOR};
++
++fn card_face(name: &str, core: Vec<CoreType>) -> CardFace {
++    CardFace {
++        name: name.to_string(),
++        card_type: CardType {
++            supertypes: Vec::new(),
++            core_types: core,
++            subtypes: Vec::new(),
++        },
++        ..Default::default()
++    }
++}
++
++fn entry(card: CardFace, count: u32) -> DeckEntry {
++    DeckEntry { card, count }
++}
++
++/// "You gain N life" effect (controller-scoped — your source).
++fn gain_life_you() -> Effect {
++    Effect::GainLife {
++        amount: QuantityExpr::Fixed { value: 2 },
++        player: TargetFilter::Controller,
++    }
++}
++
++fn ability(effect: Effect) -> AbilityDefinition {
++    AbilityDefinition::new(AbilityKind::Spell, effect)
++}
++
++/// A lifelink creature — a lifegain source.
++fn lifelink_source(name: &str) -> CardFace {
++    let mut face = card_face(name, vec![CoreType::Creature]);
++    face.keywords.push(Keyword::Lifelink);
++    face
++}
++
++/// A "whenever you gain life, …" payoff.
++fn lifegain_payoff(name: &str) -> CardFace {
++    let mut face = card_face(name, vec![CoreType::Creature]);
++    face.triggers
++        .push(TriggerDefinition::new(TriggerMode::LifeGained));
++    face
++}
++
++fn vanilla(name: &str) -> CardFace {
++    card_face(name, vec![CoreType::Creature])
++}
++
++#[test]
++fn lifelink_is_source() {
++    let f = detect(&[entry(lifelink_source("Vampire"), 1)]);
++    assert_eq!(f.source_count, 1);
++    assert_eq!(f.payoff_count, 0);
++}
++
++#[test]
++fn gain_life_effect_is_source() {
++    let mut face = card_face("Healing Salve", vec![CoreType::Instant]);
++    face.abilities.push(ability(gain_life_you()));
++    let f = detect(&[entry(face, 1)]);
++    assert_eq!(f.source_count, 1);
++}
++
++#[test]
++fn other_player_gain_life_is_not_your_source() {
++    // "Target player gains 2 life" is not a reliable source of YOUR lifegain
++    // (only a controller-scoped gain counts), so it must not register.
++    let mut face = card_face("Shared Healing", vec![CoreType::Instant]);
++    face.abilities.push(ability(Effect::GainLife {
++        amount: QuantityExpr::Fixed { value: 2 },
++        player: TargetFilter::Player,
++    }));
++    let f = detect(&[entry(face, 1)]);
++    assert_eq!(f.source_count, 0);
++}
++
++#[test]
++fn life_gained_trigger_is_payoff() {
++    let f = detect(&[entry(lifegain_payoff("Ajani's Pridemate"), 1)]);
++    assert_eq!(f.payoff_count, 1);
++}
++
++#[test]
++fn opponent_life_gained_trigger_is_not_your_payoff() {
++    let mut face = card_face("Punisher", vec![CoreType::Creature]);
++    let mut trigger = TriggerDefinition::new(TriggerMode::LifeGained);
++    trigger.valid_target = Some(TargetFilter::Typed(
++        TypedFilter::default().controller(ControllerRef::Opponent),
++    ));
++    face.triggers.push(trigger);
++
++    let f = detect(&[entry(face, 1)]);
++    assert_eq!(f.payoff_count, 0);
++}
++
++#[test]
++fn trigger_borne_gain_life_is_source() {
++    // A triggered "you gain N life" (e.g., Soul Warden's ETB) is a source. The
++    // detector is trigger-mode-agnostic — it inspects the executed effect chain.
++    let mut face = card_face("Soul Warden Variant", vec![CoreType::Creature]);
++    face.triggers
++        .push(TriggerDefinition::new(TriggerMode::ChangesZone).execute(ability(gain_life_you())));
++    let f = detect(&[entry(face, 1)]);
++    assert_eq!(f.source_count, 1);
++}
++
++#[test]
++fn vanilla_creature_inert() {
++    let f = detect(&[entry(vanilla("Bear"), 1)]);
++    assert_eq!(f.source_count, 0);
++    assert_eq!(f.payoff_count, 0);
++    assert_eq!(f.commitment, 0.0);
++}
++
++#[test]
++fn empty_deck_defaults() {
++    let f = detect(&[]);
++    assert_eq!(f.source_count, 0);
++    assert_eq!(f.payoff_count, 0);
++    assert_eq!(f.commitment, 0.0);
++}
++
++#[test]
++fn shared_source_predicate_matches_lifelink_and_gain_life() {
++    // Single authority shared by the detector and `LifegainPayoffPolicy`.
++    assert!(is_lifegain_source_parts(&[Keyword::Lifelink], &[]));
++    let gain = gain_life_you();
++    assert!(is_lifegain_source_parts(&[], &[&gain]));
++    let other = Effect::GainLife {
++        amount: QuantityExpr::Fixed { value: 2 },
++        player: TargetFilter::Player,
++    };
++    assert!(!is_lifegain_source_parts(&[], &[&other]));
++    assert!(!is_lifegain_source_parts(&[Keyword::Flying], &[]));
++    assert!(!is_lifegain_source_parts(&[], &[]));
++}
++
++// ─── calibration anchors ──────────────────────────────────────────────────────
++
++#[test]
++fn positive_calibration_real_lifegain_deck_activates() {
++    // A genuine lifegain-matters package: 4 payoffs + 6 sources in a 40-nonland
++    // deck must clear the activation floor.
++    let mut deck = vec![entry(vanilla("Filler"), 30)];
++    for i in 0..4 {
++        deck.push(entry(lifegain_payoff(&format!("Payoff {i}")), 1));
++    }
++    for i in 0..6 {
++        deck.push(entry(lifelink_source(&format!("Source {i}")), 1));
++    }
++    let f = detect(&deck);
++    assert_eq!(f.payoff_count, 4);
++    assert_eq!(f.source_count, 6);
++    assert!(
++        f.commitment >= COMMITMENT_FLOOR,
++        "real lifegain deck must activate, got {}",
++        f.commitment
++    );
++}
++
++#[test]
++fn anti_calibration_single_incidental_payoff_inert() {
++    // One incidental lifegain payoff in an otherwise unrelated 40-nonland deck
++    // must NOT cross the floor (the false-positive guard).
++    let mut deck = vec![entry(vanilla("Filler"), 39)];
++    deck.push(entry(lifegain_payoff("Lone Payoff"), 1));
++    let f = detect(&deck);
++    assert_eq!(f.payoff_count, 1);
++    assert!(
++        f.commitment < COMMITMENT_FLOOR,
++        "a single incidental payoff must stay inert, got {}",
++        f.commitment
++    );
++}
++
++#[test]
++fn anti_calibration_incidental_lifelink_without_payoff_inert() {
++    // Incidental lifelink/gain-life is common in non-lifegain decks; without
++    // payoffs it must not register as a lifegain-matters commitment.
++    let mut deck = vec![entry(vanilla("Filler"), 34)];
++    for i in 0..6 {
++        deck.push(entry(lifelink_source(&format!("Source {i}")), 1));
++    }
++    let f = detect(&deck);
++    assert_eq!(f.payoff_count, 0);
++    assert!(
++        f.commitment < COMMITMENT_FLOOR,
++        "lifelink without payoffs must stay inert, got {}",
++        f.commitment
++    );
++}
+diff --git a/crates/phase-ai/src/features/tests/mod.rs b/crates/phase-ai/src/features/tests/mod.rs
+index 29e71e22f7..d88c86db66 100644
+--- a/crates/phase-ai/src/features/tests/mod.rs
++++ b/crates/phase-ai/src/features/tests/mod.rs
+@@ -1,4 +1,5 @@
+ // allow: no_name_matching_self
+ //! Shared lint scaffolding for feature module invariants.
+ 
++pub mod lifegain;
+ pub mod no_name_matching;
+diff --git a/crates/phase-ai/src/policies/lifegain_payoff.rs b/crates/phase-ai/src/policies/lifegain_payoff.rs
+new file mode 100644
+index 0000000000..39306e2346
+--- /dev/null
++++ b/crates/phase-ai/src/policies/lifegain_payoff.rs
+@@ -0,0 +1,83 @@
++//! Lifegain-payoff tactical policy.
++//!
++//! For decks committed to the lifegain-matters axis *and* containing lifegain
++//! payoffs, values casting lifegain sources — each life-gain event the source
++//! produces feeds the deck's "whenever you gain life, …" payoffs (card
++//! advantage, counters, tokens, damage). Strictly **payoff-gated**: it opts out
++//! entirely when the deck has no lifegain payoff, so incidental lifegain in
++//! non-lifegain decks is unaffected (and it does not fight the
++//! `redundancy_avoidance` penalty there).
++//!
++//! CR 702.15a: Lifelink — its controller gains life equal to damage dealt.
++//! CR 119.3: "You gain N life." CR 603.6a: `LifeGained` payoff triggers.
++
++use engine::types::actions::GameAction;
++use engine::types::game_state::GameState;
++use engine::types::player::PlayerId;
++
++use super::context::PolicyContext;
++use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
++use crate::ability_chain::collect_chain_effects;
++use crate::features::lifegain::{
++    is_lifegain_source_parts, is_lifegain_source_trigger, COMMITMENT_FLOOR,
++};
++use crate::features::DeckFeatures;
++
++pub struct LifegainPayoffPolicy;
++
++impl TacticalPolicy for LifegainPayoffPolicy {
++    fn id(&self) -> PolicyId {
++        PolicyId::LifegainPayoff
++    }
++
++    fn decision_kinds(&self) -> &'static [DecisionKind] {
++        &[DecisionKind::CastSpell]
++    }
++
++    fn activation(
++        &self,
++        features: &DeckFeatures,
++        _state: &GameState,
++        _player: PlayerId,
++    ) -> Option<f32> {
++        let lifegain = &features.lifegain;
++        // Payoff-gated: with no payoff, gaining life converts to nothing, so the
++        // policy is inert (this is what keeps non-lifegain decks unaffected).
++        if lifegain.payoff_count == 0 || lifegain.commitment < COMMITMENT_FLOOR {
++            None
++        } else {
++            Some(lifegain.commitment)
++        }
++    }
++
++    fn verdict(&self, ctx: &PolicyContext<'_>) -> PolicyVerdict {
++        let GameAction::CastSpell { object_id, .. } = &ctx.candidate.action else {
++            return PolicyVerdict::neutral(PolicyReason::new("lifegain_payoff_na"));
++        };
++        let Some(object) = ctx.state.objects.get(object_id) else {
++            return PolicyVerdict::neutral(PolicyReason::new("lifegain_payoff_na"));
++        };
++
++        // Casting a lifegain source in a deck that has lifegain payoffs (ensured
++        // by `activation`) is what fuels those payoffs. Classification is shared
++        // with the deck-time detector via `is_lifegain_source_parts` so the two
++        // never drift. CR 702.15a / CR 119.3.
++        let effects: Vec<_> = object
++            .abilities
++            .iter()
++            .flat_map(collect_chain_effects)
++            .collect();
++        let trigger_borne_source = object
++            .trigger_definitions
++            .iter_unchecked()
++            .any(is_lifegain_source_trigger);
++        if is_lifegain_source_parts(&object.keywords, &effects) || trigger_borne_source {
++            return PolicyVerdict::score(
++                ctx.penalties().lifegain_source_bonus,
++                PolicyReason::new("lifegain_source_for_payoff"),
++            );
++        }
++
++        PolicyVerdict::neutral(PolicyReason::new("lifegain_payoff_inert"))
++    }
++}
+diff --git a/crates/phase-ai/src/policies/mod.rs b/crates/phase-ai/src/policies/mod.rs
+index b7923de05e..6ba47a6fc4 100644
+--- a/crates/phase-ai/src/policies/mod.rs
++++ b/crates/phase-ai/src/policies/mod.rs
+@@ -28,6 +28,7 @@ mod land_sequencing;
+ mod landfall_timing;
+ mod lethality_awareness;
+ mod life_total_resource;
++mod lifegain_payoff;
+ mod mana_efficiency;
+ mod mill_targeting;
+ pub mod mulligan;
+diff --git a/crates/phase-ai/src/policies/registry.rs b/crates/phase-ai/src/policies/registry.rs
+index e321d91ad9..63c6718bde 100644
+--- a/crates/phase-ai/src/policies/registry.rs
++++ b/crates/phase-ai/src/policies/registry.rs
+@@ -20,6 +20,7 @@ use super::interaction_reservation::InteractionReservationPolicy;
+ use super::landfall_timing::LandfallTimingPolicy;
+ use super::lethality_awareness::LethalityAwarenessPolicy;
+ use super::life_total_resource::LifeTotalResourcePolicy;
++use super::lifegain_payoff::LifegainPayoffPolicy;
+ use super::payment_selection::PaymentSelectionPolicy;
+ use super::plus_one_counters::PlusOneCountersPolicy;
+ use super::ramp_timing::RampTimingPolicy;
+@@ -66,6 +67,7 @@ pub enum PolicyId {
+     RecursionAwareness,
+     BoardWipeTelegraph,
+     LifeTotalResource,
++    LifegainPayoff,
+     CardAdvantage,
+     LandfallTiming,
+     RampTiming,
+@@ -281,6 +283,7 @@ impl Default for PolicyRegistry {
+             Box::new(RecursionAwarenessPolicy),
+             Box::new(BoardWipeTelegraphPolicy),
+             Box::new(LifeTotalResourcePolicy),
++            Box::new(LifegainPayoffPolicy),
+             Box::new(CardAdvantagePolicy),
+             Box::new(LandfallTimingPolicy),
+             Box::new(RampTimingPolicy),
+diff --git a/crates/phase-ai/src/policies/tests/lifegain_payoff.rs b/crates/phase-ai/src/policies/tests/lifegain_payoff.rs
+new file mode 100644
+index 0000000000..f56f33a40f
+--- /dev/null
++++ b/crates/phase-ai/src/policies/tests/lifegain_payoff.rs
+@@ -0,0 +1,257 @@
++//! Tests for `LifegainPayoffPolicy`. Live in a sibling test module (declared
++//! from `policies/tests/mod.rs`) so `policies/lifegain_payoff.rs` stays
++//! implementation-only and SOURCE-classified.
++
++use std::sync::Arc;
++
++use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
++use engine::game::zones::create_object;
++use engine::types::ability::{
++    AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter, TriggerDefinition,
++};
++use engine::types::actions::GameAction;
++use engine::types::card_type::{CardType, CoreType};
++use engine::types::game_state::{CastPaymentMode, GameState, WaitingFor};
++use engine::types::identifiers::{CardId, ObjectId};
++use engine::types::keywords::Keyword;
++use engine::types::player::PlayerId;
++use engine::types::triggers::TriggerMode;
++use engine::types::zones::Zone;
++
++use crate::config::AiConfig;
++use crate::context::AiContext;
++use crate::features::lifegain::LifegainFeature;
++use crate::features::DeckFeatures;
++use crate::session::AiSession;
++
++use super::super::context::PolicyContext;
++use super::super::lifegain_payoff::LifegainPayoffPolicy;
++use super::super::registry::{DecisionKind, PolicyId, PolicyVerdict, TacticalPolicy};
++
++const AI: PlayerId = PlayerId(0);
++
++fn features(commitment: f32, payoff_count: u32) -> DeckFeatures {
++    DeckFeatures {
++        lifegain: LifegainFeature {
++            source_count: 6,
++            payoff_count,
++            commitment,
++        },
++        ..DeckFeatures::default()
++    }
++}
++
++fn ai_context(commitment: f32, payoff_count: u32) -> (AiContext, AiConfig) {
++    let config = AiConfig::default();
++    let mut session = AiSession::empty();
++    session
++        .features
++        .insert(AI, features(commitment, payoff_count));
++    let mut context = AiContext::empty(&config.weights);
++    context.session = Arc::new(session);
++    context.player = AI;
++    (context, config)
++}
++
++fn decision() -> AiDecisionContext {
++    AiDecisionContext {
++        waiting_for: WaitingFor::Priority { player: AI },
++        candidates: Vec::new(),
++    }
++}
++
++fn cast_candidate(object_id: ObjectId) -> CandidateAction {
++    CandidateAction {
++        action: GameAction::CastSpell {
++            object_id,
++            card_id: CardId(object_id.0),
++            targets: Vec::new(),
++            payment_mode: CastPaymentMode::default(),
++        },
++        metadata: ActionMetadata {
++            actor: Some(AI),
++            tactical_class: TacticalClass::Spell,
++        },
++    }
++}
++
++fn spell_object(state: &mut GameState, idx: u64, core: Vec<CoreType>) -> ObjectId {
++    let oid = create_object(state, CardId(idx), AI, format!("Spell {idx}"), Zone::Stack);
++    state.objects.get_mut(&oid).unwrap().card_types = CardType {
++        supertypes: Vec::new(),
++        core_types: core,
++        subtypes: Vec::new(),
++    };
++    oid
++}
++
++fn delta_of(verdict: PolicyVerdict) -> (f64, String) {
++    match verdict {
++        PolicyVerdict::Score { delta, reason } => (delta, reason.kind.to_string()),
++        PolicyVerdict::Reject { .. } => panic!("unexpected Reject"),
++    }
++}
++
++// ─── identity ────────────────────────────────────────────────────────────────
++
++#[test]
++fn policy_identity() {
++    assert_eq!(LifegainPayoffPolicy.id(), PolicyId::LifegainPayoff);
++    assert!(LifegainPayoffPolicy
++        .decision_kinds()
++        .contains(&DecisionKind::CastSpell));
++}
++
++// ─── activation gate ─────────────────────────────────────────────────────────
++
++#[test]
++fn opts_out_with_no_payoff_even_at_high_commitment() {
++    // Payoff-gated: no payoff → inert even if commitment is high.
++    let features = features(0.9, 0);
++    let state = GameState::new_two_player(7);
++    assert!(LifegainPayoffPolicy
++        .activation(&features, &state, AI)
++        .is_none());
++}
++
++#[test]
++fn opts_out_below_commitment_floor() {
++    let features = features(0.1, 4);
++    let state = GameState::new_two_player(7);
++    assert!(LifegainPayoffPolicy
++        .activation(&features, &state, AI)
++        .is_none());
++}
++
++#[test]
++fn opts_in_with_payoff_above_floor() {
++    let features = features(0.6, 4);
++    let state = GameState::new_two_player(7);
++    assert_eq!(
++        LifegainPayoffPolicy.activation(&features, &state, AI),
++        Some(0.6)
++    );
++}
++
++// ─── verdict ─────────────────────────────────────────────────────────────────
++
++#[test]
++fn lifelink_source_scored() {
++    let mut state = GameState::new_two_player(7);
++    let oid = spell_object(&mut state, 1, vec![CoreType::Creature]);
++    state
++        .objects
++        .get_mut(&oid)
++        .unwrap()
++        .keywords
++        .push(Keyword::Lifelink);
++
++    let candidate = cast_candidate(oid);
++    let decision = decision();
++    let (context, config) = ai_context(0.8, 4);
++    let ctx = PolicyContext {
++        state: &state,
++        decision: &decision,
++        candidate: &candidate,
++        ai_player: AI,
++        config: &config,
++        context: &context,
++        cast_facts: None,
++    };
++
++    let (delta, kind) = delta_of(LifegainPayoffPolicy.verdict(&ctx));
++    assert_eq!(kind, "lifegain_source_for_payoff");
++    assert!(delta > 0.0, "expected a positive delta, got {delta}");
++}
++
++#[test]
++fn gain_life_spell_scored() {
++    let mut state = GameState::new_two_player(7);
++    let oid = spell_object(&mut state, 2, vec![CoreType::Instant]);
++    Arc::make_mut(&mut state.objects.get_mut(&oid).unwrap().abilities).push(
++        AbilityDefinition::new(
++            AbilityKind::Spell,
++            Effect::GainLife {
++                amount: QuantityExpr::Fixed { value: 3 },
++                player: TargetFilter::Controller,
++            },
++        ),
++    );
++
++    let candidate = cast_candidate(oid);
++    let decision = decision();
++    let (context, config) = ai_context(0.8, 4);
++    let ctx = PolicyContext {
++        state: &state,
++        decision: &decision,
++        candidate: &candidate,
++        ai_player: AI,
++        config: &config,
++        context: &context,
++        cast_facts: None,
++    };
++
++    let (delta, kind) = delta_of(LifegainPayoffPolicy.verdict(&ctx));
++    assert_eq!(kind, "lifegain_source_for_payoff");
++    assert!(delta > 0.0, "expected a positive delta, got {delta}");
++}
++
++#[test]
++fn trigger_borne_lifegain_source_scored() {
++    let mut state = GameState::new_two_player(7);
++    let oid = spell_object(&mut state, 4, vec![CoreType::Creature]);
++    state
++        .objects
++        .get_mut(&oid)
++        .unwrap()
++        .trigger_definitions
++        .push(
++            TriggerDefinition::new(TriggerMode::ChangesZone).execute(AbilityDefinition::new(
++                AbilityKind::Spell,
++                Effect::GainLife {
++                    amount: QuantityExpr::Fixed { value: 1 },
++                    player: TargetFilter::Controller,
++                },
++            )),
++        );
++
++    let candidate = cast_candidate(oid);
++    let decision = decision();
++    let (context, config) = ai_context(0.8, 4);
++    let ctx = PolicyContext {
++        state: &state,
++        decision: &decision,
++        candidate: &candidate,
++        ai_player: AI,
++        config: &config,
++        context: &context,
++        cast_facts: None,
++    };
++
++    let (delta, kind) = delta_of(LifegainPayoffPolicy.verdict(&ctx));
++    assert_eq!(kind, "lifegain_source_for_payoff");
++    assert!(delta > 0.0, "expected a positive delta, got {delta}");
++}
++
++#[test]
++fn non_source_spell_inert() {
++    let mut state = GameState::new_two_player(7);
++    let oid = spell_object(&mut state, 3, vec![CoreType::Sorcery]);
++
++    let candidate = cast_candidate(oid);
++    let decision = decision();
++    let (context, config) = ai_context(0.8, 4);
++    let ctx = PolicyContext {
++        state: &state,
++        decision: &decision,
++        candidate: &candidate,
++        ai_player: AI,
++        config: &config,
++        context: &context,
++        cast_facts: None,
++    };
++
++    let (delta, kind) = delta_of(LifegainPayoffPolicy.verdict(&ctx));
++    assert_eq!(kind, "lifegain_payoff_inert");
++    assert_eq!(delta, 0.0);
++}
+diff --git a/crates/phase-ai/src/policies/tests/mod.rs b/crates/phase-ai/src/policies/tests/mod.rs
+index 55264fcc94..e9b632c81a 100644
+--- a/crates/phase-ai/src/policies/tests/mod.rs
++++ b/crates/phase-ai/src/policies/tests/mod.rs
+@@ -1,5 +1,6 @@
+ //! Architectural lint scaffolding for `policies/`.
+ 
+ pub mod activation_marker_lint;
++pub mod lifegain_payoff;
+ pub mod mulligan_input_lint;
+ pub mod score_contract_lint;

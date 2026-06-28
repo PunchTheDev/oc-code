@@ -1,0 +1,178 @@
+diff --git a/tests/health-chain-events-cache.test.mjs b/tests/health-chain-events-cache.test.mjs
+new file mode 100644
+index 000000000..c80925d43
+--- /dev/null
++++ b/tests/health-chain-events-cache.test.mjs
+@@ -0,0 +1,83 @@
++import assert from "node:assert/strict";
++import { test } from "vitest";
++import { CHAIN_EVENTS_DB_TTL_MS, readChainEventsDb } from "../workers/api.mjs";
++
++function mkDbEnv(row = { block: 100, at: 1_700_000_000_000 }) {
++  let queries = 0;
++  return {
++    get queries() {
++      return queries;
++    },
++    METAGRAPH_HEALTH_DB: {
++      prepare() {
++        return {
++          bind() {
++            return {
++              async all() {
++                queries += 1;
++                return { results: row ? [row] : [] };
++              },
++            };
++          },
++        };
++      },
++    },
++  };
++}
++
++test("readChainEventsDb memoizes within the TTL — one D1 query for repeated calls", async () => {
++  const env = mkDbEnv();
++  const t0 = 5_000_000;
++  const a = await readChainEventsDb(env, t0);
++  const b = await readChainEventsDb(env, t0 + 1000);
++  assert.deepEqual(a, b);
++  assert.equal(
++    env.queries,
++    1,
++    "a second call within the TTL must be served from the in-isolate memo",
++  );
++
++  await readChainEventsDb(env, t0 + CHAIN_EVENTS_DB_TTL_MS + 1);
++  assert.equal(env.queries, 2, "an expired memo triggers a fresh D1 query");
++});
++
++test("readChainEventsDb never cross-reads a different env (isolation safety)", async () => {
++  const envA = mkDbEnv({ block: 10, at: 1_000 });
++  const envB = mkDbEnv({ block: 20, at: 2_000 });
++  const t0 = 6_000_000;
++  const a = await readChainEventsDb(envA, t0);
++  const b = await readChainEventsDb(envB, t0);
++  assert.equal(a?.block, 10);
++  assert.equal(b?.block, 20);
++  assert.equal(envA.queries, 1);
++  assert.equal(envB.queries, 1);
++});
++
++test("readChainEventsDb returns null when health_db binding is absent", async () => {
++  const result = await readChainEventsDb({}, 7_000_000);
++  assert.equal(result, null);
++});
++
++test("readChainEventsDb does not cache a null result (no sticky cold miss)", async () => {
++  let queries = 0;
++  const env = {
++    METAGRAPH_HEALTH_DB: {
++      prepare() {
++        return {
++          bind() {
++            return {
++              async all() {
++                queries += 1;
++                return { results: [] };
++              },
++            };
++          },
++        };
++      },
++    },
++  };
++  const t0 = 8_000_000;
++  await readChainEventsDb(env, t0);
++  await readChainEventsDb(env, t0 + 1000);
++  assert.equal(queries, 2, "a null result must not be memoized");
++});
+diff --git a/workers/api.mjs b/workers/api.mjs
+index 849ac2bc1..21923e172 100644
+--- a/workers/api.mjs
++++ b/workers/api.mjs
+@@ -936,11 +936,11 @@ export async function handleRequest(request, env = {}, ctx = {}) {
+   // Both are worker-owned (see wrangler `run_worker_first`) so they carry the
+   // right headers/content-type instead of 404-ing through to the static assets.
+   if (url.pathname === "/" || url.pathname === "") {
+-    return homepageResponse(request);
++    return await homepageResponse(request);
+   }
+ 
+   if (url.pathname === "/.well-known/api-catalog") {
+-    return apiCatalogResponse(request);
++    return await apiCatalogResponse(request);
+   }
+ 
+   if (url.pathname === "/.well-known/mcp/server-card.json") {
+@@ -1749,6 +1749,31 @@ export async function readEconomicsCurrentKv(env, now = Date.now()) {
+   return value;
+ }
+ 
++// Chain-events index heartbeat read. Memoized per-isolate at a short TTL so
++// repeated /health probes on warm isolates don't issue a billed D1 query per
++// request. Null results are not cached (cold/unbound store stays re-queried).
++// Keyed on env so tests / multi-binding callers never cross-read.
++export const CHAIN_EVENTS_DB_TTL_MS = 30_000;
++let chainEventsDbMemo = { env: null, value: null, expiresAt: 0 };
++
++export async function readChainEventsDb(env, now = Date.now()) {
++  if (chainEventsDbMemo.env === env && now < chainEventsDbMemo.expiresAt) {
++    return chainEventsDbMemo.value;
++  }
++  if (!env?.METAGRAPH_HEALTH_DB?.prepare) return null;
++  const rows = await d1All(
++    env,
++    "SELECT block_number AS block, observed_at AS at FROM account_events " +
++      "ORDER BY observed_at DESC LIMIT 1",
++    [],
++  );
++  const value = rows[0] || null;
++  if (value !== null) {
++    chainEventsDbMemo = { env, value, expiresAt: now + CHAIN_EVENTS_DB_TTL_MS };
++  }
++  return value;
++}
++
+ configureAnalyticsRoutes({ readHealthMetaKv, readEconomicsCurrentKv });
+ 
+ async function resolveSubnetSlugRoute(
+@@ -2154,7 +2179,7 @@ function matchRoute(pathname) {
+ }
+ 
+ // Lightweight readiness probe for uptime checks and load balancers. Reports
+-// which bindings are wired without touching R2/KV (no I/O, no cold-start cost).
++// which bindings are wired; KV reads are in-isolate memoized.
+ async function handleHealthRequest(request, env) {
+   if (request.method !== "GET" && request.method !== "HEAD") {
+     return errorResponse(
+@@ -2215,19 +2240,17 @@ async function handleHealthRequest(request, env) {
+   // best-effort + null on a cold/unbound store.
+   let chainEvents = null;
+   if (bindings.health_db) {
+-    const rows = await d1All(
+-      env,
+-      "SELECT block_number AS block, observed_at AS at FROM account_events " +
+-        "ORDER BY observed_at DESC LIMIT 1",
+-      [],
+-    );
+-    const row = rows[0] || {};
+-    const atMs = Number(row.at);
+-    const fresh = Number.isFinite(atMs);
++    const chainEventsRow = await readChainEventsDb(env);
++    const chainEventsAtMs = chainEventsRow ? Number(chainEventsRow.at) : NaN;
++    const chainEventsFresh = Number.isFinite(chainEventsAtMs);
+     chainEvents = {
+-      latest_indexed_block: row.block ?? null,
+-      latest_event_at: fresh ? new Date(atMs).toISOString() : null,
+-      age_seconds: fresh ? Math.round((Date.now() - atMs) / 1000) : null,
++      latest_indexed_block: chainEventsRow?.block ?? null,
++      latest_event_at: chainEventsFresh
++        ? new Date(chainEventsAtMs).toISOString()
++        : null,
++      age_seconds: chainEventsFresh
++        ? Math.round((Date.now() - chainEventsAtMs) / 1000)
++        : null,
+     };
+   }
+ 

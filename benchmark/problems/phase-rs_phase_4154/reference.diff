@@ -1,0 +1,1843 @@
+diff --git a/crates/engine/src/database/augment.rs b/crates/engine/src/database/augment.rs
+new file mode 100644
+index 0000000000..c59c423d77
+--- /dev/null
++++ b/crates/engine/src/database/augment.rs
+@@ -0,0 +1,287 @@
++//! Augment / Host synthesis for Unstable.
++
++use crate::database::mtgjson::parse_mtgjson_mana_cost;
++use crate::types::ability::{
++    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, CombineSource,
++    ControllerRef, Effect, FilterProp, TargetFilter, TypeFilter, TypedFilter,
++};
++use crate::types::card::CardFace;
++use crate::types::card_type::Supertype;
++use crate::types::keywords::{Keyword, KeywordKind};
++use crate::types::mana::ManaCost;
++use crate::types::triggers::TriggerMode;
++use crate::types::zones::EtbTapState;
++use crate::types::zones::Zone;
++
++pub fn synthesize_augment(face: &mut CardFace) {
++    let oracle = face.oracle_text.clone().unwrap_or_default();
++    let has_augment = face
++        .keywords
++        .iter()
++        .any(|keyword| matches!(keyword, Keyword::Augment));
++    let references_host_combine = oracle.contains("combine it with")
++        || oracle.contains("combine this card")
++        || oracle.contains("card with augment");
++    if !has_augment && !references_host_combine {
++        return;
++    }
++
++    if has_augment {
++        synthesize_augment_half(face, &oracle);
++    }
++
++    match face.name.as_str() {
++        "Teacher's Pet" => rewrite_teachers_pet(face),
++        "Dr. Julius Jumblemorph" => rewrite_dr_julius(face),
++        "Strutting Turkey" => rewrite_strutting_turkey(face),
++        _ => {}
++    }
++}
++
++fn synthesize_augment_half(face: &mut CardFace, oracle: &str) {
++    let Some(cost) = augment_cost(face, oracle) else {
++        return;
++    };
++    let printed_augment_description = face
++        .abilities
++        .iter()
++        .filter_map(|ability| ability.description.clone())
++        .find(|description| description.starts_with("Augment "))
++        .unwrap_or_else(|| "Augment".to_string());
++
++    face.abilities.retain(|ability| {
++        let Some(description) = ability.description.as_deref() else {
++            return true;
++        };
++        if description.starts_with("Augment ") {
++            return false;
++        }
++        if description
++            == "You may activate this card's augment ability any time you could cast an instant."
++        {
++            return false;
++        }
++        true
++    });
++
++    for ability in &mut face.abilities {
++        let is_prefix_placeholder = ability.kind == AbilityKind::Activated
++            && matches!(ability.effect.as_ref(), Effect::Unimplemented { name, .. } if name == "empty")
++            && ability
++                .description
++                .as_deref()
++                .is_some_and(|description| description.trim_end().ends_with(':'));
++        if is_prefix_placeholder {
++            *ability.effect = Effect::NoOp;
++        }
++    }
++
++    let mut augment_ability = AbilityDefinition::new(
++        AbilityKind::Activated,
++        Effect::CombineHost {
++            source: CombineSource::Source,
++            host: Box::new(host_filter()),
++        },
++    )
++    .cost(AbilityCost::Composite {
++        costs: vec![
++            AbilityCost::Mana { cost },
++            AbilityCost::Reveal {
++                count: 1,
++                filter: Some(TargetFilter::SelfRef),
++            },
++        ],
++    })
++    .description(printed_augment_description);
++    augment_ability.activation_zone = Some(Zone::Hand);
++    augment_ability.ability_tag = Some(AbilityTag::Augment);
++    if !oracle.contains("any time you could cast an instant") {
++        augment_ability = augment_ability.sorcery_speed();
++    }
++    face.abilities.push(augment_ability);
++
++    if face.name == "Zombified" {
++        for ability in &mut face.abilities {
++            if ability.description.as_deref()
++                == Some("{4}{B}: Combine this card from your graveyard with target host.")
++            {
++                *ability.effect = Effect::CombineHost {
++                    source: CombineSource::Source,
++                    host: Box::new(host_filter()),
++                };
++                ability.activation_zone = Some(Zone::Graveyard);
++            }
++        }
++    }
++}
++
++fn rewrite_teachers_pet(face: &mut CardFace) {
++    let Some(cost) = face
++        .abilities
++        .first()
++        .and_then(|ability| ability.cost.clone())
++    else {
++        return;
++    };
++    face.abilities.clear();
++    face.abilities.push(
++        AbilityDefinition::new(
++            AbilityKind::Activated,
++            Effect::ChooseAugmentAndCombineWithHost {
++                zones: vec![Zone::Library],
++                filter: Box::new(augment_card_filter()),
++                host: Box::new(controlled_host_filter()),
++            },
++        )
++        .cost(cost)
++        .description(
++            "{2}{W}, Sacrifice ~: Search your library for a card with augment, combine it with target host you control, then shuffle."
++                .to_string(),
++        )
++        .sub_ability(AbilityDefinition::new(
++            AbilityKind::Spell,
++            Effect::Shuffle {
++                target: TargetFilter::Controller,
++            },
++        )),
++    );
++}
++
++fn rewrite_dr_julius(face: &mut CardFace) {
++    for trigger in &mut face.triggers {
++        if !trigger.description.as_deref().is_some_and(|description| {
++            description.contains("search your library and/or graveyard for a card with augment")
++        }) {
++            continue;
++        }
++        trigger.valid_card = Some(controlled_host_filter());
++        trigger.mode = TriggerMode::ChangesZone;
++        trigger.origin = None;
++        trigger.destination = Some(Zone::Battlefield);
++        trigger.execute = Some(Box::new(
++            AbilityDefinition::new(
++                AbilityKind::Spell,
++                Effect::ChooseAugmentAndCombineWithHost {
++                    zones: vec![Zone::Graveyard, Zone::Library],
++                    filter: Box::new(augment_card_filter()),
++                    host: Box::new(TargetFilter::TriggeringSource),
++                },
++            )
++            .optional()
++            .sub_ability(AbilityDefinition::new(
++                AbilityKind::Spell,
++                Effect::Shuffle {
++                    target: TargetFilter::Controller,
++                },
++            )),
++        ));
++    }
++}
++
++fn rewrite_strutting_turkey(face: &mut CardFace) {
++    face.abilities.clear();
++    for trigger in &mut face.triggers {
++        if trigger.mode != TriggerMode::ChangesZone
++            || trigger.destination != Some(Zone::Battlefield)
++            || trigger.valid_card != Some(TargetFilter::SelfRef)
++        {
++            continue;
++        }
++        trigger.execute = Some(Box::new(
++            AbilityDefinition::new(
++                AbilityKind::Spell,
++                Effect::ChangeZone {
++                    origin: Some(Zone::Graveyard),
++                    destination: Zone::Exile,
++                    target: TypedFilter::new(TypeFilter::Creature)
++                        .controller(ControllerRef::You)
++                        .properties(vec![FilterProp::InZone {
++                            zone: Zone::Graveyard,
++                        }])
++                        .into(),
++                    owner_library: false,
++                    enter_transformed: false,
++                    enters_under: None,
++                    enter_tapped: EtbTapState::Unspecified,
++                    enters_attacking: false,
++                    up_to: false,
++                    enter_with_counters: Vec::new(),
++                    face_down_profile: None,
++                },
++            )
++            .sub_ability(
++                AbilityDefinition::new(
++                    AbilityKind::Spell,
++                    Effect::CombineHost {
++                        source: CombineSource::ParentTarget,
++                        host: Box::new(controlled_host_filter()),
++                    },
++                )
++                .condition(AbilityCondition::TargetMatchesFilter {
++                    filter: augment_card_filter(),
++                    use_lki: false,
++                })
++                .with_else_ability(AbilityDefinition::new(
++                    AbilityKind::Spell,
++                    Effect::ChangeZone {
++                        origin: Some(Zone::Exile),
++                        destination: Zone::Battlefield,
++                        target: TargetFilter::ParentTarget,
++                        owner_library: false,
++                        enter_transformed: false,
++                        enters_under: None,
++                        enter_tapped: EtbTapState::Unspecified,
++                        enters_attacking: false,
++                        up_to: false,
++                        enter_with_counters: Vec::new(),
++                        face_down_profile: None,
++                    },
++                )),
++            ),
++        ));
++        break;
++    }
++}
++
++fn augment_cost(face: &CardFace, oracle: &str) -> Option<ManaCost> {
++    face.abilities
++        .iter()
++        .filter_map(|ability| ability.description.as_deref())
++        .find_map(|description| {
++            description
++                .strip_prefix("Augment ")
++                .map(|rest| parse_mtgjson_mana_cost(rest.trim()))
++        })
++        .or_else(|| {
++            oracle.lines().find_map(|line| {
++                let cost_text = line.trim().strip_prefix("Augment ")?;
++                let cost_text = cost_text.split_whitespace().next()?;
++                Some(parse_mtgjson_mana_cost(cost_text))
++            })
++        })
++}
++
++fn augment_card_filter() -> TargetFilter {
++    TypedFilter::card()
++        .properties(vec![FilterProp::HasKeywordKind {
++            value: KeywordKind::Augment,
++        }])
++        .into()
++}
++
++fn host_filter() -> TargetFilter {
++    TypedFilter::creature()
++        .properties(vec![FilterProp::HasSupertype {
++            value: Supertype::Host,
++        }])
++        .into()
++}
++
++fn controlled_host_filter() -> TargetFilter {
++    TypedFilter::creature()
++        .controller(ControllerRef::You)
++        .properties(vec![FilterProp::HasSupertype {
++            value: Supertype::Host,
++        }])
++        .into()
++}
+diff --git a/crates/engine/src/database/augment_tests.rs b/crates/engine/src/database/augment_tests.rs
+new file mode 100644
+index 0000000000..90976e12a6
+--- /dev/null
++++ b/crates/engine/src/database/augment_tests.rs
+@@ -0,0 +1,34 @@
++use crate::database::augment::synthesize_augment;
++use crate::types::ability::{AbilityDefinition, AbilityKind, Effect};
++use crate::types::card::CardFace;
++use crate::types::keywords::Keyword;
++
++#[test]
++fn synthesize_augment_adds_hand_activated_combine_ability() {
++    let mut face = CardFace {
++        name: "Monkey-".to_string(),
++        oracle_text: Some(
++            "Whenever a nontoken creature you control dies,\nAugment {2}{G} ({2}{G}, Reveal this card from your hand: Combine it with target host. Augment only as a sorcery.)"
++                .to_string(),
++        ),
++        ..CardFace::default()
++    };
++    face.keywords.push(Keyword::Augment);
++    face.abilities.push(
++        AbilityDefinition::new(
++            AbilityKind::Spell,
++            Effect::Unimplemented {
++                name: "unknown".to_string(),
++                description: Some("Augment {2}{G}".to_string()),
++            },
++        )
++        .description("Augment {2}{G}".to_string()),
++    );
++
++    synthesize_augment(&mut face);
++
++    assert!(face.abilities.iter().any(|ability| {
++        ability.activation_zone == Some(crate::types::zones::Zone::Hand)
++            && matches!(ability.effect.as_ref(), Effect::CombineHost { .. })
++    }));
++}
+diff --git a/crates/engine/src/database/mod.rs b/crates/engine/src/database/mod.rs
+index 06a893e9eb..53af9fe577 100644
+--- a/crates/engine/src/database/mod.rs
++++ b/crates/engine/src/database/mod.rs
+@@ -1,3 +1,4 @@
++pub mod augment;
+ pub mod bracket_lists;
+ pub mod card_db;
+ pub mod embalm_eternalize;
+@@ -16,6 +17,8 @@ pub mod set_gating;
+ pub mod synthesis;
+ pub mod unearth;
+ 
++#[cfg(test)]
++mod augment_tests;
+ #[cfg(test)]
+ mod embalm_eternalize_tests;
+ #[cfg(test)]
+diff --git a/crates/engine/src/database/synthesis.rs b/crates/engine/src/database/synthesis.rs
+index 3bf9ae5207..0c46ac7857 100644
+--- a/crates/engine/src/database/synthesis.rs
++++ b/crates/engine/src/database/synthesis.rs
+@@ -8977,6 +8977,7 @@ pub fn synthesize_all(face: &mut CardFace) {
+     // CR 702.75a: Hideaway ETB look-and-exile-face-down — self-contained
+     // building block (Dig + conceal continuation).
+     crate::database::hideaway::synthesize_hideaway(face);
++    crate::database::augment::synthesize_augment(face);
+     synthesize_outlast(face);
+     synthesize_reinforce(face);
+     synthesize_casualty(face);
+diff --git a/crates/engine/src/game/augment.rs b/crates/engine/src/game/augment.rs
+new file mode 100644
+index 0000000000..b03094c789
+--- /dev/null
++++ b/crates/engine/src/game/augment.rs
+@@ -0,0 +1,497 @@
++//! Augment runtime support for Unstable Host creatures.
++
++use std::sync::Arc;
++
++use crate::game::merge::{install_merge_layer_effect, remove_merge_layer_effect};
++use crate::game::printed_cards::intrinsic_copiable_values;
++use crate::game::targeting::resolved_object_ids_for_filter;
++use crate::types::ability::{
++    AbilityDefinition, AbilityKind, CombineSource, CopiableValues, Effect, EffectError, EffectKind,
++    ResolvedAbility, TargetFilter, TargetRef, TriggerDefinition,
++};
++use crate::types::card::{PrintedCardRef, TokenImageRef};
++use crate::types::card_type::{CardType, Supertype};
++use crate::types::events::GameEvent;
++use crate::types::game_state::{GameState, PendingContinuation, WaitingFor};
++use crate::types::identifiers::ObjectId;
++use crate::types::keywords::Keyword;
++use crate::types::mana::ManaColor;
++use crate::types::player::PlayerId;
++use crate::types::zones::Zone;
++
++use super::game_object::{DisplaySource, MergeKind};
++use super::printed_cards;
++use super::zones;
++
++pub fn resolve_combine_host(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    let (source_kind, host_filter) = match &ability.effect {
++        Effect::CombineHost { source, host } => (*source, host.as_ref()),
++        _ => {
++            return Err(EffectError::MissingParam(
++                "CombineHost source/host".to_string(),
++            ))
++        }
++    };
++
++    let Some(augment_id) = resolve_source_id(state, ability, source_kind) else {
++        events.push(GameEvent::EffectResolved {
++            kind: EffectKind::CombineHost,
++            source_id: ability.source_id,
++        });
++        return Ok(());
++    };
++
++    let mut hosts = resolved_object_ids_for_filter(state, ability, host_filter);
++    hosts.retain(|id| {
++        state.objects.get(id).is_some_and(|obj| {
++            obj.zone == Zone::Battlefield && obj.card_types.supertypes.contains(&Supertype::Host)
++        })
++    });
++    hosts.sort_by_key(|id| id.0);
++    hosts.dedup();
++
++    match hosts.as_slice() {
++        [] => {
++            events.push(GameEvent::EffectResolved {
++                kind: EffectKind::CombineHost,
++                source_id: ability.source_id,
++            });
++            Ok(())
++        }
++        [host_id] => {
++            combine_card_with_host(state, augment_id, *host_id, ability.controller, events);
++            events.push(GameEvent::EffectResolved {
++                kind: EffectKind::CombineHost,
++                source_id: ability.source_id,
++            });
++            Ok(())
++        }
++        _ => {
++            let mut continuation = ability.clone();
++            continuation.targets.clear();
++            continuation.effect = Effect::CombineHost {
++                source: CombineSource::SpecificObject { id: augment_id },
++                host: Box::new(TargetFilter::ParentTarget),
++            };
++            state.pending_continuation = Some(PendingContinuation::new(Box::new(continuation)));
++            state.waiting_for = WaitingFor::ChooseFromZoneChoice {
++                player: ability.controller,
++                cards: hosts,
++                count: 1,
++                up_to: false,
++                constraint: None,
++                source_id: ability.source_id,
++            };
++            events.push(GameEvent::EffectResolved {
++                kind: EffectKind::CombineHost,
++                source_id: ability.source_id,
++            });
++            Ok(())
++        }
++    }
++}
++
++pub fn resolve_choose_augment_and_combine(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    let (zones_to_search, filter, host_filter) = match &ability.effect {
++        Effect::ChooseAugmentAndCombineWithHost {
++            zones,
++            filter,
++            host,
++        } => (zones.clone(), filter.as_ref(), host.as_ref()),
++        _ => {
++            return Err(EffectError::MissingParam(
++                "ChooseAugmentAndCombineWithHost".to_string(),
++            ))
++        }
++    };
++
++    let frozen_host = freeze_unique_host_filter(state, ability, host_filter)
++        .unwrap_or_else(|| host_filter.clone());
++    let candidates = resolve_candidates(state, ability.controller, &zones_to_search, filter);
++
++    match candidates.as_slice() {
++        [] => {
++            events.push(GameEvent::EffectResolved {
++                kind: EffectKind::ChooseAugmentAndCombineWithHost,
++                source_id: ability.source_id,
++            });
++            Ok(())
++        }
++        [augment_id] => {
++            let mut direct = ability.clone();
++            direct.effect = Effect::CombineHost {
++                source: CombineSource::SpecificObject { id: *augment_id },
++                host: Box::new(frozen_host),
++            };
++            resolve_combine_host(state, &direct, events)
++        }
++        _ => {
++            let mut continuation = ability.clone();
++            continuation.targets.clear();
++            continuation.effect = Effect::CombineHost {
++                source: CombineSource::ParentTarget,
++                host: Box::new(frozen_host),
++            };
++            state.pending_continuation = Some(PendingContinuation::new(Box::new(continuation)));
++            state.waiting_for = WaitingFor::ChooseFromZoneChoice {
++                player: ability.controller,
++                cards: candidates,
++                count: 1,
++                up_to: false,
++                constraint: None,
++                source_id: ability.source_id,
++            };
++            events.push(GameEvent::EffectResolved {
++                kind: EffectKind::ChooseAugmentAndCombineWithHost,
++                source_id: ability.source_id,
++            });
++            Ok(())
++        }
++    }
++}
++
++pub(crate) fn check_standalone_augment_permanents(
++    state: &mut GameState,
++    events: &mut Vec<GameEvent>,
++    any_performed: &mut bool,
++) {
++    let standalone: Vec<ObjectId> = state
++        .battlefield
++        .iter()
++        .copied()
++        .filter(|id| {
++            state.objects.get(id).is_some_and(|obj| {
++                obj.keywords
++                    .iter()
++                    .any(|keyword| matches!(keyword, Keyword::Augment))
++                    && obj.merged_components.is_empty()
++            })
++        })
++        .collect();
++
++    for object_id in standalone {
++        zones::move_to_zone(state, object_id, Zone::Graveyard, events);
++        *any_performed = true;
++    }
++}
++
++fn resolve_source_id(
++    state: &GameState,
++    ability: &ResolvedAbility,
++    source: CombineSource,
++) -> Option<ObjectId> {
++    match source {
++        CombineSource::Source => Some(ability.source_id),
++        CombineSource::ParentTarget => ability.targets.iter().find_map(|target| match target {
++            TargetRef::Object(id) => Some(*id),
++            TargetRef::Player(_) => None,
++        }),
++        CombineSource::SpecificObject { id } => state.objects.contains_key(&id).then_some(id),
++    }
++}
++
++fn freeze_unique_host_filter(
++    state: &GameState,
++    ability: &ResolvedAbility,
++    host_filter: &TargetFilter,
++) -> Option<TargetFilter> {
++    let mut hosts = resolved_object_ids_for_filter(state, ability, host_filter);
++    hosts.retain(|id| {
++        state
++            .objects
++            .get(id)
++            .is_some_and(|obj| obj.zone == Zone::Battlefield)
++    });
++    hosts.sort_by_key(|id| id.0);
++    hosts.dedup();
++    match hosts.as_slice() {
++        [host_id] => Some(TargetFilter::SpecificObject { id: *host_id }),
++        _ => None,
++    }
++}
++
++fn resolve_candidates(
++    state: &GameState,
++    player: PlayerId,
++    zones_to_search: &[Zone],
++    filter: &TargetFilter,
++) -> Vec<ObjectId> {
++    let mut candidates = Vec::new();
++    for zone in zones_to_search {
++        let ids: Vec<ObjectId> = match zone {
++            Zone::Library => state.players[player.0 as usize]
++                .library
++                .iter()
++                .copied()
++                .collect(),
++            Zone::Graveyard => state.players[player.0 as usize]
++                .graveyard
++                .iter()
++                .copied()
++                .collect(),
++            Zone::Hand => state.players[player.0 as usize]
++                .hand
++                .iter()
++                .copied()
++                .collect(),
++            Zone::Battlefield => state.battlefield.iter().copied().collect(),
++            Zone::Exile => state.exile.iter().copied().collect(),
++            _ => Vec::new(),
++        };
++        for id in ids {
++            let ctx = crate::game::filter::FilterContext::from_source_with_controller(
++                ObjectId(0),
++                player,
++            );
++            if crate::game::filter::matches_target_filter(state, id, filter, &ctx)
++                && !candidates.contains(&id)
++            {
++                candidates.push(id);
++            }
++        }
++    }
++    candidates
++}
++
++fn combine_card_with_host(
++    state: &mut GameState,
++    augment_id: ObjectId,
++    host_id: ObjectId,
++    controller: PlayerId,
++    events: &mut Vec<GameEvent>,
++) {
++    if let Some(zone) = state.objects.get(&augment_id).map(|obj| obj.zone) {
++        let owner = state.objects[&augment_id].owner;
++        zones::apply_zone_exit_cleanup(state, augment_id, zone, Zone::Battlefield);
++        zones::remove_from_zone(state, augment_id, zone, owner);
++    }
++    if let Some(augment) = state.objects.get_mut(&augment_id) {
++        augment.zone = Zone::Battlefield;
++    }
++
++    let Some((values, display_source, printed_ref, token_image_ref)) =
++        merged_copiable_values(state, augment_id, host_id)
++    else {
++        return;
++    };
++    remove_merge_layer_effect(state, host_id);
++
++    if let Some(host) = state.objects.get_mut(&host_id) {
++        let existing = std::mem::take(&mut host.merged_components);
++        let mut ordered = if existing.is_empty() {
++            vec![host_id]
++        } else {
++            existing
++        };
++        if !ordered.contains(&augment_id) {
++            ordered.push(augment_id);
++        }
++        host.merged_components = ordered;
++        host.merge_kind = Some(MergeKind::Augment);
++        if host.pre_merge_is_token.is_none() {
++            host.pre_merge_is_token = Some(host.is_token);
++        }
++    }
++
++    install_merge_layer_effect(
++        state,
++        host_id,
++        controller,
++        values,
++        display_source,
++        printed_ref,
++        token_image_ref,
++    );
++    events.push(GameEvent::Augmented {
++        merged_id: host_id,
++        augmenting_id: augment_id,
++        controller,
++    });
++}
++
++fn merged_copiable_values(
++    state: &GameState,
++    augment_id: ObjectId,
++    host_id: ObjectId,
++) -> Option<(
++    CopiableValues,
++    DisplaySource,
++    Option<PrintedCardRef>,
++    Option<TokenImageRef>,
++)> {
++    let augment = state.objects.get(&augment_id)?;
++    let host = state.objects.get(&host_id)?;
++    let host_values = crate::game::layers::compute_current_copiable_values(state, host_id)
++        .unwrap_or_else(|| intrinsic_copiable_values(host));
++
++    let mut card_types = host_values.card_types.clone();
++    merge_card_types(&mut card_types, &augment.base_card_types);
++    card_types
++        .supertypes
++        .retain(|supertype| *supertype != Supertype::Host);
++
++    let mut color = host_values.color.clone();
++    push_unique_colors(&mut color, &augment.base_color);
++
++    let mut keywords = host_values.keywords.clone();
++    for keyword in &augment.base_keywords {
++        if matches!(keyword, Keyword::Augment) {
++            continue;
++        }
++        if !keywords.contains(keyword) {
++            keywords.push(keyword.clone());
++        }
++    }
++
++    let (abilities, triggers, statics, replacements) = merged_ability_sets(augment, &host_values);
++    let values = CopiableValues {
++        name: combine_name(&augment.base_name, &host_values.name),
++        mana_cost: host_values.mana_cost,
++        color,
++        card_types,
++        power: Some(host_values.power.unwrap_or(0) + augment.base_power.unwrap_or(0)),
++        toughness: Some(host_values.toughness.unwrap_or(0) + augment.base_toughness.unwrap_or(0)),
++        loyalty: host_values.loyalty,
++        keywords,
++        abilities: Arc::new(abilities),
++        trigger_definitions: Arc::new(triggers),
++        replacement_definitions: Arc::new(replacements),
++        static_definitions: Arc::new(statics),
++    };
++
++    Some((
++        values,
++        host.display_source,
++        host.printed_ref.clone(),
++        host.token_image_ref.clone(),
++    ))
++}
++
++fn merged_ability_sets(
++    augment: &crate::game::game_object::GameObject,
++    host_values: &CopiableValues,
++) -> (
++    Vec<AbilityDefinition>,
++    Vec<TriggerDefinition>,
++    Vec<crate::types::ability::StaticDefinition>,
++    Vec<crate::types::ability::ReplacementDefinition>,
++) {
++    let host_body = host_values
++        .trigger_definitions
++        .iter()
++        .find(|trigger| {
++            matches!(
++                trigger.mode,
++                crate::types::triggers::TriggerMode::ChangesZone
++            ) && trigger.destination == Some(Zone::Battlefield)
++                && trigger.valid_card == Some(TargetFilter::SelfRef)
++        })
++        .and_then(|trigger| trigger.execute.as_deref().cloned());
++
++    let mut abilities = Vec::new();
++    for ability in augment.base_abilities.iter() {
++        if ability.ability_tag == Some(crate::types::ability::AbilityTag::Augment) {
++            continue;
++        }
++        if matches!(ability.effect.as_ref(), Effect::CombineHost { .. }) {
++            continue;
++        }
++        if ability.kind == AbilityKind::Activated
++            && matches!(ability.effect.as_ref(), Effect::NoOp)
++            && ability
++                .description
++                .as_deref()
++                .is_some_and(|description| description.trim_end().ends_with(':'))
++        {
++            if let Some(body) = host_body.clone() {
++                abilities.push(splice_host_body_onto_activated_prefix(ability, &body));
++            }
++            continue;
++        }
++        abilities.push(ability.clone());
++    }
++
++    let mut triggers = Vec::new();
++    for trigger in augment.base_trigger_definitions.iter() {
++        if trigger.execute.is_none() {
++            if let Some(body) = host_body.clone() {
++                let mut combined = trigger.clone();
++                combined.execute = Some(Box::new(body));
++                triggers.push(combined);
++            }
++            continue;
++        }
++        triggers.push(trigger.clone());
++    }
++
++    let statics = augment.base_static_definitions.iter().cloned().collect();
++    let replacements = augment
++        .base_replacement_definitions
++        .iter()
++        .filter(|definition| !printed_cards::is_runtime_control_gated_replacement(definition))
++        .cloned()
++        .collect();
++
++    (abilities, triggers, statics, replacements)
++}
++
++fn splice_host_body_onto_activated_prefix(
++    prefix: &AbilityDefinition,
++    host_body: &AbilityDefinition,
++) -> AbilityDefinition {
++    let mut combined = host_body.clone();
++    combined.kind = AbilityKind::Activated;
++    combined.cost = prefix.cost.clone();
++    combined.description = prefix.description.clone();
++    combined.activation_restrictions = prefix.activation_restrictions.clone();
++    combined.activator_filter = prefix.activator_filter.clone();
++    combined.activation_zone = prefix.activation_zone;
++    combined.ability_tag = prefix.ability_tag;
++    combined
++}
++
++fn combine_name(augment_name: &str, host_name: &str) -> String {
++    let host_suffix = host_name
++        .rsplit_once(' ')
++        .map(|(_, suffix)| suffix)
++        .unwrap_or(host_name);
++    if augment_name.ends_with('-') {
++        format!("{augment_name}{host_suffix}")
++    } else {
++        format!("{augment_name} {host_suffix}")
++    }
++}
++
++fn merge_card_types(into: &mut CardType, extra: &CardType) {
++    for supertype in &extra.supertypes {
++        if !into.supertypes.contains(supertype) {
++            into.supertypes.push(*supertype);
++        }
++    }
++    for core_type in &extra.core_types {
++        if !into.core_types.contains(core_type) {
++            into.core_types.push(*core_type);
++        }
++    }
++    for subtype in &extra.subtypes {
++        if !into.subtypes.contains(subtype) {
++            into.subtypes.push(subtype.clone());
++        }
++    }
++}
++
++fn push_unique_colors(into: &mut Vec<ManaColor>, extra: &[ManaColor]) {
++    for color in extra {
++        if !into.contains(color) {
++            into.push(*color);
++        }
++    }
++}
+diff --git a/crates/engine/src/game/augment_tests.rs b/crates/engine/src/game/augment_tests.rs
+new file mode 100644
+index 0000000000..7369149b85
+--- /dev/null
++++ b/crates/engine/src/game/augment_tests.rs
+@@ -0,0 +1,325 @@
++use crate::database::augment::synthesize_augment;
++use crate::game::augment::resolve_combine_host;
++use crate::game::effects::become_copy;
++use crate::game::merge::{merge_object_onto, MergeSide};
++use crate::game::printed_cards::apply_card_face_to_object;
++use crate::game::zones::create_object;
++use crate::types::ability::{
++    AbilityDefinition, AbilityKind, CombineSource, Effect, PtValue, QuantityExpr, ResolvedAbility,
++    TargetFilter, TargetRef, TriggerDefinition,
++};
++use crate::types::card::CardFace;
++use crate::types::card_type::{CoreType, Supertype};
++use crate::types::events::GameEvent;
++use crate::types::game_state::GameState;
++use crate::types::identifiers::CardId;
++use crate::types::mana::ManaColor;
++use crate::types::player::PlayerId;
++use crate::types::triggers::TriggerMode;
++use crate::types::zones::Zone;
++
++fn host_face() -> CardFace {
++    let mut face = CardFace {
++        name: "Adorable Kitten".to_string(),
++        ..CardFace::default()
++    };
++    face.card_type.core_types.push(CoreType::Creature);
++    face.card_type.supertypes.push(Supertype::Host);
++    face.card_type.subtypes.push("Cat".to_string());
++    face.power = Some(PtValue::Fixed(1));
++    face.toughness = Some(PtValue::Fixed(1));
++    face.triggers.push(
++        TriggerDefinition::new(TriggerMode::ChangesZone)
++            .execute(AbilityDefinition::new(
++                AbilityKind::Spell,
++                Effect::GainLife {
++                    amount: QuantityExpr::Fixed { value: 2 },
++                    player: TargetFilter::Controller,
++                },
++            ))
++            .description("When ~ enters, you gain 2 life.".to_string())
++            .valid_card(TargetFilter::SelfRef)
++            .destination(Zone::Battlefield)
++            .trigger_zones(vec![Zone::Battlefield]),
++    );
++    face
++}
++
++fn augment_face() -> CardFace {
++    let mut face = CardFace {
++        name: "Monkey-".to_string(),
++        oracle_text: Some(
++            "Whenever a nontoken creature you control dies,\nAugment {2}{G} ({2}{G}, Reveal this card from your hand: Combine it with target host. Augment only as a sorcery.)"
++                .to_string(),
++        ),
++        ..CardFace::default()
++    };
++    face.card_type.core_types.push(CoreType::Creature);
++    face.card_type.subtypes.push("Monkey".to_string());
++    face.power = Some(PtValue::Fixed(2));
++    face.toughness = Some(PtValue::Fixed(2));
++    face.keywords.push(crate::types::keywords::Keyword::Augment);
++    face.abilities.push(
++        AbilityDefinition::new(
++            AbilityKind::Spell,
++            Effect::Unimplemented {
++                name: "unknown".to_string(),
++                description: Some("Augment {2}{G}".to_string()),
++            },
++        )
++        .description("Augment {2}{G}".to_string()),
++    );
++    face.triggers.push(
++        TriggerDefinition::new(TriggerMode::ChangesZone)
++            .description("Whenever a nontoken creature you control dies,".to_string())
++            .origin(Zone::Battlefield)
++            .destination(Zone::Graveyard)
++            .trigger_zones(vec![Zone::Battlefield]),
++    );
++    synthesize_augment(&mut face);
++    face
++}
++
++fn copied_host_face() -> CardFace {
++    let mut face = CardFace {
++        name: "Curious Puppy".to_string(),
++        ..CardFace::default()
++    };
++    face.card_type.core_types.push(CoreType::Creature);
++    face.card_type.supertypes.push(Supertype::Host);
++    face.card_type.subtypes.push("Dog".to_string());
++    face.power = Some(PtValue::Fixed(3));
++    face.toughness = Some(PtValue::Fixed(4));
++    face.color_override = Some(vec![ManaColor::Green]);
++    face.triggers.push(
++        TriggerDefinition::new(TriggerMode::ChangesZone)
++            .execute(AbilityDefinition::new(
++                AbilityKind::Spell,
++                Effect::GainLife {
++                    amount: QuantityExpr::Fixed { value: 5 },
++                    player: TargetFilter::Controller,
++                },
++            ))
++            .description("When ~ enters, you gain 5 life.".to_string())
++            .valid_card(TargetFilter::SelfRef)
++            .destination(Zone::Battlefield)
++            .trigger_zones(vec![Zone::Battlefield]),
++    );
++    face
++}
++
++fn rider_face() -> CardFace {
++    let mut face = CardFace {
++        name: "Sky Rider".to_string(),
++        ..CardFace::default()
++    };
++    face.card_type.core_types.push(CoreType::Creature);
++    face.card_type.supertypes.push(Supertype::Host);
++    face.card_type.subtypes.push("Bird".to_string());
++    face.power = Some(PtValue::Fixed(4));
++    face.toughness = Some(PtValue::Fixed(4));
++    face.color_override = Some(vec![ManaColor::Blue]);
++    face
++}
++
++fn gain_life_amount(trigger: &TriggerDefinition) -> Option<i32> {
++    match trigger
++        .execute
++        .as_deref()
++        .map(|ability| ability.effect.as_ref())
++    {
++        Some(Effect::GainLife {
++            amount: QuantityExpr::Fixed { value },
++            ..
++        }) => Some(*value),
++        _ => None,
++    }
++}
++
++#[test]
++fn combine_host_merges_augmented_values_onto_host() {
++    let mut state = GameState::new_two_player(1);
++    let host = create_object(
++        &mut state,
++        CardId(1),
++        PlayerId(0),
++        "Adorable Kitten".to_string(),
++        Zone::Battlefield,
++    );
++    let augment = create_object(
++        &mut state,
++        CardId(2),
++        PlayerId(0),
++        "Monkey-".to_string(),
++        Zone::Hand,
++    );
++    apply_card_face_to_object(state.objects.get_mut(&host).unwrap(), &host_face());
++    apply_card_face_to_object(state.objects.get_mut(&augment).unwrap(), &augment_face());
++
++    let ability = ResolvedAbility::new(
++        Effect::CombineHost {
++            source: CombineSource::SpecificObject { id: augment },
++            host: Box::new(TargetFilter::SpecificObject { id: host }),
++        },
++        Vec::new(),
++        augment,
++        PlayerId(0),
++    );
++    let mut events = Vec::<GameEvent>::new();
++    resolve_combine_host(&mut state, &ability, &mut events).unwrap();
++
++    let merged = &state.objects[&host];
++    assert_eq!(merged.name, "Monkey-Kitten");
++    assert_eq!(merged.power, Some(3));
++    assert_eq!(merged.toughness, Some(3));
++    assert_eq!(
++        merged.merge_kind,
++        Some(crate::game::game_object::MergeKind::Augment)
++    );
++    assert!(!merged.card_types.supertypes.contains(&Supertype::Host));
++    assert!(merged.card_types.subtypes.contains(&"Cat".to_string()));
++    assert!(merged.card_types.subtypes.contains(&"Monkey".to_string()));
++    assert!(
++        events.iter().any(|event| matches!(
++            event,
++            GameEvent::Augmented {
++                merged_id,
++                augmenting_id,
++                ..
++            } if *merged_id == host && *augmenting_id == augment
++        )),
++        "augment should emit its dedicated Host/Augment event"
++    );
++    assert!(
++        !events
++            .iter()
++            .any(|event| matches!(event, GameEvent::Mutated { .. })),
++        "augment must not emit the mutate-only event or satisfy mutate triggers"
++    );
++}
++
++#[test]
++fn combine_host_uses_current_copiable_values_after_copy_effect() {
++    let mut state = GameState::new_two_player(1);
++    let host = create_object(
++        &mut state,
++        CardId(1),
++        PlayerId(0),
++        "Adorable Kitten".to_string(),
++        Zone::Battlefield,
++    );
++    let copied_host = create_object(
++        &mut state,
++        CardId(2),
++        PlayerId(0),
++        "Curious Puppy".to_string(),
++        Zone::Battlefield,
++    );
++    let augment = create_object(
++        &mut state,
++        CardId(3),
++        PlayerId(0),
++        "Monkey-".to_string(),
++        Zone::Hand,
++    );
++    apply_card_face_to_object(state.objects.get_mut(&host).unwrap(), &host_face());
++    apply_card_face_to_object(
++        state.objects.get_mut(&copied_host).unwrap(),
++        &copied_host_face(),
++    );
++    apply_card_face_to_object(state.objects.get_mut(&augment).unwrap(), &augment_face());
++
++    let mut events = Vec::<GameEvent>::new();
++    let copy_ability = ResolvedAbility::new(
++        Effect::BecomeCopy {
++            target: TargetFilter::Any,
++            duration: None,
++            mana_value_limit: None,
++            additional_modifications: Vec::new(),
++        },
++        vec![TargetRef::Object(copied_host)],
++        host,
++        PlayerId(0),
++    );
++    become_copy::resolve(&mut state, &copy_ability, &mut events).unwrap();
++
++    let ability = ResolvedAbility::new(
++        Effect::CombineHost {
++            source: CombineSource::SpecificObject { id: augment },
++            host: Box::new(TargetFilter::SpecificObject { id: host }),
++        },
++        Vec::new(),
++        augment,
++        PlayerId(0),
++    );
++    resolve_combine_host(&mut state, &ability, &mut events).unwrap();
++
++    let merged = &state.objects[&host];
++    assert_eq!(merged.name, "Monkey-Puppy");
++    assert_eq!(merged.power, Some(5));
++    assert_eq!(merged.toughness, Some(6));
++    assert_eq!(merged.color, vec![ManaColor::Green]);
++    assert!(merged.card_types.subtypes.contains(&"Dog".to_string()));
++    assert!(merged.card_types.subtypes.contains(&"Monkey".to_string()));
++    assert_eq!(
++        merged
++            .trigger_definitions
++            .iter_all()
++            .find_map(gain_life_amount),
++        Some(5)
++    );
++}
++
++#[test]
++fn combine_host_preserves_existing_merged_stack_and_current_values() {
++    let mut state = GameState::new_two_player(1);
++    let host = create_object(
++        &mut state,
++        CardId(1),
++        PlayerId(0),
++        "Adorable Kitten".to_string(),
++        Zone::Battlefield,
++    );
++    let rider = create_object(
++        &mut state,
++        CardId(2),
++        PlayerId(0),
++        "Sky Rider".to_string(),
++        Zone::Battlefield,
++    );
++    let augment = create_object(
++        &mut state,
++        CardId(3),
++        PlayerId(0),
++        "Monkey-".to_string(),
++        Zone::Hand,
++    );
++    apply_card_face_to_object(state.objects.get_mut(&host).unwrap(), &host_face());
++    apply_card_face_to_object(state.objects.get_mut(&rider).unwrap(), &rider_face());
++    apply_card_face_to_object(state.objects.get_mut(&augment).unwrap(), &augment_face());
++
++    let mut events = Vec::<GameEvent>::new();
++    merge_object_onto(&mut state, rider, host, MergeSide::Top, &mut events);
++
++    let ability = ResolvedAbility::new(
++        Effect::CombineHost {
++            source: CombineSource::SpecificObject { id: augment },
++            host: Box::new(TargetFilter::SpecificObject { id: host }),
++        },
++        Vec::new(),
++        augment,
++        PlayerId(0),
++    );
++    resolve_combine_host(&mut state, &ability, &mut events).unwrap();
++
++    let merged = &state.objects[&host];
++    assert_eq!(merged.name, "Monkey-Rider");
++    assert_eq!(merged.power, Some(6));
++    assert_eq!(merged.toughness, Some(6));
++    assert_eq!(merged.color, vec![ManaColor::Blue]);
++    assert_eq!(
++        merged.merged_components,
++        vec![rider, host, augment],
++        "augment should extend the existing merged stack without discarding prior components"
++    );
++}
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index ed394e06bc..a6b3315767 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -2404,6 +2404,19 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+                 d.push(("on_decline".into(), "present".into()));
+             }
+         }
++        Effect::CombineHost { source, host } => {
++            d.push(("source".into(), format!("{source:?}")));
++            d.push(("host".into(), fmt_target(host)));
++        }
++        Effect::ChooseAugmentAndCombineWithHost {
++            zones,
++            filter,
++            host,
++        } => {
++            d.push(("zones".into(), zones.iter().map(fmt_zone).collect::<Vec<_>>().join("/")));
++            d.push(("filter".into(), fmt_target(filter)));
++            d.push(("host".into(), fmt_target(host)));
++        }
+         Effect::RevealTop { player, count } => {
+             d.push(("player".into(), fmt_target(player)));
+             d.push(("count".into(), count.to_string()));
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index 7530e84ce1..42577c226f 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -2676,6 +2676,12 @@ pub fn resolve_effect(
+         Effect::Myriad => myriad::resolve(state, ability, events),
+         Effect::ExileHaunting { .. } => crate::game::haunt::resolve(state, ability, events),
+         Effect::Encore => encore::resolve(state, ability, events),
++        Effect::CombineHost { .. } => {
++            crate::game::augment::resolve_combine_host(state, ability, events)
++        }
++        Effect::ChooseAugmentAndCombineWithHost { .. } => {
++            crate::game::augment::resolve_choose_augment_and_combine(state, ability, events)
++        }
+         Effect::Meld { .. } => crate::game::meld::perform_meld(state, ability, events),
+         Effect::HideawayConceal { .. } => hideaway::resolve(state, ability, events),
+         Effect::CopyTokenBlockingAttacker { .. } => {
+diff --git a/crates/engine/src/game/filter.rs b/crates/engine/src/game/filter.rs
+index 1e15125e86..e15eafd27d 100644
+--- a/crates/engine/src/game/filter.rs
++++ b/crates/engine/src/game/filter.rs
+@@ -1974,6 +1974,10 @@ fn subtype_matches_with_changeling(
+     false
+ }
+ 
++fn subtype_matches_host_supertype(subtype: &str, supertypes: &[Supertype]) -> bool {
++    subtype.eq_ignore_ascii_case("host") && supertypes.contains(&Supertype::Host)
++}
++
+ /// Check if an object matches a TypeFilter variant.
+ /// Check if an object's card types match a `TypeFilter`.
+ /// CR 205.2a: Each card type has its own rules for how it behaves.
+@@ -2013,12 +2017,14 @@ pub fn type_filter_matches(
+         // expands Changeling into `obj.card_types.subtypes`, but for cards in
+         // library/hand/graveyard/exile the helper below handles the expansion
+         // by inspecting `obj.keywords` and the runtime creature-type catalog.
+-        TypeFilter::Subtype(ref sub) => subtype_matches_with_changeling(
+-            sub,
+-            &obj.card_types.subtypes,
+-            &obj.keywords,
+-            all_creature_types,
+-        ),
++        TypeFilter::Subtype(ref sub) => {
++            subtype_matches_with_changeling(
++                sub,
++                &obj.card_types.subtypes,
++                &obj.keywords,
++                all_creature_types,
++            ) || subtype_matches_host_supertype(sub, &obj.card_types.supertypes)
++        }
+         // CR 608.2b: Disjunction — matches if any inner filter matches.
+         TypeFilter::AnyOf(ref filters) => filters
+             .iter()
+@@ -2057,12 +2063,14 @@ fn zone_change_record_matches_type_filter(
+         // CR 205.3 + CR 702.73a: Subtype match through the Changeling helper —
+         // zone-change records snapshot the object's keywords, so Changeling
+         // travels with the snapshot.
+-        TypeFilter::Subtype(subtype) => subtype_matches_with_changeling(
+-            subtype,
+-            &record.subtypes,
+-            &record.keywords,
+-            all_creature_types,
+-        ),
++        TypeFilter::Subtype(subtype) => {
++            subtype_matches_with_changeling(
++                subtype,
++                &record.subtypes,
++                &record.keywords,
++                all_creature_types,
++            ) || subtype_matches_host_supertype(subtype, &record.supertypes)
++        }
+         TypeFilter::AnyOf(filters) => filters
+             .iter()
+             .any(|inner| zone_change_record_matches_type_filter(record, inner, all_creature_types)),
+@@ -2578,12 +2586,14 @@ fn spell_record_matches_type_filter(
+         // CR 205.3 + CR 702.73a: Spell-cast records snapshot keywords, so
+         // Ur-Dragon's "Dragon spells you cast" matches Mistform Ultimus on the
+         // stack via Changeling.
+-        TypeFilter::Subtype(subtype) => subtype_matches_with_changeling(
+-            subtype,
+-            &record.subtypes,
+-            &record.keywords,
+-            all_creature_types,
+-        ),
++        TypeFilter::Subtype(subtype) => {
++            subtype_matches_with_changeling(
++                subtype,
++                &record.subtypes,
++                &record.keywords,
++                all_creature_types,
++            ) || subtype_matches_host_supertype(subtype, &record.supertypes)
++        }
+         TypeFilter::AnyOf(filters) => filters
+             .iter()
+             .any(|inner| spell_record_matches_type_filter(record, inner, all_creature_types)),
+diff --git a/crates/engine/src/game/game_object.rs b/crates/engine/src/game/game_object.rs
+index e88b1e9f16..8c08779428 100644
+--- a/crates/engine/src/game/game_object.rs
++++ b/crates/engine/src/game/game_object.rs
+@@ -87,6 +87,7 @@ pub struct MutateFormState;
+ pub enum MergeKind {
+     Mutate,
+     Meld,
++    Augment,
+ }
+ 
+ /// CR 702.160a: Prototype form marker — `Some(_)` means this object was cast
+diff --git a/crates/engine/src/game/gap_analysis.rs b/crates/engine/src/game/gap_analysis.rs
+index 4a353032ef..1a0b6ff46d 100644
+--- a/crates/engine/src/game/gap_analysis.rs
++++ b/crates/engine/src/game/gap_analysis.rs
+@@ -71,7 +71,6 @@ const NEW_MECHANIC_KEYWORDS: &[&str] = &[
+     "draft",
+     "drafted",
+     "ante",
+-    "augment",
+     "sticker",
+     "attraction",
+     "unfinity",
+diff --git a/crates/engine/src/game/log.rs b/crates/engine/src/game/log.rs
+index 640de3289c..94e9318b1a 100644
+--- a/crates/engine/src/game/log.rs
++++ b/crates/engine/src/game/log.rs
+@@ -172,6 +172,8 @@ fn categorize(event: &GameEvent) -> LogCategory {
+         | GameEvent::Saddled { .. }
+         // CR 702.140c + CR 730.2: a mutating creature spell merged with a permanent.
+         | GameEvent::Mutated { .. }
++        // Unstable Host/Augment: a card with augment combined with a Host creature.
++        | GameEvent::Augmented { .. }
+         | GameEvent::BecomesPlotted { .. } => LogCategory::State,
+ 
+         GameEvent::SpeedChanged { .. } => LogCategory::Special,
+@@ -321,6 +323,7 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
+                 AbilityTag::PowerUp => " activates power-up: ",
+                 // CR 702.6a: Equip activation.
+                 AbilityTag::Equip => " activates equip: ",
++                AbilityTag::Augment => " activates augment: ",
+             };
+             vec![
+                 player_seg(state, *player_id),
+@@ -704,6 +707,16 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
+             card_seg(state, *merged_id),
+         ],
+ 
++        GameEvent::Augmented {
++            merged_id,
++            augmenting_id,
++            ..
++        } => vec![
++            card_seg(state, *augmenting_id),
++            text(" augments "),
++            card_seg(state, *merged_id),
++        ],
++
+         GameEvent::TurnedFaceUp { object_id } => {
+             vec![card_seg(state, *object_id), text(" is turned face up")]
+         }
+diff --git a/crates/engine/src/game/merge.rs b/crates/engine/src/game/merge.rs
+index 736815cfd3..2f98fea65f 100644
+--- a/crates/engine/src/game/merge.rs
++++ b/crates/engine/src/game/merge.rs
+@@ -261,7 +261,7 @@ fn merged_copiable_values(
+     Some((values, display_source, printed_ref, token_image_ref))
+ }
+ 
+-fn remove_merge_layer_effect(state: &mut GameState, target_id: ObjectId) {
++pub(crate) fn remove_merge_layer_effect(state: &mut GameState, target_id: ObjectId) {
+     let effect_id = state
+         .objects
+         .get(&target_id)
+diff --git a/crates/engine/src/game/mod.rs b/crates/engine/src/game/mod.rs
+index d920b03fde..75d6ee1927 100644
+--- a/crates/engine/src/game/mod.rs
++++ b/crates/engine/src/game/mod.rs
+@@ -1,6 +1,7 @@
+ pub mod ability_utils;
+ pub mod arithmetic;
+ pub mod attractions;
++pub mod augment;
+ pub mod bending;
+ pub mod blitz;
+ // Tests for `blitz` live in a sibling file (declared here, not in `blitz.rs`,
+@@ -98,6 +99,9 @@ pub mod perf_counters;
+ #[cfg(test)]
+ #[path = "archenemy_tests.rs"]
+ mod archenemy_tests;
++#[cfg(test)]
++#[path = "augment_tests.rs"]
++mod augment_tests;
+ pub mod phasing;
+ pub mod planechase;
+ // Tests for `planechase` live in a sibling file (declared here, not in
+diff --git a/crates/engine/src/game/printed_cards.rs b/crates/engine/src/game/printed_cards.rs
+index 4ec2c975ee..06f280a606 100644
+--- a/crates/engine/src/game/printed_cards.rs
++++ b/crates/engine/src/game/printed_cards.rs
+@@ -1109,6 +1109,8 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
+         | Effect::GiveControl { .. }
+         | Effect::RemoveFromCombat { .. }
+         | Effect::CreateDamageReplacement { .. }
++        | Effect::CombineHost { .. }
++        | Effect::ChooseAugmentAndCombineWithHost { .. }
+         // CR 614.12 + CR 303.4: ReturnAsAura.grants carry typed
+         // ContinuousModifications, never conjured card names.
+         | Effect::ReturnAsAura { .. }
+diff --git a/crates/engine/src/game/public_state.rs b/crates/engine/src/game/public_state.rs
+index 529e1acd60..ccd8ddcb29 100644
+--- a/crates/engine/src/game/public_state.rs
++++ b/crates/engine/src/game/public_state.rs
+@@ -230,6 +230,12 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
+                 mark_object_dirty_with_mana(state, *merged_id);
+                 mark_battlefield_display_dirty(state);
+             }
++            // Unstable Host/Augment combine uses the same merged-permanent
++            // display surface as mutate, but it is a distinct game event.
++            GameEvent::Augmented { merged_id, .. } => {
++                mark_object_dirty_with_mana(state, *merged_id);
++                mark_battlefield_display_dirty(state);
++            }
+             GameEvent::CounterAdded { object_id, .. }
+             | GameEvent::ObjectIntensified { object_id, .. }
+             | GameEvent::CounterRemoved { object_id, .. }
+diff --git a/crates/engine/src/game/sba.rs b/crates/engine/src/game/sba.rs
+index e849217bb5..76aab03469 100644
+--- a/crates/engine/src/game/sba.rs
++++ b/crates/engine/src/game/sba.rs
+@@ -151,6 +151,14 @@ pub fn check_state_based_actions(state: &mut GameState, events: &mut Vec<GameEve
+         // CR 704.5d: Tokens in zones other than the battlefield cease to exist.
+         check_token_cease_to_exist(state, &mut any_performed);
+ 
++        // Unstable Host/Augment: a standalone augment permanent on the
++        // battlefield is put into its owner's graveyard.
++        crate::game::augment::check_standalone_augment_permanents(
++            state,
++            events,
++            &mut any_performed,
++        );
++
+         // CR 704.5z: A player controlling Start your engines! gets speed 1 if they had none.
+         check_start_your_engines(state, events, &mut any_performed);
+ 
+diff --git a/crates/engine/src/game/trigger_index.rs b/crates/engine/src/game/trigger_index.rs
+index 50096fc90b..58e251ee63 100644
+--- a/crates/engine/src/game/trigger_index.rs
++++ b/crates/engine/src/game/trigger_index.rs
+@@ -637,6 +637,9 @@ pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
+         // unclassified bucket (see `keys_from_trigger_def`), so the `Mutated`
+         // event needs no dedicated index key — `match_mutates` is always consulted.
+         GameEvent::Mutated { .. } => {}
++        // Unstable Host/Augment combine is a distinct mechanic and has no
++        // dedicated trigger mode today.
++        GameEvent::Augmented { .. } => {}
+         GameEvent::Firebend { .. }
+         | GameEvent::Airbend { .. }
+         | GameEvent::Earthbend { .. }
+@@ -892,7 +895,9 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
+         | EffectKind::ExchangeLifeTotals
+         // Heist/HeistExile have no production EffectResolved-dispatching matcher.
+         | EffectKind::Heist
+-        | EffectKind::HeistExile => {}
++        | EffectKind::HeistExile
++        | EffectKind::CombineHost
++        | EffectKind::ChooseAugmentAndCombineWithHost => {}
+     }
+ }
+ 
+diff --git a/crates/engine/src/game/trigger_matchers.rs b/crates/engine/src/game/trigger_matchers.rs
+index 2fdd67ca9d..327bdbfe71 100644
+--- a/crates/engine/src/game/trigger_matchers.rs
++++ b/crates/engine/src/game/trigger_matchers.rs
+@@ -831,6 +831,9 @@ fn count_matching_trigger_event_subjects(
+         | GameEvent::StickerPlaced { object_id, .. } => count_one(*object_id),
+         // CR 702.140c + CR 730.2c: the merged (surviving) permanent is the subject.
+         GameEvent::Mutated { merged_id, .. } => count_one(*merged_id),
++        // Unstable Host/Augment combine also makes the surviving Host permanent
++        // the observable subject for generic object-scoped event helpers.
++        GameEvent::Augmented { merged_id, .. } => count_one(*merged_id),
+         // Object target events yield the affected object as subject. Player
+         // target events carry no object subject; player scoping lives on
+         // `valid_target`.
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 1907b7d8dc..d7e08a60a9 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -4492,6 +4492,8 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
+         | Effect::GiveControl { .. }
+         | Effect::RemoveFromCombat { .. }
+         | Effect::Conjure { .. }
++        | Effect::CombineHost { .. }
++        | Effect::ChooseAugmentAndCombineWithHost { .. }
+         | Effect::Intensify { .. }
+         | Effect::ApplyPerpetual { .. }
+         | Effect::DraftFromSpellbook { .. }
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 824175f644..7faaf09ef2 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -5979,6 +5979,17 @@ pub enum RuntimeHandler {
+     NinjutsuFamily,
+ }
+ 
++/// Which object a Host/Augment combine effect should merge onto a Host.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub enum CombineSource {
++    /// The resolving ability's source object.
++    Source,
++    /// The first inherited object target in the current resolution chain.
++    ParentTarget,
++    /// Runtime continuation payload: a previously chosen specific object.
++    SpecificObject { id: ObjectId },
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ pub enum BeholdCostAction {
+     ChooseOrReveal,
+@@ -8399,6 +8410,19 @@ pub enum Effect {
+     /// target (opponents and per-opponent attack binding are chosen by the
+     /// effect, like `Myriad`).
+     Encore,
++    /// Unstable Augment / Host combine primitive: merge a known card with
++    /// augment onto a Host creature.
++    CombineHost {
++        source: CombineSource,
++        host: Box<TargetFilter>,
++    },
++    /// Unstable Host-support helper: choose a card with augment from the listed
++    /// zones, then combine it with a Host creature.
++    ChooseAugmentAndCombineWithHost {
++        zones: Vec<Zone>,
++        filter: Box<TargetFilter>,
++        host: Box<TargetFilter>,
++    },
+     /// CR 701.42a / CR 712.4a: Meld — exile both the real meld instigator
+     /// (`source`) and a battlefield object named `partner` that the controller
+     /// both owns and controls, then put a single melded permanent onto the
+@@ -11032,6 +11056,9 @@ impl Effect {
+             // on the stack, so it must be surfaced for the target-slot path.
+             | Effect::ExileHaunting { target } => Some(target),
+ 
++            Effect::CombineHost { host, .. }
++            | Effect::ChooseAugmentAndCombineWithHost { host, .. } => Some(host.as_ref()),
++
+             // CR 702.75a: Hideaway conceal acts on the just-exiled card inherited
+             // from the parent `Dig` continuation (`ParentTarget`); it is never
+             // announced as a target, but surfacing the filter keeps chain-time
+@@ -11560,6 +11587,8 @@ impl Effect {
+             | Effect::Unimplemented { .. }
+             | Effect::VentureInto { .. }
+             | Effect::VentureIntoDungeon
++            | Effect::CombineHost { .. }
++            | Effect::ChooseAugmentAndCombineWithHost { .. }
+             | Effect::WinTheGame { .. } => None,
+         }
+     }
+@@ -11778,6 +11807,8 @@ impl Effect {
+             | Effect::Unimplemented { .. }
+             | Effect::VentureInto { .. }
+             | Effect::VentureIntoDungeon
++            | Effect::CombineHost { .. }
++            | Effect::ChooseAugmentAndCombineWithHost { .. }
+             | Effect::WinTheGame { .. } => None,
+         }
+     }
+@@ -11855,6 +11886,8 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
+         Effect::CreateTokenCopyFromPool { .. } => "CreateTokenCopyFromPool",
+         Effect::Myriad => "Myriad",
+         Effect::Encore => "Encore",
++        Effect::CombineHost { .. } => "CombineHost",
++        Effect::ChooseAugmentAndCombineWithHost { .. } => "ChooseAugmentAndCombineWithHost",
+         Effect::Meld { .. } => "Meld",
+         Effect::ExileHaunting { .. } => "ExileHaunting",
+         Effect::HideawayConceal { .. } => "HideawayConceal",
+@@ -12073,6 +12106,8 @@ pub enum EffectKind {
+     CreateTokenCopyFromPool,
+     Myriad,
+     Encore,
++    CombineHost,
++    ChooseAugmentAndCombineWithHost,
+     Meld,
+     ExileHaunting,
+     HideawayConceal,
+@@ -12294,6 +12329,10 @@ impl From<&Effect> for EffectKind {
+             Effect::CreateTokenCopyFromPool { .. } => EffectKind::CreateTokenCopyFromPool,
+             Effect::Myriad => EffectKind::Myriad,
+             Effect::Encore => EffectKind::Encore,
++            Effect::CombineHost { .. } => EffectKind::CombineHost,
++            Effect::ChooseAugmentAndCombineWithHost { .. } => {
++                EffectKind::ChooseAugmentAndCombineWithHost
++            }
+             Effect::Meld { .. } => EffectKind::Meld,
+             Effect::ExileHaunting { .. } => EffectKind::ExileHaunting,
+             Effect::HideawayConceal { .. } => EffectKind::HideawayConceal,
+@@ -12646,6 +12685,8 @@ pub enum AbilityTag {
+     PowerUp,
+     /// CR 702.6a: This ability originated from an Equip keyword definition.
+     Equip,
++    /// Unstable Augment hand-activated combine ability.
++    Augment,
+ }
+ 
+ impl AbilityTag {
+@@ -12663,6 +12704,7 @@ impl AbilityTag {
+             AbilityTag::Backup => "backup",
+             AbilityTag::PowerUp => "power-up",
+             AbilityTag::Equip => "equip",
++            AbilityTag::Augment => "augment",
+         }
+     }
+ }
+@@ -13532,6 +13574,11 @@ impl AbilityDefinition {
+         self
+     }
+ 
++    pub fn with_else_ability(mut self, ability: AbilityDefinition) -> Self {
++        self.else_ability = Some(Box::new(ability));
++        self
++    }
++
+     pub fn with_modal(
+         mut self,
+         modal: ModalChoice,
+diff --git a/crates/engine/src/types/card_type.rs b/crates/engine/src/types/card_type.rs
+index 9f78317165..8faf15c532 100644
+--- a/crates/engine/src/types/card_type.rs
++++ b/crates/engine/src/types/card_type.rs
+@@ -3,7 +3,8 @@ use std::str::FromStr;
+ 
+ use serde::{Deserialize, Serialize};
+ 
+-/// CR 205.4: Supertypes — Legendary, Basic, Snow, World, Ongoing.
++/// CR 205.4: Supertypes — Legendary, Basic, Snow, World, Ongoing, plus
++/// supplemental set-specific supertypes such as Host.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+ pub enum Supertype {
+     Legendary,
+@@ -11,6 +12,7 @@ pub enum Supertype {
+     Snow,
+     World,
+     Ongoing,
++    Host,
+ }
+ 
+ impl FromStr for Supertype {
+@@ -23,6 +25,7 @@ impl FromStr for Supertype {
+             "Snow" => Ok(Supertype::Snow),
+             "World" => Ok(Supertype::World),
+             "Ongoing" => Ok(Supertype::Ongoing),
++            "Host" => Ok(Supertype::Host),
+             _ => Err(()),
+         }
+     }
+@@ -36,6 +39,7 @@ impl fmt::Display for Supertype {
+             Supertype::Snow => write!(f, "Snow"),
+             Supertype::World => write!(f, "World"),
+             Supertype::Ongoing => write!(f, "Ongoing"),
++            Supertype::Host => write!(f, "Host"),
+         }
+     }
+ }
+diff --git a/crates/engine/src/types/events.rs b/crates/engine/src/types/events.rs
+index 062ed790f9..c146503ccb 100644
+--- a/crates/engine/src/types/events.rs
++++ b/crates/engine/src/types/events.rs
+@@ -143,6 +143,19 @@ pub enum GameEvent {
+         merging_id: ObjectId,
+         controller: PlayerId,
+     },
++    /// Unstable Host/Augment: a card with augment combined with a Host
++    /// creature, forming a merged permanent. Emitted by `augment.rs`.
++    /// `merged_id` is the surviving permanent's `ObjectId` (the Host
++    /// creature's continuity id); `augmenting_id` is the augment component that
++    /// merged onto it; `controller` is the player who performed the combine.
++    ///
++    /// Distinct from `Mutated`: Augment reuses merge-like bookkeeping but is a
++    /// separate mechanic and must not satisfy `TriggerMode::Mutates`.
++    Augmented {
++        merged_id: ObjectId,
++        augmenting_id: ObjectId,
++        controller: PlayerId,
++    },
+     /// CR 707.10: A spell was copied onto the stack. A copy of a spell isn't
+     /// cast, so this is a distinct event from `SpellCast` — copy-sensitive
+     /// triggers (Magecraft, "whenever you copy a spell") fire on this, while
+diff --git a/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs b/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
+index d8fbe3ca12..040cbcc252 100644
+--- a/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
++++ b/crates/engine/tests/integration/anaphoric_scope_allowlist_guard.rs
+@@ -170,7 +170,6 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
+     "beastie beatdown",
+     "benalish faithbonder",
+     "benalish knight-counselor",
+-    "bionic blow",
+     "bite down on crime",
+     "blood poet",
+     "bottle golems",
+@@ -178,7 +177,6 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
+     "brainstealer dragon",
+     "brokers charm",
+     "burrog barrage",
+-    "captain marvel, shooting star",
+     "champion of the path",
+     "champion of wits",
+     "chastise",
+@@ -186,7 +184,6 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
+     "clear shot",
+     "coalition skyknight",
+     "coalition warbrute",
+-    "colossal collision",
+     "common black removal",
+     "conclave mentor",
+     "consume",
+@@ -209,7 +206,6 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
+     "electryte",
+     "exile",
+     "felling blow",
+-    "feral encounter",
+     "foot chopper",
+     "gargantuan gorilla",
+     "garruk relentless",
+@@ -258,9 +254,7 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
+     "nibelheim aflame",
+     "nissa's judgment",
+     "nissa's revelation",
+-    "nova flame",
+     "noxious gearhulk",
+-    "origin of thor",
+     "orzhov charm",
+     "packsong pup",
+     "pain for all",
+@@ -287,6 +281,7 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
+     "shriveling rot",
+     "signature slam",
+     "sister hospitaller",
++    "sly spy",
+     "sorin the mirthless",
+     "sorin, grim nemesis",
+     "south wind avatar",
+@@ -352,7 +347,6 @@ const DEMONSTRATIVE_SCOPE_CARDS: &[&str] = &[
+     "consuming vapors",
+     "cragganwick cremator",
+     "creature bond",
+-    "daredevil, fearless fighter",
+     "daxos of meletis",
+     "dead reckoning",
+     "devour flesh",
+@@ -431,10 +425,8 @@ const DEMONSTRATIVE_SCOPE_CARDS: &[&str] = &[
+     "singe-mind ogre",
+     "summon: kujata",
+     "terror of the peaks",
+-    "the frightful four",
+     "the lord of pain",
+     "the provider",
+-    "thor, god of thunder",
+     "tribute to hunger",
+     "trostani, selesnya's voice",
+     "twisted justice",
+@@ -552,17 +544,23 @@ fn anaphoric_scope_set_is_frozen() {
+     // spell), dropping it back out (-1) for a net count of 172. Vivien's
+     // Invocation remains Anaphoric: the reflexive-trigger anaphor handling in
+     // this batch keeps its "its mana value" pointing at the entering creature.
++    // The current export once again retains Sly Spy's reveal-referent pronoun
++    // ("its mana value") as ObjectScope::Anaphoric, taking the count to 173.
++    // The current export no longer retains the prior one-sided-fight /
++    // target-event anaphor set (Bionic Blow, Captain Marvel, Colossal
++    // Collision, Feral Encounter, Nova Flame, Origin of Thor), dropping the
++    // count to 167.
+     assert_eq!(
+         observed.len(),
+-        172,
+-        "Expected exactly 172 cards retaining ObjectScope::Anaphoric (pronoun \
++        167,
++        "Expected exactly 167 cards retaining ObjectScope::Anaphoric (pronoun \
+          'its' antecedents). Count moved to {}.",
+         observed.len()
+     );
+     assert_eq!(
+         ANAPHORIC_SCOPE_CARDS.len(),
+-        172,
+-        "ANAPHORIC_SCOPE_CARDS must list exactly 172 cards."
++        167,
++        "ANAPHORIC_SCOPE_CARDS must list exactly 167 cards."
+     );
+ }
+ 
+@@ -614,18 +612,20 @@ fn demonstrative_scope_set_is_frozen() {
+     // nom quantity call-site migration briefly resolved Nightmares and Daydreams
+     // out of the demonstrative set, but the delayed-trigger split combined with
+     // this batch's grammar keeps it parsing as a bare demonstrative, so it is
+-    // retained.)
++    // retained.) The current export no longer retains the prior three Marvel
++    // demonstrative keys ("daredevil, fearless fighter", "the frightful four",
++    // and "thor, god of thunder"), dropping the count to 113.
+     assert_eq!(
+         observed.len(),
+-        116,
+-        "Expected exactly 116 cards retaining ObjectScope::Demonstrative. Count \
++        113,
++        "Expected exactly 113 cards retaining ObjectScope::Demonstrative. Count \
+          moved to {}.",
+         observed.len()
+     );
+     assert_eq!(
+         DEMONSTRATIVE_SCOPE_CARDS.len(),
+-        116,
+-        "DEMONSTRATIVE_SCOPE_CARDS must list exactly 116 cards."
++        113,
++        "DEMONSTRATIVE_SCOPE_CARDS must list exactly 113 cards."
+     );
+ }
+ 
+diff --git a/crates/phase-ai/src/policies/redundancy_avoidance.rs b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+index bcf02f9d6c..b550b95591 100644
+--- a/crates/phase-ai/src/policies/redundancy_avoidance.rs
++++ b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+@@ -302,6 +302,7 @@ fn redundancy_delta(
+             /* delta= */ -3.0,
+         ),
+         Effect::ApplyPostReplacementDamage { .. } => None,
++        Effect::CombineHost { .. } | Effect::ChooseAugmentAndCombineWithHost { .. } => None,
+         Effect::Draw { count, .. } => zero_quantity_redundancy(
+             state,
+             source_id,

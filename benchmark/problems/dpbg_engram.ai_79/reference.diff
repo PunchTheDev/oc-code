@@ -1,0 +1,340 @@
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 4959a38..a52b28d 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -80,14 +80,15 @@ jobs:
+           enable-cache: true
+           python-version: ${{ matrix.python-version }}
+ 
+-      - name: Run Kernel + Meta-Programmer + Coordinator + Dashboard safety tests
++      - name: Run Kernel + Meta-Programmer + Coordinator + Dashboard + Beliefs safety tests
+         env:
+-          PYTHONPATH: kernel/src:meta-programmer/src:coordinator/src:dashboard/src
++          PYTHONPATH: kernel/src:meta-programmer/src:coordinator/src:dashboard/src:beliefs/src
+         # uv run builds an ephemeral env (avoids the runner's externally-managed
+         # system Python); --with-editable ./sdk provides activelearning + its deps.
+         # Coordinator gate + dashboard auth tests load their module under test
+-        # directly (pure stdlib), so they need no extra service deps.
+-        run: uv run --no-project --with-editable ./sdk --with pytest python -m pytest kernel/tests meta-programmer/tests coordinator/tests dashboard/tests -o addopts="" -v
++        # directly (pure stdlib), so they need no extra service deps. Beliefs
++        # tests need networkx (the belief graph backend).
++        run: uv run --no-project --with-editable ./sdk --with pytest --with networkx python -m pytest kernel/tests meta-programmer/tests coordinator/tests dashboard/tests beliefs/tests -o addopts="" -v
+ 
+   sandbox:
+     name: Sandbox image build + smoke
+diff --git a/beliefs/src/beliefs/graph.py b/beliefs/src/beliefs/graph.py
+index c31a5bc..2335a6b 100644
+--- a/beliefs/src/beliefs/graph.py
++++ b/beliefs/src/beliefs/graph.py
+@@ -19,6 +19,12 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Constitutional VALUE nodes have a confidence floor that CANNOT be lowered by
++# any path — learning, decay, contradiction pressure, a re-add, or tampered
++# persistence. This is the load-bearing safety claim (CLAUDE.md §3, beliefs).
++# Enforced in add_node, update_belief, and import_from_dict.
++VALUE_CONFIDENCE_FLOOR = 0.9
++
+ 
+ class NodeType(Enum):
+     """Types of belief nodes."""
+@@ -108,11 +114,23 @@ def add_node(self, node: BeliefNode) -> str:
+         if not node.id:
+             node.id = str(uuid.uuid4())
+ 
++        # Enforce the VALUE floor at the single chokepoint every write goes
++        # through (NATS add_node, DB load, seeding). NetworkX add_node overwrites
++        # an existing node's attributes, so without this a VALUE could be lowered
++        # below its floor simply by re-adding it with a low confidence.
++        confidence = node.confidence
++        if node.type == NodeType.VALUE and confidence < VALUE_CONFIDENCE_FLOOR:
++            logger.warning(
++                "Clamping VALUE %s confidence %.3f up to floor %.2f",
++                node.id, confidence, VALUE_CONFIDENCE_FLOOR,
++            )
++            confidence = VALUE_CONFIDENCE_FLOOR
++
+         self._graph.add_node(
+             node.id,
+             type=node.type.value,
+             content=node.content,
+-            confidence=node.confidence,
++            confidence=confidence,
+             source=node.source,
+             metadata=node.metadata,
+             created_at=node.created_at,
+@@ -212,7 +230,7 @@ def update_belief(
+         # This is the constitutional constraint: the brain can learn facts
+         # and norms, but cannot learn to override core values.
+         if node_data.get("type") == NodeType.VALUE.value:
+-            new_confidence = max(new_confidence, 0.9)
++            new_confidence = max(new_confidence, VALUE_CONFIDENCE_FLOOR)
+ 
+         # Update node
+         self._graph.nodes[node_id]["confidence"] = new_confidence
+@@ -353,7 +371,7 @@ def import_from_dict(self, data: dict[str, Any]) -> None:
+             # Enforce VALUE confidence floor on import — protects against
+             # corrupted or tampered persistence data.
+             if node.get("type") == NodeType.VALUE.value:
+-                node["confidence"] = max(node.get("confidence", 1.0), 0.9)
++                node["confidence"] = max(node.get("confidence", 1.0), VALUE_CONFIDENCE_FLOOR)
+             self._graph.add_node(node_id, **node)
+ 
+         for edge in data.get("edges", []):
+diff --git a/beliefs/tests/test_belief_floor.py b/beliefs/tests/test_belief_floor.py
+new file mode 100644
+index 0000000..d4263a3
+--- /dev/null
++++ b/beliefs/tests/test_belief_floor.py
+@@ -0,0 +1,156 @@
++"""Constitutional VALUE confidence-floor is non-lowerable (E1.8.1).
++
++The beliefs graph holds constitutional VALUE nodes whose confidence "cannot be
++lowered" — the load-bearing safety claim in CLAUDE.md §3. These tests prove the
++floor holds against EVERY mutation path: direct set, re-add overwrite, Bayesian
++decay under contradiction pressure, and a persistence round-trip (export/import
++and the DB-load-via-add_node path used on restart). They also cover the
++contradiction detector the Kernel relies on.
++
++This is the canonical regression for the floor invariant.
++"""
++
++import os
++import sys
++
++# beliefs/src on path so `import beliefs.*` resolves without installing.
++_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
++if _SRC not in sys.path:
++    sys.path.insert(0, _SRC)
++
++from beliefs.graph import (  # noqa: E402
++    VALUE_CONFIDENCE_FLOOR,
++    BeliefEdge,
++    BeliefGraph,
++    BeliefNode,
++    EdgeType,
++    NodeType,
++)
++
++
++def _seeded() -> BeliefGraph:
++    g = BeliefGraph()
++    g.seed_constitutional_beliefs()
++    return g
++
++
++# ── floor: direct add and re-add overwrite ───────────────────────────────────
++
++
++def test_add_new_value_below_floor_is_clamped():
++    g = BeliefGraph()
++    g.add_node(BeliefNode(id="value.x", type=NodeType.VALUE, content="x", confidence=0.1))
++    assert g.get_node("value.x").confidence >= VALUE_CONFIDENCE_FLOOR
++
++
++def test_readd_cannot_lower_existing_value():
++    # NetworkX add_node overwrites attributes; re-adding a VALUE with a low
++    # confidence must NOT erode it below the floor.
++    g = _seeded()
++    before = g.get_node("value.human_safety").confidence
++    assert before >= VALUE_CONFIDENCE_FLOOR
++    g.add_node(BeliefNode(id="value.human_safety", type=NodeType.VALUE,
++                          content="hijacked", confidence=0.01))
++    assert g.get_node("value.human_safety").confidence >= VALUE_CONFIDENCE_FLOOR
++
++
++def test_norm_is_not_floored():
++    # The floor is VALUE-specific: norms/facts must remain freely adjustable,
++    # otherwise the brain could not learn at all.
++    g = BeliefGraph()
++    g.add_node(BeliefNode(id="norm.y", type=NodeType.NORM, content="y", confidence=0.1))
++    assert g.get_node("norm.y").confidence == 0.1
++
++
++# ── floor: Bayesian update under contradiction pressure ──────────────────────
++
++
++def test_value_floor_survives_contradiction_pressure():
++    g = _seeded()
++    # Hammer the value with maximal contradicting evidence many times.
++    for _ in range(50):
++        g.update_belief("value.human_safety", evidence_strength=1.0, supports=False)
++    assert g.get_node("value.human_safety").confidence >= VALUE_CONFIDENCE_FLOOR
++
++
++def test_norm_confidence_can_decay_below_floor():
++    # Sanity check the update path actually moves confidence — proves the value
++    # floor above is meaningful, not a no-op.
++    g = _seeded()
++    for _ in range(50):
++        g.update_belief("norm.force_limit", evidence_strength=1.0, supports=False)
++    assert g.get_node("norm.force_limit").confidence < VALUE_CONFIDENCE_FLOOR
++
++
++# ── floor: persistence round-trips ───────────────────────────────────────────
++
++
++def test_floor_survives_export_import_roundtrip_with_tampering():
++    g = _seeded()
++    data = g.export_to_dict()
++    # Tamper persisted data: drive every VALUE to zero confidence.
++    for node in data["nodes"]:
++        if node.get("type") == NodeType.VALUE.value:
++            node["confidence"] = 0.0
++    g2 = BeliefGraph()
++    g2.import_from_dict(data)
++    for v in g2.get_beliefs_by_type(NodeType.VALUE):
++        assert v.confidence >= VALUE_CONFIDENCE_FLOOR
++
++
++def test_floor_survives_db_load_path_with_tampering():
++    # The service loads from SQLite by calling add_node per row (not
++    # import_from_dict). Simulate a tampered DB row going through that path.
++    g = _seeded()
++    data = g.export_to_dict()
++    g2 = BeliefGraph()
++    for node in data["nodes"]:
++        conf = 0.0 if node["type"] == NodeType.VALUE.value else node["confidence"]
++        g2.add_node(BeliefNode(
++            id=node["id"], type=NodeType(node["type"]), content=node["content"],
++            confidence=conf, source=node["source"], metadata=node.get("metadata", {}),
++        ))
++    for v in g2.get_beliefs_by_type(NodeType.VALUE):
++        assert v.confidence >= VALUE_CONFIDENCE_FLOOR
++
++
++# ── contradiction detection ──────────────────────────────────────────────────
++
++
++def _add_conflicting(g: BeliefGraph, conf_a=0.9, conf_b=0.9, strength=0.9):
++    g.add_node(BeliefNode(id="fact.a", type=NodeType.FACT, content="A is safe", confidence=conf_a))
++    g.add_node(BeliefNode(id="fact.b", type=NodeType.FACT, content="A is unsafe", confidence=conf_b))
++    g.add_edge(BeliefEdge(id="e.ab", type=EdgeType.CONTRADICTS,
++                          source_id="fact.a", target_id="fact.b", strength=strength))
++
++
++def test_find_contradictions_flags_conflict():
++    g = BeliefGraph()
++    _add_conflicting(g)
++    found = g.find_contradictions(threshold=0.5)
++    assert len(found) == 1
++    assert {found[0].node_a_id, found[0].node_b_id} == {"fact.a", "fact.b"}
++
++
++def test_find_contradictions_respects_strength_threshold():
++    g = BeliefGraph()
++    _add_conflicting(g, strength=0.3)
++    assert g.find_contradictions(threshold=0.5) == []
++
++
++def test_find_contradictions_ignores_low_confidence_nodes():
++    g = BeliefGraph()
++    _add_conflicting(g, conf_a=0.4)  # one side below the 0.5 confidence gate
++    assert g.find_contradictions(threshold=0.5) == []
++
++
++# ── norm inventory the Kernel consumes ───────────────────────────────────────
++
++
++def test_seeded_values_and_norms_present():
++    g = _seeded()
++    values = g.get_beliefs_by_type(NodeType.VALUE)
++    norms = g.get_beliefs_by_type(NodeType.NORM)
++    assert len(values) == 4
++    assert {v.id for v in values} >= {"value.human_safety", "value.operator_obey"}
++    assert {n.id for n in norms} >= {"norm.force_limit", "norm.gradual_motor"}
+diff --git a/beliefs/tests/test_norm_query.py b/beliefs/tests/test_norm_query.py
+new file mode 100644
+index 0000000..7400003
+--- /dev/null
++++ b/beliefs/tests/test_norm_query.py
+@@ -0,0 +1,88 @@
++"""beliefs norm-query returns the norms (and risk-boost metadata) the Kernel
++consumes (E1.8.1).
++
++The Kernel calls BELIEFS_QUERY_REQUEST with {"type": "norms", "threshold": 0.8}
++and derives per-action risk boosts from each norm's metadata (e.g.
++norm.gradual_motor.max_intensity_delta, norm.force_limit.motor_channels). This
++test asserts the service reply preserves that contract.
++
++The handler is exercised directly with a fake request message, bypassing
++BaseService.__init__ (no NATS/DB needed).
++"""
++
++import asyncio
++import os
++import sys
++
++_SDK = os.path.join(os.path.dirname(__file__), "..", "..", "sdk", "src")
++_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
++for _p in (_SDK, _SRC):
++    if _p not in sys.path:
++        sys.path.insert(0, _p)
++
++from activelearning.nats_client import deserialize_message  # noqa: E402
++
++from beliefs.graph import BeliefGraph  # noqa: E402
++from beliefs.service import BeliefsService  # noqa: E402
++
++
++class _FakeMsg:
++    def __init__(self):
++        self.reply = "_INBOX.test"
++        self.response = None
++
++    async def respond(self, data):
++        self.response = data
++
++
++class _Logger:
++    def info(self, *a, **k):
++        pass
++
++    def warning(self, *a, **k):
++        pass
++
++    def error(self, *a, **k):
++        pass
++
++
++def _service() -> BeliefsService:
++    svc = BeliefsService.__new__(BeliefsService)
++    svc.logger = _Logger()
++    svc._graph = BeliefGraph()
++    svc._graph.seed_constitutional_beliefs()
++    return svc
++
++
++def _query(svc, payload) -> dict:
++    msg = _FakeMsg()
++    asyncio.run(svc._handle_query_request(payload, msg))
++    assert msg.response is not None, "handler must reply"
++    return deserialize_message(msg.response)
++
++
++def test_norms_query_returns_high_confidence_norms():
++    svc = _service()
++    resp = _query(svc, {"type": "norms", "threshold": 0.8})
++    assert resp["query_type"] == "norms"
++    norm_ids = {n["id"] for n in resp["result"]}
++    # Constitutional norms at/above the Kernel's 0.8 threshold.
++    assert {"norm.force_limit", "norm.gradual_motor", "norm.no_self_modify"} <= norm_ids
++    assert all(n["confidence"] >= 0.8 for n in resp["result"])
++
++
++def test_norms_query_preserves_risk_boost_metadata():
++    svc = _service()
++    resp = _query(svc, {"type": "norms", "threshold": 0.8})
++    by_id = {n["id"]: n for n in resp["result"]}
++
++    # The exact metadata fields the Kernel reads to compute risk boosts.
++    assert by_id["norm.gradual_motor"]["metadata"]["max_intensity_delta"] == 0.3
++    assert "manipulation" in by_id["norm.force_limit"]["metadata"]["motor_channels"]
++
++
++def test_norms_query_threshold_filters_below():
++    svc = _service()
++    # Threshold above every seeded norm confidence → empty result.
++    resp = _query(svc, {"type": "norms", "threshold": 0.999})
++    assert resp["result"] == []

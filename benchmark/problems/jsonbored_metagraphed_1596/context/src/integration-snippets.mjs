@@ -1,0 +1,133 @@
+// Ready-to-run integration snippets (issue #351): given a callable service's
+// base_url + declared auth, emit copy-paste curl / Python / TypeScript that does
+// a GET against the service — the fastest path to a first successful call.
+// Worker-safe (pure string ops, no node deps) so the build generates them once
+// into the agent-catalog and the Worker/MCP can regenerate on demand if needed.
+//
+// We snippet a GET of the surface URL itself (always a valid, documented entry
+// point regardless of surface kind); for subnet-api surfaces with a captured
+// schema the agent then reads it (get_api_schema) for specific endpoints. Auth
+// uses the structured `auth` detail (#746) — the exact header/param name + a
+// value PLACEHOLDER derived from the spec's securitySchemes or curated — and
+// only falls back to a scheme-type guess when no structured detail is present.
+
+// Resolve the structured per-surface auth (#746) into a snippet-ready credential:
+// { location: "header"|"query", name, value-placeholder }. Returns null for no
+// auth or an unsafe placeholder (a placeholder must never break snippet quoting,
+// and is never a real secret).
+function authFromDetail(auth) {
+  if (!auth || typeof auth !== "object") return null;
+  const scheme = String(auth.scheme || "").toLowerCase();
+  if (scheme === "none") return null;
+  const location = auth.location === "query" ? "query" : "header";
+  const name =
+    typeof auth.name === "string" && auth.name
+      ? auth.name
+      : location === "query"
+        ? "api_key"
+        : "Authorization";
+  const value =
+    typeof auth.value_format === "string" && auth.value_format
+      ? auth.value_format
+      : scheme === "api-key"
+        ? "YOUR_API_KEY"
+        : scheme === "basic"
+          ? "Basic <base64(user:pass)>"
+          : "Bearer YOUR_API_KEY";
+  if (/['"`\\\n]/.test(name) || /['"`\\\n]/.test(value)) return null;
+  return { location, name, value };
+}
+
+function authHeaderForSchemes(schemes) {
+  const types = new Set(
+    (Array.isArray(schemes) ? schemes : []).map((scheme) =>
+      String(scheme).toLowerCase(),
+    ),
+  );
+  if (
+    types.has("http") ||
+    types.has("bearer") ||
+    types.has("oauth2") ||
+    types.has("openidconnect")
+  ) {
+    return { name: "Authorization", value: "Bearer YOUR_API_KEY" };
+  }
+  if (types.has("apikey")) {
+    return { name: "X-API-Key", value: "YOUR_API_KEY" };
+  }
+  // Auth required but scheme unknown — a generic bearer placeholder + a hint.
+  return { name: "Authorization", value: "Bearer YOUR_API_KEY" };
+}
+
+// A validated public URL never contains a quote/backtick/newline (normalizePublicUrl
+// rejects credentials and percent-encodes the rest), but guard anyway so a snippet
+// string can never break out of its quoting.
+function isSnippetSafeUrl(url) {
+  return typeof url === "string" && url.length > 0 && !/['"`\\\s]/.test(url);
+}
+
+function isCredentialSafeUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" || parsed.protocol === "wss:";
+  } catch {
+    return false;
+  }
+}
+
+// Returns { curl, python, typescript } or null when there is no usable base_url.
+export function generateServiceSnippets(service) {
+  const url = service?.base_url;
+  if (!isSnippetSafeUrl(url)) return null;
+  // Prefer the structured auth detail; fall back to the scheme-type guess only
+  // when no structured detail is present at all. A structured detail is
+  // authoritative — including an explicit scheme:"none" (→ no credential). Auth
+  // is only ever attached over a credential-safe (https/wss) transport.
+  const hasStructuredAuth = service?.auth && typeof service.auth === "object";
+  const auth = !isCredentialSafeUrl(url)
+    ? null
+    : hasStructuredAuth
+      ? authFromDetail(service.auth)
+      : service?.auth_required
+        ? { location: "header", ...authHeaderForSchemes(service?.auth_schemes) }
+        : null;
+
+  // Header credentials go in the request headers; query credentials go on the URL.
+  const requestUrl =
+    auth?.location === "query"
+      ? `${url}${url.includes("?") ? "&" : "?"}${auth.name}=${auth.value}`
+      : url;
+  if (!isSnippetSafeUrl(requestUrl)) return null;
+  const header = auth?.location === "header" ? auth : null;
+
+  const curl = header
+    ? `curl -sS '${requestUrl}' \\\n  -H '${header.name}: ${header.value}'`
+    : `curl -sS '${requestUrl}'`;
+
+  const pythonHeaders = header
+    ? `, headers={"${header.name}": "${header.value}"}`
+    : "";
+  const python = [
+    "import requests",
+    "",
+    `resp = requests.get("${requestUrl}"${pythonHeaders})`,
+    "resp.raise_for_status()",
+    "print(resp.json())",
+  ].join("\n");
+
+  const typescript = header
+    ? [
+        `const resp = await fetch("${requestUrl}", {`,
+        `  headers: { "${header.name}": "${header.value}" },`,
+        "});",
+        "if (!resp.ok) throw new Error(`HTTP ${resp.status}`);",
+        "const data = await resp.json();",
+      ].join("\n")
+    : [
+        `const resp = await fetch("${requestUrl}");`,
+        "if (!resp.ok) throw new Error(`HTTP ${resp.status}`);",
+        "const data = await resp.json();",
+      ].join("\n");
+
+  return { curl, python, typescript };
+}

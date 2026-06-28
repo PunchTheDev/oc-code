@@ -1,0 +1,576 @@
+diff --git a/docs/adr/0001-nats-authz.md b/docs/adr/0001-nats-authz.md
+index 8426f16..683b174 100644
+--- a/docs/adr/0001-nats-authz.md
++++ b/docs/adr/0001-nats-authz.md
+@@ -200,6 +200,7 @@ prefix/token family; the allowlist entry uses the wildcard form.
+ | `code.decision.>` | **kernel only** | meta, waiters | Per-trace code decisions. JetStream. |
+ | `kernel.status` | dashboard (request) | kernel | Request/reply status. |
+ | `kernel.status.response` | kernel | dashboard | Reply payload. |
++| `kernel.heartbeat` | kernel | kernel-watchdog, dashboard | Liveness pulse published by the Kernel on a fixed interval (E1.9.3). Absence triggers SAFE_HALT via the kernel-loss watchdog. |
+ 
+ ### Policy (Kernel-owned; see §3)
+ 
+diff --git a/kernel/src/kernel/service.py b/kernel/src/kernel/service.py
+index 61e5d77..57a314b 100644
+--- a/kernel/src/kernel/service.py
++++ b/kernel/src/kernel/service.py
+@@ -8,6 +8,7 @@
+ import asyncio
+ import json
+ import os
++import time
+ import uuid
+ from typing import Any, Optional
+ 
+@@ -52,6 +53,19 @@ def __init__(self):
+         self._rollback = PolicyRollbackManager()
+         self._deny_tracker = DecisionSequenceTracker()
+ 
++        # Heartbeat (E1.9.3): publish kernel.heartbeat so the watchdog can detect loss.
++        # A non-positive or non-finite interval would collapse the publish cadence,
++        # so we validate and refuse to start with an invalid configuration.
++        import math as _math
++        _raw_hb = float(os.environ.get("KERNEL_HEARTBEAT_INTERVAL_S", "5.0"))
++        if not (_math.isfinite(_raw_hb) and _raw_hb > 0.0):
++            raise ValueError(
++                "KERNEL_HEARTBEAT_INTERVAL_S must be a positive finite number; "
++                f"got {os.environ.get('KERNEL_HEARTBEAT_INTERVAL_S')!r}"
++            )
++        self._heartbeat_interval_s = _raw_hb
++        self._heartbeat_task: Optional[asyncio.Task] = None
++
+         # Load body profile from env if set
+         self._load_body_profile()
+ 
+@@ -123,10 +137,27 @@ async def _setup(self) -> None:
+         await self.event_bus.subscribe(Subjects.SAFETY_HALT, self._handle_safety_halt)
+         await self.event_bus.subscribe(Subjects.SAFETY_RESUME, self._handle_safety_resume)
+ 
++        # Heartbeat loop — lets the kernel-loss watchdog (E1.9.3) detect our death.
++        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
++
+     async def _cleanup(self) -> None:
+         """Service-specific cleanup."""
+-        # No kernel-specific resources to cleanup
+-        pass
++        if self._heartbeat_task:
++            self._heartbeat_task.cancel()
++
++    async def _heartbeat_loop(self) -> None:
++        """Publish kernel.heartbeat every KERNEL_HEARTBEAT_INTERVAL_S seconds (E1.9.3)."""
++        while True:
++            try:
++                await asyncio.sleep(self._heartbeat_interval_s)
++                await self.event_bus.publish(
++                    Subjects.KERNEL_HEARTBEAT,
++                    {"status": "alive", "timestamp": int(time.time() * 1000)},
++                )
++            except asyncio.CancelledError:
++                break
++            except Exception as e:
++                self.logger.warning("Heartbeat publish error: %s", e)
+ 
+     async def _handle_safety_halt(self, data: dict) -> None:
+         """Engage the system-wide kill switch (Phase 1.9).
+diff --git a/launcher/registry.py b/launcher/registry.py
+index aecab29..8f57e43 100644
+--- a/launcher/registry.py
++++ b/launcher/registry.py
+@@ -77,6 +77,15 @@ def pythonpath(self) -> str:
+         profile="core",
+         note="Moral kernel - approves/denies/transforms action proposals",
+     ),
++    Service(
++        name="kernel-watchdog",
++        module="launcher.watchdog",
++        src=".",
++        profile="core",
++        deps=("kernel",),
++        readiness_timeout=2.0,
++        note="Kernel-loss watchdog — SAFE_HALT if kernel heartbeat stops (E1.9.3)",
++    ),
+     Service(
+         name="safety-supervisor",
+         module="safety_supervisor.service",
+diff --git a/launcher/tests/test_watchdog.py b/launcher/tests/test_watchdog.py
+new file mode 100644
+index 0000000..026c5cf
+--- /dev/null
++++ b/launcher/tests/test_watchdog.py
+@@ -0,0 +1,287 @@
++"""Unit tests for the kernel-loss watchdog (E1.9.3).
++
++All tests run without a live NATS broker: the transport is replaced by a
++simple async callable that appends to a list.
++
++Design note: tests that verify a halt FIRES use an asyncio.Event for
++deterministic signaling — the test completes as soon as the halt arrives,
++not after a fixed wall-clock slice. This eliminates CI-jitter flakiness.
++Tests that verify a halt does NOT fire use generous heartbeat rates
++(beat_interval << timeout) so even a slow CI host cannot trigger a false halt.
++"""
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import time
++
++from launcher.watchdog import KernelWatchdog
++
++# ---------------------------------------------------------------------------
++# Parameters chosen to be CI-safe:
++#   _HB_TIMEOUT   — watchdog fires after this many seconds with no heartbeat
++#   _CHECK        — watchdog polls this often
++#   _SAFE_WAIT    — upper bound we allow the halt event to arrive (very generous)
++# ---------------------------------------------------------------------------
++_HB_TIMEOUT = 1.0    # large enough that spurious delays don't accidentally fire
++_CHECK = 0.05        # 50 ms — responsive without being tight
++_SAFE_WAIT = 10.0    # we expect the halt in < 0.1 s; 10 s is a CI safety net
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _expire(wdog: KernelWatchdog, extra: float = 1.0) -> None:
++    """Back-date last_heartbeat so the watchdog appears already timed out."""
++    wdog._last_heartbeat = time.monotonic() - wdog._timeout_s - extra
++
++
++async def _run_until_halt(
++    wdog: KernelWatchdog,
++    published: list,
++    *,
++    safety_timeout: float = _SAFE_WAIT,
++) -> None:
++    """Run the watchdog until safety.halt is published, then stop.
++
++    Uses asyncio.Event so the test completes immediately when the halt
++    arrives — no fixed sleep, no CI-jitter sensitivity.
++    """
++    halt_seen = asyncio.Event()
++
++    async def _publish(subject: str, payload: dict) -> None:
++        published.append((subject, payload))
++        if subject == "safety.halt":
++            halt_seen.set()
++
++    task = asyncio.create_task(wdog.run(publish_halt=_publish))
++    try:
++        await asyncio.wait_for(halt_seen.wait(), timeout=safety_timeout)
++    except asyncio.TimeoutError:
++        pass  # safety net exceeded — test assertions will fail with useful message
++    finally:
++        task.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await task
++
++
++async def _run_for(
++    wdog: KernelWatchdog,
++    published: list,
++    duration: float,
++) -> None:
++    """Run the watchdog for exactly *duration* seconds (used by no-halt tests)."""
++    async def _publish(subject: str, payload: dict) -> None:
++        published.append((subject, payload))
++
++    try:
++        await asyncio.wait_for(wdog.run(publish_halt=_publish), timeout=duration)
++    except asyncio.TimeoutError:
++        pass
++
++
++# ---------------------------------------------------------------------------
++# Startup grace period (sync — no NATS needed)
++# ---------------------------------------------------------------------------
++
++def test_freshly_constructed_watchdog_is_not_timed_out():
++    """Constructor seeds last_heartbeat to now — not immediately timed out."""
++    wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT)
++    assert not wdog.is_timed_out()
++
++
++def test_is_timed_out_after_window_expires():
++    """`is_timed_out` returns True once the window has passed."""
++    wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT)
++    _expire(wdog)
++    assert wdog.is_timed_out()
++
++
++def test_record_heartbeat_resets_timeout():
++    """`record_heartbeat` must refresh the window so is_timed_out returns False."""
++    wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT)
++    _expire(wdog)
++    assert wdog.is_timed_out()
++    wdog.record_heartbeat()
++    assert not wdog.is_timed_out()
++
++
++# ---------------------------------------------------------------------------
++# Core behaviour: halt on timeout
++# ---------------------------------------------------------------------------
++
++def test_halt_published_on_timeout():
++    """No heartbeat → safety.halt is published (event-driven, not time-bounded)."""
++    published: list = []
++    wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT, check_interval_s=_CHECK)
++    _expire(wdog)
++    asyncio.run(_run_until_halt(wdog, published))
++    assert len(published) >= 1
++    assert published[0][0] == "safety.halt"
++
++
++def test_halt_message_operator_id():
++    """Published halt must identify the watchdog as the actor."""
++    published: list = []
++    wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT, check_interval_s=_CHECK)
++    _expire(wdog)
++    asyncio.run(_run_until_halt(wdog, published))
++    _, payload = published[0]
++    assert payload["operator_id"] == "system:watchdog"
++
++
++def test_halt_message_reason_mentions_kernel_loss():
++    """Halt reason must be human-readable and name kernel-loss-watchdog."""
++    published: list = []
++    wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT, check_interval_s=_CHECK)
++    _expire(wdog)
++    asyncio.run(_run_until_halt(wdog, published))
++    _, payload = published[0]
++    assert "kernel-loss-watchdog" in payload["reason"]
++    assert "timeout" in payload["reason"]
++
++
++# ---------------------------------------------------------------------------
++# No halt while heartbeats arrive
++# ---------------------------------------------------------------------------
++
++def test_no_halt_while_heartbeats_live():
++    """Heartbeats arriving well within the timeout must prevent any halt.
++
++    Beat interval (0.2 s) is 5× smaller than the watchdog timeout (1.0 s),
++    so even a 200 ms CI-scheduling delay on a single beat cannot trigger a halt.
++    """
++    published: list = []
++
++    async def _inner() -> None:
++        wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT, check_interval_s=_CHECK)
++
++        async def _publish(subject: str, payload: dict) -> None:
++            published.append((subject, payload))
++
++        async def _beat() -> None:
++            # 8 beats × 0.2 s = 1.6 s of coverage; timeout is 1.0 s
++            for _ in range(8):
++                wdog.record_heartbeat()
++                await asyncio.sleep(0.2)
++
++        try:
++            await asyncio.wait_for(
++                asyncio.gather(_beat(), wdog.run(publish_halt=_publish)),
++                timeout=2.0,
++            )
++        except asyncio.TimeoutError:
++            pass
++
++    asyncio.run(_inner())
++    assert published == [], "halt must not fire while heartbeats are live"
++
++
++# ---------------------------------------------------------------------------
++# One halt per loss event (no duplicate spam)
++# ---------------------------------------------------------------------------
++
++def test_halt_fires_only_once_per_loss_event():
++    """A single loss event must produce exactly one safety.halt (no spam)."""
++    published: list = []
++
++    async def _inner() -> None:
++        wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT, check_interval_s=_CHECK)
++        _expire(wdog)
++        # Wait for the halt, then let several more check cycles pass.
++        await _run_until_halt(wdog, published)
++        # Run a few more cycles to confirm no second halt fires.
++        await _run_for(wdog, published, duration=_CHECK * 5)
++
++    asyncio.run(_inner())
++    halts = [s for s, _ in published if s == "safety.halt"]
++    assert len(halts) == 1, f"expected 1 halt, got {len(halts)}"
++
++
++# ---------------------------------------------------------------------------
++# No auto-resume
++# ---------------------------------------------------------------------------
++
++def test_no_auto_resume_when_heartbeat_returns():
++    """Watchdog must never publish safety.resume — resuming is operator-gated."""
++    resume_msgs: list = []
++    halt_msgs: list = []
++
++    async def _inner() -> None:
++        async def _publish(subject: str, payload: dict) -> None:
++            if subject == "safety.halt":
++                halt_msgs.append(payload)
++            elif subject == "safety.resume":
++                resume_msgs.append(payload)
++
++        wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT, check_interval_s=_CHECK)
++        _expire(wdog)
++
++        # Phase 1: wait for the halt to fire (event-driven).
++        halt_seen = asyncio.Event()
++        orig_publish = _publish
++
++        async def _tracking_publish(subject: str, payload: dict) -> None:
++            await orig_publish(subject, payload)
++            if subject == "safety.halt":
++                halt_seen.set()
++
++        task = asyncio.create_task(wdog.run(publish_halt=_tracking_publish))
++        await asyncio.wait_for(halt_seen.wait(), timeout=_SAFE_WAIT)
++        task.cancel()
++        with contextlib.suppress(asyncio.CancelledError):
++            await task
++
++        assert len(halt_msgs) == 1
++
++        # Phase 2: kernel "restarts" — heartbeat returns.
++        wdog.record_heartbeat()
++
++        # Phase 3: run several check cycles; no safety.resume must appear.
++        await _run_for(wdog, [], duration=_CHECK * 5)
++
++    asyncio.run(_inner())
++    assert resume_msgs == [], "watchdog must never auto-resume"
++
++
++# ---------------------------------------------------------------------------
++# Second loss event fires another halt
++# ---------------------------------------------------------------------------
++
++def test_second_kernel_loss_fires_second_halt():
++    """After the kernel restarts and then dies again, a second halt must fire."""
++    published: list = []
++
++    async def _inner() -> None:
++        wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT, check_interval_s=_CHECK)
++        _expire(wdog)
++
++        # First loss → first halt (event-driven).
++        await _run_until_halt(wdog, published)
++        assert len([s for s, _ in published if s == "safety.halt"]) == 1
++
++        # Kernel "restarts".
++        wdog.record_heartbeat()
++        assert not wdog._halted, "record_heartbeat must clear per-event halted flag"
++
++        # Second loss → second halt.
++        _expire(wdog)
++        await _run_until_halt(wdog, published)
++
++    asyncio.run(_inner())
++    halts = [s for s, _ in published if s == "safety.halt"]
++    assert len(halts) == 2, f"expected 2 halts, got {len(halts)}"
++
++
++# ---------------------------------------------------------------------------
++# halt_count metric
++# ---------------------------------------------------------------------------
++
++def test_halt_count_increments():
++    """_halt_count must increment once per triggered halt."""
++    published: list = []
++    wdog = KernelWatchdog(timeout_s=_HB_TIMEOUT, check_interval_s=_CHECK)
++    _expire(wdog)
++    asyncio.run(_run_until_halt(wdog, published))
++    assert wdog._halt_count == 1
+diff --git a/launcher/watchdog.py b/launcher/watchdog.py
+new file mode 100644
+index 0000000..bc62371
+--- /dev/null
++++ b/launcher/watchdog.py
+@@ -0,0 +1,169 @@
++"""Kernel-loss watchdog — triggers SAFE_HALT if the kernel heartbeat stops (E1.9.3).
++
++The watchdog subscribes to ``kernel.heartbeat`` and publishes ``safety.halt``
++to the Kernel's existing kill-switch handler if no heartbeat arrives within
++``KERNEL_WATCHDOG_TIMEOUT_S`` seconds (default 15 — 3× the kernel's 5-second
++interval). Recovery is operator-gated via ``safety.resume``; the watchdog
++never auto-resumes.
++
++Run as a subprocess:
++    python -m launcher.watchdog        # reads NATS_URL, KERNEL_WATCHDOG_TIMEOUT_S
++"""
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import os
++import time
++from typing import Awaitable, Callable
++
++log = logging.getLogger(__name__)
++
++# Subject strings are kept local so this module has zero import-time
++# dependencies on the rest of the codebase (it must start even if other
++# services are broken). Keep in sync with activelearning.subjects.Subjects.
++_KERNEL_HEARTBEAT = "kernel.heartbeat"
++_SAFETY_HALT = "safety.halt"
++
++
++class KernelWatchdog:
++    """Monitors ``kernel.heartbeat`` and triggers ``safety.halt`` on timeout.
++
++    Pure logic — no NATS coupling.  The transport is injected via the
++    ``publish_halt`` callable passed to :meth:`run`, keeping the class
++    fully testable without a live broker.
++
++    Lifecycle
++    ---------
++    * :meth:`record_heartbeat` is called on every arriving ``kernel.heartbeat``
++      message; it resets the timer and clears the per-event ``_halted`` flag so
++      a future second kernel loss is also detected.
++    * On timeout, ``safety.halt`` is published **once** (``_halted=True``
++      prevents duplicate publishes for the same loss event).
++    * The watchdog does **not** publish ``safety.resume`` — resuming is
++      always operator-gated and must be done explicitly.
++    """
++
++    def __init__(
++        self,
++        timeout_s: float = 15.0,
++        check_interval_s: float = 1.0,
++    ) -> None:
++        self._timeout_s = timeout_s
++        self._check_interval_s = check_interval_s
++        # Seeded to now so the kernel has a full timeout_s window to start up
++        # before the first check fires.
++        self._last_heartbeat: float = time.monotonic()
++        # True once we have published safety.halt for the current loss event.
++        self._halted: bool = False
++        # Cumulative halt-trigger count (observable in tests / metrics).
++        self._halt_count: int = 0
++
++    # ------------------------------------------------------------------
++    # Called by the transport layer
++    # ------------------------------------------------------------------
++
++    def record_heartbeat(self) -> None:
++        """Update the last-seen timestamp (call on each ``kernel.heartbeat``).
++
++        Clears ``_halted`` so a *future* kernel loss triggers another halt.
++        Does **not** send ``safety.resume`` — that is always operator-gated.
++        """
++        self._last_heartbeat = time.monotonic()
++        self._halted = False
++
++    # ------------------------------------------------------------------
++    # Query
++    # ------------------------------------------------------------------
++
++    def is_timed_out(self, now: float | None = None) -> bool:
++        """True if no heartbeat has arrived within the configured timeout."""
++        t = now if now is not None else time.monotonic()
++        return (t - self._last_heartbeat) > self._timeout_s
++
++    # ------------------------------------------------------------------
++    # Main loop
++    # ------------------------------------------------------------------
++
++    async def run(
++        self,
++        publish_halt: Callable[[str, dict], Awaitable[None]],
++    ) -> None:
++        """Watchdog loop — runs until cancelled.
++
++        ``publish_halt(subject, payload)`` is awaited exactly once per loss
++        event with the ``safety.halt`` subject and payload.
++        """
++        while True:
++            await asyncio.sleep(self._check_interval_s)
++            if self.is_timed_out() and not self._halted:
++                elapsed = time.monotonic() - self._last_heartbeat
++                reason = (
++                    f"kernel-loss-watchdog: no heartbeat for "
++                    f"{elapsed:.1f}s (timeout={self._timeout_s}s)"
++                )
++                self._halt_count += 1
++                log.critical("SAFE_HALT triggered — %s", reason)
++                try:
++                    await publish_halt(
++                        _SAFETY_HALT,
++                        {"reason": reason, "operator_id": "system:watchdog"},
++                    )
++                    # Only silence after a confirmed publish; on failure the next
++                    # check cycle retries rather than leaving the system unprotected.
++                    self._halted = True
++                except Exception as exc:
++                    log.error("Failed to publish safety.halt: %s — will retry", exc)
++
++
++# ---------------------------------------------------------------------------
++# Production wiring (NATS transport)
++# ---------------------------------------------------------------------------
++
++async def run_watchdog(
++    nats_url: str,
++    timeout_s: float = 15.0,
++    check_interval_s: float = 1.0,
++) -> None:
++    """Connect to NATS and run the watchdog until cancelled."""
++    import nats as _nats  # nats-py — only imported in production path
++
++    watchdog = KernelWatchdog(timeout_s=timeout_s, check_interval_s=check_interval_s)
++    log.info(
++        "Kernel watchdog starting — timeout=%.1fs check=%.1fs nats=%s",
++        timeout_s, check_interval_s, nats_url,
++    )
++
++    nc = await _nats.connect(nats_url)
++
++    async def _on_heartbeat(msg) -> None:
++        watchdog.record_heartbeat()
++
++    async def _publish_halt(subject: str, payload: dict) -> None:
++        await nc.publish(subject, json.dumps(payload).encode())
++
++    sub = await nc.subscribe(_KERNEL_HEARTBEAT, cb=_on_heartbeat)
++    try:
++        await watchdog.run(publish_halt=_publish_halt)
++    except asyncio.CancelledError:
++        pass
++    finally:
++        await sub.unsubscribe()
++        await nc.drain()
++
++
++# ---------------------------------------------------------------------------
++# Subprocess entry point
++# ---------------------------------------------------------------------------
++
++if __name__ == "__main__":
++    logging.basicConfig(
++        level=os.environ.get("LOG_LEVEL", "INFO"),
++        format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
++        datefmt="%H:%M:%S",
++    )
++    _nats_url = os.environ.get("NATS_URL", "nats://localhost:4222")
++    _timeout = float(os.environ.get("KERNEL_WATCHDOG_TIMEOUT_S", "15.0"))
++    _interval = float(os.environ.get("KERNEL_WATCHDOG_CHECK_INTERVAL_S", "1.0"))
++    asyncio.run(run_watchdog(_nats_url, _timeout, _interval))
+diff --git a/sdk/src/activelearning/subjects.py b/sdk/src/activelearning/subjects.py
+index 12a100b..23c943d 100644
+--- a/sdk/src/activelearning/subjects.py
++++ b/sdk/src/activelearning/subjects.py
+@@ -68,6 +68,9 @@ class Subjects:
+     # Meta-programmer / learning
+     KNOWLEDGE_GAP = "knowledge.gap"
+ 
++    # Kernel watchdog (E1.9.3)
++    KERNEL_HEARTBEAT = "kernel.heartbeat"
++
+ 
+ def decision_subject(trace_id: str) -> str:
+     """Per-trace kernel decision subject."""

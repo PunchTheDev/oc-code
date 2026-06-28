@@ -1,0 +1,509 @@
+diff --git a/ctx.go b/ctx.go
+index 1689af0a72a..d8b4db9a82f 100644
+--- a/ctx.go
++++ b/ctx.go
+@@ -12,6 +12,7 @@ import (
+ 	"maps"
+ 	"mime/multipart"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -59,6 +60,7 @@ type DefaultCtx struct {
+ 	fasthttp               *fasthttp.RequestCtx // Reference to *fasthttp.RequestCtx
+ 	bind                   *Bind                // Default bind reference
+ 	redirect               *Redirect            // Default redirect reference
++	reclaim                *reclaimLatch        // Coordinates safe pool reclamation of an abandoned ctx; nil on the hot path
+ 	viewBindMap            Map                  // Default view map to bind template engine
+ 	values                 [maxParams]string    // Route parameter values
+ 	baseURI                string               // HTTP base uri
+@@ -720,20 +722,30 @@ func (c *DefaultCtx) release() {
+ 	}
+ 	c.shouldSkipNonUseRoutes = false
+ 	// performance: no need for using c.isAbandoned.Store(false) here, as it is always set to false when it was true in ForceRelease
++	c.reclaim = nil
+ 	c.handlerCtx = nil
+ }
+ 
++// reclaimLatch coordinates the safe, automatic reclamation of an abandoned
++// context back into the pool. It is armed only via ScheduleReclaim (currently by
++// the timeout middleware) and stays nil on the common request path, so requests
++// that are not abandoned pay no additional cost.
++type reclaimLatch struct {
++	releasedCh chan struct{} // closed once the request handler has released the ctx (event b)
++	once       sync.Once     // guards the close-exactly-once of releasedCh
++}
++
+ // Abandon marks this context as abandoned. An abandoned context will not be
+ // returned to the pool when ReleaseCtx is called.
+ //
+-// This is used by the timeout middleware to return immediately while the
+-// handler goroutine continues using the context safely.
++// This is used by the timeout and SSE middlewares to return immediately while a
++// goroutine continues using the context safely.
+ //
+ // Only call ForceRelease after Abandon if you can guarantee no other goroutine
+ // (including Fiber's requestHandler and ErrorHandler) will touch the context.
+-// The timeout middleware intentionally does NOT call ForceRelease to avoid
+-// races, which means timed-out requests leak their contexts until a safe
+-// reclamation strategy exists.
++// Callers that cannot make that guarantee themselves can instead call
++// ScheduleReclaim, which arranges a race-free ForceRelease once the handler has
++// finished and the request handler has released the context.
+ func (c *DefaultCtx) Abandon() {
+ 	c.isAbandoned.Store(true)
+ }
+@@ -752,6 +764,49 @@ func (c *DefaultCtx) ForceRelease() {
+ 	c.app.ReleaseCtx(c)
+ }
+ 
++// ScheduleReclaim arms automatic reclamation of an abandoned context, returning
++// it to the pool once it is safe to do so.
++//
++// handlerDone must be closed once the goroutine that still uses this context
++// (for the timeout middleware, the handler goroutine) has completely finished.
++// cancel, if non-nil, is the CancelFunc of the context installed for that
++// goroutine and is invoked as soon as it finishes.
++//
++// ForceRelease is performed only after BOTH handlerDone is closed AND the request
++// handler has released the context (signaled from ReleaseCtx/releaseDefaultCtx),
++// which makes the reclamation race-free. If handlerDone never closes — a handler
++// that never returns — the context is intentionally never reclaimed, because the
++// handler still owns it.
++//
++// This method calls Abandon internally, so callers do not need to call Abandon
++// separately. Calling Abandon before ScheduleReclaim is still safe (idempotent).
++func (c *DefaultCtx) ScheduleReclaim(handlerDone <-chan struct{}, cancel context.CancelFunc) {
++	c.Abandon()
++
++	latch := &reclaimLatch{releasedCh: make(chan struct{})}
++	c.reclaim = latch
++
++	go func() {
++		<-handlerDone
++		if cancel != nil {
++			cancel()
++		}
++		<-latch.releasedCh
++		c.ForceRelease()
++	}()
++}
++
++// signalReleased records that the request handler is done touching an abandoned,
++// reclaim-armed context (event b). It is a no-op when reclamation was not armed
++// and is safe to call multiple times.
++func (c *DefaultCtx) signalReleased() {
++	if c.reclaim != nil {
++		c.reclaim.once.Do(func() {
++			close(c.reclaim.releasedCh)
++		})
++	}
++}
++
+ func (c *DefaultCtx) renderExtensions(bind any) {
+ 	if bindMap, ok := bind.(Map); ok {
+ 		// Bind view map
+diff --git a/ctx_interface.go b/ctx_interface.go
+index aba18b7ec20..c0402075e44 100644
+--- a/ctx_interface.go
++++ b/ctx_interface.go
+@@ -125,6 +125,13 @@ func (*App) prepareDefaultCtx(rawCtx any, fctx *fasthttp.RequestCtx) (*DefaultCt
+ // middleware intentionally leaves abandoned contexts unreleased to avoid races.
+ func (app *App) ReleaseCtx(c CustomCtx) {
+ 	if c.IsAbandoned() {
++		// If reclamation was armed (see ScheduleReclaim), signal that the request
++		// handler is done so the reclaimer can return the ctx to the pool. The ctx
++		// is still not pooled here; the reclaimer does that once the handler also
++		// finishes. Otherwise (e.g. SSE) leave it unreleased as before.
++		if dc, ok := c.(*DefaultCtx); ok {
++			dc.signalReleased()
++		}
+ 		return
+ 	}
+ 	c.release()
+@@ -133,6 +140,8 @@ func (app *App) ReleaseCtx(c CustomCtx) {
+ 
+ func (app *App) releaseDefaultCtx(c *DefaultCtx) {
+ 	if c.IsAbandoned() {
++		// See ReleaseCtx: signal armed reclamation, but never pool here.
++		c.signalReleased()
+ 		return
+ 	}
+ 	c.release()
+diff --git a/ctx_reclaim_test.go b/ctx_reclaim_test.go
+new file mode 100644
+index 00000000000..779efab6336
+--- /dev/null
++++ b/ctx_reclaim_test.go
+@@ -0,0 +1,165 @@
++// ⚡️ Fiber is an Express inspired web framework written in Go with ☕️
++// 🤖 GitHub Repository: https://github.com/gofiber/fiber
++// 📌 API Documentation: https://docs.gofiber.io
++
++package fiber
++
++import (
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"github.com/valyala/fasthttp"
++)
++
++// acquireReclaimTestCtx wires up a *DefaultCtx for reclaim tests without going
++// through a full request lifecycle, so each test can drive ScheduleReclaim,
++// signalReleased, and ReleaseCtx in isolation.
++func acquireReclaimTestCtx(t *testing.T) (*App, *DefaultCtx) {
++	t.Helper()
++	app := New()
++	raw := app.AcquireCtx(&fasthttp.RequestCtx{})
++	dc, ok := raw.(*DefaultCtx)
++	require.True(t, ok, "AcquireCtx must return *DefaultCtx in tests")
++	return app, dc
++}
++
++// TestDefaultCtx_ScheduleReclaim_HappyPath covers the dominant timed-out flow:
++// after ScheduleReclaim is armed and both signals fire (handlerDone closes and
++// the request handler releases the context), the context is returned to the
++// pool, observable as IsAbandoned flipping back to false.
++func TestDefaultCtx_ScheduleReclaim_HappyPath(t *testing.T) {
++	t.Parallel()
++	app, c := acquireReclaimTestCtx(t)
++
++	handlerDone := make(chan struct{})
++	c.ScheduleReclaim(handlerDone, nil)
++	require.True(t, c.IsAbandoned(), "ScheduleReclaim must Abandon the ctx internally")
++
++	close(handlerDone)
++	require.True(t, c.IsAbandoned(), "ctx must stay abandoned until ReleaseCtx fires")
++
++	app.ReleaseCtx(c)
++	require.Eventually(t, func() bool {
++		return !c.IsAbandoned()
++	}, time.Second, 5*time.Millisecond, "ctx must be reclaimed once both signals fire")
++}
++
++// TestDefaultCtx_ScheduleReclaim_ReleaseBeforeHandlerDone covers the reverse
++// ordering: ReleaseCtx is called first, then handlerDone closes. The reclaim
++// goroutine must still wait on handlerDone before pooling.
++func TestDefaultCtx_ScheduleReclaim_ReleaseBeforeHandlerDone(t *testing.T) {
++	t.Parallel()
++	app, c := acquireReclaimTestCtx(t)
++
++	handlerDone := make(chan struct{})
++	c.ScheduleReclaim(handlerDone, nil)
++
++	app.ReleaseCtx(c)
++	require.True(t, c.IsAbandoned(), "ctx must stay abandoned until handlerDone closes")
++
++	close(handlerDone)
++	require.Eventually(t, func() bool {
++		return !c.IsAbandoned()
++	}, time.Second, 5*time.Millisecond, "ctx must be reclaimed after handlerDone closes")
++}
++
++// TestDefaultCtx_ScheduleReclaim_CancelInvoked verifies the cancel hook fires
++// exactly once when the handler goroutine finishes.
++func TestDefaultCtx_ScheduleReclaim_CancelInvoked(t *testing.T) {
++	t.Parallel()
++	app, c := acquireReclaimTestCtx(t)
++
++	var calls atomic.Int32
++	cancel := func() { calls.Add(1) }
++
++	handlerDone := make(chan struct{})
++	c.ScheduleReclaim(handlerDone, cancel)
++
++	close(handlerDone)
++	app.ReleaseCtx(c)
++
++	require.Eventually(t, func() bool {
++		return calls.Load() == 1 && !c.IsAbandoned()
++	}, time.Second, 5*time.Millisecond, "cancel must fire once and ctx must be reclaimed")
++}
++
++// TestDefaultCtx_ScheduleReclaim_NilCancel exercises the cancel==nil branch.
++func TestDefaultCtx_ScheduleReclaim_NilCancel(t *testing.T) {
++	t.Parallel()
++	app, c := acquireReclaimTestCtx(t)
++
++	handlerDone := make(chan struct{})
++	c.ScheduleReclaim(handlerDone, nil)
++
++	close(handlerDone)
++	app.ReleaseCtx(c)
++
++	require.Eventually(t, func() bool {
++		return !c.IsAbandoned()
++	}, time.Second, 5*time.Millisecond, "nil cancel must not block reclamation")
++}
++
++// TestDefaultCtx_signalReleased_NoReclaim guards that calling signalReleased on
++// a context that was never armed for reclamation is a safe no-op. This is the
++// SSE-style path (Abandon without ScheduleReclaim) hit through ReleaseCtx.
++func TestDefaultCtx_signalReleased_NoReclaim(t *testing.T) {
++	t.Parallel()
++	_, c := acquireReclaimTestCtx(t)
++	require.NotPanics(t, func() { c.signalReleased() })
++	require.NotPanics(t, func() { c.signalReleased() })
++}
++
++// TestDefaultCtx_signalReleased_Idempotent guards the sync.Once semantics: even
++// if the request release path fires multiple times, the latch must close once.
++func TestDefaultCtx_signalReleased_Idempotent(t *testing.T) {
++	t.Parallel()
++	app, c := acquireReclaimTestCtx(t)
++
++	handlerDone := make(chan struct{})
++	c.ScheduleReclaim(handlerDone, nil)
++
++	require.NotPanics(t, func() {
++		c.signalReleased()
++		c.signalReleased()
++		c.signalReleased()
++	})
++
++	close(handlerDone)
++	require.Eventually(t, func() bool {
++		return !c.IsAbandoned()
++	}, time.Second, 5*time.Millisecond, "ctx must still be reclaimed exactly once")
++
++	_ = app
++}
++
++// TestApp_releaseDefaultCtx_AbandonedSignalsReclaim exercises the internal
++// releaseDefaultCtx path (called by defaultRequestHandler's defer) for an
++// abandoned, reclaim-armed context. It mirrors what ReleaseCtx does for the
++// public CustomCtx path and ensures both release entry points fire the latch.
++func TestApp_releaseDefaultCtx_AbandonedSignalsReclaim(t *testing.T) {
++	t.Parallel()
++	app, c := acquireReclaimTestCtx(t)
++
++	handlerDone := make(chan struct{})
++	c.ScheduleReclaim(handlerDone, nil)
++
++	app.releaseDefaultCtx(c)
++	require.True(t, c.IsAbandoned(), "abandoned ctx must not be pooled by releaseDefaultCtx")
++
++	close(handlerDone)
++	require.Eventually(t, func() bool {
++		return !c.IsAbandoned()
++	}, time.Second, 5*time.Millisecond, "releaseDefaultCtx must wire signalReleased into the latch")
++}
++
++// TestApp_releaseDefaultCtx_NotAbandonedPools verifies the non-abandoned branch
++// in releaseDefaultCtx still pools the ctx through the normal path.
++func TestApp_releaseDefaultCtx_NotAbandonedPools(t *testing.T) {
++	t.Parallel()
++	app, c := acquireReclaimTestCtx(t)
++
++	require.False(t, c.IsAbandoned())
++	require.NotPanics(t, func() { app.releaseDefaultCtx(c) })
++}
+diff --git a/middleware/timeout/timeout.go b/middleware/timeout/timeout.go
+index 58b0c011382..b0ee7a0fd3c 100644
+--- a/middleware/timeout/timeout.go
++++ b/middleware/timeout/timeout.go
+@@ -39,9 +39,15 @@ func New(h fiber.Handler, config ...Config) fiber.Handler {
+ 		// Channels for handler result and panics
+ 		done := make(chan error, 1)
+ 		panicChan := make(chan any, 1)
++		// handlerDone is closed once the handler goroutine has fully exited
++		// (covering both the normal and panic paths). It tells the timeout path
++		// when the goroutine has stopped touching the context, which is what makes
++		// reclaiming the abandoned context race-free.
++		handlerDone := make(chan struct{})
+ 
+ 		// Run handler in goroutine so we can race against the timeout
+ 		go func() {
++			defer close(handlerDone)
+ 			defer func() {
+ 				if p := recover(); p != nil {
+ 					log.Errorw("panic recovered in timeout handler", "panic", p, "stack", string(debug.Stack()))
+@@ -75,10 +81,10 @@ func New(h fiber.Handler, config ...Config) fiber.Handler {
+ 			return fiber.ErrInternalServerError
+ 
+ 		case <-tCtx.Done():
+-			// Timeout occurred - abandon context and return immediately
+-			// The cleanup goroutine will cancel the timeout context once the handler finishes;
+-			// the abandoned fiber.Ctx stays out of the pool.
+-			return handleTimeout(parent, ctx, cancel, done, panicChan, cfg)
++			// Timeout occurred - abandon context and return immediately.
++			// Reclamation is scheduled so the abandoned fiber.Ctx is returned to
++			// the pool once the handler goroutine finishes, instead of leaking.
++			return handleTimeout(parent, ctx, cancel, handlerDone, cfg)
+ 		}
+ 	}
+ }
+@@ -96,20 +102,9 @@ func handleTimeout(
+ 	parent context.Context,
+ 	ctx fiber.Ctx,
+ 	cancel context.CancelFunc,
+-	done <-chan error,
+-	panicChan <-chan any,
++	handlerDone <-chan struct{},
+ 	cfg Config,
+ ) error {
+-	// Mark fiber context as abandoned - ReleaseCtx will skip pooling.
+-	// The context will NOT be returned to the pool. This is an intentional
+-	// trade-off: we accept the small memory cost of not recycling timed-out
+-	// contexts in exchange for complete race-freedom.
+-	//
+-	// This is the same approach fasthttp uses - timed-out RequestCtx objects
+-	// are never returned to the pool (see fasthttp's releaseCtx which panics
+-	// if timeoutResponse is set).
+-	ctx.Abandon()
+-
+ 	// Prepare the timeout response before marking the RequestCtx as timed out so
+ 	// custom OnTimeout handlers can shape the response body.
+ 	timeoutErr := invokeOnTimeout(ctx, cfg)
+@@ -128,27 +123,33 @@ func handleTimeout(
+ 	// OnTimeout). All ctx mutations after this call are ignored by fasthttp.
+ 	ctx.RequestCtx().TimeoutErrorWithResponse(&ctx.RequestCtx().Response)
+ 
+-	// Spawn cleanup goroutine that waits for handler to finish.
+-	// This only does context cleanup (cancel + restore parent), NOT ctx release.
+-	// The fiber.Ctx is intentionally NOT released to avoid races with requestHandler
+-	// which may still access ctx (e.g., ErrorHandler) after this function returns.
+-	// ForceRelease cannot be called safely here for the same reason.
++	// Schedule race-free reclamation of the abandoned context. The context is
++	// returned to the pool only after BOTH the handler goroutine finishes AND
++	// Fiber's requestHandler releases the context (after any ErrorHandler runs),
++	// so we never race with goroutines still using it. This fixes the unbounded
++	// fiber.Ctx leak that previously affected every timed-out request (#4359).
++	//
++	// Use a concrete type assertion to *fiber.DefaultCtx rather than an interface
++	// assertion, because only *fiber.DefaultCtx has the signalReleased wiring in
++	// ReleaseCtx/releaseDefaultCtx. An interface assertion could accidentally match
++	// custom Ctx implementations that provide ScheduleReclaim but lack the release
++	// signal, causing the reclamation goroutine to block forever.
++	if dc, ok := ctx.(*fiber.DefaultCtx); ok {
++		dc.ScheduleReclaim(handlerDone, cancel)
++		return timeoutErr
++	}
++
++	// Custom context implementations fall back to the previous behavior: once the
++	// handler finishes, cancel the timeout context and restore the parent. The
++	// context stays out of the pool.
++	//
++	// Mark the context as abandoned so ReleaseCtx will skip pooling, allowing the
++	// handler goroutine to continue safely using the context.
++	ctx.Abandon()
+ 	go func() {
+-		select {
+-		case <-done:
+-		case <-panicChan:
+-		}
+-		// Handler finished - cancel timeout context and restore parent
++		<-handlerDone
+ 		cancel()
+ 		ctx.SetContext(parent)
+-
+-		// TODO: Currently the ctx is not returned to the pool (memory leak for timed-out requests).
+-		// Future improvement: Implement a concurrent "garbage collector" list where abandoned
+-		// contexts are queued after both the handler AND requestHandler are done. A background
+-		// goroutine would periodically process this list and call ForceRelease() to recycle
+-		// the contexts safely. This would require tracking when requestHandler finishes
+-		// (e.g., via a channel signaled in ReleaseCtx) without adding per-request overhead
+-		// for non-timeout cases.
+ 	}()
+ 
+ 	return timeoutErr
+diff --git a/middleware/timeout/timeout_test.go b/middleware/timeout/timeout_test.go
+index f86c4dc17b4..ab2c7bd3577 100644
+--- a/middleware/timeout/timeout_test.go
++++ b/middleware/timeout/timeout_test.go
+@@ -455,3 +455,91 @@ func TestTimeout_AbandonMechanism(t *testing.T) {
+ 	// to avoid race conditions with requestHandler. This is the same approach
+ 	// fasthttp uses for timed-out RequestCtx objects.
+ }
++
++// TestTimeout_AbandonedCtxReclaimed verifies the fix for #4359: a timed-out
++// request's context is NOT reclaimed while its handler is still running, and IS
++// returned to the pool once the handler finishes (proven by IsAbandoned flipping
++// back to false, which only ForceRelease does).
++func TestTimeout_AbandonedCtxReclaimed(t *testing.T) {
++	t.Parallel()
++	app := fiber.New()
++
++	ctxCh := make(chan fiber.Ctx, 1)
++	release := make(chan struct{})
++	app.Get("/reclaim", New(func(c fiber.Ctx) error {
++		ctxCh <- c
++		// Keep "running" past the timeout until the test releases us, simulating
++		// a slow upstream.
++		<-release
++		return nil
++	}, Config{Timeout: 20 * time.Millisecond}))
++
++	req := httptest.NewRequest(fiber.MethodGet, "/reclaim", http.NoBody)
++	resp, err := app.Test(req)
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusRequestTimeout, resp.StatusCode)
++
++	var c fiber.Ctx
++	select {
++	case c = <-ctxCh:
++	case <-time.After(time.Second):
++		t.Fatal("handler did not start")
++	}
++
++	// Handler is still running -> the abandoned context must NOT be reclaimed yet.
++	require.True(t, c.IsAbandoned(), "context reclaimed while handler still running")
++	time.Sleep(30 * time.Millisecond)
++	require.True(t, c.IsAbandoned(), "context reclaimed while handler still running")
++
++	// Let the handler finish; the context must now be reclaimed (pooled).
++	close(release)
++	require.Eventually(t, func() bool {
++		return !c.IsAbandoned()
++	}, time.Second, 5*time.Millisecond, "abandoned context was not reclaimed after handler finished")
++}
++
++// TestTimeout_PanicAfterTimeoutReclaimed verifies that the panic-after-timeout
++// path also reclaims the abandoned context once the handler goroutine unwinds.
++func TestTimeout_PanicAfterTimeoutReclaimed(t *testing.T) {
++	t.Parallel()
++	app := fiber.New()
++
++	ctxCh := make(chan fiber.Ctx, 1)
++	release := make(chan struct{})
++	app.Get("/panic-reclaim", New(func(c fiber.Ctx) error {
++		ctxCh <- c
++		<-release
++		panic("panic after timeout")
++	}, Config{Timeout: 20 * time.Millisecond}))
++
++	req := httptest.NewRequest(fiber.MethodGet, "/panic-reclaim", http.NoBody)
++	resp, err := app.Test(req)
++	require.NoError(t, err)
++	require.Equal(t, fiber.StatusRequestTimeout, resp.StatusCode)
++
++	var c fiber.Ctx
++	select {
++	case c = <-ctxCh:
++	case <-time.After(time.Second):
++		t.Fatal("handler did not start")
++	}
++
++	close(release)
++	require.Eventually(t, func() bool {
++		return !c.IsAbandoned()
++	}, time.Second, 5*time.Millisecond, "abandoned context was not reclaimed after handler panicked")
++}
++
++// TestTimeout_AbandonWithoutReclaimNotPooled guards the SSE-style use of
++// Abandon(): a context that is abandoned but never armed for reclamation stays
++// out of the pool when ReleaseCtx is called.
++func TestTimeout_AbandonWithoutReclaimNotPooled(t *testing.T) {
++	t.Parallel()
++	app := fiber.New()
++	ctx := app.AcquireCtx(&fasthttp.RequestCtx{})
++	t.Cleanup(ctx.ForceRelease)
++
++	ctx.Abandon()
++	app.ReleaseCtx(ctx)
++	require.True(t, ctx.IsAbandoned(), "abandoned, un-armed context must not be auto-reclaimed")
++}

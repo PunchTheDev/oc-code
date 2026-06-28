@@ -1,0 +1,388 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c6fd410a..de2c11eb 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -33,6 +33,11 @@ All notable changes to vouch are documented here. Format follows
+   (#226).
+ ### Fixed
+ - `sync_apply` now loads the sync source exactly once and passes the same `_SyncSource` instance into `sync_check`, closing a TOCTOU window where a bundle replaced on disk between the two `_load_source` calls could cause the validation and write phases to operate on different snapshots. Also eliminates redundant directory walks (KB sources) and triple tarball opens (bundle sources). Fixes #217.
++- `vault_to_kb` now passes `slug_hint=page_id` to `propose_page` so vault edit proposals target the existing page id from frontmatter instead of a slugified copy of the title (fixes #219).
++- `vault_to_kb` skips mirror files whose page no longer exists in the KB, preventing ghost-page proposals that would fail on approve (fixes #219).
++- `vault_to_kb` skips filing a second proposal when a pending proposal already targets the same page id (with differing body), preventing duplicate proposals on repeated sync runs before approval (fixes #219).
++- `vault_to_kb` now warns when a user edits a claim stub instead of silently dropping the edit, directing the user to edit the citing page instead, and reports it via the dedicated `claim_stubs_edited` field on `VaultSyncResult` (fixes #219).
++- `approve()` now supports updating an existing page via `KBStore.update_page` when a PAGE proposal's id matches an existing artifact (the vault-edit flow), instead of raising `cannot approve: page already exists` for every vault edit (fixes #219).
+ 
+ ### Fixed
+ - `vouch serve` now fails fast with a clear `vouch init` hint when no `.vouch/` KB is present, instead of starting a server that immediately misbehaves (#95).
+diff --git a/src/vouch/proposals.py b/src/vouch/proposals.py
+index c61ad8c8..8c5f1c41 100644
+--- a/src/vouch/proposals.py
++++ b/src/vouch/proposals.py
+@@ -369,7 +369,11 @@ def approve(
+     # Refuse to overwrite an existing artifact. Without this guard a retry
+     # after a crash between put_<kind>() and move_proposal_to_decided() would
+     # silently rewrite the artifact with new approved_by / created_at metadata.
+-    _ensure_no_existing_artifact(store, proposal.kind, payload["id"])
++    # Exception: PAGE proposals may legitimately target an existing page when
++    # filed by vault_to_kb (vault edit flow) — the approve path handles that
++    # via update_page rather than put_page.
++    if proposal.kind != ProposalKind.PAGE:
++        _ensure_no_existing_artifact(store, proposal.kind, payload["id"])
+     result: Claim | Page | Entity | Relation
+     if proposal.kind == ProposalKind.CLAIM:
+         claim = Claim(approved_by=approved_by, **payload)
+@@ -382,7 +386,16 @@ def approve(
+         result = claim
+     elif proposal.kind == ProposalKind.PAGE:
+         page = Page(**payload)
+-        store.put_page(page)
++        # Vault-edit proposals use slug_hint=page_id so the payload id matches
++        # an existing page. In that case update rather than create so the
++        # approve path doesn't raise "page already exists" for every normal
++        # vault edit. For new pages (no existing artifact) put_page is used
++        # as before.
++        try:
++            store.get_page(page.id)
++            store.update_page(page)
++        except ArtifactNotFoundError:
++            store.put_page(page)
+         with index_db.open_db(store.kb_dir) as conn:
+             index_db.index_page(
+                 conn, id=page.id, title=page.title, body=page.body,
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index 88c600cc..9d00da5e 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -452,6 +452,24 @@ def get_page(self, page_id: str) -> Page:
+             raise ArtifactNotFoundError(f"page {page_id}")
+         return _deserialize_page(p.read_text(encoding="utf-8"))
+ 
++    def update_page(self, page: Page) -> Page:
++        """Overwrite an existing page on disk. Used by the vault-edit approve path.
++
++        Parallel to `update_claim`: the caller is responsible for ensuring the
++        page id already exists (raises ArtifactNotFoundError otherwise). The
++        embedding index is refreshed so search reflects the new body.
++        """
++        if not self._page_path(page.id).exists():
++            raise ArtifactNotFoundError(f"page {page.id}")
++        self._page_path(page.id).write_text(
++            _serialize_page(page), encoding="utf-8"
++        )
++        self._embed_and_store(
++            kind="page", id=page.id,
++            text=f"{page.title}\n\n{page.body}",
++        )
++        return page
++
+     def list_pages(self) -> list[Page]:
+         pdir = self.kb_dir / "pages"
+         if not pdir.is_dir():
+diff --git a/src/vouch/vault_sync.py b/src/vouch/vault_sync.py
+index 07293e4b..895f172b 100644
+--- a/src/vouch/vault_sync.py
++++ b/src/vouch/vault_sync.py
+@@ -84,6 +84,7 @@ class VaultSyncResult:
+     pages_proposed: list[str] = field(default_factory=list)
+     pages_skipped_unchanged: list[str] = field(default_factory=list)
+     pages_skipped_unknown_id: list[str] = field(default_factory=list)
++    claim_stubs_edited: list[str] = field(default_factory=list)
+ 
+ 
+ # --- state file -----------------------------------------------------------
+@@ -268,6 +269,29 @@ def kb_to_vault(store: KBStore, vault_dir: Path) -> VaultSyncResult:
+ # --- forward direction: vault -> KB ---------------------------------------
+ 
+ 
++def _has_pending_page_proposal(
++    store: KBStore, page_id: str, *, body: str | None = None
++) -> bool:
++    """Return True if a pending proposal already targets ``page_id``.
++
++    When ``body`` is supplied, only returns True if the pending proposal
++    also carries the same body — allowing a second different vault edit
++    to file a new proposal even while the first is still pending.
++    Prevents duplicate proposals when vault_to_kb runs multiple times
++    before the reviewer approves the first proposal for a given page edit.
++    """
++    from .models import ProposalKind, ProposalStatus
++    for proposal in store.list_proposals(ProposalStatus.PENDING):
++        if proposal.kind != ProposalKind.PAGE:
++            continue
++        payload = proposal.payload
++        if not isinstance(payload, dict) or payload.get("id") != page_id:
++            continue
++        if body is None or payload.get("body") == body:
++            return True
++    return False
++
++
+ def vault_to_kb(
+     store: KBStore,
+     vault_dir: Path,
+@@ -315,6 +339,35 @@ def vault_to_kb(
+             result.pages_skipped_unknown_id.append(rel)
+             continue
+ 
++        # Fix 1 (#219): guard against proposing edits for pages that no
++        # longer exist in the KB. The mirror file may outlive the KB page if
++        # the page was deleted after the last backward sync; filing a proposal
++        # for a ghost page would produce an unresolvable slug on approve.
++        try:
++            store.get_page(page_id)
++        except ArtifactNotFoundError:
++            log.warning(
++                "vault sync: mirror file %s references page %r which no longer "
++                "exists in the KB; skipping to avoid a ghost proposal",
++                rel, page_id,
++            )
++            result.pages_skipped_unknown_id.append(rel)
++            continue
++
++        # Fix 2 (#219): skip if a pending proposal already targets this page
++        # id. Without this guard, running vault_to_kb twice before the first
++        # proposal is approved files duplicate proposals for the same edit,
++        # cluttering the review queue and causing the second approve to fail
++        # with "page already exists".
++        if _has_pending_page_proposal(store, page_id):
++            log.debug(
++                "vault sync: pending proposal already exists for page %r; "
++                "skipping to avoid duplicate",
++                page_id,
++            )
++            result.pages_skipped_unchanged.append(rel)
++            continue
++
+         # Record the user's edit as a vault-origin source so reviewers can
+         # see the exact bytes that triggered the proposal. Content-addressed
+         # via sha256, so re-runs against the same bytes coalesce on the same
+@@ -328,10 +381,11 @@ def vault_to_kb(
+             tags=["vault", "vault-sync"],
+         )
+ 
+-        # File the page-edit proposal. The store-side validator will reject
+-        # any references to artifacts the KB doesn't know about -- which is
+-        # the right behaviour: the user can't introduce phantom claim ids
+-        # from inside Obsidian.
++        # Fix 3 (#219): pass slug_hint=page_id so the proposal targets the
++        # existing page rather than a slugified copy of the title. Without
++        # this, a page with id "auth-decision-001" and title "Auth Decision"
++        # would produce a proposal for a new page "auth-decision", silently
++        # duplicating the KB entry on approve instead of updating it.
+         propose_page(
+             store,
+             title=edited.title,
+@@ -342,12 +396,33 @@ def vault_to_kb(
+             source_ids=list({*edited.sources, source.id}),
+             proposed_by=actor,
+             tags=list(edited.tags),
++            slug_hint=page_id,
+         )
+         result.pages_proposed.append(page_id)
+ 
+         # Update state so we don't re-propose the same edit on the next tick.
+         state[rel] = current_hash
+ 
++    # Fix 4 (#219): walk claims/ and warn on any user edit. Claim stubs are
++    # read-only mirrors written by kb_to_vault; edits there are silently
++    # dropped without this guard. Warn so the user knows to edit the citing
++    # page instead.
++    claims_mirror = _claims_dir(vault_dir)
++    if claims_mirror.is_dir():
++        for path in sorted(claims_mirror.glob("*.md")):
++            rel = f"claims/{path.name}"
++            recorded = state.get(rel)
++            if recorded is None:
++                continue
++            current_hash = _sha256_text(path.read_text(encoding="utf-8"))
++            if current_hash != recorded:
++                log.warning(
++                    "vault sync: edit detected in claim stub %s; claim stubs "
++                    "are read-only mirrors — edit the citing page instead",
++                    rel,
++                )
++                result.claim_stubs_edited.append(rel)
++
+     _save_state(vault_dir, state)
+     return result
+ 
+diff --git a/tests/test_vault_sync.py b/tests/test_vault_sync.py
+index b041104c..632015b7 100644
+--- a/tests/test_vault_sync.py
++++ b/tests/test_vault_sync.py
+@@ -312,3 +312,175 @@ def test_state_file_lives_under_vouch_subdir(store: KBStore, vault: Path) -> Non
+     # so the next forward pass can detect user edits.
+     assert isinstance(data, dict)
+     assert any(k.startswith("pages/") for k in data)
++
++
++# --- fix #219: slug_hint, ghost-page guard, dedup proposals, claim stub warning ---
++
++
++def test_vault_to_kb_proposal_uses_page_id_not_slugified_title(
++    store: KBStore, vault: Path,
++) -> None:
++    """Fix 3 (#219): the proposal id must match the page id from frontmatter,
++    not a slugified copy of the title. A page with id "alpha-page" and title
++    "Alpha page" must produce a proposal targeting "alpha-page", not
++    "alpha-page" derived from slugify("Alpha page") by accident -- but more
++    importantly, a page whose id and title diverge (e.g. id="auth-001",
++    title="Auth Decision") must still target the correct id."""
++    # Add a page whose id and title diverge so slugify would produce the wrong id.
++    src = store.put_source(b"extra", title="extra")
++    from vouch.models import Claim as _Claim
++    claim2 = _Claim(
++        id="auth-claim",
++        text="Auth claim.",
++        evidence=[src.id],
++        approved_by="tester",
++    )
++    store.put_claim(claim2)
++    from vouch.models import Page as _Page
++    from vouch.models import PageStatus, PageType
++    page2 = _Page(
++        id="auth-001",
++        title="Auth Decision",
++        body="Original auth body.\n",
++        type=PageType.CONCEPT,
++        status=PageStatus.ACTIVE,
++        claims=[claim2.id],
++        sources=[src.id],
++    )
++    store.put_page(page2)
++
++    kb_to_vault(store, vault)
++    mirror = vault / VAULT_DIR / "pages" / "auth-001.md"
++    mirror.write_text(
++        mirror.read_text(encoding="utf-8").replace("Original auth body.", "Edited auth body."),
++        encoding="utf-8",
++    )
++
++    result = vault_to_kb(store, vault, actor="vault-sync")
++
++    assert "auth-001" in result.pages_proposed
++    proposals = sorted((store.kb_dir / "proposed").glob("*.yaml"))
++    proposal_text = proposals[-1].read_text(encoding="utf-8")
++    # The proposal must target the original id, not "auth-decision"
++    assert "id: auth-001" in proposal_text
++    assert "id: auth-decision" not in proposal_text
++
++
++def test_vault_to_kb_skips_ghost_page_after_kb_deletion(
++    store: KBStore, vault: Path,
++) -> None:
++    """Fix 1 (#219): if a page is deleted from the KB after the last backward
++    sync, vault_to_kb must skip the mirror file instead of filing a proposal
++    for a non-existent page that would fail on approve."""
++    kb_to_vault(store, vault)
++    mirror = vault / VAULT_DIR / "pages" / "alpha-page.md"
++    # Simulate user edit so it looks like a changed file.
++    mirror.write_text(
++        mirror.read_text(encoding="utf-8").replace("Original body.", "Edited body."),
++        encoding="utf-8",
++    )
++    # Delete the page from the KB to simulate post-mirror deletion.
++    (store.kb_dir / "pages" / "alpha-page.md").unlink()
++
++    result = vault_to_kb(store, vault, actor="vault-sync")
++
++    assert "alpha-page" not in result.pages_proposed
++    assert any("alpha-page" in s for s in result.pages_skipped_unknown_id)
++    assert not list((store.kb_dir / "proposed").glob("*.yaml")), (
++        "no proposal should be filed for a deleted page"
++    )
++
++
++def test_vault_to_kb_deduplicates_pending_proposals(
++    store: KBStore, vault: Path,
++) -> None:
++    """Fix 2 (#219): running vault_to_kb twice before the first proposal is
++    approved must not produce duplicate proposals for the same page."""
++    kb_to_vault(store, vault)
++    mirror = vault / VAULT_DIR / "pages" / "alpha-page.md"
++    edited_text = mirror.read_text(encoding="utf-8").replace(
++        "Original body.", "Edited body."
++    )
++    mirror.write_text(edited_text, encoding="utf-8")
++
++    # First run: proposal is filed.
++    r1 = vault_to_kb(store, vault, actor="vault-sync")
++    assert "alpha-page" in r1.pages_proposed
++    proposals_after_first = list((store.kb_dir / "proposed").glob("*.yaml"))
++    assert len(proposals_after_first) == 1
++
++    # Restore the mirror to the edited state (simulate another sync tick
++    # before the proposal is approved).
++    mirror.write_text(edited_text, encoding="utf-8")
++    # Also restore the state file so it still sees the edit.
++    from vouch.vault_sync import _load_state, _save_state, _sha256_text
++    state = _load_state(vault)
++    # Revert state hash to force re-detection.
++    state["pages/alpha-page.md"] = _sha256_text("old content")
++    _save_state(vault, state)
++
++    # Second run: must skip, not file a second proposal.
++    r2 = vault_to_kb(store, vault, actor="vault-sync")
++    assert "alpha-page" not in r2.pages_proposed
++    proposals_after_second = list((store.kb_dir / "proposed").glob("*.yaml"))
++    assert len(proposals_after_second) == 1, (
++        f"expected 1 proposal after second run, got {len(proposals_after_second)}"
++    )
++
++
++def test_vault_to_kb_warns_on_claim_stub_edit(
++    store: KBStore, vault: Path, caplog: pytest.LogCaptureFixture,
++) -> None:
++    """Fix 4 (#219): editing a claim stub in the vault must produce a warning
++    instead of being silently dropped, so the user knows claim stubs are
++    read-only and they should edit the citing page instead."""
++    import logging
++    kb_to_vault(store, vault)
++    stub = vault / VAULT_DIR / "claims" / "alpha-claim.md"
++    assert stub.is_file(), "claim stub must exist after backward sync"
++
++    # Simulate user editing the claim stub.
++    stub.write_text(
++        stub.read_text(encoding="utf-8") + "\n\n<!-- user edit -->",
++        encoding="utf-8",
++    )
++
++    with caplog.at_level(logging.WARNING, logger="vouch.vault_sync"):
++        result = vault_to_kb(store, vault, actor="vault-sync")
++
++    assert "alpha-claim" not in result.pages_proposed
++    assert any("claim stub" in record.message for record in caplog.records), (
++        "expected a warning about claim stub edit, got: "
++        + str([r.message for r in caplog.records])
++    )
++    assert any("alpha-claim" in s for s in result.claim_stubs_edited), (
++        "expected alpha-claim.md in claim_stubs_edited"
++    )
++
++
++def test_vault_edit_proposal_can_be_approved_without_page_already_exists_error(
++    store: KBStore, vault: Path,
++) -> None:
++    """P1 fix (#219): approving a vault-edit proposal must update the existing
++    page rather than raising 'page already exists'. Before the fix, slug_hint=
++    page_id caused _ensure_no_existing_artifact to reject every vault edit."""
++    from vouch.proposals import approve
++    kb_to_vault(store, vault)
++    mirror = vault / VAULT_DIR / "pages" / "alpha-page.md"
++    mirror.write_text(
++        mirror.read_text(encoding="utf-8").replace("Original body.", "Approved edit."),
++        encoding="utf-8",
++    )
++
++    result = vault_to_kb(store, vault, actor="vault-sync")
++    assert "alpha-page" in result.pages_proposed
++
++    proposals = sorted((store.kb_dir / "proposed").glob("*.yaml"))
++    assert proposals, "no proposal was filed"
++    proposal_id = proposals[-1].stem
++
++    # Approving must succeed and update the existing page.
++    approved = approve(store, proposal_id, approved_by="reviewer")
++    assert approved.id == "alpha-page"
++    updated = store.get_page("alpha-page")
++    assert "Approved edit." in updated.body

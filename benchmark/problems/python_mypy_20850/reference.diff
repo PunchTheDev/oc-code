@@ -1,0 +1,487 @@
+diff --git a/mypy/checkexpr.py b/mypy/checkexpr.py
+index 6df02870d1042..3a5ea8a321519 100644
+--- a/mypy/checkexpr.py
++++ b/mypy/checkexpr.py
+@@ -30,6 +30,7 @@
+ from mypy.exprtotype import TypeTranslationError, expr_to_unanalyzed_type
+ from mypy.infer import ArgumentInferContext, infer_function_type_arguments, infer_type_arguments
+ from mypy.literals import literal
++from mypy.lookup import lookup_fully_qualified
+ from mypy.maptype import map_instance_to_supertype
+ from mypy.meet import is_overlapping_types, narrow_declared_type
+ from mypy.message_registry import ErrorMessage
+@@ -92,6 +93,7 @@
+     SuperExpr,
+     SymbolNode,
+     SymbolTableNode,
++    TemplateStrExpr,
+     TempNode,
+     TupleExpr,
+     TypeAlias,
+@@ -5487,6 +5489,23 @@ def find_typeddict_context(
+         # No TypedDict type in context.
+         return [], False
+ 
++    def visit_template_str_expr(self, e: TemplateStrExpr) -> Type:
++        """Type check a template string expression (t-string).
++
++        Type-checks all interpolated expressions but the result is always
++        string.templatelib.Template.
++        """
++        for item in e.items:
++            if isinstance(item, tuple):
++                value_expr, _source, _conversion, format_spec = item
++                self.accept(value_expr)
++                if format_spec is not None:
++                    self.accept(format_spec)
++        sym = lookup_fully_qualified("string.templatelib.Template", self.chk.modules)
++        if sym is not None and isinstance(sym.node, TypeInfo):
++            return Instance(sym.node, [])
++        return AnyType(TypeOfAny.from_error)
++
+     def visit_lambda_expr(self, e: LambdaExpr) -> Type:
+         """Type check lambda expression."""
+         old_in_lambda = self.in_lambda_expr
+diff --git a/mypy/evalexpr.py b/mypy/evalexpr.py
+index 218d50e37ec36..f46e5c23c3e43 100644
+--- a/mypy/evalexpr.py
++++ b/mypy/evalexpr.py
+@@ -192,6 +192,9 @@ def visit__promote_expr(self, o: mypy.nodes.PromoteExpr) -> object:
+     def visit_await_expr(self, o: mypy.nodes.AwaitExpr) -> object:
+         return UNKNOWN
+ 
++    def visit_template_str_expr(self, o: mypy.nodes.TemplateStrExpr) -> object:
++        return UNKNOWN
++
+     def visit_temp_node(self, o: mypy.nodes.TempNode) -> object:
+         return UNKNOWN
+ 
+diff --git a/mypy/fastparse.py b/mypy/fastparse.py
+index 701e449f8f338..68826ecadb7b7 100644
+--- a/mypy/fastparse.py
++++ b/mypy/fastparse.py
+@@ -78,6 +78,7 @@
+     Statement,
+     StrExpr,
+     SuperExpr,
++    TemplateStrExpr,
+     TempNode,
+     TryStmt,
+     TupleExpr,
+@@ -1685,20 +1686,22 @@ def visit_FormattedValue(self, n: ast3.FormattedValue) -> Expression:
+         return self.set_line(result_expression, n)
+ 
+     # TemplateStr(expr* values)
+-    def visit_TemplateStr(self, n: ast_TemplateStr) -> Expression:
+-        self.fail(
+-            ErrorMessage("PEP 750 template strings are not yet supported"),
+-            n.lineno,
+-            n.col_offset,
+-            blocker=False,
+-        )
+-        e = TempNode(AnyType(TypeOfAny.from_error))
++    def visit_TemplateStr(self, n: ast_TemplateStr) -> TemplateStrExpr:
++        items: list[Expression | tuple[Expression, str, str | None, Expression | None]] = []
++        for value in n.values:
++            if isinstance(value, ast_Interpolation):  # type: ignore[misc]
++                val_expr = self.visit(value.value)
++                val_expr.set_line(value.lineno, value.col_offset)
++                conversion = None if value.conversion < 0 else chr(value.conversion)
++                format_spec = (
++                    self.visit(value.format_spec) if value.format_spec is not None else None
++                )
++                items.append((val_expr, value.str, conversion, format_spec))
++            else:
++                items.append(self.visit(value))
++        e = TemplateStrExpr(items)
+         return self.set_line(e, n)
+ 
+-    # Interpolation(expr value, constant str, int conversion, expr? format_spec)
+-    def visit_Interpolation(self, n: ast_Interpolation) -> Expression:
+-        assert False, "Unreachable"
+-
+     # Attribute(expr value, identifier attr, expr_context ctx)
+     def visit_Attribute(self, n: Attribute) -> MemberExpr | SuperExpr:
+         value = n.value
+diff --git a/mypy/literals.py b/mypy/literals.py
+index 50720da35548c..f572a6f9c624f 100644
+--- a/mypy/literals.py
++++ b/mypy/literals.py
+@@ -42,6 +42,7 @@
+     StarExpr,
+     StrExpr,
+     SuperExpr,
++    TemplateStrExpr,
+     TempNode,
+     TupleExpr,
+     TypeAliasExpr,
+@@ -316,6 +317,9 @@ def visit__promote_expr(self, e: PromoteExpr) -> None:
+     def visit_await_expr(self, e: AwaitExpr) -> None:
+         return None
+ 
++    def visit_template_str_expr(self, e: TemplateStrExpr) -> None:
++        return None
++
+     def visit_temp_node(self, e: TempNode) -> None:
+         return None
+ 
+diff --git a/mypy/nodes.py b/mypy/nodes.py
+index 4c238592f9927..4dbed8beb8e33 100644
+--- a/mypy/nodes.py
++++ b/mypy/nodes.py
+@@ -2765,6 +2765,29 @@ def accept(self, visitor: ExpressionVisitor[T]) -> T:
+         return visitor.visit_dict_expr(self)
+ 
+ 
++class TemplateStrExpr(Expression):
++    """Template string expression t'...'."""
++
++    __slots__ = ("items",)
++    __match_args__ = ("items",)
++
++    # Each item is either:
++    #   - a StrExpr (literal string segment), or
++    #   - a tuple (value_expr, source_text, conversion, format_spec_expr)
++    #     where conversion is str | None ("r", "s", "a", or None)
++    #     and format_spec_expr is Expression | None
++    items: list[Expression | tuple[Expression, str, str | None, Expression | None]]
++
++    def __init__(
++        self, items: list[Expression | tuple[Expression, str, str | None, Expression | None]]
++    ) -> None:
++        super().__init__()
++        self.items = items
++
++    def accept(self, visitor: ExpressionVisitor[T]) -> T:
++        return visitor.visit_template_str_expr(self)
++
++
+ class TupleExpr(Expression):
+     """Tuple literal expression (..., ...)
+ 
+diff --git a/mypy/semanal.py b/mypy/semanal.py
+index 219459c92e3ce..e2c073fd4dea8 100644
+--- a/mypy/semanal.py
++++ b/mypy/semanal.py
+@@ -166,6 +166,7 @@
+     SymbolNode,
+     SymbolTable,
+     SymbolTableNode,
++    TemplateStrExpr,
+     TempNode,
+     TryStmt,
+     TupleExpr,
+@@ -5850,6 +5851,15 @@ def visit_dict_expr(self, expr: DictExpr) -> None:
+                 key.accept(self)
+             value.accept(self)
+ 
++    def visit_template_str_expr(self, expr: TemplateStrExpr) -> None:
++        for item in expr.items:
++            if isinstance(item, tuple):
++                item[0].accept(self)
++                if item[3] is not None:
++                    item[3].accept(self)
++            else:
++                item.accept(self)
++
+     def visit_star_expr(self, expr: StarExpr) -> None:
+         if not expr.valid:
+             self.fail("can't use starred expression here", expr, blocker=True)
+diff --git a/mypy/server/subexpr.py b/mypy/server/subexpr.py
+index 013b936e8b7c9..12aae33eaaf59 100644
+--- a/mypy/server/subexpr.py
++++ b/mypy/server/subexpr.py
+@@ -26,6 +26,7 @@
+     SetExpr,
+     SliceExpr,
+     StarExpr,
++    TemplateStrExpr,
+     TupleExpr,
+     TypeApplication,
+     TypeFormExpr,
+@@ -155,6 +156,10 @@ def visit_dict_expr(self, e: DictExpr) -> None:
+         self.add(e)
+         super().visit_dict_expr(e)
+ 
++    def visit_template_str_expr(self, e: TemplateStrExpr) -> None:
++        self.add(e)
++        super().visit_template_str_expr(e)
++
+     def visit_set_expr(self, e: SetExpr) -> None:
+         self.add(e)
+         super().visit_set_expr(e)
+diff --git a/mypy/strconv.py b/mypy/strconv.py
+index 168a8bcffdc7e..e16060f3f5817 100644
+--- a/mypy/strconv.py
++++ b/mypy/strconv.py
+@@ -497,6 +497,15 @@ def visit_list_expr(self, o: mypy.nodes.ListExpr) -> str:
+     def visit_dict_expr(self, o: mypy.nodes.DictExpr) -> str:
+         return self.dump([[k, v] for k, v in o.items], o)
+ 
++    def visit_template_str_expr(self, o: mypy.nodes.TemplateStrExpr) -> str:
++        items_repr: list[object] = []
++        for item in o.items:
++            if isinstance(item, tuple):
++                items_repr.append(item[0])  # value expression
++            else:
++                items_repr.append(item)
++        return self.dump(items_repr, o)
++
+     def visit_set_expr(self, o: mypy.nodes.SetExpr) -> str:
+         return self.dump(o.items, o)
+ 
+diff --git a/mypy/stubgen.py b/mypy/stubgen.py
+index 5d6149b97507a..ce6335e9e34f9 100755
+--- a/mypy/stubgen.py
++++ b/mypy/stubgen.py
+@@ -113,6 +113,7 @@
+     StarExpr,
+     Statement,
+     StrExpr,
++    TemplateStrExpr,
+     TempNode,
+     TupleExpr,
+     TypeAliasStmt,
+@@ -373,6 +374,9 @@ def visit_dict_expr(self, o: DictExpr) -> str:
+             dict_items.append(f"{key.accept(self)}: {value.accept(self)}")
+         return f"{{{', '.join(dict_items)}}}"
+ 
++    def visit_template_str_expr(self, o: TemplateStrExpr) -> str:
++        return self.stubgen.add_name("_typeshed.Incomplete")
++
+     def visit_ellipsis(self, node: EllipsisExpr) -> str:
+         return "..."
+ 
+diff --git a/mypy/traverser.py b/mypy/traverser.py
+index ad5e805d31ab5..6fdb54298f85c 100644
+--- a/mypy/traverser.py
++++ b/mypy/traverser.py
+@@ -68,6 +68,7 @@
+     StarExpr,
+     StrExpr,
+     SuperExpr,
++    TemplateStrExpr,
+     TempNode,
+     TryStmt,
+     TupleExpr,
+@@ -329,6 +330,15 @@ def visit_dict_expr(self, o: DictExpr, /) -> None:
+                 k.accept(self)
+             v.accept(self)
+ 
++    def visit_template_str_expr(self, o: TemplateStrExpr, /) -> None:
++        for item in o.items:
++            if isinstance(item, tuple):
++                item[0].accept(self)
++                if item[3] is not None:
++                    item[3].accept(self)
++            else:
++                item.accept(self)
++
+     def visit_set_expr(self, o: SetExpr, /) -> None:
+         for item in o.items:
+             item.accept(self)
+@@ -785,6 +795,11 @@ def visit_dict_expr(self, o: DictExpr, /) -> None:
+             return
+         super().visit_dict_expr(o)
+ 
++    def visit_template_str_expr(self, o: TemplateStrExpr, /) -> None:
++        if not self.visit(o):
++            return
++        super().visit_template_str_expr(o)
++
+     def visit_tuple_expr(self, o: TupleExpr, /) -> None:
+         if not self.visit(o):
+             return
+diff --git a/mypy/treetransform.py b/mypy/treetransform.py
+index 1a76a50a2d94e..2c66d4b5f3659 100644
+--- a/mypy/treetransform.py
++++ b/mypy/treetransform.py
+@@ -77,6 +77,7 @@
+     StrExpr,
+     SuperExpr,
+     SymbolTable,
++    TemplateStrExpr,
+     TempNode,
+     TryStmt,
+     TupleExpr,
+@@ -578,6 +579,18 @@ def visit_dict_expr(self, node: DictExpr) -> DictExpr:
+             [(self.expr(key) if key else None, self.expr(value)) for key, value in node.items]
+         )
+ 
++    def visit_template_str_expr(self, node: TemplateStrExpr) -> TemplateStrExpr:
++        items: list[Expression | tuple[Expression, str, str | None, Expression | None]] = []
++        for item in node.items:
++            if isinstance(item, tuple):
++                value, source, conversion, format_spec = item
++                items.append(
++                    (self.expr(value), source, conversion, self.optional_expr(format_spec))
++                )
++            else:
++                items.append(self.expr(item))
++        return TemplateStrExpr(items)
++
+     def visit_tuple_expr(self, node: TupleExpr) -> TupleExpr:
+         return TupleExpr(self.expressions(node.items))
+ 
+diff --git a/mypy/visitor.py b/mypy/visitor.py
+index e150788ec3c16..de754c408f97d 100644
+--- a/mypy/visitor.py
++++ b/mypy/visitor.py
+@@ -111,6 +111,10 @@ def visit_list_expr(self, o: mypy.nodes.ListExpr, /) -> T:
+     def visit_dict_expr(self, o: mypy.nodes.DictExpr, /) -> T:
+         pass
+ 
++    @abstractmethod
++    def visit_template_str_expr(self, o: mypy.nodes.TemplateStrExpr, /) -> T:
++        pass
++
+     @abstractmethod
+     def visit_tuple_expr(self, o: mypy.nodes.TupleExpr, /) -> T:
+         pass
+@@ -539,6 +543,9 @@ def visit_list_expr(self, o: mypy.nodes.ListExpr, /) -> T:
+     def visit_dict_expr(self, o: mypy.nodes.DictExpr, /) -> T:
+         raise NotImplementedError()
+ 
++    def visit_template_str_expr(self, o: mypy.nodes.TemplateStrExpr, /) -> T:
++        raise NotImplementedError()
++
+     def visit_tuple_expr(self, o: mypy.nodes.TupleExpr, /) -> T:
+         raise NotImplementedError()
+ 
+diff --git a/mypyc/irbuild/visitor.py b/mypyc/irbuild/visitor.py
+index dc81e95a2980e..705513171e3d1 100644
+--- a/mypyc/irbuild/visitor.py
++++ b/mypyc/irbuild/visitor.py
+@@ -66,6 +66,7 @@
+     StarExpr,
+     StrExpr,
+     SuperExpr,
++    TemplateStrExpr,
+     TempNode,
+     TryStmt,
+     TupleExpr,
+@@ -311,6 +312,9 @@ def visit_tuple_expr(self, expr: TupleExpr) -> Value:
+     def visit_dict_expr(self, expr: DictExpr) -> Value:
+         return transform_dict_expr(self.builder, expr)
+ 
++    def visit_template_str_expr(self, expr: TemplateStrExpr) -> Value:
++        assert False, "TemplateStrExpr should have been handled already"
++
+     def visit_set_expr(self, expr: SetExpr) -> Value:
+         return transform_set_expr(self.builder, expr)
+ 
+diff --git a/test-data/unit/check-python314.test b/test-data/unit/check-python314.test
+index f1043aab860ae..b7440bcc406b2 100644
+--- a/test-data/unit/check-python314.test
++++ b/test-data/unit/check-python314.test
+@@ -1,3 +1,32 @@
+-[case testTemplateString]
+-reveal_type(t"mypy")  # E: PEP 750 template strings are not yet supported \
+-                      # N: Revealed type is "Any"
++[case testTemplateStringBasics]
++reveal_type(t"foobar")  # N: Revealed type is "string.templatelib.Template"
++t"{'foobar'}"
++t"foo{'bar'}"
++t".{1}."
++t"{type(1)}"
++t"{1!r}"
++t"{1:03d}"
++t"{1!r:03d}"
++
++from string.templatelib import Template
++a: Template
++a = t"foobar"
++a = t"{'foobar'}"
++[builtins fixtures/f_string.pyi]
++
++[case testTemplateStringExpressionsOk]
++t".{1 + 1}."
++t".{1 + 1}.{'foo' + 'bar'}"
++[builtins fixtures/f_string.pyi]
++
++[case testTemplateStringExpressionsErrors]
++t"{1 + ''}"   # E: Unsupported operand types for + ("int" and "str")
++t".{1 + ''}"  # E: Unsupported operand types for + ("int" and "str")
++[builtins fixtures/f_string.pyi]
++
++[case testTemplateStringParseFormatOptions]
++value = 10.5142
++width = 10
++precision = 4
++t"result: {value:{width}.{precision}}"
++[builtins fixtures/f_string.pyi]
+diff --git a/test-data/unit/parse-python314.test b/test-data/unit/parse-python314.test
+index 34fe753084f67..c319d5d8eebb1 100644
+--- a/test-data/unit/parse-python314.test
++++ b/test-data/unit/parse-python314.test
+@@ -1,5 +1,68 @@
+-[case testTemplateString]
++[case testTemplateStringSimple]
+ x = 'mypy'
+ t'Hello {x}'
+ [out]
+-main:2: error: PEP 750 template strings are not yet supported
++MypyFile:1(
++  AssignmentStmt:1(
++    NameExpr(x)
++    StrExpr(mypy))
++  ExpressionStmt:2(
++    TemplateStrExpr:2(
++      StrExpr(Hello )
++      NameExpr(x))))
++
++[case testTemplateStringWithConversion]
++x = 'mypy'
++T'Hello {x!r}'
++[out]
++MypyFile:1(
++  AssignmentStmt:1(
++    NameExpr(x)
++    StrExpr(mypy))
++  ExpressionStmt:2(
++    TemplateStrExpr:2(
++      StrExpr(Hello )
++      NameExpr(x))))
++
++[case testTemplateStringWithOnlyFormatSpecifier]
++x = 'mypy'
++t'Hello {x:<30}'
++[out]
++MypyFile:1(
++  AssignmentStmt:1(
++    NameExpr(x)
++    StrExpr(mypy))
++  ExpressionStmt:2(
++    TemplateStrExpr:2(
++      StrExpr(Hello )
++      NameExpr(x))))
++
++[case testTemplateStringWithFormatSpecifierAndConversion]
++x = 'mypy'
++t'Hello {x!s:<30}'
++[out]
++MypyFile:1(
++  AssignmentStmt:1(
++    NameExpr(x)
++    StrExpr(mypy))
++  ExpressionStmt:2(
++    TemplateStrExpr:2(
++      StrExpr(Hello )
++      NameExpr(x))))
++
++[case testTemplateStringWithFormatSpecifierExpression]
++x = 'mypy'
++y = 30
++t'Hello {x!s:<{y+y}}'
++[out]
++MypyFile:1(
++  AssignmentStmt:1(
++    NameExpr(x)
++    StrExpr(mypy))
++  AssignmentStmt:2(
++    NameExpr(y)
++    IntExpr(30))
++  ExpressionStmt:3(
++    TemplateStrExpr:3(
++      StrExpr(Hello )
++      NameExpr(x))))

@@ -1,0 +1,461 @@
+// Package session provides session management middleware for Fiber.
+// This middleware handles user sessions, including storing session data in the store.
+package session
+
+import (
+	"context"
+	"errors"
+	"sync"
+
+	"github.com/gofiber/fiber/v3"
+	"github.com/gofiber/fiber/v3/internal/redact"
+	"github.com/gofiber/fiber/v3/middleware/logger"
+)
+
+// Middleware holds session data and configuration.
+// Middleware serializes access to its internal state with a mutex, but it is
+// request-scoped and must not be used after the request lifecycle ends.
+type Middleware struct {
+	Session     *Session
+	ctx         fiber.Ctx
+	config      Config
+	mu          sync.RWMutex
+	isDestroyed bool
+}
+
+// Context key for session middleware lookup.
+type middlewareKey int
+
+const (
+	// middlewareContextKey is the key used to store the *Middleware in the context locals.
+	middlewareContextKey middlewareKey = iota
+)
+
+var (
+	// ErrTypeAssertionFailed occurs when a type assertion fails.
+	ErrTypeAssertionFailed = errors.New("failed to type-assert to *Middleware")
+
+	// Pool for reusing middleware instances.
+	middlewarePool = &sync.Pool{
+		New: func() any {
+			return &Middleware{}
+		},
+	}
+)
+
+// New initializes session middleware with optional configuration.
+//
+// Parameters:
+//   - config: Variadic parameter to override default config.
+//
+// Returns:
+//   - fiber.Handler: The Fiber handler for the session middleware.
+//
+// Usage:
+//
+//	app.Use(session.New())
+//
+// Usage:
+//
+//	app.Use(session.New())
+func New(config ...Config) fiber.Handler {
+	if len(config) > 0 {
+		handler, _ := NewWithStore(config[0])
+		return handler
+	}
+	handler, _ := NewWithStore()
+	return handler
+}
+
+// NewWithStore creates session middleware with an optional custom store.
+//
+// Parameters:
+//   - config: Variadic parameter to override default config.
+//
+// Returns:
+//   - fiber.Handler: The Fiber handler for the session middleware.
+//   - *Store: The session store.
+//
+// Usage:
+//
+//	handler, store := session.NewWithStore()
+func NewWithStore(config ...Config) (fiber.Handler, *Store) {
+	registerLogContextTagsOnce.Do(registerLogContextTags)
+
+	cfg := configDefault(config...)
+
+	if cfg.Store == nil {
+		cfg.Store = NewStore(cfg)
+	}
+
+	handler := func(c fiber.Ctx) error {
+		if cfg.Next != nil && cfg.Next(c) {
+			return c.Next()
+		}
+
+		// Acquire session middleware
+		m := acquireMiddleware()
+		if err := m.initialize(c, &cfg); err != nil {
+			releaseMiddleware(m)
+			handleSessionError(c, cfg.ErrorHandler, err)
+			return nil
+		}
+
+		stackErr := c.Next()
+
+		m.mu.RLock()
+		isDestroyed := m.isDestroyed
+		m.mu.RUnlock()
+
+		if !isDestroyed {
+			m.saveSession()
+		} else {
+			// saveSession is skipped for destroyed sessions, so the session must
+			// be returned to the pool here.
+			releaseSession(m.Session)
+		}
+
+		releaseMiddleware(m)
+		return stackErr
+	}
+
+	return handler, cfg.Store
+}
+
+var registerLogContextTagsOnce sync.Once
+
+func handleSessionError(c fiber.Ctx, handler func(fiber.Ctx, error), err error) {
+	if handler != nil {
+		handler(c, err)
+		return
+	}
+	DefaultErrorHandler(c, err)
+}
+
+func registerLogContextTags() {
+	logger.RegisterContextTag("session-id", func(ctx any) string {
+		id, ok := fiber.ValueFromContext[string](ctx, sessionIDContextKey)
+		if !ok || id == "" {
+			return ""
+		}
+
+		return redact.Prefix(id)
+	})
+}
+
+func storeMiddlewareContext(c fiber.Ctx, session *Session, m *Middleware) {
+	fiber.StoreInContext(c, sessionIDContextKey, session.ID())
+	fiber.StoreInContext(c, middlewareContextKey, m)
+}
+
+// clearMiddlewareContext clears both Fiber locals and the request context
+// because session middleware stores these values in both layers.
+func clearMiddlewareContext(c fiber.Ctx) {
+	c.Locals(sessionIDContextKey, "")
+	c.Locals(middlewareContextKey, nil)
+	ctx := context.WithValue(c.Context(), sessionIDContextKey, "")
+	c.SetContext(context.WithValue(ctx, middlewareContextKey, (*Middleware)(nil)))
+}
+
+// initialize sets up middleware for the request. It returns an error when the
+// session cannot be loaded from the store (e.g. the backing storage is down)
+// so the request can fail gracefully instead of crashing the server.
+func (m *Middleware) initialize(c fiber.Ctx, cfg *Config) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	session, err := cfg.Store.getSession(c)
+	if err != nil {
+		return err
+	}
+
+	m.config = *cfg
+	m.Session = session
+	m.ctx = c
+
+	storeMiddlewareContext(c, session, m)
+	return nil
+}
+
+// saveSession handles session saving and error management after the response.
+func (m *Middleware) saveSession() {
+	if err := m.Session.saveSessionWithContext(m.resolveContext()); err != nil {
+		if m.config.ErrorHandler != nil {
+			m.config.ErrorHandler(m.ctx, err)
+		} else {
+			DefaultErrorHandler(m.ctx, err)
+		}
+	}
+
+	releaseSession(m.Session)
+}
+
+// resolveContext returns the middleware's stored fiber context if available,
+// otherwise returns context.Background().
+// fiber.Ctx implements context.Context directly, so no allocation is needed.
+func (m *Middleware) resolveContext() context.Context {
+	if m.ctx != nil {
+		return m.ctx
+	}
+	return context.Background()
+}
+
+// acquireMiddleware retrieves a middleware instance from the pool.
+func acquireMiddleware() *Middleware {
+	m, ok := middlewarePool.Get().(*Middleware)
+	if !ok {
+		panic(ErrTypeAssertionFailed.Error())
+	}
+	return m
+}
+
+// releaseMiddleware resets and returns middleware to the pool.
+//
+// Parameters:
+//   - m: The middleware object to release.
+//
+// Usage:
+//
+//	releaseMiddleware(m)
+func releaseMiddleware(m *Middleware) {
+	m.mu.Lock()
+	if m.ctx != nil {
+		clearMiddlewareContext(m.ctx)
+	}
+	m.config = Config{}
+	m.Session = nil
+	m.ctx = nil
+	m.isDestroyed = false
+	m.mu.Unlock()
+	middlewarePool.Put(m)
+}
+
+// FromContext returns the Middleware from the Fiber context.
+// It accepts fiber.CustomCtx, fiber.Ctx, *fasthttp.RequestCtx, and context.Context.
+//
+// Parameters:
+//   - c: The Fiber context.
+//
+// Returns:
+//   - *Middleware: The middleware object if found; otherwise, nil.
+//
+// Usage:
+//
+//	m := session.FromContext(c)
+func FromContext(ctx any) *Middleware {
+	if m, ok := fiber.ValueFromContext[*Middleware](ctx, middlewareContextKey); ok {
+		return m
+	}
+
+	return nil
+}
+
+// Set sets a key-value pair in the session.
+//
+// Parameters:
+//   - key: The key to set.
+//   - value: The value to set.
+//
+// Usage:
+//
+//	m.Set("key", "value")
+func (m *Middleware) Set(key, value any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.Session.Set(key, value)
+}
+
+// Get retrieves a value from the session by key.
+//
+// Parameters:
+//   - key: The key to retrieve.
+//
+// Returns:
+//   - any: The value associated with the key.
+//
+// Usage:
+//
+//	value := m.Get("key")
+func (m *Middleware) Get(key any) any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.Session.Get(key)
+}
+
+// Delete removes a key-value pair from the session.
+//
+// Parameters:
+//   - key: The key to delete.
+//
+// Usage:
+//
+//	m.Delete("key")
+func (m *Middleware) Delete(key any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.Session.Delete(key)
+}
+
+// Keys returns all keys in the current session.
+//
+// Returns:
+//   - []any: A slice of all keys in the session.
+//
+// Usage:
+//
+//	keys := m.Keys()
+func (m *Middleware) Keys() []any {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.Session.Keys()
+}
+
+// Destroy destroys the session.
+//
+// Returns:
+//   - error: An error if the destruction fails.
+//
+// Usage:
+//
+//	err := m.Destroy()
+func (m *Middleware) Destroy() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	err := m.Session.Destroy()
+	m.isDestroyed = true
+	return err
+}
+
+// DestroyWithContext destroys the session using the provided context for cancellation and timeout control.
+//
+// Parameters:
+//   - ctx: The context to use for the storage operation.
+//
+// Returns:
+//   - error: An error if the destruction fails.
+//
+// Usage:
+//
+//	err := m.DestroyWithContext(ctx)
+func (m *Middleware) DestroyWithContext(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	err := m.Session.DestroyWithContext(ctx)
+	m.isDestroyed = true
+	return err
+}
+
+// Fresh checks if the session is fresh.
+//
+// Returns:
+//   - bool: True if the session is fresh; otherwise, false.
+//
+// Usage:
+//
+//	isFresh := m.Fresh()
+func (m *Middleware) Fresh() bool {
+	return m.Session.Fresh()
+}
+
+// ID returns the session ID.
+//
+// Returns:
+//   - string: The session ID.
+//
+// Usage:
+//
+//	id := m.ID()
+func (m *Middleware) ID() string {
+	return m.Session.ID()
+}
+
+// Reset resets the session.
+//
+// Returns:
+//   - error: An error if the reset fails.
+//
+// Usage:
+//
+//	err := m.Reset()
+func (m *Middleware) Reset() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.Session.Reset()
+}
+
+// ResetWithContext resets the session using the provided context for cancellation and timeout control.
+//
+// Parameters:
+//   - ctx: The context to use for the storage operation.
+//
+// Returns:
+//   - error: An error if the reset fails.
+//
+// Usage:
+//
+//	err := m.ResetWithContext(ctx)
+func (m *Middleware) ResetWithContext(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.Session.ResetWithContext(ctx)
+}
+
+// Regenerate generates a new session ID while preserving session data.
+//
+// This method is commonly used after authentication to prevent session fixation attacks.
+// Unlike Reset(), this method preserves all existing session data.
+//
+// Returns:
+//   - error: An error if the regeneration fails.
+//
+// Usage:
+//
+//	err := m.Regenerate()
+func (m *Middleware) Regenerate() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.Session.Regenerate()
+}
+
+// RegenerateWithContext generates a new session ID while preserving session data,
+// using the provided context for cancellation and timeout control.
+//
+// This method is commonly used after authentication to prevent session fixation attacks.
+// Unlike ResetWithContext(), this method preserves all existing session data.
+//
+// Parameters:
+//   - ctx: The context to use for the storage operation.
+//
+// Returns:
+//   - error: An error if the regeneration fails.
+//
+// Usage:
+//
+//	err := m.RegenerateWithContext(ctx)
+func (m *Middleware) RegenerateWithContext(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.Session.RegenerateWithContext(ctx)
+}
+
+// Store returns the session store.
+//
+// Returns:
+//   - *Store: The session store.
+//
+// Usage:
+//
+//	store := m.Store()
+func (m *Middleware) Store() *Store {
+	return m.config.Store
+}

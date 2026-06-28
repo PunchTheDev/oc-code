@@ -1,0 +1,403 @@
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index e7ebb66c05..d9d9e50bb4 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -2115,6 +2115,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+                 Some(CounteredSpellDestination::Library {
+                     position: LibraryPosition::NthFromTop { n },
+                 }) => d.push(("redirect".into(), format!("library #{n} from top"))),
++                Some(CounteredSpellDestination::Library {
++                    position: LibraryPosition::BeneathTop { .. },
++                }) => d.push(("redirect".into(), "library beneath top X".into())),
+                 Some(CounteredSpellDestination::Hand) => {
+                     d.push(("redirect".into(), "hand".into()))
+                 }
+diff --git a/crates/engine/src/game/effects/put_on_top.rs b/crates/engine/src/game/effects/put_on_top.rs
+index 2b432ddf8d..6444c99e68 100644
+--- a/crates/engine/src/game/effects/put_on_top.rs
++++ b/crates/engine/src/game/effects/put_on_top.rs
+@@ -257,12 +257,20 @@ pub fn resolve(
+         &collected_targets[..collected_targets.len().min(expected)]
+     };
+ 
+-    let index = match position {
++    let index = match &position {
+         // Top = index 0, Bottom = None (push to end), NthFromTop = index n-1
+         // ("second from the top" = index 1).
+         LibraryPosition::Top => Some(0),
+         LibraryPosition::Bottom => None,
+         LibraryPosition::NthFromTop { n } => Some(n.saturating_sub(1) as usize),
++        // CR 401.7 (Unexpectedly Absent class): "just beneath the top N cards"
++        // leaves exactly `depth` cards above the placed object, i.e. the 0-based
++        // insertion index IS the resolved depth (no `-1`, unlike `NthFromTop`).
++        // Per CR 401.7 `move_to_library_at_index` clamps an index past the
++        // library size to the bottom.
++        LibraryPosition::BeneathTop { depth } => {
++            Some(resolve_quantity_with_targets(state, depth, ability).max(0) as usize)
++        }
+     };
+     match position {
+         LibraryPosition::Top => {
+@@ -270,7 +278,9 @@ pub fn resolve(
+                 zones::move_to_library_at_index(state, *object_id, index, events);
+             }
+         }
+-        LibraryPosition::Bottom | LibraryPosition::NthFromTop { .. } => {
++        LibraryPosition::Bottom
++        | LibraryPosition::NthFromTop { .. }
++        | LibraryPosition::BeneathTop { .. } => {
+             for object_id in to_place {
+                 zones::move_to_library_at_index(state, *object_id, index, events);
+             }
+diff --git a/crates/engine/src/game/zone_pipeline.rs b/crates/engine/src/game/zone_pipeline.rs
+index 26705a0051..2d37963b37 100644
+--- a/crates/engine/src/game/zone_pipeline.rs
++++ b/crates/engine/src/game/zone_pipeline.rs
+@@ -602,6 +602,17 @@ pub(crate) fn move_object(
+                     // CR: `NthFromTop { n }` is 1-based ("second from the top" =>
+                     // n=2, index 1); `move_to_library_at_index` is 0-based.
+                     LibraryPosition::NthFromTop { n } => Some(n.saturating_sub(1) as usize),
++                    // CR 401.7: "beneath the top N cards" is only produced by the
++                    // `PutAtLibraryPosition` resolver, which moves directly and never
++                    // routes through this rebuilt-tail path. Handled for exhaustiveness:
++                    // a literal depth is honored (0-based index), a runtime-resolved
++                    // depth cannot be evaluated without the originating ability here.
++                    LibraryPosition::BeneathTop { depth } => match depth {
++                        crate::types::ability::QuantityExpr::Fixed { value } => {
++                            Some(value.max(0) as usize)
++                        }
++                        _ => None,
++                    },
+                 };
+                 zones::move_to_library_at_index(state, req.object_id, index, events);
+                 return ZoneMoveResult::Done;
+@@ -1601,6 +1612,16 @@ pub(crate) fn deliver_replaced_zone_change(
+                     // CR: `NthFromTop { n }` is 1-based ("second from the top"
+                     // => n=2, index 1); `move_to_library_at_index` is 0-based.
+                     LibraryPosition::NthFromTop { n } => Some(n.saturating_sub(1) as usize),
++                    // CR 401.7: "beneath the top N cards" only flows from the
++                    // `PutAtLibraryPosition` resolver (direct move), never this
++                    // path. Exhaustiveness arm: honor a literal depth; a
++                    // runtime-resolved depth needs the originating ability.
++                    LibraryPosition::BeneathTop { depth } => match depth {
++                        crate::types::ability::QuantityExpr::Fixed { value } => {
++                            Some((*value).max(0) as usize)
++                        }
++                        _ => None,
++                    },
+                 };
+                 zones::move_to_library_at_index(state, object_id, index, events);
+             }
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index b8240432cf..a21d5e2517 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -4909,6 +4909,21 @@ pub(super) fn parse_put_ast(
+         return Some(PutImperativeAst::BottomOfLibrary);
+     }
+ 
++    // CR 401.7 (Unexpectedly Absent): "into its owner's library just beneath
++    // the top X cards of that library" — the placed permanent ends with exactly
++    // the named number of cards above it. The bare "X" is the spell's announced
++    // {X}, resolved at resolution time. The "where X is ..." rebinding forms
++    // (Quarry Colossus's Plains count, the die-roll cards) carry their own count
++    // source and stay out of scope, so a present "where x is" clause is skipped.
++    if take_until::<_, _, OracleError<'_>>("where x is")
++        .parse(lower)
++        .is_err()
++    {
++        if let Some(depth) = parse_beneath_top_depth(lower) {
++            return Some(PutImperativeAst::BeneathTop { depth });
++        }
++    }
++
+     // "put X into Y's library Nth from the top" —
+     // specific positional placement (God-Eternals, Approach, Bury in Books).
+     if let Ok((_, before_from)) = take_until::<_, _, OracleError<'_>>("from the top").parse(lower) {
+@@ -5008,6 +5023,38 @@ pub(super) fn parse_put_ast(
+     None
+ }
+ 
++/// Extract the depth N from a "...beneath the top N cards..." clause (CR
++/// 401.7). The bare "X" form resolves to the spell's announced `{X}` via
++/// `QuantityRef::Variable { name: "X" }`; an explicit integer yields a literal.
++/// Any other phrasing returns `None` so the clause falls through unchanged.
++fn parse_beneath_top_depth(lower: &str) -> Option<QuantityExpr> {
++    // Combinator scan to the depth token: "...beneath the top <DEPTH> cards...".
++    let (rest, _) = take_until::<_, _, OracleError<'_>>("beneath the top ")
++        .parse(lower)
++        .ok()?;
++    let (_, depth_token) = preceded(
++        tag::<_, _, OracleError<'_>>("beneath the top "),
++        take_until::<_, _, OracleError<'_>>(" cards"),
++    )
++    .parse(rest)
++    .ok()?;
++    // `all_consuming` keeps the bare "X" / literal-integer arms from matching a
++    // longer token (e.g. "xenagos") — the whole depth token must be the count.
++    all_consuming(alt((
++        map(tag::<_, _, OracleError<'_>>("x"), |_| QuantityExpr::Ref {
++            qty: QuantityRef::Variable {
++                name: "X".to_string(),
++            },
++        }),
++        map(nom::character::complete::i32, |value| QuantityExpr::Fixed {
++            value,
++        }),
++    )))
++    .parse(depth_token)
++    .ok()
++    .map(|(_, expr)| expr)
++}
++
+ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
+     match ast {
+         PutImperativeAst::Mill { count } => Effect::Mill {
+@@ -5126,6 +5173,11 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
+             count: QuantityExpr::Fixed { value: 1 },
+             position: LibraryPosition::NthFromTop { n },
+         },
++        PutImperativeAst::BeneathTop { depth } => Effect::PutAtLibraryPosition {
++            target: TargetFilter::Any,
++            count: QuantityExpr::Fixed { value: 1 },
++            position: LibraryPosition::BeneathTop { depth },
++        },
+         PutImperativeAst::PutTopCardsIntoHandMatchingExileCount => Effect::Mill {
+             count: QuantityExpr::Ref {
+                 qty: QuantityRef::CardsExiledBySource,
+diff --git a/crates/engine/src/parser/oracle_ir/ast.rs b/crates/engine/src/parser/oracle_ir/ast.rs
+index 2118aabf8f..051fc63732 100644
+--- a/crates/engine/src/parser/oracle_ir/ast.rs
++++ b/crates/engine/src/parser/oracle_ir/ast.rs
+@@ -1184,6 +1184,14 @@ pub(crate) enum PutImperativeAst {
+     NthFromTop {
+         n: u32,
+     },
++    /// CR 401.7 (Unexpectedly Absent class): "into its owner's library just
++    /// beneath the top N cards of that library." The placed object ends with
++    /// exactly `depth` cards above it (0-based insertion index = resolved
++    /// `depth`). `depth` is a `QuantityExpr` so the count can be the spell's
++    /// announced `{X}` resolved at resolution time.
++    BeneathTop {
++        depth: QuantityExpr,
++    },
+     /// CR 121.5: "put that many cards from the top of your library into your
+     /// hand" moves library cards without drawing them (Scroll Rack).
+     PutTopCardsIntoHandMatchingExileCount,
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 1eb6a93979..c5647044f2 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -7278,6 +7278,15 @@ pub enum LibraryPosition {
+     NthFromTop {
+         n: u32,
+     },
++    /// CR 401.7: "just beneath the top N cards of that library" (Unexpectedly
++    /// Absent class), where N is resolved at resolution time — e.g. the spell's
++    /// announced `{X}`. The object is inserted at the 0-based index equal to the
++    /// resolved depth, i.e. with exactly `depth` cards left above it. Per CR
++    /// 401.7 a depth at or beyond the library size puts the card on the bottom
++    /// (clamped in `move_to_library_at_index`).
++    BeneathTop {
++        depth: QuantityExpr,
++    },
+ }
+ 
+ /// CR 701.20a + CR 608.2c: How the *set* of matching cards found by an
+diff --git a/crates/engine/tests/integration/issue_788_unexpectedly_absent.rs b/crates/engine/tests/integration/issue_788_unexpectedly_absent.rs
+new file mode 100644
+index 0000000000..69d496fd19
+--- /dev/null
++++ b/crates/engine/tests/integration/issue_788_unexpectedly_absent.rs
+@@ -0,0 +1,179 @@
++//! Regression test for GitHub issue #788 — Unexpectedly Absent.
++//!
++//! "{X}{W}{W} Sorcery — Put target nonland permanent into its owner's library
++//! just beneath the top X cards of that library."
++//!
++//! Reported behavior: the spell "doesn't let me select a target, it just
++//! resolves and does nothing." Root cause: the parser had no handling for the
++//! "just beneath the top X cards of that library" placement and emitted
++//! `Effect::Unimplemented`, so the spell carried no target and no effect.
++//!
++//! The fix parses the clause to
++//! `Effect::PutAtLibraryPosition { target: nonland permanent,
++//! position: BeneathTop { depth: X } }`. "Beneath the top X cards" (CR 401.7)
++//! places the permanent so that exactly X cards remain above it — the 0-based
++//! library insertion index equals the announced `{X}`.
++//!
++//! Discriminator: with X = 2 and a four-card library, the targeted permanent
++//! must land at library index 2 (two cards above, two below). A "do nothing"
++//! regression leaves it on the battlefield; a naive top/bottom placement lands
++//! it at index 0 or at the end.
++
++use engine::game::ability_utils::build_resolved_from_def_with_targets;
++use engine::game::effects::resolve_ability_chain;
++use engine::game::scenario::{GameScenario, P0, P1};
++use engine::game::zones::create_object;
++use engine::parser::oracle::parse_oracle_text;
++use engine::types::ability::{
++    Effect, LibraryPosition, QuantityExpr, QuantityRef, TargetFilter, TargetRef,
++};
++use engine::types::card_type::CoreType;
++use engine::types::identifiers::CardId;
++use engine::types::zones::Zone;
++
++const ORACLE: &str =
++    "Put target nonland permanent into its owner's library just beneath the top X cards of that library.";
++
++#[test]
++fn unexpectedly_absent_parses_to_beneath_top_x_placement() {
++    let parsed = parse_oracle_text(
++        ORACLE,
++        "Unexpectedly Absent",
++        &[],
++        &["Sorcery".to_string()],
++        &[],
++    );
++    let ability = parsed
++        .abilities
++        .first()
++        .expect("Unexpectedly Absent must parse to a spell ability");
++
++    let Effect::PutAtLibraryPosition {
++        target, position, ..
++    } = &*ability.effect
++    else {
++        panic!(
++            "expected PutAtLibraryPosition (not Unimplemented), got {:?}",
++            ability.effect
++        );
++    };
++
++    // The spell targets a nonland permanent — the missing target was the
++    // user-visible symptom of #788.
++    let TargetFilter::Typed(typed) = target else {
++        panic!("expected a typed nonland-permanent target, got {target:?}");
++    };
++    assert!(
++        typed.type_filters.len() == 2,
++        "target must constrain to permanent + nonland, got {:?}",
++        typed.type_filters
++    );
++
++    // The placement is "beneath the top X cards", with X = the spell's {X}.
++    assert_eq!(
++        *position,
++        LibraryPosition::BeneathTop {
++            depth: QuantityExpr::Ref {
++                qty: QuantityRef::Variable {
++                    name: "X".to_string()
++                }
++            }
++        },
++        "placement must be BeneathTop bound to the cast variable X"
++    );
++}
++
++#[test]
++fn unexpectedly_absent_places_target_beneath_top_x_cards() {
++    let parsed = parse_oracle_text(
++        ORACLE,
++        "Unexpectedly Absent",
++        &[],
++        &["Sorcery".to_string()],
++        &[],
++    );
++    let ability = parsed
++        .abilities
++        .into_iter()
++        .next()
++        .expect("Unexpectedly Absent must parse to a spell ability");
++
++    let scenario = GameScenario::new();
++    let mut runner = scenario.build();
++
++    // P0 casts the spell; P1 owns and controls the targeted permanent.
++    let source = create_object(
++        runner.state_mut(),
++        CardId(900),
++        P0,
++        "Unexpectedly Absent".to_string(),
++        Zone::Stack,
++    );
++
++    let victim = create_object(
++        runner.state_mut(),
++        CardId(901),
++        P1,
++        "Grizzly Bears".to_string(),
++        Zone::Battlefield,
++    );
++    runner
++        .state_mut()
++        .objects
++        .get_mut(&victim)
++        .unwrap()
++        .card_types
++        .core_types = vec![CoreType::Creature];
++
++    // Four cards already in P1's library so index 2 is a true interior slot.
++    let mut lib = Vec::new();
++    for idx in 0..4 {
++        let id = create_object(
++            runner.state_mut(),
++            CardId(910 + idx),
++            P1,
++            format!("Library Card {idx}"),
++            Zone::Library,
++        );
++        lib.push(id);
++    }
++    let lib_len_before = runner.state().players[P1.0 as usize].library.len();
++    assert_eq!(lib_len_before, 4, "P1 library should start with four cards");
++
++    // Announce X = 2: the permanent goes beneath the top two cards.
++    let mut resolved =
++        build_resolved_from_def_with_targets(&ability, source, P0, vec![TargetRef::Object(victim)]);
++    resolved.chosen_x = Some(2);
++
++    let mut events = Vec::new();
++    resolve_ability_chain(runner.state_mut(), &resolved, &mut events, 0)
++        .expect("Unexpectedly Absent resolution");
++
++    let state = runner.state();
++    let victim_obj = &state.objects[&victim];
++    assert_eq!(
++        victim_obj.zone,
++        Zone::Library,
++        "the targeted permanent must leave the battlefield for its owner's library"
++    );
++    assert_eq!(
++        victim_obj.owner, P1,
++        "the permanent goes into ITS OWNER's library"
++    );
++
++    let library = &state.players[P1.0 as usize].library;
++    assert_eq!(
++        library.len(),
++        lib_len_before + 1,
++        "library grows by exactly the placed permanent"
++    );
++    let pos = library
++        .iter()
++        .position(|id| *id == victim)
++        .expect("victim must be in P1's library");
++    assert_eq!(
++        pos, 2,
++        "beneath the top X=2 cards means index 2 (two cards above it); \
++         index 0 would be a top placement and the end would be a bottom placement"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 46884ab428..78b9603732 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -375,6 +375,7 @@ mod issue_689_resonating_lute_hand_size;
+ mod issue_691_sheoldred_saga_lore;
+ mod issue_709_regression;
+ mod issue_787_once_upon_a_time;
++mod issue_788_unexpectedly_absent;
+ mod issue_828_full_throttle;
+ mod issue_841_selvala_explorer_returned;
+ mod issue_847_braids_cabal_minion;

@@ -1,0 +1,895 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index d1bd61d2..bf77e347 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,15 @@ All notable changes to vouch are documented here. Format follows
+ ## [Unreleased]
+ 
+ ### Added
++- typed page kinds (#234): a KB can declare extra page kinds in
++  `.vouch/config.yaml` under `page_kinds`, each with `required_fields`, a
++  JSON-Schema-subset `frontmatter_schema`, `required_citations`, and one level
++  of `extends`. `kb.propose_page` now takes a `metadata` frontmatter dict and
++  validates the kind at both the propose and approve gates, surfacing one error
++  per offending field. The built-in `PageType` kinds keep working unchanged.
++  New `vouch schema list` and `vouch schema sync` commands inspect declared
++  kinds and audit existing pages against them; `propose-page` gains `--kind`
++  and repeatable `--meta key=value`.
+ - `kb.synthesize` — answer-mode retrieval over the review-gated KB. Answers a
+   query in prose from approved claims only, with an inline `[claim_id]`
+   citation behind every sentence, an explicit `gaps` block listing query
+diff --git a/schemas/page.schema.json b/schemas/page.schema.json
+index 6cd7ad40..8c1f12ec 100644
+--- a/schemas/page.schema.json
++++ b/schemas/page.schema.json
+@@ -9,21 +9,6 @@
+       ],
+       "title": "PageStatus",
+       "type": "string"
+-    },
+-    "PageType": {
+-      "enum": [
+-        "entity",
+-        "concept",
+-        "decision",
+-        "workflow",
+-        "session",
+-        "index",
+-        "log",
+-        "report",
+-        "source-summary"
+-      ],
+-      "title": "PageType",
+-      "type": "string"
+     }
+   },
+   "$id": "https://vouch.dev/schemas/page.schema.json",
+@@ -58,6 +43,11 @@
+       "title": "Id",
+       "type": "string"
+     },
++    "metadata": {
++      "additionalProperties": true,
++      "title": "Metadata",
++      "type": "object"
++    },
+     "sources": {
+       "items": {
+         "type": "string"
+@@ -81,8 +71,9 @@
+       "type": "string"
+     },
+     "type": {
+-      "$ref": "#/$defs/PageType",
+-      "default": "concept"
++      "default": "concept",
++      "title": "Type",
++      "type": "string"
+     },
+     "updated_at": {
+       "format": "date-time",
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index 7a85e38f..401f8b18 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -41,6 +41,7 @@
+ from .logging_config import configure_logging
+ from .models import Proposal, ProposalKind, ProposalStatus
+ from .onboarding import seed_starter_kb
++from .page_kinds import PageKindError, load_page_kind_registry
+ from .proposals import (
+     EXPIRE_ACTOR,
+     ProposalError,
+@@ -978,27 +979,132 @@ def propose_claim_cmd(
+ @click.option("--title", required=True)
+ @click.option("--body", default="", help="Page body. Use `-` to read from stdin.")
+ @click.option("--type", "page_type", default="concept", show_default=True)
++@click.option("--kind", "kind", default=None, help="alias for --type (config-declared page kind).")
++@click.option(
++    "--meta",
++    "meta",
++    multiple=True,
++    help="per-kind frontmatter field as key=value (repeatable). Value parsed as YAML.",
++)
+ @click.option("--claim", "claims", multiple=True)
+ @click.option("--entity", "entities", multiple=True)
+ def propose_page_cmd(
+-    title: str, body: str, page_type: str, claims: tuple[str, ...], entities: tuple[str, ...]
++    title: str,
++    body: str,
++    page_type: str,
++    kind: str | None,
++    meta: tuple[str, ...],
++    claims: tuple[str, ...],
++    entities: tuple[str, ...],
+ ) -> None:
+     store = _load_store()
+     if body == "-":
+         body = sys.stdin.read()
++    metadata = _parse_meta(meta)
+     with _cli_errors():
+         pr = propose_page(
+             store,
+             title=title,
+             body=body,
+-            page_type=page_type,
++            page_type=kind or page_type,
+             claim_ids=list(claims),
+             entity_ids=list(entities),
++            metadata=metadata,
+             proposed_by=_whoami(),
+         )
+     click.echo(pr.id)
+ 
+ 
++def _parse_meta(pairs: tuple[str, ...]) -> dict[str, Any]:
++    """Parse repeated ``--meta key=value`` pairs into a frontmatter dict.
++
++    Values run through ``yaml.safe_load`` so ``attendees=[a, b]`` and
++    ``count=3`` arrive as a list / int rather than strings.
++    """
++    out: dict[str, Any] = {}
++    for pair in pairs:
++        if "=" not in pair:
++            raise click.BadParameter(f"--meta expects key=value, got {pair!r}")
++        key, _, raw = pair.partition("=")
++        out[key.strip()] = yaml.safe_load(raw)
++    return out
++
++
++@cli.group(name="schema")
++def schema() -> None:
++    """inspect and validate config-declared page kinds (issue #234)."""
++
++
++@schema.command(name="list")
++@click.option("--json", "as_json", is_flag=True, help="emit machine-readable JSON.")
++def schema_list_cmd(as_json: bool) -> None:
++    """list the page kinds this KB recognizes (built-in + config-declared)."""
++    store = _load_store()
++    registry = load_page_kind_registry(store)
++    rows: list[dict[str, Any]] = []
++    lines: list[str] = []
++    for name in sorted(registry.known()):
++        required, fm_schema, citations = registry.resolve(name)
++        rows.append(
++            {
++                "kind": name,
++                "required_fields": required,
++                "required_citations": citations,
++                "has_frontmatter_schema": bool(fm_schema),
++            }
++        )
++        extras: list[str] = []
++        if required:
++            extras.append(f"required={','.join(required)}")
++        if citations:
++            extras.append("citations-required")
++        if fm_schema:
++            extras.append("schema")
++        suffix = f"  ({'; '.join(extras)})" if extras else ""
++        lines.append(f"{name}{suffix}")
++    if as_json:
++        click.echo(json.dumps(rows, indent=2))
++        return
++    for line in lines:
++        click.echo(line)
++
++
++@schema.command(name="sync")
++@click.option("--json", "as_json", is_flag=True, help="emit machine-readable JSON.")
++def schema_sync_cmd(as_json: bool) -> None:
++    """validate every page against its declared kind; report conflicts.
++
++    Read-only: it never rewrites pages (that would bypass the review gate).
++    Exits non-zero when any page conflicts, so it doubles as a CI guard after
++    a `page_kinds` change. Resolve conflicts by re-proposing the page through
++    the normal review flow.
++    """
++    store = _load_store()
++    registry = load_page_kind_registry(store)
++    conflicts: list[dict[str, Any]] = []
++    checked = 0
++    for page in store.list_pages():
++        checked += 1
++        try:
++            registry.validate(
++                page.type,
++                page.metadata,
++                has_citations=bool(page.claims or page.sources),
++            )
++        except PageKindError as e:
++            conflicts.append({"page": page.id, "kind": page.type, "problems": e.problems})
++    if as_json:
++        click.echo(json.dumps({"checked": checked, "conflicts": conflicts}, indent=2))
++    else:
++        click.echo(f"checked {checked} page(s)")
++        for c in conflicts:
++            click.echo(f"  {c['page']} [{c['kind']}]: {'; '.join(c['problems'])}")
++        if not conflicts:
++            click.echo("no conflicts")
++    if conflicts:
++        raise SystemExit(1)
++
++
+ @cli.command(name="propose-entity")
+ @click.option("--name", required=True)
+ @click.option("--type", "entity_type", required=True)
+diff --git a/src/vouch/health.py b/src/vouch/health.py
+index 312e9160..9e6f9ebd 100644
+--- a/src/vouch/health.py
++++ b/src/vouch/health.py
+@@ -546,7 +546,7 @@ def _tick(phase: str) -> None:
+                 id=p.id,
+                 title=p.title,
+                 body=p.body,
+-                type=p.type.value,
++                type=p.type,
+                 tags=p.tags,
+             )
+         for e in store.list_entities():
+diff --git a/src/vouch/jsonl_server.py b/src/vouch/jsonl_server.py
+index 10827513..ec738c6b 100644
+--- a/src/vouch/jsonl_server.py
++++ b/src/vouch/jsonl_server.py
+@@ -336,6 +336,7 @@ def _h_propose_page(p: dict) -> dict:
+         claim_ids=p.get("claim_ids"),
+         entity_ids=p.get("entity_ids"),
+         source_ids=p.get("source_ids"),
++        metadata=p.get("metadata"),
+         rationale=p.get("rationale"),
+         slug_hint=p.get("slug_hint"),
+         session_id=p.get("session_id"),
+diff --git a/src/vouch/models.py b/src/vouch/models.py
+index 56e07ec7..23f94aa4 100644
+--- a/src/vouch/models.py
++++ b/src/vouch/models.py
+@@ -289,15 +289,31 @@ class Page(BaseModel):
+     id: str
+     title: str
+     body: str = ""
+-    type: PageType = PageType.CONCEPT
++    # An open string rather than `PageType` so a KB can declare extra kinds in
++    # config.yaml (issue #234). Built-in kinds are still the `PageType` values;
++    # existence of a non-built-in kind is enforced by page_kinds.validate_page
++    # at the propose/approve gates, where the store (and its config) is in hand.
++    type: str = PageType.CONCEPT.value
+     status: PageStatus = PageStatus.DRAFT
+     claims: list[str] = Field(default_factory=list)
+     entities: list[str] = Field(default_factory=list)
+     sources: list[str] = Field(default_factory=list)
+     tags: list[str] = Field(default_factory=list)
++    # Per-kind frontmatter (e.g. a meeting-notes kind's `attendees`). Empty for
++    # the built-in kinds; serialized into the on-disk YAML frontmatter.
++    metadata: dict[str, Any] = Field(default_factory=dict)
+     created_at: datetime = Field(default_factory=utcnow)
+     updated_at: datetime = Field(default_factory=utcnow)
+ 
++    @field_validator("type", mode="before")
++    @classmethod
++    def _normalize_type(cls, v: Any) -> str:
++        if isinstance(v, PageType):
++            return v.value
++        if not isinstance(v, str) or not v.strip():
++            raise ValueError("page type must be a non-empty string")
++        return v.strip()
++
+ 
+ # --- audit + sessions -----------------------------------------------------
+ 
+diff --git a/src/vouch/page_kinds.py b/src/vouch/page_kinds.py
+new file mode 100644
+index 00000000..c675ccde
+--- /dev/null
++++ b/src/vouch/page_kinds.py
+@@ -0,0 +1,245 @@
++"""Config-declared page kinds and their frontmatter validation.
++
++The built-in `PageType` enum is closed by design — it pins the kinds vouch
++ships with. This module lets a KB *extend* that set from `.vouch/config.yaml`
++without forking the model: a contributor can declare a `meeting-notes` or
++`decision-record` kind, give it a required-field list and a small frontmatter
++schema, and have `kb.propose_page` validate against it.
++
++The validation layer lives here rather than on the `Page` model because the
++model has no access to the store (hence no access to the config). Both the
++propose gate and the approve gate call `validate_page` so a kind that is added
++or tightened after a proposal is filed is still enforced at approval time.
++
++Built-in kinds carry an empty spec (no required fields, no schema), so they
++keep working exactly as before.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++import yaml
++from pydantic import BaseModel, Field, field_validator
++
++from .models import PageType
++from .storage import KBStore
++
++CONFIG_FILENAME = "config.yaml"
++
++# JSON-Schema `type` keyword -> python types it accepts. `bool` is excluded
++# from the numeric types on purpose: in python `True` is an int, but a schema
++# author asking for an integer never means a boolean.
++_JSON_TYPES: dict[str, tuple[type, ...]] = {
++    "string": (str,),
++    "number": (int, float),
++    "integer": (int,),
++    "boolean": (bool,),
++    "array": (list,),
++    "object": (dict,),
++}
++
++
++class PageKindError(ValueError):
++    """Raised when a page violates its declared kind's schema.
++
++    Carries one message per failing field so callers can surface a per-field
++    error rather than a single opaque "invalid page".
++    """
++
++    def __init__(self, kind: str, problems: list[str]) -> None:
++        self.kind = kind
++        self.problems = problems
++        joined = "; ".join(problems)
++        super().__init__(f"page kind '{kind}': {joined}")
++
++
++class PageKindSpec(BaseModel):
++    """One declared page kind, parsed from `config.yaml: page_kinds.<name>`."""
++
++    extends: str | None = Field(
++        default=None,
++        description="inherit fields + schema from another kind (one level only)",
++    )
++    required_fields: list[str] = Field(default_factory=list)
++    frontmatter_schema: dict[str, Any] | None = Field(
++        default=None,
++        description="JSON-Schema subset: {type: object, properties: {...}, required: [...]}",
++    )
++    required_citations: bool = False
++    description: str | None = None
++
++    @field_validator("frontmatter_schema", mode="before")
++    @classmethod
++    def _parse_inline_schema(cls, v: Any) -> Any:
++        # The issue's worked example quotes the schema as an inline YAML/JSON
++        # string; a nested mapping is just as valid. Accept both.
++        if isinstance(v, str):
++            loaded = yaml.safe_load(v)
++            return loaded if isinstance(loaded, dict) else {}
++        return v
++
++
++# Built-in kinds resolve to an empty spec — declaring them in config is
++# allowed (to add required fields) but never required for them to work.
++BUILTIN_PAGE_KINDS: dict[str, PageKindSpec] = {pt.value: PageKindSpec() for pt in PageType}
++
++
++def _coerce_schema(spec: PageKindSpec) -> dict[str, Any]:
++    return spec.frontmatter_schema or {}
++
++
++class PageKindRegistry:
++    """Resolved view over built-in + config-declared page kinds."""
++
++    def __init__(self, specs: dict[str, PageKindSpec]) -> None:
++        self._specs = specs
++
++    def known(self) -> set[str]:
++        return set(self._specs)
++
++    def is_known(self, name: str) -> bool:
++        return name in self._specs
++
++    def resolve(self, name: str) -> tuple[list[str], dict[str, Any], bool]:
++        """Return (required_fields, frontmatter_schema, required_citations).
++
++        Applies a single level of `extends`. A parent that itself extends
++        another kind raises — issue #234 scopes inheritance to one level.
++        """
++        spec = self._specs[name]
++        required = list(spec.required_fields)
++        schema = _coerce_schema(spec)
++        citations = spec.required_citations
++
++        if spec.extends is not None:
++            parent_name = spec.extends
++            if parent_name not in self._specs:
++                raise PageKindError(name, [f"extends unknown kind '{parent_name}'"])
++            parent = self._specs[parent_name]
++            if parent.extends is not None:
++                raise PageKindError(
++                    name,
++                    [f"multi-level inheritance unsupported (parent '{parent_name}' also extends)"],
++                )
++            required = list(dict.fromkeys([*parent.required_fields, *required]))
++            schema = _merge_schema(_coerce_schema(parent), schema)
++            citations = citations or parent.required_citations
++
++        return required, schema, citations
++
++    def validate(
++        self,
++        page_type: str,
++        metadata: dict[str, Any],
++        *,
++        has_citations: bool,
++    ) -> None:
++        """Raise `PageKindError` if `page_type`/`metadata` violate the kind.
++
++        Collects *all* problems before raising so the caller can report every
++        offending field at once.
++        """
++        if not self.is_known(page_type):
++            declared = ", ".join(sorted(self.known()))
++            raise PageKindError(page_type, [f"unknown page kind (declared: {declared})"])
++
++        required, schema, requires_citations = self.resolve(page_type)
++        problems: list[str] = []
++
++        for field in required:
++            if _is_missing(metadata.get(field)):
++                problems.append(f"missing required field '{field}'")
++
++        problems.extend(_validate_against_schema(schema, metadata))
++
++        if requires_citations and not has_citations:
++            problems.append("requires at least one claim or source citation")
++
++        if problems:
++            raise PageKindError(page_type, problems)
++
++
++def _is_missing(value: Any) -> bool:
++    return value is None or value == "" or value == [] or value == {}
++
++
++def _merge_schema(parent: dict[str, Any], child: dict[str, Any]) -> dict[str, Any]:
++    """Shallow-merge two object schemas; child wins on per-property conflicts."""
++    if not parent:
++        return child
++    if not child:
++        return parent
++    merged: dict[str, Any] = {"type": "object"}
++    props: dict[str, Any] = {}
++    props.update(parent.get("properties", {}))
++    props.update(child.get("properties", {}))
++    merged["properties"] = props
++    required = list(dict.fromkeys([*parent.get("required", []), *child.get("required", [])]))
++    if required:
++        merged["required"] = required
++    return merged
++
++
++def _validate_against_schema(schema: dict[str, Any], data: dict[str, Any]) -> list[str]:
++    """Validate `data` against a small JSON-Schema subset.
++
++    Supports `type: object` with `properties` (each a `{type: <jsontype>}`)
++    and a top-level `required` list. Unknown keywords are ignored so a richer
++    schema degrades gracefully rather than rejecting valid pages.
++    """
++    if not schema or schema.get("type") != "object":
++        return []
++    problems: list[str] = []
++    for field in schema.get("required", []):
++        if _is_missing(data.get(field)):
++            problems.append(f"missing required field '{field}'")
++    for field, field_schema in schema.get("properties", {}).items():
++        if field not in data or data[field] is None:
++            continue
++        expected = field_schema.get("type") if isinstance(field_schema, dict) else None
++        if expected and expected in _JSON_TYPES:
++            allowed = _JSON_TYPES[expected]
++            value = data[field]
++            # `bool` is an `int`; reject it where a number/integer is expected.
++            bool_as_number = isinstance(value, bool) and expected in ("number", "integer")
++            if bool_as_number or not isinstance(value, allowed):
++                problems.append(f"field '{field}' must be {expected}")
++    return problems
++
++
++def load_page_kind_registry(store: KBStore) -> PageKindRegistry:
++    """Build a registry from built-in kinds + `config.yaml: page_kinds`."""
++    specs = dict(BUILTIN_PAGE_KINDS)
++    raw = _read_page_kinds(store)
++    for name, body in raw.items():
++        if not isinstance(body, dict):
++            raise PageKindError(str(name), ["definition must be a mapping"])
++        specs[str(name)] = PageKindSpec.model_validate(body)
++    return PageKindRegistry(specs)
++
++
++def _read_page_kinds(store: KBStore) -> dict[str, Any]:
++    path = store.kb_dir / CONFIG_FILENAME
++    if not path.exists():
++        return {}
++    try:
++        loaded = yaml.safe_load(path.read_text())
++    except yaml.YAMLError:
++        return {}
++    if not isinstance(loaded, dict):
++        return {}
++    kinds = loaded.get("page_kinds")
++    return kinds if isinstance(kinds, dict) else {}
++
++
++def validate_page(
++    store: KBStore,
++    page_type: str,
++    metadata: dict[str, Any] | None,
++    *,
++    has_citations: bool,
++) -> None:
++    """Convenience wrapper used by both the propose and approve gates."""
++    registry = load_page_kind_registry(store)
++    registry.validate(page_type, metadata or {}, has_citations=has_citations)
+diff --git a/src/vouch/proposals.py b/src/vouch/proposals.py
+index 8c5f1c41..89aa5bb5 100644
+--- a/src/vouch/proposals.py
++++ b/src/vouch/proposals.py
+@@ -24,6 +24,7 @@
+     ProposalStatus,
+     Relation,
+ )
++from .page_kinds import PageKindError, validate_page
+ from .storage import ArtifactNotFoundError, KBStore
+ 
+ 
+@@ -171,6 +172,7 @@ def propose_page(
+     source_ids: list[str] | None = None,
+     proposed_by: str,
+     tags: list[str] | None = None,
++    metadata: dict[str, Any] | None = None,
+     rationale: str | None = None,
+     slug_hint: str | None = None,
+     session_id: str | None = None,
+@@ -197,6 +199,19 @@ def propose_page(
+             store.get_source(sid)
+         except ArtifactNotFoundError as e:
+             raise ProposalError(f"unknown source id: {sid}") from e
++    meta = metadata or {}
++    # Validate the page kind (built-in or config-declared) and its required
++    # frontmatter before filing. Raised here so propose-time callers get a
++    # per-field error rather than discovering it only at approve.
++    try:
++        validate_page(
++            store,
++            page_type,
++            meta,
++            has_citations=bool(claim_ids or source_ids),
++        )
++    except PageKindError as e:
++        raise ProposalError(str(e)) from e
+     payload = {
+         "id": slug_hint or _slugify(title),
+         "title": title.strip(),
+@@ -206,6 +221,7 @@ def propose_page(
+         "entities": entity_ids or [],
+         "sources": source_ids or [],
+         "tags": tags or [],
++        "metadata": meta,
+     }
+     return _file_proposal(
+         store, kind=ProposalKind.PAGE, payload=payload,
+@@ -386,6 +402,18 @@ def approve(
+         result = claim
+     elif proposal.kind == ProposalKind.PAGE:
+         page = Page(**payload)
++        # Re-validate the kind at the gate: config may have tightened (or a
++        # kind been removed) between propose and approve. Built-in kinds pass
++        # trivially, so this is a no-op for the common path.
++        try:
++            validate_page(
++                store,
++                page.type,
++                page.metadata,
++                has_citations=bool(page.claims or page.sources),
++            )
++        except PageKindError as e:
++            raise ProposalError(str(e)) from e
+         # Vault-edit proposals use slug_hint=page_id so the payload id matches
+         # an existing page. In that case update rather than create so the
+         # approve path doesn't raise "page already exists" for every normal
+@@ -399,7 +427,7 @@ def approve(
+         with index_db.open_db(store.kb_dir) as conn:
+             index_db.index_page(
+                 conn, id=page.id, title=page.title, body=page.body,
+-                type=page.type.value, tags=page.tags,
++                type=page.type, tags=page.tags,
+             )
+         result = page
+         # Lazy import: extractors.edges calls back into propose_relation,
+diff --git a/src/vouch/server.py b/src/vouch/server.py
+index 706940ce..6443b975 100644
+--- a/src/vouch/server.py
++++ b/src/vouch/server.py
+@@ -286,7 +286,7 @@ def kb_read_relation(relation_id: str) -> dict[str, Any]:
+ @mcp.tool()
+ def kb_list_pages() -> list[dict[str, Any]]:
+     return [
+-        {"id": p.id, "title": p.title, "type": p.type.value, "tags": p.tags}
++        {"id": p.id, "title": p.title, "type": p.type, "tags": p.tags}
+         for p in _store().list_pages()
+     ]
+ 
+@@ -411,6 +411,7 @@ def kb_propose_page(
+     claim_ids: list[str] | None = None,
+     entity_ids: list[str] | None = None,
+     source_ids: list[str] | None = None,
++    metadata: dict[str, Any] | None = None,
+     rationale: str | None = None,
+     slug_hint: str | None = None,
+     session_id: str | None = None,
+@@ -420,8 +421,8 @@ def kb_propose_page(
+         pr = propose_page(
+             _store(), title=title, body=body, page_type=page_type,
+             claim_ids=claim_ids, entity_ids=entity_ids, source_ids=source_ids,
+-            rationale=rationale, slug_hint=slug_hint, session_id=session_id,
+-            dry_run=dry_run, proposed_by=_agent(),
++            metadata=metadata, rationale=rationale, slug_hint=slug_hint,
++            session_id=session_id, dry_run=dry_run, proposed_by=_agent(),
+         )
+     except (ProposalError, ArtifactNotFoundError, ValueError) as e:
+         raise ValueError(str(e)) from e
+diff --git a/src/vouch/sessions.py b/src/vouch/sessions.py
+index 0b1b80e1..44e8b285 100644
+--- a/src/vouch/sessions.py
++++ b/src/vouch/sessions.py
+@@ -114,7 +114,7 @@ def crystallize(
+         with index_db.open_db(store.kb_dir) as conn:
+             index_db.index_page(
+                 conn, id=page.id, title=page.title, body=page.body,
+-                type=page.type.value, tags=page.tags,
++                type=page.type, tags=page.tags,
+             )
+         summary_page_id = page.id
+ 
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index 9d00da5e..fa40ea53 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -92,6 +92,10 @@ def _starter_config() -> dict[str, Any]:
+                 "human review via vouch pending/show/approve",
+             ],
+         },
++        # Extra page kinds beyond the built-in PageType enum. Each maps a kind
++        # name to {required_fields, frontmatter_schema, required_citations,
++        # extends}. See `vouch schema list` / docs for the shape. (issue #234)
++        "page_kinds": {},
+     }
+ 
+ 
+diff --git a/tests/test_page_kinds.py b/tests/test_page_kinds.py
+new file mode 100644
+index 00000000..0418f7df
+--- /dev/null
++++ b/tests/test_page_kinds.py
+@@ -0,0 +1,223 @@
++"""Config-declared page kinds and per-kind frontmatter validation (issue #234)."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++
++import pytest
++import yaml
++from click.testing import CliRunner
++
++from vouch.cli import cli
++from vouch.models import Page
++from vouch.page_kinds import PageKindError, load_page_kind_registry, validate_page
++from vouch.proposals import ProposalError, approve, propose_page
++from vouch.storage import KBStore
++
++
++@pytest.fixture
++def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> KBStore:
++    s = KBStore.init(tmp_path)
++    monkeypatch.chdir(s.root)
++    return s
++
++
++def _declare_kinds(store: KBStore, kinds: dict[str, Any]) -> None:
++    cfg = yaml.safe_load(store.config_path.read_text())
++    assert isinstance(cfg, dict)
++    cfg["page_kinds"] = kinds
++    store.config_path.write_text(yaml.safe_dump(cfg))
++
++
++# --- acceptance: declaring a kind makes it usable --------------------------
++
++
++def test_declared_kind_is_accepted(store: KBStore) -> None:
++    _declare_kinds(store, {"meeting-notes": {"required_fields": ["attendees"]}})
++    pr = propose_page(
++        store,
++        title="Weekly sync",
++        body="notes",
++        page_type="meeting-notes",
++        metadata={"attendees": ["alice-example", "bob-example"]},
++        proposed_by="agent",
++    )
++    page = approve(store, pr.id, approved_by="reviewer")
++    assert isinstance(page, Page)
++    assert page.type == "meeting-notes"
++    assert page.metadata["attendees"] == ["alice-example", "bob-example"]
++    # survives a round-trip to disk
++    assert store.get_page(page.id).metadata["attendees"] == ["alice-example", "bob-example"]
++
++
++def test_undeclared_kind_is_rejected(store: KBStore) -> None:
++    with pytest.raises(ProposalError) as exc:
++        propose_page(store, title="X", body="b", page_type="proposal", proposed_by="a")
++    assert "unknown page kind" in str(exc.value)
++
++
++# --- acceptance: per-field error on a missing required field ---------------
++
++
++def test_missing_required_field_reports_that_field(store: KBStore) -> None:
++    _declare_kinds(store, {"meeting-notes": {"required_fields": ["attendees", "date"]}})
++    with pytest.raises(ProposalError) as exc:
++        propose_page(
++            store,
++            title="Sync",
++            body="b",
++            page_type="meeting-notes",
++            metadata={"attendees": ["a"]},
++            proposed_by="agent",
++        )
++    msg = str(exc.value)
++    assert "date" in msg
++    assert "attendees" not in msg  # provided -> not reported
++
++
++# --- acceptance: built-in kinds keep working unchanged ---------------------
++
++
++@pytest.mark.parametrize("kind", ["entity", "decision", "concept", "session"])
++def test_builtin_kinds_unchanged(store: KBStore, kind: str) -> None:
++    pr = propose_page(store, title=f"a {kind}", body="b", page_type=kind, proposed_by="a")
++    page = approve(store, pr.id, approved_by="r")
++    assert isinstance(page, Page)
++    assert page.type == kind
++
++
++def test_builtin_default_page_type_still_concept(store: KBStore) -> None:
++    pr = propose_page(store, title="thing", body="b", proposed_by="a")
++    page = approve(store, pr.id, approved_by="r")
++    assert page.type == "concept"
++
++
++# --- frontmatter schema validation -----------------------------------------
++
++
++def test_frontmatter_schema_type_mismatch(store: KBStore) -> None:
++    _declare_kinds(
++        store,
++        {
++            "meeting-notes": {
++                "frontmatter_schema": {
++                    "type": "object",
++                    "properties": {"attendees": {"type": "array"}},
++                }
++            }
++        },
++    )
++    with pytest.raises(ProposalError) as exc:
++        propose_page(
++            store,
++            title="Sync",
++            body="b",
++            page_type="meeting-notes",
++            metadata={"attendees": "alice"},  # string, should be array
++            proposed_by="a",
++        )
++    assert "attendees" in str(exc.value)
++
++
++def test_frontmatter_schema_accepts_string_form(store: KBStore) -> None:
++    # the issue writes frontmatter_schema as a quoted inline string
++    _declare_kinds(
++        store,
++        {"meeting-notes": {"frontmatter_schema": "{type: object, required: [date]}"}},
++    )
++    with pytest.raises(ProposalError):
++        propose_page(store, title="S", body="b", page_type="meeting-notes", proposed_by="a")
++    pr = propose_page(
++        store,
++        title="S",
++        body="b",
++        page_type="meeting-notes",
++        metadata={"date": "2026-06-22"},
++        proposed_by="a",
++    )
++    assert pr.id
++
++
++# --- one-level inheritance (extends) ---------------------------------------
++
++
++def test_extends_merges_required_fields(store: KBStore) -> None:
++    _declare_kinds(
++        store,
++        {
++            "base-decision": {"required_fields": ["owner"]},
++            "decision-record": {"extends": "base-decision", "required_fields": ["date"]},
++        },
++    )
++    registry = load_page_kind_registry(store)
++    required, _schema, _cit = registry.resolve("decision-record")
++    assert set(required) == {"owner", "date"}
++
++
++def test_multi_level_inheritance_rejected(store: KBStore) -> None:
++    _declare_kinds(
++        store,
++        {
++            "a": {"required_fields": ["x"]},
++            "b": {"extends": "a"},
++            "c": {"extends": "b"},
++        },
++    )
++    with pytest.raises(PageKindError) as exc:
++        validate_page(store, "c", {}, has_citations=False)
++    assert "multi-level" in str(exc.value)
++
++
++def test_required_citations(store: KBStore) -> None:
++    _declare_kinds(store, {"cited": {"required_citations": True}})
++    with pytest.raises(ProposalError):
++        propose_page(store, title="t", body="b", page_type="cited", proposed_by="a")
++
++
++# --- CLI surface ------------------------------------------------------------
++
++
++def test_cli_propose_page_kind_and_meta(store: KBStore) -> None:
++    _declare_kinds(store, {"meeting-notes": {"required_fields": ["attendees"]}})
++    runner = CliRunner()
++    res = runner.invoke(
++        cli,
++        [
++            "propose-page",
++            "--title",
++            "Sync",
++            "--kind",
++            "meeting-notes",
++            "--meta",
++            "attendees=[alice, bob]",
++        ],
++    )
++    assert res.exit_code == 0, res.output
++
++
++def test_cli_schema_list_and_sync(store: KBStore) -> None:
++    _declare_kinds(store, {"meeting-notes": {"required_fields": ["attendees"]}})
++    runner = CliRunner()
++    listed = runner.invoke(cli, ["schema", "list"])
++    assert listed.exit_code == 0, listed.output
++    assert "meeting-notes" in listed.output
++
++    # a clean KB has no conflicts
++    sync = runner.invoke(cli, ["schema", "sync"])
++    assert sync.exit_code == 0, sync.output
++    assert "no conflicts" in sync.output
++
++
++def test_schema_sync_flags_pages_after_tightening(store: KBStore) -> None:
++    # propose+approve a meeting-notes page while no fields are required
++    _declare_kinds(store, {"meeting-notes": {}})
++    pr = propose_page(
++        store, title="Sync", body="b", page_type="meeting-notes", proposed_by="a"
++    )
++    approve(store, pr.id, approved_by="r")
++    # now tighten the kind: the existing page is missing the new field
++    _declare_kinds(store, {"meeting-notes": {"required_fields": ["attendees"]}})
++    res = CliRunner().invoke(cli, ["schema", "sync"])
++    assert res.exit_code == 1
++    assert "attendees" in res.output

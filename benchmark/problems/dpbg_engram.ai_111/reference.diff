@@ -1,0 +1,344 @@
+diff --git a/meta-programmer/src/meta_programmer/safety.py b/meta-programmer/src/meta_programmer/safety.py
+index 3f9d48e..f42820a 100644
+--- a/meta-programmer/src/meta_programmer/safety.py
++++ b/meta-programmer/src/meta_programmer/safety.py
+@@ -20,6 +20,8 @@
+ 
+ import ast
+ import os
++import subprocess
++import sys
+ from dataclasses import dataclass
+ from typing import Optional
+ 
+@@ -141,7 +143,43 @@ def is_dangerous(code: str) -> bool:
+     return any(f.severity == "high" for f in scan_source(code))
+ 
+ 
+-def deploy_atomically(target_path: str, code: str, validate_syntax: bool = True) -> tuple[bool, str]:
++def run_health_probe(target_path: str, timeout: float = 5.0) -> tuple[bool, str]:
++    """Import-probe the deployed module in an isolated subprocess (Phase E1.9.2).
++
++    Spawns a throwaway interpreter that tries to load the file via
++    ``importlib.util``. Any crash, import error, or hang within ``timeout``
++    seconds is treated as a probe failure and should trigger rollback.
++
++    Returns ``(ok, reason)``.
++    """
++    if not os.path.exists(target_path):
++        return False, f"deployed file not found: {target_path!r}"
++
++    probe = (
++        "import importlib.util, sys\n"
++        f"spec = importlib.util.spec_from_file_location('_probe', {target_path!r})\n"
++        "mod = importlib.util.module_from_spec(spec)\n"
++        "spec.loader.exec_module(mod)\n"
++        "print('ok')\n"
++    )
++    try:
++        result = subprocess.run(
++            [sys.executable, "-c", probe],
++            timeout=timeout,
++            capture_output=True,
++            text=True,
++        )
++        if result.returncode == 0:
++            return True, "health probe passed"
++        stderr = result.stderr.strip() or result.stdout.strip()
++        return False, f"probe failed (exit {result.returncode}): {stderr}"
++    except subprocess.TimeoutExpired:
++        return False, f"probe timed out after {timeout}s"
++    except Exception as e:  # noqa: BLE001
++        return False, f"probe error: {e}"
++
++
++def deploy_atomically(target_path: str, code: str, validate_syntax: bool = True, probe_timeout: float = 0.0) -> tuple[bool, str]:
+     """Write ``code`` to ``target_path`` with automatic rollback on failure (Phase 1.9).
+ 
+     A deploy must never leave the system in a half-broken state. This:
+@@ -187,6 +225,12 @@ def _rollback() -> None:
+                 _rollback()
+                 return False, f"rolled back — syntax error: {e}"
+ 
++        if probe_timeout > 0.0:
++            ok_probe, probe_reason = run_health_probe(target_path, timeout=probe_timeout)
++            if not ok_probe:
++                _rollback()
++                return False, f"rolled back — health probe failed: {probe_reason}"
++
+         return True, "deployed"
+     except Exception as e:  # noqa: BLE001 — any failure must trigger rollback
+         try:
+diff --git a/meta-programmer/src/meta_programmer/service.py b/meta-programmer/src/meta_programmer/service.py
+index dfa8ff4..1eb61b6 100644
+--- a/meta-programmer/src/meta_programmer/service.py
++++ b/meta-programmer/src/meta_programmer/service.py
+@@ -7,6 +7,7 @@
+ 
+ import asyncio
+ import json
++import math
+ import os
+ import time
+ from typing import Any, Optional
+@@ -53,6 +54,17 @@ def __init__(self):
+         self.defer_ttl_ms = int(os.environ.get("DEFER_TTL_MS", "300000"))  # 5 min
+         self._sweep_task: Optional[asyncio.Task] = None
+ 
++        # Post-deploy health probe timeout (E1.9.2); 0 disables the probe.
++        # Reject nan/inf/negative — any of these would silently disable or
++        # mis-configure the fail-closed probe, which is a safety violation.
++        _raw_timeout = float(os.environ.get("HEALTH_PROBE_TIMEOUT_SECONDS", "5.0"))
++        if not (math.isfinite(_raw_timeout) and _raw_timeout >= 0.0):
++            raise ValueError(
++                "HEALTH_PROBE_TIMEOUT_SECONDS must be 0 (probe disabled) or a "
++                f"positive finite number; got {os.environ.get('HEALTH_PROBE_TIMEOUT_SECONDS')!r}"
++            )
++        self._health_probe_timeout = _raw_timeout
++
+         # Metrics
+         self._gaps_processed = 0
+         self._code_generated = 0
+@@ -61,6 +73,8 @@ def __init__(self):
+         self._sandbox_unavailable = 0  # fail-closed blocks (containment could not run)
+         self._deployments = 0
+         self._reviews_expired = 0
++        self._health_probe_failures = 0  # E1.9.2: deploys that failed the post-deploy probe
++        self._auto_rollbacks = 0         # E1.9.2: automatic rollbacks triggered by probe failure
+ 
+     async def _setup(self) -> None:
+         """Initialize service-specific setup."""
+@@ -348,11 +362,34 @@ async def _deploy_code(self, trace_id: str, target_path: str, code: str) -> None
+             target_path = resolved
+ 
+             # Write atomically: snapshot any existing file, validate the new
+-            # code compiles, and roll back to the prior content (or remove a
+-            # newly-created file) on any failure — never leave a broken artifact.
+-            ok, detail = deploy_atomically(target_path, code)
++            # code compiles, run a post-deploy health probe (E1.9.2), and roll
++            # back to the prior content (or remove a newly-created file) on any
++            # failure — never leave a broken artifact.
++            ok, detail = await asyncio.to_thread(
++                lambda: deploy_atomically(target_path, code, probe_timeout=self._health_probe_timeout)
++            )
+             if not ok:
+-                self.logger.error("Deploy rolled back for %s: %s", target_path, detail)
++                if "health probe" in detail:
++                    self._health_probe_failures += 1
++                    self._auto_rollbacks += 1
++                    self.logger.error(
++                        "POST-DEPLOY HEALTH PROBE FAILED for %s at %s — auto-rolled back. %s",
++                        trace_id, target_path, detail,
++                    )
++                    try:
++                        await self.event_bus.publish(
++                            "deploy.rolled_back",
++                            {
++                                "trace_id": trace_id,
++                                "target_path": target_path,
++                                "reason": detail,
++                                "auto_rollback": True,
++                            },
++                        )
++                    except Exception as pub_err:
++                        self.logger.warning("Could not publish deploy.rolled_back event: %s", pub_err)
++                else:
++                    self.logger.error("Deploy rolled back for %s: %s", target_path, detail)
+                 raise RuntimeError(f"Deploy rolled back: {detail}")
+ 
+             self.logger.info(f"Deployed code to: {target_path}")
+@@ -399,6 +436,29 @@ async def _publish_gap_result(
+         except Exception as e:
+             self.logger.error(f"Error publishing gap result: {e}")
+ 
++    async def _handle_status(self, data: dict[str, Any]) -> None:
++        """Handle status requests."""
++        try:
++            ac = self._approval_consumer
++            status = {
++                "status": "running",
++                "metrics": {
++                    "gaps_processed": self._gaps_processed,
++                    "code_generated": self._code_generated,
++                    "tests_passed": self._tests_passed + (ac.tests_passed if ac else 0),
++                    "tests_failed": self._tests_failed + (ac.tests_failed if ac else 0),
++                    "deployments": self._deployments + (ac.deployments if ac else 0),
++                    "reviews_expired": self._reviews_expired,
++                    "sandbox_unavailable": self._sandbox_unavailable,
++                    "health_probe_failures": self._health_probe_failures,
++                    "auto_rollbacks": self._auto_rollbacks,
++                },
++            }
++
++            # Publish status response
++            await self.event_bus.publish("metaprogrammer.status.response", status)
++        except Exception as e:
++            self.logger.error(f"Error getting status: {e}")
+     async def _handle_status(self, _data: dict[str, Any], msg: Msg) -> None:
+         """Reply to status requests via request-reply."""
+         ac = self._approval_consumer
+diff --git a/meta-programmer/tests/test_health_probe.py b/meta-programmer/tests/test_health_probe.py
+new file mode 100644
+index 0000000..7df5912
+--- /dev/null
++++ b/meta-programmer/tests/test_health_probe.py
+@@ -0,0 +1,159 @@
++"""Tests for post-deploy health probe and auto-rollback (Phase E1.9.2).
++
++Covers:
++- run_health_probe: pass, import-error, missing file, timeout
++- deploy_atomically with probe_timeout: rollback over existing file,
++  removal of newly-created broken file, and pass-through for healthy artifact.
++- Default behaviour (probe_timeout=0): import-time crashes are not caught
++  (only syntax is checked), i.e. the probe is opt-in.
++"""
++
++import importlib.util
++import os
++import sys
++import tempfile
++import time
++
++# Load safety.py directly so the test doesn't pull in the `docker` SDK.
++_SAFETY_PATH = os.path.join(
++    os.path.dirname(__file__), "..", "src", "meta_programmer", "safety.py"
++)
++_spec = importlib.util.spec_from_file_location("mp_safety_hp", _SAFETY_PATH)
++_safety = importlib.util.module_from_spec(_spec)
++sys.modules["mp_safety_hp"] = _safety
++_spec.loader.exec_module(_safety)
++
++run_health_probe = _safety.run_health_probe
++deploy_atomically = _safety.deploy_atomically
++
++
++# ── run_health_probe unit tests ───────────────────────────────────────────────
++
++def test_probe_passes_for_valid_module():
++    with tempfile.TemporaryDirectory() as d:
++        target = os.path.join(d, "plugin.py")
++        with open(target, "w") as f:
++            f.write("LOADED = True\n")
++        ok, reason = run_health_probe(target, timeout=5.0)
++        assert ok is True
++        assert "passed" in reason
++
++
++def test_probe_fails_for_import_error():
++    with tempfile.TemporaryDirectory() as d:
++        target = os.path.join(d, "broken.py")
++        with open(target, "w") as f:
++            f.write("raise ImportError('intentional failure')\n")
++        ok, reason = run_health_probe(target, timeout=5.0)
++        assert ok is False
++        assert "probe failed" in reason
++
++
++def test_probe_fails_for_runtime_error_at_import():
++    with tempfile.TemporaryDirectory() as d:
++        target = os.path.join(d, "crasher.py")
++        with open(target, "w") as f:
++            f.write("raise RuntimeError('crash at module level')\n")
++        ok, reason = run_health_probe(target, timeout=5.0)
++        assert ok is False
++        assert "probe failed" in reason
++
++
++def test_probe_fails_for_missing_file():
++    ok, reason = run_health_probe("/nonexistent/path/to/plugin.py", timeout=5.0)
++    assert ok is False
++    assert "not found" in reason
++
++
++def test_probe_times_out_for_hanging_module():
++    with tempfile.TemporaryDirectory() as d:
++        target = os.path.join(d, "hanging.py")
++        with open(target, "w") as f:
++            # Hangs immediately at import time
++            f.write("import time\ntime.sleep(60)\n")
++        start = time.monotonic()
++        ok, reason = run_health_probe(target, timeout=1.0)
++        elapsed = time.monotonic() - start
++        assert ok is False
++        assert "timed out" in reason
++        # Must not take much longer than the configured timeout
++        assert elapsed < 5.0
++
++
++# ── deploy_atomically with probe_timeout ─────────────────────────────────────
++
++def test_deploy_with_probe_passes_healthy_artifact():
++    with tempfile.TemporaryDirectory() as d:
++        target = os.path.join(d, "plugin.py")
++        ok, detail = deploy_atomically(target, "VERSION = '1.0'\n", probe_timeout=5.0)
++        assert ok is True
++        assert "deployed" in detail
++        with open(target) as f:
++            assert "VERSION" in f.read()
++
++
++def test_deploy_with_probe_rolls_back_broken_artifact_over_existing():
++    """Artifact that crashes at import-time must restore the prior good file."""
++    with tempfile.TemporaryDirectory() as d:
++        target = os.path.join(d, "plugin.py")
++        with open(target, "w") as f:
++            f.write("GOOD = True\n")
++
++        ok, detail = deploy_atomically(
++            target,
++            "raise ImportError('deliberate probe failure')\n",
++            probe_timeout=5.0,
++        )
++
++        assert ok is False
++        assert "rolled back" in detail
++        assert "health probe" in detail
++        # Prior content must be restored intact.
++        with open(target) as f:
++            assert f.read() == "GOOD = True\n"
++
++
++def test_deploy_with_probe_removes_new_broken_artifact():
++    """A brand-new file that fails the probe must be cleaned up entirely."""
++    with tempfile.TemporaryDirectory() as d:
++        target = os.path.join(d, "new_plugin.py")
++
++        ok, detail = deploy_atomically(
++            target,
++            "raise RuntimeError('crash on import')\n",
++            probe_timeout=5.0,
++        )
++
++        assert ok is False
++        assert "rolled back" in detail
++        assert "health probe" in detail
++        assert not os.path.exists(target)
++
++
++def test_deploy_with_probe_replaces_existing_on_success():
++    with tempfile.TemporaryDirectory() as d:
++        target = os.path.join(d, "plugin.py")
++        with open(target, "w") as f:
++            f.write("OLD = 1\n")
++
++        ok, detail = deploy_atomically(target, "NEW = 2\n", probe_timeout=5.0)
++
++        assert ok is True
++        with open(target) as f:
++            assert f.read() == "NEW = 2\n"
++
++
++# ── default behaviour: no probe unless probe_timeout > 0 ─────────────────────
++
++def test_deploy_without_probe_does_not_catch_import_errors():
++    """With probe_timeout=0 (default) only syntax is checked — import-time
++    crashes are NOT caught, so a valid-syntax but crashing module deploys."""
++    with tempfile.TemporaryDirectory() as d:
++        target = os.path.join(d, "plugin.py")
++        ok, detail = deploy_atomically(
++            target,
++            "raise RuntimeError('crash on import')\n",
++        )
++        # Valid Python syntax — should be written successfully (no probe)
++        assert ok is True
++        assert os.path.exists(target)

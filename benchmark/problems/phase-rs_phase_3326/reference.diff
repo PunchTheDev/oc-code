@@ -1,0 +1,1275 @@
+diff --git a/crates/engine/src/game/casting_costs.rs b/crates/engine/src/game/casting_costs.rs
+index d075d34dc4..6ca4758acc 100644
+--- a/crates/engine/src/game/casting_costs.rs
++++ b/crates/engine/src/game/casting_costs.rs
+@@ -7563,6 +7563,39 @@ pub fn cost_has_x(cost: &crate::types::mana::ManaCost) -> bool {
+     }
+ }
+ 
++/// Return true when an activated ability's cost contains `{X}` anywhere in its
++/// cost tree (including composite costs like `{T}, Pay {X}`).
++pub fn ability_cost_has_x(cost: &crate::types::ability::AbilityCost) -> bool {
++    use crate::types::ability::AbilityCost;
++    match cost {
++        AbilityCost::Mana { cost } => cost_has_x(cost),
++        AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
++            costs.iter().any(ability_cost_has_x)
++        }
++        _ => false,
++    }
++}
++
++/// Return true when `source_id`'s most recent pending activation carries an
++/// `{X}` activation cost. Used by `AbilityActivated` trigger matchers.
++pub fn pending_activation_cost_has_x(state: &GameState, source_id: ObjectId) -> bool {
++    let Some((_, ability_index)) = state
++        .pending_activations
++        .iter()
++        .rev()
++        .find(|(id, _)| *id == source_id)
++    else {
++        return false;
++    };
++    let Some(obj) = state.objects.get(&source_id) else {
++        return false;
++    };
++    let Some(ability) = obj.abilities.get(*ability_index) else {
++        return false;
++    };
++    ability.cost.as_ref().is_some_and(ability_cost_has_x)
++}
++
+ /// Extract a mana sub-cost containing X from an activated ability cost.
+ ///
+ /// CR 107.1b + CR 601.2f: X must be chosen before mana is paid. For composite
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index 4ff66a136b..021aac6d42 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -722,6 +722,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
+                 parts.push(format!("not {}", fmt_typed_filter(&inner_tf)));
+             }
+             FilterProp::HasXInManaCost => parts.push("with {X} in cost".into()),
++            FilterProp::HasXInActivationCost => parts.push("with {X} in activation cost".into()),
+             FilterProp::HasManaAbility => parts.push("with a mana ability".into()),
+             FilterProp::HasNoAbilities => parts.push("with no abilities".into()),
+         }
+diff --git a/crates/engine/src/game/effects/copy_spell.rs b/crates/engine/src/game/effects/copy_spell.rs
+index 160bfb4af2..3a639ac0b3 100644
+--- a/crates/engine/src/game/effects/copy_spell.rs
++++ b/crates/engine/src/game/effects/copy_spell.rs
+@@ -73,16 +73,21 @@ pub fn resolve(
+     //     (Twincast, Gogo) resolve under the copying player.
+     let copy_kind = {
+         let mut kind = top_entry.kind.clone();
+-        if let StackEntryKind::Spell {
+-            ability: Some(ref mut a),
+-            ..
+-        } = kind
+-        {
+-            set_resolved_source_recursive(a, copy_id);
+-            a.context.additional_cost_paid = false;
+-            a.context.alternative_mana_cost_paid = false;
+-            a.context.additional_cost_payment_count = 0;
+-            a.context.kickers_paid.clear();
++        match &mut kind {
++            StackEntryKind::Spell {
++                ability: Some(ref mut a),
++                ..
++            } => {
++                set_resolved_source_recursive(a, copy_id);
++                a.context.additional_cost_paid = false;
++                a.context.alternative_mana_cost_paid = false;
++                a.context.additional_cost_payment_count = 0;
++                a.context.kickers_paid.clear();
++            }
++            StackEntryKind::ActivatedAbility { ability, .. } => {
++                set_resolved_source_recursive(ability, copy_id);
++            }
++            _ => {}
+         }
+         set_copied_kind_controller(&mut kind, copy_controller);
+         kind
+@@ -397,7 +402,18 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Sta
+         return state
+             .stack
+             .iter()
+-            .find(|entry| entry.id == target_id)
++            .rev()
++            .find(|entry| {
++                entry.id == target_id
++                    || entry.source_id == target_id
++                    || matches!(
++                        &entry.kind,
++                        StackEntryKind::ActivatedAbility {
++                            source_id: activated_id,
++                            ..
++                        } if *activated_id == target_id
++                    )
++            })
+             .cloned();
+     }
+     if matches!(
+@@ -443,8 +459,21 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Sta
+ fn triggering_spell_stack_entry(state: &GameState) -> Option<StackEntry> {
+     let event = state.current_trigger_event.as_ref()?;
+     let object_id = crate::game::targeting::extract_source_from_event(event)?;
++    if matches!(event, GameEvent::AbilityActivated { .. }) {
++        if let Some(entry) = state.stack.iter().rev().find(|entry| {
++            matches!(
++                entry.kind,
++                StackEntryKind::ActivatedAbility {
++                    source_id: activated_id,
++                    ..
++                } if activated_id == object_id
++            ) || entry.source_id == object_id
++        }) {
++            return Some(entry.clone());
++        }
++    }
+     let mut fallback = None;
+-    for entry in &state.stack {
++    for entry in state.stack.iter().rev() {
+         if entry.id == object_id {
+             return Some(entry.clone());
+         }
+@@ -520,7 +549,8 @@ mod tests {
+     use super::*;
+     use crate::game::game_object::GameObject;
+     use crate::types::ability::{
+-        ControllerRef, CopyRetargetPermission, Effect, QuantityExpr, TargetFilter, TargetRef,
++        ControllerRef, CopyRetargetPermission, Effect, QuantityExpr, QuantityRef, TargetFilter,
++        TargetRef,
+     };
+     use crate::types::game_state::{CastingVariant, StackEntry, StackEntryKind};
+     use crate::types::identifiers::{CardId, ObjectId};
+@@ -1593,6 +1623,130 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn copy_spell_triggering_source_copies_activated_ability_on_stack() {
++        let mut state = GameState::new_two_player(42);
++        let source_creature = ObjectId(10);
++        let magus = ObjectId(20);
++
++        let mut draw_resolved = ResolvedAbility::new(
++            Effect::Draw {
++                count: QuantityExpr::Ref {
++                    qty: QuantityRef::CostXPaid,
++                },
++                target: TargetFilter::Controller,
++            },
++            vec![],
++            source_creature,
++            PlayerId(0),
++        );
++        draw_resolved.chosen_x = Some(2);
++
++        state.stack.push_back(StackEntry {
++            id: ObjectId(100),
++            source_id: source_creature,
++            controller: PlayerId(0),
++            kind: StackEntryKind::ActivatedAbility {
++                source_id: source_creature,
++                ability: draw_resolved,
++            },
++        });
++
++        state.current_trigger_event = Some(GameEvent::AbilityActivated {
++            player_id: PlayerId(0),
++            source_id: source_creature,
++        });
++
++        let copy_effect = ResolvedAbility::new(
++            Effect::CopySpell {
++                target: TargetFilter::TriggeringSource,
++                retarget: CopyRetargetPermission::MayChooseNewTargets,
++                copier: None,
++            },
++            vec![],
++            magus,
++            PlayerId(0),
++        );
++
++        let mut events = Vec::new();
++        resolve(&mut state, &copy_effect, &mut events).unwrap();
++
++        assert_eq!(
++            state.stack.len(),
++            2,
++            "copy must remain on stack below the copy"
++        );
++        let copied = state.stack.back().unwrap().ability().expect("copy entry");
++        assert_eq!(
++            copied.chosen_x,
++            Some(2),
++            "activated-ability copies must preserve announced X"
++        );
++        assert!(
++            events
++                .iter()
++                .any(|event| matches!(event, GameEvent::StackPushed { .. })),
++            "copying an activated ability must push a stack entry"
++        );
++    }
++
++    #[test]
++    fn copy_spell_hydrated_triggering_source_finds_activated_ability_by_permanent_id() {
++        let mut state = GameState::new_two_player(42);
++        let source_creature = ObjectId(10);
++        let magus = ObjectId(20);
++
++        let mut draw_resolved = ResolvedAbility::new(
++            Effect::Draw {
++                count: QuantityExpr::Ref {
++                    qty: QuantityRef::CostXPaid,
++                },
++                target: TargetFilter::Controller,
++            },
++            vec![],
++            source_creature,
++            PlayerId(0),
++        );
++        draw_resolved.chosen_x = Some(2);
++
++        state.stack.push_back(StackEntry {
++            id: ObjectId(100),
++            source_id: source_creature,
++            controller: PlayerId(0),
++            kind: StackEntryKind::ActivatedAbility {
++                source_id: source_creature,
++                ability: draw_resolved,
++            },
++        });
++
++        state.current_trigger_event = Some(GameEvent::AbilityActivated {
++            player_id: PlayerId(0),
++            source_id: source_creature,
++        });
++
++        let copy_effect = ResolvedAbility::new(
++            Effect::CopySpell {
++                target: TargetFilter::TriggeringSource,
++                retarget: CopyRetargetPermission::KeepOriginalTargets,
++                copier: None,
++            },
++            vec![TargetRef::Object(source_creature)],
++            magus,
++            PlayerId(0),
++        );
++
++        let mut events = Vec::new();
++        resolve(&mut state, &copy_effect, &mut events).unwrap();
++
++        assert_eq!(state.stack.len(), 2);
++        assert!(
++            events
++                .iter()
++                .any(|event| matches!(event, GameEvent::StackPushed { .. })),
++            "hydrated TriggeringSource must copy the activated ability on stack"
++        );
++    }
++
+     #[test]
+     fn uncopyable_activated_ability_on_stack_is_not_copied_through_stack_resolution() {
+         let mut state = GameState::new_two_player(42);
+diff --git a/crates/engine/src/game/effects/delayed_trigger.rs b/crates/engine/src/game/effects/delayed_trigger.rs
+index c14b32ccd5..ccb4c3b417 100644
+--- a/crates/engine/src/game/effects/delayed_trigger.rs
++++ b/crates/engine/src/game/effects/delayed_trigger.rs
+@@ -234,8 +234,7 @@ fn bind_contextual_filter_to_condition(
+         DelayedTriggerCondition::WhenDiesOrExiled { filter } => {
+             bind_parent_target_filter(filter, parent_targets);
+         }
+-        DelayedTriggerCondition::WheneverEvent { trigger }
+-        | DelayedTriggerCondition::WhenNextEvent { trigger } => {
++        DelayedTriggerCondition::WheneverEvent { trigger } => {
+             for filter in [
+                 &mut trigger.valid_card,
+                 &mut trigger.valid_source,
+@@ -247,6 +246,33 @@ fn bind_contextual_filter_to_condition(
+                 bind_parent_target_filter(filter, parent_targets);
+             }
+         }
++        DelayedTriggerCondition::WhenNextEvent {
++            trigger,
++            or_trigger,
++        } => {
++            for filter in [
++                &mut trigger.valid_card,
++                &mut trigger.valid_source,
++                &mut trigger.valid_target,
++            ]
++            .into_iter()
++            .flatten()
++            {
++                bind_parent_target_filter(filter, parent_targets);
++            }
++            if let Some(alt) = or_trigger {
++                for filter in [
++                    &mut alt.valid_card,
++                    &mut alt.valid_source,
++                    &mut alt.valid_target,
++                ]
++                .into_iter()
++                .flatten()
++                {
++                    bind_parent_target_filter(filter, parent_targets);
++                }
++            }
++        }
+         _ => {}
+     }
+ }
+diff --git a/crates/engine/src/game/filter.rs b/crates/engine/src/game/filter.rs
+index f7cf4f1ecc..83591cd160 100644
+--- a/crates/engine/src/game/filter.rs
++++ b/crates/engine/src/game/filter.rs
+@@ -197,6 +197,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
+         | FilterProp::AttackedOrBlockedThisTurn
+         | FilterProp::FaceDown
+         | FilterProp::HasXInManaCost
++        | FilterProp::HasXInActivationCost
+         | FilterProp::HasManaAbility
+         | FilterProp::HasNoAbilities
+         | FilterProp::Named { .. }
+@@ -396,6 +397,7 @@ fn entered_object_perturbs_filter_prop(
+         | FilterProp::AttackedOrBlockedThisTurn
+         | FilterProp::FaceDown
+         | FilterProp::HasXInManaCost
++        | FilterProp::HasXInActivationCost
+         | FilterProp::HasManaAbility
+         | FilterProp::HasNoAbilities
+         | FilterProp::Named { .. }
+@@ -2516,6 +2518,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
+         // CR 107.3 + CR 202.1: The snapshot captured whether the printed mana
+         // cost contained an `{X}` shard at cast time.
+         FilterProp::HasXInManaCost => record.has_x_in_cost,
++        FilterProp::HasXInActivationCost => false,
+         // CR 605.1: Spell-cast records snapshot the spell object, not the
+         // object's ability list. Fail closed for history predicates.
+         FilterProp::HasManaAbility
+@@ -2948,6 +2951,12 @@ fn matches_filter_prop(
+         // printed mana cost for an `{X}` shard. Applies to spells on the stack
+         // and to any live-object evaluation path (e.g. static-ability filters).
+         FilterProp::HasXInManaCost => crate::game::casting_costs::cost_has_x(&obj.mana_cost),
++        // CR 107.3 + CR 601.2f: "{X} in its activation cost" — consult the
++        // pending activation record for the matched source object. Composes with
++        // typed type/controller filters via `TargetFilter::And`/`Or`.
++        FilterProp::HasXInActivationCost => {
++            crate::game::casting_costs::pending_activation_cost_has_x(state, object_id)
++        }
+         // CR 605.1: Delegate to the single mana-ability classifier instead of
+         // duplicating the definition at the filter layer.
+         FilterProp::HasManaAbility => obj
+@@ -3778,6 +3787,7 @@ fn zone_change_record_matches_property(
+         // meaning for a zone-change record (the object has already left the stack
+         // or never was a spell). Fail closed — the snapshot carries no such info.
+         | FilterProp::HasXInManaCost
++        | FilterProp::HasXInActivationCost
+         // CR 605.1: Zone-change records do not snapshot ability lists.
+         | FilterProp::HasManaAbility
+         // CR 113.1 + CR 113.3: Zone-change records do not snapshot all
+@@ -4953,6 +4963,54 @@ mod tests {
+         );
+     }
+ 
++    /// CR 107.3 + CR 601.2f: `FilterProp::HasXInActivationCost` consults the
++    /// pending activation record and composes with typed filters via `And`.
++    #[test]
++    fn pending_activation_has_x_in_activation_cost_composes_with_type_filter() {
++        use crate::types::ability::{
++            AbilityCost, AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter as Tf,
++            TypedFilter,
++        };
++        use crate::types::mana::{ManaCost, ManaCostShard};
++
++        let mut state = GameState::new_two_player(42);
++        let source = add_creature(&mut state, PlayerId(0), "X Activator");
++        let mut ability = AbilityDefinition::new(
++            AbilityKind::Activated,
++            Effect::Draw {
++                count: QuantityExpr::Fixed { value: 1 },
++                target: Tf::Controller,
++            },
++        );
++        ability.cost = Some(AbilityCost::Mana {
++            cost: ManaCost::Cost {
++                generic: 0,
++                shards: vec![ManaCostShard::X],
++            },
++        });
++        std::sync::Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities)
++            .push(ability);
++        state.pending_activations.push((source, 0));
++
++        let filter = TargetFilter::And {
++            filters: vec![
++                TargetFilter::Typed(TypedFilter::creature()),
++                TargetFilter::Typed(
++                    TypedFilter::default().properties(vec![FilterProp::HasXInActivationCost]),
++                ),
++            ],
++        };
++        assert!(
++            matches_target_filter(&state, source, &filter, source),
++            "creature source with pending X activation must match composed filter"
++        );
++        state.pending_activations.clear();
++        assert!(
++            !matches_target_filter(&state, source, &filter, source),
++            "without pending activation, HasXInActivationCost must fail"
++        );
++    }
++
+     #[test]
+     fn spell_record_matches_cast_origin_zone_filter() {
+         let hand_record = SpellCastRecord {
+diff --git a/crates/engine/src/game/mana_abilities.rs b/crates/engine/src/game/mana_abilities.rs
+index 5e597b9499..66a10c4c67 100644
+--- a/crates/engine/src/game/mana_abilities.rs
++++ b/crates/engine/src/game/mana_abilities.rs
+@@ -43,6 +43,9 @@ pub fn is_mana_ability(ability_def: &AbilityDefinition) -> bool {
+     // `Effect::Mana::target` field (Jeska's Will mode 1: "Add {R} for each
+     // card in target opponent's hand" — the spell targets, so it must use the
+     // stack and is not a mana ability under CR 605).
++    if ability_def.multi_target.is_some() || target_attached.is_some() {
++        return false;
++    }
+     ability_def.multi_target.is_none() && target_attached.is_none()
+ }
+ 
+@@ -2709,10 +2712,11 @@ mod tests {
+     use crate::game::zones::create_object;
+     use crate::types::ability::{
+         AbilityCondition, AbilityCost, AbilityKind, AbilityTag, ActivationRestriction, Comparator,
+-        ContinuousModification, ControllerRef, DevotionColors, Duration, Effect, FilterProp,
+-        LinkedExileScope, ManaContribution, ManaProduction, MultiTargetSpec, ObjectScope,
+-        PlayerScope, QuantityExpr, QuantityRef, SacrificeCost, StaticDefinition, TargetFilter,
+-        TypeFilter, TypedFilter, REMOVE_COUNTER_COST_ANY_NUMBER,
++        ContinuousModification, ControllerRef, CopyRetargetPermission, DelayedTriggerCondition,
++        DevotionColors, Duration, Effect, FilterProp, LinkedExileScope, ManaContribution,
++        ManaProduction, MultiTargetSpec, ObjectScope, PlayerScope, QuantityExpr, QuantityRef,
++        SacrificeCost, StaticDefinition, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter,
++        REMOVE_COUNTER_COST_ANY_NUMBER,
+     };
+     use crate::types::card_type::CoreType;
+     use crate::types::counter::CounterType;
+@@ -2868,6 +2872,90 @@ mod tests {
+         assert!(!is_mana_ability(&def));
+     }
+ 
++    #[test]
++    fn mana_with_delayed_trigger_sub_remains_mana_ability() {
++        let mut head = make_mana_ability(ManaProduction::Colorless {
++            count: QuantityExpr::Fixed { value: 2 },
++        });
++        head.sub_ability = Some(Box::new(AbilityDefinition::new(
++            AbilityKind::Spell,
++            Effect::CreateDelayedTrigger {
++                condition: DelayedTriggerCondition::WhenNextEvent {
++                    trigger: Box::new(TriggerDefinition::new(TriggerMode::SpellCast)),
++                    or_trigger: None,
++                },
++                effect: Box::new(AbilityDefinition::new(
++                    AbilityKind::Spell,
++                    Effect::CopySpell {
++                        target: TargetFilter::TriggeringSource,
++                        retarget: CopyRetargetPermission::KeepOriginalTargets,
++                        copier: None,
++                    },
++                )),
++                uses_tracked_set: false,
++            },
++        )));
++        assert!(
++            is_mana_ability(&head),
++            "CR 605.1: chained delayed triggers do not disqualify activated mana abilities"
++        );
++    }
++
++    #[test]
++    fn resolve_mana_ability_sub_chain_registers_delayed_trigger() {
++        use crate::types::ability::{
++            CopyRetargetPermission, DelayedTriggerCondition, FilterProp, TriggerDefinition,
++            TypedFilter,
++        };
++        use crate::types::triggers::TriggerMode;
++
++        let mut state = GameState::new_two_player(42);
++        let obj_id = create_object(
++            &mut state,
++            CardId(1),
++            PlayerId(0),
++            "Magus Lucea Kane".to_string(),
++            Zone::Battlefield,
++        );
++
++        let copy_effect = AbilityDefinition::new(
++            AbilityKind::Spell,
++            Effect::CopySpell {
++                target: TargetFilter::TriggeringSource,
++                retarget: CopyRetargetPermission::MayChooseNewTargets,
++                copier: None,
++            },
++        );
++        let delayed = AbilityDefinition::new(
++            AbilityKind::Spell,
++            Effect::CreateDelayedTrigger {
++                condition: DelayedTriggerCondition::WhenNextEvent {
++                    trigger: Box::new({
++                        let mut trigger = TriggerDefinition::new(TriggerMode::SpellCast);
++                        trigger.valid_card = Some(TargetFilter::Typed(
++                            TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
++                        ));
++                        trigger.valid_target = Some(TargetFilter::Controller);
++                        trigger
++                    }),
++                    or_trigger: None,
++                },
++                effect: Box::new(copy_effect),
++                uses_tracked_set: false,
++            },
++        );
++        let mut def = make_mana_ability(ManaProduction::Colorless {
++            count: QuantityExpr::Fixed { value: 2 },
++        });
++        def.sub_ability = Some(Box::new(delayed));
++
++        let mut events = Vec::new();
++        resolve_mana_ability(&mut state, obj_id, PlayerId(0), &def, &mut events, None).unwrap();
++
++        assert_eq!(state.delayed_triggers.len(), 1);
++        assert!(state.objects.get(&obj_id).unwrap().tapped);
++    }
++
+     #[test]
+     fn mana_with_roll_die_sub_remains_mana_ability() {
+         // CR 605.1: mana abilities remain mana abilities regardless of other
+diff --git a/crates/engine/src/game/trigger_matchers.rs b/crates/engine/src/game/trigger_matchers.rs
+index 2a68a0d8eb..45cbf8b964 100644
+--- a/crates/engine/src/game/trigger_matchers.rs
++++ b/crates/engine/src/game/trigger_matchers.rs
+@@ -3903,8 +3903,10 @@ pub(super) fn match_ability_activated(
+     else {
+         return false;
+     };
+-    valid_player_matches(trigger, state, *player_id, source_id)
+-        && valid_card_matches(trigger, state, *activated_id, source_id)
++    if !valid_player_matches(trigger, state, *player_id, source_id) {
++        return false;
++    }
++    valid_card_matches(trigger, state, *activated_id, source_id)
+ }
+ 
+ /// CR 702.26c: Matches when a permanent phases in.
+diff --git a/crates/engine/src/game/triggers.rs b/crates/engine/src/game/triggers.rs
+index e21d542078..e7ed4d1f88 100644
+--- a/crates/engine/src/game/triggers.rs
++++ b/crates/engine/src/game/triggers.rs
+@@ -4287,8 +4287,7 @@ fn delayed_trigger_event(
+             })
+             .cloned(),
+         // CR 603.7c: "Whenever [event] this turn" — delegate to trigger matcher registry.
+-        DelayedTriggerCondition::WheneverEvent { trigger }
+-        | DelayedTriggerCondition::WhenNextEvent { trigger } => {
++        DelayedTriggerCondition::WheneverEvent { trigger } => {
+             if let Some(matcher) = super::trigger_matchers::trigger_matcher(trigger.mode.clone()) {
+                 events
+                     .iter()
+@@ -4298,6 +4297,24 @@ fn delayed_trigger_event(
+                 None
+             }
+         }
++        // CR 603.7: "When you next [event] this turn" — one-shot; optional
++        // `or_trigger` covers disjunctive clauses (Magus Lucea Kane).
++        // Scan newest-to-oldest so a batch containing several events binds
++        // the most recent match (the activation/cast that fired the trigger).
++        DelayedTriggerCondition::WhenNextEvent {
++            trigger,
++            or_trigger,
++        } => events.iter().rev().find_map(|event| {
++            for t in std::iter::once(trigger.as_ref()).chain(or_trigger.iter().map(|b| b.as_ref()))
++            {
++                if let Some(matcher) = super::trigger_matchers::trigger_matcher(t.mode.clone()) {
++                    if matcher(event, t, source_id, state) {
++                        return Some(event.clone());
++                    }
++                }
++            }
++            None
++        }),
+     }
+ }
+ 
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index 7ba7f6c96c..d93b964529 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -3276,6 +3276,24 @@ pub(super) fn parse_utility_imperative_ast(
+             }),
+             "copy" => {
+                 let rest_lower = &lower[lower.len() - rest.len()..];
++                if tag::<_, _, OracleError<'_>>("that spell or ability")
++                    .parse(rest_lower)
++                    .is_ok()
++                {
++                    let consumed = "that spell or ability".len();
++                    let rem = &rest[consumed..];
++                    let retarget = if super::sequence::recognize_copy_retarget_clause(rem.trim()) {
++                        CopyRetargetPermission::MayChooseNewTargets
++                    } else {
++                        #[cfg(debug_assertions)]
++                        assert_no_compound_remainder(rem, text);
++                        CopyRetargetPermission::KeepOriginalTargets
++                    };
++                    return Some(UtilityImperativeAst::Copy {
++                        target: TargetFilter::TriggeringSource,
++                        retarget,
++                    });
++                }
+                 let (target, _rem) = if let Some((target, rem_lower)) =
+                     parse_copy_stack_ability_target(rest_lower)
+                 {
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index cf72889872..afbcf81bee 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -602,6 +602,64 @@ fn extract_when_next_spell_filter(payload: &str) -> Option<TargetFilter> {
+     })
+ }
+ 
++const WHEN_NEXT_OR_ACTIVATE_ABILITY: &str = " or activate an ability ";
++
++/// CR 603.7: Parse a disjunctive delayed-trigger condition of the form
++/// "cast a <spell-qualifier> or activate an ability <activation-qualifier>".
++/// Each branch lowers into a normal `TriggerDefinition` filter via the shared
++/// spell/activation post-modifier combinators.
++fn try_parse_when_next_spell_or_activate_disjunction(
++    condition_fragment: &str,
++) -> Option<(TargetFilter, TargetFilter)> {
++    use nom::bytes::complete::{tag, take_until};
++    use nom::Parser;
++
++    let (rest, spell_part) = take_until::<_, _, OracleError<'_>>(WHEN_NEXT_OR_ACTIVATE_ABILITY)
++        .parse(condition_fragment.trim())
++        .ok()?;
++    let (activation_part, _) = tag::<_, _, OracleError<'_>>(WHEN_NEXT_OR_ACTIVATE_ABILITY)
++        .parse(rest)
++        .ok()?;
++    let spell_filter = extract_when_next_spell_filter(spell_part.trim())?;
++    let ability_filter =
++        crate::parser::oracle_trigger::parse_post_activation_modifier(activation_part.trim())?;
++    Some((spell_filter, ability_filter))
++}
++
++fn build_when_next_delayed_trigger(
++    mode: crate::types::triggers::TriggerMode,
++    valid_card: TargetFilter,
++    inner: AbilityDefinition,
++    or_branch: Option<(crate::types::triggers::TriggerMode, TargetFilter)>,
++) -> ParsedEffectClause {
++    let mut trigger_def = crate::types::ability::TriggerDefinition::new(mode);
++    trigger_def.valid_card = Some(valid_card);
++    trigger_def.valid_target = Some(TargetFilter::Controller);
++    let or_trigger = or_branch.map(|(or_mode, or_filter)| {
++        let mut alt = crate::types::ability::TriggerDefinition::new(or_mode);
++        alt.valid_card = Some(or_filter);
++        alt.valid_target = Some(TargetFilter::Controller);
++        Box::new(alt)
++    });
++    ParsedEffectClause {
++        effect: Effect::CreateDelayedTrigger {
++            condition: DelayedTriggerCondition::WhenNextEvent {
++                trigger: Box::new(trigger_def),
++                or_trigger,
++            },
++            effect: Box::new(inner),
++            uses_tracked_set: false,
++        },
++        duration: None,
++        sub_ability: None,
++        distribute: None,
++        multi_target: None,
++        condition: None,
++        optional: false,
++        unless_pay: None,
++    }
++}
++
+ /// CR 603.7: Parse "when you next cast a [type] spell [post-spell modifier] this turn, [effect]"
+ /// delayed triggers. Creates a one-shot delayed trigger that fires once on the next matching
+ /// SpellCast event.
+@@ -627,14 +685,6 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
+     // — e.g. "creature spell" (type only), "instant or sorcery spell" (disjunction),
+     // "spell with {x} in its mana cost" (post only).
+     let condition_fragment = &before_this_turn.lower[matched_prefix.len()..];
+-    let combined_filter = extract_when_next_spell_filter(condition_fragment)?;
+-
+-    // Build a SpellCast trigger definition with the combined filter
+-    let mut trigger_def = crate::types::ability::TriggerDefinition::new(TriggerMode::SpellCast);
+-    trigger_def.valid_card = Some(combined_filter);
+-    // "when YOU next cast" — scope to the source's controller.
+-    trigger_def.valid_target = Some(TargetFilter::Controller);
+-
+     let effect_text = after.original;
+     let effect_lower = after.lower;
+ 
+@@ -645,10 +695,32 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
+         parse_effect_chain(effect_text, AbilityKind::Spell)
+     };
+ 
++    if let Some((spell_filter, ability_filter)) =
++        try_parse_when_next_spell_or_activate_disjunction(condition_fragment)
++    {
++        use crate::types::triggers::TriggerMode;
++
++        return Some(build_when_next_delayed_trigger(
++            TriggerMode::SpellCast,
++            spell_filter,
++            inner,
++            Some((TriggerMode::AbilityActivated, ability_filter)),
++        ));
++    }
++
++    let combined_filter = extract_when_next_spell_filter(condition_fragment)?;
++
++    // Build a SpellCast trigger definition with the combined filter
++    let mut trigger_def = crate::types::ability::TriggerDefinition::new(TriggerMode::SpellCast);
++    trigger_def.valid_card = Some(combined_filter);
++    // "when YOU next cast" — scope to the source's controller.
++    trigger_def.valid_target = Some(TargetFilter::Controller);
++
+     Some(ParsedEffectClause {
+         effect: Effect::CreateDelayedTrigger {
+             condition: DelayedTriggerCondition::WhenNextEvent {
+                 trigger: Box::new(trigger_def),
++                or_trigger: None,
+             },
+             effect: Box::new(inner),
+             uses_tracked_set: false,
+@@ -1272,6 +1344,7 @@ fn try_parse_inline_delayed_trigger(
+     {
+         DelayedTriggerCondition::WhenNextEvent {
+             trigger: Box::new(trigger),
++            or_trigger: None,
+         }
+     } else {
+         match scan_delayed_condition_kind(condition_text) {
+@@ -32552,7 +32625,7 @@ mod tests {
+         );
+         match e {
+             Effect::CreateDelayedTrigger {
+-                condition: DelayedTriggerCondition::WhenNextEvent { trigger },
++                condition: DelayedTriggerCondition::WhenNextEvent { trigger, .. },
+                 uses_tracked_set: false,
+                 ..
+             } => {
+@@ -44118,7 +44191,11 @@ mod tests {
+         else {
+             panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
+         };
+-        let DelayedTriggerCondition::WhenNextEvent { trigger } = condition else {
++        let DelayedTriggerCondition::WhenNextEvent {
++            trigger,
++            or_trigger,
++        } = condition
++        else {
+             panic!("expected WhenNextEvent, got {:?}", condition);
+         };
+         assert_eq!(
+@@ -44134,12 +44211,132 @@ mod tests {
+             Some(&expected),
+             "valid_card must carry HasXInManaCost filter"
+         );
++        assert!(
++            or_trigger.is_none(),
++            "single-branch when-next-cast must not carry or_trigger"
++        );
+         // Scoped to the source's controller — "when YOU next cast".
+         assert_eq!(trigger.valid_target, Some(TargetFilter::Controller));
+         // Inner effect should parse as a draw.
+         assert!(matches!(&*effect.effect, Effect::Draw { .. }));
+     }
+ 
++    /// CR 603.7 + CR 707.10: Magus Lucea Kane Psychic Stimulus delayed copy.
++    #[test]
++    fn magus_lucea_kane_psychic_stimulus_parses_delayed_copy() {
++        use crate::types::ability::{
++            CopyRetargetPermission, DelayedTriggerCondition, FilterProp, TypedFilter,
++        };
++        let def = parse_effect_chain(
++            "When you next cast a spell with {X} in its mana cost or activate an ability with {X} in its activation cost this turn, copy that spell or ability. You may choose new targets for the copy.",
++            AbilityKind::Activated,
++        );
++        let Effect::CreateDelayedTrigger {
++            condition, effect, ..
++        } = &*def.effect
++        else {
++            panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
++        };
++        let DelayedTriggerCondition::WhenNextEvent {
++            trigger,
++            or_trigger,
++        } = condition
++        else {
++            panic!("expected WhenNextEvent, got {:?}", condition);
++        };
++        assert_eq!(
++            trigger.valid_card.as_ref(),
++            Some(&TargetFilter::Typed(
++                TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
++            )),
++        );
++        let alt = or_trigger
++            .as_ref()
++            .expect("Magus disjunction must use or_trigger, not chained sub_abilities");
++        assert_eq!(
++            alt.mode,
++            crate::types::triggers::TriggerMode::AbilityActivated
++        );
++        assert_eq!(
++            alt.valid_card.as_ref(),
++            Some(&TargetFilter::Typed(
++                TypedFilter::default().properties(vec![FilterProp::HasXInActivationCost]),
++            )),
++        );
++        assert!(
++            matches!(
++                *effect.effect,
++                Effect::CopySpell {
++                    target: TargetFilter::TriggeringSource,
++                    retarget: CopyRetargetPermission::MayChooseNewTargets,
++                    ..
++                }
++            ),
++            "expected CopySpell on triggering source, got {:?}",
++            effect.effect
++        );
++    }
++
++    /// CR 603.7: disjunctive when-next conditions compose spell and activation
++    /// qualifiers through the shared post-modifier combinators rather than an
++    /// exact full-clause string match.
++    #[test]
++    fn when_next_spell_or_activate_disjunction_composes_spell_type_filter() {
++        use crate::types::ability::{DelayedTriggerCondition, FilterProp, TypedFilter};
++        let def = parse_effect_chain(
++            "When you next cast a creature spell with {X} in its mana cost or activate an ability with {X} in its activation cost this turn, copy that spell or ability.",
++            AbilityKind::Activated,
++        );
++        let Effect::CreateDelayedTrigger { condition, .. } = &*def.effect else {
++            panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
++        };
++        let DelayedTriggerCondition::WhenNextEvent {
++            trigger,
++            or_trigger,
++        } = condition
++        else {
++            panic!("expected WhenNextEvent, got {:?}", condition);
++        };
++        assert_eq!(
++            trigger.valid_card.as_ref(),
++            Some(&TargetFilter::And {
++                filters: vec![
++                    TargetFilter::Typed(TypedFilter::creature()),
++                    TargetFilter::Typed(
++                        TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
++                    ),
++                ],
++            }),
++        );
++        let alt = or_trigger
++            .as_ref()
++            .expect("disjunctive when-next must carry or_trigger");
++        assert_eq!(
++            alt.valid_card.as_ref(),
++            Some(&TargetFilter::Typed(
++                TypedFilter::default().properties(vec![FilterProp::HasXInActivationCost]),
++            )),
++        );
++    }
++
++    /// CR 605.1a: Magus tap ability remains a mana ability; the delayed copy
++    /// clause resolves inline on the mana-ability path.
++    #[test]
++    fn magus_lucea_kane_tap_ability_is_mana_ability() {
++        let parsed = crate::parser::parse_oracle_text(
++            "Psychic Stimulus — {T}: Add {C}{C}. When you next cast a spell with {X} in its mana cost or activate an ability with {X} in its activation cost this turn, copy that spell or ability. You may choose new targets for the copy.",
++            "Magus Lucea Kane",
++            &[],
++            &["Creature".to_string()],
++            &[],
++        );
++        let ability = parsed.abilities.last().expect("tap ability");
++        assert!(
++            crate::game::mana_abilities::is_mana_ability(ability),
++            "Psychic Stimulus must remain a mana ability per CR 605.1"
++        );
++    }
++
+     /// CR 201.2: "Destroy target nonland permanent and all other permanents
+     /// with the same name as that permanent" (Maelstrom Pulse, and the Echoing
+     /// cycle, Bile Blight, Homing Lightning, Detention Sphere class). The
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index fedeabd1a4..487efbc01c 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -10638,6 +10638,37 @@ pub(crate) fn parse_post_spell_modifier(modifier: &str) -> Option<TargetFilter>
+     None
+ }
+ 
++/// Parse an activated-ability qualifier phrase for "when you next … or activate
++/// an ability <qualifier>" delayed triggers.
++///
++/// Currently supports:
++/// - "with {x} in its activation cost" — CR 107.3 + CR 601.2f. Produces a
++///   `TargetFilter` containing `FilterProp::HasXInActivationCost`.
++///
++/// Shared with `oracle_effect::try_parse_when_next_event` — exposed as
++/// `pub(crate)` to keep the combinator definition in a single place.
++pub(crate) fn parse_post_activation_modifier(modifier: &str) -> Option<TargetFilter> {
++    use crate::types::ability::{FilterProp, TypedFilter};
++
++    if let Ok((rest, ())) = alt((
++        value(
++            (),
++            tag::<_, _, OracleError<'_>>("with {x} in its activation cost"),
++        ),
++        value((), tag("with an {x} in its activation cost")),
++    ))
++    .parse(modifier)
++    {
++        if rest.trim().is_empty() {
++            return Some(TargetFilter::Typed(
++                TypedFilter::default().properties(vec![FilterProp::HasXInActivationCost]),
++            ));
++        }
++    }
++
++    None
++}
++
+ /// Parse "whenever [subject] draw(s) [possessive] Nth card each turn" into a Drawn trigger
+ /// with a NthDrawThisTurn constraint.
+ /// Follows the same decomposition pattern as `try_parse_nth_spell_trigger`.
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 24e8f31db0..8c63352c5f 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -1938,7 +1938,14 @@ pub enum DelayedTriggerCondition {
+     /// CR 603.7: "When you next [event] this turn" — fires once on the next matching
+     /// event, then is removed. One-shot variant of `WheneverEvent`.
+     /// Uses existing trigger matching infrastructure to detect the event.
+-    WhenNextEvent { trigger: Box<TriggerDefinition> },
++    WhenNextEvent {
++        trigger: Box<TriggerDefinition>,
++        /// Optional alternate matcher for disjunctive "when you next … or …"
++        /// clauses (Magus Lucea Kane). Either branch satisfies the condition;
++        /// only the first matching event fires the delayed ability.
++        #[serde(default)]
++        or_trigger: Option<Box<TriggerDefinition>>,
++    },
+ }
+ 
+ /// Specifies variable-count targeting for "any number of" effects.
+@@ -2587,6 +2594,10 @@ pub enum FilterProp {
+     /// Evaluated against `SpellCastRecord.has_x_in_cost` in the spell-history
+     /// filter path and against `cost_has_x(&obj.mana_cost)` for live objects.
+     HasXInManaCost,
++    /// CR 107.3 + CR 602.1: Matches activated abilities whose activation cost
++    /// contains an `{X}` shard. Used for "activate an ability with {X} in its
++    /// activation cost" on `AbilityActivated` delayed triggers (Magus Lucea Kane).
++    HasXInActivationCost,
+     /// CR 605.1: Matches objects that have at least one ability classified as a
+     /// mana ability by the engine's authoritative mana-ability classifier.
+     /// Used for library filters such as "artifact card with a mana ability".
+diff --git a/crates/engine/tests/integration/issue_1010_magus_lucea_kane.rs b/crates/engine/tests/integration/issue_1010_magus_lucea_kane.rs
+new file mode 100644
+index 0000000000..e8016af947
+--- /dev/null
++++ b/crates/engine/tests/integration/issue_1010_magus_lucea_kane.rs
+@@ -0,0 +1,270 @@
++//! Issue #1010 — Magus Lucea Kane Psychic Stimulus copies the next {X} spell or ability.
++
++use engine::game::scenario::{GameScenario, P0};
++use engine::types::ability::{
++    AbilityCost, AbilityDefinition, AbilityKind, Effect, QuantityExpr, QuantityRef, TargetFilter,
++};
++use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
++use engine::types::phase::Phase;
++
++const MAGUS_ORACLE: &str = "Psychic Stimulus — {T}: Add {C}{C}. When you next cast a spell with {X} in its mana cost or activate an ability with {X} in its activation cost this turn, copy that spell or ability. You may choose new targets for the copy.";
++
++fn add_colorless(runner: &mut engine::game::scenario::GameRunner, count: usize) {
++    for _ in 0..count {
++        runner.state_mut().players[0].mana_pool.add(ManaUnit::new(
++            ManaType::Colorless,
++            engine::types::identifiers::ObjectId(0),
++            false,
++            vec![],
++        ));
++    }
++}
++
++#[test]
++fn magus_lucea_kane_tap_ability_parses_delayed_copy_not_unimplemented() {
++    let parsed = engine::parser::parse_oracle_text(
++        MAGUS_ORACLE,
++        "Magus Lucea Kane",
++        &[],
++        &["Creature".to_string()],
++        &[],
++    );
++    let ability = parsed.abilities.last().expect("tap ability");
++    let sub = ability
++        .sub_ability
++        .as_ref()
++        .expect("delayed copy sub_ability");
++    assert!(
++        matches!(sub.effect.as_ref(), Effect::CreateDelayedTrigger { .. }),
++        "expected CreateDelayedTrigger, got {:?}",
++        sub.effect
++    );
++}
++
++#[test]
++fn magus_lucea_kane_tap_registers_delayed_copy_for_next_x_spell() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    scenario.with_library_top(
++        P0,
++        &[
++            "Card One",
++            "Card Two",
++            "Card Three",
++            "Card Four",
++            "Card Five",
++            "Card Six",
++        ],
++    );
++
++    let magus = scenario
++        .add_creature_from_oracle(P0, "Magus Lucea Kane", 2, 4, MAGUS_ORACLE)
++        .id();
++
++    let spell = scenario
++        .add_spell_to_hand(P0, "Draw X", false)
++        .with_mana_cost(ManaCost::Cost {
++            shards: vec![ManaCostShard::X],
++            generic: 0,
++        })
++        .with_ability(Effect::Draw {
++            count: QuantityExpr::Ref {
++                qty: QuantityRef::CostXPaid,
++            },
++            target: TargetFilter::Controller,
++        })
++        .id();
++
++    let mut runner = scenario.build();
++    let library_before = runner.state().players[0].library.len();
++
++    runner.activate(magus, 0).resolve();
++    assert_eq!(
++        runner.state().delayed_triggers.len(),
++        1,
++        "Psychic Stimulus must register a one-shot delayed trigger"
++    );
++
++    add_colorless(&mut runner, 3);
++    runner.cast(spell).x(2).resolve();
++
++    assert_eq!(
++        library_before - runner.state().players[0].library.len(),
++        4,
++        "Draw X=2 plus its copy should draw four cards total"
++    );
++    assert!(
++        runner.state().delayed_triggers.is_empty(),
++        "one-shot delayed trigger must be consumed after the X spell is cast"
++    );
++}
++
++#[test]
++fn magus_delayed_copy_trigger_sits_above_activated_ability_on_stack() {
++    use engine::types::actions::GameAction;
++
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    scenario.with_library_top(
++        P0,
++        &[
++            "Card One",
++            "Card Two",
++            "Card Three",
++            "Card Four",
++            "Card Five",
++            "Card Six",
++        ],
++    );
++
++    let magus = scenario
++        .add_creature_from_oracle(P0, "Magus Lucea Kane", 2, 4, MAGUS_ORACLE)
++        .id();
++
++    let draw_x_ability = AbilityDefinition::new(
++        AbilityKind::Activated,
++        Effect::Draw {
++            count: QuantityExpr::Ref {
++                qty: QuantityRef::CostXPaid,
++            },
++            target: TargetFilter::Controller,
++        },
++    )
++    .cost(AbilityCost::Mana {
++        cost: ManaCost::Cost {
++            shards: vec![ManaCostShard::X],
++            generic: 0,
++        },
++    });
++
++    let source = scenario
++        .add_creature(P0, "Draw X Source", 1, 1)
++        .with_ability_definition(draw_x_ability)
++        .id();
++
++    let mut runner = scenario.build();
++    runner.activate(magus, 0).resolve();
++    add_colorless(&mut runner, 3);
++
++    runner
++        .act(GameAction::ActivateAbility {
++            source_id: source,
++            ability_index: 0,
++        })
++        .expect("announce activation");
++    runner
++        .act(GameAction::ChooseX { value: 2 })
++        .expect("announce X");
++    runner
++        .act(GameAction::PassPriority)
++        .expect("pay activation cost");
++
++    assert_eq!(
++        runner.state().stack.len(),
++        2,
++        "activated ability plus Magus delayed copy trigger must both be on stack"
++    );
++    assert!(
++        matches!(
++            runner.state().stack.back().map(|e| &e.kind),
++            Some(engine::types::game_state::StackEntryKind::TriggeredAbility { .. })
++        ),
++        "Magus delayed copy must be on top of the activating ability"
++    );
++
++    let library_before = runner.state().players[0].library.len();
++    for _ in 0..16 {
++        if runner.state().stack.is_empty() {
++            break;
++        }
++        runner
++            .act(GameAction::PassPriority)
++            .expect("priority pass P0");
++        if runner.state().stack.is_empty() {
++            break;
++        }
++        runner
++            .act(GameAction::PassPriority)
++            .expect("priority pass P1");
++    }
++    assert!(
++        runner.state().stack.is_empty(),
++        "both stack objects must resolve, stack = {:?}",
++        runner.state().stack.len()
++    );
++    assert_eq!(
++        library_before - runner.state().players[0].library.len(),
++        4,
++        "copy trigger plus original and copy of Draw X=2 should draw four cards"
++    );
++}
++
++#[test]
++fn magus_lucea_kane_tap_registers_delayed_copy_for_next_x_activated_ability() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    scenario.with_library_top(
++        P0,
++        &[
++            "Card One",
++            "Card Two",
++            "Card Three",
++            "Card Four",
++            "Card Five",
++            "Card Six",
++        ],
++    );
++
++    let magus = scenario
++        .add_creature_from_oracle(P0, "Magus Lucea Kane", 2, 4, MAGUS_ORACLE)
++        .id();
++
++    let draw_x_ability = AbilityDefinition::new(
++        AbilityKind::Activated,
++        Effect::Draw {
++            count: QuantityExpr::Ref {
++                qty: QuantityRef::CostXPaid,
++            },
++            target: TargetFilter::Controller,
++        },
++    )
++    .cost(AbilityCost::Mana {
++        cost: ManaCost::Cost {
++            shards: vec![ManaCostShard::X],
++            generic: 0,
++        },
++    });
++
++    let source = scenario
++        .add_creature(P0, "Draw X Source", 1, 1)
++        .with_ability_definition(draw_x_ability)
++        .id();
++
++    let mut runner = scenario.build();
++    let library_before = runner.state().players[0].library.len();
++
++    runner.activate(magus, 0).resolve();
++    assert_eq!(runner.state().delayed_triggers.len(), 1);
++    match &runner.state().delayed_triggers[0].condition {
++        engine::types::ability::DelayedTriggerCondition::WhenNextEvent { or_trigger, .. } => {
++            assert!(
++                or_trigger.is_some(),
++                "Magus delayed trigger must carry or_trigger for activated abilities"
++            )
++        }
++        other => panic!("expected WhenNextEvent delayed trigger, got {other:?}"),
++    }
++
++    add_colorless(&mut runner, 3);
++    runner.activate(source, 0).x(2).resolve();
++
++    assert!(
++        runner.state().delayed_triggers.is_empty(),
++        "one-shot delayed trigger must be consumed after the X activated ability"
++    );
++    assert_eq!(
++        library_before - runner.state().players[0].library.len(),
++        4,
++        "Draw X=2 activated ability plus its copy should draw four cards total"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 3c10762c8d..b497c6d83a 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -95,6 +95,7 @@ mod integration_landfall;
+ mod invoke_calamity_free_cast;
+ mod issue_1005_suffer_the_past;
+ mod issue_1008_korvold_sacrifice_triggers;
++mod issue_1010_magus_lucea_kane;
+ mod issue_1011_vexing_puzzlebox_roll;
+ mod issue_1016_peregrin_took_food_token;
+ mod issue_1017_ring_tempts_you;

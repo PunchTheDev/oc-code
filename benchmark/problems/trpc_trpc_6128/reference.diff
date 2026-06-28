@@ -1,0 +1,461 @@
+diff --git a/packages/client/src/internals/signals.ts b/packages/client/src/internals/signals.ts
+index 1aa715e3477..fd001d18fc2 100644
+--- a/packages/client/src/internals/signals.ts
++++ b/packages/client/src/internals/signals.ts
+@@ -33,6 +33,9 @@ export function allAbortSignals(...signals: Maybe<AbortSignal>[]): AbortSignal {
+ 
+ /**
+  * Like `Promise.race` but for abort signals
++ *
++ * Basically, a ponyfill for
++ * [`AbortSignal.any`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/any_static).
+  */
+ export function raceAbortSignals(
+   ...signals: Maybe<AbortSignal>[]
+diff --git a/packages/server/src/unstable-core-do-not-import/http/resolveResponse.ts b/packages/server/src/unstable-core-do-not-import/http/resolveResponse.ts
+index 49d8bcf01c5..bec275a4331 100644
+--- a/packages/server/src/unstable-core-do-not-import/http/resolveResponse.ts
++++ b/packages/server/src/unstable-core-do-not-import/http/resolveResponse.ts
+@@ -15,7 +15,7 @@ import type { TRPCResponse } from '../rpc';
+ import { isPromise, jsonlStreamProducer } from '../stream/jsonl';
+ import { sseHeaders, sseStreamProducer } from '../stream/sse';
+ import { transformTRPCResponse } from '../transformer';
+-import { isAsyncIterable, isObject } from '../utils';
++import { abortSignalsAnyPonyfill, assert, isAsyncIterable, isObject } from '../utils';
+ import { getRequestInfo } from './contentType';
+ import { getHTTPStatusCode } from './getHTTPStatusCode';
+ import type {
+@@ -260,9 +260,13 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+       });
+     }
+ 
++    interface RPCResultOk {
++      data: unknown;
++      abortCtrl?: AbortController;
++    }
+     type RPCResult =
+       | [result: null, error: TRPCError]
+-      | [result: unknown, error?: never];
++      | [result: RPCResultOk, error?: never];
+     const rpcCalls = info.calls.map(async (call): Promise<RPCResult> => {
+       const proc = call.procedure;
+       try {
+@@ -279,21 +283,28 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+             message: `Unsupported ${req.method}-request to ${proc._def.type} procedure at path "${call.path}"`,
+           });
+         }
+-        /* istanbul ignore if -- @preserve */
+-        if (proc._def.type === 'subscription' && info!.isBatchCall) {
+-          throw new TRPCError({
+-            code: 'BAD_REQUEST',
+-            message: `Cannot batch subscription calls`,
+-          });
++        let abortCtrl: AbortController | undefined;
++        if (proc._def.type === 'subscription') {
++          /* istanbul ignore if -- @preserve */
++          if (info!.isBatchCall) {
++            throw new TRPCError({
++              code: 'BAD_REQUEST',
++              message: `Cannot batch subscription calls`,
++            });
++          }
++          abortCtrl = new AbortController();
+         }
++
+         const data: unknown = await proc({
+           path: call.path,
+           getRawInput: call.getRawInput,
+           ctx,
+           type: proc._def.type,
+-          signal: opts.req.signal,
++          signal: abortCtrl
++            ? abortSignalsAnyPonyfill([opts.req.signal, abortCtrl.signal])
++            : opts.req.signal,
+         });
+-        return [data];
++        return [{ data, abortCtrl }];
+       } catch (cause) {
+         const error = getTRPCErrorFromUnknown(cause);
+         const input = call.result();
+@@ -314,7 +325,7 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+     // ----------- response handlers -----------
+     if (!info.isBatchCall) {
+       const [call] = info.calls;
+-      const [data, error] = await rpcCalls[0]!;
++      const [result, error] = await rpcCalls[0]!;
+ 
+       switch (info.type) {
+         case 'unknown':
+@@ -323,7 +334,7 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+           // httpLink
+           headers.set('content-type', 'application/json');
+ 
+-          if (isDataStream(data)) {
++          if (isDataStream(result?.data)) {
+             throw new TRPCError({
+               code: 'UNSUPPORTED_MEDIA_TYPE',
+               message:
+@@ -341,7 +352,7 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+                   type: info.type,
+                 }),
+               }
+-            : { result: { data } };
++            : { result: { data: result.data } };
+ 
+           const headResponse = initResponse({
+             ctx,
+@@ -372,6 +383,11 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+           if (error) {
+             throw error;
+           }
++          const { data, abortCtrl } = result;
++          assert(
++            abortCtrl !== undefined,
++            'subscription type must have an AbortController',
++          );
+ 
+           if (!isObservable(data) && !isAsyncIterable(data)) {
+             throw new TRPCError({
+@@ -388,6 +404,7 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+           const stream = sseStreamProducer({
+             ...config.experimental?.sseSubscriptions,
+             data: dataAsIterable,
++            abortCtrl,
+             serialize: (v) => config.transformer.output.serialize(v),
+             formatError(errorOpts) {
+               const error = getTRPCErrorFromUnknown(errorOpts.error);
+@@ -481,17 +498,18 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+               }),
+             };
+           }
++          const { data } = result;
+ 
+           /**
+            * Not very pretty, but we need to wrap nested data in promises
+            * Our stream producer will only resolve top-level async values or async values that are directly nested in another async value
+            */
+-          const data = isObservable(result)
+-            ? observableToAsyncIterable(result)
+-            : Promise.resolve(result);
++          const dataAsPromiseOrIterable = isObservable(data)
++            ? observableToAsyncIterable(data)
++            : Promise.resolve(data);
+           return {
+             result: Promise.resolve({
+-              data,
++              data: dataAsPromiseOrIterable,
+             }),
+           };
+         }),
+@@ -539,12 +557,12 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+     headers.set('content-type', 'application/json');
+     const results: RPCResult[] = (await Promise.all(rpcCalls)).map(
+       (res): RPCResult => {
+-        const [data, error] = res;
++        const [result, error] = res;
+         if (error) {
+           return res;
+         }
+ 
+-        if (isDataStream(data)) {
++        if (isDataStream(result.data)) {
+           return [
+             null,
+             new TRPCError({
+@@ -559,7 +577,7 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+     );
+     const resultAsRPCResponse = results.map(
+       (
+-        [data, error],
++        [result, error],
+         index,
+       ): TRPCResponse<unknown, inferRouterError<TRouter>> => {
+         const call = info!.calls[index]!;
+@@ -576,7 +594,7 @@ export async function resolveResponse<TRouter extends AnyRouter>(
+           };
+         }
+         return {
+-          result: { data },
++          result: { data: result.data },
+         };
+       },
+     );
+diff --git a/packages/server/src/unstable-core-do-not-import/stream/sse.test.ts b/packages/server/src/unstable-core-do-not-import/stream/sse.test.ts
+index e2dd00ad9f2..887210541fd 100644
+--- a/packages/server/src/unstable-core-do-not-import/stream/sse.test.ts
++++ b/packages/server/src/unstable-core-do-not-import/stream/sse.test.ts
+@@ -1,6 +1,8 @@
++import { EventEmitter, on } from 'node:events';
+ import { EventSourcePolyfill, NativeEventSource } from 'event-source-polyfill';
+ import SuperJSON from 'superjson';
+ import type { Maybe } from '../types';
++import { abortSignalsAnyPonyfill, run, sleep } from '../utils';
+ import { sseHeaders, sseStreamConsumer, sseStreamProducer } from './sse';
+ import { isTrackedEnvelope, sse, tracked } from './tracked';
+ import { createDeferred } from './utils/createDeferred';
+@@ -63,6 +65,7 @@ test('e2e, server-sent events (SSE)', async () => {
+     const stream = sseStreamProducer({
+       data: data(asNumber),
+       serialize: (v) => SuperJSON.serialize(v),
++      abortCtrl: new AbortController(),
+     });
+     const reader = stream.getReader();
+     for (const [key, value] of Object.entries(sseHeaders)) {
+@@ -150,20 +153,19 @@ test('e2e, server-sent events (SSE)', async () => {
+ });
+ 
+ test('SSE on serverless - emit and disconnect early', async () => {
+-  async function* data(lastEventId?: Maybe<number>) {
++  const ee = new EventEmitter();
++
++  async function* data(lastEventId: Maybe<number>, signal: AbortSignal) {
+     let i = lastEventId ?? 0;
+ 
++    for await (const _ of on(ee, 'next', { signal })) {
++      yield* yieldEvent();
++    }
++
+     function* yieldEvent() {
+       i++;
+       yield tracked(String(i), i);
+     }
+-    while (true) {
+-      // yield 2 events at a time to test if the client will get both without reconnecting in between
+-      yield* yieldEvent();
+-      yield* yieldEvent();
+-
+-      await new Promise((resolve) => setTimeout(resolve, 5));
+-    }
+   }
+   type inferAsyncIterable<T> = T extends AsyncIterable<infer U> ? U : never;
+   type Data = inferAsyncIterable<ReturnType<typeof data>>;
+@@ -205,10 +207,19 @@ test('SSE on serverless - emit and disconnect early', async () => {
+ 
+     const asNumber = stringToNumber(lastEventId);
+ 
++    const producerAbortCtrl = new AbortController();
++
+     const stream = sseStreamProducer({
+-      data: data(asNumber),
++      data: data(
++        asNumber,
++        abortSignalsAnyPonyfill([
++          reqAbortCtrl.signal,
++          producerAbortCtrl.signal,
++        ]),
++      ),
+       serialize: (v) => SuperJSON.serialize(v),
+       emitAndEndImmediately: true,
++      abortCtrl: producerAbortCtrl,
+     });
+     const reader = stream.getReader();
+     for (const [key, value] of Object.entries(sseHeaders)) {
+@@ -227,16 +238,25 @@ test('SSE on serverless - emit and disconnect early', async () => {
+     res.end();
+   });
+ 
+-  const ac = new AbortController();
++  const reqAbortCtrl = new AbortController();
+ 
+   const iterable = sseStreamConsumer<Data>({
+     // from: es,
+     url: () => server.url,
+-    signal: ac.signal,
++    signal: reqAbortCtrl.signal,
+     init: () => ({}),
+     deserialize: SuperJSON.deserialize,
+   });
+ 
++  const emitterRun = run(async () => {
++    while (!reqAbortCtrl.signal.aborted) {
++      await sleep(10);
++      // yield 2 events at a time to test if the client will get both without reconnecting in between
++      ee.emit('next');
++      ee.emit('next');
++    }
++  });
++
+   function range(start: number, end: number) {
+     return Array.from({ length: end - start }, (_, i) => i + start);
+   }
+@@ -257,6 +277,19 @@ test('SSE on serverless - emit and disconnect early', async () => {
+       }
+     }
+   }
++
++  // Little bit of non-determinism if the producerAbortCtrl.signal has fired
++  // already...
++  // But in no case should it be more than 1 (which would be the case if
++  // producerAbortCtrl would not be triggered properly)
++  expect(ee.listenerCount('next')).toBeLessThanOrEqual(1);
++
++  reqAbortCtrl.abort();
++  expect(ee.listenerCount('next')).toBe(0);
++
++  // make sure for this to have terminated (without errors)
++  await emitterRun;
++
+   expect(values).toEqual(range(1, ITERATIONS + 1));
+ 
+   expect(requests).toHaveLength(2);
+@@ -312,8 +345,6 @@ test('SSE on serverless - emit and disconnect early', async () => {
+       },
+     ]
+   `);
+-
+-  ac.abort();
+   await server.close();
+ });
+ 
+diff --git a/packages/server/src/unstable-core-do-not-import/stream/sse.ts b/packages/server/src/unstable-core-do-not-import/stream/sse.ts
+index 775aef4952c..7f21cb7dea9 100644
+--- a/packages/server/src/unstable-core-do-not-import/stream/sse.ts
++++ b/packages/server/src/unstable-core-do-not-import/stream/sse.ts
+@@ -32,6 +32,7 @@ export interface PingOptions {
+ export interface SSEStreamProducerOptions<TValue = unknown> {
+   serialize?: Serialize;
+   data: AsyncIterable<TValue>;
++  abortCtrl: AbortController;
+   maxDepth?: number;
+   ping?: PingOptions;
+   /**
+@@ -61,7 +62,9 @@ type SSEvent = Partial<{
+  *
+  * @see https://html.spec.whatwg.org/multipage/server-sent-events.html
+  */
+-export function sseStreamProducer<TValue = unknown>(opts: SSEStreamProducerOptions<TValue>) {
++export function sseStreamProducer<TValue = unknown>(
++  opts: SSEStreamProducerOptions<TValue>,
++) {
+   const stream = createReadableStream<SSEvent>();
+   stream.controller.enqueue({ comment: 'connected' });
+ 
+@@ -74,11 +77,15 @@ export function sseStreamProducer<TValue = unknown>(opts: SSEStreamProducerOptio
+ 
+   run(async () => {
+     let iterable: AsyncIterable<TValue | typeof PING_SYM> = opts.data;
+-    
++
+     iterable = withCancel(iterable, stream.cancelledPromise);
+ 
+     if (opts.emitAndEndImmediately) {
+-      iterable = takeWithGrace(iterable, { count: 1, gracePeriodMs: 1 });
++      iterable = takeWithGrace(iterable, {
++        count: 1,
++        gracePeriodMs: 1,
++        onCancel: () => opts.abortCtrl.abort(),
++      });
+     }
+ 
+     let maxDurationTimer: PromiseTimer | null = null;
+@@ -88,7 +95,10 @@ export function sseStreamProducer<TValue = unknown>(opts: SSEStreamProducerOptio
+       opts.maxDurationMs !== Infinity
+     ) {
+       maxDurationTimer = createPromiseTimer(opts.maxDurationMs).start();
+-      iterable = withCancel(iterable, maxDurationTimer.promise);
++      iterable = withCancel(
++        iterable,
++        maxDurationTimer.promise.then(() => opts.abortCtrl.abort()),
++      );
+     }
+ 
+     if (ping.enabled && ping.intervalMs !== Infinity && ping.intervalMs > 0) {
+diff --git a/packages/server/src/unstable-core-do-not-import/stream/utils/asyncIterable.ts b/packages/server/src/unstable-core-do-not-import/stream/utils/asyncIterable.ts
+index ba1741bba81..b66b4bc3023 100644
+--- a/packages/server/src/unstable-core-do-not-import/stream/utils/asyncIterable.ts
++++ b/packages/server/src/unstable-core-do-not-import/stream/utils/asyncIterable.ts
+@@ -27,6 +27,7 @@ export async function* withCancel<T>(
+ interface TakeWithGraceOptions {
+   count: number;
+   gracePeriodMs: number;
++  onCancel?: () => void;
+ }
+ 
+ /**
+@@ -36,7 +37,7 @@ interface TakeWithGraceOptions {
+  */
+ export async function* takeWithGrace<T>(
+   iterable: AsyncIterable<T>,
+-  { count, gracePeriodMs }: TakeWithGraceOptions,
++  { count, gracePeriodMs, onCancel }: TakeWithGraceOptions,
+ ): AsyncGenerator<T> {
+   const iterator = iterable[Symbol.asyncIterator]();
+   const timer = createPromiseTimer(gracePeriodMs);
+@@ -53,7 +54,7 @@ export async function* takeWithGrace<T>(
+       }
+       yield result.value;
+       if (--count === 0) {
+-        timer.start();
++        timer.start().promise.then(onCancel, noop);
+       }
+     }
+   } finally {
+diff --git a/packages/server/src/unstable-core-do-not-import/stream/utils/promiseTimer.ts b/packages/server/src/unstable-core-do-not-import/stream/utils/promiseTimer.ts
+index 62e03b446d3..b0cff60f36b 100644
+--- a/packages/server/src/unstable-core-do-not-import/stream/utils/promiseTimer.ts
++++ b/packages/server/src/unstable-core-do-not-import/stream/utils/promiseTimer.ts
+@@ -17,7 +17,7 @@ export function createPromiseTimer(ms: number) {
+ 
+   function start(): PromiseTimer {
+     if (timeout != null) {
+-      throw new Error("PromiseTimer already started.");
++      throw new Error('PromiseTimer already started.');
+     }
+     timeout = setTimeout(deferred.resolve, ms);
+     return timer;
+diff --git a/packages/server/src/unstable-core-do-not-import/utils.ts b/packages/server/src/unstable-core-do-not-import/utils.ts
+index 294c34d71a0..6552126b55a 100644
+--- a/packages/server/src/unstable-core-do-not-import/utils.ts
++++ b/packages/server/src/unstable-core-do-not-import/utils.ts
+@@ -68,3 +68,51 @@ export function noop(): void {}
+ export function identity<T>(it: T): T {
+   return it;
+ }
++
++/**
++ * Generic runtime assertion function. Throws, if the condition is not `true`.
++ *
++ * Can be used as a slightly less dangerous variant of type assertions. Code
++ * mistakes would be revealed at runtime then (hopefully during testing).
++ */
++export function assert(
++  condition: boolean,
++  msg = 'no additional info',
++): asserts condition {
++  if (!condition) {
++    throw new Error(`AssertionError: ${msg}`);
++  }
++}
++
++export function sleep(ms = 0): Promise<void> {
++  return new Promise<void>((res) => setTimeout(res, ms));
++}
++
++/**
++ * Ponyfill for
++ * [`AbortSignal.any`](https://developer.mozilla.org/en-US/docs/Web/API/AbortSignal/any_static).
++ */
++export function abortSignalsAnyPonyfill(signals: AbortSignal[]): AbortSignal {
++  if (typeof AbortSignal.any === 'function') {
++    return AbortSignal.any(signals);
++  }
++
++  const ac = new AbortController();
++
++  for (const signal of signals) {
++    if (signal.aborted) {
++      trigger();
++    } else if (!ac.signal.aborted) {
++      signal.addEventListener('abort', trigger, { once: true });
++    }
++  }
++
++  return ac.signal;
++
++  function trigger() {
++    ac.abort();
++    for (const signal of signals) {
++      signal.removeEventListener('abort', trigger);
++    }
++  }
++}

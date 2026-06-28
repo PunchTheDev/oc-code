@@ -1,0 +1,244 @@
+diff --git a/binder/form.go b/binder/form.go
+index 65a1829eeeb..fb846b66ef5 100644
+--- a/binder/form.go
++++ b/binder/form.go
+@@ -121,6 +121,10 @@ func acquireFileHeaderMap() map[string][]*multipart.FileHeader {
+ }
+ 
+ func releaseFileHeaderMap(m map[string][]*multipart.FileHeader) {
++	if len(m) > maxPoolableDataMapSize {
++		return
++	}
++
+ 	clearFileHeaderMap(m)
+ 	formFileMapPool.Put(m)
+ }
+diff --git a/client/cookiejar.go b/client/cookiejar.go
+index ebdc740339d..9e6a3dc59f8 100644
+--- a/client/cookiejar.go
++++ b/client/cookiejar.go
+@@ -252,6 +252,7 @@ func (cj *CookieJar) SetByHost(host []byte, cookies ...*fasthttp.Cookie) {
+ // This function helps prevent extra allocations by avoiding duplication of repeated cookies.
+ func (cj *CookieJar) SetKeyValue(host, key, value string) {
+ 	c := fasthttp.AcquireCookie()
++	defer fasthttp.ReleaseCookie(c)
+ 	c.SetKey(key)
+ 	c.SetValue(value)
+ 
+@@ -263,6 +264,7 @@ func (cj *CookieJar) SetKeyValue(host, key, value string) {
+ // This function helps prevent extra allocations by avoiding duplication of repeated cookies.
+ func (cj *CookieJar) SetKeyValueBytes(host string, key, value []byte) {
+ 	c := fasthttp.AcquireCookie()
++	defer fasthttp.ReleaseCookie(c)
+ 	c.SetKeyBytes(key)
+ 	c.SetValueBytes(value)
+ 
+diff --git a/client/hooks.go b/client/hooks.go
+index b7e26625ad7..4e1b4cbd1a6 100644
+--- a/client/hooks.go
++++ b/client/hooks.go
+@@ -235,19 +235,28 @@ func parserRequestBody(c *Client, req *Request) error {
+ // parserRequestBodyFile handles the case where the request contains files to be uploaded.
+ func parserRequestBodyFile(req *Request) error {
+ 	mw := multipart.NewWriter(req.RawRequest.BodyWriter())
+-	err := mw.SetBoundary(req.boundary)
+-	if err != nil {
++	if err := mw.SetBoundary(req.boundary); err != nil {
+ 		return fmt.Errorf("set boundary error: %w", err)
+ 	}
+-	defer func() {
+-		e := mw.Close()
+-		if e != nil {
+-			// Close errors are typically ignored.
+-			return
+-		}
+-	}()
+ 
++	if err := writeMultipartBody(mw, req); err != nil {
++		mw.Close() //nolint:errcheck // the body write already failed; surface that error instead
++		return err
++	}
++
++	// Close writes the trailing boundary; if it fails the multipart body is
++	// incomplete, so surface the error instead of sending a malformed request.
++	if err := mw.Close(); err != nil {
++		return fmt.Errorf("failed to close multipart writer: %w", err)
++	}
++
++	return nil
++}
++
++// writeMultipartBody writes the form fields and files of req to mw.
++func writeMultipartBody(mw *multipart.Writer, req *Request) error {
+ 	// Add form data.
++	var err error
+ 	for key, value := range req.formData.All() {
+ 		err = mw.WriteField(utils.UnsafeString(key), utils.UnsafeString(value))
+ 		if err != nil {
+diff --git a/listen_test.go b/listen_test.go
+index ad4189377c2..dfc92b5221c 100644
+--- a/listen_test.go
++++ b/listen_test.go
+@@ -601,8 +601,21 @@ func Test_Listen_BeforeServeFunc(t *testing.T) {
+ 	require.Zero(t, handlers)
+ }
+ 
++// skipIfNoIPv6 skips the test on hosts without IPv6 support (e.g. some CI containers).
++func skipIfNoIPv6(t *testing.T) {
++	t.Helper()
++
++	probe, err := net.Listen(NetworkTCP6, "[::1]:0")
++	if err != nil {
++		t.Skipf("skipping: IPv6 is not available: %v", err)
++	}
++	require.NoError(t, probe.Close())
++}
++
+ // go test -run Test_Listen_ListenerNetwork
+ func Test_Listen_ListenerNetwork(t *testing.T) {
++	skipIfNoIPv6(t)
++
+ 	var network string
+ 	app := New()
+ 
+diff --git a/middleware/proxy/proxy_test.go b/middleware/proxy/proxy_test.go
+index e5732142a7d..901e904773c 100644
+--- a/middleware/proxy/proxy_test.go
++++ b/middleware/proxy/proxy_test.go
+@@ -53,6 +53,14 @@ func createProxyTestServerIPv4(t *testing.T, handler fiber.Handler) (target *fib
+ 
+ func createProxyTestServerIPv6(t *testing.T, handler fiber.Handler) (target *fiber.App, addr string) { //nolint:nonamedreturns // gocritic unnamedResult prefers naming returned target app and address for readability
+ 	t.Helper()
++
++	// Skip instead of failing on hosts without IPv6 support (e.g. some CI containers).
++	probe, err := net.Listen(fiber.NetworkTCP6, "[::1]:0")
++	if err != nil {
++		t.Skipf("skipping: IPv6 is not available: %v", err)
++	}
++	require.NoError(t, probe.Close())
++
+ 	return createProxyTestServer(t, handler, fiber.NetworkTCP6, "[::1]:0")
+ }
+ 
+diff --git a/middleware/session/middleware.go b/middleware/session/middleware.go
+index 7b5f8de5ada..0f902505598 100644
+--- a/middleware/session/middleware.go
++++ b/middleware/session/middleware.go
+@@ -5,6 +5,7 @@ package session
+ import (
+ 	"context"
+ 	"errors"
++	"fmt"
+ 	"sync"
+ 
+ 	"github.com/gofiber/fiber/v3"
+@@ -95,7 +96,10 @@ func NewWithStore(config ...Config) (fiber.Handler, *Store) {
+ 
+ 		// Acquire session middleware
+ 		m := acquireMiddleware()
+-		m.initialize(c, &cfg)
++		if err := m.initialize(c, &cfg); err != nil {
++			releaseMiddleware(m)
++			return fmt.Errorf("session: failed to get session: %w", err)
++		}
+ 
+ 		stackErr := c.Next()
+ 
+@@ -141,14 +145,16 @@ func clearMiddlewareContext(c fiber.Ctx) {
+ 	c.SetContext(context.WithValue(ctx, middlewareContextKey, (*Middleware)(nil)))
+ }
+ 
+-// initialize sets up middleware for the request.
+-func (m *Middleware) initialize(c fiber.Ctx, cfg *Config) {
++// initialize sets up middleware for the request. It returns an error when the
++// session cannot be loaded from the store (e.g. the backing storage is down)
++// so the request can fail gracefully instead of crashing the server.
++func (m *Middleware) initialize(c fiber.Ctx, cfg *Config) error {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+ 
+ 	session, err := cfg.Store.getSession(c)
+ 	if err != nil {
+-		panic(err) // handle or log this error appropriately in production
++		return err
+ 	}
+ 
+ 	m.config = *cfg
+@@ -156,6 +162,7 @@ func (m *Middleware) initialize(c fiber.Ctx, cfg *Config) {
+ 	m.ctx = c
+ 
+ 	storeMiddlewareContext(c, session, m)
++	return nil
+ }
+ 
+ // saveSession handles session saving and error management after the response.
+diff --git a/middleware/session/middleware_test.go b/middleware/session/middleware_test.go
+index cc26ede948d..24fb931f0e6 100644
+--- a/middleware/session/middleware_test.go
++++ b/middleware/session/middleware_test.go
+@@ -2,6 +2,8 @@ package session
+ 
+ import (
+ 	"bytes"
++	"context"
++	"errors"
+ 	"fmt"
+ 	"net/http"
+ 	"net/http/httptest"
+@@ -658,3 +660,43 @@ func Test_Session_Middleware_Store(t *testing.T) {
+ 	h(ctx)
+ 	require.Equal(t, fiber.StatusOK, ctx.Response.StatusCode())
+ }
++
++// failingStorage simulates a session store whose backend is unavailable.
++type failingStorage struct {
++	err error
++}
++
++func (s *failingStorage) GetWithContext(context.Context, string) ([]byte, error) { return nil, s.err }
++func (s *failingStorage) Get(string) ([]byte, error)                             { return nil, s.err }
++func (s *failingStorage) SetWithContext(context.Context, string, []byte, time.Duration) error {
++	return s.err
++}
++func (s *failingStorage) Set(string, []byte, time.Duration) error         { return s.err }
++func (s *failingStorage) DeleteWithContext(context.Context, string) error { return s.err }
++func (s *failingStorage) Delete(string) error                             { return s.err }
++func (s *failingStorage) ResetWithContext(context.Context) error          { return s.err }
++func (s *failingStorage) Reset() error                                    { return s.err }
++func (*failingStorage) Close() error                                      { return nil }
++
++// Regression: https://github.com/gofiber/fiber/issues/4348
++// A failing session store must result in an error response, not a panic.
++func Test_Session_Middleware_StoreError(t *testing.T) {
++	t.Parallel()
++
++	storage := &failingStorage{err: errors.New("storage unavailable")}
++	app := fiber.New()
++	app.Use(New(Config{Storage: storage}))
++
++	app.Get("/", func(c fiber.Ctx) error {
++		return c.SendStatus(fiber.StatusOK)
++	})
++
++	h := app.Handler()
++
++	ctx := &fasthttp.RequestCtx{}
++	ctx.Request.Header.SetMethod(fiber.MethodGet)
++	// Provide a session ID so the middleware attempts a storage lookup.
++	ctx.Request.Header.SetCookie("session_id", "some-session-id")
++	require.NotPanics(t, func() { h(ctx) })
++	require.Equal(t, fiber.StatusInternalServerError, ctx.Response.StatusCode())
++}
+diff --git a/prefork_test.go b/prefork_test.go
+index da4524b55a7..78e20bfe89b 100644
+--- a/prefork_test.go
++++ b/prefork_test.go
+@@ -17,6 +17,8 @@ import (
+ )
+ 
+ func Test_App_Prefork_Child_Process(t *testing.T) {
++	skipIfNoIPv6(t)
++
+ 	enableTestPreforkMaster(t)
+ 
+ 	setupIsChild(t)

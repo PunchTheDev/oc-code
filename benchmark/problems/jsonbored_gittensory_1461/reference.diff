@@ -1,0 +1,186 @@
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index b80e629f..2330a13d 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -72,6 +72,7 @@ import { loadOrComputeRepoOutcomePatternsResponse } from "../services/repo-outco
+ import { buildRepoOutcomeCalibration, outcomeCalibrationSummary } from "../services/outcome-calibration";
+ import { computeFleetAnalytics } from "../orb/analytics";
+ import { loadMaintainerNoiseReport, maintainerNoiseSummary } from "../services/maintainer-noise";
++import { loadLabelAudit, labelAuditSummary } from "../services/label-audit";
+ import { loadMaintainerLaneReport, maintainerLaneSummary } from "../services/maintainer-lane";
+ import { buildUnavailableQueueTrendReport } from "../services/queue-trends";
+ import {
+@@ -612,6 +613,19 @@ const maintainerNoiseOutputSchema = {
+   summary: z.string().optional(),
+ };
+ 
++const labelAuditOutputSchema = {
++  repoFullName: z.string().optional(),
++  generatedAt: z.string().optional(),
++  configuredLabels: z.array(z.string()).optional(),
++  liveLabels: z.array(z.string()).optional(),
++  observedLabels: z.array(z.unknown()).optional(),
++  missingConfiguredLabels: z.array(z.string()).optional(),
++  suspiciousConfiguredLabels: z.array(z.string()).optional(),
++  trustedPipelineReady: z.boolean().optional(),
++  findings: z.array(z.unknown()).optional(),
++  summary: z.string().optional(),
++};
++
+ const maintainerLaneOutputSchema = {
+   repoFullName: z.string().optional(),
+   generatedAt: z.string().optional(),
+@@ -1076,6 +1090,16 @@ export class GittensoryMcp {
+       async (input) => this.toolResult(await this.getMaintainerNoise(input)),
+     );
+ 
++    server.registerTool(
++      "gittensory_get_label_audit",
++      {
++        description: "Return the repo's label-policy audit: configured-vs-live labels, missing configured labels, suspicious status/source-style labels, and trusted-label-pipeline readiness for label-multiplier scoring. Maintainer-authenticated; advisory only.",
++        inputSchema: ownerRepoShape,
++        outputSchema: labelAuditOutputSchema,
++      },
++      async (input) => this.toolResult(await this.getLabelAudit(input)),
++    );
++
+     server.registerTool(
+       "gittensory_get_maintainer_lane",
+       {
+@@ -1853,6 +1877,16 @@ export class GittensoryMcp {
+     };
+   }
+ 
++  private async getLabelAudit(input: { owner: string; repo: string }): Promise<ToolPayload> {
++    const fullName = `${input.owner}/${input.repo}`;
++    await this.requireRepoAccess(fullName);
++    const report = await loadLabelAudit(this.env, fullName);
++    return {
++      summary: labelAuditSummary(report),
++      data: report as unknown as Record<string, unknown>,
++    };
++  }
++
+   private async getMaintainerLane(input: { owner: string; repo: string }): Promise<ToolPayload> {
+     const fullName = `${input.owner}/${input.repo}`;
+     await this.requireRepoAccess(fullName);
+diff --git a/src/services/label-audit.ts b/src/services/label-audit.ts
+new file mode 100644
+index 00000000..cd2225f9
+--- /dev/null
++++ b/src/services/label-audit.ts
+@@ -0,0 +1,21 @@
++import { getRepository, listIssueSignalSample, listOpenPullRequests, listRepoLabels } from "../db/repositories";
++import { buildLabelAudit, type LabelAudit } from "../signals/engine";
++
++// Maintainer label-policy health: whether the repo's configured (.gittensory.yml / dashboard) label set matches
++// the live GitHub labels and is trustworthy for label-multiplier scoring — surfacing missing configured labels,
++// suspicious status/source-style labels, and the overall trusted-label-pipeline readiness. The deterministic
++// builder already powers the repo-intelligence response; this load-or-compute wrapper makes the same audit
++// available to the MCP tool surface (agent / CLI), mirroring the maintainer-noise / maintainer-lane serving.
++export async function loadLabelAudit(env: Env, fullName: string): Promise<LabelAudit> {
++  const [repo, labels, issues, pullRequests] = await Promise.all([
++    getRepository(env, fullName),
++    listRepoLabels(env, fullName),
++    listIssueSignalSample(env, fullName),
++    listOpenPullRequests(env, fullName),
++  ]);
++  return buildLabelAudit(repo, labels, issues, pullRequests, fullName);
++}
++
++export function labelAuditSummary(report: LabelAudit): string {
++  return `Gittensory label audit for ${report.repoFullName}: trusted-label pipeline ${report.trustedPipelineReady ? "ready" : "not ready"}; ${report.missingConfiguredLabels.length} missing, ${report.suspiciousConfiguredLabels.length} suspicious configured label(s).`;
++}
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index c1e5e9ba..7ee66364 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -4900,6 +4900,7 @@ describe("api routes", () => {
+     const toolNames = toolsPayload.result.tools.map((tool) => tool.name);
+     expect(toolNames).toContain("gittensory_get_repo_context");
+     expect(toolNames).toContain("gittensory_get_maintainer_noise");
++    expect(toolNames).toContain("gittensory_get_label_audit");
+     expect(toolNames).toContain("gittensory_get_maintainer_lane");
+     expect(toolNames).toContain("gittensory_get_issue_quality");
+     expect(toolNames).toContain("gittensory_get_burden_forecast");
+diff --git a/test/unit/label-audit.test.ts b/test/unit/label-audit.test.ts
+new file mode 100644
+index 00000000..f89e1aa2
+--- /dev/null
++++ b/test/unit/label-audit.test.ts
+@@ -0,0 +1,43 @@
++import { describe, expect, it } from "vitest";
++import { upsertRepositoryFromGitHub } from "../../src/db/repositories";
++import type { LabelAudit } from "../../src/signals/engine";
++import { labelAuditSummary, loadLabelAudit } from "../../src/services/label-audit";
++import { createTestEnv } from "../helpers/d1";
++
++describe("label audit serving", () => {
++  it("loads repo labels and computes the audit on demand", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "demo", full_name: "octo/demo", private: false, owner: { login: "octo" }, default_branch: "main" });
++    const report = await loadLabelAudit(env, "octo/demo");
++    expect(report.repoFullName).toBe("octo/demo");
++    expect(Array.isArray(report.configuredLabels)).toBe(true);
++    expect(Array.isArray(report.suspiciousConfiguredLabels)).toBe(true);
++    expect(Array.isArray(report.observedLabels)).toBe(true);
++    expect(typeof report.trustedPipelineReady).toBe("boolean");
++    // Public-safe: no private economic/identity terms leak through.
++    expect(JSON.stringify(report)).not.toMatch(/wallet|hotkey|coldkey|payout|reward/i);
++  });
++
++  it("renders a public-safe summary for both trusted-pipeline-readiness states", () => {
++    const base: LabelAudit = {
++      repoFullName: "octo/demo",
++      generatedAt: "2026-06-01T00:00:00.000Z",
++      configuredLabels: ["bug", "status:ready"],
++      liveLabels: ["status:ready"],
++      observedLabels: [],
++      missingConfiguredLabels: ["bug"],
++      suspiciousConfiguredLabels: ["status:ready"],
++      trustedPipelineReady: false,
++      findings: [],
++    };
++    const notReady = labelAuditSummary(base);
++    expect(notReady).toContain("octo/demo");
++    expect(notReady).toContain("not ready");
++    expect(notReady).toContain("1 missing");
++    expect(notReady).toContain("1 suspicious");
++
++    const ready = labelAuditSummary({ ...base, missingConfiguredLabels: [], suspiciousConfiguredLabels: [], trustedPipelineReady: true });
++    expect(ready).toContain("pipeline ready");
++    expect(ready).not.toContain("not ready");
++  });
++});
+diff --git a/test/unit/mcp-output-schemas.test.ts b/test/unit/mcp-output-schemas.test.ts
+index 99ac17db..64e71717 100644
+--- a/test/unit/mcp-output-schemas.test.ts
++++ b/test/unit/mcp-output-schemas.test.ts
+@@ -13,6 +13,7 @@ import { createTestEnv } from "../helpers/d1";
+ const TOOLS_WITH_OUTPUT_SCHEMA = [
+   "gittensory_get_repo_context",
+   "gittensory_get_maintainer_noise",
++  "gittensory_get_label_audit",
+   "gittensory_get_maintainer_lane",
+   "gittensory_get_burden_forecast",
+   "gittensory_get_repo_outcome_patterns",
+@@ -234,6 +235,19 @@ describe("MCP tool calls return schema-valid structured content", () => {
+     expect(result.structuredContent).toBeUndefined();
+   });
+ 
++  it("gittensory_get_label_audit returns a structured label-policy audit for a repo", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "demo", full_name: "octo/demo", private: false, owner: { login: "octo" }, default_branch: "main" });
++    const { client } = await connectTestClient(env);
++    const result = await client.callTool({ name: "gittensory_get_label_audit", arguments: { owner: "octo", repo: "demo" } });
++    expect(result.isError).toBeFalsy();
++    const data = result.structuredContent as Record<string, unknown>;
++    expect(data.repoFullName).toBe("octo/demo");
++    expect(typeof data.trustedPipelineReady).toBe("boolean");
++    expect(Array.isArray(data.suspiciousConfiguredLabels)).toBe(true);
++    expect(JSON.stringify(data)).not.toMatch(/hotkey|coldkey|wallet|payout|reward/i);
++  });
++
+   it("gittensory_get_maintainer_lane returns a structured lane triage report for a repo", async () => {
+     const env = createTestEnv();
+     await upsertRepositoryFromGitHub(env, { name: "demo", full_name: "octo/demo", private: false, owner: { login: "octo" }, default_branch: "main" });

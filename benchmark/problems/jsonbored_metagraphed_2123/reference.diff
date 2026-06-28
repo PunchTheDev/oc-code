@@ -1,0 +1,181 @@
+diff --git a/src/health-serving.mjs b/src/health-serving.mjs
+index 22a58eaf8..d43fe277c 100644
+--- a/src/health-serving.mjs
++++ b/src/health-serving.mjs
+@@ -586,8 +586,8 @@ export function formatRpcUsage({
+ // SLA + downtime incidents per surface. `slaRows`: [{ surface_id, surface_key?,
+ // total, ok_count }]. `incidentRows`: [{ surface_id, surface_key?, started_at, ended_at,
+ // failed_samples }] — one row PER INCIDENT (gap-islands grouped in SQL).
+-// `maxIncidents` is a defensive API cap so flapping endpoints cannot force the
+-// formatter to materialize unbounded incident arrays.
++// `maxIncidents` is a per-surface defensive API cap so one flapping endpoint
++// cannot monopolize the budget and starve sibling surfaces on the same subnet.
+ export function formatIncidents({
+   netuid,
+   window,
+@@ -600,12 +600,14 @@ export function formatIncidents({
+     ? Math.max(0, maxIncidents)
+     : Infinity;
+   const incidentsBySurface = new Map();
+-  let acceptedIncidents = 0;
++  const acceptedBySurface = new Map();
+   for (const row of incidentRows || []) {
+-    if (acceptedIncidents >= incidentLimit) {
+-      break;
+-    }
+     const key = surfaceLookupKey(row);
++    if (!key) continue;
++    const accepted = acceptedBySurface.get(key) || 0;
++    if (accepted >= incidentLimit) {
++      continue;
++    }
+     const list = incidentsBySurface.get(key) || [];
+     const startedAt = Number(row.started_at);
+     const endedAt = Number(row.ended_at);
+@@ -615,7 +617,7 @@ export function formatIncidents({
+       duration_ms: endedAt - startedAt,
+       failed_samples: Number(row.failed_samples) || 0,
+     });
+-    acceptedIncidents += 1;
++    acceptedBySurface.set(key, accepted + 1);
+     incidentsBySurface.set(key, list);
+   }
+ 
+diff --git a/tests/analytics.test.mjs b/tests/analytics.test.mjs
+index b56bd991a..938f91a48 100644
+--- a/tests/analytics.test.mjs
++++ b/tests/analytics.test.mjs
+@@ -126,6 +126,35 @@ describe("formatIncidents", () => {
+     assert.equal(out.surfaces[0].incident_count, 2);
+     assert.equal(out.surfaces[0].incidents.length, 2);
+   });
++  test("caps incidents per surface independently (regression: global cap starvation)", () => {
++    const t = 1_000_000_000_000;
++    const out = formatIncidents({
++      netuid: 1,
++      slaRows: [
++        { surface_id: "a", total: 10, ok_count: 5 },
++        { surface_id: "z", total: 10, ok_count: 5 },
++      ],
++      incidentRows: [
++        ...Array.from({ length: 3 }, (_, i) => ({
++          surface_id: "a",
++          started_at: t + i * 60_000,
++          ended_at: t + i * 60_000 + 1_000,
++          failed_samples: 1,
++        })),
++        ...Array.from({ length: 2 }, (_, i) => ({
++          surface_id: "z",
++          started_at: t + 100_000 + i * 60_000,
++          ended_at: t + 100_000 + i * 60_000 + 1_000,
++          failed_samples: 1,
++        })),
++      ],
++      maxIncidents: 2,
++    });
++    const a = out.surfaces.find((surface) => surface.surface_id === "a");
++    const z = out.surfaces.find((surface) => surface.surface_id === "z");
++    assert.equal(a.incident_count, 2);
++    assert.equal(z.incident_count, 2);
++  });
+ });
+ 
+ describe("formatLeaderboards", () => {
+@@ -1065,9 +1094,10 @@ describe("analytics routes (fake D1 with data)", () => {
+       queries[1].sql,
+       /SUM\(CASE WHEN ok = 1 OR gap IS NULL OR gap > \?/,
+     );
+-    assert.match(queries[1].sql, /FROM grouped\n {7}WHERE ok = 0/);
++    assert.match(queries[1].sql, /incidents AS \(/);
++    assert.match(queries[1].sql, /FROM grouped\n {9}WHERE ok = 0/);
+   });
+-  test("incidents SQL uses a hard incident row cap", async () => {
++  test("incidents SQL caps rows per surface_key", async () => {
+     const queries = [];
+     const { status } = await getJson(
+       "https://api.metagraph.sh/api/v1/subnets/7/health/incidents",
+@@ -1077,7 +1107,8 @@ describe("analytics routes (fake D1 with data)", () => {
+     const incidentQuery = queries.find((query) =>
+       query.sql.includes("WITH checks"),
+     );
+-    assert.ok(incidentQuery.sql.includes("LIMIT ?"));
++    assert.ok(incidentQuery.sql.includes("ROW_NUMBER()"));
++    assert.ok(incidentQuery.sql.includes("WHERE rn <= ?"));
+     assert.equal(incidentQuery.params.at(-1), 1000);
+     // Single-probe blips are excluded: an incident needs >= 2 consecutive fails.
+     assert.ok(incidentQuery.sql.includes("HAVING COUNT(*) >= ?"));
+diff --git a/tests/request-handlers-analytics.test.mjs b/tests/request-handlers-analytics.test.mjs
+index 37611b235..e9f7202f9 100644
+--- a/tests/request-handlers-analytics.test.mjs
++++ b/tests/request-handlers-analytics.test.mjs
+@@ -1230,6 +1230,7 @@ describe("handleHealthIncidents", () => {
+     );
+     assert.ok(cap.sql.some((s) => s.includes("GROUP BY COALESCE")));
+     assert.ok(cap.sql.some((s) => s.includes("WITH checks")));
++    assert.ok(cap.sql.some((s) => s.includes("ROW_NUMBER()")));
+     assert.equal(cap.sql.length, 2);
+   });
+ 
+diff --git a/workers/request-handlers/analytics.mjs b/workers/request-handlers/analytics.mjs
+index 10b6d03ae..236aabb3d 100644
+--- a/workers/request-handlers/analytics.mjs
++++ b/workers/request-handlers/analytics.mjs
+@@ -491,8 +491,8 @@ export async function handleHealthIncidents(
+         [netuid, since],
+       ),
+       // Gap-island grouping in SQL: collapse consecutive failures (gap <= the
+-      // incident threshold) into one incident row, then cap the public payload so
+-      // flapping endpoints cannot force unbounded result sets/responses.
++      // incident threshold) into one incident row, then cap per surface_key so
++      // one flappy endpoint cannot starve sibling surfaces in the same subnet.
+       d1All(
+         env,
+         `WITH checks AS (
+@@ -513,18 +513,37 @@ export async function handleHealthIncidents(
+                 SUM(CASE WHEN ok = 1 OR gap IS NULL OR gap > ? THEN 1 ELSE 0 END)
+                   OVER (PARTITION BY surface_key ORDER BY checked_at) AS grp
+          FROM checks
++       ),
++       incidents AS (
++         SELECT MAX(surface_id) AS surface_id,
++                surface_key,
++                MIN(checked_at) AS started_at,
++                MAX(checked_at) AS ended_at,
++                COUNT(*) AS failed_samples
++         FROM grouped
++         WHERE ok = 0
++         GROUP BY surface_key, grp
++         HAVING COUNT(*) >= ?
+        )
+-       SELECT MAX(surface_id) AS surface_id,
++       SELECT surface_id,
+               surface_key,
+-              MIN(checked_at) AS started_at,
+-              MAX(checked_at) AS ended_at,
+-              COUNT(*) AS failed_samples
+-       FROM grouped
+-       WHERE ok = 0
+-       GROUP BY surface_key, grp
+-       HAVING COUNT(*) >= ?
+-       ORDER BY surface_id, started_at
+-       LIMIT ?`,
++              started_at,
++              ended_at,
++              failed_samples
++       FROM (
++         SELECT surface_id,
++                surface_key,
++                started_at,
++                ended_at,
++                failed_samples,
++                ROW_NUMBER() OVER (
++                  PARTITION BY surface_key
++                  ORDER BY started_at
++                ) AS rn
++         FROM incidents
++       ) ranked
++       WHERE rn <= ?
++       ORDER BY surface_id, started_at`,
+         [
+           netuid,
+           since,

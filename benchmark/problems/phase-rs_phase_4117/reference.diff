@@ -1,0 +1,584 @@
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index b16c15ce82..4f58fa97b6 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -7671,6 +7671,13 @@ pub fn handle_cast_spell_as_madness_with_payment_mode(
+     continue_with_prepared(state, player, prepared, events)
+ }
+ 
++pub(super) struct ResolutionCastRequest {
++    pub(super) constraint: Option<crate::types::ability::CastPermissionConstraint>,
++    pub(super) cast_transformed: bool,
++    pub(super) cleanup: crate::types::ability::ResolutionCastCleanup,
++    pub(super) exile_instead_of_graveyard_on_resolve: bool,
++}
++
+ /// CR 608.2g: Cast a Cascade/Discover hit *during resolution* of its source
+ /// spell, rather than granting a lingering permission that requires a separate
+ /// later `CastSpell`. The single authority that constructs the
+@@ -7699,11 +7706,15 @@ pub(super) fn initiate_cast_during_resolution(
+     state: &mut GameState,
+     player: PlayerId,
+     hit_card: ObjectId,
+-    constraint: Option<crate::types::ability::CastPermissionConstraint>,
+-    cast_transformed: bool,
+-    cleanup: crate::types::ability::ResolutionCastCleanup,
++    request: ResolutionCastRequest,
+     events: &mut Vec<GameEvent>,
+ ) -> Result<WaitingFor, EngineError> {
++    let ResolutionCastRequest {
++        constraint,
++        cast_transformed,
++        cleanup,
++        exile_instead_of_graveyard_on_resolve,
++    } = request;
+     if let Some(obj) = state.objects.get_mut(&hit_card) {
+         // CR 601.2a + CR 601.2i: zero-cost permission consumed by
+         // `prepare_spell_cast_with_variant_override`'s exile alt-cost scan.
+@@ -7721,9 +7732,12 @@ pub(super) fn initiate_cast_during_resolution(
+                 granted_to: Some(player),
+                 resolution_cleanup: Some(cleanup),
+                 duration: None,
+-                exile_instead_of_graveyard_on_resolve: false,
++                exile_instead_of_graveyard_on_resolve,
+                 enters_with_counter: None,
+             });
++        if exile_instead_of_graveyard_on_resolve {
++            crate::game::casting_costs::apply_exile_instead_of_graveyard_rider(state, hit_card);
++        }
+     }
+     let mut prepared = prepare_spell_cast_with_variant_override(state, player, hit_card, None)?;
+     prepared.payment_mode = CastPaymentMode::Auto;
+@@ -26226,9 +26240,11 @@ mod tests {
+         let mut events = Vec::new();
+         cast_from_zone::resolve(&mut state, &ability, &mut events).unwrap();
+ 
+-        let prepared = prepare_spell_cast(&state, PlayerId(0), instant)
+-            .expect("graveyard instant must be castable under the grant");
+-        continue_with_prepared(&mut state, PlayerId(0), prepared, &mut events).unwrap();
++        assert_eq!(
++            state.objects[&instant].zone,
++            Zone::Stack,
++            "CR 608.2g: accepting the free cast must put the spell on the stack during resolution"
++        );
+ 
+         stack::resolve_top(&mut state, &mut events);
+ 
+diff --git a/crates/engine/src/game/effects/cast_from_zone.rs b/crates/engine/src/game/effects/cast_from_zone.rs
+index 7a5f7d1b6d..519f40dfe2 100644
+--- a/crates/engine/src/game/effects/cast_from_zone.rs
++++ b/crates/engine/src/game/effects/cast_from_zone.rs
+@@ -91,7 +91,7 @@ pub fn resolve(
+         cast_transformed,
+         alt_ability_cost,
+         constraint,
+-        _duration,
++        duration,
+         driver,
+     ) = match &ability.effect {
+         Effect::CastFromZone {
+@@ -235,25 +235,27 @@ pub fn resolve(
+         && alt_ability_cost.is_none()
+         && target_ids.len() == 1;
+ 
+-    // CR 608.2g: A targeted free-cast of a card the controller could never
+-    // surface a *later* cast for must also be driven DURING resolution. Memory
+-    // Plunder's "you may cast target instant or sorcery card from an opponent's
+-    // graveyard without paying its mana cost" leaves the card in the OPPONENT's
+-    // graveyard; a lingering `ExileWithAltCost` grant is inert there because the
+-    // graveyard cast surface (`graveyard_spell_objects_available_to_cast`) only
+-    // offers cards in the *controller's own* graveyard (`obj.owner == player`),
+-    // so the granted player can never act on the permission (issue #2884:
+-    // accepting the "you may cast" prompt did nothing). When the single resolved
+-    // target is a card in a graveyard owned by another player, the only
+-    // rules-correct casting mechanism is CR 608.2g — cast it as this effect
+-    // resolves. The Suspend/Rebound self-cast (`driver` + `target == source`) is
+-    // the other during-resolution case; both share the same casting authority.
+-    let foreign_graveyard_free_cast = without_paying
++    // CR 608.2g: A targeted immediate free-cast of a card in a graveyard must
++    // be driven DURING resolution — the controller chooses whether to cast as
++    // this effect resolves (Torrential Gearhulk / Memory Plunder / Toshiro
++    // class). A lingering `ExileWithAltCost` grant is wrong here:
++    //   - opponent-graveyard targets are inert on the graveyard cast surface
++    //     (issue #2884 — accepting did nothing);
++    //   - own-graveyard targets defer the cast to a later priority window,
++    //     which violates CR 608.2g for resolution-time "you may cast" with no
++    //     standing duration (issue #852).
++    // Timed grants (`duration: Some(_)`) and paid casts stay on the lingering
++    // permission path (Emry, Urza-class deferred play).
++    let immediate_graveyard_free_cast = without_paying
+         && alt_ability_cost.is_none()
++        && duration.is_none()
+         && target_ids.len() == 1
+-        && target_is_in_other_players_graveyard(state, target_ids[0], ability.controller);
++        && state
++            .objects
++            .get(&target_ids[0])
++            .is_some_and(|obj| obj.zone == Zone::Graveyard);
+ 
+-    if driver_free_cast || foreign_graveyard_free_cast {
++    if driver_free_cast || immediate_graveyard_free_cast {
+         return cast_single_target_during_resolution(
+             state,
+             ability,
+@@ -274,22 +276,6 @@ pub fn resolve(
+     Ok(())
+ }
+ 
+-/// CR 608.2g: True when `card` currently sits in a graveyard owned by a player
+-/// other than `controller`. Such a card can never be cast via a lingering
+-/// `ExileWithAltCost` grant — the graveyard cast surface only offers cards in
+-/// the controller's own graveyard — so a targeted free-cast of it must happen
+-/// during resolution (Memory Plunder, issue #2884).
+-fn target_is_in_other_players_graveyard(
+-    state: &GameState,
+-    card: ObjectId,
+-    controller: crate::types::player::PlayerId,
+-) -> bool {
+-    state
+-        .objects
+-        .get(&card)
+-        .is_some_and(|obj| obj.zone == Zone::Graveyard && obj.owner != controller)
+-}
+-
+ /// CR 608.2g + CR 601.2a: After a resolution-time hand pick for a free
+ /// `CastFromZone` (Expertise cycle, Electrodominance), cast the chosen spell
+ /// during resolution instead of granting a lingering hand permission.
+@@ -396,13 +382,17 @@ fn cast_single_target_during_resolution(
+         reject_action: crate::types::ability::ResolutionMvRejectAction::RemainExiled,
+         success_action: crate::types::ability::ResolutionCastSuccessAction::BottomMisses,
+     };
++    let exile_instead_of_graveyard_on_resolve = cast_from_zone_has_graveyard_exile_rider(ability);
+     state.waiting_for = crate::game::casting::initiate_cast_during_resolution(
+         state,
+         ability.controller,
+         card,
+-        constraint,
+-        cast_transformed,
+-        cleanup,
++        crate::game::casting::ResolutionCastRequest {
++            constraint,
++            cast_transformed,
++            cleanup,
++            exile_instead_of_graveyard_on_resolve,
++        },
+         events,
+     )
+     .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
+@@ -685,18 +675,9 @@ mod tests {
+         )));
+     }
+ 
+-    /// Issue #2884 — Memory Plunder: "you may cast target instant or sorcery card
+-    /// from an opponent's graveyard without paying its mana cost". The target is
+-    /// in the OPPONENT's graveyard, where a lingering `ExileWithAltCost` grant is
+-    /// inert (the graveyard cast surface only offers cards in the controller's own
+-    /// graveyard). The free cast must therefore be driven DURING resolution
+-    /// (CR 608.2g): the card moves directly from that graveyard to the stack
+-    /// under CR 601.2a, rather than staying in the graveyard with a dead
+-    /// permission or detouring through exile.
+-    ///
+-    /// Discriminator vs. `graveyard_target_grant_stays_in_graveyard_with_timed_permission`:
+-    /// the only difference is the target's owner — own-graveyard → lingering
+-    /// permission (stays put); opponent-graveyard → cast during resolution.
++    /// Issue #2884 / #852 — Memory Plunder (opponent graveyard) and Torrential
++    /// Gearhulk (own graveyard): immediate "you may cast target … from a
++    /// graveyard without paying its mana cost" must cast during resolution.
+     #[test]
+     fn opponent_graveyard_free_cast_moves_directly_to_stack() {
+         let mut state = make_test_state();
+@@ -771,6 +752,47 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn own_graveyard_immediate_free_cast_moves_directly_to_stack() {
++        let mut state = make_test_state();
++        let obj_id = {
++            let id = add_card_to_graveyard(&mut state, PlayerId(0), CardId(852));
++            state
++                .objects
++                .get_mut(&id)
++                .unwrap()
++                .card_types
++                .core_types
++                .push(CoreType::Instant);
++            id
++        };
++
++        let ability = ResolvedAbility::new(
++            Effect::CastFromZone {
++                target: TargetFilter::ParentTarget,
++                without_paying_mana_cost: true,
++                mode: CardPlayMode::Cast,
++                cast_transformed: false,
++                alt_ability_cost: None,
++                constraint: None,
++                duration: None,
++                driver: CastFromZoneDriver::LingeringPermission,
++            },
++            vec![TargetRef::Object(obj_id)],
++            ObjectId(999),
++            PlayerId(0),
++        );
++
++        let mut events = vec![];
++        resolve(&mut state, &ability, &mut events).unwrap();
++
++        assert_eq!(
++            state.objects.get(&obj_id).map(|obj| obj.zone),
++            Some(Zone::Stack),
++            "Torrential Gearhulk class free casts must move from own graveyard to stack during resolution"
++        );
++    }
++
+     /// Issue #1520 — suspend last-time-counter free cast must actually CAST the
+     /// card as the trigger resolves (CR 702.62a), not merely grant a lingering
+     /// `ExileWithAltCost` permission that the player has to act on later. The
+@@ -1318,16 +1340,19 @@ mod tests {
+         let mut events = vec![];
+         resolve(&mut state, &ability, &mut events).unwrap();
+ 
+-        assert!(state.objects[&instant]
+-            .casting_permissions
+-            .iter()
+-            .any(|p| matches!(
+-                p,
+-                CastingPermission::ExileWithAltCost {
+-                    exile_instead_of_graveyard_on_resolve: true,
+-                    ..
+-                }
+-            )));
++        assert_eq!(state.objects[&instant].zone, Zone::Stack);
++        assert!(
++            state.objects[&instant].casting_permissions.iter().any(|p| {
++                matches!(
++                    p,
++                    CastingPermission::ExileWithAltCost {
++                        exile_instead_of_graveyard_on_resolve: true,
++                        ..
++                    }
++                )
++            }) || !state.objects[&instant].replacement_definitions.is_empty(),
++            "exile rider must stamp either the permission or a graveyard redirect"
++        );
+     }
+ 
+     #[test]
+diff --git a/crates/engine/src/game/engine_resolution_choices.rs b/crates/engine/src/game/engine_resolution_choices.rs
+index a192517407..06f179c4d7 100644
+--- a/crates/engine/src/game/engine_resolution_choices.rs
++++ b/crates/engine/src/game/engine_resolution_choices.rs
+@@ -544,14 +544,19 @@ pub(super) fn handle_resolution_choice(
+                     state,
+                     player,
+                     hit_card,
+-                    Some(crate::types::ability::CastPermissionConstraint::ManaValue {
+-                        comparator: crate::types::ability::Comparator::LE,
+-                        value: QuantityExpr::Fixed {
+-                            value: discover_value as i32,
+-                        },
+-                    }),
+-                    false,
+-                    cleanup,
++                    casting::ResolutionCastRequest {
++                        constraint: Some(
++                            crate::types::ability::CastPermissionConstraint::ManaValue {
++                                comparator: crate::types::ability::Comparator::LE,
++                                value: QuantityExpr::Fixed {
++                                    value: discover_value as i32,
++                                },
++                            },
++                        ),
++                        cast_transformed: false,
++                        cleanup,
++                        exile_instead_of_graveyard_on_resolve: false,
++                    },
+                     events,
+                 )?;
+                 ResolutionChoiceOutcome::WaitingFor(result)
+@@ -774,14 +779,19 @@ pub(super) fn handle_resolution_choice(
+                     state,
+                     player,
+                     hit_card,
+-                    Some(crate::types::ability::CastPermissionConstraint::ManaValue {
+-                        comparator: crate::types::ability::Comparator::LT,
+-                        value: QuantityExpr::Fixed {
+-                            value: source_mv as i32,
+-                        },
+-                    }),
+-                    false,
+-                    cleanup,
++                    casting::ResolutionCastRequest {
++                        constraint: Some(
++                            crate::types::ability::CastPermissionConstraint::ManaValue {
++                                comparator: crate::types::ability::Comparator::LT,
++                                value: QuantityExpr::Fixed {
++                                    value: source_mv as i32,
++                                },
++                            },
++                        ),
++                        cast_transformed: false,
++                        cleanup,
++                        exile_instead_of_graveyard_on_resolve: false,
++                    },
+                     events,
+                 )?;
+                 ResolutionChoiceOutcome::WaitingFor(result)
+@@ -822,7 +832,16 @@ pub(super) fn handle_resolution_choice(
+                         },
+                 };
+                 let result = casting::initiate_cast_during_resolution(
+-                    state, player, hit_card, None, false, cleanup, events,
++                    state,
++                    player,
++                    hit_card,
++                    casting::ResolutionCastRequest {
++                        constraint: None,
++                        cast_transformed: false,
++                        cleanup,
++                        exile_instead_of_graveyard_on_resolve: false,
++                    },
++                    events,
+                 )?;
+                 ResolutionChoiceOutcome::WaitingFor(result)
+             } else {
+@@ -906,7 +925,16 @@ pub(super) fn handle_resolution_choice(
+                     },
+             };
+             let result = casting::initiate_cast_during_resolution(
+-                state, player, chosen, None, false, cleanup, events,
++                state,
++                player,
++                chosen,
++                casting::ResolutionCastRequest {
++                    constraint: None,
++                    cast_transformed: false,
++                    cleanup,
++                    exile_instead_of_graveyard_on_resolve: false,
++                },
++                events,
+             )?;
+             ResolutionChoiceOutcome::WaitingFor(result)
+         }
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index 0490095e45..905ad45638 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -1069,6 +1069,16 @@ fn has_later_sentence_if(lower: &str) -> bool {
+     })
+ }
+ 
++/// True when a resolution-time optional cast names a player-chosen target that
++/// must be announced when the triggered ability is put on the stack (CR 603.3d).
++fn trigger_effect_requires_stack_time_targets(ability: &AbilityDefinition) -> bool {
++    matches!(ability.effect.as_ref(), Effect::CastFromZone { .. })
++        && ability
++            .effect
++            .target_filter()
++            .is_some_and(|filter| !filter.is_context_ref())
++}
++
+ /// Lowering: assemble a `TriggerDefinition` from a `TriggerIr`.
+ ///
+ /// Applies all post-extraction transforms: condition composition, target-player
+@@ -1124,6 +1134,19 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
+ 
+     def.execute = execute;
+     def.optional = modifiers.optional;
++    // CR 603.3d + CR 608.2c: "you may cast target … from [public zone]"
++    // (Torrential Gearhulk / Toshiro / Emet-Selch class) — the leading "you
++    // may" is resolution-time optionality on the cast (`execute.optional`), not
++    // permission to skip putting the triggered ability on the stack. Target
++    // selection happens when the ability is put on the stack (CR 603.3d).
++    if def.optional
++        && def
++            .execute
++            .as_ref()
++            .is_some_and(|ability| trigger_effect_requires_stack_time_targets(ability))
++    {
++        def.optional = false;
++    }
+     def.unless_pay = modifiers.unless_pay.clone();
+ 
+     // CR 603.4: Compose intervening-if with existing condition via And.
+@@ -24207,6 +24230,48 @@ mod tests {
+         assert!(sub.optional, "second sentence ability should be optional");
+     }
+ 
++    #[test]
++    fn trigger_you_may_cast_target_instant_from_graveyard_is_not_trigger_optional() {
++        let def = parse_trigger_line(
++            "When this creature enters, you may cast target instant card from your graveyard without paying its mana cost. If that spell would be put into your graveyard, exile it instead.",
++            "Torrential Gearhulk",
++        );
++        assert!(
++            !def.optional,
++            "CR 603.3d: targeted cast triggers must go on the stack when legal targets exist"
++        );
++        let execute = def.execute.as_ref().expect("ETB execute body");
++        assert!(
++            execute.optional,
++            "CR 608.2c: the cast itself is optional at resolution"
++        );
++        assert_eq!(
++            execute.target_choice_timing,
++            crate::types::ability::TargetChoiceTiming::Stack,
++            "graveyard instant target must be chosen when the trigger goes on the stack"
++        );
++        assert!(
++            matches!(execute.effect.as_ref(), Effect::CastFromZone { .. }),
++            "expected CastFromZone root effect, got {:?}",
++            execute.effect
++        );
++        if let Effect::CastFromZone {
++            without_paying_mana_cost,
++            duration,
++            ..
++        } = execute.effect.as_ref()
++        {
++            assert!(
++                *without_paying_mana_cost,
++                "Gearhulk cast must be without paying mana cost"
++            );
++            assert!(
++                duration.is_none(),
++                "immediate graveyard cast must not carry a standing duration: {duration:?}"
++            );
++        }
++    }
++
+     // ── Work Item 1: Leaves-Graveyard Batch Triggers ──────────────
+ 
+     #[test]
+diff --git a/crates/engine/tests/integration/issue_852_torrential_gearhulk.rs b/crates/engine/tests/integration/issue_852_torrential_gearhulk.rs
+new file mode 100644
+index 0000000000..97f6421801
+--- /dev/null
++++ b/crates/engine/tests/integration/issue_852_torrential_gearhulk.rs
+@@ -0,0 +1,113 @@
++//! Issue #852 — Torrential Gearhulk must allow selecting and casting a graveyard instant.
++//!
++//! https://github.com/phase-rs/phase/issues/852
++
++use engine::game::scenario::{GameScenario, P0};
++use engine::types::ability::TargetRef;
++use engine::types::actions::GameAction;
++use engine::types::game_state::WaitingFor;
++use engine::types::identifiers::ObjectId;
++use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
++use engine::types::phase::Phase;
++use engine::types::zones::Zone;
++
++const GEARHULK_ORACLE: &str = "Flash\n\
++When this creature enters, you may cast target instant card from your graveyard without paying its mana cost. If that spell would be put into your graveyard, exile it instead.";
++
++const OPT_ORACLE: &str = "Draw a card.";
++
++fn floating_mana(n: usize, ty: ManaType) -> Vec<ManaUnit> {
++    (0..n)
++        .map(|_| ManaUnit::new(ty, ObjectId(0), false, vec![]))
++        .collect()
++}
++
++#[test]
++fn torrential_gearhulk_etb_casts_graveyard_instant_without_mana_cost() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    scenario.with_mana_pool(
++        P0,
++        floating_mana(4, ManaType::Colorless)
++            .into_iter()
++            .chain(floating_mana(2, ManaType::Blue))
++            .collect(),
++    );
++
++    let opt = scenario
++        .add_spell_to_graveyard(P0, "Opt", true)
++        .from_oracle_text(OPT_ORACLE)
++        .with_mana_cost(ManaCost::Cost {
++            shards: vec![ManaCostShard::Blue],
++            generic: 0,
++        })
++        .id();
++
++    let _dispel = scenario
++        .add_spell_to_graveyard(P0, "Dispel", true)
++        .from_oracle_text("Counter target spell.")
++        .with_mana_cost(ManaCost::Cost {
++            shards: vec![ManaCostShard::Blue],
++            generic: 0,
++        })
++        .id();
++
++    let gearhulk = scenario
++        .add_creature_to_hand_from_oracle(P0, "Torrential Gearhulk", 5, 6, GEARHULK_ORACLE)
++        .with_mana_cost(ManaCost::Cost {
++            shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
++            generic: 4,
++        })
++        .id();
++
++    let mut runner = scenario.build();
++
++    assert!(
++        !runner.state().objects[&gearhulk].trigger_definitions[0].optional,
++        "Gearhulk ETB must be mandatory on stack when targets exist"
++    );
++
++    runner.cast(gearhulk).commit();
++    runner.advance_until_stack_empty();
++
++    let legal = match &runner.state().waiting_for {
++        WaitingFor::TriggerTargetSelection { target_slots, .. } => target_slots
++            .iter()
++            .flat_map(|slot| slot.legal_targets.iter())
++            .cloned()
++            .collect::<Vec<_>>(),
++        other => panic!("expected TriggerTargetSelection for Gearhulk ETB, got {other:?}"),
++    };
++    assert!(
++        legal.contains(&TargetRef::Object(opt)),
++        "Opt in graveyard must be a legal Gearhulk target; legal={legal:?}"
++    );
++
++    runner
++        .act(GameAction::ChooseTarget {
++            target: Some(TargetRef::Object(opt)),
++        })
++        .expect("select graveyard instant for ETB trigger");
++
++    runner.resolve_top();
++
++    assert!(
++        matches!(
++            runner.state().waiting_for,
++            WaitingFor::OptionalEffectChoice { .. }
++        ),
++        "after targeting, optional cast prompt must appear; got {:?}",
++        runner.state().waiting_for
++    );
++
++    runner
++        .act(GameAction::DecideOptionalEffect { accept: true })
++        .expect("accept free cast");
++
++    assert_eq!(
++        runner.state().objects[&opt].zone,
++        Zone::Stack,
++        "accepting must cast the targeted instant during resolution; waiting_for={:?}",
++        runner.state().waiting_for
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index ee1c0f2b0a..1bfd66b4ac 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -348,6 +348,7 @@ mod issue_691_sheoldred_saga_lore;
+ mod issue_709_regression;
+ mod issue_841_selvala_explorer_returned;
+ mod issue_847_braids_cabal_minion;
++mod issue_852_torrential_gearhulk;
+ mod issue_859_weathered_wayfarer;
+ mod issue_860_luminarch_aspirant;
+ mod issue_861_first_sliver_cascade;

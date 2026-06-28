@@ -1,0 +1,431 @@
+package tools.jackson.databind;
+
+import java.util.*;
+
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
+
+import tools.jackson.databind.cfg.MapperConfig;
+import tools.jackson.databind.introspect.*;
+import tools.jackson.databind.util.Annotations;
+
+/**
+ * Basic container for information gathered by {@link ClassIntrospector} to
+ * help in constructing serializers and deserializers.
+ * Note that the one implementation type is
+ * {@link tools.jackson.databind.introspect.BasicBeanDescription},
+ * meaning that it is safe to upcast to that type.
+ */
+public abstract class BeanDescription
+{
+    /**
+     * Bean type information, including raw class and possible
+     * generics information
+     */
+    protected final JavaType _type;
+
+    /*
+    /**********************************************************************
+    /* Life-cycle
+    /**********************************************************************
+     */
+
+    protected BeanDescription(JavaType type) {
+        _type = type;
+    }
+
+    /**
+     * Method for constructing a supplier for this bean description instance:
+     * sometimes needed when code expects supplier, not description instance.
+     */
+    public abstract BeanDescription.Supplier supplier();
+
+    /*
+    /**********************************************************************
+    /* Simple accessors
+    /**********************************************************************
+     */
+
+    /**
+     * Method for accessing declared type of bean being introspected,
+     * including full generic type information (from declaration)
+     */
+    public JavaType getType() { return _type; }
+
+    public Class<?> getBeanClass() { return _type.getRawClass(); }
+
+    public boolean isRecordType() { return _type.isRecordType(); }
+
+    public boolean isNonStaticInnerClass() {
+        return getClassInfo().isNonStaticInnerClass();
+    }
+
+    /**
+     * Method for accessing low-level information about Class this
+     * item describes.
+     */
+    public abstract AnnotatedClass getClassInfo();
+
+    /**
+     * Accessor for getting information about Object Id expected to
+     * be used for this POJO type, if any.
+     */
+    public abstract ObjectIdInfo getObjectIdInfo();
+
+    /**
+     * Method for checking whether class being described has any
+     * annotations recognized by registered annotation introspector.
+     */
+    public abstract boolean hasKnownClassAnnotations();
+
+    /**
+     * Method for accessing collection of annotations the bean
+     * class has.
+     */
+    public abstract Annotations getClassAnnotations();
+
+    /*
+    /**********************************************************************
+    /* Basic API for finding properties
+    /**********************************************************************
+     */
+
+    /**
+     * @return Ordered Map with logical property name as key, and
+     *    matching getter method as value.
+     */
+    public abstract List<BeanPropertyDefinition> findProperties();
+
+    /**
+     * Returns the combined set of property names that are marked to be ignored,
+     * from both per-property {@code @JsonIgnore} markers and class-level
+     * {@code @JsonIgnoreProperties} (annotation and config overrides).
+     * Note that the set is direction-specific: a name may appear for serialization
+     * but not deserialization, depending on the annotation attributes.
+     */
+    public abstract Set<String> getIgnoredPropertyNames();
+
+    /**
+     * Returns the class-level property ignorals value (annotation plus config overrides),
+     * pre-computed during property collection.  Preferred over re-calling
+     * {@code findPropertyIgnoralByName()} in factory code since the result is cached.
+     * Returns {@code null} when neither annotation nor config override defines any ignorals.
+     *<p>
+     * Note: per-property {@code @JsonIgnore} names are NOT included here; see
+     * {@link #getIgnoredPropertyNames()} for the full combined set.
+     */
+    public JsonIgnoreProperties.Value getPropertyIgnorals() {
+        return null;
+    }
+
+    /**
+     * Method for locating all back-reference properties (setters, fields) bean has
+     */
+    public abstract List<BeanPropertyDefinition> findBackReferences();
+
+    /*
+    /**********************************************************************
+    /* Basic API for finding Creators, related information
+    /**********************************************************************
+     */
+
+    /**
+     * Helper method that will return all non-default constructors (that is,
+     * constructors that take one or more arguments) this class has.
+     */
+    public abstract List<AnnotatedConstructor> getConstructors();
+
+    /**
+     * Method similar to {@link #getConstructors()} except will also introspect
+     * {@code JsonCreator.Mode} and filter out ones marked as not applicable and
+     * include mode (or lack thereof) for remaining constructors.
+     *<p>
+     * Note that no other filtering (regarding visibility or other annotations)
+     * is performed
+     */
+    public abstract List<AnnotatedAndMetadata<AnnotatedConstructor, JsonCreator.Mode>> getConstructorsWithMode();
+
+    /**
+     * Helper method that will check all static methods of the bean class
+     * that seem like factory methods eligible to be used as Creators.
+     * This requires that the static method:
+     *<ol>
+     * <li>Returns type compatible with bean type (same or subtype)
+     *  </li>
+     * <li>Is recognized from either explicit annotation (usually {@code @JsonCreator}
+     *   OR naming:
+     *   names {@code valueOf()} and {@code fromString()} are recognized but
+     *   only for 1-argument factory methods, and in case of {@code fromString()}
+     *   argument type must further be either {@code String} or {@code CharSequence}.
+     *  </li>
+     *</ol>
+     * Note that caller typically applies further checks for things like visibility.
+     *
+     * @return List of static methods considered as possible Factory methods
+     */
+    public abstract List<AnnotatedMethod> getFactoryMethods();
+
+    /**
+     * Method similar to {@link #getFactoryMethods()} but will return {@code JsonCreator.Mode}
+     * metadata along with qualifying factory method candidates.
+     *
+     * @since 2.13
+     */
+    public abstract List<AnnotatedAndMetadata<AnnotatedMethod, JsonCreator.Mode>> getFactoryMethodsWithMode();
+
+    /**
+     * Method that will locate the no-arg constructor for this class,
+     * if it has one, and that constructor has not been marked as
+     * ignorable.
+     */
+    public abstract AnnotatedConstructor findDefaultConstructor();
+
+    /**
+     * Method that is replacing earlier Creator introspection access methods.
+     *
+     * @since 2.18
+     *
+     * @return Container for introspected Creator candidates, if any
+     */
+    public abstract PotentialCreators getPotentialCreators();
+
+    /*
+    /**********************************************************************
+    /* Basic API for finding property accessors
+    /**********************************************************************
+     */
+
+    /**
+     * Method for locating accessor (readable field, or "getter" method)
+     * that has
+     * {@link com.fasterxml.jackson.annotation.JsonKey} annotation,
+     * if any. If multiple ones are found,
+     * an error is reported by throwing {@link IllegalArgumentException}
+     */
+    public AnnotatedMember findJsonKeyAccessor() {
+        return null;
+    }
+
+    /**
+     * Method for locating accessor (readable field, or "getter" method)
+     * that has
+     * {@link com.fasterxml.jackson.annotation.JsonValue} annotation,
+     * if any. If multiple ones are found,
+     * an error is reported by throwing {@link IllegalArgumentException}
+     */
+    public abstract AnnotatedMember findJsonValueAccessor();
+
+    /**
+     * Method used to locate the Method or Field of introspected class that
+     * is annotated with {@link com.fasterxml.jackson.annotation.JsonAnyGetter}
+     * (or equivalent annotation).
+     * If no such {@code AnnotatedMember} exists {@code null} is returned.
+     * If more than one are found, an exception is thrown.
+     */
+    public abstract AnnotatedMember findAnyGetter();
+
+    /**
+     * Method used to locate a mutator (settable field, or 2-argument set method)
+     * of introspected class that
+     * is annotated with {@link com.fasterxml.jackson.annotation.JsonAnySetter}
+     * (or equivalent annotation).
+     * If no such mutator exists {@code null} is returned.
+     * If more than one are found an exception is thrown.
+     * Additional checks are also made to see that method signature
+     * is acceptable: needs to take 2 arguments, first one String or
+     * Object; second any can be any type.
+     */
+    public abstract AnnotatedMember findAnySetterAccessor();
+
+    public abstract AnnotatedMethod findMethod(String name, Class<?>[] paramTypes);
+
+    /*
+    /**********************************************************************
+    /* Basic API, class configuration
+    /**********************************************************************
+     */
+
+    /**
+     * Method for finding annotation-indicated inclusion definition (if any);
+     * possibly overriding given default value.
+     *<p>
+     * NOTE: does NOT use global inclusion default settings as the base, unless
+     * passed as `defValue`.
+     */
+    public abstract JsonInclude.Value findPropertyInclusion(JsonInclude.Value defValue);
+
+    /*
+    /**********************************************************************
+    /* Basic API, other
+    /**********************************************************************
+     */
+
+    public abstract Map<Object, AnnotatedMember> findInjectables();
+
+    /**
+     * Method called to create a "default instance" of the bean, currently
+     * only needed for obtaining default field values which may be used for
+     * suppressing serialization of fields that have "not changed".
+     *
+     * @param fixAccess If true, method is allowed to fix access to the
+     *   default constructor (to be able to call non-public constructor);
+     *   if false, has to use constructor as is.
+     *
+     * @return Instance of class represented by this descriptor, if
+     *   suitable default constructor was found; null otherwise.
+     */
+    public abstract Object instantiateBean(boolean fixAccess);
+
+    /**
+     * Method for finding out if the POJO specifies default view(s) to
+     * use for properties, considering both per-type annotations and
+     * global default settings.
+     */
+    public abstract Class<?>[] findDefaultViews();
+
+ 
+    /**
+     * Interface for lazily-constructed suppliers for {@link BeanDescription} instances;
+     * extends plain {@link java.util.function.Supplier} with convenience accessors.
+     */
+    public interface Supplier extends java.util.function.Supplier<BeanDescription>
+    {
+        @Override
+        public BeanDescription get();
+
+        Annotations getClassAnnotations();
+
+        Class<?> getBeanClass();
+
+        AnnotatedClass getClassInfo();
+
+        JavaType getType();
+
+        boolean isRecordType();
+
+        JsonFormat.Value findExpectedFormat(Class<?> baseType);
+    }
+
+    protected static abstract class SupplierBase implements Supplier
+    {
+        protected final MapperConfig<?> _config;
+        protected final JavaType _type;
+
+        /**
+         * Format definitions lazily introspected from class annotations
+         */
+        protected transient JsonFormat.Value _classFormat;
+
+        protected SupplierBase(MapperConfig<?> config, JavaType type) {
+             _config = config;
+             _type = type;
+        }
+
+        // // Simple accessors:
+
+        @Override
+        public JavaType getType() { return _type; }
+
+        @Override
+        public Class<?> getBeanClass() { return _type.getRawClass(); }
+
+        @Override
+        public boolean isRecordType() { return _type.isRecordType(); }
+
+        // // // Introspection
+
+        @Override
+        public JsonFormat.Value findExpectedFormat(Class<?> baseType)
+        {
+            JsonFormat.Value v0 = _classFormat;
+            if (v0 == null) { // copied from above
+                v0 = _config.getAnnotationIntrospector().findFormat(_config,
+                        getClassInfo());
+                if (v0 == null) {
+                    v0 = JsonFormat.Value.empty();
+                }
+                _classFormat = v0;
+            }
+            JsonFormat.Value v1 = _config.getDefaultPropertyFormat(baseType);
+            if (v1 == null) {
+                return v0;
+            }
+            return JsonFormat.Value.merge(v0, v1);
+        }
+    }
+
+    /**
+     * Partial implementation for lazily-constructed suppliers for {@link BeanDescription} instances.
+     */
+    public static abstract class LazySupplier extends SupplierBase
+    {
+        protected transient AnnotatedClass _classDesc;
+
+        protected transient BeanDescription _beanDesc;
+
+        protected LazySupplier(MapperConfig<?> config, JavaType type) {
+            super(config, type);
+        }
+
+        // // Entity accessors:
+
+        @Override
+        public Annotations getClassAnnotations() {
+            return getClassInfo().getAnnotations();
+        }
+
+        @Override
+        public AnnotatedClass getClassInfo() {
+            if (_classDesc == null) {
+                _classDesc = _introspect(_type);
+            }
+            return _classDesc;
+        }
+
+        @Override
+        public BeanDescription get() {
+            if (_beanDesc == null) {
+                // To test without caching, uncomment:
+                //return _construct(_type, getClassInfo());
+
+                _beanDesc = _construct(_type, getClassInfo());
+            }
+            return _beanDesc;
+        }
+
+        // // // Internal factory methods
+
+        protected abstract AnnotatedClass _introspect(JavaType forType);
+
+        protected abstract BeanDescription _construct(JavaType forType, AnnotatedClass ac);
+    }
+
+    /**
+     * Simple {@link Supplier} implementation that just returns pre-constructed
+     * {@link BeanDescription} instance.
+     */
+    public static class EagerSupplier extends SupplierBase
+    {
+        protected final BeanDescription _beanDesc;
+
+        public EagerSupplier(MapperConfig<?> config, BeanDescription beanDesc) {
+            super(config, beanDesc.getType());
+            _beanDesc = beanDesc;
+        }
+
+        @Override
+        public BeanDescription get() { return _beanDesc; }
+
+        @Override
+        public AnnotatedClass getClassInfo() {
+            return _beanDesc.getClassInfo();
+        }
+
+        @Override
+        public Annotations getClassAnnotations() {
+            return _beanDesc.getClassAnnotations();
+        }
+    }  
+}

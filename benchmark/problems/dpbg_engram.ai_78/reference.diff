@@ -1,0 +1,547 @@
+diff --git a/meta-programmer/src/meta_programmer/sandbox_manager.py b/meta-programmer/src/meta_programmer/sandbox_manager.py
+index a475ad7..327bc5f 100644
+--- a/meta-programmer/src/meta_programmer/sandbox_manager.py
++++ b/meta-programmer/src/meta_programmer/sandbox_manager.py
+@@ -14,6 +14,14 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# Shown to operators whenever the sandbox cannot run. The fix is always to make
++# the containment image available; never to skip the sandbox.
++SANDBOX_REMEDIATION = (
++    "Sandbox containment unavailable — refusing to deploy untested code. "
++    "Build the image: `docker compose --profile build-only build sandbox-base` "
++    "and ensure the Docker daemon is running."
++)
++
+ 
+ class SandboxManager:
+     """
+@@ -27,7 +35,14 @@ class SandboxManager:
+     """
+ 
+     def __init__(self):
+-        self.docker_client = docker.from_env()
++        # A missing/unreachable Docker daemon must NOT crash the service at
++        # construction — it must surface later as a fail-closed "sandbox
++        # unavailable" result so deploy is blocked (see run_tests).
++        try:
++            self.docker_client = docker.from_env()
++        except docker.errors.DockerException as e:
++            logger.error("Docker unavailable at init (%s): sandbox will fail closed", e)
++            self.docker_client = None
+         self.sandbox_image = "activelearning-sandbox:latest"
+ 
+         # Configurable limits from environment
+@@ -36,6 +51,20 @@ def __init__(self):
+         self.timeout = int(os.environ.get("SANDBOX_TIMEOUT_SECONDS", "30"))
+         self.max_pids = int(os.environ.get("SANDBOX_MAX_PIDS", "100"))
+ 
++    @staticmethod
++    def _unavailable(detail: str) -> dict:
++        """Build a fail-closed result meaning 'containment could not run'.
++
++        Distinct from a genuine test failure: the caller MUST treat this as a
++        hard deny (never deploy), and surface the remediation to the operator.
++        """
++        return {
++            "success": False,
++            "sandbox_unavailable": True,
++            "output": "",
++            "error": f"{detail} {SANDBOX_REMEDIATION}",
++        }
++
+     async def run_tests(
+         self,
+         code_path: str,
+@@ -51,20 +80,32 @@ async def run_tests(
+         Returns:
+             dict with keys:
+                 - success: bool indicating if tests passed
++                - sandbox_unavailable: bool — True when containment could not
++                  run at all (no daemon, missing image, spawn failure). The
++                  deploy path treats this as a hard fail-closed block, NOT as a
++                  test failure.
+                 - output: stdout from pytest
+                 - error: error message if failed
+         """
++        # Fail closed: no Docker client means containment cannot run.
++        if self.docker_client is None:
++            logger.error("Sandbox unavailable: no Docker client")
++            return self._unavailable("Docker daemon unavailable: no client.")
++
+         try:
++            # Validate the daemon is actually reachable before relying on it.
++            try:
++                self.docker_client.ping()
++            except docker.errors.DockerException as e:
++                logger.error("Sandbox unavailable: Docker daemon unreachable: %s", e)
++                return self._unavailable(f"Docker daemon unreachable: {e}.")
++
+             # Validate sandbox image exists
+             try:
+                 self.docker_client.images.get(self.sandbox_image)
+             except docker.errors.ImageNotFound:
+-                logger.error(f"Sandbox image not found: {self.sandbox_image}")
+-                return {
+-                    "success": False,
+-                    "output": "",
+-                    "error": f"Sandbox image not found: {self.sandbox_image}. Run: docker compose --profile build-only build sandbox-base",
+-                }
++                logger.error("Sandbox image not found: %s", self.sandbox_image)
++                return self._unavailable(f"Sandbox image not found: {self.sandbox_image}.")
+ 
+             # Prepare volume mounts (read-only)
+             volumes = {}
+@@ -83,22 +124,28 @@ async def run_tests(
+ 
+             logger.info(f"Spawning sandbox for: {code_path}")
+ 
+-            # Run sandbox container
+-            container: Container = self.docker_client.containers.run(
+-                image=self.sandbox_image,
+-                command=command,
+-                volumes=volumes,
+-                network_disabled=True,            # No network access
+-                read_only=True,                   # Read-only root filesystem
+-                cap_drop=["ALL"],                 # Drop all Linux capabilities
+-                security_opt=["no-new-privileges"],  # Block privilege escalation
+-                mem_limit=self.memory_limit,
+-                cpu_quota=self.cpu_quota,
+-                pids_limit=self.max_pids,
+-                detach=True,
+-                remove=True,                      # Auto-destroy after completion
+-                tmpfs={"/tmp": "size=50M"},       # Writable /tmp only
+-            )
++            # Run sandbox container. A spawn failure (daemon died, resource
++            # rejection, API error) is containment-unavailable, not a test
++            # failure — fail closed so we never deploy untested code.
++            try:
++                container: Container = self.docker_client.containers.run(
++                    image=self.sandbox_image,
++                    command=command,
++                    volumes=volumes,
++                    network_disabled=True,            # No network access
++                    read_only=True,                   # Read-only root filesystem
++                    cap_drop=["ALL"],                 # Drop all Linux capabilities
++                    security_opt=["no-new-privileges"],  # Block privilege escalation
++                    mem_limit=self.memory_limit,
++                    cpu_quota=self.cpu_quota,
++                    pids_limit=self.max_pids,
++                    detach=True,
++                    remove=True,                      # Auto-destroy after completion
++                    tmpfs={"/tmp": "size=50M"},       # Writable /tmp only
++                )
++            except docker.errors.DockerException as e:
++                logger.error("Sandbox spawn failed: %s", e)
++                return self._unavailable(f"Sandbox container spawn failed: {e}.")
+ 
+             # Wait for completion with timeout
+             try:
+@@ -112,13 +159,18 @@ async def run_tests(
+ 
+                 logger.info(f"Sandbox completed with exit code: {exit_code}")
+ 
++                # Containment ran to completion: a non-zero exit is a genuine
++                # TEST failure, not sandbox unavailability.
+                 return {
+                     "success": exit_code == 0,
++                    "sandbox_unavailable": False,
+                     "output": output,
+                     "error": None if exit_code == 0 else f"Tests failed with exit code {exit_code}",
+                 }
+ 
+             except asyncio.TimeoutError:
++                # Containment worked (and we kill the container); the code under
++                # test hung. That's a test failure, not sandbox unavailability.
+                 logger.error(f"Sandbox timeout after {self.timeout}s")
+                 try:
+                     container.kill()
+@@ -126,6 +178,7 @@ async def run_tests(
+                     pass
+                 return {
+                     "success": False,
++                    "sandbox_unavailable": False,
+                     "output": "",
+                     "error": f"Sandbox timeout after {self.timeout} seconds",
+                 }
+diff --git a/meta-programmer/src/meta_programmer/service.py b/meta-programmer/src/meta_programmer/service.py
+index 8cbccd5..bfd93e3 100644
+--- a/meta-programmer/src/meta_programmer/service.py
++++ b/meta-programmer/src/meta_programmer/service.py
+@@ -54,6 +54,7 @@ def __init__(self):
+         self._code_generated = 0
+         self._tests_passed = 0
+         self._tests_failed = 0
++        self._sandbox_unavailable = 0  # fail-closed blocks (containment could not run)
+         self._deployments = 0
+         self._reviews_expired = 0
+ 
+@@ -212,6 +213,21 @@ async def _handle_knowledge_gap(self, data: dict[str, Any]) -> None:
+                 test_path=os.path.join(os.path.dirname(staged_path), "tests.py") if test_content else None,
+             )
+ 
++            # Fail closed: if containment itself could not run (no Docker daemon,
++            # missing image, spawn failure) we must NOT deploy. This is distinct
++            # from a genuine test failure — untested code is never deployed.
++            if test_result.get("sandbox_unavailable"):
++                reason = test_result.get("error", "Sandbox unavailable")
++                self.logger.error(
++                    "FAIL-CLOSED: sandbox unavailable for %s — blocking deploy. %s",
++                    trace_id,
++                    reason,
++                )
++                self._sandbox_unavailable += 1
++                self._staging_manager.stage_rejected(trace_id, reason)
++                await self._publish_gap_result(trace_id, False, reason, fail_closed=True)
++                return
++
+             if test_result["success"]:
+                 self.logger.info(f"Tests passed for: {trace_id}")
+                 self._tests_passed += 1
+@@ -331,8 +347,19 @@ async def _deploy_code(self, trace_id: str, target_path: str, code: str) -> None
+             self.logger.error(f"Error deploying code: {e}")
+             raise
+ 
+-    async def _publish_gap_result(self, trace_id: str, success: bool, message: str) -> None:
+-        """Publish knowledge gap processing result."""
++    async def _publish_gap_result(
++        self,
++        trace_id: str,
++        success: bool,
++        message: str,
++        fail_closed: bool = False,
++    ) -> None:
++        """Publish knowledge gap processing result.
++
++        fail_closed=True marks results where containment could not run, so
++        downstream consumers/metrics can distinguish a safety block from an
++        ordinary test failure.
++        """
+         try:
+             await self.event_bus.publish(
+                 f"knowledge.gap.result.{trace_id}",
+@@ -340,6 +367,7 @@ async def _publish_gap_result(self, trace_id: str, success: bool, message: str)
+                     "trace_id": trace_id,
+                     "success": success,
+                     "message": message,
++                    "fail_closed": fail_closed,
+                 },
+             )
+         except Exception as e:
+@@ -355,6 +383,7 @@ async def _handle_status(self, data: dict[str, Any]) -> None:
+                     "code_generated": self._code_generated,
+                     "tests_passed": self._tests_passed,
+                     "tests_failed": self._tests_failed,
++                    "sandbox_unavailable": self._sandbox_unavailable,
+                     "deployments": self._deployments,
+                 },
+             }
+diff --git a/meta-programmer/tests/test_sandbox_failclosed.py b/meta-programmer/tests/test_sandbox_failclosed.py
+new file mode 100644
+index 0000000..0522480
+--- /dev/null
++++ b/meta-programmer/tests/test_sandbox_failclosed.py
+@@ -0,0 +1,280 @@
++"""Fail-closed when Docker/sandbox is unavailable (Phase 1, E1.3.2).
++
++Untested code must NEVER deploy. If containment cannot run — no Docker daemon,
++missing image, or a spawn failure — the deploy path must treat it as a hard
++block (fail-closed), distinct from a genuine test failure.
++
++The `docker` SDK is not installed in the test env, so we inject a minimal fake
++`docker` module into sys.modules before importing the modules under test. This
++mirrors the real SDK's surface: ``docker.from_env``, ``docker.errors.*`` and
++``docker.models.containers.Container``.
++"""
++
++import asyncio
++import os
++import sys
++import types
++
++# ── fake `docker` SDK ────────────────────────────────────────────────────────
++
++
++class _ImageNotFound(Exception):
++    pass
++
++
++class _DockerException(Exception):
++    pass
++
++
++def _install_fake_docker() -> types.ModuleType:
++    docker = types.ModuleType("docker")
++    errors = types.ModuleType("docker.errors")
++    errors.ImageNotFound = _ImageNotFound
++    errors.DockerException = _DockerException
++    errors.APIError = _DockerException
++    models = types.ModuleType("docker.models")
++    containers = types.ModuleType("docker.models.containers")
++
++    class Container:  # noqa: D401 - marker type only
++        pass
++
++    containers.Container = Container
++
++    def from_env():
++        # Default: a working client. Individual tests replace docker_client.
++        return object()
++
++    docker.errors = errors
++    docker.models = models
++    docker.from_env = from_env
++    models.containers = containers
++
++    sys.modules["docker"] = docker
++    sys.modules["docker.errors"] = errors
++    sys.modules["docker.models"] = models
++    sys.modules["docker.models.containers"] = containers
++    return docker
++
++
++_install_fake_docker()
++
++# meta_programmer/src on path so `import meta_programmer.*` resolves.
++_SRC = os.path.join(os.path.dirname(__file__), "..", "src")
++if _SRC not in sys.path:
++    sys.path.insert(0, _SRC)
++
++from meta_programmer.sandbox_manager import (  # noqa: E402
++    SANDBOX_REMEDIATION,
++    SandboxManager,
++)
++
++
++def _run(coro):
++    return asyncio.run(coro)
++
++
++# ── fakes for the Docker client used by run_tests ────────────────────────────
++
++
++class _FakeImages:
++    def __init__(self, found: bool):
++        self._found = found
++
++    def get(self, _image):
++        if not self._found:
++            raise _ImageNotFound("no such image")
++        return object()
++
++
++class _FakeContainer:
++    def __init__(self, status_code: int):
++        self._status_code = status_code
++
++    def wait(self):
++        return {"StatusCode": self._status_code}
++
++    def logs(self):
++        return b"pytest output"
++
++    def kill(self):
++        pass
++
++
++class _FakeContainers:
++    def __init__(self, status_code=0, spawn_error=False):
++        self._status_code = status_code
++        self._spawn_error = spawn_error
++
++    def run(self, **_kwargs):
++        if self._spawn_error:
++            raise _DockerException("daemon refused spawn")
++        return _FakeContainer(self._status_code)
++
++
++class _FakeDockerClient:
++    def __init__(self, image_found=True, status_code=0, spawn_error=False, ping_ok=True):
++        self.images = _FakeImages(image_found)
++        self.containers = _FakeContainers(status_code, spawn_error)
++        self._ping_ok = ping_ok
++
++    def ping(self):
++        if not self._ping_ok:
++            raise _DockerException("daemon unreachable")
++        return True
++
++
++def _manager(client) -> SandboxManager:
++    mgr = SandboxManager()
++    mgr.docker_client = client
++    return mgr
++
++
++# ── run_tests classification: unavailable vs test-failure ────────────────────
++
++
++def test_no_docker_client_is_unavailable():
++    mgr = _manager(None)
++    result = _run(mgr.run_tests("/staging/x/mod.py"))
++    assert result["success"] is False
++    assert result["sandbox_unavailable"] is True
++    assert SANDBOX_REMEDIATION in result["error"]
++
++
++def test_daemon_unreachable_is_unavailable():
++    mgr = _manager(_FakeDockerClient(ping_ok=False))
++    result = _run(mgr.run_tests("/staging/x/mod.py"))
++    assert result["sandbox_unavailable"] is True
++
++
++def test_missing_image_is_unavailable():
++    mgr = _manager(_FakeDockerClient(image_found=False))
++    result = _run(mgr.run_tests("/staging/x/mod.py"))
++    assert result["sandbox_unavailable"] is True
++    assert "image not found" in result["error"].lower()
++
++
++def test_spawn_failure_is_unavailable():
++    mgr = _manager(_FakeDockerClient(spawn_error=True))
++    result = _run(mgr.run_tests("/staging/x/mod.py"))
++    assert result["sandbox_unavailable"] is True
++
++
++def test_failing_tests_are_not_unavailable():
++    # Containment ran; pytest exited non-zero. This is a TEST failure, and must
++    # be reported as such — not as sandbox unavailability.
++    mgr = _manager(_FakeDockerClient(status_code=1))
++    result = _run(mgr.run_tests("/staging/x/mod.py"))
++    assert result["success"] is False
++    assert result["sandbox_unavailable"] is False
++
++
++def test_passing_tests_succeed():
++    mgr = _manager(_FakeDockerClient(status_code=0))
++    result = _run(mgr.run_tests("/staging/x/mod.py"))
++    assert result["success"] is True
++    assert result["sandbox_unavailable"] is False
++
++
++# ── service deploy path: unavailable sandbox blocks deploy ───────────────────
++
++
++class _FakeStaging:
++    def __init__(self):
++        self.rejected = []
++
++    def stage_testing(self, _trace_id):
++        pass
++
++    def stage_approved(self, _trace_id):
++        raise AssertionError("must not approve when sandbox is unavailable")
++
++    def stage_rejected(self, trace_id, reason):
++        self.rejected.append((trace_id, reason))
++
++
++class _FakeBus:
++    def __init__(self):
++        self.published = []
++
++    async def publish(self, subject, data):
++        self.published.append((subject, data))
++
++
++class _FakeTeam:
++    async def generate_code(self, trace_id, description, context):
++        return {
++            "success": True,
++            "target_path": "/data/plugins/generated_mod.py",
++            "code": "def add(a, b):\n    return a + b\n",
++            "tests": "",
++        }
++
++
++class _UnavailableSandbox:
++    async def run_tests(self, code_path, test_path=None):
++        return {
++            "success": False,
++            "sandbox_unavailable": True,
++            "output": "",
++            "error": "Docker daemon unavailable: no client. " + SANDBOX_REMEDIATION,
++        }
++
++
++class _Logger:
++    def info(self, *a, **k):
++        pass
++
++    def warning(self, *a, **k):
++        pass
++
++    def error(self, *a, **k):
++        pass
++
++
++def _build_service():
++    from meta_programmer.service import MetaProgrammerService
++
++    # Bypass BaseService.__init__ (no NATS/DB) — set only what the handler uses.
++    svc = MetaProgrammerService.__new__(MetaProgrammerService)
++    svc.logger = _Logger()
++    svc._gaps_processed = 0
++    svc._code_generated = 0
++    svc._tests_passed = 0
++    svc._tests_failed = 0
++    svc._sandbox_unavailable = 0
++    svc._deployments = 0
++    svc._team = _FakeTeam()
++    svc._staging_manager = _FakeStaging()
++    svc._sandbox_manager = _UnavailableSandbox()
++    svc.event_bus = _FakeBus()
++    return svc
++
++
++def test_unavailable_sandbox_blocks_deploy():
++    svc = _build_service()
++
++    deployed = []
++
++    async def _fake_deploy(trace_id, target_path, code):
++        deployed.append(trace_id)
++
++    async def _fake_approval(**_kwargs):
++        return {"type": "ALLOW"}
++
++    svc._deploy_code = _fake_deploy
++    svc._request_kernel_approval = _fake_approval
++    # stage_pending is sync in the real StagingManager; patch onto the fake.
++    svc._staging_manager.stage_pending = lambda **kw: "/data/staging/t-1/generated_mod.py"
++
++    _run(svc._handle_knowledge_gap({"trace_id": "t-1", "description": "add", "context": {}}))
++
++    # Core guarantee: nothing deployed, and a fail-closed result was published.
++    assert deployed == [], "untested code must not deploy when sandbox is unavailable"
++    assert svc._deployments == 0
++    assert svc._sandbox_unavailable == 1
++    assert svc._staging_manager.rejected, "must record a rejection"
++
++    results = [d for subj, d in svc.event_bus.published if subj.startswith("knowledge.gap.result")]
++    assert results, "must publish a gap result"
++    assert results[-1]["success"] is False
++    assert results[-1]["fail_closed"] is True
+diff --git a/sandbox/README.md b/sandbox/README.md
+index 31eb37b..ecb2be8 100644
+--- a/sandbox/README.md
++++ b/sandbox/README.md
+@@ -18,6 +18,17 @@ The sandbox provides a secure, resource-limited container where generated code c
+ - **Non-root User**: Runs as `sandbox` user (UID 1000)
+ - **Auto-destroy**: Containers are automatically removed after execution
+ 
++## Fail-closed behavior
++
++Containment is load-bearing: untested code is **never** deployed. If the sandbox
++cannot run — no Docker daemon, unreachable daemon, missing
++`activelearning-sandbox:latest` image, or a container spawn failure —
++`SandboxManager.run_tests` returns a result with `sandbox_unavailable: True`
++(distinct from a genuine test failure). The Meta-Programmer treats that as a
++hard block: it rejects the staged code, increments the `sandbox_unavailable`
++metric, and publishes a `fail_closed` gap result. The remediation is always to
++restore containment (build the image / start Docker), never to skip the sandbox.
++
+ ## Usage
+ 
+ The sandbox is not run directly. Instead, it's spawned on-demand by the Meta-Programmer:

@@ -1,0 +1,598 @@
+diff --git a/packages/client/src/links/httpSubscriptionLink.ts b/packages/client/src/links/httpSubscriptionLink.ts
+index 5b2742fbe95..c6da01188b2 100644
+--- a/packages/client/src/links/httpSubscriptionLink.ts
++++ b/packages/client/src/links/httpSubscriptionLink.ts
+@@ -33,11 +33,31 @@ async function urlWithConnectionParams(
+   return url;
+ }
+ 
++type RecreateOnErrorOpt =
++  | {
++      type: 'raw';
++      event: Event;
++    }
++  | {
++      type: 'http-error';
++      status: number;
++      event: Event;
++    };
++
+ type HTTPSubscriptionLinkOptions<TRoot extends AnyClientTypes> = {
+   /**
+    * EventSource options or a callback that returns them
+    */
+   eventSourceOptions?: CallbackOrValue<EventSourceInit>;
++  /**
++   * For a given error, should we reinitialize the underlying EventSource?
++   *
++   * This is useful where a long running subscription might be interrupted by a recoverable network error,
++   * but the existing authorization in a header or URI has expired in the mean-time
++   */
++  shouldRecreateOnError?: (
++    opt: RecreateOnErrorOpt,
++  ) => boolean | Promise<boolean>;
+ } & TransformerOptions<TRoot> &
+   UrlOptionsWithConnectionParams;
+ 
+@@ -60,7 +80,7 @@ export function unstable_httpSubscriptionLink<
+           throw new Error('httpSubscriptionLink only supports subscriptions');
+         }
+ 
+-        let eventSource: EventSource | null = null;
++        let eventSource: EventSourceWrapper | null = null;
+         let unsubscribed = false;
+ 
+         run(async () => {
+@@ -79,22 +99,22 @@ export function unstable_httpSubscriptionLink<
+             // already unsubscribed - rare race condition
+             return;
+           }
+-          eventSource = new EventSource(url, eventSourceOptions);
++
++          eventSource = new EventSourceWrapper(url, eventSourceOptions);
++
+           const onStarted = () => {
+             observer.next({
+               result: {
+                 type: 'started',
+               },
+               context: {
+-                eventSource,
++                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
++                eventSource: eventSource!.getEventSource(),
+               },
+             });
+-
+-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+-            eventSource!.removeEventListener('open', onStarted);
+           };
+-          // console.log('starting', new Date());
+-          eventSource.addEventListener('open', onStarted);
++          eventSource.addEventListener('open', onStarted, { once: true });
++
+           const iterable = sseStreamConsumer<
+             Partial<{
+               id?: string;
+@@ -103,6 +123,38 @@ export function unstable_httpSubscriptionLink<
+           >({
+             from: eventSource,
+             deserialize: transformer.output.deserialize,
++            tryHandleError: async (ev) => {
++              if (
++                typeof opts.shouldRecreateOnError !== 'function' ||
++                !eventSource
++              ) {
++                return false;
++              }
++
++              const recreateOnErrorOpts = createRecreateOnErrorOpts(ev);
++
++              const shouldRestart = await opts.shouldRecreateOnError(
++                recreateOnErrorOpts,
++              );
++
++              if (!shouldRestart) {
++                return false;
++              }
++
++              eventSource.restart(
++                getUrl({
++                  transformer,
++                  url: await urlWithConnectionParams(opts),
++                  input,
++                  path,
++                  type,
++                  signal: null,
++                }),
++                await resultOf(opts.eventSourceOptions),
++              );
++
++              return true;
++            },
+           });
+ 
+           for await (const chunk of iterable) {
+@@ -140,3 +192,97 @@ export function unstable_httpSubscriptionLink<
+     };
+   };
+ }
++
++function createRecreateOnErrorOpts(ev: Event): RecreateOnErrorOpt {
++  if ('status' in ev && typeof ev.status === 'number') {
++    return {
++      type: 'http-error',
++      status: ev.status,
++      event: ev,
++    };
++  }
++
++  return {
++    type: 'raw',
++    event: ev,
++  };
++}
++
++/**
++ * We wrap EventSource so that is can be reinitialized with new options
++ */
++class EventSourceWrapper implements Partial<EventSource> {
++  private es: EventSource;
++
++  private listeners: Partial<
++    Record<
++      keyof EventSourceEventMap,
++      Parameters<EventSource['addEventListener']>[]
++    >
++  > = {};
++  private *getAllEventListeners() {
++    for (const _type in this.listeners) {
++      const type = _type as keyof typeof this.listeners;
++      for (const listener of this.listeners[type] ?? []) {
++        yield listener;
++      }
++    }
++  }
++
++  constructor(url: string, options: EventSourceInit | undefined) {
++    this.es = new EventSource(url, options);
++  }
++
++  restart(url: string, options: EventSourceInit | undefined) {
++    for (const [type, callback, options] of this.getAllEventListeners()) {
++      this.es.removeEventListener(type, callback, options);
++    }
++
++    this.es.close();
++    this.es = new EventSource(url, options);
++
++    for (const [type, callback, options] of this.getAllEventListeners()) {
++      this.es.addEventListener(type, callback, options);
++    }
++  }
++
++  close() {
++    this.listeners = {};
++    this.es.close();
++  }
++
++  getEventSource() {
++    return this.es;
++  }
++
++  get readyState() {
++    return this.es.readyState;
++  }
++
++  addEventListener<TEvent extends keyof EventSourceEventMap>(
++    type: TEvent,
++    listener: (this: EventSource, ev: EventSourceEventMap[TEvent]) => any,
++    options?: boolean | AddEventListenerOptions,
++  ) {
++    this.listeners[type] ??= [];
++    this.listeners[type].push([type, listener as any, options]);
++
++    this.es.addEventListener(type, listener, options);
++  }
++
++  removeEventListener<TEvent extends keyof EventSourceEventMap>(
++    type: TEvent,
++    listener: (this: EventSource, ev: EventSourceEventMap[TEvent]) => any,
++    options?: boolean | EventListenerOptions,
++  ) {
++    this.listeners[type] ??= [];
++
++    const indexToRemove = this.listeners[type]?.findIndex(
++      ([_type, thisListener]) => thisListener === listener,
++    );
++    if (typeof indexToRemove === 'number' && indexToRemove >= 0) {
++      this.listeners[type].splice(indexToRemove, 1);
++    }
++    this.es.removeEventListener(type, listener, options);
++  }
++}
+diff --git a/packages/server/src/unstable-core-do-not-import/stream/sse.ts b/packages/server/src/unstable-core-do-not-import/stream/sse.ts
+index 689b477a0c3..84b949722af 100644
+--- a/packages/server/src/unstable-core-do-not-import/stream/sse.ts
++++ b/packages/server/src/unstable-core-do-not-import/stream/sse.ts
+@@ -3,7 +3,7 @@ import { run } from '../utils';
+ import type { ConsumerOnError } from './jsonl';
+ import type { inferTrackedOutput } from './tracked';
+ import { isTrackedEnvelope } from './tracked';
+-import { createTimeoutPromise } from './utils/createDeferred';
++import { createDeferred, createTimeoutPromise } from './utils/createDeferred';
+ import { createReadableStream } from './utils/createReadableStream';
+ 
+ type Serialize = (value: any) => any;
+@@ -189,9 +189,10 @@ type ConsumerStreamResult<TData> =
+  * @see https://html.spec.whatwg.org/multipage/server-sent-events.html
+  */
+ export function sseStreamConsumer<TData>(opts: {
+-  from: EventSource;
++  from: Pick<EventSource, 'addEventListener' | 'readyState'>;
+   onError?: ConsumerOnError;
+   deserialize?: Deserialize;
++  tryHandleError?: (error: Event) => Promise<boolean>;
+ }): AsyncIterable<ConsumerStreamResult<TData>> {
+   const { deserialize = (v) => v } = opts;
+   const eventSource = opts.from;
+@@ -227,19 +228,38 @@ export function sseStreamConsumer<TData>(opts: {
+     },
+   });
+ 
++  let errorLock: Promise<void | 'CANCEL_ALL'> | undefined = undefined;
+   eventSource.addEventListener('message', (msg) => {
+     stream.controller.enqueue(msg);
+   });
+   eventSource.addEventListener(SERIALIZED_ERROR_EVENT, (msg) => {
+     stream.controller.enqueue(msg);
+   });
+-  eventSource.addEventListener('error', (cause) => {
++  eventSource.addEventListener('error', async (cause) => {
++    // We prevent more than 1 error handler from waiting at the same time
++    const result = await errorLock;
++    if (result === 'CANCEL_ALL') {
++      return;
++    }
++
++    const resolvable = createDeferred<void | 'CANCEL_ALL'>();
++    errorLock = resolvable.promise;
++
++    const handled = await opts.tryHandleError?.(cause);
++
++    resolvable.resolve();
++
++    if (handled === true) {
++      return;
++    }
++
+     if (eventSource.readyState === EventSource.CLOSED) {
+       stream.controller.error(cause);
+     }
+   });
+ 
+   const readable = stream.readable.pipeThrough(transform);
++
+   return {
+     [Symbol.asyncIterator]() {
+       const reader = readable.getReader();
+diff --git a/packages/tests/server/httpSubscriptionLink.headers.test.ts b/packages/tests/server/httpSubscriptionLink.headers.test.ts
+new file mode 100644
+index 00000000000..a4085ef1f8a
+--- /dev/null
++++ b/packages/tests/server/httpSubscriptionLink.headers.test.ts
+@@ -0,0 +1,238 @@
++import { EventEmitter, on } from 'node:events';
++import { scheduler } from 'node:timers/promises';
++import { routerToServerAndClientNew, suppressLogs } from './___testHelpers';
++import { waitFor } from '@testing-library/react';
++import type { TRPCLink } from '@trpc/client';
++import {
++  splitLink,
++  unstable_httpBatchStreamLink,
++  unstable_httpSubscriptionLink,
++} from '@trpc/client';
++import { initTRPC, tracked, TRPCError } from '@trpc/server';
++import { observable } from '@trpc/server/observable';
++import type { EventSourcePolyfillInit } from 'event-source-polyfill';
++import { EventSourcePolyfill, NativeEventSource } from 'event-source-polyfill';
++import { konn } from 'konn';
++import superjson from 'superjson';
++import { z } from 'zod';
++
++const sleep = (ms = 1) => new Promise((resolve) => setTimeout(resolve, ms));
++
++const orderedResults: number[] = [];
++const ctx = konn()
++  .beforeEach(() => {
++    //
++    // This is the heart of the test, the client will send this along and the server
++    // will increment it on each createContext(). If the latest version is
++    // always sent then the server will always receive the latest version
++    let incrementingTestHeader = 1;
++
++    globalThis.EventSource = EventSourcePolyfill as typeof EventSource;
++
++    const onIterableInfiniteSpy =
++      vi.fn<(args: { input: { lastEventId?: number } }) => void>();
++
++    const ee = new EventEmitter();
++    const eeEmit = (data: number | Error) => {
++      ee.emit('data', data);
++    };
++
++    const t = initTRPC.create({
++      transformer: superjson,
++    });
++    orderedResults.length = 0;
++    const infiniteYields = vi.fn();
++
++    const router = t.router({
++      sub: {
++        iterableInfinite: t.procedure
++          .input(
++            z.object({
++              lastEventId: z.coerce.number().min(0).optional(),
++            }),
++          )
++          .subscription(async function* (opts) {
++            onIterableInfiniteSpy({
++              input: opts.input,
++            });
++            let idx = opts.input.lastEventId ?? 0;
++            while (true) {
++              yield tracked(String(idx), idx);
++              idx++;
++              await sleep();
++              infiniteYields();
++            }
++          }),
++      },
++    });
++
++    const linkSpy: TRPCLink<typeof router> = () => {
++      // here we just got initialized in the app - this happens once per app
++      // useful for storing cache for instance
++      return ({ next, op }) => {
++        // this is when passing the result to the next link
++        // each link needs to return an observable which propagates results
++        return observable((observer) => {
++          const unsubscribe = next(op).subscribe({
++            next(value) {
++              orderedResults.push(value.result.data as number);
++              observer.next(value);
++            },
++            error: observer.error,
++          });
++          return unsubscribe;
++        });
++      };
++    };
++
++    const opts = routerToServerAndClientNew(router, {
++      server: {
++        onError(err) {
++          // eslint-disable-next-line no-console
++          console.error('caught server error:', err.error.message);
++        },
++        createContext(opts) {
++          // eslint-disable-next-line no-console
++          console.log(
++            'new connection made with x-test:',
++            opts.req.headers['x-test'],
++            'expecting to be to be:',
++            incrementingTestHeader,
++          );
++
++          const expectedHeader = `x-test: ${incrementingTestHeader}`;
++          const receivedHeader = `x-test: ${opts.req.headers['x-test']}`;
++          if (expectedHeader !== receivedHeader) {
++            throw new TRPCError({
++              code: 'UNAUTHORIZED',
++              message: 'x-test header mismatch. this means the test has failed',
++            });
++          }
++
++          // Increment header so next time a connection is made we expect this version
++          incrementingTestHeader++;
++
++          return {};
++        },
++      },
++      client(opts) {
++        return {
++          links: [
++            linkSpy,
++            splitLink({
++              condition: (op) => op.type === 'subscription',
++              true: unstable_httpSubscriptionLink({
++                url: opts.httpUrl,
++                transformer: superjson,
++                eventSourceOptions() {
++                  return {
++                    headers: {
++                      'x-test': String(incrementingTestHeader),
++                    },
++                  } as EventSourcePolyfillInit;
++                },
++                shouldRecreateOnError(opts) {
++                  const willRestart =
++                    opts.type === 'http-error' &&
++                    [401, 403].includes(opts.status);
++
++                  if (willRestart) {
++                    // eslint-disable-next-line no-console
++                    console.log('Restarting EventSource due to 401/403 error');
++                  }
++                  return willRestart;
++                },
++              }),
++              false: unstable_httpBatchStreamLink({
++                url: opts.httpUrl,
++                transformer: superjson,
++              }),
++            }),
++          ],
++        };
++      },
++    });
++    return {
++      ...opts,
++      ee,
++      eeEmit,
++      infiniteYields,
++      onIterableInfiniteSpy,
++    };
++  })
++  .afterEach(async (opts) => {
++    await opts?.close?.();
++    globalThis.EventSource = NativeEventSource as typeof EventSource;
++  })
++  .done();
++
++test('disconnect and reconnect with updated headers', async () => {
++  const { client } = ctx;
++
++  const onStarted =
++    vi.fn<(args: { context: Record<string, unknown> | undefined }) => void>();
++  const onData = vi.fn<(args: { data: number; id: string }) => void>();
++  const subscription = client.sub.iterableInfinite.subscribe(
++    {},
++    {
++      onStarted: onStarted,
++      onData,
++    },
++  );
++
++  await waitFor(() => {
++    expect(onStarted).toHaveBeenCalledTimes(1);
++  });
++
++  function getES() {
++    const lastCall = onStarted.mock.calls.length - 1;
++    // @ts-expect-error lint makes this accessing annoying
++    const es = onStarted.mock.calls[lastCall]![0].context?.eventSource;
++    assert(es instanceof EventSource);
++    return es;
++  }
++
++  await waitFor(() => {
++    expect(onData.mock.calls.length).toBeGreaterThan(5);
++  });
++
++  expect(onData.mock.calls[0]![0]).toEqual({
++    data: 0,
++    id: '0',
++  });
++
++  expect(ctx.onIterableInfiniteSpy).toHaveBeenCalledTimes(1);
++
++  expect(getES().readyState).toBe(EventSource.OPEN);
++
++  ctx.destroyConnections();
++  await waitFor(
++    () => {
++      expect(onStarted).toHaveBeenCalledTimes(2);
++    },
++    {
++      timeout: 3_000,
++    },
++  );
++
++  await waitFor(
++    () => {
++      expect(getES().readyState).toBe(EventSource.OPEN);
++    },
++    {
++      timeout: 3_000,
++    },
++  );
++
++  subscription.unsubscribe();
++  expect(getES().readyState).toBe(EventSource.CLOSED);
++
++  // const lastEventId = onData.mock.calls.at(-1)[0]![0]!
++  await waitFor(() => {
++    expect(ctx.onReqAborted).toHaveBeenCalledTimes(1);
++  });
++  await sleep(50);
++  ctx.infiniteYields.mockClear();
++  await sleep(50);
++  expect(ctx.infiniteYields).toHaveBeenCalledTimes(0);
++});
+diff --git a/www/docs/client/links/httpSubscriptionLink.md b/www/docs/client/links/httpSubscriptionLink.md
+index 47cb4949ec1..dafc244ea1f 100644
+--- a/www/docs/client/links/httpSubscriptionLink.md
++++ b/www/docs/client/links/httpSubscriptionLink.md
+@@ -73,8 +73,10 @@ If the client and server are not on the same domain, you can use `withCredential
+ // [...]
+ unstable_httpSubscriptionLink({
+   url: 'https://example.com/api/trpc',
+-  eventSourceOptions: {
+-    withCredentials: true, // <---
++  eventSourceOptions() {
++    return {
++      withCredentials: true, // <---
++    }
+   },
+ });
+ ```
+@@ -122,6 +124,59 @@ const trpc = createTRPCClient<AppRouter>({
+ });
+ ```
+ 
++### Updating configuration on an active connection {#updatingConfig}
++
++Since `httpSubscriptionLink` is built on SSE via `EventSource`, connections which encounter errors such as network failures or bad response codes will be seamlessly retried. EventSource cannot re-run the `eventSourceOptions()` or `url()` options to update its configuration though, for instance where authentication has expired since the last connection.
++
++We support fully restarting the connection when an error occurs
++
++```tsx
++import {
++  createTRPCClient,
++  httpBatchLink,
++  splitLink,
++  unstable_httpSubscriptionLink,
++} from '@trpc/client';
++import { EventSourcePolyfill, EventSourcePolyfillInit } from 'event-source-polyfill';
++import type { AppRouter } from '../server/index.js';
++
++// polyfill EventSource
++globalThis.EventSource = EventSourcePolyfill;
++
++// Initialize the tRPC client
++const trpc = createTRPCClient<AppRouter>({
++  links: [
++    splitLink({
++      condition: (op) => op.type === 'subscription',
++      true: unstable_httpSubscriptionLink({
++        url: async () => {
++          // calculate the latest URL if needed...
++          return getAuthenticatedUri()
++        },
++        eventSourceOptions: async () => {
++          // ...or maybe renew an access token
++          const token = await auth.getOrRenewToken()
++
++          return {
++            headers: {
++              authorization: 'Bearer ' + token,
++            },
++          } as EventSourcePolyfillInit;
++        },
++
++        // In this example we handle an authentication failure
++        shouldRecreateOnError(opts) {
++          return opts.type === 'http-error' && [401, 403].includes(opts.status);
++        },
++      }),
++      false: httpBatchLink({
++        url: 'http://localhost:3000',
++      }),
++    }),
++  ],
++});
++```
++
+ ### Connection params {#connectionParams}
+ 
+ In order to authenticate with `EventSource`, you can define `connectionParams` in `httpSubscriptionLink`. This will be sent as part of the URL, which is why other methods are preferred).

@@ -1,0 +1,233 @@
+diff --git a/CONTRIBUTORS.txt b/CONTRIBUTORS.txt
+index 296d1d6daf3..cdbf4e0828c 100644
+--- a/CONTRIBUTORS.txt
++++ b/CONTRIBUTORS.txt
+@@ -308,3 +308,4 @@ Lucas Infante, 2025/05/15
+ Diego Margoni, 2025/07/01
+ Brian Helba, 2026/01/12
+ 송준호, 2026/04/22
++Hmn Falahi, 2026/07/08
+diff --git a/celery/worker/request.py b/celery/worker/request.py
+index 4b5b97f11ee..0350fa640be 100644
+--- a/celery/worker/request.py
++++ b/celery/worker/request.py
+@@ -647,6 +647,27 @@ def on_failure(self, exc_info, send_failed_event=True, return_ok=False):
+         elif isinstance(exc, MemoryError):
+             raise MemoryError(f'Process got: {exc}')
+         elif isinstance(exc, Reject):
++            if not exc.requeue:
++                # A task that rejects its message without requeueing will
++                # never run again, so record a terminal FAILURE result and
++                # fire the task_failure signal instead of leaving the task
++                # stuck in PENDING/STARTED forever (Issue #4222).
++                self.task.backend.mark_as_failure(
++                    self.id, exc, request=self._context,
++                    store_result=self.store_errors,
++                )
++                signals.task_failure.send(
++                    sender=self.task, task_id=self.id, exception=exc,
++                    args=self.args, kwargs=self.kwargs,
++                    traceback=exc_info.traceback, einfo=exc_info,
++                )
++                if send_failed_event:
++                    self.send_event(
++                        'task-failed',
++                        exception=safe_repr(
++                            get_pickled_exception(exc_info.exception)),
++                        traceback=exc_info.traceback,
++                    )
+             return self.reject(requeue=exc.requeue)
+         elif isinstance(exc, Ignore):
+             return self.acknowledge()
+diff --git a/docs/userguide/tasks.rst b/docs/userguide/tasks.rst
+index d0515b84b99..a8bb69f1653 100644
+--- a/docs/userguide/tasks.rst
++++ b/docs/userguide/tasks.rst
+@@ -1474,8 +1474,20 @@ messages are redelivered to.
+ 
+ .. _`Dead Letter Exchanges`: http://www.rabbitmq.com/dlx.html
+ 
++When a task raises :exc:`~@Reject` without re-queuing (``requeue=False``) it
++will never run again, so its result is stored in the :state:`FAILURE` state
++and the :signal:`task_failure` signal is sent, just like any other failed
++task. This means :meth:`AsyncResult.failed() <celery.result.AsyncResult.failed>`
++returns :const:`True` and the rejection reason is available as the result.
++This terminal result is recorded regardless of :attr:`Task.acks_late`; the
++broker-level ``basic_reject`` (and therefore re-queuing) is the part that only
++takes effect when ``acks_late`` is enabled.
++
+ Reject can also be used to re-queue messages, but please be very careful
+ when using this as it can easily result in an infinite message loop.
++Re-queuing (``requeue=True``) only takes effect when :attr:`Task.acks_late`
++is enabled; the message is then redelivered and executed again, so no terminal
++result is stored for it.
+ 
+ Example using reject when a task causes an out of memory condition:
+ 
+diff --git a/t/integration/tasks.py b/t/integration/tasks.py
+index 28aa618fd53..6696ff498c1 100644
+--- a/t/integration/tasks.py
++++ b/t/integration/tasks.py
+@@ -543,6 +543,12 @@ def reject_then_succeed(self):
+     return 'second-pass'
+ 
+ 
++@shared_task
++def reject_without_requeue():
++    """Reject permanently so the worker records a terminal FAILURE."""
++    raise Reject('rejected', requeue=False)
++
++
+ @shared_task(soft_time_limit=2, time_limit=1)
+ def soft_time_limit_must_exceed_time_limit():
+     pass
+diff --git a/t/integration/test_tasks.py b/t/integration/test_tasks.py
+index 6e2e1a528e0..9188ce322b2 100644
+--- a/t/integration/test_tasks.py
++++ b/t/integration/test_tasks.py
+@@ -16,10 +16,10 @@
+ 
+ from .conftest import TEST_BACKEND, get_active_redis_channels, get_redis_connection
+ from .tasks import (ClassBasedAutoRetryTask, ExpectedException, add, add_ignore_result, add_not_typed, add_pydantic,
+-                    add_pydantic_string_annotations, fail, fail_unpickleable, print_unicode, retry, retry_once,
+-                    retry_once_headers, retry_once_priority, retry_unpickleable, return_properties,
+-                    return_request_time_limits, second_order_replace1, sleeping,
+-                    soft_time_limit_must_exceed_time_limit, task_with_declared_time_limits)
++                    add_pydantic_string_annotations, fail, fail_unpickleable, print_unicode, reject_then_succeed,
++                    reject_without_requeue, retry, retry_once, retry_once_headers, retry_once_priority,
++                    retry_unpickleable, return_properties, return_request_time_limits, second_order_replace1,
++                    sleeping, soft_time_limit_must_exceed_time_limit, task_with_declared_time_limits)
+ 
+ TIMEOUT = 10
+ 
+@@ -130,6 +130,25 @@ def test_ignore_result(self, manager):
+         time.sleep(1)
+         assert result.result is None
+ 
++    @flaky
++    def test_reject_without_requeue_stores_failure(self, manager):
++        result = reject_without_requeue.delay()
++        with pytest.raises(celery.exceptions.Reject):
++            result.get(timeout=TIMEOUT)
++        assert result.status == 'FAILURE'
++        assert result.ready() is True
++        assert result.failed() is True
++        assert result.successful() is False
++
++    @flaky
++    def test_reject_with_requeue_redelivers_and_succeeds(self, manager):
++        result = reject_then_succeed.delay()
++        assert result.get(timeout=TIMEOUT) == 'second-pass'
++        assert result.status == 'SUCCESS'
++        assert result.ready() is True
++        assert result.failed() is False
++        assert result.successful() is True
++
+     @flaky
+     def test_pydantic_annotations(self, manager):
+         """Tests task call with Pydantic model serialization."""
+diff --git a/t/unit/worker/test_request.py b/t/unit/worker/test_request.py
+index 0ad3d0b5e39..2c79e3e25f0 100644
+--- a/t/unit/worker/test_request.py
++++ b/t/unit/worker/test_request.py
+@@ -317,11 +317,81 @@ def test_on_failure_Reject_rejects(self):
+             einfo = ExceptionInfo(internal=True)
+         assert einfo is not None
+         req = self.get_request(self.add.s(2, 2))
++        req.task.backend = Mock()
+         req.on_failure(einfo)
+         req.on_reject.assert_called_with(
+             req_logger, req.connection_errors, False,
+         )
+ 
++    def test_on_failure_Reject_marks_as_failure(self):
++        # Issue #4222: Reject(requeue=False) must store a terminal FAILURE
++        # result (and fire task_failure) instead of leaving the task PENDING.
++        einfo = None
++        try:
++            raise Reject('rejected')
++        except Reject:
++            einfo = ExceptionInfo(internal=True)
++        assert einfo is not None
++        req = self.get_request(self.add.s(2, 2))
++        req.task.backend = Mock()
++        handler = Mock()
++        task_failure.connect(handler, sender=req.task, weak=False)
++        try:
++            req.on_failure(einfo)
++        finally:
++            task_failure.disconnect(handler, sender=req.task)
++        req.task.backend.mark_as_failure.assert_called_once()
++        call = req.task.backend.mark_as_failure.call_args
++        assert call.args[0] == req.id
++        stored_exc = getattr(call.args[1], 'exc', call.args[1])
++        assert isinstance(stored_exc, Reject)
++        assert call.kwargs['request'] is req._context
++        assert call.kwargs['store_result'] == req.store_errors
++        handler.assert_called_once()
++        assert handler.call_args.kwargs['task_id'] == req.id
++        req.on_reject.assert_called_with(
++            req_logger, req.connection_errors, False,
++        )
++        # a task-failed event is emitted so monitors show FAILURE, not STARTED
++        assert any(
++            c.args and c.args[0] == 'task-failed'
++            for c in req.eventer.send.call_args_list
++        )
++
++    def test_on_failure_Reject_respects_send_failed_event(self):
++        # send_failed_event=False must suppress the task-failed event for
++        # Reject(requeue=False) too, while still recording the failure.
++        einfo = None
++        try:
++            raise Reject('rejected')
++        except Reject:
++            einfo = ExceptionInfo(internal=True)
++        assert einfo is not None
++        req = self.get_request(self.add.s(2, 2))
++        req.task.backend = Mock()
++        req.on_failure(einfo, send_failed_event=False)
++        req.task.backend.mark_as_failure.assert_called_once()
++        assert not any(
++            c.args and c.args[0] == 'task-failed'
++            for c in req.eventer.send.call_args_list
++        )
++
++    def test_on_failure_Reject_marks_as_failure_when_already_acked(self):
++        # With the default acks_late=False the message is acknowledged on
++        # receipt, so self.reject() is a no-op; the terminal FAILURE result
++        # must still be recorded (Issue #4222).
++        einfo = None
++        try:
++            raise Reject(requeue=False)
++        except Reject:
++            einfo = ExceptionInfo(internal=True)
++        assert einfo is not None
++        req = self.get_request(self.add.s(2, 2))
++        req.task.backend = Mock()
++        req.acknowledged = True  # simulate the default early ack
++        req.on_failure(einfo)
++        req.task.backend.mark_as_failure.assert_called_once()
++
+     def test_on_failure_Reject_rejects_with_requeue(self):
+         einfo = None
+         try:
+@@ -330,10 +400,18 @@ def test_on_failure_Reject_rejects_with_requeue(self):
+             einfo = ExceptionInfo(internal=True)
+         assert einfo is not None
+         req = self.get_request(self.add.s(2, 2))
++        req.task.backend = Mock()
+         req.on_failure(einfo)
+         req.on_reject.assert_called_with(
+             req_logger, req.connection_errors, True,
+         )
++        # A requeued message is redelivered and re-executed, so no terminal
++        # result is stored and no task-failed event is emitted.
++        req.task.backend.mark_as_failure.assert_not_called()
++        assert not any(
++            c.args and c.args[0] == 'task-failed'
++            for c in req.eventer.send.call_args_list
++        )
+ 
+     def test_on_failure_WorkerLostError_rejects_with_requeue(self):
+         try:

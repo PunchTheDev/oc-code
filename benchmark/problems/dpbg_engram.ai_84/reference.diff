@@ -1,0 +1,587 @@
+diff --git a/meta-programmer/src/meta_programmer/approval_consumer.py b/meta-programmer/src/meta_programmer/approval_consumer.py
+new file mode 100644
+index 0000000..f26b9a8
+--- /dev/null
++++ b/meta-programmer/src/meta_programmer/approval_consumer.py
+@@ -0,0 +1,157 @@
++"""Human-approval consumer (Phase E1.9.1).
++
++Processes DEFER approval/denial responses that arrive on
++``approval.response.<trace_id>`` from the Dashboard.
++
++The consumer is extracted from MetaProgrammerService into its own class so
++that it can be unit-tested without importing the full service (which pulls in
++the docker and NATS runtimes).
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++import time
++from typing import Any, Awaitable, Callable, Optional
++
++from meta_programmer.staging import StagingManager, is_review_expired
++
++logger = logging.getLogger(__name__)
++
++
++class ApprovalConsumer:
++    """Processes human approval/denial responses for DEFERred proposals.
++
++    Designed to be fully injected — all I/O dependencies (sandbox, deploy,
++    publish) are passed as async callables so the class is testable without
++    the live runtime.
++    """
++
++    def __init__(
++        self,
++        staging: StagingManager,
++        defer_ttl_ms: int,
++        run_tests: Callable[..., Awaitable[dict]],
++        deploy: Callable[[str, str, str], Awaitable[None]],
++        publish_gap_result: Callable[[str, bool, str], Awaitable[None]],
++        log: Optional[logging.Logger] = None,
++    ) -> None:
++        """
++        Args:
++            staging: the StagingManager shared with the service.
++            defer_ttl_ms: maximum age of a pending DEFER before it is expired.
++            run_tests: async callable matching SandboxManager.run_tests signature.
++            deploy: async callable (trace_id, target_path, code) → None.
++            publish_gap_result: async callable (trace_id, success, message) → None.
++            log: optional logger; falls back to the module logger.
++        """
++        self._staging = staging
++        self._defer_ttl_ms = defer_ttl_ms
++        self._run_tests = run_tests
++        self._deploy = deploy
++        self._publish_gap_result = publish_gap_result
++        self._log = log or logger
++
++        # Counters — additive with the service's own metrics.
++        self.tests_passed: int = 0
++        self.tests_failed: int = 0
++        self.deployments: int = 0
++
++    async def handle_approval_response(self, data: dict[str, Any]) -> None:
++        """Handle a human approval/denial response for a DEFERred proposal.
++
++        Subscribed to ``approval.response.*``.
++
++        Decision tree:
++        - No trace_id / bad type → ignore (warn).
++        - Item not in human_review → already resolved; ignore (idempotent).
++        - TTL expired → fail-closed: reject + publish denied result.
++        - approved is True → run sandbox tests then deploy.
++        - approved is anything else → deny, fail-closed.
++        """
++        trace_id = data.get("trace_id", "")
++        if not isinstance(trace_id, str) or not trace_id:
++            self._log.warning("Approval response missing trace_id — ignoring")
++            return
++
++        # Idempotent: if the item has already left human_review (e.g. the
++        # expiry sweep ran first, or this is a duplicate message) do nothing.
++        if not self._staging.is_in_human_review(trace_id):
++            self._log.info(
++                "Approval for %s — already resolved (late or duplicate), ignoring",
++                trace_id,
++            )
++            return
++
++        # Fail-closed on TTL: if the dashboard answered too late, reject.
++        metadata = self._staging.get_metadata(trace_id) or {}
++        now_ms = int(time.time() * 1000)
++        if is_review_expired(metadata, now_ms, self._defer_ttl_ms):
++            self._log.warning(
++                "Approval for %s arrived after TTL expiry — fail-closed", trace_id
++            )
++            reason = "Approval arrived after TTL expiry (fail-closed)"
++            self._staging.stage_rejected(trace_id, reason)
++            await self._publish_gap_result(trace_id, False, reason)
++            return
++
++        approved = data.get("approved")
++        if approved is True:
++            await self._process_approved(trace_id, metadata)
++        else:
++            # Anything that isn't an explicit True is treated as denial.
++            reason = "Human denied the proposal"
++            self._log.info("DEFER denied by human: %s", trace_id)
++            self._staging.stage_rejected(trace_id, reason)
++            await self._publish_gap_result(trace_id, False, reason)
++
++    async def _process_approved(self, trace_id: str, metadata: dict[str, Any]) -> None:
++        """Run sandbox tests and atomically deploy a human-approved proposal."""
++        target_path = metadata.get("target_path", "")
++        self._log.info("DEFER approved by human — running sandbox tests: %s", trace_id)
++
++        # Move from human_review to testing before running sandbox.
++        self._staging.stage_human_review_to_testing(trace_id)
++
++        code_path = os.path.join(self._staging.testing_dir, trace_id, "code.py")
++        tests_path = os.path.join(self._staging.testing_dir, trace_id, "tests.py")
++
++        try:
++            with open(code_path) as f:
++                code_content = f.read()
++        except OSError as e:
++            reason = f"Cannot read staged code: {e}"
++            self._log.error(reason)
++            self._staging.stage_rejected(trace_id, reason)
++            await self._publish_gap_result(trace_id, False, reason)
++            return
++
++        test_result = await self._run_tests(
++            code_path=code_path,
++            test_path=tests_path if os.path.exists(tests_path) else None,
++        )
++
++        if test_result.get("success"):
++            self.tests_passed += 1
++            # Deploy first, then advance to approved so that a deploy failure
++            # can still be recorded as rejected (item is still in testing/).
++            try:
++                await self._deploy(trace_id, target_path, code_content)
++                self._staging.stage_approved(trace_id)
++                self.deployments += 1
++                await self._publish_gap_result(
++                    trace_id, True, "Human approved, tested, and deployed"
++                )
++            except Exception as e:
++                self._log.error(
++                    "Deploy failed for approved DEFER %s: %s", trace_id, e
++                )
++                reason = f"Deploy failed after approval: {e}"
++                self._staging.stage_rejected(trace_id, reason)
++                await self._publish_gap_result(trace_id, False, reason)
++        else:
++            self.tests_failed += 1
++            reason = f"Tests failed after approval: {test_result.get('error', 'unknown')}"
++            self._staging.stage_rejected(trace_id, reason)
++            await self._publish_gap_result(trace_id, False, reason)
+diff --git a/meta-programmer/src/meta_programmer/service.py b/meta-programmer/src/meta_programmer/service.py
+index bfd93e3..e9d9f72 100644
+--- a/meta-programmer/src/meta_programmer/service.py
++++ b/meta-programmer/src/meta_programmer/service.py
+@@ -13,6 +13,7 @@
+ 
+ from activelearning import BaseService
+ 
++from meta_programmer.approval_consumer import ApprovalConsumer
+ from meta_programmer.sandbox_manager import SandboxManager
+ from meta_programmer.staging import StagingManager
+ from meta_programmer.agents import MetaProgrammerTeam
+@@ -43,6 +44,7 @@ def __init__(self):
+         self._sandbox_manager = SandboxManager()
+         self._staging_manager = StagingManager(self.staging_root)
+         self._team: Optional[MetaProgrammerTeam] = None
++        self._approval_consumer: Optional[ApprovalConsumer] = None
+ 
+         # A deferred (human-review) proposal that no one answers is failed
+         # closed after this TTL (Phase 1.9), rather than lingering forever.
+@@ -73,12 +75,27 @@ async def _setup(self) -> None:
+             db=self.database._connection,
+         )
+ 
++        # Approval consumer — handles Dashboard responses to DEFER requests.
++        self._approval_consumer = ApprovalConsumer(
++            staging=self._staging_manager,
++            defer_ttl_ms=self.defer_ttl_ms,
++            run_tests=self._sandbox_manager.run_tests,
++            deploy=self._deploy_code,
++            publish_gap_result=self._publish_gap_result,
++            log=self.logger,
++        )
++
+         # Subscribe to knowledge gaps
+         await self.event_bus.subscribe("knowledge.gap", self._handle_knowledge_gap)
+ 
+         # Subscribe to status requests
+         await self.event_bus.subscribe("metaprogrammer.status", self._handle_status)
+ 
++        # Subscribe to human approval/denial responses from the Dashboard.
++        await self.event_bus.subscribe(
++            "approval.response.*", self._approval_consumer.handle_approval_response
++        )
++
+         # Periodically fail-close DEFERs that no human ever answered.
+         self._sweep_task = asyncio.create_task(self._expire_reviews_loop())
+ 
+@@ -376,11 +393,16 @@ async def _publish_gap_result(
+     async def _handle_status(self, data: dict[str, Any]) -> None:
+         """Handle status requests."""
+         try:
++            ac = self._approval_consumer
+             status = {
+                 "status": "running",
+                 "metrics": {
+                     "gaps_processed": self._gaps_processed,
+                     "code_generated": self._code_generated,
++                    "tests_passed": self._tests_passed + (ac.tests_passed if ac else 0),
++                    "tests_failed": self._tests_failed + (ac.tests_failed if ac else 0),
++                    "deployments": self._deployments + (ac.deployments if ac else 0),
++                    "reviews_expired": self._reviews_expired,
+                     "tests_passed": self._tests_passed,
+                     "tests_failed": self._tests_failed,
+                     "sandbox_unavailable": self._sandbox_unavailable,
+diff --git a/meta-programmer/src/meta_programmer/staging.py b/meta-programmer/src/meta_programmer/staging.py
+index 6a99bda..0bbacb4 100644
+--- a/meta-programmer/src/meta_programmer/staging.py
++++ b/meta-programmer/src/meta_programmer/staging.py
+@@ -204,6 +204,14 @@ def expired_reviews(self, now_ms: int, ttl_ms: int) -> list[str]:
+             if "trace_id" in m and is_review_expired(m, now_ms, ttl_ms)
+         ]
+ 
++    def is_in_human_review(self, trace_id: str) -> bool:
++        """True if trace_id is still awaiting human review."""
++        return os.path.isdir(os.path.join(self.human_review_dir, trace_id))
++
++    def stage_human_review_to_testing(self, trace_id: str) -> None:
++        """Move code from human_review to testing after human approval."""
++        self._move_stage(trace_id, self.human_review_dir, self.testing_dir, "testing")
++
+     def get_metadata(self, trace_id: str) -> Optional[dict]:
+         """Get metadata for a trace_id (searches all stages)."""
+         for stage_dir in [
+diff --git a/meta-programmer/tests/test_approval_consumer.py b/meta-programmer/tests/test_approval_consumer.py
+new file mode 100644
+index 0000000..561812a
+--- /dev/null
++++ b/meta-programmer/tests/test_approval_consumer.py
+@@ -0,0 +1,334 @@
++"""Tests for the human-approval consumer (Phase E1.9.1).
++
++Covers:
++  - StagingManager.is_in_human_review helper
++  - StagingManager.stage_human_review_to_testing helper
++  - ApprovalConsumer.handle_approval_response: approve, deny, late-answer,
++    TTL-expired, and ambiguous approved value
++  - Sandbox test failure after approval (rejects, doesn't deploy)
++  - Deploy failure after sandbox pass (rejects via stage_rejected)
++
++All modules are loaded via importlib to avoid triggering meta_programmer's
++__init__.py, which transitively imports the docker and NATS runtimes that are
++not available in the CI governance test environment.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import importlib.util
++import json
++import os
++import sys
++import tempfile
++import types
++
++# ── module bootstrap ─────────────────────────────────────────────────────────
++# We load staging.py and approval_consumer.py directly so their code runs
++# but meta_programmer/__init__.py (which pulls in docker / nats) does not.
++
++_SRC = os.path.join(os.path.dirname(__file__), "..", "src", "meta_programmer")
++
++# Create a stub meta_programmer package entry so that
++# "from meta_programmer.staging import ..." inside approval_consumer.py
++# resolves without triggering __init__.py.
++# __path__ must be set so Python treats the stub as a package — without it
++# any later `from meta_programmer.<submodule> import ...` in another test
++# collected in the same process fails with "not a package".
++if "meta_programmer" not in sys.modules:
++    _fake_pkg = types.ModuleType("meta_programmer")
++    _fake_pkg.__path__ = [_SRC]
++    _fake_pkg.__package__ = "meta_programmer"
++    sys.modules["meta_programmer"] = _fake_pkg
++
++
++def _load(module_dotted_name: str, filename: str) -> types.ModuleType:
++    path = os.path.join(_SRC, filename)
++    spec = importlib.util.spec_from_file_location(module_dotted_name, path)
++    mod = importlib.util.module_from_spec(spec)
++    mod.__package__ = "meta_programmer"
++    sys.modules[module_dotted_name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++_staging_mod = _load("meta_programmer.staging", "staging.py")
++_consumer_mod = _load("meta_programmer.approval_consumer", "approval_consumer.py")
++
++StagingManager = _staging_mod.StagingManager
++is_review_expired = _staging_mod.is_review_expired
++ApprovalConsumer = _consumer_mod.ApprovalConsumer
++
++
++# ── helpers ──────────────────────────────────────────────────────────────────
++
++
++def _staged_review(staging_root: str, trace_id: str, created_at: int) -> StagingManager:
++    """Return a StagingManager with trace_id in human_review at a given age."""
++    sm = StagingManager(staging_root)
++    sm.initialize()
++    sm.stage_pending(trace_id, f"/data/plugins/{trace_id}.py", "x = 1\n")
++    # Override created_at so tests can control TTL.
++    meta_path = os.path.join(sm.pending_dir, trace_id, "metadata.json")
++    with open(meta_path) as f:
++        meta = json.load(f)
++    meta["created_at"] = created_at
++    with open(meta_path, "w") as f:
++        json.dump(meta, f)
++    sm.stage_human_review(trace_id)
++    return sm
++
++
++async def _noop_run_tests(**_kwargs) -> dict:
++    return {"success": True, "error": None}
++
++
++async def _failing_run_tests(**_kwargs) -> dict:
++    return {"success": False, "error": "assertion failed"}
++
++
++async def _noop_deploy(trace_id: str, target_path: str, code: str) -> None:
++    pass
++
++
++async def _raising_deploy(trace_id: str, target_path: str, code: str) -> None:
++    raise RuntimeError("disk full")
++
++
++def _make_consumer(
++    sm: StagingManager,
++    *,
++    defer_ttl_ms: int = 300_000,
++    run_tests=None,
++    deploy=None,
++    gap_results: list | None = None,
++) -> ApprovalConsumer:
++    results = gap_results if gap_results is not None else []
++
++    async def _publish(trace_id: str, success: bool, message: str) -> None:
++        results.append({"trace_id": trace_id, "success": success, "message": message})
++
++    return ApprovalConsumer(
++        staging=sm,
++        defer_ttl_ms=defer_ttl_ms,
++        run_tests=run_tests or _noop_run_tests,
++        deploy=deploy or _noop_deploy,
++        publish_gap_result=_publish,
++    )
++
++
++# ── StagingManager helpers ────────────────────────────────────────────────────
++
++
++def test_is_in_human_review_true_when_awaiting():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=0)
++        assert sm.is_in_human_review("t1") is True
++
++
++def test_is_in_human_review_false_when_not_staged():
++    with tempfile.TemporaryDirectory() as d:
++        sm = StagingManager(d)
++        sm.initialize()
++        assert sm.is_in_human_review("unknown") is False
++
++
++def test_is_in_human_review_false_after_rejection():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=0)
++        sm.stage_rejected("t1", "expired")
++        assert sm.is_in_human_review("t1") is False
++
++
++def test_stage_human_review_to_testing_moves_item():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=0)
++        sm.stage_human_review_to_testing("t1")
++        assert not sm.is_in_human_review("t1")
++        assert os.path.isdir(os.path.join(sm.testing_dir, "t1"))
++
++
++def test_stage_human_review_to_testing_updates_stage_name():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=0)
++        sm.stage_human_review_to_testing("t1")
++        assert sm.get_metadata("t1")["stage"] == "testing"
++
++
++def test_stage_human_review_to_testing_preserves_created_at():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=12345)
++        sm.stage_human_review_to_testing("t1")
++        assert sm.get_metadata("t1")["created_at"] == 12345
++
++
++# ── ApprovalConsumer — approve path ──────────────────────────────────────────
++
++
++def test_approve_response_deploys_and_publishes_success():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))  # far future → not expired
++        results: list = []
++        consumer = _make_consumer(sm, gap_results=results)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": True}))
++        assert len(results) == 1
++        assert results[0]["success"] is True
++        assert "t1" in results[0]["trace_id"]
++
++
++def test_approve_increments_counters():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))
++        consumer = _make_consumer(sm)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": True}))
++        assert consumer.tests_passed == 1
++        assert consumer.deployments == 1
++        assert consumer.tests_failed == 0
++
++
++def test_approve_moves_item_to_approved():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))
++        consumer = _make_consumer(sm)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": True}))
++        assert sm.get_metadata("t1")["stage"] == "approved"
++
++
++# ── ApprovalConsumer — deny path ─────────────────────────────────────────────
++
++
++def test_deny_response_stages_rejected():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))
++        consumer = _make_consumer(sm)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": False}))
++        assert sm.get_metadata("t1")["stage"] == "rejected"
++
++
++def test_deny_response_publishes_failure():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))
++        results: list = []
++        consumer = _make_consumer(sm, gap_results=results)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": False}))
++        assert results[0]["success"] is False
++
++
++def test_ambiguous_approved_value_treated_as_deny():
++    # Only explicit True is accepted; anything else is fail-closed.
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))
++        consumer = _make_consumer(sm)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": "yes"}))
++        assert sm.get_metadata("t1")["stage"] == "rejected"
++
++
++def test_missing_approved_field_treated_as_deny():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))
++        consumer = _make_consumer(sm)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1"}))
++        assert sm.get_metadata("t1")["stage"] == "rejected"
++
++
++# ── ApprovalConsumer — idempotency (late answer) ─────────────────────────────
++
++
++def test_late_answer_after_expiry_sweep_is_ignored():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=0)
++        # Simulate expiry sweep running first.
++        sm.stage_rejected("t1", "DEFER expired — no human approval (fail-closed)")
++        results: list = []
++        consumer = _make_consumer(sm, gap_results=results)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": True}))
++        # No additional gap result published; item remains rejected.
++        assert results == []
++        assert sm.get_metadata("t1")["stage"] == "rejected"
++
++
++def test_duplicate_approve_ignored():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))
++        results: list = []
++        consumer = _make_consumer(sm, gap_results=results)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": True}))
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": True}))
++        # Second call is a no-op.
++        assert len(results) == 1
++
++
++# ── ApprovalConsumer — TTL-expired fail-closed ───────────────────────────────
++
++
++def test_approval_after_ttl_expired_fail_closed():
++    with tempfile.TemporaryDirectory() as d:
++        # created_at=0 means the item was created at epoch → always expired.
++        sm = _staged_review(d, "t1", created_at=0)
++        results: list = []
++        consumer = _make_consumer(sm, defer_ttl_ms=1_000, gap_results=results)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": True}))
++        assert sm.get_metadata("t1")["stage"] == "rejected"
++        assert results[0]["success"] is False
++        assert "TTL" in results[0]["message"]
++
++
++# ── ApprovalConsumer — sandbox failure after approve ─────────────────────────
++
++
++def test_sandbox_failure_after_approve_rejects():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))
++        results: list = []
++        consumer = _make_consumer(sm, run_tests=_failing_run_tests, gap_results=results)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": True}))
++        assert sm.get_metadata("t1")["stage"] == "rejected"
++        assert results[0]["success"] is False
++        assert "Tests failed" in results[0]["message"]
++
++
++def test_sandbox_failure_increments_tests_failed():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))
++        consumer = _make_consumer(sm, run_tests=_failing_run_tests)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": True}))
++        assert consumer.tests_failed == 1
++        assert consumer.tests_passed == 0
++        assert consumer.deployments == 0
++
++
++# ── ApprovalConsumer — deploy failure after sandbox pass ─────────────────────
++
++
++def test_deploy_failure_after_sandbox_pass_rejects():
++    with tempfile.TemporaryDirectory() as d:
++        sm = _staged_review(d, "t1", created_at=int(9e12))
++        results: list = []
++        consumer = _make_consumer(sm, deploy=_raising_deploy, gap_results=results)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "t1", "approved": True}))
++        assert sm.get_metadata("t1")["stage"] == "rejected"
++        assert results[0]["success"] is False
++        assert "Deploy failed" in results[0]["message"]
++
++
++# ── ApprovalConsumer — malformed input ───────────────────────────────────────
++
++
++def test_missing_trace_id_is_ignored():
++    with tempfile.TemporaryDirectory() as d:
++        sm = StagingManager(d)
++        sm.initialize()
++        results: list = []
++        consumer = _make_consumer(sm, gap_results=results)
++        asyncio.run(consumer.handle_approval_response({"approved": True}))
++        assert results == []
++
++
++def test_empty_trace_id_is_ignored():
++    with tempfile.TemporaryDirectory() as d:
++        sm = StagingManager(d)
++        sm.initialize()
++        results: list = []
++        consumer = _make_consumer(sm, gap_results=results)
++        asyncio.run(consumer.handle_approval_response({"trace_id": "", "approved": True}))
++        assert results == []

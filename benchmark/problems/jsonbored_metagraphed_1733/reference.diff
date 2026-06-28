@@ -1,0 +1,158 @@
+diff --git a/src/health-serving.mjs b/src/health-serving.mjs
+index b0341da40..e10990965 100644
+--- a/src/health-serving.mjs
++++ b/src/health-serving.mjs
+@@ -1054,11 +1054,10 @@ export function formatUptime({
+   rows,
+   now = null,
+ }) {
+-  const reliabilityRows = (rows || []).map((row) => ({
+-    ...row,
+-    surface_id: surfaceLookupKey(row),
+-  }));
+-  const reliability = computeReliability(reliabilityRows, {
++  // computeReliability keys per-surface aggregation on the stable surface_key
++  // itself (falling back to surface_id), so renamed rows already collapse into
++  // one bucket — no need to pre-rewrite surface_id here.
++  const reliability = computeReliability(rows || [], {
+     window: window || null,
+     now,
+   });
+diff --git a/src/reliability.mjs b/src/reliability.mjs
+index fb9affdf2..576c64036 100644
+--- a/src/reliability.mjs
++++ b/src/reliability.mjs
+@@ -72,10 +72,14 @@ export function scoreFromStats({
+ }
+ 
+ // Aggregate surface_uptime_daily rows into a subnet-level score + a per-surface
+-// score map. `rows`: [{ surface_id, day, samples, ok_count, avg_latency_ms,
+-// latency_samples }]. The window mean is weighted by latency_samples (healthy
+-// readings per day), not total samples; legacy rows fall back to total samples.
+-// `subnet` is null when there are no samples.
++// score map. `rows`: [{ surface_id, surface_key?, day, samples, ok_count,
++// avg_latency_ms, latency_samples }]. Per-surface aggregation keys on the stable
++// `surface_key` (the rename-proof identity from #1005), falling back to
++// `surface_id` for legacy rows that predate it — so a surface renamed within the
++// window stays ONE bucket instead of splitting (which would inflate
++// surface_count and fragment its score). The window mean is weighted by
++// latency_samples (healthy readings per day), not total samples; legacy rows
++// fall back to total samples. `subnet` is null when there are no samples.
+ export function computeReliability(rows, { window = null, now = null } = {}) {
+   const bySurface = new Map();
+   let totalSamples = 0;
+@@ -92,7 +96,10 @@ export function computeReliability(rows, { window = null, now = null } = {}) {
+     // Healthy readings behind this day's mean; legacy rows lack it → total samples.
+     const latencyCount =
+       row.latency_samples == null ? samples : Number(row.latency_samples) || 0;
+-    const surface = bySurface.get(row.surface_id) || {
++    // Stable identity first: a surface keeps one `surface_key` across renames,
++    // while `surface_id` can change (and legacy rows only have surface_id).
++    const surfaceKey = row.surface_key || row.surface_id;
++    const surface = bySurface.get(surfaceKey) || {
+       samples: 0,
+       okCount: 0,
+       latencyWeighted: 0,
+@@ -106,7 +113,7 @@ export function computeReliability(rows, { window = null, now = null } = {}) {
+       latencyWeighted += latency * latencyCount;
+       latencySamples += latencyCount;
+     }
+-    bySurface.set(row.surface_id, surface);
++    bySurface.set(surfaceKey, surface);
+     totalSamples += samples;
+     totalOk += okCount;
+     if (row.day) {
+@@ -115,8 +122,8 @@ export function computeReliability(rows, { window = null, now = null } = {}) {
+   }
+ 
+   const surfaces = {};
+-  for (const [surfaceId, surface] of bySurface) {
+-    surfaces[surfaceId] = scoreFromStats({
++  for (const [surfaceKey, surface] of bySurface) {
++    surfaces[surfaceKey] = scoreFromStats({
+       samples: surface.samples,
+       okCount: surface.okCount,
+       avgLatencyMs: surface.latencySamples
+diff --git a/tests/health-serving.test.mjs b/tests/health-serving.test.mjs
+index 8be86b7fc..6c7efaada 100644
+--- a/tests/health-serving.test.mjs
++++ b/tests/health-serving.test.mjs
+@@ -2212,6 +2212,40 @@ describe("computeReliability (score from uptime history)", () => {
+     assert.equal(out.surfaces.b.grade, "F");
+   });
+ 
++  test("aggregates a renamed surface as ONE bucket via stable surface_key", () => {
++    // The same physical surface across a rename: one stable surface_key, two
++    // different surface_id values on either side of the rename boundary. It must
++    // NOT split into two surfaces (which would inflate surface_count and
++    // fragment the per-surface score).
++    const out = computeReliability(
++      [
++        {
++          surface_id: "7:api:old",
++          surface_key: "srf-stableapi0000",
++          day: "2026-06-12",
++          samples: 100,
++          ok_count: 80,
++          avg_latency_ms: 100,
++        },
++        {
++          surface_id: "7:api:new",
++          surface_key: "srf-stableapi0000",
++          day: "2026-06-13",
++          samples: 100,
++          ok_count: 100,
++          avg_latency_ms: 100,
++        },
++      ],
++      { window: "30d", now: "2026-06-13T00:00:00.000Z" },
++    );
++    assert.equal(out.subnet.surface_count, 1);
++    assert.equal(out.subnet.sample_count, 200);
++    // surfaces map is keyed by the stable surface_key, not either surface_id.
++    assert.deepEqual(Object.keys(out.surfaces), ["srf-stableapi0000"]);
++    assert.equal(out.surfaces["srf-stableapi0000"].uptime_ratio, 0.9);
++    assert.equal(out.surfaces["7:api:old"], undefined);
++  });
++
+   test("weights latency by healthy readings and reports latency_sample_count", () => {
+     const out = computeReliability(
+       [
+@@ -2381,6 +2415,37 @@ describe("loadSubnetReliability (D1-backed)", () => {
+     assert.equal(out.computed_at, "2026-06-13T00:00:00.000Z");
+   });
+ 
++  test("counts a renamed surface once across the rename boundary", async () => {
++    // The query GROUP BYs COALESCE(surface_key, surface_id) per day and emits
++    // MAX(surface_id) per group, so a surface renamed mid-window yields rows with
++    // ONE stable surface_key but a different surface_id on each side of the
++    // rename. surface_count must stay 1 (not inflate to 2).
++    const out = await loadSubnetReliability({
++      db: uptimeDb([
++        {
++          surface_id: "7:api:new",
++          surface_key: "srf-stableapi0000",
++          day: "2026-06-13",
++          samples: 720,
++          ok_count: 720,
++          avg_latency_ms: 120,
++        },
++        {
++          surface_id: "7:api:old",
++          surface_key: "srf-stableapi0000",
++          day: "2026-06-12",
++          samples: 720,
++          ok_count: 540,
++          avg_latency_ms: 120,
++        },
++      ]),
++      netuid: 7,
++      now: "2026-06-14T00:00:00.000Z",
++    });
++    assert.equal(out.surface_count, 1);
++    assert.equal(out.uptime_ratio, 0.875); // (720+540)/1440
++  });
++
+   test("returns null (not throw) when the query fails", async () => {
+     const out = await loadSubnetReliability({
+       db: {

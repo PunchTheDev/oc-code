@@ -1,0 +1,62 @@
+pub(crate) mod activation;
+mod aggro_pressure;
+mod anthem_priority;
+mod anti_self_harm;
+mod blight_value;
+mod board_development;
+mod board_wipe_telegraph;
+mod card_advantage;
+mod chalice_avoidance;
+mod combat_tax;
+pub(crate) mod combo_line;
+mod condition_gated_activation;
+pub(crate) mod context;
+mod control_change_awareness;
+pub(crate) mod copy_value;
+mod downside_awareness;
+pub(crate) mod effect_classify;
+mod effect_timing;
+mod equipment_priority;
+mod etb_value;
+mod evasion_removal_priority;
+mod free_outlet_activation;
+pub(crate) mod hand_disruption;
+mod hold_mana_up;
+mod interaction_reservation;
+mod land_animation;
+mod land_sequencing;
+mod landfall_timing;
+mod lethality_awareness;
+mod life_total_resource;
+mod lifegain_payoff;
+mod mana_efficiency;
+mod mill_targeting;
+pub mod mulligan;
+mod payment_selection;
+mod planeswalker_loyalty;
+mod plus_one_counters;
+mod ramp_timing;
+mod reactive_self_protection;
+mod recursion_awareness;
+mod redundancy_avoidance;
+pub mod registry;
+mod sacrifice_value;
+mod separate_piles_timing;
+mod spellskite_priority;
+mod spellslinger_casting;
+pub(crate) mod stack_awareness;
+pub(crate) mod strategy_helpers;
+mod sweeper_timing;
+mod synergy_casting;
+mod tempo_curve;
+mod tokens_wide;
+mod tribal_lord_priority;
+pub(crate) mod tutor;
+mod x_value;
+
+#[cfg(test)]
+pub mod tests;
+
+pub use registry::{
+    DecisionKind, PolicyId, PolicyReason, PolicyRegistry, PolicyVerdict, TacticalPolicy,
+};

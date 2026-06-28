@@ -1,0 +1,332 @@
+diff --git a/sdk/src/activelearning/config.py b/sdk/src/activelearning/config.py
+index ee55caf..0fa67a7 100644
+--- a/sdk/src/activelearning/config.py
++++ b/sdk/src/activelearning/config.py
+@@ -10,6 +10,8 @@
+ from dataclasses import dataclass
+ from typing import Optional
+ 
++from activelearning.database import default_sqlite_path
++
+ 
+ @dataclass
+ class ServiceConfig:
+@@ -49,7 +51,7 @@ def from_env(cls, service_name: str) -> "ServiceConfig":
+         return cls(
+             service_name=service_name,
+             nats_url=os.environ.get("NATS_URL", "nats://localhost:4222"),
+-            sqlite_path=os.environ.get("SQLITE_PATH", "/data/sqlite/unified.db"),
++            sqlite_path=default_sqlite_path(),
+             ollama_url=os.environ.get("OLLAMA_URL", "http://localhost:11434"),
+             qdrant_url=os.environ.get("QDRANT_URL", "http://localhost:6333"),
+             tasks_root=os.environ.get("TASKS_ROOT", "/data/tasks"),
+diff --git a/sdk/src/activelearning/database.py b/sdk/src/activelearning/database.py
+index 30f6c2c..9e9cc07 100644
+--- a/sdk/src/activelearning/database.py
++++ b/sdk/src/activelearning/database.py
+@@ -7,6 +7,7 @@
+ 
+ import logging
+ import os
++import sys
+ from pathlib import Path
+ from typing import Any, Optional
+ 
+@@ -15,6 +16,23 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++def default_sqlite_path(db_name: str = "unified.db") -> str:
++    """Return the default SQLite path, honoring SQLITE_PATH when set.
++
++    Windows standalone uses a user-writable AppData path; Linux/macOS keep
++    the Docker-oriented /data/sqlite default when SQLITE_PATH is unset.
++    """
++    if env_path := os.environ.get("SQLITE_PATH"):
++        return env_path
++    if sys.platform == "win32":
++        local = os.environ.get(
++            "LOCALAPPDATA",
++            str(Path.home() / "AppData" / "Local"),
++        )
++        return str(Path(local) / "Engram" / "sqlite" / db_name)
++    return f"/data/sqlite/{db_name}"
++
++
+ def _load_schema() -> str:
+     """Load SQL schema from external file."""
+     schema_path = Path(__file__).parent / "schema.sql"
+@@ -54,9 +72,7 @@ def __init__(self, db_path: Optional[str] = None):
+         Args:
+             db_path: Path to SQLite database file
+         """
+-        self.db_path = db_path or os.environ.get(
+-            "SQLITE_PATH", "/data/sqlite/unified.db"
+-        )
++        self.db_path = db_path or default_sqlite_path()
+         self._connection: Optional[aiosqlite.Connection] = None
+ 
+     async def initialize(self) -> None:
+diff --git a/sdk/src/activelearning/embeddings.py b/sdk/src/activelearning/embeddings.py
+index 6a3153d..cc69150 100644
+--- a/sdk/src/activelearning/embeddings.py
++++ b/sdk/src/activelearning/embeddings.py
+@@ -48,6 +48,19 @@ def __init__(
+         # key to the most-recently-used end, and eviction drops the LRU front.
+         self._cache: OrderedDict[str, list[float]] = OrderedDict()
+         self._cache_max_size = 10000  # Max cached embeddings
++        self._session: Optional[aiohttp.ClientSession] = None
++
++    async def _get_session(self) -> aiohttp.ClientSession:
++        """Return a shared aiohttp session, creating one if needed."""
++        if self._session is None or self._session.closed:
++            self._session = aiohttp.ClientSession()
++        return self._session
++
++    async def close(self) -> None:
++        """Close the shared HTTP session."""
++        if self._session is not None and not self._session.closed:
++            await self._session.close()
++        self._session = None
+ 
+     async def embed_text(self, text: str) -> list[float]:
+         """
+@@ -68,18 +81,18 @@ async def embed_text(self, text: str) -> list[float]:
+ 
+         # Call Ollama embedding endpoint
+         try:
+-            async with aiohttp.ClientSession() as session:
+-                async with session.post(
+-                    f"{self.ollama_host}/api/embeddings",
+-                    json={"model": self.model, "prompt": text},
+-                    timeout=aiohttp.ClientTimeout(total=30),
+-                ) as response:
+-                    if response.status != 200:
+-                        error_text = await response.text()
+-                        raise RuntimeError(f"Ollama embedding error: {error_text}")
+-
+-                    result = await response.json()
+-                    embedding = result["embedding"]
++            session = await self._get_session()
++            async with session.post(
++                f"{self.ollama_host}/api/embeddings",
++                json={"model": self.model, "prompt": text},
++                timeout=aiohttp.ClientTimeout(total=30),
++            ) as response:
++                if response.status != 200:
++                    error_text = await response.text()
++                    raise RuntimeError(f"Ollama embedding error: {error_text}")
++
++                result = await response.json()
++                embedding = result["embedding"]
+ 
+         except aiohttp.ClientError as e:
+             logger.error(f"Failed to get embedding: {e}")
+@@ -124,18 +137,18 @@ def clear_cache(self) -> None:
+     async def is_available(self) -> bool:
+         """Check if the embedding service is available."""
+         try:
+-            async with aiohttp.ClientSession() as session:
+-                async with session.get(
+-                    f"{self.ollama_host}/api/tags",
+-                    timeout=aiohttp.ClientTimeout(total=5),
+-                ) as response:
+-                    if response.status == 200:
+-                        data = await response.json()
+-                        models = [m["name"] for m in data.get("models", [])]
+-                        return self.model in models or any(
+-                            self.model in m for m in models
+-                        )
+-                    return False
++            session = await self._get_session()
++            async with session.get(
++                f"{self.ollama_host}/api/tags",
++                timeout=aiohttp.ClientTimeout(total=5),
++            ) as response:
++                if response.status == 200:
++                    data = await response.json()
++                    models = [m["name"] for m in data.get("models", [])]
++                    return self.model in models or any(
++                        self.model in m for m in models
++                    )
++                return False
+         except Exception as e:
+             logger.warning(f"Embedding service not available: {e}")
+             return False
+diff --git a/sdk/src/activelearning/nats_client.py b/sdk/src/activelearning/nats_client.py
+index 9e44b17..3824afb 100644
+--- a/sdk/src/activelearning/nats_client.py
++++ b/sdk/src/activelearning/nats_client.py
+@@ -84,6 +84,7 @@ def __init__(
+         self._js: Optional[JetStreamContext] = None
+         self._subscriptions: dict[str, nats.aio.subscription.Subscription] = {}
+         self._handlers: dict[str, MessageHandler] = {}
++        self._request_handlers: set[str] = set()
+         self._connected = asyncio.Event()
+ 
+     async def connect(self) -> None:
+@@ -119,6 +120,8 @@ async def close(self) -> None:
+             self._js = None
+             self._connected.clear()
+             self._subscriptions.clear()
++            self._handlers.clear()
++            self._request_handlers.clear()
+ 
+     async def publish(self, subject: str, data: Any) -> None:
+         """
+@@ -189,6 +192,10 @@ async def message_callback(msg: Msg) -> None:
+         )
+         self._subscriptions[subject] = sub
+         self._handlers[subject] = handler
++        if is_request_handler:
++            self._request_handlers.add(subject)
++        else:
++            self._request_handlers.discard(subject)
+         logger.info(f"Subscribed to {subject}")
+ 
+     async def unsubscribe(self, subject: str) -> None:
+@@ -198,6 +205,7 @@ async def unsubscribe(self, subject: str) -> None:
+             del self._subscriptions[subject]
+             if subject in self._handlers:
+                 del self._handlers[subject]
++            self._request_handlers.discard(subject)
+             logger.info(f"Unsubscribed from {subject}")
+ 
+     async def request(
+@@ -279,12 +287,8 @@ async def force_reconnect(self) -> None:
+         Safe to call even if already connected (becomes a no-op reconnect).
+         """
+         saved_handlers: dict[str, tuple[MessageHandler, bool]] = {}
+-        for subject, sub in self._subscriptions.items():
+-            handler = self._handlers.get(subject)
+-            if handler is not None:
+-                # Detect if this was a request handler by checking stored metadata
+-                # We store the original handler, not the wrapper
+-                saved_handlers[subject] = (handler, False)
++        for subject, handler in self._handlers.items():
++            saved_handlers[subject] = (handler, subject in self._request_handlers)
+ 
+         logger.warning(f"force_reconnect: tearing down NATS connection ({len(saved_handlers)} subs to restore)")
+ 
+@@ -298,6 +302,8 @@ async def force_reconnect(self) -> None:
+             self._js = None
+             self._connected.clear()
+             self._subscriptions.clear()
++            self._handlers.clear()
++            self._request_handlers.clear()
+ 
+         # Create fresh connection
+         await self.connect()
+diff --git a/sdk/src/activelearning/runtime.py b/sdk/src/activelearning/runtime.py
+index 3beb425..e40e59a 100644
+--- a/sdk/src/activelearning/runtime.py
++++ b/sdk/src/activelearning/runtime.py
+@@ -79,6 +79,7 @@ async def stop(self) -> None:
+ 
+         # Close connections
+         await self.bus.close()
++        await self.embeddings.close()
+         await self.db.close()
+ 
+         logger.info("SDK Runtime stopped")
+diff --git a/sdk/tests/test_robustness.py b/sdk/tests/test_robustness.py
+new file mode 100644
+index 0000000..ddbcf67
+--- /dev/null
++++ b/sdk/tests/test_robustness.py
+@@ -0,0 +1,95 @@
++"""Tests for issue #47 robustness fixes (reconnect, embeddings session, DB path)."""
++
++from __future__ import annotations
++
++import sys
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++
++from activelearning.database import Database, default_sqlite_path
++from activelearning.embeddings import EmbeddingService
++from activelearning.nats_client import EventBus
++
++
++class TestDefaultSqlitePath:
++    def test_honors_sqlite_path_env(self, monkeypatch):
++        monkeypatch.setenv("SQLITE_PATH", "/custom/path/db.sqlite")
++        assert default_sqlite_path() == "/custom/path/db.sqlite"
++
++    def test_windows_default_uses_appdata(self, monkeypatch):
++        monkeypatch.delenv("SQLITE_PATH", raising=False)
++        monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\test\AppData\Local")
++        with patch.object(sys, "platform", "win32"):
++            path = default_sqlite_path()
++        normalized = path.replace("\\", "/")
++        assert normalized == "C:/Users/test/AppData/Local/Engram/sqlite/unified.db"
++
++    def test_unix_default_uses_data_dir(self, monkeypatch):
++        monkeypatch.delenv("SQLITE_PATH", raising=False)
++        with patch.object(sys, "platform", "linux"):
++            assert default_sqlite_path() == "/data/sqlite/unified.db"
++
++
++class TestDatabaseInitialize:
++    @pytest.mark.asyncio
++    async def test_initialize_creates_parent_dir(self, tmp_path, monkeypatch):
++        db_file = tmp_path / "nested" / "test.db"
++        monkeypatch.setenv("SQLITE_PATH", str(db_file))
++        db = Database()
++        await db.initialize()
++        try:
++            assert db_file.exists()
++        finally:
++            await db.close()
++
++
++class TestEmbeddingServiceSession:
++    @pytest.mark.asyncio
++    async def test_reuses_single_session(self):
++        service = EmbeddingService()
++        session_one = await service._get_session()
++        session_two = await service._get_session()
++        assert session_one is session_two
++        await service.close()
++        assert service._session is None
++
++
++class TestForceReconnectRequestHandlers:
++    @pytest.mark.asyncio
++    async def test_force_reconnect_restores_request_handler_flag(self):
++        bus = EventBus()
++
++        async def pub_handler(_data):
++            pass
++
++        async def req_handler(_data, _msg):
++            pass
++
++        bus._handlers = {
++            "events.pub": pub_handler,
++            "safety.analyze": req_handler,
++        }
++        bus._request_handlers = {"safety.analyze"}
++        bus._subscriptions = {
++            "events.pub": MagicMock(),
++            "safety.analyze": MagicMock(),
++        }
++        bus._nc = MagicMock()
++        bus._nc.close = AsyncMock()
++
++        subscribe_calls: list[dict] = []
++
++        async def track_subscribe(subject, handler, **kwargs):
++            subscribe_calls.append({"subject": subject, **kwargs})
++
++        bus.connect = AsyncMock()
++        bus.subscribe = AsyncMock(side_effect=track_subscribe)
++
++        await bus.force_reconnect()
++
++        assert bus.connect.await_count == 1
++        assert len(subscribe_calls) == 2
++        by_subject = {call["subject"]: call for call in subscribe_calls}
++        assert by_subject["events.pub"]["is_request_handler"] is False
++        assert by_subject["safety.analyze"]["is_request_handler"] is True
