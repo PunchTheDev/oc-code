@@ -1,0 +1,387 @@
+diff --git a/packages/gittensory-miner/lib/event-ledger.d.ts b/packages/gittensory-miner/lib/event-ledger.d.ts
+new file mode 100644
+index 000000000..480474a4e
+--- /dev/null
++++ b/packages/gittensory-miner/lib/event-ledger.d.ts
+@@ -0,0 +1,36 @@
++export type LedgerEntry = {
++  id: number;
++  seq: number;
++  type: string;
++  repoFullName: string | null;
++  payload: Record<string, unknown>;
++  createdAt: string;
++};
++
++export type AppendEventInput = {
++  type: string;
++  repoFullName?: string;
++  payload: Record<string, unknown>;
++};
++
++export type ReadEventsFilter = {
++  repoFullName?: string;
++  since?: number;
++};
++
++export type EventLedger = {
++  dbPath: string;
++  appendEvent(event: AppendEventInput): LedgerEntry;
++  readEvents(filter?: ReadEventsFilter): LedgerEntry[];
++  close(): void;
++};
++
++export function resolveEventLedgerDbPath(env?: Record<string, string | undefined>): string;
++
++export function initEventLedger(dbPath?: string): EventLedger;
++
++export function appendEvent(event: AppendEventInput): LedgerEntry;
++
++export function readEvents(filter?: ReadEventsFilter): LedgerEntry[];
++
++export function closeDefaultEventLedger(): void;
+diff --git a/packages/gittensory-miner/lib/event-ledger.js b/packages/gittensory-miner/lib/event-ledger.js
+new file mode 100644
+index 000000000..116b09eaf
+--- /dev/null
++++ b/packages/gittensory-miner/lib/event-ledger.js
+@@ -0,0 +1,195 @@
++import { chmodSync, mkdirSync } from "node:fs";
++import { homedir } from "node:os";
++import { dirname, join } from "node:path";
++import { DatabaseSync } from "node:sqlite";
++import { isDeepStrictEqual } from "node:util";
++
++// The miner's local, append-only event ledger (#2290): an immutable audit trail of every significant miner-loop
++// event (discovered_issue, plan_built, plan_step_completed, pr_prepared, … — a small fixed vocabulary for this
++// foundation phase that grows in later phases), each stamped with a module-maintained monotonic `seq` and a
++// timestamp. IMMUTABILITY INVARIANT: this module only ever issues INSERT and SELECT — it NEVER rewrites or removes
++// a row, so a contributor auditing the miner's history later can trust it was not retroactively edited. Keep it
++// that way: do not add any statement that mutates or removes an existing row. The database is 100% local; this
++// module never uploads, syncs, or phones home with its contents. Mirrors the local-store pattern of run-state.js.
++
++const defaultDbFileName = "event-ledger.sqlite3";
++let defaultEventLedger = null;
++
++export function resolveEventLedgerDbPath(env = process.env) {
++  const explicitPath = typeof env.GITTENSORY_MINER_EVENT_LEDGER_DB === "string"
++    ? env.GITTENSORY_MINER_EVENT_LEDGER_DB.trim()
++    : "";
++  if (explicitPath) return explicitPath;
++
++  const explicitConfigDir = typeof env.GITTENSORY_MINER_CONFIG_DIR === "string"
++    ? env.GITTENSORY_MINER_CONFIG_DIR.trim()
++    : "";
++  if (explicitConfigDir) return join(explicitConfigDir, defaultDbFileName);
++
++  const configHome = typeof env.XDG_CONFIG_HOME === "string" && env.XDG_CONFIG_HOME.trim()
++    ? env.XDG_CONFIG_HOME.trim()
++    : join(homedir(), ".config");
++  return join(configHome, "gittensory-miner", defaultDbFileName);
++}
++
++function normalizeDbPath(dbPath) {
++  const path = (dbPath ?? resolveEventLedgerDbPath()).trim();
++  if (!path) throw new Error("invalid_event_ledger_db_path");
++  return path;
++}
++
++function normalizeEventType(type) {
++  if (typeof type !== "string") throw new Error("invalid_event_type");
++  const trimmed = type.trim();
++  if (!trimmed) throw new Error("invalid_event_type");
++  return trimmed;
++}
++
++/** Optional repo scope: omitted/nullish → null; otherwise a validated `owner/repo`. */
++function normalizeOptionalRepoFullName(repoFullName) {
++  if (repoFullName === undefined || repoFullName === null) return null;
++  if (typeof repoFullName !== "string") throw new Error("invalid_repo_full_name");
++  const [owner, repo, extra] = repoFullName.trim().split("/");
++  if (!owner || !repo || extra !== undefined) throw new Error("invalid_repo_full_name");
++  return `${owner}/${repo}`;
++}
++
++// Serialize an audit payload, enforcing that it round-trips through JSON VERBATIM. A plain JSON.stringify would
++// silently drop `undefined`/function/symbol values and coerce `NaN`/`Infinity` to `null` (and throw on BigInt or a
++// cycle), so a read-back would not equal the appended event. We reject any such lossy payload outright — an audit
++// ledger must return exactly what was recorded.
++function serializePayload(payload) {
++  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
++    throw new Error("invalid_payload");
++  }
++  let json;
++  try {
++    json = JSON.stringify(payload);
++  } catch {
++    throw new Error("invalid_payload"); // BigInt value or circular reference
++  }
++  if (!isDeepStrictEqual(JSON.parse(json), payload)) {
++    throw new Error("invalid_payload"); // a value JSON would drop or coerce (undefined/NaN/function/symbol/Date/…)
++  }
++  return json;
++}
++
++function rowToEntry(row) {
++  return {
++    id: row.id,
++    seq: row.seq,
++    type: row.event_type,
++    repoFullName: row.repo_full_name,
++    payload: JSON.parse(row.payload_json),
++    createdAt: row.created_at,
++  };
++}
++
++/**
++ * Opens the local append-only event ledger, creating the table on first use. `seq` is a monotonically increasing
++ * counter maintained by this module (next = current MAX(seq) + 1) rather than relying on `AUTOINCREMENT`'s
++ * reuse-after-vacuum behavior, so consumers get a stable ordering guarantee. Rows read back in `seq ASC` order.
++ * (#2290)
++ */
++export function initEventLedger(dbPath = resolveEventLedgerDbPath()) {
++  const resolvedPath = normalizeDbPath(dbPath);
++  mkdirSync(dirname(resolvedPath), { recursive: true, mode: 0o700 });
++  const db = new DatabaseSync(resolvedPath);
++  chmodSync(resolvedPath, 0o600);
++  // Wait (rather than fail) for a concurrent writer's lock so two ledger instances on the same file serialize.
++  db.exec("PRAGMA busy_timeout = 5000");
++  // `UNIQUE(seq)` makes the monotonic-ordering guarantee an enforced invariant: a duplicate seq can never persist,
++  // even if the append path were ever changed.
++  db.exec(`
++    CREATE TABLE IF NOT EXISTS miner_event_ledger (
++      id INTEGER PRIMARY KEY AUTOINCREMENT,
++      seq INTEGER NOT NULL UNIQUE,
++      event_type TEXT NOT NULL,
++      repo_full_name TEXT,
++      payload_json TEXT NOT NULL,
++      created_at TEXT NOT NULL
++    )
++  `);
++
++  const nextSeqStatement = db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 AS nextSeq FROM miner_event_ledger");
++  const appendStatement = db.prepare(`
++    INSERT INTO miner_event_ledger (seq, event_type, repo_full_name, payload_json, created_at)
++    VALUES (?, ?, ?, ?, ?)
++  `);
++  const getByIdStatement = db.prepare("SELECT * FROM miner_event_ledger WHERE id = ?");
++  const readAllStatement = db.prepare("SELECT * FROM miner_event_ledger ORDER BY seq ASC");
++  const readByRepoStatement = db.prepare(
++    "SELECT * FROM miner_event_ledger WHERE repo_full_name = ? ORDER BY seq ASC",
++  );
++  const readSinceStatement = db.prepare(
++    "SELECT * FROM miner_event_ledger WHERE seq > ? ORDER BY seq ASC",
++  );
++  const readByRepoSinceStatement = db.prepare(
++    "SELECT * FROM miner_event_ledger WHERE repo_full_name = ? AND seq > ? ORDER BY seq ASC",
++  );
++
++  return {
++    dbPath: resolvedPath,
++    appendEvent(event) {
++      const type = normalizeEventType(event?.type);
++      const repoFullName = normalizeOptionalRepoFullName(event?.repoFullName);
++      const payloadJson = serializePayload(event?.payload);
++      const createdAt = new Date().toISOString();
++      // Serialize the read-then-write: BEGIN IMMEDIATE takes the write lock BEFORE reading MAX(seq), so two ledger
++      // instances on the same file cannot both compute the same next seq and corrupt the ordering guarantee.
++      db.exec("BEGIN IMMEDIATE");
++      try {
++        const { nextSeq } = nextSeqStatement.get();
++        const result = appendStatement.run(nextSeq, type, repoFullName, payloadJson, createdAt);
++        const entry = rowToEntry(getByIdStatement.get(Number(result.lastInsertRowid)));
++        db.exec("COMMIT");
++        return entry;
++      } catch (error) {
++        db.exec("ROLLBACK");
++        throw error;
++      }
++    },
++    readEvents(filter = {}) {
++      const repoFullName = filter.repoFullName === undefined
++        ? undefined
++        : normalizeOptionalRepoFullName(filter.repoFullName);
++      // `since` returns events with a seq STRICTLY greater than it — the "give me everything after the last seq I
++      // saw" polling shape.
++      const since = typeof filter.since === "number" ? filter.since : undefined;
++
++      let rows;
++      if (repoFullName !== undefined && since !== undefined) {
++        rows = readByRepoSinceStatement.all(repoFullName, since);
++      } else if (repoFullName !== undefined) {
++        rows = readByRepoStatement.all(repoFullName);
++      } else if (since !== undefined) {
++        rows = readSinceStatement.all(since);
++      } else {
++        rows = readAllStatement.all();
++      }
++      return rows.map(rowToEntry);
++    },
++    close() {
++      db.close();
++    },
++  };
++}
++
++function getDefaultEventLedger() {
++  defaultEventLedger ??= initEventLedger();
++  return defaultEventLedger;
++}
++
++export function appendEvent(event) {
++  return getDefaultEventLedger().appendEvent(event);
++}
++
++export function readEvents(filter) {
++  return getDefaultEventLedger().readEvents(filter);
++}
++
++export function closeDefaultEventLedger() {
++  if (!defaultEventLedger) return;
++  defaultEventLedger.close();
++  defaultEventLedger = null;
++}
+diff --git a/packages/gittensory-miner/package.json b/packages/gittensory-miner/package.json
+index 32e000a94..7e175d4c5 100644
+--- a/packages/gittensory-miner/package.json
++++ b/packages/gittensory-miner/package.json
+@@ -31,7 +31,7 @@
+     "lib"
+   ],
+   "scripts": {
+-    "build": "node --check bin/gittensory-miner.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/update-check.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js"
++    "build": "node --check bin/gittensory-miner.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/update-check.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js"
+   },
+   "dependencies": {
+     "@jsonbored/gittensory-engine": "0.1.0"
+diff --git a/test/unit/miner-event-ledger.test.ts b/test/unit/miner-event-ledger.test.ts
+new file mode 100644
+index 000000000..ebaae1f7e
+--- /dev/null
++++ b/test/unit/miner-event-ledger.test.ts
+@@ -0,0 +1,125 @@
++import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it } from "vitest";
++import {
++  closeDefaultEventLedger,
++  initEventLedger,
++  resolveEventLedgerDbPath,
++} from "../../packages/gittensory-miner/lib/event-ledger.js";
++
++const roots: string[] = [];
++const ledgers: Array<{ close(): void }> = [];
++
++function tempLedger() {
++  const root = mkdtempSync(join(tmpdir(), "gittensory-miner-event-ledger-"));
++  roots.push(root);
++  const ledger = initEventLedger(join(root, "nested", "event-ledger.sqlite3"));
++  ledgers.push(ledger);
++  return ledger;
++}
++
++afterEach(() => {
++  for (const ledger of ledgers.splice(0)) ledger.close();
++  closeDefaultEventLedger();
++  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
++});
++
++describe("gittensory-miner event ledger (#2290)", () => {
++  it("resolves the DB path from env override, miner config dir, XDG config, then the home default", () => {
++    expect(resolveEventLedgerDbPath({ GITTENSORY_MINER_EVENT_LEDGER_DB: "/custom/e.sqlite3" })).toBe(
++      "/custom/e.sqlite3",
++    );
++    expect(resolveEventLedgerDbPath({ GITTENSORY_MINER_CONFIG_DIR: "/custom/config" })).toBe(
++      "/custom/config/event-ledger.sqlite3",
++    );
++    expect(resolveEventLedgerDbPath({ XDG_CONFIG_HOME: "/xdg" })).toBe(
++      "/xdg/gittensory-miner/event-ledger.sqlite3",
++    );
++    expect(resolveEventLedgerDbPath({})).toMatch(/\/\.config\/gittensory-miner\/event-ledger\.sqlite3$/);
++  });
++
++  it("creates the SQLite file with owner-only permissions and reads empty before any append", () => {
++    const ledger = tempLedger();
++    expect(statSync(ledger.dbPath).mode & 0o077).toBe(0);
++    expect(ledger.readEvents()).toEqual([]);
++  });
++
++  it("appends an event and reads it back verbatim (JSON payload round-trip)", () => {
++    const ledger = tempLedger();
++    const entry = ledger.appendEvent({
++      type: "discovered_issue",
++      repoFullName: "JSONbored/gittensory",
++      payload: { issueNumber: 2290, labels: ["gittensor:feature"] },
++    });
++    expect(entry).toMatchObject({
++      seq: 1,
++      type: "discovered_issue",
++      repoFullName: "JSONbored/gittensory",
++      payload: { issueNumber: 2290, labels: ["gittensor:feature"] },
++    });
++    expect(typeof entry.id).toBe("number");
++    expect(typeof entry.createdAt).toBe("string");
++    expect(ledger.readEvents()).toEqual([entry]);
++  });
++
++  it("stores a null repo scope when none is given", () => {
++    const ledger = tempLedger();
++    expect(ledger.appendEvent({ type: "plan_built", payload: { steps: 3 } }).repoFullName).toBeNull();
++  });
++
++  it("assigns a strictly monotonic, gapless, unique seq across many appends", () => {
++    const ledger = tempLedger();
++    for (let i = 0; i < 50; i += 1) ledger.appendEvent({ type: "discovered_issue", payload: { i } });
++    const seqs = ledger.readEvents().map((entry) => entry.seq);
++    expect(seqs).toEqual(Array.from({ length: 50 }, (_unused, i) => i + 1)); // 1..50, gapless
++    expect(new Set(seqs).size).toBe(50); // all unique
++  });
++
++  it("filters by repoFullName", () => {
++    const ledger = tempLedger();
++    ledger.appendEvent({ type: "discovered_issue", repoFullName: "o/a", payload: {} });
++    ledger.appendEvent({ type: "discovered_issue", repoFullName: "o/b", payload: {} });
++    ledger.appendEvent({ type: "plan_built", repoFullName: "o/a", payload: {} });
++    expect(ledger.readEvents({ repoFullName: "o/a" }).map((entry) => entry.type)).toEqual([
++      "discovered_issue",
++      "plan_built",
++    ]);
++  });
++
++  it("filters by `since` (strictly greater seq), and combines with repoFullName", () => {
++    const ledger = tempLedger();
++    ledger.appendEvent({ type: "discovered_issue", repoFullName: "o/a", payload: {} }); // seq 1
++    ledger.appendEvent({ type: "plan_built", repoFullName: "o/b", payload: {} }); // seq 2
++    ledger.appendEvent({ type: "pr_prepared", repoFullName: "o/a", payload: {} }); // seq 3
++    expect(ledger.readEvents({ since: 1 }).map((entry) => entry.seq)).toEqual([2, 3]);
++    expect(ledger.readEvents({ repoFullName: "o/a", since: 1 }).map((entry) => entry.seq)).toEqual([3]);
++  });
++
++  it("rejects a non-object payload and a malformed repo scope rather than persisting them", () => {
++    const ledger = tempLedger();
++    // @ts-expect-error — payload must be an object
++    expect(() => ledger.appendEvent({ type: "x", payload: "nope" })).toThrow("invalid_payload");
++    expect(() => ledger.appendEvent({ type: "  ", payload: {} })).toThrow("invalid_event_type");
++    expect(() => ledger.appendEvent({ type: "x", repoFullName: "no-slash", payload: {} })).toThrow(
++      "invalid_repo_full_name",
++    );
++  });
++
++  it("rejects a payload JSON would not round-trip verbatim, and accepts a nested JSON-safe one", () => {
++    const ledger = tempLedger();
++    // Values JSON drops or coerces would make the audit entry differ from what was appended.
++    expect(() => ledger.appendEvent({ type: "x", payload: { a: undefined } })).toThrow("invalid_payload");
++    expect(() => ledger.appendEvent({ type: "x", payload: { a: Number.NaN } })).toThrow("invalid_payload");
++    expect(() => ledger.appendEvent({ type: "x", payload: { a: () => 1 } })).toThrow("invalid_payload");
++    expect(() => ledger.appendEvent({ type: "x", payload: { a: [1, undefined] } })).toThrow("invalid_payload");
++    // A fully JSON-safe nested payload is accepted and reads back identically.
++    const entry = ledger.appendEvent({ type: "x", payload: { a: { b: [1, "two", true, null] } } });
++    expect(ledger.readEvents()).toContainEqual(entry);
++  });
++
++  it("is append-only: the module source issues no UPDATE or DELETE against the ledger", () => {
++    const source = readFileSync("packages/gittensory-miner/lib/event-ledger.js", "utf8");
++    expect(source).not.toMatch(/\b(UPDATE|DELETE)\b/i);
++  });
++});

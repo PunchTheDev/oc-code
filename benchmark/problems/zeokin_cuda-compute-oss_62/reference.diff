@@ -1,0 +1,167 @@
+diff --git a/eval/cli.py b/eval/cli.py
+index 5df9358..240de32 100644
+--- a/eval/cli.py
++++ b/eval/cli.py
+@@ -24,7 +24,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
+                    help="number of random couples to average over. default 3")
+     p.add_argument("--dtype", choices=("fp16", "fp32", "fp64"), default="fp32")
+     p.add_argument("--rank-m", type=int, default=None,
+-                   help="subspace dimension M for the smart strategy (default N//8)")
++                   help="subspace dimension M for the smart strategy "
++                        "(default min(N, max(64, N//8)))")
+     p.add_argument("--fill", choices=("random", "lowrank", "iota"), default="random",
+                    help="matrix content. 'random'=hard/full-rank (default), "
+                         "'lowrank'=the strategy's happy path")
+diff --git a/eval/evaluator.py b/eval/evaluator.py
+index 2342df2..94b737b 100644
+--- a/eval/evaluator.py
++++ b/eval/evaluator.py
+@@ -25,6 +25,7 @@
+ from strategy.backend import Backend
+ from strategy.config import Config
+ from strategy import subspace, storage
++from strategy.subspace import default_rank_m
+ 
+ from . import metrics
+ from .memory import MemoryProbe
+@@ -37,7 +38,7 @@ class EvalConfig:
+     n            : matrix edge N (square N x N couples).
+     pairs        : how many random couples to generate and average over.
+     dtype        : element type (fp16 / fp32 / fp64).
+-    rank_m       : subspace dimension M for the smart strategy (None => N//8).
++    rank_m       : subspace dimension M for the smart strategy (None => min(N, max(64, N//8))).
+     fill         : matrix content: 'random' (hard, full-rank), 'lowrank'
+                    (the strategy's happy path), or 'iota'.
+     data_rank    : rank used when fill='lowrank' (None => N//32).
+@@ -64,6 +65,11 @@ class EvalConfig:
+     verbose: bool = True
+ 
+ 
++def effective_rank_m(ev: EvalConfig) -> int:
++    """M used for scoring: explicit ``rank_m`` or the strategy's default."""
++    return ev.rank_m if ev.rank_m is not None else default_rank_m(ev.n)
++
++
+ def _strategy_config(ev: EvalConfig, transform: str) -> Config:
+     return Config(
+         device=ev.device,
+@@ -113,7 +119,7 @@ def evaluate(ev: EvalConfig) -> dict:
+         print(f"[eval] device     : {backend.name}")
+         print(f"[eval] couples     : {ev.pairs} x ({ev.n} x {ev.n})  fill={ev.fill}  "
+               f"dtype={ev.dtype}")
+-        print(f"[eval] rank_m (M)  : {ev.rank_m or ev.n // 8}")
++        print(f"[eval] rank_m (M)  : {effective_rank_m(ev)}")
+         print(f"[eval] transforms  : {', '.join(names)}")
+ 
+     pairs, dt = _generate_pairs(ev)
+@@ -189,7 +195,7 @@ def evaluate(ev: EvalConfig) -> dict:
+         }
+ 
+     ranking = sorted(results.items(), key=lambda kv: kv[1]["score"], reverse=True)
+-    m = ev.rank_m or ev.n // 8
++    m = effective_rank_m(ev)
+     out = {
+         "config": {
+             "n": ev.n, "pairs": ev.pairs, "dtype": ev.dtype, "rank_m": m,
+@@ -199,7 +205,8 @@ def evaluate(ev: EvalConfig) -> dict:
+         "complexity": {
+             "normal": "O(N^3)",
+             "smart": "O(N^2 * M)"
+-            + (f"  (M={m} fixed -> ~O(N^2))" if ev.rank_m else f"  (M=N/8 -> ~O(N^3))"),
++            + (f"  (M={m} fixed -> ~O(N^2))" if ev.rank_m is not None
++               else f"  (M=min(N,max(64,N/8))={m} -> ~O(N^3) when M grows with N)"),
+         },
+         "exact": {
+             "latency_s": float(np.mean(exact_lat)),
+@@ -220,7 +227,7 @@ def estimate_scaling(ns, ev: EvalConfig) -> dict:
+ 
+     Runs one smart multiply per N in ``ns`` and fits latency ~ c * N^p by least
+     squares in log-log space. Set ``ev.rank_m`` to hold M fixed (isolates the
+-    ~N^2 term); leave it None and M = N//8 grows with N (~N^3).
++    ~N^2 term); leave it None and M = min(N, max(64, N//8)) grows with N (~N^3).
+     """
+     backend = Backend(ev.device, ev.verbose)
+     name = (ev.transforms or _transforms.available())[0]
+diff --git a/eval/tests/test_eval.py b/eval/tests/test_eval.py
+index 5e61f82..ad3c1eb 100644
+--- a/eval/tests/test_eval.py
++++ b/eval/tests/test_eval.py
+@@ -13,7 +13,8 @@
+ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+ 
+ from eval import metrics
+-from eval.evaluator import EvalConfig, evaluate, estimate_scaling
++from eval.evaluator import EvalConfig, effective_rank_m, evaluate, estimate_scaling
++from strategy.subspace import default_rank_m
+ 
+ 
+ class _Skip(Exception):
+@@ -101,6 +102,19 @@ def test_score_monotonic_in_accuracy():
+     assert hi > lo
+ 
+ 
++def test_default_rank_m_matches_strategy_floor():
++    # Strategy floors M at 64; eval must report the same default, not bare N//8.
++    assert default_rank_m(256) == 64
++    assert default_rank_m(256) != 256 // 8
++    assert default_rank_m(12000) == 1500
++    assert default_rank_m(32) == 32
++
++
++def test_effective_rank_m_uses_strategy_default():
++    assert effective_rank_m(EvalConfig(n=256, rank_m=None)) == 64
++    assert effective_rank_m(EvalConfig(n=256, rank_m=48)) == 48
++
++
+ # ---- dominance gate (the improvement rule) -------------------------------
+ def test_dominance_all_axes_below_exact():
+     # Faster, lighter, fewer FLOPs than exact -> admitted as an improvement.
+@@ -138,6 +152,7 @@ def test_evaluate_smoke():
+     ev = EvalConfig(n=96, pairs=2, dtype="fp32", fill="lowrank", data_rank=4,
+                     transforms=["rsvd"], verbose=False)
+     out = evaluate(ev)
++    assert out["config"]["rank_m"] == default_rank_m(96)
+     assert set(out["transforms"]) == {"rsvd"}
+     for r in out["transforms"].values():
+         assert 0.0 <= r["accuracy"] <= 1.0
+diff --git a/strategy/config.py b/strategy/config.py
+index 0f7f2de..912b043 100644
+--- a/strategy/config.py
++++ b/strategy/config.py
+@@ -20,7 +20,7 @@ class Config:
+ 
+     device        : GPU device index (CUDA).
+     dtype         : element type, one of DTYPES keys.
+-    rank_m        : subspace dimension M. None => n // 8. Smaller = faster,
++    rank_m        : subspace dimension M. None => min(n, max(64, n // 8)). Smaller = faster,
+                     less accurate. The approximation is exact only when M = n
+                     or when A/B live in the captured subspace (low rank).
+     transform     : registry name ("rsvd", the only built-in) OR a Transform
+diff --git a/strategy/subspace.py b/strategy/subspace.py
+index 8b82d01..6e41348 100644
+--- a/strategy/subspace.py
++++ b/strategy/subspace.py
+@@ -107,7 +107,13 @@ def reconstruct(Ctil, Q, C_out, backend: Backend, out_dtype,
+ # ---------------------------------------------------------------------------
+ # smart (subspace) multiply
+ # ---------------------------------------------------------------------------
+-def _default_rank(n: int) -> int:
++def default_rank_m(n: int) -> int:
++    """Default subspace dimension M when ``rank_m`` is unset.
++
++    Matches the strategy's real default: ``min(n, max(64, n // 8))``. The floor
++    at 64 keeps tiny-N smoke runs numerically stable; eval must report this same
++    value so scorecards reproduce what was actually multiplied.
++    """
+     return int(min(n, max(64, n // 8)))
+ 
+ 
+@@ -130,7 +136,7 @@ def multiply_subspace(A, B, C, backend: Backend, cfg: Config) -> dict:
+     n = A.shape[0]
+     if A.shape != (n, n) or B.shape != (n, n) or C.shape != (n, n):
+         raise ValueError("A, B, C must all be square n x n with matching n")
+-    m = cfg.rank_m or _default_rank(n)
++    m = cfg.rank_m if cfg.rank_m is not None else default_rank_m(n)
+     if not (1 <= m <= n):
+         raise ValueError(f"rank_m must be in [1, n]; got {m} for n={n}")
+     cdt = cfg.compute_dtype

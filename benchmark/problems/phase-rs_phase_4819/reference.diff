@@ -1,0 +1,213 @@
+diff --git a/crates/engine/src/game/triggers.rs b/crates/engine/src/game/triggers.rs
+index feb1e695a7..9b55058e4a 100644
+--- a/crates/engine/src/game/triggers.rs
++++ b/crates/engine/src/game/triggers.rs
+@@ -7246,6 +7246,100 @@ pub mod tests {
+         );
+     }
+ 
++    /// CR 113.6 / CR 113.6b + CR 603.10a: end-to-end proof that Teval, the
++    /// Balanced Scale's "Whenever one or more cards leave your graveyard, create a
++    /// token" trigger is battlefield-only — it must fire while Teval is on the
++    /// battlefield and must NOT fire while Teval itself is in the graveyard.
++    /// (issue #765)
++    ///
++    /// The trigger references *other* cards leaving the graveyard (subject "cards",
++    /// not `~`/SelfRef), so it is a permanent's triggered ability that functions
++    /// only on the battlefield (CR 113.6) — it does not state that it functions
++    /// from any other zone (CR 113.6b), and only a self-referential leaves trigger
++    /// gets the CR 603.10a graveyard/exile look-back. This discriminates the fix:
++    /// with the reverted blanket `trigger_zones = [Battlefield, Graveyard, Exile]`
++    /// the graveyard case wrongly fires (the observable bug).
++    ///
++    /// Installs the *parsed* production trigger (not a hand-built one) and varies
++    /// only Teval's own zone across the two cases.
++    #[test]
++    fn teval_leave_graveyard_trigger_is_battlefield_only() {
++        // Real production parser output for Teval's trigger.
++        let parsed = crate::parser::oracle_trigger::parse_trigger_line(
++            "Whenever one or more cards leave your graveyard, create a 2/2 black \
++             Zombie Druid creature token.",
++            "Teval, the Balanced Scale",
++        );
++        assert_eq!(parsed.mode, TriggerMode::ChangesZoneAll);
++        assert_eq!(parsed.origin, Some(Zone::Graveyard));
++        // The fix under test: this non-self trigger is battlefield-only.
++        assert_eq!(parsed.trigger_zones, vec![Zone::Battlefield]);
++
++        // Build fresh state with Teval carrying the parsed trigger in `teval_zone`,
++        // then fire a DIFFERENT P0-owned card leaving the graveyard. Returns whether
++        // Teval's trigger reached the stack (or pending target selection).
++        let run_case = |teval_zone: Zone| -> bool {
++            let mut state = setup();
++            state.active_player = PlayerId(0);
++
++            let teval = create_object(
++                &mut state,
++                CardId(1),
++                PlayerId(0),
++                "Teval, the Balanced Scale".to_string(),
++                teval_zone,
++            );
++            {
++                let obj = state.objects.get_mut(&teval).unwrap();
++                obj.card_types.core_types.push(CoreType::Creature);
++                obj.base_card_types = obj.card_types.clone();
++                obj.trigger_definitions.push(parsed.clone());
++            }
++
++            // A different P0-owned card leaves the graveyard (the batched event).
++            let leaver = create_object(
++                &mut state,
++                CardId(2),
++                PlayerId(0),
++                "Some Card".to_string(),
++                Zone::Hand,
++            );
++            let event = zone_changed_event(
++                leaver,
++                Zone::Graveyard,
++                Zone::Hand,
++                vec![CoreType::Creature],
++                vec![],
++            );
++
++            process_triggers(&mut state, &[event]);
++
++            let on_stack = state.stack.iter().any(|entry| {
++                entry.source_id == teval
++                    && matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
++            });
++            let pending = state
++                .pending_trigger
++                .as_ref()
++                .is_some_and(|p| p.source_id == teval);
++            on_stack || pending
++        };
++
++        // (a) Teval on the battlefield → the leave-graveyard trigger fires.
++        assert!(
++            run_case(Zone::Battlefield),
++            "Teval on the battlefield must fire its leave-graveyard trigger"
++        );
++
++        // (b) Teval in the graveyard → the trigger must NOT fire (CR 113.6b).
++        // Reverting the fix (blanket graveyard/exile trigger_zones) makes this
++        // wrongly fire — the observable bug in issue #765.
++        assert!(
++            !run_case(Zone::Graveyard),
++            "Teval in the graveyard must NOT fire its battlefield-only trigger"
++        );
++    }
++
+     /// CR 702.149a + CR 508.1a: the synthesized Training condition is a filtered
+     /// `MinCoAttackers { minimum: 1, filter: Some(power > source) }`. This drives
+     /// the *real* synthesized condition through `check_trigger_condition` to prove
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index f8749bc117..29628b967a 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -10519,10 +10519,17 @@ fn try_parse_one_or_more_leave_graveyard(lower: &str) -> Option<(TriggerMode, Tr
+         let mut def = make_base();
+         def.mode = TriggerMode::ChangesZoneAll;
+         def.origin = Some(Zone::Graveyard);
+-        def.valid_card = Some(with_owner_scope(filter, ControllerRef::You));
++        let scoped = with_owner_scope(filter, ControllerRef::You);
+         def.batched = true;
+-        // LTB-from-graveyard triggers need to fire from graveyard zone context
+-        def.trigger_zones = vec![Zone::Battlefield, Zone::Graveyard, Zone::Exile];
++        // CR 113.6 / CR 113.6b: a permanent's triggered ability functions only on the
++        // battlefield unless it states otherwise, so this batched "leave your graveyard"
++        // trigger keeps make_base()'s battlefield-only default. CR 113.6k + CR 603.10a:
++        // when the source card is itself the object leaving its own graveyard, the trigger
++        // condition cannot trigger from the battlefield and needs graveyard/exile zones.
++        if filter_references_self(&scoped) {
++            def.trigger_zones = vec![Zone::Battlefield, Zone::Graveyard, Zone::Exile];
++        }
++        def.valid_card = Some(scoped);
+         if during_your_turn {
+             def.constraint = Some(TriggerConstraint::OnlyDuringYourTurn);
+         }
+@@ -10591,10 +10598,12 @@ fn try_parse_one_or_more_put_into_exile_from(
+         def.origin_zones = zones;
+         def.destination = Some(Zone::Exile);
+         def.batched = true;
+-        // Source can fire from any public zone context since cards move from
+-        // library/graveyard — trigger source (e.g. Laelia) is on the battlefield,
+-        // but keeping these zones mirrors the leave-graveyard precedent.
+-        def.trigger_zones = vec![Zone::Battlefield, Zone::Graveyard, Zone::Exile];
++        // CR 113.6 / CR 113.6b: this batched "cards are put into exile from
++        // library/graveyard" ability is a permanent's triggered ability whose source
++        // (e.g. Laelia the Blade Reforged, Rakshasa Vizier) is on the battlefield, and
++        // it doesn't state that it functions from any other zone — so it keeps
++        // make_base()'s battlefield-only default. There is no self-referential subject
++        // here (valid_card is None), so no graveyard/exile look-back zones are needed.
+         return Some((TriggerMode::ChangesZoneAll, def));
+     }
+ 
+diff --git a/crates/engine/src/parser/oracle_trigger_tests.rs b/crates/engine/src/parser/oracle_trigger_tests.rs
+index 5919b20500..d0c7ce65bd 100644
+--- a/crates/engine/src/parser/oracle_trigger_tests.rs
++++ b/crates/engine/src/parser/oracle_trigger_tests.rs
+@@ -12833,6 +12833,11 @@ fn trigger_one_or_more_creature_cards_leave_graveyard() {
+     assert_eq!(def.origin, Some(Zone::Graveyard));
+     assert!(def.batched);
+     assert_owned_by_you(def.valid_card.as_ref().expect("valid_card"));
++    // CR 113.6 / CR 113.6b: Insidious Roots is a battlefield permanent whose
++    // "leave your graveyard" trigger references other cards, not itself, so it
++    // functions only from the battlefield (make_base() default). CR 603.10a's
++    // graveyard/exile look-back applies only to self-referential leaves triggers.
++    assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
+ }
+ 
+ #[test]
+@@ -12850,6 +12855,9 @@ fn trigger_one_or_more_cards_leave_graveyard() {
+         matches!(filter, TargetFilter::Typed(typed) if typed.type_filters == vec![TypeFilter::Card]),
+         "expected card filter for unqualified cards, got {filter:?}"
+     );
++    // CR 113.6 / CR 113.6b: Chalk Outline's trigger references other cards leaving
++    // its owner's graveyard, not itself — battlefield-only (make_base() default).
++    assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
+ }
+ 
+ #[test]
+@@ -12863,6 +12871,9 @@ fn trigger_one_or_more_cards_leave_graveyard_during_your_turn() {
+     assert!(def.batched);
+     assert_owned_by_you(def.valid_card.as_ref().expect("valid_card"));
+     assert_eq!(def.constraint, Some(TriggerConstraint::OnlyDuringYourTurn));
++    // CR 113.6 / CR 113.6b: Soul Enervation is a battlefield permanent; its
++    // non-self "leave your graveyard" trigger stays battlefield-only.
++    assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
+ }
+ 
+ #[test]
+@@ -12877,6 +12888,10 @@ fn trigger_one_or_more_cards_put_into_exile_from_library_or_graveyard() {
+     assert_eq!(def.destination, Some(Zone::Exile));
+     assert_eq!(def.origin_zones, vec![Zone::Library, Zone::Graveyard]);
+     assert!(def.batched);
++    // CR 113.6 / CR 113.6b: Laelia is a battlefield permanent whose "cards are put
++    // into exile from library/graveyard" trigger has no self-referential subject —
++    // it functions only from the battlefield (make_base() default).
++    assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
+ }
+ 
+ #[test]
+@@ -12890,6 +12905,8 @@ fn trigger_one_or_more_cards_put_into_exile_from_library_only() {
+     assert_eq!(def.destination, Some(Zone::Exile));
+     assert_eq!(def.origin_zones, vec![Zone::Library]);
+     assert!(def.batched);
++    // CR 113.6 / CR 113.6b: battlefield-only for the single-source variant too.
++    assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
+ }
+ 
+ #[test]
+@@ -12904,6 +12921,9 @@ fn trigger_one_or_more_artifact_or_creature_cards_leave_graveyard() {
+     let filter = def.valid_card.as_ref().expect("valid_card");
+     assert!(matches!(filter, TargetFilter::Or { .. }));
+     assert_owned_by_you(filter);
++    // CR 113.6 / CR 113.6b: Attuned Hunter's disjunctive "leave your graveyard"
++    // trigger references other cards, not itself — battlefield-only.
++    assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
+ }
+ 
+ // ── Work Item 2: Discard Batch Triggers ───────────────────────

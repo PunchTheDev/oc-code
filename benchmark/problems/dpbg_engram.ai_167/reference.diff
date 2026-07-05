@@ -1,0 +1,385 @@
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 9f638b0..e046cf0 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -46,6 +46,31 @@ jobs:
+           ENGRAM_SKIP_MUJOCO_LOOP: "1"
+         run: uv run --extra dev python -m pytest tests/ -v -p no:anchorpy --ignore=tests/test_cognitive_bridge_lifecycle.py
+ 
++  benchmark-regression:
++    name: Neuromorphic benchmark regression gate
++    runs-on: ubuntu-latest
++    timeout-minutes: 15
++    # Fast small-network profile (~1 min). Runs on all PRs; touches neuromorphic/ most often.
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Install uv and Python 3.12
++        uses: astral-sh/setup-uv@v5
++        with:
++          enable-cache: true
++          python-version: "3.12"
++
++      - name: Run benchmark CI performance gate
++        working-directory: neuromorphic
++        env:
++          ENGRAM_SKIP_MUJOCO_LOOP: "1"
++        run: uv run --extra dev python scripts/benchmark_ci_gate.py
++
++      - name: Run benchmark gate unit tests
++        working-directory: neuromorphic
++        run: uv run --extra dev python -m pytest tests/test_benchmark_ci_gate.py -v -p no:anchorpy
++
+   sdk:
+     name: SDK test suite
+     runs-on: ubuntu-latest
+diff --git a/CONTRIBUTING.md b/CONTRIBUTING.md
+index 67037a0..4d12573 100644
+--- a/CONTRIBUTING.md
++++ b/CONTRIBUTING.md
+@@ -189,6 +189,10 @@ cd neuromorphic && uv run --extra dev python -m pytest tests/ -v -p no:anchorpy
+ On every pull request to `dev` (and `main`), the **`Tests`** workflow runs:
+ 
+ - the **neuromorphic** test suite on **Python 3.11 and 3.12**,
++- a **benchmark regression gate** (`neuromorphic/scripts/benchmark_ci_gate.py`) on a small
++  fixed-size network — fails if step timing regresses more than **25%** vs.
++  `neuromorphic/benchmarks/ci_performance_baseline.json` (see
++  [Performance regression gate](#performance-regression-gate)),
+ - the **SDK** test suite on **Python 3.11 and 3.12**,
+ - a **blocking lint gate** (`ruff --select E9,F63,F7,F82` — catches real bugs like
+   undefined names), and
+@@ -196,6 +200,34 @@ On every pull request to `dev` (and `main`), the **`Tests`** workflow runs:
+ 
+ Your PR can be merged once the blocking jobs are green.
+ 
++### Performance regression gate
++
++PRs run `neuromorphic/scripts/benchmark_ci_gate.py`, which invokes
++`scripts/benchmark.py` on a **small fixed-size network** (not the ~1M-neuron
++production scale). Results are compared to the committed baseline at
++`neuromorphic/benchmarks/ci_performance_baseline.json`.
++
++| Metric | Baseline field | Failure when |
++|--------|----------------|--------------|
++| Simulation throughput | `speed_steps_per_sec` | Drops more than **25%** below baseline |
++| Mean step time | `speed_mean_step_ms` | Exceeds baseline by more than **25%** |
++| Learning throughput | `learning_steps_per_sec` | Drops more than **25%** below baseline |
++
++To reproduce locally:
++
++```bash
++cd neuromorphic && uv run --extra dev python scripts/benchmark_ci_gate.py
++```
++
++To capture fresh metrics after an intentional performance change (maintainers only):
++
++```bash
++cd neuromorphic && uv run --extra dev python scripts/benchmark_ci_gate.py --update-baseline
++```
++
++Update `ci_performance_baseline.json` in a separate commit after reviewing the
++new numbers — do not widen the threshold to make a regression pass silently.
++
+ ## Code Standards
+ 
+ - **Python**: `async`/`await` patterns; type hints on public APIs.
+diff --git a/neuromorphic/benchmarks/ci_performance_baseline.json b/neuromorphic/benchmarks/ci_performance_baseline.json
+new file mode 100644
+index 0000000..3c4f7ba
+--- /dev/null
++++ b/neuromorphic/benchmarks/ci_performance_baseline.json
+@@ -0,0 +1,32 @@
++{
++  "description": "CI performance baseline for neuromorphic/scripts/benchmark.py (issue #132). Small fixed network — not the ~1M-neuron production scale.",
++  "benchmark_args": {
++    "steps": 50,
++    "patterns": 2,
++    "reps": 1,
++    "steps_per_pattern": 8
++  },
++  "env": {
++    "NEURO_BRAINSTEM_N": "50",
++    "NEURO_REFLEX_N": "30",
++    "NEURO_SENSORY_N": "200",
++    "NEURO_MOTOR_N": "100",
++    "NEURO_CEREBELLUM_N": "50",
++    "NEURO_ASSOCIATION_N": "150",
++    "NEURO_PREDICTIVE_N": "80",
++    "NEURO_WORKING_MEM_N": "40",
++    "NEURO_FEATURE_N": "0",
++    "NEURO_CONCEPT_N": "0",
++    "NEURO_DG_N": "0",
++    "NEURO_META_N": "0",
++    "NEURO_WORKSPACE_N": "0",
++    "NEURO_DENDRITES": "0",
++    "ENGRAM_SKIP_MUJOCO_LOOP": "1"
++  },
++  "regression_threshold_pct": 25,
++  "metrics": {
++    "speed_steps_per_sec": 400.0,
++    "speed_mean_step_ms": 2.5,
++    "learning_steps_per_sec": 350.0
++  }
++}
+diff --git a/neuromorphic/scripts/benchmark_ci_gate.py b/neuromorphic/scripts/benchmark_ci_gate.py
+new file mode 100644
+index 0000000..1e5f607
+--- /dev/null
++++ b/neuromorphic/scripts/benchmark_ci_gate.py
+@@ -0,0 +1,180 @@
++"""
++CI performance-regression gate for scripts/benchmark.py (issue #132).
++
++Runs a small fixed-size network benchmark and fails if step timing regresses
++beyond the committed baseline in benchmarks/ci_performance_baseline.json.
++
++Usage:
++    cd neuromorphic && uv run python scripts/benchmark_ci_gate.py
++    cd neuromorphic && uv run python scripts/benchmark_ci_gate.py --baseline benchmarks/ci_performance_baseline.json
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++from typing import Any
++
++_SCRIPT_DIR = Path(__file__).resolve().parent
++_NEURO_DIR = _SCRIPT_DIR.parent
++_DEFAULT_BASELINE = _NEURO_DIR / "benchmarks" / "ci_performance_baseline.json"
++
++
++def load_baseline(path: Path) -> dict[str, Any]:
++    data = json.loads(path.read_text(encoding="utf-8"))
++    if "metrics" not in data:
++        raise ValueError(f"Baseline missing 'metrics': {path}")
++    return data
++
++
++def apply_ci_env(env_overrides: dict[str, str]) -> None:
++    """Apply small-network env vars from the baseline profile."""
++    for key, value in env_overrides.items():
++        os.environ[key] = str(value)
++
++
++def run_benchmark(
++    output_dir: Path,
++    steps: int,
++    patterns: int,
++    reps: int,
++    steps_per_pattern: int,
++) -> dict[str, Any]:
++    """Invoke scripts/benchmark.py and return the latest result JSON."""
++    output_dir.mkdir(parents=True, exist_ok=True)
++    cmd = [
++        sys.executable,
++        str(_SCRIPT_DIR / "benchmark.py"),
++        "--steps", str(steps),
++        "--patterns", str(patterns),
++        "--reps", str(reps),
++        "--steps-per-pattern", str(steps_per_pattern),
++        "--output", str(output_dir),
++    ]
++    subprocess.run(cmd, check=True, cwd=_NEURO_DIR)
++    files = sorted(output_dir.glob("benchmark_*.json"))
++    if not files:
++        raise RuntimeError(f"No benchmark output in {output_dir}")
++    return json.loads(files[-1].read_text(encoding="utf-8"))
++
++
++def check_regression(
++    result: dict[str, Any],
++    baseline: dict[str, Any],
++) -> list[str]:
++    """Return human-readable failure messages (empty if within threshold)."""
++    metrics = baseline["metrics"]
++    threshold = float(baseline.get("regression_threshold_pct", 25)) / 100.0
++    failures: list[str] = []
++
++    speed = result.get("speed", {})
++    learning = result.get("learning", {})
++
++    actual_sps = float(speed.get("steps_per_sec", 0))
++    base_sps = float(metrics["speed_steps_per_sec"])
++    min_sps = base_sps * (1.0 - threshold)
++    if actual_sps < min_sps:
++        failures.append(
++            f"speed steps/sec regressed: {actual_sps:.1f} < minimum {min_sps:.1f} "
++            f"(baseline {base_sps:.1f}, threshold -{threshold * 100:.0f}%)",
++        )
++
++    phase_timing = speed.get("phase_timing", {})
++    total_timing = phase_timing.get("total", {})
++    actual_ms = float(total_timing.get("mean_ms", 0))
++    base_ms = float(metrics["speed_mean_step_ms"])
++    max_ms = base_ms * (1.0 + threshold)
++    if actual_ms > max_ms:
++        failures.append(
++            f"mean step time regressed: {actual_ms:.3f} ms > maximum {max_ms:.3f} ms "
++            f"(baseline {base_ms:.3f} ms, threshold +{threshold * 100:.0f}%)",
++        )
++
++    actual_learn = float(learning.get("steps_per_sec", 0))
++    base_learn = float(metrics["learning_steps_per_sec"])
++    min_learn = base_learn * (1.0 - threshold)
++    if actual_learn < min_learn:
++        failures.append(
++            f"learning steps/sec regressed: {actual_learn:.1f} < minimum {min_learn:.1f} "
++            f"(baseline {base_learn:.1f}, threshold -{threshold * 100:.0f}%)",
++        )
++
++    return failures
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description="CI benchmark performance regression gate")
++    parser.add_argument(
++        "--baseline",
++        type=Path,
++        default=_DEFAULT_BASELINE,
++        help="Committed baseline JSON (default: benchmarks/ci_performance_baseline.json)",
++    )
++    parser.add_argument(
++        "--output",
++        type=Path,
++        default=None,
++        help="Directory for benchmark output (default: temp dir)",
++    )
++    parser.add_argument(
++        "--update-baseline",
++        action="store_true",
++        help="Print measured metrics for baseline refresh (does not fail)",
++    )
++    args = parser.parse_args()
++
++    baseline = load_baseline(args.baseline)
++    bench_args = baseline.get("benchmark_args", {})
++    apply_ci_env(baseline.get("env", {}))
++
++    out_dir = args.output
++    tmp: tempfile.TemporaryDirectory[str] | None = None
++    if out_dir is None:
++        tmp = tempfile.TemporaryDirectory(prefix="engram-bench-ci-")
++        out_dir = Path(tmp.name)
++
++    result = run_benchmark(
++        out_dir,
++        steps=int(bench_args.get("steps", 50)),
++        patterns=int(bench_args.get("patterns", 2)),
++        reps=int(bench_args.get("reps", 1)),
++        steps_per_pattern=int(bench_args.get("steps_per_pattern", 8)),
++    )
++
++    if args.update_baseline:
++        speed = result.get("speed", {})
++        learning = result.get("learning", {})
++        measured = {
++            "speed_steps_per_sec": speed.get("steps_per_sec"),
++            "speed_mean_step_ms": speed.get("phase_timing", {}).get("total", {}).get("mean_ms"),
++            "learning_steps_per_sec": learning.get("steps_per_sec"),
++        }
++        print(json.dumps({"metrics": measured}, indent=2))
++        return 0
++
++    failures = check_regression(result, baseline)
++    if failures:
++        print("PERFORMANCE REGRESSION DETECTED", file=sys.stderr)
++        for msg in failures:
++            print(f"  - {msg}", file=sys.stderr)
++        print(
++            "\nIf this regression is expected, update "
++            "neuromorphic/benchmarks/ci_performance_baseline.json after review.",
++            file=sys.stderr,
++        )
++        return 1
++
++    speed = result["speed"]
++    print(
++        f"OK: speed {speed['steps_per_sec']:.1f} steps/sec, "
++        f"mean step {speed['phase_timing']['total']['mean_ms']:.3f} ms",
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/neuromorphic/tests/test_benchmark_ci_gate.py b/neuromorphic/tests/test_benchmark_ci_gate.py
+new file mode 100644
+index 0000000..10ac7ff
+--- /dev/null
++++ b/neuromorphic/tests/test_benchmark_ci_gate.py
+@@ -0,0 +1,69 @@
++"""Tests for scripts/benchmark_ci_gate.py (issue #132)."""
++
++from __future__ import annotations
++
++import json
++import sys
++from pathlib import Path
++
++import pytest
++
++_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
++sys.path.insert(0, str(_SCRIPTS))
++
++import benchmark_ci_gate  # noqa: E402
++
++
++@pytest.fixture
++def baseline() -> dict:
++    return {
++        "regression_threshold_pct": 25,
++        "metrics": {
++            "speed_steps_per_sec": 400.0,
++            "speed_mean_step_ms": 2.5,
++            "learning_steps_per_sec": 350.0,
++        },
++    }
++
++
++def _result(sps: float, mean_ms: float, learn_sps: float) -> dict:
++    return {
++        "speed": {
++            "steps_per_sec": sps,
++            "phase_timing": {"total": {"mean_ms": mean_ms}},
++        },
++        "learning": {"steps_per_sec": learn_sps},
++    }
++
++
++class TestCheckRegression:
++    def test_passes_within_threshold(self, baseline):
++        assert benchmark_ci_gate.check_regression(
++            _result(450.0, 2.0, 400.0), baseline,
++        ) == []
++
++    def test_fails_slow_steps_per_sec(self, baseline):
++        failures = benchmark_ci_gate.check_regression(
++            _result(200.0, 2.0, 400.0), baseline,
++        )
++        assert any("speed steps/sec" in f for f in failures)
++
++    def test_fails_high_mean_step_ms(self, baseline):
++        failures = benchmark_ci_gate.check_regression(
++            _result(450.0, 5.0, 400.0), baseline,
++        )
++        assert any("mean step time" in f for f in failures)
++
++    def test_fails_slow_learning(self, baseline):
++        failures = benchmark_ci_gate.check_regression(
++            _result(450.0, 2.0, 100.0), baseline,
++        )
++        assert any("learning steps/sec" in f for f in failures)
++
++
++def test_committed_baseline_is_valid_json():
++    path = Path(__file__).resolve().parents[1] / "benchmarks" / "ci_performance_baseline.json"
++    data = json.loads(path.read_text(encoding="utf-8"))
++    assert "metrics" in data
++    assert "benchmark_args" in data
++    assert data["metrics"]["speed_steps_per_sec"] > 0

@@ -1,0 +1,1194 @@
+diff --git a/packages/gittensory-engine/README.md b/packages/gittensory-engine/README.md
+index 7bc57b68d..2e6ecb439 100644
+--- a/packages/gittensory-engine/README.md
++++ b/packages/gittensory-engine/README.md
+@@ -244,6 +244,85 @@ rejected because the repo was not opted in, had invalid ids, or exposed no recog
+ component scores, effective weights, contributing repos, dimension tables, rejected rows, and a contributing-repo
+ summary. All caller-supplied ids and repo names are Markdown-escaped and newline-collapsed before rendering.
+ 
++## Phase 7 calibration loop
++
++`computePhase7CalibrationLoop()` wires the historical-replay composite score into the live Phase 7 calibration loop
++alongside the passive pr_outcome signal. The module tracks a combined calibration-accuracy metric against the
++documented 62% baseline, records provenance per source, recommends replay-run cadence, and fail-closes autonomy-level
++increases when the replay harness is missing, stale, degraded, or below the configured threshold.
++
++The loop is default-off and must be enabled explicitly:
++
++```yaml
++miner:
++  calibration:
++    phase7LoopEnabled: true
++    autonomyIncreaseMinAccuracy: 0.70
++    replayFreshnessMaxAgeHours: 168
++    historicalReplayWeight: 0.5
++    prOutcomeWeight: 0.5
++```
++
++When enabled, autonomy-level increases require a fresh healthy historical-replay run plus enough live pr_outcome samples.
++If the replay harness is degraded or unavailable, the loop sets an explicit hold flag instead of silently falling back
++to pr_outcome-only gating.
++
++```ts
++import {
++  computePhase7CalibrationLoop,
++  shouldScheduleHistoricalReplayRun,
++} from "@jsonbored/gittensory-engine";
++
++const prOutcome = {
++  mergeConfirmed: 74,
++  mergeFalse: 26,
++  closeConfirmed: 0,
++  closeFalse: 0,
++  observedAt: "2026-07-04T18:00:00Z",
++};
++
++const loop = computePhase7CalibrationLoop({
++  config: {
++    phase7LoopEnabled: true,
++    autonomyIncreaseMinAccuracy: 0.7,
++    replayFreshnessMaxAgeHours: 168,
++    historicalReplayWeight: 0.5,
++    prOutcomeWeight: 0.5,
++    prOutcomeMinDecided: 10,
++    warnings: [],
++  },
++  prOutcome,
++  historicalReplay: {
++    compositeScore: 0.82,
++    replayRunId: "replay-2026-07-04",
++    observedAt: "2026-07-04T12:00:00Z",
++    harnessStatus: "healthy",
++  },
++  now: "2026-07-04T18:00:00Z",
++});
++
++const schedule = shouldScheduleHistoricalReplayRun({
++  config: {
++    phase7LoopEnabled: true,
++    autonomyIncreaseMinAccuracy: 0.7,
++    replayFreshnessMaxAgeHours: 168,
++    historicalReplayWeight: 0.5,
++    prOutcomeWeight: 0.5,
++    prOutcomeMinDecided: 10,
++    warnings: [],
++  },
++  lastReplayObservedAt: loop.bySource.historical_replay.observedAt,
++  harnessStatus: loop.replayHarnessStatus,
++  now: "2026-07-04T18:00:00Z",
++});
++```
++
++`renderPhase7CalibrationAuditMarkdown(loop)` turns the result into a deterministic local artifact with the combined
++metric, baseline delta, per-source breakdown, hold reasons, and replay cadence state.
++
++`computePrOutcomeCalibrationAccuracy()` is a read-only helper for inspecting derived accuracy from raw gate-eval
++counters; pass the counters themselves into `computePhase7CalibrationLoop()`, not the helper result.
++
+ ## Track-record summary
+ 
+ `computeTrackRecordSummary()` and `renderTrackRecordSummaryMarkdown()` provide a portable first-contact summary for a
+diff --git a/packages/gittensory-engine/src/index.ts b/packages/gittensory-engine/src/index.ts
+index ea0925bbc..69e3ff4a4 100644
+--- a/packages/gittensory-engine/src/index.ts
++++ b/packages/gittensory-engine/src/index.ts
+@@ -53,6 +53,24 @@ export {
+   type GateVerdictCalibrationWeights,
+   type GateVerdictCompositeCalibrationScore,
+ } from "./gate-verdict-calibration.js";
++export {
++  computePhase7CalibrationLoop,
++  computePrOutcomeCalibrationAccuracy,
++  DOCUMENTED_CALIBRATION_BASELINE,
++  evaluateAutonomyIncreaseEligibility,
++  isHistoricalReplayRunFresh,
++  renderPhase7CalibrationAuditMarkdown,
++  resolvePhase7CalibrationConfig,
++  shouldScheduleHistoricalReplayRun,
++  type CalibrationSignalSource,
++  type CalibrationSourceMetric,
++  type HistoricalReplayCalibrationInput,
++  type Phase7CalibrationConfig,
++  type Phase7CalibrationLoopResult,
++  type Phase7CalibrationManifest,
++  type PrOutcomeCalibrationInput,
++  type ReplayHarnessStatus,
++} from "./phase7-calibration-loop.js";
+ export {
+   computeTrackRecordSummary,
+   renderTrackRecordSummaryMarkdown,
+diff --git a/packages/gittensory-engine/src/phase7-calibration-loop.ts b/packages/gittensory-engine/src/phase7-calibration-loop.ts
+new file mode 100644
+index 000000000..35969f5ac
+--- /dev/null
++++ b/packages/gittensory-engine/src/phase7-calibration-loop.ts
+@@ -0,0 +1,590 @@
++// Phase 7 historical-replay calibration loop (#3014).
++//
++// Pure engine contract for combining the historical-replay composite score with the passive pr_outcome signal,
++// tracking calibration accuracy against the documented 62% baseline, and fail-closed gating of autonomy-level
++// increases. The miner runtime owns scheduling replay runs and persisting ledger rows; this module owns the
++// deterministic combine, freshness, threshold, and hold-reason logic.
++
++import type { GateVerdictCompositeCalibrationScore } from "./gate-verdict-calibration.js";
++
++/** Documented self-review calibration baseline from the Phase 7 roadmap (#2994). */
++export const DOCUMENTED_CALIBRATION_BASELINE = 0.62;
++
++export type CalibrationSignalSource = "historical_replay" | "pr_outcome";
++
++export type ReplayHarnessStatus = "healthy" | "degraded" | "unavailable";
++
++export type Phase7CalibrationManifest = {
++  miner?: {
++    calibration?: {
++      /** Explicit opt-in for Phase 7 loop gating. Default false. */
++      phase7LoopEnabled?: unknown;
++      /** Combined calibration accuracy required before any autonomy-level increase. Default 0.70. */
++      autonomyIncreaseMinAccuracy?: unknown;
++      /** Maximum replay-run age before the harness is treated as stale. Default 168 hours. */
++      replayFreshnessMaxAgeHours?: unknown;
++      /** Weight for the historical-replay composite signal when composing the tracked metric. Default 0.5. */
++      historicalReplayWeight?: unknown;
++      /** Weight for the live pr_outcome signal when composing the tracked metric. Default 0.5. */
++      prOutcomeWeight?: unknown;
++      /** Minimum decided pr_outcome samples before the live signal contributes. Default 10. */
++      prOutcomeMinDecided?: unknown;
++    } | null;
++  } | null;
++  calibration?: {
++    phase7LoopEnabled?: unknown;
++    autonomyIncreaseMinAccuracy?: unknown;
++    replayFreshnessMaxAgeHours?: unknown;
++    historicalReplayWeight?: unknown;
++    prOutcomeWeight?: unknown;
++    prOutcomeMinDecided?: unknown;
++  } | null;
++};
++
++export type Phase7CalibrationConfig = {
++  phase7LoopEnabled: boolean;
++  autonomyIncreaseMinAccuracy: number;
++  replayFreshnessMaxAgeHours: number;
++  historicalReplayWeight: number;
++  prOutcomeWeight: number;
++  prOutcomeMinDecided: number;
++  warnings: string[];
++};
++
++export type PrOutcomeCalibrationInput = {
++  mergeConfirmed: number;
++  mergeFalse: number;
++  closeConfirmed: number;
++  closeFalse: number;
++  hold?: number | undefined;
++  observedAt?: string | undefined;
++};
++
++export type HistoricalReplayCalibrationInput = {
++  compositeScore: number | GateVerdictCompositeCalibrationScore;
++  replayRunId: string;
++  observedAt: string;
++  harnessStatus: ReplayHarnessStatus;
++};
++
++export type CalibrationSourceMetric = {
++  source: CalibrationSignalSource;
++  accuracy: number | null;
++  sampleSize: number;
++  observedAt: string | null;
++  fresh: boolean;
++  replayRunId?: string | undefined;
++  harnessStatus?: ReplayHarnessStatus | undefined;
++};
++
++export type Phase7CalibrationLoopResult = {
++  enabled: boolean;
++  baselineAccuracy: number;
++  combinedAccuracy: number | null;
++  deltaFromBaseline: number | null;
++  weights: {
++    historicalReplay: number;
++    prOutcome: number;
++  };
++  bySource: {
++    historical_replay: CalibrationSourceMetric;
++    pr_outcome: CalibrationSourceMetric;
++  };
++  replayHarnessHold: boolean;
++  replayHarnessStatus: ReplayHarnessStatus | "missing";
++  autonomyIncreasePermitted: boolean;
++  holdReasons: string[];
++  replayRunDue: boolean;
++  audit: {
++    contributingSources: CalibrationSignalSource[];
++    rejectedSources: Array<{ source: CalibrationSignalSource; reason: string }>;
++  };
++};
++
++const DEFAULT_CONFIG: Omit<Phase7CalibrationConfig, "warnings"> = {
++  phase7LoopEnabled: false,
++  autonomyIncreaseMinAccuracy: 0.7,
++  replayFreshnessMaxAgeHours: 168,
++  historicalReplayWeight: 0.5,
++  prOutcomeWeight: 0.5,
++  prOutcomeMinDecided: 10,
++};
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return Boolean(value && typeof value === "object" && !Array.isArray(value));
++}
++
++function roundScore(value: number): number {
++  return Math.round(Math.min(1, Math.max(0, value)) * 1_000_000) / 1_000_000;
++}
++
++function finiteNonNegative(value: number | undefined, fallback: number): number {
++  if (value === undefined) return fallback;
++  if (!Number.isFinite(value) || value < 0) return 0;
++  return value;
++}
++
++function normalizeBoolean(value: unknown): boolean | undefined {
++  if (typeof value === "boolean") return value;
++  if (typeof value === "number") {
++    if (value === 1) return true;
++    if (value === 0) return false;
++    return undefined;
++  }
++  if (typeof value !== "string") return undefined;
++  const normalized = value.trim().toLowerCase();
++  if (["true", "1", "yes", "on", "enabled"].includes(normalized)) return true;
++  if (["false", "0", "no", "off", "disabled"].includes(normalized)) return false;
++  return undefined;
++}
++
++function normalizeOptionalNumber(value: unknown): number | undefined {
++  if (value === undefined || value === null) return undefined;
++  const number = typeof value === "number" ? value : typeof value === "string" ? Number(value.trim()) : Number.NaN;
++  if (!Number.isFinite(number)) return undefined;
++  return number;
++}
++
++function normalizeOptionalPositiveInt(value: unknown, fallback: number): number {
++  const number = normalizeOptionalNumber(value);
++  if (number === undefined || number <= 0) return fallback;
++  return Math.max(1, Math.floor(number));
++}
++
++function normalizeObservedAt(value: string | undefined): string | null {
++  if (!value) return null;
++  const ms = Date.parse(value);
++  if (!Number.isFinite(ms)) return null;
++  return new Date(ms).toISOString();
++}
++
++function parseNow(value: string | Date | null | undefined): Date {
++  if (value instanceof Date && Number.isFinite(value.getTime())) return value;
++  const parsed = normalizeObservedAt(typeof value === "string" ? value : undefined);
++  return parsed ? new Date(parsed) : new Date();
++}
++
++function normalizeReplayRunId(value: string): string | null {
++  const trimmed = value.trim();
++  if (!trimmed || trimmed.length > 160 || /[\r\n\0]/u.test(trimmed)) return null;
++  return trimmed;
++}
++
++function normalizeCompositeWeights(config: Phase7CalibrationConfig): { historicalReplay: number; prOutcome: number } {
++  const raw = {
++    historicalReplay: finiteNonNegative(config.historicalReplayWeight, DEFAULT_CONFIG.historicalReplayWeight),
++    prOutcome: finiteNonNegative(config.prOutcomeWeight, DEFAULT_CONFIG.prOutcomeWeight),
++  };
++  const total = raw.historicalReplay + raw.prOutcome;
++  if (total <= 0) {
++    return { historicalReplay: DEFAULT_CONFIG.historicalReplayWeight, prOutcome: DEFAULT_CONFIG.prOutcomeWeight };
++  }
++  return {
++    historicalReplay: raw.historicalReplay / total,
++    prOutcome: raw.prOutcome / total,
++  };
++}
++
++function markdownSafe(value: string): string {
++  return value.replace(/[\r\n]+/gu, " ").replace(/[\\`*_[\]<>|]/gu, "\\$&");
++}
++
++function markdownList(values: readonly string[]): string {
++  if (values.length === 0) return "- none";
++  return values.map((value) => `- ${markdownSafe(value)}`).join("\n");
++}
++
++/**
++ * Resolve the explicit Phase 7 loop config from a parsed `.gittensory-miner.yml`-style object. Default is disabled
++ * and fail-closed when enabled but inputs are missing or degraded.
++ */
++export function resolvePhase7CalibrationConfig(
++  manifest: Phase7CalibrationManifest | Record<string, unknown> | null | undefined,
++): Phase7CalibrationConfig {
++  const warnings: string[] = [];
++  const root = isRecord(manifest) ? manifest : {};
++  const miner = isRecord(root.miner) ? root.miner : {};
++  const minerCalibration = isRecord(miner.calibration) ? miner.calibration : {};
++  const topCalibration = isRecord(root.calibration) ? root.calibration : {};
++
++  const enabledRaw = minerCalibration.phase7LoopEnabled ?? topCalibration.phase7LoopEnabled ?? undefined;
++  const enabled = normalizeBoolean(enabledRaw);
++  if (enabledRaw !== undefined && enabled === undefined) {
++    warnings.push("miner.calibration.phase7LoopEnabled must be a boolean-like value; defaulting to false.");
++  }
++
++  const minAccuracyRaw =
++    minerCalibration.autonomyIncreaseMinAccuracy ?? topCalibration.autonomyIncreaseMinAccuracy ?? undefined;
++  const minAccuracy = normalizeOptionalNumber(minAccuracyRaw);
++  if (minAccuracyRaw !== undefined && (minAccuracy === undefined || minAccuracy < 0 || minAccuracy > 1)) {
++    warnings.push(
++      "miner.calibration.autonomyIncreaseMinAccuracy must be a finite number in [0, 1]; using default 0.70.",
++    );
++  }
++
++  const freshnessRaw =
++    minerCalibration.replayFreshnessMaxAgeHours ?? topCalibration.replayFreshnessMaxAgeHours ?? undefined;
++  const freshness = normalizeOptionalNumber(freshnessRaw);
++  if (freshnessRaw !== undefined && (freshness === undefined || freshness <= 0)) {
++    warnings.push("miner.calibration.replayFreshnessMaxAgeHours must be a positive finite number; using default 168.");
++  }
++
++  const replayWeightRaw =
++    minerCalibration.historicalReplayWeight ?? topCalibration.historicalReplayWeight ?? undefined;
++  const replayWeight = normalizeOptionalNumber(replayWeightRaw);
++  if (replayWeightRaw !== undefined && (replayWeight === undefined || replayWeight < 0)) {
++    warnings.push("miner.calibration.historicalReplayWeight must be a non-negative finite number; using default 0.5.");
++  }
++
++  const prOutcomeWeightRaw = minerCalibration.prOutcomeWeight ?? topCalibration.prOutcomeWeight ?? undefined;
++  const prOutcomeWeight = normalizeOptionalNumber(prOutcomeWeightRaw);
++  if (prOutcomeWeightRaw !== undefined && (prOutcomeWeight === undefined || prOutcomeWeight < 0)) {
++    warnings.push("miner.calibration.prOutcomeWeight must be a non-negative finite number; using default 0.5.");
++  }
++
++  const minDecidedRaw = minerCalibration.prOutcomeMinDecided ?? topCalibration.prOutcomeMinDecided ?? undefined;
++  const minDecided = normalizeOptionalPositiveInt(minDecidedRaw, DEFAULT_CONFIG.prOutcomeMinDecided);
++  if (minDecidedRaw !== undefined && normalizeOptionalNumber(minDecidedRaw) === undefined) {
++    warnings.push("miner.calibration.prOutcomeMinDecided must be a positive integer; using default 10.");
++  }
++
++  return {
++    phase7LoopEnabled: enabled === true,
++    autonomyIncreaseMinAccuracy:
++      minAccuracy !== undefined && minAccuracy >= 0 && minAccuracy <= 1
++        ? roundScore(minAccuracy)
++        : DEFAULT_CONFIG.autonomyIncreaseMinAccuracy,
++    replayFreshnessMaxAgeHours:
++      freshness !== undefined && freshness > 0 ? freshness : DEFAULT_CONFIG.replayFreshnessMaxAgeHours,
++    historicalReplayWeight:
++      replayWeight !== undefined && replayWeight >= 0 ? replayWeight : DEFAULT_CONFIG.historicalReplayWeight,
++    prOutcomeWeight:
++      prOutcomeWeight !== undefined && prOutcomeWeight >= 0 ? prOutcomeWeight : DEFAULT_CONFIG.prOutcomeWeight,
++    prOutcomeMinDecided: minDecided,
++    warnings,
++  };
++}
++
++/** Derive live pr_outcome calibration accuracy from a gate-eval-style confusion matrix. Pure. */
++export function computePrOutcomeCalibrationAccuracy(input: PrOutcomeCalibrationInput): {
++  accuracy: number | null;
++  sampleSize: number;
++} {
++  const mergeConfirmed = finiteNonNegative(input.mergeConfirmed, 0);
++  const mergeFalse = finiteNonNegative(input.mergeFalse, 0);
++  const closeConfirmed = finiteNonNegative(input.closeConfirmed, 0);
++  const closeFalse = finiteNonNegative(input.closeFalse, 0);
++  const sampleSize = mergeConfirmed + mergeFalse + closeConfirmed + closeFalse;
++  if (sampleSize <= 0) return { accuracy: null, sampleSize: 0 };
++  return {
++    accuracy: roundScore((mergeConfirmed + closeConfirmed) / sampleSize),
++    sampleSize,
++  };
++}
++
++/** True when a replay run is still fresh relative to the configured max age. Pure. */
++export function isHistoricalReplayRunFresh(input: {
++  observedAt: string;
++  maxAgeHours: number;
++  now?: string | Date | null | undefined;
++}): boolean {
++  const observed = normalizeObservedAt(input.observedAt);
++  if (!observed) return false;
++  const maxAgeHours = finiteNonNegative(input.maxAgeHours, DEFAULT_CONFIG.replayFreshnessMaxAgeHours);
++  if (maxAgeHours <= 0) return false;
++  const ageMs = parseNow(input.now).getTime() - new Date(observed).getTime();
++  if (!Number.isFinite(ageMs) || ageMs < 0) return false;
++  return ageMs <= maxAgeHours * 3_600_000;
++}
++
++/** Recommend whether a new historical-replay run should be scheduled/triggered. Pure. */
++export function shouldScheduleHistoricalReplayRun(input: {
++  config: Phase7CalibrationConfig | Phase7CalibrationManifest | Record<string, unknown> | null | undefined;
++  lastReplayObservedAt?: string | null | undefined;
++  harnessStatus?: ReplayHarnessStatus | "missing" | undefined;
++  now?: string | Date | null | undefined;
++}): { due: boolean; reason: string } {
++  const config =
++    input.config && "phase7LoopEnabled" in input.config
++      ? (input.config as Phase7CalibrationConfig)
++      : resolvePhase7CalibrationConfig(input.config);
++  if (!config.phase7LoopEnabled) {
++    return { due: false, reason: "phase7_loop_disabled" };
++  }
++  if (input.harnessStatus === "unavailable" || input.harnessStatus === "degraded") {
++    return { due: true, reason: `replay_harness_${input.harnessStatus}` };
++  }
++  if (!input.lastReplayObservedAt) {
++    return { due: true, reason: "no_replay_run_recorded" };
++  }
++  if (
++    !isHistoricalReplayRunFresh({
++      observedAt: input.lastReplayObservedAt,
++      maxAgeHours: config.replayFreshnessMaxAgeHours,
++      now: input.now,
++    })
++  ) {
++    return { due: true, reason: "replay_run_stale" };
++  }
++  return { due: false, reason: "replay_run_fresh" };
++}
++
++function extractHistoricalReplayScore(
++  compositeScore: number | GateVerdictCompositeCalibrationScore,
++): number {
++  if (typeof compositeScore === "number") return roundScore(compositeScore);
++  return roundScore(compositeScore.compositeScore);
++}
++
++/**
++ * Combine historical-replay and pr_outcome calibration signals into the tracked Phase 7 metric, record provenance,
++ * and evaluate fail-closed autonomy-level increase eligibility.
++ */
++export function computePhase7CalibrationLoop(input: {
++  config?: Phase7CalibrationConfig | Phase7CalibrationManifest | Record<string, unknown> | null | undefined;
++  prOutcome?: PrOutcomeCalibrationInput | null | undefined;
++  historicalReplay?: HistoricalReplayCalibrationInput | null | undefined;
++  now?: string | Date | null | undefined;
++}): Phase7CalibrationLoopResult {
++  const config =
++    input.config && "phase7LoopEnabled" in input.config
++      ? (input.config as Phase7CalibrationConfig)
++      : resolvePhase7CalibrationConfig(input.config);
++  const weights = normalizeCompositeWeights(config);
++  const now = parseNow(input.now);
++  const holdReasons: string[] = [];
++  const contributingSources: CalibrationSignalSource[] = [];
++  const rejectedSources: Phase7CalibrationLoopResult["audit"]["rejectedSources"] = [];
++
++  const prOutcomeDerived = input.prOutcome ? computePrOutcomeCalibrationAccuracy(input.prOutcome) : null;
++  const prOutcomeMetric: CalibrationSourceMetric = {
++    source: "pr_outcome",
++    accuracy: prOutcomeDerived?.accuracy ?? null,
++    sampleSize: prOutcomeDerived?.sampleSize ?? 0,
++    observedAt: normalizeObservedAt(input.prOutcome?.observedAt),
++    fresh: true,
++  };
++  if (prOutcomeDerived && prOutcomeDerived.sampleSize >= config.prOutcomeMinDecided && prOutcomeDerived.accuracy !== null) {
++    contributingSources.push("pr_outcome");
++  } else if (input.prOutcome) {
++    rejectedSources.push({
++      source: "pr_outcome",
++      reason:
++        prOutcomeDerived && prOutcomeDerived.sampleSize > 0
++          ? "insufficient_pr_outcome_samples"
++          : "no_pr_outcome_signal",
++    });
++  }
++
++  let replayHarnessStatus: ReplayHarnessStatus | "missing" = "missing";
++  let replayHarnessHold = false;
++  let historicalReplayMetric: CalibrationSourceMetric = {
++    source: "historical_replay",
++    accuracy: null,
++    sampleSize: 0,
++    observedAt: null,
++    fresh: false,
++  };
++
++  if (input.historicalReplay) {
++    const replayRunId = normalizeReplayRunId(input.historicalReplay.replayRunId);
++    const observedAt = normalizeObservedAt(input.historicalReplay.observedAt);
++    replayHarnessStatus = input.historicalReplay.harnessStatus;
++    const fresh =
++      observedAt !== null &&
++      isHistoricalReplayRunFresh({
++        observedAt,
++        maxAgeHours: config.replayFreshnessMaxAgeHours,
++        now,
++      });
++    const accuracy = extractHistoricalReplayScore(input.historicalReplay.compositeScore);
++    historicalReplayMetric = {
++      source: "historical_replay",
++      accuracy,
++      sampleSize: 1,
++      observedAt,
++      fresh,
++      replayRunId: replayRunId ?? undefined,
++      harnessStatus: input.historicalReplay.harnessStatus,
++    };
++
++    if (input.historicalReplay.harnessStatus !== "healthy") {
++      replayHarnessHold = true;
++      holdReasons.push(`replay_harness_${input.historicalReplay.harnessStatus}`);
++      rejectedSources.push({
++        source: "historical_replay",
++        reason: `replay_harness_${input.historicalReplay.harnessStatus}`,
++      });
++    } else if (!replayRunId || !observedAt) {
++      replayHarnessHold = true;
++      holdReasons.push("invalid_replay_run_metadata");
++      rejectedSources.push({ source: "historical_replay", reason: "invalid_replay_run_metadata" });
++    } else if (!fresh) {
++      replayHarnessHold = true;
++      holdReasons.push("replay_run_stale");
++      rejectedSources.push({ source: "historical_replay", reason: "replay_run_stale" });
++    } else {
++      contributingSources.push("historical_replay");
++    }
++  } else if (config.phase7LoopEnabled) {
++    replayHarnessHold = true;
++    holdReasons.push("no_historical_replay_signal");
++    rejectedSources.push({ source: "historical_replay", reason: "no_historical_replay_signal" });
++  }
++
++  const usable = {
++    historical_replay:
++      historicalReplayMetric.accuracy !== null &&
++      contributingSources.includes("historical_replay")
++        ? { accuracy: historicalReplayMetric.accuracy, weight: weights.historicalReplay }
++        : null,
++    pr_outcome:
++      prOutcomeMetric.accuracy !== null && contributingSources.includes("pr_outcome")
++        ? { accuracy: prOutcomeMetric.accuracy, weight: weights.prOutcome }
++        : null,
++  };
++
++  const weightTotal =
++    (usable.historical_replay?.weight ?? 0) + (usable.pr_outcome?.weight ?? 0);
++  const combinedAccuracy =
++    weightTotal <= 0
++      ? null
++      : roundScore(
++          ((usable.historical_replay?.accuracy ?? 0) * (usable.historical_replay?.weight ?? 0) +
++            (usable.pr_outcome?.accuracy ?? 0) * (usable.pr_outcome?.weight ?? 0)) /
++            weightTotal,
++        );
++
++  const deltaFromBaseline =
++    combinedAccuracy === null ? null : roundScore(combinedAccuracy - DOCUMENTED_CALIBRATION_BASELINE);
++
++  const schedule = shouldScheduleHistoricalReplayRun({
++    config,
++    lastReplayObservedAt: historicalReplayMetric.observedAt,
++    harnessStatus: replayHarnessStatus,
++    now,
++  });
++
++  let autonomyIncreasePermitted = true;
++  if (config.phase7LoopEnabled) {
++    autonomyIncreasePermitted = false;
++    if (replayHarnessHold) {
++      // fail-closed: degraded/unavailable/stale/missing replay blocks increases without silent pr_outcome fallback
++    } else if (combinedAccuracy === null) {
++      holdReasons.push("no_combined_calibration_signal");
++    } else if (combinedAccuracy < config.autonomyIncreaseMinAccuracy) {
++      holdReasons.push("calibration_below_threshold");
++    } else if (!contributingSources.includes("historical_replay") || !contributingSources.includes("pr_outcome")) {
++      holdReasons.push("missing_required_signal_source");
++    } else {
++      autonomyIncreasePermitted = true;
++    }
++  }
++
++  if (!autonomyIncreasePermitted && holdReasons.length === 0) {
++    holdReasons.push("phase7_loop_hold");
++  }
++
++  return {
++    enabled: config.phase7LoopEnabled,
++    baselineAccuracy: DOCUMENTED_CALIBRATION_BASELINE,
++    combinedAccuracy,
++    deltaFromBaseline,
++    weights,
++    bySource: {
++      historical_replay: historicalReplayMetric,
++      pr_outcome: prOutcomeMetric,
++    },
++    replayHarnessHold,
++    replayHarnessStatus,
++    autonomyIncreasePermitted,
++    holdReasons: [...new Set(holdReasons)],
++    replayRunDue: schedule.due,
++    audit: {
++      contributingSources,
++      rejectedSources,
++    },
++  };
++}
++
++/** Evaluate autonomy-level increase eligibility from a computed loop result. Pure alias for callers that split steps. */
++export function evaluateAutonomyIncreaseEligibility(result: Phase7CalibrationLoopResult): {
++  permitted: boolean;
++  holdReasons: string[];
++  replayHarnessHold: boolean;
++} {
++  return {
++    permitted: result.autonomyIncreasePermitted,
++    holdReasons: result.holdReasons,
++    replayHarnessHold: result.replayHarnessHold,
++  };
++}
++
++/**
++ * Render a deterministic, public-safe Markdown report for a Phase 7 calibration loop evaluation. Includes the
++ * tracked metric, baseline delta, per-source breakdown, replay cadence recommendation, and hold reasons.
++ */
++export function renderPhase7CalibrationAuditMarkdown(result: Phase7CalibrationLoopResult): string {
++  const formatAccuracy = (value: number | null): string => (value === null ? "n/a" : `${(value * 100).toFixed(2)}%`);
++  const lines = [
++    "# Phase 7 Calibration Loop",
++    "",
++    `- loop enabled: ${result.enabled}`,
++    `- documented baseline: ${(result.baselineAccuracy * 100).toFixed(2)}%`,
++    `- combined calibration accuracy: ${formatAccuracy(result.combinedAccuracy)}`,
++    `- delta from baseline: ${
++      result.deltaFromBaseline === null ? "n/a" : `${(result.deltaFromBaseline * 100).toFixed(2)} percentage points`
++    }`,
++    `- autonomy increase permitted: ${result.autonomyIncreasePermitted}`,
++    `- replay harness hold: ${result.replayHarnessHold}`,
++    `- replay harness status: ${result.replayHarnessStatus}`,
++    `- replay run due: ${result.replayRunDue}`,
++    "",
++    "## Effective Weights",
++    "",
++    `- historical_replay: ${result.weights.historicalReplay.toFixed(6)}`,
++    `- pr_outcome: ${result.weights.prOutcome.toFixed(6)}`,
++    "",
++    "## Signal Sources",
++    "",
++    "### historical_replay",
++    "",
++    `- accuracy: ${formatAccuracy(result.bySource.historical_replay.accuracy)}`,
++    `- sampleSize: ${result.bySource.historical_replay.sampleSize}`,
++    `- observedAt: ${result.bySource.historical_replay.observedAt ?? "n/a"}`,
++    `- fresh: ${result.bySource.historical_replay.fresh}`,
++    `- replayRunId: ${result.bySource.historical_replay.replayRunId ? markdownSafe(result.bySource.historical_replay.replayRunId) : "n/a"}`,
++    `- harnessStatus: ${result.bySource.historical_replay.harnessStatus ?? "n/a"}`,
++    "",
++    "### pr_outcome",
++    "",
++    `- accuracy: ${formatAccuracy(result.bySource.pr_outcome.accuracy)}`,
++    `- sampleSize: ${result.bySource.pr_outcome.sampleSize}`,
++    `- observedAt: ${result.bySource.pr_outcome.observedAt ?? "n/a"}`,
++    "",
++    "## Hold Reasons",
++    "",
++    markdownList(result.holdReasons),
++    "",
++    "## Contributing Sources",
++    "",
++    markdownList(result.audit.contributingSources),
++    "",
++    "## Rejected Sources",
++    "",
++  ];
++
++  if (result.audit.rejectedSources.length === 0) {
++    lines.push("- none");
++  } else {
++    lines.push(
++      "| Source | Reason |",
++      "| --- | --- |",
++      ...result.audit.rejectedSources.map(
++        (row) => `| ${markdownSafe(row.source)} | ${markdownSafe(row.reason)} |`,
++      ),
++    );
++  }
++
++  return `${lines.join("\n")}\n`;
++}
+diff --git a/packages/gittensory-engine/test/phase7-calibration-loop.test.ts b/packages/gittensory-engine/test/phase7-calibration-loop.test.ts
+new file mode 100644
+index 000000000..ad286f777
+--- /dev/null
++++ b/packages/gittensory-engine/test/phase7-calibration-loop.test.ts
+@@ -0,0 +1,473 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++
++import {
++  computeGateVerdictCompositeCalibrationScore,
++  computePhase7CalibrationLoop,
++  computePrOutcomeCalibrationAccuracy,
++  DOCUMENTED_CALIBRATION_BASELINE,
++  evaluateAutonomyIncreaseEligibility,
++  isHistoricalReplayRunFresh,
++  renderPhase7CalibrationAuditMarkdown,
++  resolvePhase7CalibrationConfig,
++  shouldScheduleHistoricalReplayRun,
++} from "../dist/index.js";
++
++const NOW = "2026-07-04T18:00:00.000Z";
++const FRESH_REPLAY_AT = "2026-07-04T12:00:00.000Z";
++const STALE_REPLAY_AT = "2026-06-20T12:00:00.000Z";
++
++function enabledConfig(overrides: Record<string, unknown> = {}) {
++  return resolvePhase7CalibrationConfig({
++    miner: {
++      calibration: {
++        phase7LoopEnabled: true,
++        autonomyIncreaseMinAccuracy: 0.7,
++        replayFreshnessMaxAgeHours: 168,
++        historicalReplayWeight: 0.5,
++        prOutcomeWeight: 0.5,
++        ...overrides,
++      },
++    },
++  });
++}
++
++function healthyReplay(compositeScore = 0.82) {
++  return {
++    compositeScore,
++    replayRunId: "replay-2026-07-04",
++    observedAt: FRESH_REPLAY_AT,
++    harnessStatus: "healthy" as const,
++  };
++}
++
++function sufficientPrOutcome(accuracy = 0.75) {
++  const decided = 20;
++  const correct = Math.round(decided * accuracy);
++  const incorrect = decided - correct;
++  return {
++    mergeConfirmed: correct,
++    mergeFalse: incorrect,
++    closeConfirmed: 0,
++    closeFalse: 0,
++    observedAt: NOW,
++  };
++}
++
++test("barrel: exports Phase 7 calibration loop APIs (#3014)", () => {
++  assert.equal(DOCUMENTED_CALIBRATION_BASELINE, 0.62);
++  assert.equal(typeof resolvePhase7CalibrationConfig, "function");
++  assert.equal(typeof computePrOutcomeCalibrationAccuracy, "function");
++  assert.equal(typeof isHistoricalReplayRunFresh, "function");
++  assert.equal(typeof shouldScheduleHistoricalReplayRun, "function");
++  assert.equal(typeof computePhase7CalibrationLoop, "function");
++  assert.equal(typeof evaluateAutonomyIncreaseEligibility, "function");
++  assert.equal(typeof renderPhase7CalibrationAuditMarkdown, "function");
++});
++
++test("resolvePhase7CalibrationConfig defaults to disabled fail-closed settings", () => {
++  assert.deepEqual(resolvePhase7CalibrationConfig(undefined), {
++    phase7LoopEnabled: false,
++    autonomyIncreaseMinAccuracy: 0.7,
++    replayFreshnessMaxAgeHours: 168,
++    historicalReplayWeight: 0.5,
++    prOutcomeWeight: 0.5,
++    prOutcomeMinDecided: 10,
++    warnings: [],
++  });
++});
++
++test("resolvePhase7CalibrationConfig honors the explicit miner opt-in path", () => {
++  const result = resolvePhase7CalibrationConfig({
++    miner: {
++      calibration: {
++        phase7LoopEnabled: true,
++        autonomyIncreaseMinAccuracy: 0.68,
++        replayFreshnessMaxAgeHours: 72,
++        historicalReplayWeight: 0.6,
++        prOutcomeWeight: 0.4,
++        prOutcomeMinDecided: 15,
++      },
++    },
++  });
++
++  assert.deepEqual(result, {
++    phase7LoopEnabled: true,
++    autonomyIncreaseMinAccuracy: 0.68,
++    replayFreshnessMaxAgeHours: 72,
++    historicalReplayWeight: 0.6,
++    prOutcomeWeight: 0.4,
++    prOutcomeMinDecided: 15,
++    warnings: [],
++  });
++});
++
++test("resolvePhase7CalibrationConfig keeps top-level calibration as an explicit alias", () => {
++  const result = resolvePhase7CalibrationConfig({
++    calibration: {
++      phase7LoopEnabled: "yes",
++      autonomyIncreaseMinAccuracy: "0.66",
++    },
++  });
++
++  assert.equal(result.phase7LoopEnabled, true);
++  assert.equal(result.autonomyIncreaseMinAccuracy, 0.66);
++});
++
++test("resolvePhase7CalibrationConfig prefers miner.calibration over the top-level alias", () => {
++  const result = resolvePhase7CalibrationConfig({
++    miner: { calibration: { phase7LoopEnabled: false, autonomyIncreaseMinAccuracy: 0.71 } },
++    calibration: { phase7LoopEnabled: true, autonomyIncreaseMinAccuracy: 0.99 },
++  });
++
++  assert.equal(result.phase7LoopEnabled, false);
++  assert.equal(result.autonomyIncreaseMinAccuracy, 0.71);
++});
++
++test("resolvePhase7CalibrationConfig warns on malformed values and falls back safely", () => {
++  const result = resolvePhase7CalibrationConfig({
++    miner: {
++      calibration: {
++        phase7LoopEnabled: "maybe",
++        autonomyIncreaseMinAccuracy: 1.5,
++        replayFreshnessMaxAgeHours: -4,
++        historicalReplayWeight: Number.NaN,
++        prOutcomeWeight: "heavy",
++        prOutcomeMinDecided: "few",
++      },
++    },
++  });
++
++  assert.equal(result.phase7LoopEnabled, false);
++  assert.equal(result.autonomyIncreaseMinAccuracy, 0.7);
++  assert.equal(result.replayFreshnessMaxAgeHours, 168);
++  assert.equal(result.historicalReplayWeight, 0.5);
++  assert.equal(result.prOutcomeWeight, 0.5);
++  assert.equal(result.prOutcomeMinDecided, 10);
++  assert.match(result.warnings.join("\n"), /phase7LoopEnabled/u);
++  assert.match(result.warnings.join("\n"), /autonomyIncreaseMinAccuracy/u);
++  assert.match(result.warnings.join("\n"), /replayFreshnessMaxAgeHours/u);
++  assert.match(result.warnings.join("\n"), /historicalReplayWeight/u);
++  assert.match(result.warnings.join("\n"), /prOutcomeWeight/u);
++  assert.match(result.warnings.join("\n"), /prOutcomeMinDecided/u);
++});
++
++test("computePrOutcomeCalibrationAccuracy derives accuracy from the gate-eval confusion matrix", () => {
++  assert.deepEqual(
++    computePrOutcomeCalibrationAccuracy({
++      mergeConfirmed: 62,
++      mergeFalse: 38,
++      closeConfirmed: 0,
++      closeFalse: 0,
++    }),
++    { accuracy: 0.62, sampleSize: 100 },
++  );
++  assert.deepEqual(
++    computePrOutcomeCalibrationAccuracy({
++      mergeConfirmed: 0,
++      mergeFalse: 0,
++      closeConfirmed: 0,
++      closeFalse: 0,
++    }),
++    { accuracy: null, sampleSize: 0 },
++  );
++});
++
++test("isHistoricalReplayRunFresh accepts a replay inside the configured max age", () => {
++  assert.equal(
++    isHistoricalReplayRunFresh({
++      observedAt: FRESH_REPLAY_AT,
++      maxAgeHours: 168,
++      now: NOW,
++    }),
++    true,
++  );
++  assert.equal(
++    isHistoricalReplayRunFresh({
++      observedAt: STALE_REPLAY_AT,
++      maxAgeHours: 168,
++      now: NOW,
++    }),
++    false,
++  );
++  assert.equal(
++    isHistoricalReplayRunFresh({
++      observedAt: "not-a-date",
++      maxAgeHours: 168,
++      now: NOW,
++    }),
++    false,
++  );
++});
++
++test("shouldScheduleHistoricalReplayRun recommends a run when the loop is enabled but no replay exists", () => {
++  assert.deepEqual(
++    shouldScheduleHistoricalReplayRun({
++      config: enabledConfig(),
++      lastReplayObservedAt: null,
++      now: NOW,
++    }),
++    { due: true, reason: "no_replay_run_recorded" },
++  );
++});
++
++test("shouldScheduleHistoricalReplayRun recommends a run when the replay harness is degraded or unavailable", () => {
++  assert.deepEqual(
++    shouldScheduleHistoricalReplayRun({
++      config: enabledConfig(),
++      lastReplayObservedAt: FRESH_REPLAY_AT,
++      harnessStatus: "degraded",
++      now: NOW,
++    }),
++    { due: true, reason: "replay_harness_degraded" },
++  );
++  assert.deepEqual(
++    shouldScheduleHistoricalReplayRun({
++      config: enabledConfig(),
++      lastReplayObservedAt: FRESH_REPLAY_AT,
++      harnessStatus: "unavailable",
++      now: NOW,
++    }),
++    { due: true, reason: "replay_harness_unavailable" },
++  );
++});
++
++test("shouldScheduleHistoricalReplayRun stays quiet when the loop is disabled", () => {
++  assert.deepEqual(
++    shouldScheduleHistoricalReplayRun({
++      config: resolvePhase7CalibrationConfig(undefined),
++      lastReplayObservedAt: null,
++      now: NOW,
++    }),
++    { due: false, reason: "phase7_loop_disabled" },
++  );
++});
++
++test("README-shaped input passes raw pr_outcome counters so both sources contribute", () => {
++  const prOutcome = {
++    mergeConfirmed: 74,
++    mergeFalse: 26,
++    closeConfirmed: 0,
++    closeFalse: 0,
++    observedAt: "2026-07-04T18:00:00Z",
++  };
++
++  const loop = computePhase7CalibrationLoop({
++    config: resolvePhase7CalibrationConfig({
++      miner: {
++        calibration: {
++          phase7LoopEnabled: true,
++          autonomyIncreaseMinAccuracy: 0.7,
++          replayFreshnessMaxAgeHours: 168,
++          historicalReplayWeight: 0.5,
++          prOutcomeWeight: 0.5,
++          prOutcomeMinDecided: 10,
++        },
++      },
++    }),
++    prOutcome,
++    historicalReplay: {
++      compositeScore: 0.82,
++      replayRunId: "replay-2026-07-04",
++      observedAt: "2026-07-04T12:00:00Z",
++      harnessStatus: "healthy",
++    },
++    now: "2026-07-04T18:00:00Z",
++  });
++
++  assert.deepEqual(loop.audit.contributingSources, ["pr_outcome", "historical_replay"]);
++  assert.equal(loop.bySource.pr_outcome.accuracy, 0.74);
++  assert.equal(loop.bySource.pr_outcome.sampleSize, 100);
++});
++
++test("computePhase7CalibrationLoop combines historical-replay and pr_outcome signals with provenance", () => {
++  const composite = computeGateVerdictCompositeCalibrationScore({
++    objectiveAnchor: 0.8,
++    pairwise: 0.76,
++    gateVerdicts: { accepted: [], rejected: [] },
++  });
++  const result = computePhase7CalibrationLoop({
++    config: enabledConfig(),
++    prOutcome: sufficientPrOutcome(0.74),
++    historicalReplay: {
++      compositeScore: composite,
++      replayRunId: "replay-2026-07-04",
++      observedAt: FRESH_REPLAY_AT,
++      harnessStatus: "healthy",
++    },
++    now: NOW,
++  });
++
++  assert.equal(result.enabled, true);
++  assert.equal(result.combinedAccuracy, 0.76625);
++  assert.equal(result.deltaFromBaseline, 0.14625);
++  assert.deepEqual(result.audit.contributingSources, ["pr_outcome", "historical_replay"]);
++  assert.equal(result.bySource.historical_replay.replayRunId, "replay-2026-07-04");
++  assert.equal(result.bySource.pr_outcome.sampleSize, 20);
++});
++
++test("computePhase7CalibrationLoop permits autonomy increases only when both sources meet the threshold", () => {
++  const passing = computePhase7CalibrationLoop({
++    config: enabledConfig({ autonomyIncreaseMinAccuracy: 0.7 }),
++    prOutcome: sufficientPrOutcome(0.74),
++    historicalReplay: healthyReplay(0.82),
++    now: NOW,
++  });
++  assert.equal(passing.autonomyIncreasePermitted, true);
++  assert.deepEqual(passing.holdReasons, []);
++
++  const failing = computePhase7CalibrationLoop({
++    config: enabledConfig({ autonomyIncreaseMinAccuracy: 0.9 }),
++    prOutcome: sufficientPrOutcome(0.74),
++    historicalReplay: healthyReplay(0.82),
++    now: NOW,
++  });
++  assert.equal(failing.autonomyIncreasePermitted, false);
++  assert.deepEqual(failing.holdReasons, ["calibration_below_threshold"]);
++});
++
++test("computePhase7CalibrationLoop fails closed when the replay harness is degraded or unavailable", () => {
++  for (const harnessStatus of ["degraded", "unavailable"] as const) {
++    const result = computePhase7CalibrationLoop({
++      config: enabledConfig(),
++      prOutcome: sufficientPrOutcome(0.9),
++      historicalReplay: {
++        ...healthyReplay(0.9),
++        harnessStatus,
++      },
++      now: NOW,
++    });
++
++    assert.equal(result.replayHarnessHold, true);
++    assert.equal(result.autonomyIncreasePermitted, false);
++    assert.ok(result.holdReasons.includes(`replay_harness_${harnessStatus}`));
++    assert.ok(result.audit.rejectedSources.some((row) => row.reason === `replay_harness_${harnessStatus}`));
++  }
++});
++
++test("computePhase7CalibrationLoop fails closed on stale replay rather than silently using pr_outcome only", () => {
++  const result = computePhase7CalibrationLoop({
++    config: enabledConfig(),
++    prOutcome: sufficientPrOutcome(0.95),
++    historicalReplay: {
++      ...healthyReplay(0.95),
++      observedAt: STALE_REPLAY_AT,
++    },
++    now: NOW,
++  });
++
++  assert.equal(result.replayHarnessHold, true);
++  assert.equal(result.autonomyIncreasePermitted, false);
++  assert.ok(result.holdReasons.includes("replay_run_stale"));
++  assert.ok(result.audit.rejectedSources.some((row) => row.reason === "replay_run_stale"));
++  assert.ok(!result.audit.contributingSources.includes("historical_replay"));
++});
++
++test("computePhase7CalibrationLoop fails closed when no historical replay signal is present", () => {
++  const result = computePhase7CalibrationLoop({
++    config: enabledConfig(),
++    prOutcome: sufficientPrOutcome(0.95),
++    now: NOW,
++  });
++
++  assert.equal(result.replayHarnessHold, true);
++  assert.equal(result.autonomyIncreasePermitted, false);
++  assert.ok(result.holdReasons.includes("no_historical_replay_signal"));
++});
++
++test("computePhase7CalibrationLoop does not gate autonomy when the loop is disabled", () => {
++  const result = computePhase7CalibrationLoop({
++    config: resolvePhase7CalibrationConfig(undefined),
++    prOutcome: sufficientPrOutcome(0.4),
++    now: NOW,
++  });
++
++  assert.equal(result.enabled, false);
++  assert.equal(result.autonomyIncreasePermitted, true);
++  assert.deepEqual(result.holdReasons, []);
++});
++
++test("computePhase7CalibrationLoop rejects pr_outcome rows below the configured minimum sample size", () => {
++  const result = computePhase7CalibrationLoop({
++    config: enabledConfig({ prOutcomeMinDecided: 10 }),
++    prOutcome: {
++      mergeConfirmed: 6,
++      mergeFalse: 2,
++      closeConfirmed: 0,
++      closeFalse: 0,
++      observedAt: NOW,
++    },
++    historicalReplay: healthyReplay(0.82),
++    now: NOW,
++  });
++
++  assert.ok(result.audit.rejectedSources.some((row) => row.reason === "insufficient_pr_outcome_samples"));
++  assert.equal(result.autonomyIncreasePermitted, false);
++  assert.ok(result.holdReasons.includes("missing_required_signal_source"));
++});
++
++test("evaluateAutonomyIncreaseEligibility mirrors the computed loop hold state", () => {
++  const result = computePhase7CalibrationLoop({
++    config: enabledConfig(),
++    prOutcome: sufficientPrOutcome(0.74),
++    historicalReplay: healthyReplay(0.82),
++    now: NOW,
++  });
++
++  assert.deepEqual(evaluateAutonomyIncreaseEligibility(result), {
++    permitted: true,
++    holdReasons: [],
++    replayHarnessHold: false,
++  });
++});
++
++test("renderPhase7CalibrationAuditMarkdown renders baseline, per-source breakdown, and hold reasons", () => {
++  const result = computePhase7CalibrationLoop({
++    config: enabledConfig(),
++    prOutcome: sufficientPrOutcome(0.74),
++    historicalReplay: healthyReplay(0.82),
++    now: NOW,
++  });
++  const markdown = renderPhase7CalibrationAuditMarkdown(result);
++
++  assert.match(markdown, /# Phase 7 Calibration Loop/u);
++  assert.match(markdown, /documented baseline: 62\.00%/u);
++  assert.match(markdown, /### historical_replay/u);
++  assert.match(markdown, /### pr_outcome/u);
++  assert.match(markdown, /autonomy increase permitted: true/u);
++  assert.match(markdown, /Contributing Sources/u);
++});
++
++test("renderPhase7CalibrationAuditMarkdown escapes replay run ids and hold reasons", () => {
++  const result = computePhase7CalibrationLoop({
++    config: enabledConfig(),
++    prOutcome: sufficientPrOutcome(0.74),
++    historicalReplay: {
++      ...healthyReplay(0.82),
++      replayRunId: "replay-*bold*",
++    },
++    now: NOW,
++  });
++  const markdown = renderPhase7CalibrationAuditMarkdown(result);
++
++  assert.ok(markdown.includes("replay-\\*bold\\*"));
++});
++
++test("REGRESSION (#3014): combined metric stays anchored to the documented 62% baseline", () => {
++  const result = computePhase7CalibrationLoop({
++    config: enabledConfig(),
++    prOutcome: {
++      mergeConfirmed: 62,
++      mergeFalse: 38,
++      closeConfirmed: 0,
++      closeFalse: 0,
++      observedAt: NOW,
++    },
++    historicalReplay: healthyReplay(0.62),
++    now: NOW,
++  });
++
++  assert.equal(result.baselineAccuracy, 0.62);
++  assert.equal(result.combinedAccuracy, 0.62);
++  assert.equal(result.deltaFromBaseline, 0);
++});

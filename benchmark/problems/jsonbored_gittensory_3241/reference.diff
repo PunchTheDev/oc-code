@@ -1,0 +1,658 @@
+diff --git a/.env.example b/.env.example
+index d136d7d1c..b49feab5d 100644
+--- a/.env.example
++++ b/.env.example
+@@ -67,20 +67,22 @@ GITTENSORY_REVIEW_ENRICHMENT=false
+ # provenance,codeowners,secretLog,assetWeight,typosquat,commitSignature,iacMisconfig,nativeBuild
+ # history,docCommentDrift,duplication,churnHotspot,blameLink,approvalIntegrity,ciCheckSignals
+ # undocumentedExport,staleBranch,commitHygiene,pendingReviewRequests,testRatio,migrationSafety
++# looseRange
+ #
+ # Profile defaults:
+ # fast: dependency,lockfileDrift,secret,license,installScript,heavyDependency,actionPin,eol
+ # redos,provenance,secretLog,typosquat,iacMisconfig,nativeBuild,testRatio,migrationSafety
++# looseRange
+ # balanced (default): dependency,lockfileDrift,secret,license,installScript,heavyDependency
+ # actionPin,eol,redos,provenance,codeowners,secretLog,assetWeight,typosquat,commitSignature
+ # iacMisconfig,nativeBuild,history,docCommentDrift,duplication,churnHotspot,blameLink
+ # approvalIntegrity,ciCheckSignals,undocumentedExport,staleBranch,commitHygiene
+-# pendingReviewRequests,testRatio,migrationSafety
++# pendingReviewRequests,testRatio,migrationSafety,looseRange
+ # deep: dependency,lockfileDrift,secret,license,installScript,heavyDependency,actionPin,eol
+ # redos,provenance,codeowners,secretLog,assetWeight,typosquat,commitSignature,iacMisconfig
+ # nativeBuild,history,docCommentDrift,duplication,churnHotspot,blameLink,approvalIntegrity
+ # ciCheckSignals,undocumentedExport,staleBranch,commitHygiene,pendingReviewRequests,testRatio
+-# migrationSafety
++# migrationSafety,looseRange
+ # END GENERATED REES ANALYZERS
+ 
+ # Submitter-reputation spend control (internal-only): downgrades new/burst/low-rep
+diff --git a/apps/gittensory-ui/src/lib/rees-analyzers.ts b/apps/gittensory-ui/src/lib/rees-analyzers.ts
+index 0ecd40f31..8f302c4e6 100644
+--- a/apps/gittensory-ui/src/lib/rees-analyzers.ts
++++ b/apps/gittensory-ui/src/lib/rees-analyzers.ts
+@@ -773,6 +773,28 @@ export const REES_ANALYZERS = [
+         "Detection is line-anchored single-statement shapes only; statements split across lines are skipped rather than tracked with cross-line state.",
+     },
+   },
++  {
++    name: "looseRange",
++    title: "Loose dependency version range",
++    category: "supply-chain",
++    cost: "local",
++    defaultEnabled: true,
++    profiles: ["fast", "balanced", "deep"],
++    requires: ["files"],
++    limits: {
++      maxFindings: 20,
++      maxLineChars: 2000,
++    },
++    docs: {
++      summary:
++        "Flags newly-added npm dependency specifiers that use dangerously loose ranges instead of a pinned/caret/tilde range.",
++      looksAt: "Added specifier lines in package.json patches.",
++      reports: "Manifest file, line, package, raw specifier, and loose-range kind.",
++      network: "Pure local analyzer. No external network call.",
++      notes:
++        "Judges only the version specifier, never the package; wildcard, latest, unbounded >=, and bare-major ranges let any future publish flow into the next install.",
++    },
++  },
+ ] as const satisfies readonly ReesAnalyzerDoc[];
+ 
+ export const REES_ANALYZER_NAMES = REES_ANALYZERS.map((analyzer) => analyzer.name);
+diff --git a/review-enrichment/analyzer-metadata.json b/review-enrichment/analyzer-metadata.json
+index d6e660968..1f20c6a74 100644
+--- a/review-enrichment/analyzer-metadata.json
++++ b/review-enrichment/analyzer-metadata.json
+@@ -868,6 +868,32 @@
+         "network": "Pure local analyzer. No external network call.",
+         "notes": "Detection is line-anchored single-statement shapes only; statements split across lines are skipped rather than tracked with cross-line state."
+       }
++    },
++    {
++      "name": "looseRange",
++      "title": "Loose dependency version range",
++      "category": "supply-chain",
++      "cost": "local",
++      "defaultEnabled": true,
++      "profiles": [
++        "fast",
++        "balanced",
++        "deep"
++      ],
++      "requires": [
++        "files"
++      ],
++      "limits": {
++        "maxFindings": 20,
++        "maxLineChars": 2000
++      },
++      "docs": {
++        "summary": "Flags newly-added npm dependency specifiers that use dangerously loose ranges instead of a pinned/caret/tilde range.",
++        "looksAt": "Added specifier lines in package.json patches.",
++        "reports": "Manifest file, line, package, raw specifier, and loose-range kind.",
++        "network": "Pure local analyzer. No external network call.",
++        "notes": "Judges only the version specifier, never the package; wildcard, latest, unbounded >=, and bare-major ranges let any future publish flow into the next install."
++      }
+     }
+   ]
+ }
+diff --git a/review-enrichment/src/analyzers/loose-range.ts b/review-enrichment/src/analyzers/loose-range.ts
+new file mode 100644
+index 000000000..3431199e2
+--- /dev/null
++++ b/review-enrichment/src/analyzers/loose-range.ts
+@@ -0,0 +1,190 @@
++// Overly-broad dependency version-range analyzer (#2036). Flags newly-added/changed npm dependency specifiers
++// that use dangerously loose ranges — `*`/`x` wildcards, the `latest` dist-tag, unbounded `>=`/`>` ranges, and
++// bare-major ranges (`18`, `18.x`) — instead of a pinned/caret/tilde range. A loose range lets any future
++// publish (including a compromised one) flow into the next install: a reproducibility and supply-chain drift
++// risk. Distinct from the vuln/typosquat analyzers: this judges only the SPECIFIER, never the package. Pure
++// compute over added package.json patch lines, no registry call. Like the sibling dependency-scan.ts, parsing
++// is a line-based heuristic (not a full manifest parse) — good enough to classify the specifiers a PR adds
++// without resolving the whole tree.
++import type { EnrichRequest, LooseRangeFinding } from "../types.js";
++import { isDiffFileHeaderLine } from "./diff-lines.js";
++
++const MAX_FINDINGS = 20;
++const MAX_LINE_CHARS = 2000;
++
++// `"name": "spec"` on an added line, same shape the sibling dependency-scan.ts keys on.
++const NPM_LINE_RE = /^"([^"]+)"\s*:\s*"([^"]+)"/;
++// An `npm:pkg@range` alias — classify the range part, exactly as dependency-scan.ts unwraps it.
++const NPM_ALIAS_RE = /^npm:(?:@[^/]+\/[^@]+|[^@]+)@(.+)$/;
++
++// A `"section": {` object header — the lightweight per-hunk section state that decides whether a
++// `"name": "spec"` line is a dependency entry at all.
++const SECTION_HEADER_RE = /^"([^"]+)"\s*:\s*\{/;
++// The manifest blocks whose entries ARE dependency specifiers. Classification requires POSITIVE dependency
++// context: a line is only judged when its enclosing block is one of these and that header is visible in the
++// hunk. Inside such a block every entry is classified with no suppression — a real dependency named `npm` or
++// `node` is still a dependency. Inside any other visible block (engines, publishConfig, scripts, tool
++// config, …) nothing is a dependency. When the enclosing section is UNKNOWN (a hunk that starts mid-block
++// without its header in view), the analyzer stays SILENT rather than guessing: a hunk starting mid-`engines`
++// or mid-`scripts` must not report `"some-engine": "*"` or `"releaseTag": "latest"` as a loose dependency,
++// and a wrong finding costs more than a missed one for an advisory brief (fail-safe, like the sibling
++// analyzers' no-findings-on-uncertainty posture).
++const DEPENDENCY_SECTIONS = new Set([
++  "dependencies",
++  "devDependencies",
++  "peerDependencies",
++  "optionalDependencies",
++]);
++
++const UNBOUNDED_GTE_RE = /^>=?\s*\d/;
++const UPPER_BOUND_RE = /<\s*=?\s*\d/;
++const BARE_MAJOR_RE = /^\d+(?:\.[xX*])?(?:\.[xX*])?$/;
++
++/** Classify one raw npm version specifier; null when the range is not one of the loose kinds. Pure. */
++export function classifyRange(spec: string): LooseRangeFinding["kind"] | null {
++  const alias = NPM_ALIAS_RE.exec(spec);
++  const range = (alias ? alias[1]! : spec).trim();
++  if (range === "*" || range === "x" || range === "X") return "wildcard";
++  // Deliberately exact-lowercase: `latest` is npm's default dist-tag, installed when no tag is given. A
++  // differently-cased tag (`Latest`) is a DIFFERENT user-defined tag on the registry, not the default one,
++  // so it is out of scope for this kind.
++  if (range === "latest") return "latest";
++  // Conservative on compound ranges: any `<`/`<=` comparator anywhere counts as an upper bound, so an
++  // OR-compound like `>=1 || <0.5` is not flagged even though one arm is unbounded — a complex range is a
++  // deliberate authoring choice, and a wrong finding costs more than a missed one here.
++  if (UNBOUNDED_GTE_RE.test(range) && !UPPER_BOUND_RE.test(range)) {
++    return "unbounded-gte";
++  }
++  if (BARE_MAJOR_RE.test(range)) return "bare";
++  return null;
++}
++
++function* patchLines(patch: string): Generator<string> {
++  let start = 0;
++  for (let i = 0; i <= patch.length; i++) {
++    if (i === patch.length || patch[i] === "\n") {
++      yield patch.slice(start, i);
++      start = i + 1;
++    }
++  }
++}
++
++type ScanLimits = {
++  maxFindings?: number;
++  signal?: AbortSignal;
++};
++
++/** Scan one package.json patch for loose specifiers on ADDED lines. Pure. */
++export function scanPatchForLooseRanges(
++  path: string,
++  patch: string,
++  limits: ScanLimits = {},
++): LooseRangeFinding[] {
++  const maxFindings = limits.maxFindings ?? MAX_FINDINGS;
++  if (maxFindings <= 0) return [];
++
++  const findings: LooseRangeFinding[] = [];
++  let newLine = 0;
++  let inHunk = false;
++  // The enclosing manifest section, tracked from added AND context lines (both describe the new file).
++  // null = unknown (top level, or a hunk that starts mid-block without its section header in view).
++  let section: string | null = null;
++
++  for (const line of patchLines(patch)) {
++    if (limits.signal?.aborted) throw new Error("analyzer_aborted");
++    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
++    if (hunk) {
++      newLine = Number(hunk[1]);
++      inHunk = true;
++      // Hunks can jump anywhere in the file — section state from a previous hunk must never leak into
++      // the next one, or a hunk starting inside engines could inherit a stale "dependencies" state.
++      section = null;
++      continue;
++    }
++    // Skip pre-hunk preamble; inside a hunk `+++x`/`+++ x` is added content, not a header.
++    if (!inHunk) continue;
++
++    const isAddedContent = line.startsWith("+") && !isDiffFileHeaderLine(line);
++    const isContext =
++      !line.startsWith("+") && !line.startsWith("-") && !line.startsWith("\\");
++
++    if (isContext) {
++      const trimmed = line.slice(1).trim();
++      const header = SECTION_HEADER_RE.exec(trimmed);
++      if (header) section = header[1]!;
++      else if (trimmed.startsWith("}")) section = null;
++      newLine++;
++      continue;
++    }
++    if (!isAddedContent) {
++      // A `\ No newline at end of file` marker and a removed line are not new-file content lines, so they
++      // must not advance the new-file line counter — mirrors the sibling analyzers (e.g. iac-misconfig.ts).
++      // Removed lines describe the OLD file only, so they never touch section state either.
++      if (!line.startsWith("-") && !line.startsWith("\\")) newLine++;
++      continue;
++    }
++
++    const body = line.slice(1);
++    if (body.length > MAX_LINE_CHARS) {
++      newLine++;
++      continue;
++    }
++
++    const trimmed = body.trim();
++    const header = SECTION_HEADER_RE.exec(trimmed);
++    if (header) {
++      section = header[1]!;
++      newLine++;
++      continue;
++    }
++    if (trimmed.startsWith("}")) {
++      section = null;
++      newLine++;
++      continue;
++    }
++
++    const match = NPM_LINE_RE.exec(trimmed);
++    if (match && section !== null && DEPENDENCY_SECTIONS.has(section)) {
++      // Positive dependency context only: entries are judged solely inside a visible dependency block, where
++      // EVERY entry is a dependency (a package really named `npm` or `node` included). Any other visible
++      // block, and any hunk whose enclosing section is not in view, yields nothing — see the
++      // DEPENDENCY_SECTIONS comment for why unknown context stays silent.
++      const kind = classifyRange(match[2]!);
++      if (kind) {
++        findings.push({
++          file: path,
++          line: newLine,
++          package: match[1]!,
++          range: match[2]!,
++          kind,
++        });
++        if (findings.length >= maxFindings) return findings;
++      }
++    }
++
++    newLine++;
++  }
++
++  return findings;
++}
++
++/** Analyzer entrypoint: added package.json specifier lines → loose-range findings. No network. */
++export async function scanLooseRanges(
++  req: EnrichRequest,
++  signal?: AbortSignal,
++): Promise<LooseRangeFinding[]> {
++  const findings: LooseRangeFinding[] = [];
++  for (const file of req.files ?? []) {
++    if (signal?.aborted) throw new Error("analyzer_aborted");
++    const basename = file.path.split("/").pop() ?? file.path;
++    if (!file.patch || basename !== "package.json") continue;
++    for (const finding of scanPatchForLooseRanges(file.path, file.patch, {
++      maxFindings: MAX_FINDINGS - findings.length,
++      signal,
++    })) {
++      findings.push(finding);
++      if (findings.length >= MAX_FINDINGS) return findings;
++    }
++  }
++  return findings;
++}
+diff --git a/review-enrichment/src/analyzers/registry.ts b/review-enrichment/src/analyzers/registry.ts
+index 54a978739..fc4fec814 100644
+--- a/review-enrichment/src/analyzers/registry.ts
++++ b/review-enrichment/src/analyzers/registry.ts
+@@ -26,6 +26,7 @@ import { scanSecretLog } from "./secret-log.js";
+ import { scanStaleBranch } from "./stale-branch.js";
+ import { scanTestRatio } from "./test-ratio.js";
+ import { scanMigrationSafety } from "./migration-safety.js";
++import { scanLooseRanges } from "./loose-range.js";
+ import { scanTyposquat } from "./typosquat.js";
+ import { scanUndocumentedExport } from "./undocumented-export.js";
+ import type {
+@@ -751,6 +752,47 @@ export const ANALYZER_DESCRIPTORS = [
+     },
+     run: (req, { signal }) => scanMigrationSafety(req, signal),
+   }),
++  descriptor({
++    name: "looseRange",
++    title: "Loose dependency version range",
++    category: "supply-chain",
++    cost: "local",
++    defaultEnabled: true,
++    requires: ["files"],
++    limits: { maxFindings: 20, maxLineChars: 2000 },
++    docs: {
++      summary:
++        "Flags newly-added npm dependency specifiers that use dangerously loose ranges instead of a pinned/caret/tilde range.",
++      looksAt: "Added specifier lines in package.json patches.",
++      reports: "Manifest file, line, package, raw specifier, and loose-range kind.",
++      network: "Pure local analyzer. No external network call.",
++      notes:
++        "Judges only the version specifier, never the package; wildcard, latest, unbounded >=, and bare-major ranges let any future publish flow into the next install.",
++    },
++    render: (findings, helpers) => {
++      if (!findings.length) return [];
++      const explain = (kind: (typeof findings)[number]["kind"]): string => {
++        switch (kind) {
++          case "wildcard":
++            return "a wildcard range accepts ANY published version, including a compromised one";
++          case "latest":
++            return "the `latest` dist-tag floats to whatever is published next; installs are not reproducible";
++          case "unbounded-gte":
++            return "an unbounded `>=` range accepts every future major version, breaking changes included";
++          case "bare":
++            return "a bare-major range floats across every future minor/patch of the major line";
++        }
++      };
++      const lines = ["### Loose dependency version ranges (supply-chain drift risk)"];
++      for (const item of findings) {
++        lines.push(
++          `- ${helpers.safeCodeSpan(`${item.package}@"${item.range}"`)} (${helpers.safeCodeSpan(`${item.file}:${item.line}`)}) — ${explain(item.kind)}`,
++        );
++      }
++      return lines;
++    },
++    run: (req, { signal }) => scanLooseRanges(req, signal),
++  }),
+ ] as const satisfies readonly AnyAnalyzerDescriptor[];
+ 
+ export const ANALYZER_NAMES = ANALYZER_DESCRIPTORS.map(
+diff --git a/review-enrichment/src/render.ts b/review-enrichment/src/render.ts
+index 4af051a3a..697aaf1e6 100644
+--- a/review-enrichment/src/render.ts
++++ b/review-enrichment/src/render.ts
+@@ -455,6 +455,7 @@ export function renderBrief(
+   lines.push(...renderDescriptorSection("pendingReviewRequests", findings.pendingReviewRequests));
+   lines.push(...renderDescriptorSection("testRatio", findings.testRatio));
+   lines.push(...renderDescriptorSection("migrationSafety", findings.migrationSafety));
++  lines.push(...renderDescriptorSection("looseRange", findings.looseRange));
+ 
+   if (!lines.length) return { promptSection: "", systemSuffix: "" };
+ 
+diff --git a/review-enrichment/src/types.ts b/review-enrichment/src/types.ts
+index 7fbc09846..a6aeb89c1 100644
+--- a/review-enrichment/src/types.ts
++++ b/review-enrichment/src/types.ts
+@@ -409,6 +409,17 @@ export interface MigrationSafetyFinding {
+   kind: "drop" | "rename" | "not-null-no-default" | "blocking-rewrite";
+ }
+ 
++/** A newly-added/changed npm dependency whose version specifier is dangerously loose — a wildcard, the
++ *  `latest` dist-tag, an unbounded `>=` range, or a bare major — letting any future publish flow into the
++ *  next install (#2036, part of #1499). Reports the manifest location, package, raw specifier, and kind. */
++export interface LooseRangeFinding {
++  file: string;
++  line: number;
++  package: string;
++  range: string;
++  kind: "wildcard" | "latest" | "unbounded-gte" | "bare";
++}
++
+ /** Structured analyzer output. Each analyzer fills its own key; more land as analyzers ship (#1477/#1478). */
+ export interface BriefFindings {
+   dependency?: DependencyFinding[];
+@@ -441,6 +452,7 @@ export interface BriefFindings {
+   pendingReviewRequests?: PendingReviewRequestFinding[];
+   testRatio?: TestRatioFinding[];
+   migrationSafety?: MigrationSafetyFinding[];
++  looseRange?: LooseRangeFinding[];
+ }
+ 
+ /** A JSDoc/TSDoc block whose `@param` tags name parameters the adjacent function no longer declares — a
+diff --git a/review-enrichment/test/analyzer-registry.test.ts b/review-enrichment/test/analyzer-registry.test.ts
+index a03c25c5a..620bd50c7 100644
+--- a/review-enrichment/test/analyzer-registry.test.ts
++++ b/review-enrichment/test/analyzer-registry.test.ts
+@@ -40,6 +40,7 @@ const EXPECTED_ANALYZERS = [
+   "pendingReviewRequests",
+   "testRatio",
+   "migrationSafety",
++  "looseRange",
+ ];
+ 
+ test("analyzer descriptors cover the runtime registry in stable order", () => {
+diff --git a/review-enrichment/test/loose-range.test.ts b/review-enrichment/test/loose-range.test.ts
+new file mode 100644
+index 000000000..f5bc65514
+--- /dev/null
++++ b/review-enrichment/test/loose-range.test.ts
+@@ -0,0 +1,210 @@
++// Units for the loose dependency version-range analyzer (#2036). Own file (not enrichment.test.ts) so
++// concurrent analyzer PRs don't collide. No network involved — pure compute over added package.json patch
++// lines. Runs against the compiled dist/.
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import {
++  classifyRange,
++  scanPatchForLooseRanges,
++  scanLooseRanges,
++} from "../dist/analyzers/loose-range.js";
++import { renderBrief } from "../dist/render.js";
++
++const patchOf = (lines) => `@@ -1,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join("\n")}`;
++
++test("classifyRange: classifies each loose kind", () => {
++  assert.equal(classifyRange("*"), "wildcard");
++  assert.equal(classifyRange("x"), "wildcard");
++  assert.equal(classifyRange("X"), "wildcard");
++  assert.equal(classifyRange("latest"), "latest");
++  assert.equal(classifyRange(">=1.2.3"), "unbounded-gte");
++  assert.equal(classifyRange(">2.0.0"), "unbounded-gte");
++  assert.equal(classifyRange("18"), "bare");
++  assert.equal(classifyRange("18.x"), "bare");
++  assert.equal(classifyRange("18.x.x"), "bare");
++});
++
++test("classifyRange: pinned, caret, tilde, and bounded ranges are not loose", () => {
++  assert.equal(classifyRange("1.2.3"), null);
++  assert.equal(classifyRange("^1.2.3"), null);
++  assert.equal(classifyRange("~1.2.3"), null);
++  assert.equal(classifyRange(">=1.2.3 <2.0.0"), null); // upper bound present — bounded
++  assert.equal(classifyRange("18.2"), null); // minor given — not a bare major
++  assert.equal(classifyRange("beta"), null); // non-latest dist-tag is out of scope
++  assert.equal(classifyRange("workspace:*"), null); // workspace protocol, not an npm range
++});
++
++test("classifyRange: unwraps an npm: alias and classifies the aliased range", () => {
++  assert.equal(classifyRange("npm:left-pad@*"), "wildcard");
++  assert.equal(classifyRange("npm:@scope/pkg@latest"), "latest");
++  assert.equal(classifyRange("npm:left-pad@^1.3.0"), null);
++});
++
++test("scanPatchForLooseRanges: flags each loose kind inside a visible dependencies block with correct locations", () => {
++  const findings = scanPatchForLooseRanges(
++    "package.json",
++    patchOf([
++      '"dependencies": {',
++      '"left-pad": "*",',
++      '"lodash": "latest",',
++      '"react": ">=18.0.0",',
++      '"express": "4",',
++    ]),
++  );
++  assert.deepEqual(findings, [
++    { file: "package.json", line: 2, package: "left-pad", range: "*", kind: "wildcard" },
++    { file: "package.json", line: 3, package: "lodash", range: "latest", kind: "latest" },
++    { file: "package.json", line: 4, package: "react", range: ">=18.0.0", kind: "unbounded-gte" },
++    { file: "package.json", line: 5, package: "express", range: "4", kind: "bare" },
++  ]);
++});
++
++test("scanPatchForLooseRanges: pinned/caret/tilde specifiers and non-range values are not flagged", () => {
++  const findings = scanPatchForLooseRanges(
++    "package.json",
++    patchOf([
++      '"dependencies": {',
++      '"left-pad": "1.3.0",',
++      '"lodash": "^4.17.21",',
++      '"react": "~18.2.0",',
++      "},",
++      '"main": "index.js",',
++      '"license": "MIT",',
++    ]),
++  );
++  assert.deepEqual(findings, []);
++});
++
++test("scanPatchForLooseRanges: a dependency literally named npm/node/vscode is still flagged inside a dependency block", () => {
++  // Regression for the section-aware suppression: `npm`, `node`, and `vscode` are real, installable registry
++  // packages. When the enclosing `"dependencies"` block is visible, its entries are ALL dependencies — the
++  // engines/publishConfig key-name fallback must not suppress them.
++  const findings = scanPatchForLooseRanges(
++    "package.json",
++    patchOf(['"dependencies": {', '"npm": "*",', '"node": ">=18",', '"vscode": "latest",', "},"]),
++  );
++  assert.deepEqual(findings, [
++    { file: "package.json", line: 2, package: "npm", range: "*", kind: "wildcard" },
++    { file: "package.json", line: 3, package: "node", range: ">=18", kind: "unbounded-gte" },
++    { file: "package.json", line: 4, package: "vscode", range: "latest", kind: "latest" },
++  ]);
++});
++
++test("scanPatchForLooseRanges: entries inside a visible engines/publishConfig block are never dependencies", () => {
++  // `"node": ">=18"` inside engines is legitimate and extremely common; a publishConfig dist-tag is not a
++  // dependency either. With the section visible, EVERY entry in a non-dependency block is skipped.
++  const findings = scanPatchForLooseRanges(
++    "package.json",
++    patchOf([
++      '"engines": {',
++      '"node": ">=18.0.0",',
++      '"some-engine": "*",',
++      "},",
++      '"publishConfig": {',
++      '"tag": "latest",',
++      "},",
++    ]),
++  );
++  assert.deepEqual(findings, []);
++});
++
++test("scanPatchForLooseRanges: a hunk with no visible section header stays silent — positive dependency context is required", () => {
++  // Regression for the fail-closed rule: a hunk that starts mid-`engines`/`scripts`/tool-config has no
++  // section context, so NOTHING is judged — `"some-engine": "*"` or `"releaseTag": "latest"` in such a hunk
++  // must not be reported as a loose dependency, and even a real-looking dependency line stays silent rather
++  // than guessed at.
++  const findings = scanPatchForLooseRanges(
++    "package.json",
++    patchOf([
++      '"some-engine": "*",',
++      '"releaseTag": "latest",',
++      '"node": ">=18.0.0",',
++      '"left-pad": "*",',
++    ]),
++  );
++  assert.deepEqual(findings, []);
++});
++
++test("scanPatchForLooseRanges: section state resets at each hunk boundary and is tracked from context lines too", () => {
++  const patch = [
++    "@@ -5,3 +5,3 @@",
++    ' "dependencies": {', // context line establishes the section for this hunk
++    '+"left-pad": "*",', // new-file line 6 — flagged (inside dependencies)
++    " },",
++    "@@ -20,2 +20,2 @@",
++    // New hunk: the dependencies state above must NOT leak here. No header visible → silent, even for
++    // lines that would classify as loose inside a dependency block.
++    '+"node": ">=18",',
++    '+"some-lib": "latest",',
++  ].join("\n");
++  const findings = scanPatchForLooseRanges("package.json", patch);
++  assert.deepEqual(findings, [
++    { file: "package.json", line: 6, package: "left-pad", range: "*", kind: "wildcard" },
++  ]);
++});
++
++test("scanPatchForLooseRanges: only ADDED lines are scanned — removed and context lines are ignored", () => {
++  const patch = [
++    "@@ -1,2 +1,2 @@",
++    '-"left-pad": "*",',
++    ' "lodash": "latest",',
++    '+"react": "^18.2.0",',
++  ].join("\n");
++  assert.deepEqual(scanPatchForLooseRanges("package.json", patch), []);
++});
++
++test("scanPatchForLooseRanges: new-file line numbers stay correct across context and removed lines", () => {
++  const patch = [
++    "@@ -10,3 +10,3 @@",
++    ' "dependencies": {', // new-file line 10
++    '-"left-pad": "^1.3.0",', // removed, does not advance
++    '+"left-pad": "*",', // new-file line 11
++  ].join("\n");
++  assert.deepEqual(scanPatchForLooseRanges("package.json", patch), [
++    { file: "package.json", line: 11, package: "left-pad", range: "*", kind: "wildcard" },
++  ]);
++});
++
++test("scanPatchForLooseRanges: enforces the maxFindings cap", () => {
++  const lines = ['"dependencies": {', ...Array.from({ length: 30 }, (_, i) => `"pkg-${i}": "*",`)];
++  const findings = scanPatchForLooseRanges("package.json", patchOf(lines), { maxFindings: 5 });
++  assert.equal(findings.length, 5);
++  assert.deepEqual(findings.map((f) => f.line), [2, 3, 4, 5, 6]);
++
++  assert.deepEqual(
++    scanPatchForLooseRanges("package.json", patchOf(lines), { maxFindings: 0 }),
++    [],
++  );
++});
++
++test("scanLooseRanges: scans only package.json files and honors the global cap across files", async () => {
++  const looseLines = ['"dependencies": {', ...Array.from({ length: 15 }, (_, i) => `"pkg-${i}": "latest",`)];
++  const findings = await scanLooseRanges({
++    repoFullName: "octo/repo",
++    prNumber: 1,
++    files: [
++      { path: "config/settings.json", patch: patchOf(['"dependencies": {', '"left-pad": "*",']) },
++      { path: "package.json", patch: patchOf(looseLines) },
++      { path: "apps/web/package.json", patch: patchOf(looseLines) },
++    ],
++  });
++  assert.equal(findings.length, 20); // 15 from the root manifest + capped 5 from the workspace one
++  assert.equal(findings.filter((f) => f.file === "apps/web/package.json").length, 5);
++});
++
++test("scanLooseRanges: no files yields no findings", async () => {
++  assert.deepEqual(await scanLooseRanges({ repoFullName: "octo/repo", prNumber: 1 }), []);
++});
++
++test("renderBrief: loose-range findings render package, specifier, location, and a public-safe explanation", () => {
++  const { promptSection } = renderBrief({
++    looseRange: [
++      { file: "package.json", line: 12, package: "left-pad", range: "*", kind: "wildcard" },
++      { file: "package.json", line: 13, package: "lodash", range: "latest", kind: "latest" },
++    ],
++  });
++  assert.match(promptSection, /Loose dependency version ranges/);
++  assert.match(promptSection, /left-pad@"\*"/);
++  assert.match(promptSection, /package\.json:12/);
++  assert.match(promptSection, /not reproducible/);
++});
+diff --git a/src/review/enrichment-analyzer-names.ts b/src/review/enrichment-analyzer-names.ts
+index c43cee500..5814781d9 100644
+--- a/src/review/enrichment-analyzer-names.ts
++++ b/src/review/enrichment-analyzer-names.ts
+@@ -34,6 +34,7 @@ export const REES_ANALYZER_NAMES = [
+   "pendingReviewRequests",
+   "testRatio",
+   "migrationSafety",
++  "looseRange",
+ ] as const;
+ 
+ export type ReesAnalyzerName = (typeof REES_ANALYZER_NAMES)[number];
+diff --git a/test/unit/enrichment-wire.test.ts b/test/unit/enrichment-wire.test.ts
+index e57a212c0..8d9aac9ab 100644
+--- a/test/unit/enrichment-wire.test.ts
++++ b/test/unit/enrichment-wire.test.ts
+@@ -626,7 +626,7 @@ describe("resolveReesAnalyzers", () => {
+       resolveReesAnalyzers(
+         env({
+           REES_ANALYZERS:
+-            "dependency,lockfileDrift,secret,license,installScript,heavyDependency,actionPin,eol,redos,provenance,codeowners,secretLog,assetWeight,typosquat,commitSignature,iacMisconfig,nativeBuild,history,docCommentDrift,duplication,churnHotspot,blameLink,approvalIntegrity,ciCheckSignals,undocumentedExport,staleBranch,commitHygiene,pendingReviewRequests,testRatio,migrationSafety",
++            "dependency,lockfileDrift,secret,license,installScript,heavyDependency,actionPin,eol,redos,provenance,codeowners,secretLog,assetWeight,typosquat,commitSignature,iacMisconfig,nativeBuild,history,docCommentDrift,duplication,churnHotspot,blameLink,approvalIntegrity,ciCheckSignals,undocumentedExport,staleBranch,commitHygiene,pendingReviewRequests,testRatio,migrationSafety,looseRange",
+         }),
+       ),
+     ).toEqual([
+@@ -660,6 +660,7 @@ describe("resolveReesAnalyzers", () => {
+       "pendingReviewRequests",
+       "testRatio",
+       "migrationSafety",
++      "looseRange",
+     ]);
+   });
+ 

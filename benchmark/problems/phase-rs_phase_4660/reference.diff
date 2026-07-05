@@ -1,0 +1,618 @@
+diff --git a/crates/draft-core/src/bin/draft_pool_gen.rs b/crates/draft-core/src/bin/draft_pool_gen.rs
+index f7c3a6de9d..765179415b 100644
+--- a/crates/draft-core/src/bin/draft_pool_gen.rs
++++ b/crates/draft-core/src/bin/draft_pool_gen.rs
+@@ -2,6 +2,7 @@ use std::path::PathBuf;
+ use std::process;
+ 
+ use draft_core::extraction::extract_all_set_pools;
++use engine::database::set_catalog::load_set_catalog_adjacent_to_sets_dir;
+ use engine::database::set_gating;
+ 
+ fn main() {
+@@ -34,9 +35,10 @@ fn main() {
+         }
+     };
+ 
+-    // Release-gate: drop gated sets so they can't be drafted. No-op when
+-    // GATED_SETS is unset/empty. See `engine::database::set_gating`.
+-    let gated_sets = set_gating::gated_sets_from_env();
++    // Release-gate: drop gated sets so they can't be drafted. Sets past their
++    // MTGJSON release date are auto-unlocked. See `engine::database::set_gating`.
++    let set_catalog = load_set_catalog_adjacent_to_sets_dir(&sets_dir);
++    let gated_sets = set_gating::resolve_gated_sets(&set_catalog);
+     if !gated_sets.is_empty() {
+         let before = pools.len();
+         pools.retain(|code, _| !set_gating::is_set_gated(code, &gated_sets));
+diff --git a/crates/engine/src/bin/oracle_gen.rs b/crates/engine/src/bin/oracle_gen.rs
+index c413a749ec..1aa59863e0 100644
+--- a/crates/engine/src/bin/oracle_gen.rs
++++ b/crates/engine/src/bin/oracle_gen.rs
+@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
+ use engine::database::legality::{legalities_to_export_map, normalize_legalities};
+ use engine::database::mtgjson::{load_atomic_cards, load_card_types, AtomicCard, Ruling, SetFile};
+ use engine::database::removed_cards::is_removed_offensive_card;
++use engine::database::set_catalog::load_set_catalog;
+ use engine::database::synthesis::{
+     build_oracle_face, build_oracle_face_multi, layout_faces, map_layout, LayoutKind,
+ };
+@@ -667,6 +668,11 @@ fn main() {
+     let rarity_map = build_rarity_map(&mtgjson_path);
+     let token_source_metadata = build_token_source_metadata(&mtgjson_path);
+ 
++    let set_catalog = data_dir
++        .as_ref()
++        .map(|d| load_set_catalog(d))
++        .unwrap_or_default();
++
+     // Load non-MTGJSON bracket lists for signal stamping. Game Changers come
+     // directly from MTGJSON `isGameChanger`; this file covers policy axes that
+     // MTGJSON does not expose.
+@@ -781,6 +787,7 @@ fn main() {
+                     .get(&face.name.to_lowercase())
+                     .cloned()
+                     .unwrap_or_default();
++
+                 let bracket_signals = bracket_signals_for_face(&bracket_lists, &face, source);
+                 collect_localized(&mut sidecars, &key, source);
+                 insert_face_with_priority(
+@@ -884,6 +891,7 @@ fn main() {
+                 .get(&face.name.to_lowercase())
+                 .cloned()
+                 .unwrap_or_default();
++
+             let bracket_signals = bracket_signals_for_face(&bracket_lists, &face, &faces[0]);
+             collect_localized(&mut sidecars, &key, &faces[0]);
+             insert_face(
+@@ -921,9 +929,10 @@ fn main() {
+     // they are excluded from every format-scoped deck-builder pool. The gated
+     // sets are separately hidden from the draft/picker/deck-builder UIs below
+     // (the `is_set_gated` filter on the set list), so the sets remain
+-    // un-draftable. Reprint-aware. No-op when GATED_SETS is unset/empty. See
++    // un-draftable. Reprint-aware. Sets past their MTGJSON release date are
++    // auto-unlocked even when still listed in `GATED_SETS`. See
+     // `database::set_gating`.
+-    let gated_sets = set_gating::gated_sets_from_env();
++    let gated_sets = set_gating::resolve_gated_sets(&set_catalog);
+     if !gated_sets.is_empty() {
+         let banned = legalities_to_export_map(&set_gating::all_formats_banned());
+         let mut gated_count = 0usize;
+@@ -1188,8 +1197,9 @@ fn run_set_list(remaining_args: &[String]) {
+         .unwrap_or_else(|e| panic!("Failed to parse {}: {e}", input.display()));
+ 
+     // Release-gate: hide gated sets from the picker / draft / deck-builder UIs.
+-    // No-op when GATED_SETS is unset/empty. See `database::set_gating`.
+-    let gated_sets = set_gating::gated_sets_from_env();
++    // Sets past their release date are auto-unlocked. See `database::set_gating`.
++    let set_catalog = load_set_catalog(Path::new(data_dir));
++    let gated_sets = set_gating::resolve_gated_sets(&set_catalog);
+     let projected: BTreeMap<String, SetListEntry> = raw
+         .data
+         .into_iter()
+diff --git a/crates/engine/src/database/mod.rs b/crates/engine/src/database/mod.rs
+index e1e0e46736..28ba785713 100644
+--- a/crates/engine/src/database/mod.rs
++++ b/crates/engine/src/database/mod.rs
+@@ -14,6 +14,7 @@ pub mod mtgjson;
+ pub mod oracle_loader;
+ pub mod removed_cards;
+ pub mod search;
++pub mod set_catalog;
+ pub mod set_gating;
+ pub mod subtype_vocab;
+ pub mod synthesis;
+diff --git a/crates/engine/src/database/set_catalog.rs b/crates/engine/src/database/set_catalog.rs
+new file mode 100644
+index 0000000000..7fb93a533b
+--- /dev/null
++++ b/crates/engine/src/database/set_catalog.rs
+@@ -0,0 +1,240 @@
++//! MTGJSON SetList metadata used by the release-gate and legality-inference
++//! pipelines. This is data-pipeline tooling, not game-rules logic.
++
++use std::collections::HashMap;
++use std::path::Path;
++
++use serde::Deserialize;
++
++/// UTC calendar date (`YYYY-MM-DD`) without external date crates.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
++pub struct ReleaseDate {
++    pub year: i32,
++    pub month: u32,
++    pub day: u32,
++}
++
++impl ReleaseDate {
++    pub fn parse(raw: &str) -> Option<Self> {
++        let raw = raw.trim();
++        let (year, rest) = raw.split_once('-')?;
++        let (month, day) = rest.split_once('-')?;
++        let year = year.parse().ok()?;
++        let month = month.parse().ok()?;
++        let day = day.parse().ok()?;
++        if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
++            return None;
++        }
++        Some(Self { year, month, day })
++    }
++
++    /// Whether this date is on or before `other` (inclusive).
++    pub fn is_on_or_before(self, other: Self) -> bool {
++        self <= other
++    }
++}
++
++/// Convert a UNIX timestamp to a UTC calendar date (algorithm from Howard Hinnant).
++pub fn utc_date_from_unix_secs(secs: u64) -> ReleaseDate {
++    let days = secs / 86_400;
++    let z = days as i64 + 719_468;
++    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
++    let doe = z - era * 146_097;
++    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
++    let y = yoe + era * 400;
++    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
++    let mp = (5 * doy + 2) / 153;
++    let d = doy - (153 * mp + 2) / 5 + 1;
++    let m = mp + if mp < 10 { 3 } else { -9 };
++    let year = y + if m <= 2 { 1 } else { 0 };
++    ReleaseDate {
++        year: year as i32,
++        month: m as u32,
++        day: d as u32,
++    }
++}
++
++/// UTC "today" for release-gate evaluation during card-data generation.
++pub fn today_utc() -> ReleaseDate {
++    let secs = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .expect("system clock before UNIX epoch")
++        .as_secs();
++    utc_date_from_unix_secs(secs)
++}
++
++/// Environment variable override for the release-gate "as of" date (`YYYY-MM-DD`).
++/// Used by CI (`gen-card-data.sh`) and unit tests for deterministic behavior.
++pub const GATED_SETS_AS_OF_ENV: &str = "GATED_SETS_AS_OF";
++
++/// The effective "as of" date for release-gate evaluation.
++pub fn gated_sets_as_of() -> ReleaseDate {
++    std::env::var(GATED_SETS_AS_OF_ENV)
++        .ok()
++        .and_then(|raw| ReleaseDate::parse(&raw))
++        .unwrap_or_else(today_utc)
++}
++
++/// Per-set metadata extracted from MTGJSON `SetList.json`.
++#[derive(Debug, Clone)]
++pub struct SetMeta {
++    pub code: String,
++    pub name: String,
++    pub release_date: Option<ReleaseDate>,
++    pub set_type: Option<String>,
++    pub is_online_only: bool,
++    pub parent_code: Option<String>,
++}
++
++impl SetMeta {
++    /// Whether the set's release date is on or before `as_of`.
++    ///
++    /// Sets without a recorded release date are treated as **not released** so
++    /// preview gates stay conservative until MTGJSON publishes a date.
++    pub fn is_released_as_of(&self, as_of: ReleaseDate) -> bool {
++        self.release_date
++            .is_some_and(|release| release.is_on_or_before(as_of))
++    }
++}
++
++/// Index of MTGJSON set codes → metadata.
++#[derive(Debug, Clone, Default)]
++pub struct SetCatalog {
++    pub(crate) sets: HashMap<String, SetMeta>,
++}
++
++impl SetCatalog {
++    pub fn get(&self, code: &str) -> Option<&SetMeta> {
++        self.sets.get(&code.to_uppercase())
++    }
++
++    pub fn len(&self) -> usize {
++        self.sets.len()
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.sets.is_empty()
++    }
++
++    /// Test/catalog builder helper.
++    pub fn insert_test_meta(&mut self, meta: SetMeta) {
++        let code = meta.code.to_uppercase();
++        self.sets.insert(code, meta);
++    }
++}
++
++#[derive(Deserialize)]
++struct SetListFile {
++    data: Vec<SetListRawEntry>,
++}
++
++#[derive(Deserialize)]
++#[serde(rename_all = "camelCase")]
++struct SetListRawEntry {
++    code: String,
++    name: String,
++    #[serde(default)]
++    release_date: Option<String>,
++    #[serde(default, rename = "type")]
++    set_type: Option<String>,
++    #[serde(default)]
++    is_online_only: bool,
++    #[serde(default)]
++    parent_code: Option<String>,
++}
++
++/// Load `SetList.json` from `<data_dir>/mtgjson/SetList.json`.
++pub fn load_set_catalog(data_dir: &Path) -> SetCatalog {
++    let path = data_dir.join("mtgjson").join("SetList.json");
++    load_set_catalog_from_path(&path).unwrap_or_else(|e| {
++        eprintln!(
++            "warning: failed to load set catalog from {}: {e}; release-gate date filtering and legality inference will be degraded",
++            path.display()
++        );
++        SetCatalog::default()
++    })
++}
++
++pub fn load_set_catalog_from_path(path: &Path) -> Result<SetCatalog, String> {
++    let contents =
++        std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
++    let raw: SetListFile =
++        serde_json::from_str(&contents).map_err(|e| format!("parse {}: {e}", path.display()))?;
++    let mut sets = HashMap::new();
++    for entry in raw.data {
++        let code = entry.code.to_uppercase();
++        sets.insert(
++            code.clone(),
++            SetMeta {
++                code,
++                name: entry.name,
++                release_date: entry.release_date.as_deref().and_then(ReleaseDate::parse),
++                set_type: entry.set_type,
++                is_online_only: entry.is_online_only,
++                parent_code: entry.parent_code.map(|c| c.to_uppercase()),
++            },
++        );
++    }
++    Ok(SetCatalog { sets })
++}
++
++/// Load from `mtgjson/sets/` parent directory (draft-pool-gen layout).
++pub fn load_set_catalog_adjacent_to_sets_dir(sets_dir: &Path) -> SetCatalog {
++    let data_dir = sets_dir
++        .parent()
++        .and_then(|p| p.parent())
++        .unwrap_or_else(|| sets_dir.parent().unwrap_or(sets_dir));
++    load_set_catalog(data_dir)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn parse_release_date_accepts_mtgjson_form() {
++        let d = ReleaseDate::parse("2026-06-26").unwrap();
++        assert_eq!(d.year, 2026);
++        assert_eq!(d.month, 6);
++        assert_eq!(d.day, 26);
++    }
++
++    #[test]
++    fn release_date_ordering() {
++        let pre = ReleaseDate::parse("2026-06-25").unwrap();
++        let release = ReleaseDate::parse("2026-06-26").unwrap();
++        let after = ReleaseDate::parse("2026-06-27").unwrap();
++        assert!(pre < release);
++        assert!(release < after);
++        assert!(release.is_on_or_before(after));
++        assert!(!after.is_on_or_before(release));
++    }
++
++    #[test]
++    fn unix_epoch_maps_to_1970_01_01() {
++        let d = utc_date_from_unix_secs(0);
++        assert_eq!(d, ReleaseDate::parse("1970-01-01").unwrap());
++    }
++
++    #[test]
++    fn msh_release_date_parses() {
++        let d = ReleaseDate::parse("2026-06-26").unwrap();
++        let as_of = ReleaseDate::parse("2026-06-30").unwrap();
++        assert!(d.is_on_or_before(as_of));
++    }
++
++    #[test]
++    fn set_meta_is_released_as_of_uses_mtgjson_date() {
++        let meta = SetMeta {
++            code: "MSH".into(),
++            name: "Marvel Super Heroes".into(),
++            release_date: ReleaseDate::parse("2026-06-26"),
++            set_type: Some("expansion".into()),
++            is_online_only: false,
++            parent_code: None,
++        };
++        assert!(!meta.is_released_as_of(ReleaseDate::parse("2026-06-25").unwrap()));
++        assert!(meta.is_released_as_of(ReleaseDate::parse("2026-06-26").unwrap()));
++        assert!(meta.is_released_as_of(ReleaseDate::parse("2026-06-30").unwrap()));
++    }
++}
+diff --git a/crates/engine/src/database/set_gating.rs b/crates/engine/src/database/set_gating.rs
+index 973230b34e..9b0a3e72a5 100644
+--- a/crates/engine/src/database/set_gating.rs
++++ b/crates/engine/src/database/set_gating.rs
+@@ -5,9 +5,11 @@
+ //! time. When unset or empty, gating is a no-op and the generated artifacts are
+ //! identical to ungated builds — existing builds are unaffected.
+ //!
+-//! To gate a set before release, generate with `GATED_SETS=MSH,MSC,TMSH`. To
+-//! unlock on release, regenerate without the variable. There are no hardcoded
+-//! set codes here: the codes come only from the environment.
++//! To gate a set before release, generate with `GATED_SETS=MSH,MSC,TMSH`. Sets
++//! whose MTGJSON `releaseDate` is on or before the generation "as of" date
++//! (`GATED_SETS_AS_OF`, defaulting to UTC today) are **automatically ungated**
++//! even when still listed in `GATED_SETS` — so a forgotten env cleanup after
++//! release cannot leave cards marked Banned in every format (issue #4365).
+ //!
+ //! This is data-pipeline tooling, not game-rules logic, so no Comprehensive
+ //! Rules annotations apply.
+@@ -15,6 +17,7 @@
+ use std::collections::HashSet;
+ 
+ use super::legality::{CardLegalities, LegalityFormat, LegalityStatus};
++use super::set_catalog::{gated_sets_as_of, ReleaseDate, SetCatalog};
+ 
+ /// Name of the environment variable that lists gated set codes.
+ pub const GATED_SETS_ENV: &str = "GATED_SETS";
+@@ -42,11 +45,80 @@ pub fn parse_gated_sets(raw: &str) -> HashSet<String> {
+ /// Whether a single set code should be hidden from set-list / draft-pool output.
+ ///
+ /// Comparison is case-insensitive; `gated` is expected to already be uppercased
+-/// (as produced by [`parse_gated_sets`]).
++/// (as produced by [`parse_gated_sets`] or [`effective_gated_sets`]).
+ pub fn is_set_gated(code: &str, gated: &HashSet<String>) -> bool {
+     !gated.is_empty() && gated.contains(&code.to_uppercase())
+ }
+ 
++/// Filter `configured` gated sets to those whose release date is still in the
++/// future relative to `as_of`. Sets without a `releaseDate` in the catalog stay
++/// gated (conservative preview behavior).
++pub fn effective_gated_sets(
++    configured: &HashSet<String>,
++    catalog: &SetCatalog,
++    as_of: ReleaseDate,
++) -> HashSet<String> {
++    if configured.is_empty() {
++        return HashSet::new();
++    }
++    configured
++        .iter()
++        .filter(|code| set_still_gated(code, catalog, as_of))
++        .cloned()
++        .collect()
++}
++
++fn set_still_gated(code: &str, catalog: &SetCatalog, as_of: ReleaseDate) -> bool {
++    let Some(meta) = catalog.get(code) else {
++        // Unknown to SetList — stay gated when explicitly configured.
++        return true;
++    };
++    !meta.is_released_as_of(as_of)
++}
++
++/// Resolve the gated-set list for the current generation run: `GATED_SETS` from
++/// the environment, minus any sets whose MTGJSON release date has passed.
++pub fn resolve_gated_sets(catalog: &SetCatalog) -> HashSet<String> {
++    let configured = gated_sets_from_env();
++    let as_of = gated_sets_as_of();
++    let effective = effective_gated_sets(&configured, catalog, as_of);
++    if !configured.is_empty() {
++        let unlocked: Vec<&str> = configured
++            .iter()
++            .filter(|code| !effective.contains(*code))
++            .map(String::as_str)
++            .collect();
++        if !unlocked.is_empty() {
++            eprintln!(
++                "Set gating: auto-unlocked {} set(s) past release date (as of {}-{:02}-{:02}): {}",
++                unlocked.len(),
++                as_of.year,
++                as_of.month,
++                as_of.day,
++                unlocked.join(",")
++            );
++        }
++    }
++    effective
++}
++
++/// Test helper: build a minimal catalog entry for gating tests.
++#[cfg(test)]
++pub(crate) fn test_set_meta(
++    code: &str,
++    release_date: &str,
++    set_type: &str,
++) -> super::set_catalog::SetMeta {
++    super::set_catalog::SetMeta {
++        code: code.to_uppercase(),
++        name: code.to_string(),
++        release_date: super::set_catalog::ReleaseDate::parse(release_date),
++        set_type: Some(set_type.to_string()),
++        is_online_only: false,
++        parent_code: None,
++    }
++}
++
+ /// Reprint-aware predicate: should this card be dropped from the playable pool?
+ ///
+ /// A card is gated only when **every** set it has been printed in is gated —
+@@ -84,6 +156,7 @@ pub fn all_formats_banned() -> CardLegalities {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::database::set_catalog::{ReleaseDate, SetCatalog};
+ 
+     fn set(codes: &[&str]) -> HashSet<String> {
+         codes.iter().map(|c| c.to_string()).collect()
+@@ -181,4 +254,38 @@ mod tests {
+             .iter()
+             .all(|format| banned.get(format) == Some(&LegalityStatus::Banned)));
+     }
++
++    #[test]
++    fn effective_gated_sets_auto_unlocks_past_release() {
++        let configured = set(&["MSH", "MSC", "DOM"]);
++        let mut catalog = SetCatalog::default();
++        catalog.insert_test_meta(test_set_meta("MSH", "2026-06-26", "expansion"));
++        catalog.insert_test_meta(test_set_meta("MSC", "2026-06-26", "commander"));
++        catalog.insert_test_meta(test_set_meta("DOM", "2018-04-27", "expansion"));
++        let as_of = ReleaseDate::parse("2026-06-30").unwrap();
++        let effective = effective_gated_sets(&configured, &catalog, as_of);
++        // MSH/MSC/DOM all released — nothing left gated.
++        assert!(effective.is_empty());
++    }
++
++    #[test]
++    fn effective_gated_sets_keeps_future_release() {
++        let configured = set(&["MSH", "FUT"]);
++        let mut catalog = SetCatalog::default();
++        catalog.insert_test_meta(test_set_meta("MSH", "2026-06-26", "expansion"));
++        catalog.insert_test_meta(test_set_meta("FUT", "2026-12-01", "expansion"));
++        let as_of = ReleaseDate::parse("2026-06-30").unwrap();
++        let effective = effective_gated_sets(&configured, &catalog, as_of);
++        assert!(!effective.contains("MSH"));
++        assert!(effective.contains("FUT"));
++    }
++
++    #[test]
++    fn effective_gated_sets_unknown_set_stays_gated() {
++        let configured = set(&["MYSTERY"]);
++        let catalog = SetCatalog::default();
++        let as_of = ReleaseDate::parse("2026-06-30").unwrap();
++        let effective = effective_gated_sets(&configured, &catalog, as_of);
++        assert!(effective.contains("MYSTERY"));
++    }
+ }
+diff --git a/crates/engine/tests/issue_4365_msh_legality.rs b/crates/engine/tests/issue_4365_msh_legality.rs
+new file mode 100644
+index 0000000000..b4f8531448
+--- /dev/null
++++ b/crates/engine/tests/issue_4365_msh_legality.rs
+@@ -0,0 +1,91 @@
++//! Issue #4365 — Marvel Super Heroes release-gating must auto-unlock after the
++//! set's MTGJSON `releaseDate`, without fabricating format legalities locally.
++
++use engine::database::legality::LegalityStatus;
++use engine::database::set_catalog::{ReleaseDate, SetCatalog, SetMeta};
++use engine::database::set_gating::{
++    all_formats_banned, effective_gated_sets, is_card_gated, resolve_gated_sets,
++};
++use std::collections::HashSet;
++
++fn msh_catalog() -> SetCatalog {
++    let mut catalog = SetCatalog::default();
++    for (code, set_type) in [
++        ("MSH", "expansion"),
++        ("MSC", "commander"),
++        ("TMSH", "expansion"),
++    ] {
++        catalog.insert_test_meta(SetMeta {
++            code: code.into(),
++            name: code.into(),
++            release_date: ReleaseDate::parse("2026-06-26"),
++            set_type: Some(set_type.into()),
++            is_online_only: false,
++            parent_code: None,
++        });
++    }
++    catalog
++}
++
++#[test]
++fn msh_auto_unlocks_from_gated_sets_after_release_date() {
++    let catalog = msh_catalog();
++    let configured: HashSet<String> = ["MSH", "MSC", "TMSH"]
++        .iter()
++        .map(|s| s.to_string())
++        .collect();
++    let as_of = ReleaseDate::parse("2026-06-30").unwrap();
++    let effective = effective_gated_sets(&configured, &catalog, as_of);
++    assert!(
++        effective.is_empty(),
++        "MSH/MSC/TMSH must auto-unlock after 2026-06-26 release"
++    );
++    assert!(!is_card_gated(&["MSH".to_string()], &effective));
++}
++
++#[test]
++fn msh_stays_gated_before_release_date() {
++    let catalog = msh_catalog();
++    let configured: HashSet<String> = ["MSH", "MSC", "TMSH"]
++        .iter()
++        .map(|s| s.to_string())
++        .collect();
++    let as_of = ReleaseDate::parse("2026-06-25").unwrap();
++    let effective = effective_gated_sets(&configured, &catalog, as_of);
++    assert_eq!(effective, configured);
++    assert!(is_card_gated(&["MSH".to_string()], &effective));
++}
++
++#[test]
++fn msh_cards_are_marked_banned_only_while_gate_is_active() {
++    let printings = vec!["MSH".to_string()];
++    let pre_release_gated: HashSet<String> = ["MSH"].iter().map(|s| s.to_string()).collect();
++    assert!(is_card_gated(&printings, &pre_release_gated));
++    let banned = all_formats_banned();
++    assert!(banned
++        .values()
++        .all(|status| *status == LegalityStatus::Banned));
++}
++
++#[test]
++fn resolve_gated_sets_unlocks_msh_when_env_still_lists_it() {
++    std::env::set_var("GATED_SETS", "MSH,MSC,TMSH");
++    std::env::set_var("GATED_SETS_AS_OF", "2026-06-30");
++
++    let effective = resolve_gated_sets(&msh_catalog());
++    assert!(
++        effective.is_empty(),
++        "resolve_gated_sets must drop released sets even when GATED_SETS is stale"
++    );
++
++    std::env::remove_var("GATED_SETS");
++    std::env::remove_var("GATED_SETS_AS_OF");
++}
++
++#[test]
++fn unknown_set_stays_gated_when_configured() {
++    let configured: HashSet<String> = ["MYSTERY"].iter().map(|s| s.to_string()).collect();
++    let as_of = ReleaseDate::parse("2026-06-30").unwrap();
++    let effective = effective_gated_sets(&configured, &SetCatalog::default(), as_of);
++    assert!(effective.contains("MYSTERY"));
++}
+diff --git a/scripts/gen-card-data.sh b/scripts/gen-card-data.sh
+index 10308d4759..b995c0ed39 100755
+--- a/scripts/gen-card-data.sh
++++ b/scripts/gen-card-data.sh
+@@ -23,6 +23,11 @@ DECKS_OUTPUT="${OUTPUT_DIR}/decks.json"
+ 
+ echo "=== Card Data Generation ==="
+ 
++# Pin the release-gate "as of" date to UTC today so `GATED_SETS` auto-unlocks
++# sets whose MTGJSON releaseDate has passed (issue #4365). Override in tests
++# with GATED_SETS_AS_OF=YYYY-MM-DD.
++export GATED_SETS_AS_OF="${GATED_SETS_AS_OF:-$(date -u +%Y-%m-%d)}"
++
+ # Download MTGJSON AtomicCards if not present. mtgjson_download prefers the
+ # gzipped artifact (~50 MB vs ~156 MB uncompressed) and retries the
+ # mid-transfer connection resets mtgjson hands out on large anonymous reads.

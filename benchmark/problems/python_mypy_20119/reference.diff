@@ -1,0 +1,282 @@
+diff --git a/mypy/expandtype.py b/mypy/expandtype.py
+index 891ea4d89a806..7f95b2e25320d 100644
+--- a/mypy/expandtype.py
++++ b/mypy/expandtype.py
+@@ -3,7 +3,7 @@
+ from collections.abc import Iterable, Mapping
+ from typing import Final, TypeVar, cast, overload
+ 
+-from mypy.nodes import ARG_STAR, FakeInfo, Var
++from mypy.nodes import ARG_STAR, ArgKind, FakeInfo, Var
+ from mypy.state import state
+ from mypy.types import (
+     ANY_STRATEGY,
+@@ -270,19 +270,95 @@ def visit_param_spec(self, t: ParamSpecType) -> Type:
+                 ),
+             )
+         elif isinstance(repl, Parameters):
+-            assert t.flavor == ParamSpecFlavor.BARE
+-            return Parameters(
+-                self.expand_types(t.prefix.arg_types) + repl.arg_types,
+-                t.prefix.arg_kinds + repl.arg_kinds,
+-                t.prefix.arg_names + repl.arg_names,
+-                variables=[*t.prefix.variables, *repl.variables],
+-                imprecise_arg_kinds=repl.imprecise_arg_kinds,
+-            )
++            assert isinstance(t.upper_bound, ProperType) and isinstance(t.upper_bound, Instance)
++            if t.flavor == ParamSpecFlavor.BARE:
++                return Parameters(
++                    self.expand_types(t.prefix.arg_types) + repl.arg_types,
++                    t.prefix.arg_kinds + repl.arg_kinds,
++                    t.prefix.arg_names + repl.arg_names,
++                    variables=[*t.prefix.variables, *repl.variables],
++                    imprecise_arg_kinds=repl.imprecise_arg_kinds,
++                )
++            elif t.flavor == ParamSpecFlavor.ARGS:
++                assert all(k.is_positional() for k in t.prefix.arg_kinds)
++                return self._possible_callable_varargs(
++                    repl, list(t.prefix.arg_types), t.upper_bound
++                )
++            else:
++                assert t.flavor == ParamSpecFlavor.KWARGS
++                return self._possible_callable_kwargs(repl, t.upper_bound)
+         else:
+             # We could encode Any as trivial parameters etc., but it would be too verbose.
+             # TODO: assert this is a trivial type, like Any, Never, or object.
+             return repl
+ 
++    @classmethod
++    def _possible_callable_varargs(
++        cls, repl: Parameters, required_prefix: list[Type], tuple_type: Instance
++    ) -> ProperType:
++        """Given a callable, extract all parameters that can be passed as `*args`.
++
++        This builds a union of all (possibly variadic) tuples representing all possible
++        argument sequences that can be passed positionally. Each such tuple starts with
++        all required (pos-only without a default) arguments, followed by some prefix
++        of other arguments that can be passed positionally.
++        """
++        required_posargs = required_prefix
++        if repl.variables:
++            # We will tear the callable apart, do not leak type variables
++            return tuple_type
++        optional_posargs: list[Type] = []
++        for kind, name, type in zip(repl.arg_kinds, repl.arg_names, repl.arg_types):
++            if kind == ArgKind.ARG_POS and name is None:
++                if optional_posargs:
++                    # May happen following Unpack expansion without kinds correction
++                    required_posargs += optional_posargs
++                    optional_posargs = []
++                required_posargs.append(type)
++            elif kind.is_positional():
++                optional_posargs.append(type)
++            elif kind == ArgKind.ARG_STAR:
++                if isinstance(type, UnpackType):
++                    optional_posargs.append(type)
++                else:
++                    optional_posargs.append(UnpackType(Instance(tuple_type.type, [type])))
++                break
++        return UnionType.make_union(
++            [
++                TupleType(required_posargs + optional_posargs[:i], fallback=tuple_type)
++                for i in range(len(optional_posargs) + 1)
++            ]
++        )
++
++    @classmethod
++    def _possible_callable_kwargs(cls, repl: Parameters, dict_type: Instance) -> ProperType:
++        """Given a callable, extract all parameters that can be passed as `**kwargs`.
++
++        If the function only accepts **kwargs, this will be a `dict[str, KwargsValueType]`.
++        Otherwise, this will be a `TypedDict` containing all explicit args and ignoring
++        `**kwargs` (until PEP 728 `extra_items` is supported). TypedDict entries will
++        be required iff the corresponding argument is kw-only and has no default.
++        """
++        if repl.variables:
++            # We will tear the callable apart, do not leak type variables
++            return dict_type
++        kwargs = {}
++        required_names = set()
++        extra_items: Type = UninhabitedType()
++        for kind, name, type in zip(repl.arg_kinds, repl.arg_names, repl.arg_types):
++            if kind == ArgKind.ARG_NAMED and name is not None:
++                kwargs[name] = type
++                required_names.add(name)
++            elif kind == ArgKind.ARG_STAR2:
++                # Unpack[TypedDict] is normalized early, it isn't stored as Unpack
++                extra_items = type
++            elif not kind.is_star() and name is not None:
++                kwargs[name] = type
++        if not kwargs:
++            return Instance(dict_type.type, [dict_type.args[0], extra_items])
++        # TODO: when PEP 728 is implemented, pass extra_items below.
++        return TypedDictType(kwargs, required_names, set(), fallback=dict_type)
++
+     def visit_type_var_tuple(self, t: TypeVarTupleType) -> Type:
+         # Sometimes solver may need to expand a type variable with (a copy of) itself
+         # (usually together with other TypeVars, but it is hard to filter out TypeVarTuples).
+diff --git a/test-data/unit/check-parameter-specification.test b/test-data/unit/check-parameter-specification.test
+index 25a8dbe387deb..41a6c5b33cb99 100644
+--- a/test-data/unit/check-parameter-specification.test
++++ b/test-data/unit/check-parameter-specification.test
+@@ -2599,3 +2599,160 @@ def run3(predicate: Callable[Concatenate[int, str, _P], None], *args: _P.args, *
+                                            # E: Argument 1 has incompatible type "*tuple[int | str, ...]"; expected "str" \
+                                            # E: Argument 1 has incompatible type "*tuple[int | str, ...]"; expected "_P.args"
+ [builtins fixtures/paramspec.pyi]
++
++[case testRevealBoundParamSpecArgs]
++from typing import Callable, Generic, ParamSpec
++from typing_extensions import Concatenate, TypeVarTuple, Unpack
++
++P = ParamSpec("P")
++Ts = TypeVarTuple("Ts")
++
++class Sneaky(Generic[P]):
++    def __init__(self, fn: Callable[P, object], *args: P.args, **kwargs: P.kwargs) -> None:
++        self.fn = fn
++        self.args = args
++        self.kwargs = kwargs
++
++class SneakyPrefix(Generic[P]):
++    def __init__(self, fn: Callable[Concatenate[int, P], object], _: int, *args: P.args, **kwargs: P.kwargs) -> None:
++        self.fn = fn
++        self.args = args
++        self.kwargs = kwargs
++
++def f1() -> int:
++    return 0
++def f2(x: int) -> int:
++    return 0
++def f3(x: int, /) -> int:
++    return 0
++def f4(*, x: int) -> int:
++    return 0
++def f5(x: int, y: int = 0) -> int:
++    return 0
++def f6(x: int, *args: int) -> int:
++    return 0
++def f7(x: int, *args: Unpack[Ts]) -> int:
++    return 0
++def f8(x: int, *args: Unpack[tuple[str, ...]]) -> int:
++    return 0
++def f9(x: int, *args: Unpack[tuple[str, int]]) -> int:
++    return 0
++def f10(x: int=0, *args: Unpack[tuple[str, ...]]) -> int:
++    return 0
++def f11(x: int = 0, /) -> int:
++    return 0
++
++reveal_type(Sneaky(f1).args)  # N: Revealed type is "tuple[()]"
++reveal_type(SneakyPrefix(f1).args)  # E: Missing positional argument "_" in call to "SneakyPrefix" \
++                                    # N: Revealed type is "tuple[()]" \
++                                    # E: Argument 1 to "SneakyPrefix" has incompatible type "Callable[[], int]"; expected "Callable[[int], object]"
++
++reveal_type(Sneaky(f2, 1).args)  # N: Revealed type is "tuple[()] | tuple[builtins.int]"
++reveal_type(SneakyPrefix(f2, 1).args)  # N: Revealed type is "tuple[()]"
++
++reveal_type(Sneaky(f3, 1).args)  # N: Revealed type is "tuple[builtins.int]"
++reveal_type(SneakyPrefix(f3, 1).args)  # N: Revealed type is "tuple[()]"
++
++reveal_type(Sneaky(f4, x=1).args)  # N: Revealed type is "tuple[()]"
++
++reveal_type(Sneaky(f5, 1).args)  # N: Revealed type is "tuple[()] | tuple[builtins.int] | tuple[builtins.int, builtins.int]"
++reveal_type(SneakyPrefix(f5, 1).args)  # N: Revealed type is "tuple[()] | tuple[builtins.int]"
++reveal_type(Sneaky(f5, 1, 2).args)  # N: Revealed type is "tuple[()] | tuple[builtins.int] | tuple[builtins.int, builtins.int]"
++reveal_type(SneakyPrefix(f5, 1, 2).args)  # N: Revealed type is "tuple[()] | tuple[builtins.int]"
++
++reveal_type(Sneaky(f6, 1).args)  # N: Revealed type is "tuple[()] | tuple[builtins.int] | tuple[builtins.int, Unpack[builtins.tuple[builtins.int, ...]]]"
++reveal_type(SneakyPrefix(f6, 1).args)  # N: Revealed type is "tuple[()] | tuple[Unpack[builtins.tuple[builtins.int, ...]]]"
++reveal_type(Sneaky(f6, 1, 2).args)  # N: Revealed type is "tuple[()] | tuple[builtins.int] | tuple[builtins.int, Unpack[builtins.tuple[builtins.int, ...]]]"
++reveal_type(SneakyPrefix(f6, 1, 2).args)  # N: Revealed type is "tuple[()] | tuple[Unpack[builtins.tuple[builtins.int, ...]]]"
++
++reveal_type(Sneaky(f7, 1, 2).args)  # N: Revealed type is "tuple[Literal[1]?, Literal[2]?]"
++reveal_type(SneakyPrefix(f7, 1, 2).args)  # N: Revealed type is "tuple[Literal[2]?]"
++
++reveal_type(Sneaky(f8, 1, '').args)  # N: Revealed type is "tuple[()] | tuple[builtins.int] | tuple[builtins.int, Unpack[builtins.tuple[builtins.str, ...]]]"
++reveal_type(SneakyPrefix(f8, 1, '').args)  # N: Revealed type is "tuple[()] | tuple[Unpack[builtins.tuple[builtins.str, ...]]]"
++
++reveal_type(Sneaky(f9, 1, '', 0).args)  # N: Revealed type is "tuple[builtins.int, builtins.str, builtins.int]"
++reveal_type(SneakyPrefix(f9, 1, '', 0).args)  # N: Revealed type is "tuple[builtins.str, builtins.int]"
++
++reveal_type(Sneaky(f10, 1, '', '').args)  # N: Revealed type is "tuple[()] | tuple[builtins.int] | tuple[builtins.int, Unpack[builtins.tuple[builtins.str, ...]]]"
++reveal_type(SneakyPrefix(f10, 1, '', '').args)  # N: Revealed type is "tuple[()] | tuple[Unpack[builtins.tuple[builtins.str, ...]]]"
++
++reveal_type(Sneaky(f11).args)  # N: Revealed type is "tuple[()] | tuple[builtins.int]"
++[builtins fixtures/paramspec.pyi]
++
++[case testRevealBoundParamSpecGeneric]
++from typing import Callable, Generic, ParamSpec, TypeVar
++from typing_extensions import TypeVarTuple, Unpack
++
++T = TypeVar("T")
++P = ParamSpec("P")
++Ts = TypeVarTuple("Ts")
++
++class SplitSneaky(Generic[P]):
++    def __init__(self, target: Callable[P, None]) -> None:
++        ...
++
++    def run(self, *args: P.args, **kwargs: P.kwargs) -> None:
++        self.args = args
++        self.kwargs = kwargs
++
++def f1(x: T) -> None: ...
++def f2(*xs: Unpack[Ts]) -> None: ...
++def f3(fn: Callable[P, None]) -> None: ...
++
++reveal_type(SplitSneaky(f1).args)  # N: Revealed type is "builtins.tuple[builtins.object, ...]"
++reveal_type(SplitSneaky(f1).kwargs)  # N: Revealed type is "builtins.dict[builtins.str, builtins.object]"
++reveal_type(SplitSneaky(f2).args)  # N: Revealed type is "builtins.tuple[builtins.object, ...]"
++reveal_type(SplitSneaky(f2).kwargs)  # N: Revealed type is "builtins.dict[builtins.str, builtins.object]"
++reveal_type(SplitSneaky(f3).args)  # N: Revealed type is "builtins.tuple[builtins.object, ...]"
++reveal_type(SplitSneaky(f3).kwargs)  # N: Revealed type is "builtins.dict[builtins.str, builtins.object]"
++[builtins fixtures/paramspec.pyi]
++
++[case testRevealBoundParamSpecKwargs]
++from typing import Callable, Generic, ParamSpec
++from typing_extensions import Unpack, NotRequired, TypedDict
++
++P = ParamSpec("P")
++
++class Sneaky(Generic[P]):
++    def __init__(self, fn: Callable[P, object], *args: P.args, **kwargs: P.kwargs) -> None:
++        self.fn = fn
++        self.args = args
++        self.kwargs = kwargs
++
++class Opt(TypedDict):
++    y: int
++    z: NotRequired[str]
++
++def f1() -> int:
++    return 0
++def f2(x: int) -> int:
++    return 0
++def f3(x: int, /) -> int:
++    return 0
++def f4(*, x: int) -> int:
++    return 0
++def f5(x: int, y: int = 0) -> int:
++    return 0
++def f6(**kwargs: int) -> int:
++    return 0
++def f7(x: int, **kwargs: str) -> int:
++    return 0
++def f8(x: int, /, **kwargs: str) -> int:
++    return 0
++def f9(x: int, **kwargs: Unpack[Opt]) -> int:
++    return 0
++
++reveal_type(Sneaky(f1).kwargs)  # N: Revealed type is "builtins.dict[builtins.str, Never]"
++reveal_type(Sneaky(f2, 1).kwargs)  # N: Revealed type is "TypedDict('builtins.dict', {'x'?: builtins.int})"
++reveal_type(Sneaky(f3, 1).kwargs)  # N: Revealed type is "builtins.dict[builtins.str, Never]"
++reveal_type(Sneaky(f4, x=1).kwargs)  # N: Revealed type is "TypedDict('builtins.dict', {'x': builtins.int})"
++reveal_type(Sneaky(f5, 1).kwargs)  # N: Revealed type is "TypedDict('builtins.dict', {'x'?: builtins.int, 'y'?: builtins.int})"
++reveal_type(Sneaky(f5, 1, 2).kwargs)  # N: Revealed type is "TypedDict('builtins.dict', {'x'?: builtins.int, 'y'?: builtins.int})"
++reveal_type(Sneaky(f6, x=1).kwargs)  # N: Revealed type is "builtins.dict[builtins.str, builtins.int]"
++reveal_type(Sneaky(f6, x=1, y=2).kwargs)  # N: Revealed type is "builtins.dict[builtins.str, builtins.int]"
++reveal_type(Sneaky(f7, 1, y='').kwargs)  # N: Revealed type is "TypedDict('builtins.dict', {'x'?: builtins.int})"
++reveal_type(Sneaky(f8, 1, y='').kwargs)  # N: Revealed type is "builtins.dict[builtins.str, builtins.str]"
++reveal_type(Sneaky(f9, 1, y=0).kwargs)  # N: Revealed type is "TypedDict('builtins.dict', {'x'?: builtins.int, 'y': builtins.int, 'z'?: builtins.str})"
++reveal_type(Sneaky(f9, 1, y=0, z='').kwargs)  # N: Revealed type is "TypedDict('builtins.dict', {'x'?: builtins.int, 'y': builtins.int, 'z'?: builtins.str})"
++[builtins fixtures/paramspec.pyi]

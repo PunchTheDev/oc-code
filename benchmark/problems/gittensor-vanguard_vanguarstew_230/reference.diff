@@ -1,0 +1,378 @@
+diff --git a/benchmark/runner.py b/benchmark/runner.py
+index 0d3c907..cb88154 100644
+--- a/benchmark/runner.py
++++ b/benchmark/runner.py
+@@ -12,6 +12,7 @@
+ import os
+ import random
+ import shutil
++import subprocess
+ import sys
+ import tempfile
+ 
+@@ -22,6 +23,7 @@
+ from benchmark.github_context import enrich_context
+ from benchmark.judge import judge_verbose, summarize_judge_orders
+ from benchmark.leakage import scrub_context
++from benchmark.repo_set import RepoSetError, load_repo_set
+ from benchmark.score import (
+     base_from_releases,
+     composite_score,
+@@ -59,16 +61,42 @@ def _submission(out: dict) -> dict:
+     }
+ 
+ 
++def _is_placeholder_source(source: str) -> bool:
++    return "OWNER/" in source
++
++
++def _materialize_repo_source(source: str, checkout_root: str | None) -> tuple[str, bool]:
++    """Return a local repo path for a repo-set source plus whether it should be cleaned up."""
++    if _is_placeholder_source(source):
++        raise RepoSetError(
++            f"repo-set source {source!r} is a placeholder (OWNER/...); "
++            "copy the example config and replace placeholder sources with vetted repos"
++        )
++    if os.path.isdir(source):
++        return source, False
++    if checkout_root is None:
++        raise RepoSetError(f"repo-set source not found locally: {source}")
++    dest = os.path.join(checkout_root, f"repo_{len(os.listdir(checkout_root))}")
++    try:
++        subprocess.run(["git", "clone", "-q", source, dest], check=True, capture_output=True,
++                       text=True)
++    except subprocess.CalledProcessError as exc:
++        raise RepoSetError(f"failed to clone repo-set source {source!r}: {exc.stderr.strip()}") from exc
++    return dest, True
++
++
+ def run_replay(repo_path, agent_file="agent.py", n_tasks=3, horizon=5,
+                model=None, api_base=None, api_key=None, work_dir=None, seed=0,
+                enrich_github=False, github_token=None,
+                recent_bias=False, rotation_seed=None, baseline=DEFAULT_BASELINE,
+-               w_judge=0.6, w_objective=0.4, dual_order_judge=True) -> dict:
++               w_judge=0.6, w_objective=0.4, dual_order_judge=True,
++               min_history=10, after=None, before=None) -> dict:
+     solve = load_solve(agent_file)
+     opponent = get_baseline(baseline)
+     llm = LLM(model=model, api_base=api_base, api_key=api_key)
+-    tasks = generate_tasks(repo_path, n_tasks, horizon,
+-                           recent_bias=recent_bias, rotation_seed=rotation_seed)
++    tasks = generate_tasks(
++        repo_path, n_tasks, horizon, min_history=min_history,
++        recent_bias=recent_bias, rotation_seed=rotation_seed, after=after, before=before)
+     if not tasks:
+         return {"error": "no usable tasks (repo too small for horizon/min_history)", "tasks": 0}
+ 
+@@ -144,7 +172,7 @@ def run_replay(repo_path, agent_file="agent.py", n_tasks=3, horizon=5,
+     }
+ 
+ 
+-def run_multi_replay(repos, **kwargs) -> dict:
++def run_multi_replay(repos=None, repo_set=None, held_out=False, **kwargs) -> dict:
+     """Replay several repos and aggregate their composites (proposal §4 / M3 generalization).
+ 
+     Runs `run_replay` once per repo — preserving every per-repo result — and averages each
+@@ -159,25 +187,65 @@ def run_multi_replay(repos, **kwargs) -> dict:
+     Repos too small to yield tasks are kept in `per_repo` with their error and excluded from
+     the mean (and counted in `skipped`).
+     """
++    if (repos is None) == (repo_set is None):
++        raise ValueError("pass exactly one of 'repos' or 'repo_set'")
++
++    repo_set_meta = None
++    selected = []
++    checkout_root = None
++    if repo_set is not None:
++        rs = load_repo_set(repo_set)
++        entries = rs.held_out() if held_out else rs.tuned()
++        if not entries:
++            label = "held-out" if held_out else "tuned"
++            raise RepoSetError(f"repo set {repo_set!r} has no {label} repos to replay")
++        repo_set_meta = {
++            "path": repo_set,
++            "name": rs.name,
++            "selection": "held_out" if held_out else "tuned",
++        }
++        checkout_root = tempfile.mkdtemp(prefix="vanguarstew_repo_set_")
++        for entry in entries:
++            repo_path, cleanup = _materialize_repo_source(entry.source, checkout_root)
++            selected.append({
++                "repo": entry.source,
++                "repo_name": entry.name,
++                "tier": entry.tier,
++                "held_out": entry.held_out,
++                "freeze_window": dict(entry.freeze_window),
++                "repo_path": repo_path,
++                "cleanup": cleanup,
++            })
++    else:
++        selected = [{"repo": repo, "repo_path": repo, "cleanup": False} for repo in repos]
++
+     per_repo = []
+     composites = []
+     judge_parts = []
+     objective_parts = []
+     judge_orders = []
+-    for repo in repos:
+-        res = run_replay(repo, **kwargs)
+-        per_repo.append({"repo": repo, **res})
+-        if res.get("tasks", 0) > 0:
+-            composites.append(res["composite_mean"])
+-            parts = res.get("composite_parts", {})
+-            judge_parts.append(parts.get("judge_mean", 0.0))
+-            objective_parts.append(parts.get("objective_mean", 0.0))
+-            judge_orders.extend(r.get("judge_order") for r in res.get("rows", []))
++    try:
++        for repo in selected:
++            repo_kwargs = dict(kwargs)
++            for key, value in repo.get("freeze_window", {}).items():
++                repo_kwargs[key] = value
++            res = run_replay(repo["repo_path"], **repo_kwargs)
++            meta = {k: v for k, v in repo.items() if k not in ("repo_path", "cleanup")}
++            per_repo.append({**meta, **res})
++            if res.get("tasks", 0) > 0:
++                composites.append(res["composite_mean"])
++                parts = res.get("composite_parts", {})
++                judge_parts.append(parts.get("judge_mean", 0.0))
++                objective_parts.append(parts.get("objective_mean", 0.0))
++                judge_orders.extend(r.get("judge_order") for r in res.get("rows", []))
++    finally:
++        if checkout_root:
++            shutil.rmtree(checkout_root, ignore_errors=True)
+ 
+     def _mean(xs):
+         return round(sum(xs) / len(xs), 3) if xs else 0.0
+ 
+-    return {
++    result = {
+         "repos": len(per_repo),
+         "scored_repos": len(composites),
+         "skipped": len(per_repo) - len(composites),
+@@ -189,3 +257,6 @@ def _mean(xs):
+         "judge_order_stats": summarize_judge_orders(judge_orders),
+         "per_repo": per_repo,
+     }
++    if repo_set_meta is not None:
++        result["repo_set"] = repo_set_meta
++    return result
+diff --git a/benchmark/taskgen.py b/benchmark/taskgen.py
+index cb2b713..d37694f 100644
+--- a/benchmark/taskgen.py
++++ b/benchmark/taskgen.py
+@@ -8,6 +8,7 @@
+ from __future__ import annotations
+ 
+ import random
++from datetime import date
+ 
+ from benchmark.freeze import _git, parse_path_list
+ 
+@@ -33,17 +34,47 @@ def revealed_window(repo: str, commits: list, idx: int, n: int) -> list:
+     return window
+ 
+ 
++def _commit_dates(repo: str) -> dict[str, str]:
++    """First-parent commit dates keyed by full SHA, oldest -> newest."""
++    out = _git(repo, "log", "--first-parent", "--reverse", "--pretty=format:%H%x09%cI", "HEAD")
++    dates = {}
++    for line in out.splitlines():
++        sha, _, commit_date = line.partition("\t")
++        if sha and commit_date:
++            dates[sha] = commit_date
++    return dates
++
++
++def _as_date(value: str | None) -> date | None:
++    if not value:
++        return None
++    return date.fromisoformat(value[:10])
++
++
+ def generate_tasks(repo: str, num_tasks: int = 3, horizon: int = 5, min_history: int = 10,
+-                   recent_bias: bool = False, rotation_seed: int | None = None) -> list:
++                   recent_bias: bool = False, rotation_seed: int | None = None,
++                   after: str | None = None, before: str | None = None) -> list:
+     """Select freeze points from history.
+ 
+     - ``recent_bias``: draw only from the most recent usable window. Recent freeze points are
+       preferred by the leakage strategy (more likely past a model's training cutoff).
+     - ``rotation_seed``: deterministically rotate which freeze points are chosen, so tasks
+       vary run-to-run and answers aren't reused. Same seed -> same picks.
++    - ``after`` / ``before``: optional inclusive date bounds (`YYYY-MM-DD`) on the freeze
++      commit, used by curated repo-set windows to keep tasks inside vetted leakage-safe spans.
+     """
+     commits = linear_history(repo)
+     usable = [i for i in range(len(commits)) if i >= min_history and i + horizon < len(commits)]
++    if after or before:
++        lower = _as_date(after)
++        upper = _as_date(before)
++        dates = _commit_dates(repo)
++        usable = [
++            i for i in usable
++            if ((d := _as_date(dates.get(commits[i]))) is not None)
++            and (lower is None or d >= lower)
++            and (upper is None or d <= upper)
++        ]
+     if not usable:
+         return []
+ 
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 3599b55..a26a569 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -111,6 +111,19 @@ tuned   = [e.source for e in rs.tuned()]
+ heldout = [e.source for e in rs.held_out()]
+ ```
+ 
++Replay execution can consume that same config directly:
++
++```bash
++python -m scripts.run_eval --repo-set path/to/curated.json --tasks 2 --horizon 5
++python -m scripts.run_eval --repo-set path/to/curated.json --held-out --tasks 2 --horizon 5
++```
++
++The runner loads the config through `load_repo_set()`, replays the selected slice (`tuned`
++by default, `held_out` with `--held-out`), and applies each entry's `freeze_window` hints
++(`recent_bias`, `rotation_seed`, `after`, `before`, `min_history`) to task selection. The
++checked-in `example.json` remains schema-valid but **must** fail at execution time because
++its `OWNER/...` sources are placeholders, not vetted repos.
++
+ ## Leakage defenses
+ 
+ Because the reference is public GitHub history, the benchmark actively resists leakage:
+diff --git a/scripts/run_eval.py b/scripts/run_eval.py
+index 0963d2c..e4cf25f 100644
+--- a/scripts/run_eval.py
++++ b/scripts/run_eval.py
+@@ -18,6 +18,8 @@ def main() -> None:
+     src.add_argument("--repo", help="path to a single local git repo to replay")
+     src.add_argument("--repos", nargs="+",
+                      help="two or more git repos to replay and aggregate into a composite_mean")
++    src.add_argument("--repo-set",
++                     help="validated repo-set JSON config to replay instead of ad-hoc repos")
+     ap.add_argument("--agent", default="agent.py", help="agent entrypoint file")
+     ap.add_argument("--baseline", default=DEFAULT_BASELINE, choices=sorted(BASELINES),
+                     help="reference opponent the challenger is judged against")
+@@ -41,7 +43,11 @@ def main() -> None:
+     ap.add_argument("--single-order-judge", action="store_true",
+                     help="ask the judge one randomized order instead of both "
+                          "(cheaper, but no position-swap consistency check)")
++    ap.add_argument("--held-out", action="store_true",
++                    help="with --repo-set, replay the held-out slice instead of tuned repos")
+     args = ap.parse_args()
++    if args.held_out and not args.repo_set:
++        ap.error("--held-out requires --repo-set")
+ 
+     common = dict(
+         agent_file=args.agent, n_tasks=args.tasks, horizon=args.horizon,
+@@ -51,7 +57,9 @@ def main() -> None:
+         w_judge=args.w_judge, w_objective=args.w_objective,
+         dual_order_judge=not args.single_order_judge,
+     )
+-    if args.repos:
++    if args.repo_set:
++        result = run_multi_replay(repo_set=args.repo_set, held_out=args.held_out, **common)
++    elif args.repos:
+         result = run_multi_replay(args.repos, **common)
+     else:
+         result = run_replay(repo_path=args.repo, **common)
+diff --git a/tests/test_leakage.py b/tests/test_leakage.py
+index c15ef06..2577a03 100644
+--- a/tests/test_leakage.py
++++ b/tests/test_leakage.py
+@@ -147,3 +147,14 @@ def test_rotation_seed_is_deterministic(monkeypatch):
+     c = taskgen.generate_tasks("x", num_tasks=4, horizon=5, rotation_seed=99)
+     assert [t["freeze_index"] for t in a] == [t["freeze_index"] for t in b]
+     assert [t["freeze_index"] for t in a] != [t["freeze_index"] for t in c]
++
++
++def test_generate_tasks_respects_after_before_bounds(monkeypatch):
++    monkeypatch.setattr(taskgen, "linear_history", lambda repo: _fake_history(20))
++    monkeypatch.setattr(taskgen, "revealed_window", lambda *a, **k: [])
++    monkeypatch.setattr(taskgen, "_commit_dates", lambda repo: {
++        f"sha{i:03d}": f"2026-01-{i + 1:02d}T00:00:00+00:00" for i in range(20)
++    })
++    tasks = taskgen.generate_tasks(
++        "x", num_tasks=10, horizon=2, min_history=2, after="2026-01-05", before="2026-01-08")
++    assert [t["freeze_index"] for t in tasks] == [4, 5, 6, 7]
+diff --git a/tests/test_multi_repo.py b/tests/test_multi_repo.py
+index bdcb6f1..3f70d43 100644
+--- a/tests/test_multi_repo.py
++++ b/tests/test_multi_repo.py
+@@ -3,6 +3,7 @@
+     VANGUARSTEW_OFFLINE=1 python -m pytest -q
+ """
+ 
++import json
+ import os
+ import shutil
+ import subprocess
+@@ -17,6 +18,7 @@
+ 
+ os.environ["VANGUARSTEW_OFFLINE"] = "1"
+ 
++from benchmark.repo_set import RepoSetError  # noqa: E402
+ from benchmark.runner import run_multi_replay, run_replay  # noqa: E402
+ 
+ AGENT = os.path.join(ROOT, "agent.py")
+@@ -34,6 +36,11 @@ def _tiny_repo(dirpath, n=16, prefix="feat"):
+     return dirpath
+ 
+ 
++def _write_repo_set(path, repos):
++    with open(path, "w", encoding="utf-8") as f:
++        json.dump({"name": "local", "description": "test", "strategy": "test", "repos": repos}, f)
++
++
+ @pytest.mark.skipif(shutil.which("git") is None, reason="git required")
+ def test_single_run_reports_composite_mean_and_parts():
+     d = _tiny_repo(tempfile.mkdtemp())
+@@ -113,3 +120,47 @@ def test_multi_repo_skips_zero_task_repo_without_diluting():
+     finally:
+         shutil.rmtree(good, ignore_errors=True)
+         shutil.rmtree(tiny, ignore_errors=True)
++
++
++@pytest.mark.skipif(shutil.which("git") is None, reason="git required")
++def test_repo_set_replay_uses_validated_config_and_tuned_slice():
++    tuned = _tiny_repo(tempfile.mkdtemp(), prefix="tuned")
++    held = _tiny_repo(tempfile.mkdtemp(), prefix="held")
++    cfg_dir = tempfile.mkdtemp()
++    cfg = os.path.join(cfg_dir, "repos.json")
++    _write_repo_set(cfg, [
++        {"name": "tuned-a", "source": tuned, "tier": "recent",
++         "freeze_window": {"min_history": 3, "rotation_seed": 5}},
++        {"name": "held-b", "source": held, "tier": "obscure", "held_out": True,
++         "freeze_window": {"min_history": 3}},
++    ])
++    try:
++        res = run_multi_replay(
++            repo_set=cfg, agent_file=AGENT, n_tasks=2, horizon=3, seed=0)
++        assert res["repo_set"] == {"path": cfg, "name": "local", "selection": "tuned"}
++        assert res["repos"] == 1 and res["scored_repos"] == 1
++        assert [r["repo_name"] for r in res["per_repo"]] == ["tuned-a"]
++        assert res["per_repo"][0]["repo"] == tuned
++        assert res["per_repo"][0]["freeze_window"] == {"min_history": 3, "rotation_seed": 5}
++
++        held_res = run_multi_replay(
++            repo_set=cfg, held_out=True, agent_file=AGENT, n_tasks=2, horizon=3, seed=0)
++        assert held_res["repo_set"]["selection"] == "held_out"
++        assert [r["repo_name"] for r in held_res["per_repo"]] == ["held-b"]
++    finally:
++        shutil.rmtree(tuned, ignore_errors=True)
++        shutil.rmtree(held, ignore_errors=True)
++        shutil.rmtree(cfg_dir, ignore_errors=True)
++
++
++def test_repo_set_replay_rejects_placeholder_sources():
++    cfg_dir = tempfile.mkdtemp()
++    cfg = os.path.join(cfg_dir, "repos.json")
++    _write_repo_set(cfg, [
++        {"name": "example", "source": "https://github.com/OWNER/example", "tier": "recent"},
++    ])
++    try:
++        with pytest.raises(RepoSetError, match="placeholder"):
++            run_multi_replay(repo_set=cfg, agent_file=AGENT, n_tasks=1, horizon=1, seed=0)
++    finally:
++        shutil.rmtree(cfg_dir, ignore_errors=True)

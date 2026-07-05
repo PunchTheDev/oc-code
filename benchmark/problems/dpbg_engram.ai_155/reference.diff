@@ -1,0 +1,1097 @@
+diff --git a/neuromorphic/src/neuromorphic/actuators/__init__.py b/neuromorphic/src/neuromorphic/actuators/__init__.py
+new file mode 100644
+index 0000000..dc9b1ec
+--- /dev/null
++++ b/neuromorphic/src/neuromorphic/actuators/__init__.py
+@@ -0,0 +1,25 @@
++"""Actuator adapters — ActuatorPlugin implementations for the neuromorphic motor loop.
++
++Exports:
++    MuJoCoActuator       — virtual body (MuJoCo physics) as an ActuatorPlugin
++    SerialServoActuator  — real servo hardware via a serial bus driver
++    ServoDriver          — Protocol for injecting hardware backends
++    NullServoDriver      — no-op driver for offline development and tests
++    SimpleSerialDriver   — minimal binary-framed serial driver (requires pyserial)
++"""
++
++from neuromorphic.actuators.mujoco_actuator import MuJoCoActuator
++from neuromorphic.actuators.serial_servo_actuator import (
++    NullServoDriver,
++    SerialServoActuator,
++    ServoDriver,
++    SimpleSerialDriver,
++)
++
++__all__ = [
++    "MuJoCoActuator",
++    "NullServoDriver",
++    "SerialServoActuator",
++    "ServoDriver",
++    "SimpleSerialDriver",
++]
+diff --git a/neuromorphic/src/neuromorphic/actuators/mujoco_actuator.py b/neuromorphic/src/neuromorphic/actuators/mujoco_actuator.py
+new file mode 100644
+index 0000000..4a0fd1b
+--- /dev/null
++++ b/neuromorphic/src/neuromorphic/actuators/mujoco_actuator.py
+@@ -0,0 +1,90 @@
++"""MuJoCoActuator — the virtual motor body as an ActuatorPlugin.
++
++Wraps MuJoCoBody.step_command() so the MuJoCo path in MotorFeedbackAdapter
++can be addressed through the standard ActuatorPlugin interface alongside real
++hardware adapters.  MotorFeedbackAdapter creates one instance per channel and
++registers it via register_plugin().
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++from typing import Any, Optional
++
++from activelearning.plugins import ActuatorPlugin, PluginCapability, RiskClass
++
++logger = logging.getLogger(__name__)
++
++
++class MuJoCoActuator(ActuatorPlugin[dict]):
++    """ActuatorPlugin backed by the MuJoCo virtual body.
++
++    Each instance is bound to a single motor channel (e.g. ``"locomotion"``,
++    ``"manipulation"``).  The body is shared across channels — callers must
++    hold any concurrency lock themselves before calling execute() if needed.
++
++    Example::
++
++        body = MuJoCoBody(steps_per_command=200, channel_actuators=cfg.channel_actuators)
++        actuator = MuJoCoActuator(body, channel="locomotion")
++        adapter.register_plugin("locomotion", actuator)
++    """
++
++    def __init__(self, body: Any, channel: str) -> None:
++        """
++        Args:
++            body: A MuJoCoBody instance (typed as Any to avoid a hard circular
++                  import; duck-typed on step_command()).
++            channel: Motor channel name this actuator drives.
++        """
++        super().__init__(
++            actuator_id=f"mujoco.{channel}",
++            name=f"MuJoCo virtual actuator — {channel}",
++            description=(
++                f"Drives MuJoCo physics joints for the '{channel}' motor channel "
++                "via step_command(). Risk class LOW — no physical hardware."
++            ),
++            envelope={"intensity": (0.0, 1.0)},
++            risk_class=RiskClass.LOW,
++        )
++        self._body = body
++        self._channel = channel
++        self.add_capability(
++            PluginCapability(
++                name="step_command",
++                description="Apply a normalised torque and advance physics one step.",
++                parameters={"intensity": "float"},
++                risk_class=RiskClass.LOW,
++            )
++        )
++
++    async def _do_execute(self, action: dict) -> bool:
++        """Run step_command() in a thread-pool executor.
++
++        Args:
++            action: Must contain ``"intensity"`` (float 0–1). Remaining keys
++                    are ignored (population-vector routing is handled by
++                    MotorFeedbackAdapter before dispatch).
++
++        Returns:
++            True when step_command() reports success; False on error.
++        """
++        intensity = float(action.get("intensity", 0.0))
++        loop = asyncio.get_running_loop()
++        try:
++            outcome: dict = await loop.run_in_executor(
++                None, self._body.step_command, self._channel, intensity
++            )
++            return bool(outcome.get("success", False))
++        except Exception as exc:
++            logger.error(
++                "MuJoCoActuator '%s' error on channel '%s': %s",
++                self.actuator_id, self._channel, exc,
++            )
++            return False
++
++    @property
++    def channel(self) -> str:
++        """Motor channel this actuator is bound to."""
++        return self._channel
+diff --git a/neuromorphic/src/neuromorphic/actuators/serial_servo_actuator.py b/neuromorphic/src/neuromorphic/actuators/serial_servo_actuator.py
+new file mode 100644
+index 0000000..4f8faf2
+--- /dev/null
++++ b/neuromorphic/src/neuromorphic/actuators/serial_servo_actuator.py
+@@ -0,0 +1,334 @@
++"""SerialServoActuator — real servo hardware as an ActuatorPlugin.
++
++Provides a path from a sim-trained motor policy to physical hardware via a
++serial bus controller.  Hardware communication is abstracted behind the
++``ServoDriver`` Protocol so the actuator is fully testable without devices.
++
++Architecture
++------------
++1. ``ServoDriver`` (Protocol) — the hardware interface.  Implement this for
++   your specific servo bus (Dynamixel, Feetech, PWM board, custom serial…).
++2. ``NullServoDriver`` — no-op stub for offline development and unit tests.
++3. ``SimpleSerialDriver`` — minimal binary-framed driver for a generic serial
++   servo controller (requires ``pyserial``; optional import).
++4. ``SerialServoActuator`` — the ActuatorPlugin that owns a ServoDriver,
++   publishes NATS heartbeats so MotorFeedbackAdapter.is_real() returns True,
++   and routes _do_execute() calls to the driver.
++
++Usage
++-----
++    from neuromorphic.actuators import SerialServoActuator, SimpleSerialDriver
++    from activelearning.plugins import register_actuator
++
++    driver = SimpleSerialDriver("/dev/ttyUSB0", baud=115200)
++    actuator = SerialServoActuator(
++        actuator_id="servo.arm",
++        channel="manipulation",
++        driver=driver,
++        servo_ids=[0, 1, 2, 3],
++    )
++    register_actuator(actuator)
++    adapter.register_plugin("manipulation", actuator)
++    await actuator.start(bus)
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import struct
++import time
++from typing import Any, Optional, Protocol, runtime_checkable
++
++from activelearning.plugins import ActuatorPlugin, PluginCapability, RiskClass
++
++logger = logging.getLogger(__name__)
++
++_HEARTBEAT_INTERVAL_S = 5.0
++
++# Default servo IDs per channel — override via servo_ids in __init__
++_DEFAULT_SERVO_IDS: dict[str, list[int]] = {
++    "manipulation": [0, 1, 2, 3],
++    "locomotion": [4, 5, 6, 7],
++    "head": [8, 9],
++}
++
++
++@runtime_checkable
++class ServoDriver(Protocol):
++    """Hardware interface for a servo bus controller.
++
++    Implement this Protocol to connect SerialServoActuator to your hardware.
++    All methods are synchronous — the actuator runs them in a thread-pool
++    executor so they do not block the asyncio event loop.
++    """
++
++    def connect(self) -> None:
++        """Open the hardware connection (serial port, I2C bus, etc.)."""
++        ...
++
++    def disconnect(self) -> None:
++        """Close the hardware connection and release resources."""
++        ...
++
++    def set_position(self, servo_id: int, angle: float, speed: float) -> bool:
++        """Send a position command to a single servo.
++
++        Args:
++            servo_id: Hardware servo ID (0-based; mapping is hardware-specific).
++            angle: Target angle in degrees (0.0 – 180.0).
++            speed: Movement speed as a fraction (0.0 = slowest, 1.0 = maximum).
++
++        Returns:
++            True if the command was acknowledged or sent without error.
++        """
++        ...
++
++    def get_position(self, servo_id: int) -> Optional[float]:
++        """Read back the current servo position in degrees.
++
++        Returns None if the hardware does not support read-back or an error
++        occurred.
++        """
++        ...
++
++
++class NullServoDriver:
++    """No-op ServoDriver for offline development and unit tests.
++
++    All commands succeed silently.  get_position() always returns None.
++    """
++
++    def connect(self) -> None:
++        pass
++
++    def disconnect(self) -> None:
++        pass
++
++    def set_position(self, servo_id: int, angle: float, speed: float) -> bool:
++        return True
++
++    def get_position(self, servo_id: int) -> Optional[float]:
++        return None
++
++
++class SimpleSerialDriver:
++    """Minimal binary-framed serial servo driver.
++
++    Frame format (8 bytes total):
++        [0xAA][servo_id:u8][angle_centideg_hi:u8][angle_centideg_lo:u8][speed_u8][checksum:u8]
++
++    ``angle_centideg`` = int(angle * 100)  so 90° → 9000 → 0x23 0x28
++    ``speed_u8``       = int(speed * 255)
++
++    checksum = (sum of bytes 1..4) & 0xFF
++
++    Requires ``pyserial`` (``pip install pyserial``).  The import is deferred
++    to ``connect()`` so the module loads without the dependency.
++    """
++
++    def __init__(self, port: str, baud: int = 115200, timeout: float = 0.05) -> None:
++        self._port = port
++        self._baud = baud
++        self._timeout = timeout
++        self._serial: Any = None
++
++    def connect(self) -> None:
++        try:
++            import serial  # type: ignore[import]
++        except ImportError as exc:
++            raise ImportError(
++                "pyserial is required for SimpleSerialDriver. "
++                "Install it with: pip install pyserial"
++            ) from exc
++        self._serial = serial.Serial(self._port, self._baud, timeout=self._timeout)
++        logger.info(
++            "SimpleSerialDriver: opened %s @ %d baud", self._port, self._baud
++        )
++
++    def disconnect(self) -> None:
++        if self._serial is not None:
++            self._serial.close()
++            self._serial = None
++
++    def set_position(self, servo_id: int, angle: float, speed: float) -> bool:
++        if self._serial is None:
++            return False
++        angle_cd = int(min(max(angle, 0.0), 180.0) * 100)   # centidegrees, 0–18000
++        speed_u8 = int(min(max(speed, 0.0), 1.0) * 255)
++        body = bytes([servo_id & 0xFF, (angle_cd >> 8) & 0xFF, angle_cd & 0xFF, speed_u8])
++        checksum = sum(body) & 0xFF
++        frame = bytes([0xAA]) + body + bytes([checksum])
++        try:
++            self._serial.write(frame)
++            return True
++        except Exception as exc:
++            logger.error("SimpleSerialDriver write error: %s", exc)
++            return False
++
++    def get_position(self, servo_id: int) -> Optional[float]:
++        return None  # read-back not in this minimal protocol
++
++
++class SerialServoActuator(ActuatorPlugin[dict]):
++    """Real-actuator adapter that drives servos via a ServoDriver.
++
++    Registers as the ActuatorPlugin for a motor channel and publishes periodic
++    NATS heartbeats (``actuator.heartbeat.{channel}``) so
++    ``MotorFeedbackAdapter.is_real(channel)`` returns True while this adapter
++    is running.  When MotorFeedbackAdapter calls execute(), the action is
++    forwarded to the underlying ServoDriver.
++
++    Action dict expected by ``_do_execute()``::
++
++        {
++            "intensity":  float,        # 0.0–1.0 → mapped to angle 0°–180° when
++                                        # "angle" is not supplied
++            "angle":      float,        # optional: direct target degrees (overrides intensity)
++            "speed":      float,        # optional: movement speed 0.0–1.0  (default 0.5)
++            "servo_ids":  list[int],    # optional: restrict to a subset of servo IDs
++        }
++    """
++
++    def __init__(
++        self,
++        actuator_id: str,
++        channel: str,
++        driver: Optional[ServoDriver] = None,
++        servo_ids: Optional[list[int]] = None,
++    ) -> None:
++        """
++        Args:
++            actuator_id: Unique plugin identifier (e.g. ``"servo.arm"``).
++            channel: Motor channel this adapter drives (e.g. ``"manipulation"``).
++            driver: Hardware backend.  Defaults to NullServoDriver (no-op).
++            servo_ids: List of hardware servo IDs to command.  Defaults to
++                ``_DEFAULT_SERVO_IDS[channel]`` or ``[0]``.
++        """
++        super().__init__(
++            actuator_id=actuator_id,
++            name=f"Servo actuator — {channel}",
++            description=(
++                f"Drives physical servo motors on the '{channel}' motor channel "
++                "via a serial bus controller."
++            ),
++            envelope={"intensity": (0.0, 1.0), "angle": (0.0, 180.0), "speed": (0.0, 1.0)},
++            risk_class=RiskClass.HIGH,
++        )
++        self._channel = channel
++        self._driver: ServoDriver = driver if driver is not None else NullServoDriver()
++        self._servo_ids: list[int] = (
++            servo_ids
++            if servo_ids is not None
++            else _DEFAULT_SERVO_IDS.get(channel, [0])
++        )
++        self._heartbeat_task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
++
++        self.add_capability(
++            PluginCapability(
++                name="set_position",
++                description="Command all channel servos to a target angle via serial bus.",
++                parameters={
++                    "intensity": "float",
++                    "angle": "float",
++                    "speed": "float",
++                },
++                risk_class=RiskClass.HIGH,
++            )
++        )
++
++    @property
++    def channel(self) -> str:
++        """Motor channel this adapter is bound to."""
++        return self._channel
++
++    async def start(self, bus: Any = None) -> None:
++        """Connect to hardware and start publishing heartbeats."""
++        loop = asyncio.get_running_loop()
++        await loop.run_in_executor(None, self._driver.connect)
++        try:
++            await super().start(bus)
++            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
++        except Exception:
++            await loop.run_in_executor(None, self._driver.disconnect)
++            raise
++        logger.info(
++            "SerialServoActuator '%s' started (channel=%s, servos=%s)",
++            self.actuator_id, self._channel, self._servo_ids,
++        )
++
++    async def stop(self) -> None:
++        """Stop heartbeat task and disconnect from hardware."""
++        if self._heartbeat_task is not None:
++            self._heartbeat_task.cancel()
++            try:
++                await self._heartbeat_task
++            except asyncio.CancelledError:
++                pass
++            self._heartbeat_task = None
++        await super().stop()
++        loop = asyncio.get_running_loop()
++        await loop.run_in_executor(None, self._driver.disconnect)
++        logger.info("SerialServoActuator '%s' stopped", self.actuator_id)
++
++    async def _do_execute(self, action: dict) -> bool:
++        """Forward the action to all channel servos via the driver.
++
++        Returns True only if every servo command succeeded.
++        """
++        intensity = float(action.get("intensity", 0.0))
++        angle = float(action.get("angle", intensity * 180.0))
++        speed = float(action.get("speed", 0.5))
++        requested = action.get("servo_ids")
++        if requested is not None:
++            target_ids = [sid for sid in requested if sid in self._servo_ids]
++            if not target_ids:
++                logger.warning(
++                    "SerialServoActuator '%s': all requested servo_ids %s are outside "
++                    "configured set %s — command ignored",
++                    self.actuator_id, list(requested), self._servo_ids,
++                )
++                return False
++        else:
++            target_ids = self._servo_ids
++
++        loop = asyncio.get_running_loop()
++        results: list[bool] = list(
++            await asyncio.gather(*[
++                loop.run_in_executor(
++                    None, self._driver.set_position, sid, angle, speed
++                )
++                for sid in target_ids
++            ])
++        )
++        failed = sum(1 for r in results if not r)
++        if failed:
++            logger.warning(
++                "SerialServoActuator '%s': %d/%d servo(s) did not respond",
++                self.actuator_id, failed, len(results),
++            )
++        return failed == 0
++
++    async def _heartbeat_loop(self) -> None:
++        """Publish ``actuator.heartbeat.{channel}`` every _HEARTBEAT_INTERVAL_S seconds.
++
++        MotorFeedbackAdapter tracks these to decide whether to route commands
++        to real hardware (is_real()) or fall back to MuJoCo simulation.
++        """
++        while True:
++            try:
++                if self._bus is not None:
++                    await self._bus.publish(
++                        f"actuator.heartbeat.{self._channel}",
++                        {
++                            "channel": self._channel,
++                            "actuator_id": self.actuator_id,
++                            "timestamp": time.time(),
++                        },
++                    )
++            except Exception as exc:
++                logger.debug(
++                    "SerialServoActuator '%s' heartbeat error: %s",
++                    self.actuator_id, exc,
++                )
++            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+diff --git a/neuromorphic/src/neuromorphic/motor_feedback_adapter.py b/neuromorphic/src/neuromorphic/motor_feedback_adapter.py
+index d129fbe..5cf8228 100644
+--- a/neuromorphic/src/neuromorphic/motor_feedback_adapter.py
++++ b/neuromorphic/src/neuromorphic/motor_feedback_adapter.py
+@@ -65,6 +65,11 @@ def __init__(self, config: MotorFeedbackConfig, event_bus: Any):
+         self._curriculum: Optional[TaskCurriculum] = None
+         self._tasks_enabled = config.tasks_enabled
+         self._physics_running = False
++        # ActuatorPlugin registry: channel → plugin.  When a plugin is
++        # registered and is_real() is True for that channel, handle_motor_command
++        # dispatches via plugin.execute() instead of publishing to motor.execute.{channel}.
++        self._actuator_plugins: dict[str, Any] = {}  # ActuatorPlugin, lazy-imported
++        self._started = False
+ 
+     async def start(self) -> None:
+         """Subscribe to actuator heartbeats and guidance commands."""
+@@ -85,6 +90,13 @@ async def start(self) -> None:
+                 "population_vector=True requires mujoco_continuous=True for per-joint "
+                 "control. Non-continuous step_command uses uniform torque."
+             )
++        for ch, plugin in self._actuator_plugins.items():
++            try:
++                await plugin.start(self._bus)
++                logger.info("Started pre-registered ActuatorPlugin for channel '%s'", ch)
++            except Exception as exc:
++                logger.error("Failed to start ActuatorPlugin for channel '%s': %s", ch, exc)
++        self._started = True
+         logger.info("MotorFeedbackAdapter started — listening for actuator heartbeats + guidance")
+ 
+     async def stop(self) -> None:
+@@ -101,6 +113,12 @@ async def stop(self) -> None:
+             await self._bus.unsubscribe(_HEARTBEAT_SUBJECT)
+         except Exception:
+             pass  # best-effort on shutdown
++        self._started = False
++        for ch, plugin in self._actuator_plugins.items():
++            try:
++                await plugin.stop()
++            except Exception as exc:
++                logger.debug("Error stopping ActuatorPlugin for channel '%s': %s", ch, exc)
+ 
+     def _ensure_mujoco(self) -> MuJoCoBody:
+         """Lazy-load MuJoCo body on first physics command."""
+@@ -112,6 +130,37 @@ def _ensure_mujoco(self) -> MuJoCoBody:
+             )
+         return self._mujoco_body
+ 
++    def register_plugin(self, channel: str, plugin: Any) -> None:
++        """Register an ActuatorPlugin for a motor channel.
++
++        When a plugin is registered for a channel and ``is_real(channel)`` is
++        True, ``handle_motor_command()`` dispatches directly through
++        ``plugin.execute()`` instead of publishing to ``motor.execute.{channel}``.
++        The NATS fallback is preserved for channels without a registered plugin.
++
++        Args:
++            channel: Motor channel name (e.g. ``"manipulation"``).
++            plugin:  The ActuatorPlugin instance to use for that channel.
++        """
++        self._actuator_plugins[channel] = plugin
++        logger.info(
++            "ActuatorPlugin registered for channel '%s': %s", channel, plugin.actuator_id
++        )
++        if self._started:
++            asyncio.create_task(self._launch_plugin(channel, plugin))
++
++    async def _launch_plugin(self, channel: str, plugin: Any) -> None:
++        """Start a plugin registered after the adapter was already started."""
++        try:
++            await plugin.start(self._bus)
++            logger.info(
++                "Started ActuatorPlugin for channel '%s' (registered post-start)", channel,
++            )
++        except Exception as exc:
++            logger.error(
++                "Failed to start ActuatorPlugin for channel '%s': %s", channel, exc,
++            )
++
+     def is_real(self, channel: str) -> bool:
+         """Check if channel has a live real actuator (heartbeat within timeout)."""
+         last_hb = self._real_channels.get(channel)
+@@ -150,17 +199,39 @@ async def handle_motor_command(
+             self._last_cmd_time[channel] = now
+ 
+         if self.is_real(channel):
+-            # Forward to real hardware — the real actuator will publish
+-            # motor.outcome.{channel} after execution.
+-            msg: dict[str, Any] = {
+-                "channel": channel,
+-                "intensity": intensity,
+-                "trace_id": trace_id,
+-            }
+-            if actuator_intensities:
+-                msg["actuator_intensities"] = actuator_intensities
+-            await self._bus.publish(f"motor.execute.{channel}", msg)
+-            logger.debug("Motor command forwarded to real actuator: %s", channel)
++            plugin = self._actuator_plugins.get(channel)
++            if plugin is not None:
++                # Dispatch directly through the ActuatorPlugin interface.
++                # Lazy import so the module loads without the activelearning SDK.
++                from activelearning.core import ActionProposal, generate_trace_id  # noqa: PLC0415
++                action: dict[str, Any] = {"channel": channel, "intensity": intensity}
++                if actuator_intensities:
++                    action["actuator_intensities"] = actuator_intensities
++                proposal: ActionProposal = ActionProposal(
++                    trace_id=trace_id or generate_trace_id(),
++                    provenance=f"motor.{channel}",
++                    action=action,
++                )
++                outcome_obj = await plugin.execute(proposal)
++                motor_outcome: dict[str, Any] = {
++                    "channel": channel,
++                    "success": outcome_obj.success,
++                    "confidence": 0.9 if outcome_obj.success else 0.1,
++                    "proprioceptive_state": [],
++                    "error_magnitude": 0.0 if outcome_obj.success else 1.0,
++                }
++                await self._bus.publish(f"motor.outcome.{channel}", motor_outcome)
++            else:
++                # Fallback: publish to NATS for an external hardware process.
++                msg: dict[str, Any] = {
++                    "channel": channel,
++                    "intensity": intensity,
++                    "trace_id": trace_id,
++                }
++                if actuator_intensities:
++                    msg["actuator_intensities"] = actuator_intensities
++                await self._bus.publish(f"motor.execute.{channel}", msg)
++            logger.debug("Motor command routed to real actuator: %s", channel)
+             return
+ 
+         # Virtual body simulation
+diff --git a/neuromorphic/tests/test_actuator_adapters.py b/neuromorphic/tests/test_actuator_adapters.py
+new file mode 100644
+index 0000000..45607b3
+--- /dev/null
++++ b/neuromorphic/tests/test_actuator_adapters.py
+@@ -0,0 +1,426 @@
++"""Tests for ActuatorPlugin adapters and MotorFeedbackAdapter routing.
++
++Covers:
++1. MuJoCoActuator — metadata, successful execution, error handling
++2. SerialServoActuator — metadata, execution, heartbeat publication
++3. NullServoDriver and ServoDriver Protocol conformance
++4. MotorFeedbackAdapter.register_plugin() — plugin path vs NATS fallback
++"""
++
++from __future__ import annotations
++
++# ---------------------------------------------------------------------------
++# Bootstrap activelearning SDK submodules without triggering __init__.py.
++# The neuromorphic venv doesn't install aiohttp/qdrant (pulled in by the
++# activelearning __init__), but activelearning.core / .nats_client / .plugins
++# work fine once the package namespace is registered with the correct __path__.
++# ---------------------------------------------------------------------------
++import os
++import sys
++import types as _types
++
++_SDK_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "sdk", "src"))
++if "activelearning" not in sys.modules:
++    _al_pkg = _types.ModuleType("activelearning")
++    _al_pkg.__path__ = [os.path.join(_SDK_SRC, "activelearning")]  # type: ignore[attr-defined]
++    _al_pkg.__package__ = "activelearning"
++    sys.modules["activelearning"] = _al_pkg
++if _SDK_SRC not in sys.path:
++    sys.path.insert(0, _SDK_SRC)
++
++# ---------------------------------------------------------------------------
++
++import asyncio
++import time
++from typing import Any, Optional
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from activelearning.core import ActionProposal
++from activelearning.plugins import RiskClass
++from neuromorphic.actuators.mujoco_actuator import MuJoCoActuator
++from neuromorphic.actuators.serial_servo_actuator import (
++    NullServoDriver,
++    SerialServoActuator,
++    ServoDriver,
++)
++from neuromorphic.motor_feedback_adapter import MotorFeedbackAdapter
++
++
++# ---------------------------------------------------------------------------
++# Shared helpers
++# ---------------------------------------------------------------------------
++
++
++def _run(coro):
++    return asyncio.run(coro)
++
++
++class _FakeBus:
++    """Minimal event bus stub — records published subjects and payloads."""
++
++    def __init__(self):
++        self.published: list[tuple[str, Any]] = []
++        self._subs: dict[str, Any] = {}
++
++    async def publish(self, subject: str, data: Any) -> None:
++        self.published.append((subject, data))
++
++    async def subscribe(self, subject: str, handler) -> None:
++        self._subs[subject] = handler
++
++    async def unsubscribe(self, subject: str) -> None:
++        self._subs.pop(subject, None)
++
++    def subjects(self) -> list[str]:
++        return [s for s, _ in self.published]
++
++
++# ---------------------------------------------------------------------------
++# MuJoCoActuator
++# ---------------------------------------------------------------------------
++
++
++class _FakeMuJoCoBody:
++    """Minimal MuJoCoBody stub for unit tests."""
++
++    def __init__(self, success: bool = True, raise_on_call: bool = False):
++        self._success = success
++        self._raise = raise_on_call
++        self.calls: list[tuple[str, float]] = []
++
++    def step_command(self, channel: str, intensity: float) -> dict:
++        if self._raise:
++            raise RuntimeError("simulated body crash")
++        self.calls.append((channel, intensity))
++        return {"channel": channel, "success": self._success, "confidence": 0.8}
++
++
++class TestMuJoCoActuator:
++    def test_metadata(self):
++        body = _FakeMuJoCoBody()
++        act = MuJoCoActuator(body, "locomotion")
++        meta = act.describe()
++        assert meta.actuator_id == "mujoco.locomotion"
++        assert meta.risk_class == RiskClass.LOW
++        assert "intensity" in meta.envelope
++        assert meta.envelope["intensity"] == (0.0, 1.0)
++        assert len(meta.capabilities) == 1
++
++    def test_channel_property(self):
++        act = MuJoCoActuator(_FakeMuJoCoBody(), "manipulation")
++        assert act.channel == "manipulation"
++
++    def test_execute_success(self):
++        body = _FakeMuJoCoBody(success=True)
++        act = MuJoCoActuator(body, "locomotion")
++        # Wire up a fake bus so execute() can publish the outcome
++        bus = _FakeBus()
++        act._bus = bus
++
++        proposal = ActionProposal(
++            trace_id="t-1",
++            provenance="motor.locomotion",
++            action={"intensity": 0.6},
++        )
++        outcome = _run(act.execute(proposal))
++
++        assert outcome.success is True
++        assert body.calls == [("locomotion", 0.6)]
++        assert any("outcome" in s for s in bus.subjects())
++
++    def test_execute_body_failure(self):
++        body = _FakeMuJoCoBody(success=False)
++        act = MuJoCoActuator(body, "locomotion")
++        act._bus = _FakeBus()
++
++        proposal = ActionProposal(
++            trace_id="t-2",
++            provenance="motor.locomotion",
++            action={"intensity": 0.3},
++        )
++        outcome = _run(act.execute(proposal))
++        assert outcome.success is False
++
++    def test_execute_body_exception_returns_false(self):
++        body = _FakeMuJoCoBody(raise_on_call=True)
++        act = MuJoCoActuator(body, "locomotion")
++        act._bus = _FakeBus()
++
++        proposal = ActionProposal(
++            trace_id="t-3",
++            provenance="motor.locomotion",
++            action={"intensity": 0.5},
++        )
++        outcome = _run(act.execute(proposal))
++        # MuJoCoActuator catches the exception and returns success=False
++        assert outcome.success is False
++
++    def test_missing_intensity_defaults_to_zero(self):
++        body = _FakeMuJoCoBody()
++        act = MuJoCoActuator(body, "head")
++        act._bus = _FakeBus()
++
++        proposal = ActionProposal(
++            trace_id="t-4",
++            provenance="motor.head",
++            action={},  # no "intensity" key
++        )
++        _run(act.execute(proposal))
++        assert body.calls == [("head", 0.0)]
++
++
++# ---------------------------------------------------------------------------
++# ServoDriver Protocol conformance
++# ---------------------------------------------------------------------------
++
++
++class TestNullServoDriver:
++    def test_is_servo_driver(self):
++        driver = NullServoDriver()
++        assert isinstance(driver, ServoDriver)
++
++    def test_set_position_always_succeeds(self):
++        driver = NullServoDriver()
++        driver.connect()
++        assert driver.set_position(0, 90.0, 0.5) is True
++        assert driver.set_position(1, 0.0, 1.0) is True
++
++    def test_get_position_returns_none(self):
++        driver = NullServoDriver()
++        assert driver.get_position(0) is None
++
++    def test_disconnect_is_idempotent(self):
++        driver = NullServoDriver()
++        driver.connect()
++        driver.disconnect()
++        driver.disconnect()  # second call must not raise
++
++
++# ---------------------------------------------------------------------------
++# SerialServoActuator
++# ---------------------------------------------------------------------------
++
++
++class _RecordingDriver:
++    """ServoDriver that records all set_position calls."""
++
++    def __init__(self, succeed: bool = True):
++        self._succeed = succeed
++        self.connected = False
++        self.calls: list[tuple[int, float, float]] = []
++
++    def connect(self) -> None:
++        self.connected = True
++
++    def disconnect(self) -> None:
++        self.connected = False
++
++    def set_position(self, servo_id: int, angle: float, speed: float) -> bool:
++        self.calls.append((servo_id, angle, speed))
++        return self._succeed
++
++    def get_position(self, servo_id: int) -> Optional[float]:
++        return None
++
++
++class TestSerialServoActuator:
++    def test_metadata(self):
++        act = SerialServoActuator("servo.arm", "manipulation", NullServoDriver(), [0, 1])
++        meta = act.describe()
++        assert meta.actuator_id == "servo.arm"
++        assert meta.risk_class == RiskClass.HIGH
++        assert "angle" in meta.envelope
++        assert meta.envelope["angle"] == (0.0, 180.0)
++
++    def test_channel_property(self):
++        act = SerialServoActuator("servo.leg", "locomotion")
++        assert act.channel == "locomotion"
++
++    def test_execute_all_servos_commanded(self):
++        driver = _RecordingDriver(succeed=True)
++        act = SerialServoActuator("servo.arm", "manipulation", driver, [0, 1, 2])
++        act._bus = _FakeBus()
++
++        proposal = ActionProposal(
++            trace_id="t-10",
++            provenance="motor.manipulation",
++            action={"intensity": 0.5},  # → angle = 90°
++        )
++        outcome = _run(act.execute(proposal))
++
++        assert outcome.success is True
++        assert len(driver.calls) == 3
++        for sid, angle, speed in driver.calls:
++            assert angle == pytest.approx(90.0)
++            assert speed == pytest.approx(0.5)
++
++    def test_execute_direct_angle_override(self):
++        driver = _RecordingDriver()
++        act = SerialServoActuator("servo.arm", "manipulation", driver, [0])
++        act._bus = _FakeBus()
++
++        proposal = ActionProposal(
++            trace_id="t-11",
++            provenance="motor.manipulation",
++            action={"intensity": 1.0, "angle": 45.0, "speed": 0.8},
++        )
++        _run(act.execute(proposal))
++
++        assert driver.calls[0] == (0, 45.0, 0.8)
++
++    def test_execute_partial_servo_failure(self):
++        driver = _RecordingDriver(succeed=False)
++        act = SerialServoActuator("servo.arm", "manipulation", driver, [0, 1])
++        act._bus = _FakeBus()
++
++        proposal = ActionProposal(
++            trace_id="t-12",
++            provenance="motor.manipulation",
++            action={"intensity": 0.5},
++        )
++        outcome = _run(act.execute(proposal))
++        assert outcome.success is False
++
++    def test_execute_subset_servo_ids(self):
++        driver = _RecordingDriver()
++        act = SerialServoActuator("servo.arm", "manipulation", driver, [0, 1, 2, 3])
++        act._bus = _FakeBus()
++
++        proposal = ActionProposal(
++            trace_id="t-13",
++            provenance="motor.manipulation",
++            action={"intensity": 0.3, "servo_ids": [1, 3]},
++        )
++        _run(act.execute(proposal))
++
++        commanded_ids = [sid for sid, _, _ in driver.calls]
++        assert commanded_ids == [1, 3]
++
++    def test_default_servo_ids_by_channel(self):
++        act = SerialServoActuator("servo.head", "head")
++        assert act._servo_ids == [8, 9]
++
++    def test_heartbeat_published_when_bus_set(self):
++        bus = _FakeBus()
++        act = SerialServoActuator("servo.arm", "manipulation", NullServoDriver(), [0])
++        act._bus = bus
++
++        async def _one_tick():
++            # Manually invoke the heartbeat body (avoid running the full loop task)
++            await bus.publish(
++                f"actuator.heartbeat.{act._channel}",
++                {"channel": act._channel, "actuator_id": act.actuator_id,
++                 "timestamp": time.time()},
++            )
++
++        _run(_one_tick())
++        assert any("actuator.heartbeat.manipulation" in s for s in bus.subjects())
++
++
++# ---------------------------------------------------------------------------
++# MotorFeedbackAdapter — plugin routing
++# ---------------------------------------------------------------------------
++
++
++class _FakeMotorFeedbackConfig:
++    """Minimal MotorFeedbackConfig substitute."""
++    motor_rate_limit_hz: float = 0.0
++    heartbeat_timeout_s: float = 30.0
++    mujoco_continuous: bool = False
++    population_vector: bool = False
++    tasks_enabled: bool = False
++    pain_enabled: bool = False
++    mujoco_physics_hz: float = 50.0
++    mujoco_proprio_hz: float = 10.0
++    mujoco_viz_hz: float = 5.0
++    virtual_delay_ms: int = 0
++    channel_actuators: dict = {}
++
++
++class _AlwaysSuccessPlugin:
++    """Minimal ActuatorPlugin stub used to verify routing."""
++
++    def __init__(self):
++        self.actuator_id = "stub.plugin"
++        self.calls: list[ActionProposal] = []
++
++    async def execute(self, proposal) -> Any:
++        self.calls.append(proposal)
++
++        class _Outcome:
++            success = True
++
++        return _Outcome()
++
++
++class TestMotorFeedbackAdapterPluginRouting:
++    def _make_adapter(self) -> tuple[MotorFeedbackAdapter, _FakeBus]:
++        bus = _FakeBus()
++        cfg = _FakeMotorFeedbackConfig()
++        adapter = MotorFeedbackAdapter(cfg, bus)  # type: ignore[arg-type]
++        return adapter, bus
++
++    def test_register_plugin_stores_plugin(self):
++        adapter, _ = self._make_adapter()
++        plugin = _AlwaysSuccessPlugin()
++        adapter.register_plugin("manipulation", plugin)
++        assert adapter._actuator_plugins["manipulation"] is plugin
++
++    def test_plugin_receives_command_when_real(self):
++        adapter, bus = self._make_adapter()
++        plugin = _AlwaysSuccessPlugin()
++        adapter.register_plugin("manipulation", plugin)
++        # Simulate a live heartbeat so is_real() returns True
++        adapter._real_channels["manipulation"] = time.time()
++
++        _run(adapter.handle_motor_command("manipulation", 0.7, trace_id="t-20"))
++
++        assert len(plugin.calls) == 1
++        assert plugin.calls[0].action["intensity"] == pytest.approx(0.7)
++        # Outcome must be published for the brain to consume
++        assert any("motor.outcome.manipulation" in s for s in bus.subjects())
++        # Must NOT fall back to the NATS relay
++        assert not any("motor.execute" in s for s in bus.subjects())
++
++    def test_nats_fallback_when_no_plugin_registered(self):
++        adapter, bus = self._make_adapter()
++        # Real channel but no plugin registered → NATS relay
++        adapter._real_channels["manipulation"] = time.time()
++
++        _run(adapter.handle_motor_command("manipulation", 0.4, trace_id="t-21"))
++
++        assert any("motor.execute.manipulation" in s for s in bus.subjects())
++
++    def test_no_real_channel_routes_to_mujoco(self):
++        adapter, bus = self._make_adapter()
++        plugin = _AlwaysSuccessPlugin()
++        adapter.register_plugin("locomotion", plugin)
++        # No heartbeat → is_real() is False → plugin must NOT be called
++
++        with patch.object(adapter, "_ensure_mujoco") as mock_mujoco:
++            mock_body = MagicMock()
++            mock_body.step_command.return_value = {
++                "channel": "locomotion",
++                "success": True,
++                "confidence": 0.8,
++                "proprioceptive_state": [],
++                "error_magnitude": 0.0,
++            }
++            mock_mujoco.return_value = mock_body
++            _run(adapter.handle_motor_command("locomotion", 0.5, trace_id="t-22"))
++
++        assert len(plugin.calls) == 0  # plugin not invoked
++        assert any("motor.outcome.locomotion" in s for s in bus.subjects())
++
++    def test_register_plugin_logs_on_overwrite(self, caplog):
++        import logging
++        adapter, _ = self._make_adapter()
++        p1 = _AlwaysSuccessPlugin()
++        p2 = _AlwaysSuccessPlugin()
++        p2.actuator_id = "stub.plugin.2"
++        adapter.register_plugin("head", p1)
++        with caplog.at_level(logging.INFO, logger="neuromorphic.motor_feedback_adapter"):
++            adapter.register_plugin("head", p2)
++        assert adapter._actuator_plugins["head"] is p2
+diff --git a/neuromorphic/tests/test_device_pipeline.py b/neuromorphic/tests/test_device_pipeline.py
+index 4990fa1..4605c19 100644
+--- a/neuromorphic/tests/test_device_pipeline.py
++++ b/neuromorphic/tests/test_device_pipeline.py
+@@ -30,7 +30,14 @@ def _load_module(name: str, path: str):
+ # Pre-load modules that have SDK-free code
+ sys.path.insert(0, os.path.join(_ROOT, "sensory-gateway"))
+ 
+-# Kernel evaluator needs its SDK types — mock them before import
++# Kernel evaluator needs its SDK types — mock them before import.
++# Save existing sys.modules entries so tearDownModule() can restore them,
++# preventing this fake from leaking into other test modules.
++_prior_modules: dict = {
++    "activelearning": sys.modules.get("activelearning"),
++    "activelearning.core": sys.modules.get("activelearning.core"),
++}
++
+ _mock_core = type(sys)("activelearning.core")
+ 
+ 
+@@ -64,9 +71,23 @@ def __init__(self, risk_score=0.0, flags=None):
+         self.recommendations = []
+ 
+ 
++class _FakeActionProposal:
++    """Minimal ActionProposal stub — satisfies lazy imports in motor_feedback_adapter."""
++    def __init__(self, trace_id: str = "", provenance: str = "", action=None, **kw):
++        self.trace_id = trace_id
++        self.provenance = provenance
++        self.action = action or {}
++
++
++def _fake_generate_trace_id() -> str:
++    return "fake-trace-id"
++
++
+ _mock_core.KernelDecisionType = _FakeDecisionType
+ _mock_core.KernelDecision = _FakeDecision
+ _mock_core.RiskAnalysis = _FakeRiskAnalysis
++_mock_core.ActionProposal = _FakeActionProposal
++_mock_core.generate_trace_id = _fake_generate_trace_id
+ _mock_core.current_timestamp = lambda: int(time.time() * 1000)
+ _mock_core.generate_trace_id = lambda: str(uuid.uuid4())
+ 
+@@ -90,6 +111,21 @@ def __init__(self, risk_score=0.0, flags=None):
+ DecisionType = _FakeDecisionType
+ 
+ 
++def tearDownModule() -> None:
++    """Restore sys.modules to the state before this file was imported.
++
++    The module-level fake install above runs at collection time and would
++    otherwise leave _mock_core in sys.modules for the rest of the pytest
++    session, causing ImportError in any test that lazily imports a symbol
++    (e.g. ActionProposal) that the fake doesn't define.
++    """
++    for key, prior in _prior_modules.items():
++        if prior is None:
++            sys.modules.pop(key, None)
++        else:
++            sys.modules[key] = prior
++
++
+ # ===== Discovery: KNOWN_DEVICE_TYPES =====
+ 
+ class TestDiscoveryKnownTypes(unittest.TestCase):

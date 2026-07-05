@@ -1,0 +1,974 @@
+diff --git a/release-notes/CREDITS-2.x b/release-notes/CREDITS-2.x
+index afa45fd5fb..b240f8e114 100644
+--- a/release-notes/CREDITS-2.x
++++ b/release-notes/CREDITS-2.x
+@@ -150,6 +150,8 @@ Chris Cleveland:
+ Benson Margulies:
+   * Reported #467: Unwanted POJO's embedded in tree via serialization to tree
+    (2.4.0)
++  * Reported #562: Allow `@JsonAnySetter` to flow through Creators
++   (2.18.0)
+   * Reported #601: ClassCastException for a custom serializer for enum key in `EnumMap`
+    (2.4.4)
+   * Contributed 944: Failure to use custom deserializer for key deserializer
+diff --git a/release-notes/VERSION-2.x b/release-notes/VERSION-2.x
+index 883e084301..c761d4760e 100644
+--- a/release-notes/VERSION-2.x
++++ b/release-notes/VERSION-2.x
+@@ -6,6 +6,9 @@ Project: jackson-databind
+ 
+ 2.18.0 (not yet released)
+ 
++#562: Allow `@JsonAnySetter` to flow through Creators
++ (reported by Benson M)
++ (fix by Joo-Hyuk K)
+ #806: Problem with `NamingStrategy`, creator methods with implicit names
+ #2977: Incompatible `FAIL_ON_MISSING_PRIMITIVE_PROPERTIES` and
+   field level `@JsonProperty`
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/BasicDeserializerFactory.java b/src/main/java/com/fasterxml/jackson/databind/deser/BasicDeserializerFactory.java
+index 71a0f635ee..ec99b8f7f7 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/BasicDeserializerFactory.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/BasicDeserializerFactory.java
+@@ -508,12 +508,22 @@ private void _addSelectedPropertiesBasedCreator(DeserializationContext ctxt,
+     {
+         final int paramCount = candidate.paramCount();
+         SettableBeanProperty[] properties = new SettableBeanProperty[paramCount];
++        int anySetterIx = -1;
+ 
+         for (int i = 0; i < paramCount; ++i) {
+             JacksonInject.Value injectId = candidate.injection(i);
+             AnnotatedParameter param = candidate.parameter(i);
+             PropertyName name = candidate.paramName(i);
+-            if (name == null) {
++            boolean isAnySetter = Boolean.TRUE.equals(ctxt.getAnnotationIntrospector().hasAnySetter(param));
++            if (isAnySetter) {
++                if (anySetterIx >= 0) {
++                    ctxt.reportBadTypeDefinition(beanDesc,
++                            "More than one 'any-setter' specified (parameter #%d vs #%d)",
++                            anySetterIx, i);
++                } else {
++                    anySetterIx = i;
++                }
++            } else if (name == null) {
+                 // 21-Sep-2017, tatu: Looks like we want to block accidental use of Unwrapped,
+                 //   as that will not work with Creators well at all
+                 NameTransformer unwrapper = ctxt.getAnnotationIntrospector().findUnwrappingNameTransformer(param);
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializer.java b/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializer.java
+index cf744fe359..c36823415c 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializer.java
+@@ -415,7 +415,9 @@ protected Object _deserializeUsingPropertyBased(final JsonParser p, final Deseri
+         throws IOException
+     {
+         final PropertyBasedCreator creator = _propertyBasedCreator;
+-        PropertyValueBuffer buffer = creator.startBuilding(p, ctxt, _objectIdReader);
++        PropertyValueBuffer buffer = (_anySetter != null)
++            ? creator.startBuildingWithAnySetter(p, ctxt, _objectIdReader, _anySetter)
++            : creator.startBuilding(p, ctxt, _objectIdReader);
+         TokenBuffer unknown = null;
+         final Class<?> activeView = _needViewProcesing ? ctxt.getActiveView() : null;
+ 
+@@ -429,15 +431,15 @@ protected Object _deserializeUsingPropertyBased(final JsonParser p, final Deseri
+             if (buffer.readIdProperty(propName) && creatorProp == null) {
+                 continue;
+             }
+-            // creator property?
++            // Creator property?
+             if (creatorProp != null) {
+-                // Last creator property to set?
+                 Object value;
+                 if ((activeView != null) && !creatorProp.visibleInView(activeView)) {
+                     p.skipChildren();
+                     continue;
+                 }
+                 value = _deserializeWithErrorWrapping(p, ctxt, creatorProp);
++                // Last creator property to set?
+                 if (buffer.assignParameter(creatorProp, value)) {
+                     p.nextToken(); // to move to following FIELD_NAME/END_OBJECT
+                     Object bean;
+@@ -497,7 +499,7 @@ protected Object _deserializeUsingPropertyBased(final JsonParser p, final Deseri
+             // "any property"?
+             if (_anySetter != null) {
+                 try {
+-                    buffer.bufferAnyProperty(_anySetter, propName, _anySetter.deserialize(p, ctxt));
++                    buffer.bufferAnyParameterProperty(_anySetter, propName, _anySetter.deserialize(p, ctxt));
+                 } catch (Exception e) {
+                     wrapAndThrow(e, _beanType.getRawClass(), propName, ctxt);
+                 }
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java b/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java
+index 03f4d26f42..80d9d492c2 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerFactory.java
+@@ -543,9 +543,9 @@ protected void addBeanProps(DeserializationContext ctxt,
+         }
+ 
+         // Also, do we have a fallback "any" setter?
+-        AnnotatedMember anySetter = beanDesc.findAnySetterAccessor();
++        SettableAnyProperty anySetter = _resolveAnySetter(ctxt, beanDesc, creatorProps);
+         if (anySetter != null) {
+-            builder.setAnySetter(constructAnySetter(ctxt, beanDesc, anySetter));
++            builder.setAnySetter(anySetter);
+         } else {
+             // 23-Jan-2018, tatu: although [databind#1805] would suggest we should block
+             //   properties regardless, for now only consider unless there's any setter...
+@@ -661,6 +661,29 @@ protected void addBeanProps(DeserializationContext ctxt,
+         }
+     }
+ 
++    // since 2.18
++    private SettableAnyProperty _resolveAnySetter(DeserializationContext ctxt,
++              BeanDescription beanDesc, SettableBeanProperty[] creatorProps)
++            throws JsonMappingException
++    {
++        // Find the regular method/field level any-setter
++        AnnotatedMember anySetter = beanDesc.findAnySetterAccessor();
++        if (anySetter != null) {
++            return constructAnySetter(ctxt, beanDesc, anySetter);
++        }
++        // else look for any-setter via @JsonCreator
++        if (creatorProps != null) {
++            for (SettableBeanProperty prop : creatorProps) {
++                AnnotatedMember member = prop.getMember();
++                if (member != null && Boolean.TRUE.equals(ctxt.getAnnotationIntrospector().hasAnySetter(member))) {
++                    return constructAnySetter(ctxt, beanDesc, member);
++                }
++            }
++        }
++        // not found, that's fine, too
++        return null;
++    }
++
+     private boolean _isSetterlessType(Class<?> rawType) {
+         // May also need to consider getters
+         // for Map/Collection properties; but with lowest precedence
+@@ -795,25 +818,30 @@ protected void addInjectables(DeserializationContext ctxt,
+      * for handling unknown bean properties, given a method that
+      * has been designated as such setter.
+      *
+-     * @param mutator Either 2-argument method (setter, with key and value), or Field
+-     *     that contains Map; either way accessor used for passing "any values"
++     * @param mutator Either a 2-argument method (setter, with key and value),
++     *    or a Field or (as of 2.18) Constructor Parameter of type Map or JsonNode/Object;
++     *    either way accessor used for passing "any values"
+      */
+     @SuppressWarnings("unchecked")
+     protected SettableAnyProperty constructAnySetter(DeserializationContext ctxt,
+             BeanDescription beanDesc, AnnotatedMember mutator)
+         throws JsonMappingException
+     {
+-        //find the java type based on the annotated setter method or setter field
++        // find the java type based on the annotated setter method or setter field
+         BeanProperty prop;
+         JavaType keyType;
+         JavaType valueType;
+         final boolean isField = mutator instanceof AnnotatedField;
++        // [databind#562] Allow @JsonAnySetter on Creator constructor
++        final boolean isParameter = mutator instanceof AnnotatedParameter;
++        int parameterIndex = -1;
+ 
+         if (mutator instanceof AnnotatedMethod) {
+             // we know it's a 2-arg method, second arg is the value
+             AnnotatedMethod am = (AnnotatedMethod) mutator;
+             keyType = am.getParameterType(0);
+             valueType = am.getParameterType(1);
++            // Need to resolve for possible generic types (like Maps, Collections)
+             valueType = resolveMemberAndTypeAnnotations(ctxt, mutator, valueType);
+             prop = new BeanProperty.Std(PropertyName.construct(mutator.getName()),
+                     valueType, null, mutator,
+@@ -848,11 +876,43 @@ protected SettableAnyProperty constructAnySetter(DeserializationContext ctxt,
+                         "Unsupported type for any-setter: %s -- only support `Map`s, `JsonNode` and `ObjectNode` ",
+                         ClassUtil.getTypeDescription(fieldType)));
+             }
++        } else if (isParameter) {
++            AnnotatedParameter af = (AnnotatedParameter) mutator;
++            JavaType paramType = af.getType();
++            parameterIndex = af.getIndex();
++
++            if (paramType.isMapLikeType()) {
++                paramType = resolveMemberAndTypeAnnotations(ctxt, mutator, paramType);
++                keyType = paramType.getKeyType();
++                valueType = paramType.getContentType();
++                prop = new BeanProperty.Std(PropertyName.construct(mutator.getName()),
++                        paramType, null, mutator, PropertyMetadata.STD_OPTIONAL);
++            } else if (paramType.hasRawClass(JsonNode.class) || paramType.hasRawClass(ObjectNode.class)) {
++                paramType = resolveMemberAndTypeAnnotations(ctxt, mutator, paramType);
++                // Deserialize is individual values of ObjectNode, not full ObjectNode, so:
++                valueType = ctxt.constructType(JsonNode.class);
++                prop = new BeanProperty.Std(PropertyName.construct(mutator.getName()),
++                        paramType, null, mutator, PropertyMetadata.STD_OPTIONAL);
++
++                // Unlike with more complicated types, here we do not allow any annotation
++                // overrides etc but instead short-cut handling:
++                return SettableAnyProperty.constructForJsonNodeParameter(ctxt, prop, mutator, valueType,
++                        ctxt.findRootValueDeserializer(valueType), parameterIndex);
++            } else {
++                return ctxt.reportBadDefinition(beanDesc.getType(), String.format(
++                    "Unsupported type for any-setter: %s -- only support `Map`s, `JsonNode` and `ObjectNode` ",
++                    ClassUtil.getTypeDescription(paramType)));
++            }
+         } else {
+             return ctxt.reportBadDefinition(beanDesc.getType(), String.format(
+                     "Unrecognized mutator type for any-setter: %s",
+                     ClassUtil.nameOf(mutator.getClass())));
+         }
++
++        // NOTE: code from now on is for `Map` valued Any properties (JsonNode/ObjectNode
++        // already returned; unsupported types threw Exception), if we have Field/Ctor-Parameter
++        // any-setter -- or, basically Any supported type (if Method)
++
+         // First: see if there are explicitly specified
+         // and then possible direct deserializer override on accessor
+         KeyDeserializer keyDeser = findKeyDeserializerFromAnnotation(ctxt, mutator);
+@@ -880,6 +940,10 @@ protected SettableAnyProperty constructAnySetter(DeserializationContext ctxt,
+             return SettableAnyProperty.constructForMapField(ctxt,
+                     prop, mutator, valueType, keyDeser, deser, typeDeser);
+         }
++        if (isParameter) {
++            return SettableAnyProperty.constructForMapParameter(ctxt,
++                    prop, mutator, valueType, keyDeser, deser, typeDeser, parameterIndex);
++        }
+         return SettableAnyProperty.constructForMethod(ctxt,
+                 prop, mutator, valueType, keyDeser, deser, typeDeser);
+     }
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/SettableAnyProperty.java b/src/main/java/com/fasterxml/jackson/databind/deser/SettableAnyProperty.java
+index b7aafa205b..0cb738ada7 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/SettableAnyProperty.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/SettableAnyProperty.java
+@@ -1,8 +1,10 @@
+ package com.fasterxml.jackson.databind.deser;
+ 
+ import java.io.IOException;
++import java.util.HashMap;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
++import java.util.Objects;
+ 
+ import com.fasterxml.jackson.core.*;
+ import com.fasterxml.jackson.databind.*;
+@@ -117,6 +119,31 @@ public static SettableAnyProperty constructForJsonNodeField(DeserializationConte
+                 ctxt.getNodeFactory());
+     }
+ 
++    /**
++     * @since 2.18
++     */
++    public static SettableAnyProperty constructForMapParameter(DeserializationContext ctxt,
++            BeanProperty property, AnnotatedMember field, JavaType valueType, KeyDeserializer keyDeser,
++            JsonDeserializer<Object> valueDeser, TypeDeserializer typeDeser, int parameterIndex
++    ) {
++        Class<?> mapType = field.getRawType();
++        // 02-Aug-2022, tatu: Ideally would be resolved to a concrete type by caller but
++        //    alas doesn't appear to happen. Nor does `BasicDeserializerFactory` expose method
++        //    for finding default or explicit mappings.
++        if (mapType == Map.class) {
++            mapType = LinkedHashMap.class;
++        }
++        ValueInstantiator vi = JDKValueInstantiators.findStdValueInstantiator(ctxt.getConfig(), mapType);
++        return new MapParameterAnyProperty(property, field, valueType, keyDeser, valueDeser, typeDeser, vi, parameterIndex);
++    }
++
++    public static SettableAnyProperty constructForJsonNodeParameter(DeserializationContext ctxt, BeanProperty prop,
++            AnnotatedMember mutator, JavaType valueType, JsonDeserializer<Object> valueDeser, int parameterIndex
++    ) {
++        return new JsonNodeParameterAnyProperty(prop, mutator, valueType, valueDeser, ctxt.getNodeFactory(), parameterIndex);
++    }
++
++
+     // Abstract @since 2.14
+     public abstract SettableAnyProperty withValueDeserializer(JsonDeserializer<Object> deser);
+ 
+@@ -159,6 +186,23 @@ Object readResolve() {
+      */
+     public String getPropertyName() { return _property.getName(); }
+ 
++    /**
++     * Accessor for parameterIndex.
++     * @return -1 if not a parameterized setter, otherwise index of parameter
++     *
++     * @since 2.18
++     */
++    public int getParameterIndex() { return -1; }
++
++    /**
++     * Create an instance of value to pass through Creator parameter.
++     *
++     * @since 2.18
++     */
++    public Object createParameterObject() {
++        throw new UnsupportedOperationException("Cannot call createParameterObject() on " + getClass().getName());
++    }
++
+     /*
+     /**********************************************************
+     /* Public API, deserialization
+@@ -437,4 +481,102 @@ public SettableAnyProperty withValueDeserializer(JsonDeserializer<Object> deser)
+             return this;
+         }
+     }
++
++
++    /**
++     * [databind#562] Allow @JsonAnySetter on Creator constructor
++     *
++     * @since 2.18
++     */
++    protected static class MapParameterAnyProperty extends SettableAnyProperty
++        implements java.io.Serializable
++    {
++        private static final long serialVersionUID = 1L;
++
++        protected final ValueInstantiator _valueInstantiator;
++
++        protected final int _parameterIndex;
++
++        public MapParameterAnyProperty(BeanProperty property, AnnotatedMember field, JavaType valueType,
++                KeyDeserializer keyDeser, JsonDeserializer<Object> valueDeser, TypeDeserializer typeDeser,
++                ValueInstantiator inst, int parameterIndex)
++        {
++            super(property, field, valueType, keyDeser, valueDeser, typeDeser);
++            _valueInstantiator = Objects.requireNonNull(inst, "ValueInstantiator for MapParameterAnyProperty cannot be `null`");
++            _parameterIndex = parameterIndex;
++        }
++
++        @Override
++        public SettableAnyProperty withValueDeserializer(JsonDeserializer<Object> deser)
++        {
++            return new MapParameterAnyProperty(_property, _setter, _type, _keyDeserializer, deser,
++                    _valueTypeDeserializer, _valueInstantiator, _parameterIndex);
++        }
++
++        @SuppressWarnings("unchecked")
++        @Override
++        protected void _set(Object instance, Object propName, Object value)
++        {
++            ((Map<Object, Object>) instance).put(propName, value);
++        }
++
++        @Override
++        public int getParameterIndex() { return _parameterIndex; }
++
++        @Override
++        public Object createParameterObject() { return new HashMap<>(); }
++
++    }
++
++    /**
++     * [databind#562] Allow @JsonAnySetter on Creator constructor
++     *
++     * @since 2.18
++     */
++    protected static class JsonNodeParameterAnyProperty extends SettableAnyProperty
++        implements java.io.Serializable
++    {
++        private static final long serialVersionUID = 1L;
++
++        protected final JsonNodeFactory _nodeFactory;
++
++        protected final int _parameterIndex;
++
++        public JsonNodeParameterAnyProperty(BeanProperty property, AnnotatedMember field, JavaType valueType,
++                JsonDeserializer<Object> valueDeser, JsonNodeFactory nodeFactory, int parameterIndex)
++        {
++            super(property, field, valueType, null, valueDeser, null);
++            _nodeFactory = nodeFactory;
++            _parameterIndex = parameterIndex;
++        }
++
++        // Let's override since this is much simpler with JsonNodes
++        @Override
++        public Object deserialize(JsonParser p, DeserializationContext ctxt)
++                throws IOException
++        {
++            return _valueDeserializer.deserialize(p, ctxt);
++        }
++
++        @Override
++        protected void _set(Object instance, Object propName, Object value)
++                throws Exception
++        {
++            ((ObjectNode) instance).set((String) propName, (JsonNode) value);
++        }
++
++        // Should not get called but...
++        @Override
++        public SettableAnyProperty withValueDeserializer(JsonDeserializer<Object> deser) {
++            throw new UnsupportedOperationException("Cannot call withValueDeserializer() on " + getClass().getName());
++        }
++
++        @Override
++        public int getParameterIndex() { return _parameterIndex; }
++
++        @Override
++        public Object createParameterObject() { return _nodeFactory.objectNode(); }
++
++    }
++
+ }
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/impl/CreatorCollector.java b/src/main/java/com/fasterxml/jackson/databind/deser/impl/CreatorCollector.java
+index 963300a84b..2a0948ded9 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/CreatorCollector.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/CreatorCollector.java
+@@ -184,6 +184,7 @@ public void addPropertyCreator(AnnotatedWithParams creator,
+                     String name = properties[i].getName();
+                     // Need to consider Injectables, which may not have
+                     // a name at all, and need to be skipped
++                    // (same for possible AnySetter)
+                     if (name.isEmpty() && (properties[i].getInjectableValueId() != null)) {
+                         continue;
+                     }
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyBasedCreator.java b/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyBasedCreator.java
+index 5225baaab6..b11d2111b5 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyBasedCreator.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyBasedCreator.java
+@@ -6,6 +6,7 @@
+ import com.fasterxml.jackson.core.JsonParser;
+ 
+ import com.fasterxml.jackson.databind.*;
++import com.fasterxml.jackson.databind.deser.SettableAnyProperty;
+ import com.fasterxml.jackson.databind.deser.SettableBeanProperty;
+ import com.fasterxml.jackson.databind.deser.ValueInstantiator;
+ 
+@@ -194,7 +195,18 @@ public SettableBeanProperty findCreatorProperty(int propertyIndex) {
+      */
+     public PropertyValueBuffer startBuilding(JsonParser p, DeserializationContext ctxt,
+             ObjectIdReader oir) {
+-        return new PropertyValueBuffer(p, ctxt, _propertyCount, oir);
++        return new PropertyValueBuffer(p, ctxt, _propertyCount, oir, null);
++    }
++
++    /**
++     * Method called when starting to build a bean instance.
++     *
++     * @since 2.18 (added SettableAnyProperty parameter)
++     */
++    public PropertyValueBuffer startBuildingWithAnySetter(JsonParser p, DeserializationContext ctxt,
++            ObjectIdReader oir, SettableAnyProperty anySetter
++    ) {
++        return new PropertyValueBuffer(p, ctxt, _propertyCount, oir, anySetter);
+     }
+ 
+     public Object build(DeserializationContext ctxt, PropertyValueBuffer buffer) throws IOException
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValue.java b/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValue.java
+index 6558b3dcf3..4337f195fe 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValue.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValue.java
+@@ -31,6 +31,18 @@ protected PropertyValue(PropertyValue next, Object value)
+     public abstract void assign(Object bean)
+         throws IOException;
+ 
++    /**
++     * Method called to assign stored value of this property to specified
++     * parameter object.
++     *
++     * @since 2.18
++     */
++    public void setValue(Object parameterObject)
++        throws IOException
++    {
++        throw new UnsupportedOperationException("Should not be called by this type " + getClass().getName());
++    }
++
+     /*
+     /**********************************************************
+     /* Concrete property value classes
+@@ -113,4 +125,42 @@ public void assign(Object bean)
+             ((java.util.Map<Object,Object>) bean).put(_key, value);
+         }
+     }
++
++    /**
++     * Property value type used when storing entries to be passed
++     * to constructor of POJO using "any-setter".
++     *
++     * @since 2.18
++     */
++    final static class AnyParameter
++            extends PropertyValue
++    {
++        final SettableAnyProperty _property;
++        final String _propertyName;
++
++        public AnyParameter(PropertyValue next, Object value,
++                   SettableAnyProperty prop,
++                   String propName)
++        {
++            super(next, value);
++            _property = prop;
++            _propertyName = propName;
++        }
++
++        @Override
++        public void assign(Object bean)
++            throws IOException
++        {
++            // do nothing, as we are not assigning to a bean
++            // instead, we are assigning to a parameter object via setValue field.
++        }
++
++        @Override
++        public void setValue(Object parameterObject)
++            throws IOException
++        {
++            // AnyParameter
++            _property.set(parameterObject, _propertyName, value);
++        }
++    }
+ }
+diff --git a/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java b/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java
+index 5d323381a0..531c6ab24e 100644
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/PropertyValueBuffer.java
+@@ -75,14 +75,32 @@ public class PropertyValueBuffer
+      */
+     protected Object _idValue;
+ 
++    /**
++     * "Any setter" property bound to a Creator parameter (via {@code @JsonAnySetter})
++     *
++     * @since 2.18
++     */
++    protected final SettableAnyProperty _anyParamSetter;
++
++    /**
++     * If "Any-setter-via-Creator" exists, we will need to buffer values to feed it,
++     * separate from regular, non-creator properties (see {@code _buffered}).
++     *
++     * @since 2.18
++     */
++    protected PropertyValue _anyParamBuffered;
++
+     /*
+     /**********************************************************
+     /* Life-cycle
+     /**********************************************************
+      */
+ 
++    /**
++     * @since 2.18
++     */
+     public PropertyValueBuffer(JsonParser p, DeserializationContext ctxt, int paramCount,
+-            ObjectIdReader oir)
++            ObjectIdReader oir, SettableAnyProperty anyParamSetter)
+     {
+         _parser = p;
+         _context = ctxt;
+@@ -94,6 +112,19 @@ public PropertyValueBuffer(JsonParser p, DeserializationContext ctxt, int paramC
+         } else {
+             _paramsSeenBig = new BitSet();
+         }
++        // Only care about Creator-bound Any setters:
++        if ((anyParamSetter == null) || (anyParamSetter.getParameterIndex() < 0)) {
++            _anyParamSetter = null;
++        } else {
++            _anyParamSetter = anyParamSetter;
++        }
++    }
++
++    @Deprecated // since 2.18
++    public PropertyValueBuffer(JsonParser p, DeserializationContext ctxt, int paramCount,
++            ObjectIdReader oir)
++    {
++        this(p, ctxt, paramCount, oir, null);
+     }
+ 
+     /**
+@@ -145,7 +176,7 @@ public Object getParameter(SettableBeanProperty prop)
+      * then whole JSON Object has been processed,
+      */
+     public Object[] getParameters(SettableBeanProperty[] props)
+-        throws JsonMappingException
++        throws JsonMappingException, IOException
+     {
+         // quick check to see if anything else is needed
+         if (_paramsNeeded > 0) {
+@@ -165,7 +196,14 @@ public Object[] getParameters(SettableBeanProperty[] props)
+                 }
+             }
+         }
+-
++        // [databind#562] since 2.18 : Respect @JsonAnySetter in @JsonCreator
++        if (_anyParamSetter != null) {
++            Object anySetterParameterObject = _anyParamSetter.createParameterObject();
++            for (PropertyValue pv = _anyParamBuffered; pv != null; pv = pv.next) {
++                pv.setValue(anySetterParameterObject);
++            }
++            _creatorParameters[_anyParamSetter.getParameterIndex()] = anySetterParameterObject;
++        }
+         if (_context.isEnabled(DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES)) {
+             for (int ix = 0; ix < props.length; ++ix) {
+                 if (_creatorParameters[ix] == null) {
+@@ -181,6 +219,17 @@ public Object[] getParameters(SettableBeanProperty[] props)
+ 
+     protected Object _findMissing(SettableBeanProperty prop) throws JsonMappingException
+     {
++        // 08-Jun-2024: [databind#562] AnySetters are bit special
++        if (_anyParamSetter != null) {
++            if (prop.getCreatorIndex() == _anyParamSetter.getParameterIndex()) {
++                // Ok if anything buffered
++                if (_anyParamBuffered != null) {
++                    // ... will be assigned by caller later on, for now return null
++                    return null;
++                }
++            }
++        }
++
+         // First: do we have injectable value?
+         Object injectableValueId = prop.getInjectableValueId();
+         if (injectableValueId != null) {
+@@ -309,4 +358,9 @@ public void bufferAnyProperty(SettableAnyProperty prop, String propName, Object
+     public void bufferMapProperty(Object key, Object value) {
+         _buffered = new PropertyValue.Map(_buffered, value, key);
+     }
++
++    // @since 2.18
++    public void bufferAnyParameterProperty(SettableAnyProperty prop, String propName, Object value) {
++        _anyParamBuffered = new PropertyValue.AnyParameter(_anyParamBuffered, value, prop, propName);
++    }
+ }
+diff --git a/src/test-jdk17/java/com/fasterxml/jackson/databind/records/RecordCreatorWithAnySetter562Test.java b/src/test-jdk17/java/com/fasterxml/jackson/databind/records/RecordCreatorWithAnySetter562Test.java
+new file mode 100644
+index 0000000000..0ed048be1f
+--- /dev/null
++++ b/src/test-jdk17/java/com/fasterxml/jackson/databind/records/RecordCreatorWithAnySetter562Test.java
+@@ -0,0 +1,56 @@
++package com.fasterxml.jackson.databind.records;
++
++import com.fasterxml.jackson.annotation.JsonAnySetter;
++import com.fasterxml.jackson.annotation.JsonCreator;
++import com.fasterxml.jackson.annotation.JsonProperty;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++import org.junit.jupiter.api.Test;
++
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.fail;
++
++// [databind#562] Allow @JsonAnySetter on Creator constructors
++public class RecordCreatorWithAnySetter562Test
++        extends DatabindTestUtil
++{
++    record RecordWithAnySetterCtor(int id,
++                                   Map<String, Integer> additionalProperties) {
++        @JsonCreator
++        public RecordWithAnySetterCtor(@JsonProperty("regular") int id,
++                                       @JsonAnySetter Map<String, Integer> additionalProperties
++        ) {
++            this.id = id;
++            this.additionalProperties = additionalProperties;
++        }
++    }
++
++    /*
++    /**********************************************************************
++    /* Test methods, alternate constructors
++    /**********************************************************************
++     */
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    @Test
++    public void testRecordWithAnySetterCtor() throws Exception
++    {
++        // First, only regular property mapped
++        RecordWithAnySetterCtor result = MAPPER.readValue(a2q("{'regular':13}"),
++                RecordWithAnySetterCtor.class);
++        assertEquals(13, result.id);
++        assertEquals(0, result.additionalProperties.size());
++
++        // Then with unknown properties
++        result = MAPPER.readValue(a2q("{'regular':13, 'unknown':99, 'extra':-1}"),
++                RecordWithAnySetterCtor.class);
++        assertEquals(13, result.id);
++        assertEquals(Integer.valueOf(99), result.additionalProperties.get("unknown"));
++        assertEquals(Integer.valueOf(-1), result.additionalProperties.get("extra"));
++        assertEquals(2, result.additionalProperties.size());
++    }
++
++}
+diff --git a/src/test/java/com/fasterxml/jackson/databind/deser/creators/AnySetterForCreator562Test.java b/src/test/java/com/fasterxml/jackson/databind/deser/creators/AnySetterForCreator562Test.java
+new file mode 100644
+index 0000000000..e0ec28ac24
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/deser/creators/AnySetterForCreator562Test.java
+@@ -0,0 +1,225 @@
++package com.fasterxml.jackson.databind.deser.creators;
++
++import java.util.Collections;
++import java.util.HashMap;
++import java.util.Map;
++
++import com.fasterxml.jackson.annotation.JsonAnySetter;
++import com.fasterxml.jackson.annotation.JsonCreator;
++import com.fasterxml.jackson.annotation.JsonProperty;
++import com.fasterxml.jackson.databind.DeserializationFeature;
++import com.fasterxml.jackson.databind.JsonNode;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.exc.InvalidDefinitionException;
++import com.fasterxml.jackson.databind.exc.MismatchedInputException;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.fail;
++
++// [databind#562] Allow @JsonAnySetter on Creator constructors
++public class AnySetterForCreator562Test extends DatabindTestUtil
++{
++    static class POJO562
++    {
++        String a;
++        Map<String,Object> stuff;
++
++        @JsonCreator
++        public POJO562(@JsonProperty("a") String a,
++            @JsonAnySetter Map<String, Object> leftovers
++        ) {
++            this.a = a;
++            stuff = leftovers;
++        }
++    }
++
++    static class POJO562WithField
++    {
++        String a;
++        Map<String,Object> stuff;
++
++        public String b;
++        
++        @JsonCreator
++        public POJO562WithField(@JsonProperty("a") String a,
++            @JsonAnySetter Map<String, Object> leftovers
++        ) {
++            this.a = a;
++            stuff = leftovers;
++        }
++    }
++
++    static class PojoWithNodeAnySetter
++    {
++        String a;
++        JsonNode anySetterNode;
++
++        @JsonCreator
++        public PojoWithNodeAnySetter(@JsonProperty("a") String a,
++            @JsonAnySetter JsonNode leftovers
++        ) {
++            this.a = a;
++            anySetterNode = leftovers;
++        }
++    }
++
++    static class MultipleAny562
++    {
++        @JsonCreator
++        public MultipleAny562(@JsonProperty("a") String a,
++            @JsonAnySetter Map<String, Object> leftovers,
++            @JsonAnySetter Map<String, Object> leftovers2) {
++            throw new Error("Should never get here!");
++        }
++    }
++
++    static class PojoWithDisabled
++    {
++        String a;
++        Map<String,Object> stuff;
++
++        @JsonCreator
++        public PojoWithDisabled(@JsonProperty("a") String a,
++            @JsonAnySetter(enabled = false) Map<String, Object> leftovers
++        ) {
++            this.a = a;
++            stuff = leftovers;
++        }
++    }
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    @Test
++    public void mapAnySetterViaCreator562() throws Exception
++    {
++        Map<String, Object> expected = new HashMap<>();
++        expected.put("b", Integer.valueOf(42));
++        expected.put("c", Integer.valueOf(111));
++
++        POJO562 pojo = MAPPER.readValue(a2q(
++                "{'a':'value', 'b':42, 'c': 111}"
++                ),
++                POJO562.class);
++
++        assertEquals("value", pojo.a);
++        assertEquals(expected, pojo.stuff);
++
++        // Should be fine to vary ordering too
++        pojo = MAPPER.readValue(a2q(
++                "{'b':42, 'a':'value', 'c': 111}"
++                ),
++                POJO562.class);
++
++        assertEquals("value", pojo.a);
++        assertEquals(expected, pojo.stuff);
++        
++        // Should also initialize any-setter-Map even if no contents
++        pojo = MAPPER.readValue(a2q("{'a':'value2'}"), POJO562.class);
++        assertEquals("value2", pojo.a);
++        assertEquals(new HashMap<>(), pojo.stuff);
++
++    }
++
++    // Creator and non-Creator props AND any-setter ought to be fine too
++    @Test
++    public void mapAnySetterViaCreatorAndField() throws Exception
++    {
++        POJO562WithField pojo = MAPPER.readValue(
++                a2q("{'a':'value', 'b':'xyz', 'c': 'abc'}"),
++                POJO562WithField.class);
++
++        assertEquals("value", pojo.a);
++        assertEquals("xyz", pojo.b);
++        assertEquals(Collections.singletonMap("c", "abc"), pojo.stuff);
++    }
++
++    @Test
++    public void testNodeAnySetterViaCreator562() throws Exception
++    {
++        PojoWithNodeAnySetter pojo = MAPPER.readValue(
++                a2q("{'a':'value', 'b':42, 'c': 111}"),
++                PojoWithNodeAnySetter.class);
++
++        assertEquals("value", pojo.a);
++        assertEquals(a2q("{'c':111,'b':42}"), pojo.anySetterNode + "");
++
++        // Also ok to get nothing, resulting in empty ObjectNode
++        pojo = MAPPER.readValue(a2q("{'a':'ok'}"), PojoWithNodeAnySetter.class);
++
++        assertEquals("ok", pojo.a);
++        assertEquals(MAPPER.createObjectNode(), pojo.anySetterNode);
++    }
++
++    @Test
++    public void testAnyMapWithNullCreatorProp() throws Exception
++    {
++        ObjectMapper failOnNullMapper = jsonMapperBuilder()
++            .enable(DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES).build();
++
++        // 08-Jun-2024, tatu: Should be fine as we get empty Map for "no any setters"
++        POJO562 value = failOnNullMapper.readValue(a2q("{'a':'value'}"), POJO562.class);
++        assertEquals(Collections.emptyMap(), value.stuff);
++    }
++
++    @Test
++    public void testAnyMapWithMissingCreatorProp() throws Exception
++    {
++        ObjectMapper failOnMissingMapper = jsonMapperBuilder()
++            .enable(DeserializationFeature.FAIL_ON_MISSING_CREATOR_PROPERTIES).build();
++
++        // Actually missing (no any props encountered)
++        try {
++            failOnMissingMapper.readValue(a2q("{'a':'value'}"), POJO562.class);
++            fail("Should not pass");
++        } catch (MismatchedInputException e) {
++            verifyException(e, "Missing creator property ''");
++        }
++
++        // But should NOT fail if we did find at least one...
++        POJO562 value = failOnMissingMapper.readValue(a2q("{'a':'value','b':'x'}"), POJO562.class);
++        assertEquals(Collections.singletonMap("b", "x"), value.stuff);
++    }
++
++    @Test
++    public void testAnyMapWithNullOrMissingCreatorProp() throws Exception
++    {
++        ObjectMapper failOnBothMapper = jsonMapperBuilder()
++            .enable(DeserializationFeature.FAIL_ON_NULL_CREATOR_PROPERTIES)
++            .enable(DeserializationFeature.FAIL_ON_MISSING_CREATOR_PROPERTIES)
++            .build();
++        try {
++            failOnBothMapper.readValue(a2q("{'a':'value'}"), POJO562.class);
++            fail("Should not pass");
++        } catch (MismatchedInputException e) {
++            verifyException(e, "Missing creator property ''");
++        }
++    }
++
++    @Test
++    public void testAnySetterViaCreator562FailForDup() throws Exception
++    {
++        try {
++            MAPPER.readValue("{}", MultipleAny562.class);
++            fail("Should not pass");
++        } catch (InvalidDefinitionException e) {
++            verifyException(e, "Invalid type definition");
++            verifyException(e, "More than one 'any-setter'");
++        }
++    }
++
++    @Test
++    public void testAnySetterViaCreator562Disabled() throws Exception
++    {
++        try {
++            MAPPER.readValue(a2q("{'a':'value', 'b':42, 'c': 111}"),
++                PojoWithDisabled.class);
++            fail("Should not pass");
++        } catch (InvalidDefinitionException e) {
++            verifyException(e, "Invalid type definition for type");
++            verifyException(e, "has no property name (and is not Injectable): can not use as property-based Creator");
++        }
++    }
++}
+diff --git a/src/test/java/com/fasterxml/jackson/failing/AnySetterForCreator562Test.java b/src/test/java/com/fasterxml/jackson/failing/AnySetterForCreator562Test.java
+deleted file mode 100644
+index eca7692a78..0000000000
+--- a/src/test/java/com/fasterxml/jackson/failing/AnySetterForCreator562Test.java
++++ /dev/null
+@@ -1,48 +0,0 @@
+-package com.fasterxml.jackson.failing;
+-
+-import java.util.Collections;
+-import java.util.Map;
+-
+-import org.junit.jupiter.api.Test;
+-
+-import com.fasterxml.jackson.annotation.JsonAnySetter;
+-import com.fasterxml.jackson.annotation.JsonCreator;
+-import com.fasterxml.jackson.annotation.JsonProperty;
+-import com.fasterxml.jackson.databind.ObjectMapper;
+-import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
+-
+-import static org.junit.jupiter.api.Assertions.assertEquals;
+-
+-class AnySetterForCreator562Test extends DatabindTestUtil
+-{
+-    // [databind#562]
+-    static class POJO562
+-    {
+-        String a;
+-
+-        Map<String,Object> stuff;
+-
+-        @JsonCreator
+-        public POJO562(@JsonProperty("a") String a,
+-            @JsonAnySetter Map<String, Object>
+-        leftovers) {
+-            this.a = a;
+-            stuff = leftovers;
+-        }
+-    }
+-
+-    private final ObjectMapper MAPPER = newJsonMapper();
+-
+-    // [databind#562]
+-    @Test
+-    void anySetterViaCreator562() throws Exception
+-    {
+-        POJO562 pojo = MAPPER.readValue(a2q(
+-                "{'a':'value', 'b':42}"
+-                ),
+-                POJO562.class);
+-        assertEquals("value", pojo.a);
+-        assertEquals(Collections.singletonMap("b", Integer.valueOf(42)),
+-                pojo.stuff);
+-    }
+-}

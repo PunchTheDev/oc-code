@@ -1,0 +1,1040 @@
+diff --git a/scripts/validate-mcp.mjs b/scripts/validate-mcp.mjs
+index c4ccbba99..dd721bb1b 100644
+--- a/scripts/validate-mcp.mjs
++++ b/scripts/validate-mcp.mjs
+@@ -295,6 +295,14 @@ assert.ok(
+   Array.isArray(adapterCandidatesPage.candidates),
+   "list_adapter_candidates must return candidates[]",
+ );
++const enrichmentEvidencePage = await callOk("list_enrichment_evidence", {
++  limit: 3,
++  evidence_action: "replace-stale-evidence",
++});
++assert.ok(
++  Array.isArray(enrichmentEvidencePage.entries),
++  "list_enrichment_evidence must return entries[]",
++);
+ const searchIndexPage = await callOk("list_search_index", { limit: 3 });
+ assert.ok(
+   Array.isArray(searchIndexPage.documents),
+diff --git a/server.json b/server.json
+index 4268cd4e5..cb2990103 100644
+--- a/server.json
++++ b/server.json
+@@ -3,7 +3,7 @@
+   "name": "io.github.JSONbored/metagraphed",
+   "title": "metagraphed — Bittensor subnet operational registry",
+   "description": "Live operational + integration registry for Bittensor subnets: APIs, schemas, health.",
+-  "version": "1.71.0",
++  "version": "1.72.0",
+   "websiteUrl": "https://metagraph.sh",
+   "repository": {
+     "url": "https://github.com/JSONbored/metagraphed",
+diff --git a/src/enrichment-evidence-mcp.mjs b/src/enrichment-evidence-mcp.mjs
+new file mode 100644
+index 000000000..2034ed75e
+--- /dev/null
++++ b/src/enrichment-evidence-mcp.mjs
+@@ -0,0 +1,279 @@
++// Enrichment evidence list loader for MCP parity on GET /api/v1/review/enrichment-evidence.
++// Applies the same list-query transforms as the REST route over the baked
++// /metagraph/review/enrichment-evidence.json artifact.
++
++import { applyQueryFilters } from "../workers/list-query.mjs";
++import { API_QUERY_COLLECTIONS, QUERY_ENUMS } from "./contracts.mjs";
++
++export const ENRICHMENT_EVIDENCE_ARTIFACT =
++  "/metagraph/review/enrichment-evidence.json";
++
++const EVIDENCE_SORT_FIELDS =
++  API_QUERY_COLLECTIONS["enrichment-evidence"].sort_fields;
++const SURFACE_KINDS = QUERY_ENUMS.surfaceKind;
++const EVIDENCE_ACTIONS = [
++  "submit-new-evidence",
++  "verify-existing-evidence",
++  "replace-stale-evidence",
++  "review-existing-evidence",
++  "maintainer-review-existing-evidence",
++  "monitor",
++];
++const LANES = [
++  "direct-submission",
++  "maintainer-review",
++  "adapter-candidate",
++  "monitoring-followup",
++  "baseline-monitoring",
++];
++
++export function enrichmentEvidenceMcpError(code, message) {
++  const error = new Error(message);
++  error.toolError = true;
++  error.code = code;
++  return error;
++}
++
++function optionalString(args, key) {
++  const value = args?.[key];
++  if (value === undefined || value === null || value === "") return null;
++  if (typeof value !== "string" || value.trim() === "") {
++    throw enrichmentEvidenceMcpError(
++      "invalid_params",
++      `Argument \`${key}\` must be a non-empty string when provided.`,
++    );
++  }
++  return value.trim();
++}
++
++function optionalEnum(args, key, allowed) {
++  const value = args?.[key];
++  if (value === undefined || value === null || value === "") return null;
++  if (typeof value !== "string" || !allowed.includes(value)) {
++    throw enrichmentEvidenceMcpError(
++      "invalid_params",
++      `Argument \`${key}\` must be one of: ${allowed.join(", ")}.`,
++    );
++  }
++  return value;
++}
++
++function clampLimit(value, fallback, max) {
++  if (typeof value !== "number") return fallback;
++  if (!Number.isFinite(value) || value < 1) return fallback;
++  return Math.min(max, Math.floor(value));
++}
++
++export function enrichmentEvidenceQueryUrl(args) {
++  const url = new URL("https://mcp.internal/review/enrichment-evidence");
++  const q = optionalString(args, "q");
++  if (q) url.searchParams.set("q", q);
++  if (args?.netuid !== undefined) {
++    if (!Number.isInteger(args.netuid) || args.netuid < 0) {
++      throw enrichmentEvidenceMcpError(
++        "invalid_params",
++        "netuid must be a non-negative integer.",
++      );
++    }
++    url.searchParams.set("netuid", String(args.netuid));
++  }
++  const lane = optionalEnum(args, "lane", LANES);
++  if (lane) url.searchParams.set("lane", lane);
++  const evidenceAction = optionalEnum(
++    args,
++    "evidence_action",
++    EVIDENCE_ACTIONS,
++  );
++  if (evidenceAction) url.searchParams.set("evidence_action", evidenceAction);
++  const directSubmissionKinds = optionalEnum(
++    args,
++    "direct_submission_kinds",
++    SURFACE_KINDS,
++  );
++  if (directSubmissionKinds) {
++    url.searchParams.set("direct_submission_kinds", directSubmissionKinds);
++  }
++  const missingKinds = optionalEnum(args, "missing_kinds", SURFACE_KINDS);
++  if (missingKinds) url.searchParams.set("missing_kinds", missingKinds);
++  const sort = optionalEnum(args, "sort", EVIDENCE_SORT_FIELDS);
++  if (sort) url.searchParams.set("sort", sort);
++  const order = optionalEnum(args, "order", ["asc", "desc"]);
++  if (order) url.searchParams.set("order", order);
++  const fields = optionalString(args, "fields");
++  if (fields) url.searchParams.set("fields", fields);
++  if (args?.limit !== undefined) {
++    url.searchParams.set("limit", String(clampLimit(args.limit, 50, 100)));
++  }
++  if (args?.cursor !== undefined) {
++    if (!Number.isInteger(args.cursor) || args.cursor < 0) {
++      throw enrichmentEvidenceMcpError(
++        "invalid_params",
++        "cursor must be a non-negative integer.",
++      );
++    }
++    url.searchParams.set("cursor", String(args.cursor));
++  }
++  return url;
++}
++
++export async function loadEnrichmentEvidenceList(
++  ctx,
++  args,
++  { readArtifact } = {},
++) {
++  const queryUrl = enrichmentEvidenceQueryUrl(args);
++  const read = readArtifact ?? ctx.readArtifact;
++  const result = await read(ctx.env, ENRICHMENT_EVIDENCE_ARTIFACT);
++  if (!result?.ok) {
++    const code = result?.code || "artifact_unavailable";
++    if (code === "artifact_not_found") {
++      throw enrichmentEvidenceMcpError(
++        "not_found",
++        "Enrichment evidence snapshot unavailable.",
++      );
++    }
++    throw enrichmentEvidenceMcpError(
++      code,
++      `Could not load ${ENRICHMENT_EVIDENCE_ARTIFACT} (${code}).`,
++    );
++  }
++  const blob = result.data;
++  if (!blob || typeof blob !== "object") {
++    throw enrichmentEvidenceMcpError(
++      "not_found",
++      "Enrichment evidence snapshot unavailable.",
++    );
++  }
++  const transformed = applyQueryFilters(
++    blob,
++    queryUrl,
++    "enrichment-evidence",
++    [],
++  );
++  if (transformed.error) {
++    throw enrichmentEvidenceMcpError(
++      "invalid_params",
++      transformed.error.message,
++    );
++  }
++  const { data, meta } = transformed;
++  const page = meta.pagination || {};
++  const rows = Array.isArray(data.entries) ? data.entries : [];
++  const rowLen = rows.length;
++  return {
++    generated_at: data.generated_at ?? null,
++    notes: data.notes ?? null,
++    entries: rows,
++    total: page.total ?? rowLen,
++    returned: page.returned ?? rowLen,
++    limit: page.limit ?? rowLen,
++    cursor: page.cursor ?? 0,
++    next_cursor: page.next_cursor ?? null,
++    sort: page.sort ?? null,
++    order: page.order ?? null,
++  };
++}
++
++export const LIST_ENRICHMENT_EVIDENCE_INSTRUCTIONS =
++  "list_enrichment_evidence detailed candidate evidence behind the enrichment queue " +
++  "(missing kinds, evidence_action, and lane; mirrors GET /api/v1/review/enrichment-evidence), ";
++
++export const LIST_ENRICHMENT_EVIDENCE_MCP_TOOL = {
++  name: "list_enrichment_evidence",
++  title: "List review enrichment evidence entries",
++  description:
++    "Fetch detailed candidate evidence entries from the registry: per-subnet " +
++    "evidence_action, lane, missing surface kinds, direct_submission_kinds, and " +
++    "priority_score for contributor enrichment work. Filter by netuid, lane, " +
++    "evidence_action, direct_submission_kinds, or missing_kinds; search with q; " +
++    "sort with sort + order; and page with limit (1-100) / cursor. Distinct from " +
++    "list_enrichment_queue (prioritized queue summary) and get_subnet_evidence " +
++    "(one subnet's live evidence). Mirrors GET /api/v1/review/enrichment-evidence.",
++  inputSchema: {
++    type: "object",
++    properties: {
++      q: {
++        type: "string",
++        description: "Keyword search across name, slug, and evidence_action.",
++      },
++      netuid: {
++        type: "integer",
++        description: "Filter to one subnet netuid.",
++        minimum: 0,
++      },
++      lane: {
++        type: "string",
++        enum: LANES,
++        description:
++          "Filter by enrichment lane (direct-submission, maintainer-review, etc.).",
++      },
++      evidence_action: {
++        type: "string",
++        enum: EVIDENCE_ACTIONS,
++        description: "Filter by the recommended evidence action.",
++      },
++      direct_submission_kinds: {
++        type: "string",
++        enum: SURFACE_KINDS,
++        description:
++          "Filter rows whose direct_submission_kinds include this kind.",
++      },
++      missing_kinds: {
++        type: "string",
++        enum: SURFACE_KINDS,
++        description: "Filter rows whose missing_kinds include this kind.",
++      },
++      sort: {
++        type: "string",
++        enum: EVIDENCE_SORT_FIELDS,
++        description: "Field to sort by before paging.",
++      },
++      order: {
++        type: "string",
++        enum: ["asc", "desc"],
++        description: "Sort direction for sort (default asc).",
++      },
++      fields: {
++        type: "string",
++        description:
++          "Comma-separated projection of evidence row fields to return.",
++      },
++      limit: {
++        type: "integer",
++        description: "Max rows to return (1-100). Enables pagination.",
++        minimum: 1,
++        maximum: 100,
++      },
++      cursor: {
++        type: "integer",
++        description: "Pagination cursor from a prior response's next_cursor.",
++        minimum: 0,
++      },
++    },
++    additionalProperties: false,
++  },
++};
++
++const NULLABLE_STRING = { type: ["string", "null"] };
++const NULLABLE_INT = { type: ["integer", "null"] };
++
++export const LIST_ENRICHMENT_EVIDENCE_OUTPUT_SCHEMA = {
++  type: "object",
++  additionalProperties: true,
++  required: ["entries"],
++  properties: {
++    generated_at: NULLABLE_STRING,
++    notes: {
++      type: ["array", "string", "null"],
++      items: { type: "string" },
++    },
++    entries: { type: "array", items: { type: "object" } },
++    total: { type: "integer" },
++    returned: { type: "integer" },
++    limit: { type: "integer" },
++    cursor: { type: "integer" },
++    next_cursor: NULLABLE_INT,
++    sort: NULLABLE_STRING,
++    order: NULLABLE_STRING,
++  },
++};
+diff --git a/src/mcp-server.mjs b/src/mcp-server.mjs
+index 64db6f200..ba0eee0bd 100644
+--- a/src/mcp-server.mjs
++++ b/src/mcp-server.mjs
+@@ -49,6 +49,12 @@ import {
+   LIST_ADAPTER_CANDIDATES_OUTPUT_SCHEMA,
+   loadAdapterCandidatesList,
+ } from "./adapter-candidates-mcp.mjs";
++import {
++  LIST_ENRICHMENT_EVIDENCE_INSTRUCTIONS,
++  LIST_ENRICHMENT_EVIDENCE_MCP_TOOL,
++  LIST_ENRICHMENT_EVIDENCE_OUTPUT_SCHEMA,
++  loadEnrichmentEvidenceList,
++} from "./enrichment-evidence-mcp.mjs";
+ import {
+   LIST_SEARCH_INDEX_INSTRUCTIONS,
+   LIST_SEARCH_INDEX_MCP_TOOL,
+@@ -464,7 +470,7 @@ const MCP_LATEST_PROTOCOL = MCP_PROTOCOL_VERSIONS[0];
+ //   - change or remove a tool's I/O       → MAJOR
+ //   - behavioral-only fix (no I/O change) → PATCH
+ // Reported in serverInfo.version (initialize) + the generated server-card.json.
+-export const MCP_SERVER_VERSION = "1.71.0";
++export const MCP_SERVER_VERSION = "1.72.0";
+ // Window labels accepted by get_chain_transfers — derived from the loader constant
+ // so input/output schemas and runtime validation cannot drift.
+ const CHAIN_TRANSFER_WINDOW_KEYS = Object.keys(CHAIN_TRANSFER_WINDOWS);
+@@ -575,6 +581,7 @@ export const MCP_INSTRUCTIONS =
+   LIST_GAPS_INSTRUCTIONS +
+   LIST_ENRICHMENT_QUEUE_INSTRUCTIONS +
+   LIST_ADAPTER_CANDIDATES_INSTRUCTIONS +
++  LIST_ENRICHMENT_EVIDENCE_INSTRUCTIONS +
+   LIST_SEARCH_INDEX_INSTRUCTIONS +
+   "Use list_enrichment_targets to plan coverage-depth work across schemas, " +
+   "fixtures, examples, provenance, and candidate-review gaps, and " +
+@@ -6465,6 +6472,12 @@ export const MCP_TOOLS = [
+       return loadAdapterCandidatesList(ctx, args);
+     },
+   },
++  {
++    ...LIST_ENRICHMENT_EVIDENCE_MCP_TOOL,
++    async handler(args, ctx) {
++      return loadEnrichmentEvidenceList(ctx, args);
++    },
++  },
+   {
+     ...LIST_ENDPOINT_POOLS_MCP_TOOL,
+     async handler(args, ctx) {
+@@ -10145,6 +10158,7 @@ const TOOL_OUTPUT_SCHEMAS = {
+   list_gaps: LIST_GAPS_OUTPUT_SCHEMA,
+   list_enrichment_queue: LIST_ENRICHMENT_QUEUE_OUTPUT_SCHEMA,
+   list_adapter_candidates: LIST_ADAPTER_CANDIDATES_OUTPUT_SCHEMA,
++  list_enrichment_evidence: LIST_ENRICHMENT_EVIDENCE_OUTPUT_SCHEMA,
+   list_endpoint_pools: LIST_ENDPOINT_POOLS_OUTPUT_SCHEMA,
+   list_endpoint_incidents: LIST_ENDPOINT_INCIDENTS_OUTPUT_SCHEMA,
+   get_lineage: {
+diff --git a/tests/adapter-candidates-mcp.test.mjs b/tests/adapter-candidates-mcp.test.mjs
+index 0bab357f1..5bc1cb7f0 100644
+--- a/tests/adapter-candidates-mcp.test.mjs
++++ b/tests/adapter-candidates-mcp.test.mjs
+@@ -359,7 +359,7 @@ describe("adapter-candidates-mcp", () => {
+   });
+ 
+   test("MCP server exports wire list_adapter_candidates at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /list_adapter_candidates/);
+     const tool = MCP_TOOLS.find((t) => t.name === "list_adapter_candidates");
+     assert.ok(tool);
+diff --git a/tests/adapters-mcp.test.mjs b/tests/adapters-mcp.test.mjs
+index ba36fe8db..886d76a60 100644
+--- a/tests/adapters-mcp.test.mjs
++++ b/tests/adapters-mcp.test.mjs
+@@ -177,7 +177,7 @@ describe("adapters-mcp", () => {
+   });
+ 
+   test("MCP server exports wire get_adapter at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /get_adapter/);
+     const tool = MCP_TOOLS.find((t) => t.name === "get_adapter");
+     assert.ok(tool);
+diff --git a/tests/agent-resources-mcp.test.mjs b/tests/agent-resources-mcp.test.mjs
+index 875425b19..2f42b9071 100644
+--- a/tests/agent-resources-mcp.test.mjs
++++ b/tests/agent-resources-mcp.test.mjs
+@@ -145,7 +145,7 @@ describe("agent-resources-mcp", () => {
+   });
+ 
+   test("MCP server exports wire get_agent_resources at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /get_agent_resources/);
+     const tool = MCP_TOOLS.find((t) => t.name === "get_agent_resources");
+     assert.ok(tool);
+diff --git a/tests/build-mcp.test.mjs b/tests/build-mcp.test.mjs
+index 81725dd2d..70ab85b19 100644
+--- a/tests/build-mcp.test.mjs
++++ b/tests/build-mcp.test.mjs
+@@ -127,7 +127,7 @@ describe("build-mcp", () => {
+   });
+ 
+   test("MCP server exports wire get_build at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /get_build/);
+     const tool = MCP_TOOLS.find((t) => t.name === "get_build");
+     assert.ok(tool);
+diff --git a/tests/changelog-mcp.test.mjs b/tests/changelog-mcp.test.mjs
+index 76b6411c7..62c91ccac 100644
+--- a/tests/changelog-mcp.test.mjs
++++ b/tests/changelog-mcp.test.mjs
+@@ -130,7 +130,7 @@ describe("changelog-mcp", () => {
+   });
+ 
+   test("MCP server exports wire get_changelog at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /get_changelog/);
+     const tool = MCP_TOOLS.find((t) => t.name === "get_changelog");
+     assert.ok(tool);
+diff --git a/tests/contracts-mcp.test.mjs b/tests/contracts-mcp.test.mjs
+index d0255cc1a..28215d258 100644
+--- a/tests/contracts-mcp.test.mjs
++++ b/tests/contracts-mcp.test.mjs
+@@ -132,7 +132,7 @@ describe("contracts-mcp", () => {
+   });
+ 
+   test("MCP server exports wire get_contracts at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /get_contracts/);
+     const tool = MCP_TOOLS.find((t) => t.name === "get_contracts");
+     assert.ok(tool);
+diff --git a/tests/curation-mcp.test.mjs b/tests/curation-mcp.test.mjs
+index a5481bb8b..ffd97854b 100644
+--- a/tests/curation-mcp.test.mjs
++++ b/tests/curation-mcp.test.mjs
+@@ -303,7 +303,7 @@ describe("curation-mcp", () => {
+   });
+ 
+   test("MCP server exports wire list_curation at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /list_curation/);
+     const tool = MCP_TOOLS.find((t) => t.name === "list_curation");
+     assert.ok(tool);
+diff --git a/tests/endpoint-incidents-mcp.test.mjs b/tests/endpoint-incidents-mcp.test.mjs
+index 37c021b9a..fc07fdca9 100644
+--- a/tests/endpoint-incidents-mcp.test.mjs
++++ b/tests/endpoint-incidents-mcp.test.mjs
+@@ -377,7 +377,7 @@ describe("endpoint-incidents-mcp", () => {
+   });
+ 
+   test("MCP server exports wire list_endpoint_incidents at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /list_endpoint_incidents/);
+     const tool = MCP_TOOLS.find((t) => t.name === "list_endpoint_incidents");
+     assert.ok(tool);
+diff --git a/tests/endpoint-pools-mcp.test.mjs b/tests/endpoint-pools-mcp.test.mjs
+index 830e8a15b..6eef28fdc 100644
+--- a/tests/endpoint-pools-mcp.test.mjs
++++ b/tests/endpoint-pools-mcp.test.mjs
+@@ -368,7 +368,7 @@ describe("endpoint-pools-mcp", () => {
+   });
+ 
+   test("MCP server exports wire list_endpoint_pools at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /list_endpoint_pools/);
+     const tool = MCP_TOOLS.find((t) => t.name === "list_endpoint_pools");
+     assert.ok(tool);
+diff --git a/tests/enrichment-evidence-mcp.test.mjs b/tests/enrichment-evidence-mcp.test.mjs
+new file mode 100644
+index 000000000..40192271f
+--- /dev/null
++++ b/tests/enrichment-evidence-mcp.test.mjs
+@@ -0,0 +1,374 @@
++import assert from "node:assert/strict";
++import { describe, test, vi } from "vitest";
++import Ajv2020 from "ajv/dist/2020.js";
++import * as listQuery from "../workers/list-query.mjs";
++import {
++  ENRICHMENT_EVIDENCE_ARTIFACT,
++  LIST_ENRICHMENT_EVIDENCE_INSTRUCTIONS,
++  LIST_ENRICHMENT_EVIDENCE_MCP_TOOL,
++  LIST_ENRICHMENT_EVIDENCE_OUTPUT_SCHEMA,
++  enrichmentEvidenceMcpError,
++  enrichmentEvidenceQueryUrl,
++  loadEnrichmentEvidenceList,
++} from "../src/enrichment-evidence-mcp.mjs";
++import {
++  MCP_INSTRUCTIONS,
++  MCP_SERVER_VERSION,
++  MCP_TOOLS,
++} from "../src/mcp-server.mjs";
++
++const SAMPLE_BLOB = {
++  generated_at: "2026-07-01T00:00:00.000Z",
++  notes: ["evidence drill-down"],
++  entries: [
++    {
++      netuid: 7,
++      name: "Allways",
++      lane: "direct-submission",
++      evidence_action: "replace-stale-evidence",
++      priority_score: 88,
++      missing_kinds: ["openapi"],
++      direct_submission_kinds: ["openapi"],
++    },
++    {
++      netuid: 12,
++      name: "Compute",
++      lane: "maintainer-review",
++      evidence_action: "submit-new-evidence",
++      priority_score: 72,
++      missing_kinds: ["website"],
++    },
++  ],
++};
++
++function readArtifact(_env, path) {
++  if (path === ENRICHMENT_EVIDENCE_ARTIFACT) {
++    return Promise.resolve({ ok: true, data: SAMPLE_BLOB });
++  }
++  return Promise.resolve({ ok: false, code: "artifact_not_found" });
++}
++
++describe("enrichment-evidence-mcp", () => {
++  test("enrichmentEvidenceMcpError is shaped for MCP toolError handling", () => {
++    const err = enrichmentEvidenceMcpError("invalid_params", "bad lane");
++    assert.equal(err.code, "invalid_params");
++    assert.equal(err.toolError, true);
++  });
++
++  test("enrichmentEvidenceQueryUrl validates filters and cursor", () => {
++    const url = enrichmentEvidenceQueryUrl({
++      q: "openapi",
++      netuid: 7,
++      lane: "direct-submission",
++      evidence_action: "replace-stale-evidence",
++      direct_submission_kinds: "openapi",
++      missing_kinds: "openapi",
++      sort: "priority_score",
++      order: "desc",
++      fields: "netuid,lane",
++      limit: 10,
++      cursor: 5,
++    });
++    assert.equal(url.searchParams.get("q"), "openapi");
++    assert.equal(url.searchParams.get("netuid"), "7");
++    assert.equal(url.searchParams.get("lane"), "direct-submission");
++    assert.equal(
++      url.searchParams.get("evidence_action"),
++      "replace-stale-evidence",
++    );
++    assert.equal(url.searchParams.get("sort"), "priority_score");
++    assert.equal(url.searchParams.get("limit"), "10");
++    assert.equal(url.searchParams.get("cursor"), "5");
++  });
++
++  test("enrichmentEvidenceQueryUrl rejects invalid lane", () => {
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ lane: "bogus" }),
++      (err) => err.code === "invalid_params",
++    );
++  });
++
++  test("enrichmentEvidenceQueryUrl rejects invalid evidence_action", () => {
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ evidence_action: "bogus" }),
++      (err) => err.code === "invalid_params",
++    );
++  });
++
++  test("enrichmentEvidenceQueryUrl rejects invalid netuid", () => {
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ netuid: -1 }),
++      (err) => err.code === "invalid_params",
++    );
++  });
++
++  test("enrichmentEvidenceQueryUrl rejects empty q and invalid sort", () => {
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ q: "   " }),
++      (err) => err.code === "invalid_params",
++    );
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ sort: "not_a_column" }),
++      (err) => err.code === "invalid_params",
++    );
++  });
++
++  test("enrichmentEvidenceQueryUrl rejects non-string q and invalid order", () => {
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ q: 42 }),
++      (err) => err.code === "invalid_params",
++    );
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ order: "sideways" }),
++      (err) => err.code === "invalid_params",
++    );
++  });
++
++  test("enrichmentEvidenceQueryUrl rejects empty fields and non-string fields", () => {
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ fields: "   " }),
++      (err) => err.code === "invalid_params",
++    );
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ fields: 42 }),
++      (err) => err.code === "invalid_params",
++    );
++  });
++
++  test("enrichmentEvidenceQueryUrl trims and forwards a fields projection", () => {
++    const url = enrichmentEvidenceQueryUrl({ fields: " netuid,lane " });
++    assert.equal(url.searchParams.get("fields"), "netuid,lane");
++  });
++
++  test("enrichmentEvidenceQueryUrl clamps a non-numeric limit to the default", () => {
++    const url = enrichmentEvidenceQueryUrl({ limit: "lots" });
++    assert.equal(url.searchParams.get("limit"), "50");
++  });
++
++  test("enrichmentEvidenceQueryUrl clamps a sub-minimum numeric limit to the default", () => {
++    const url = enrichmentEvidenceQueryUrl({ limit: 0 });
++    assert.equal(url.searchParams.get("limit"), "50");
++  });
++
++  test("enrichmentEvidenceQueryUrl rejects a fractional netuid", () => {
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ netuid: 1.5 }),
++      (err) => err.code === "invalid_params",
++    );
++  });
++
++  test("enrichmentEvidenceQueryUrl rejects a fractional cursor", () => {
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ cursor: 1.5 }),
++      (err) => err.code === "invalid_params",
++    );
++  });
++
++  test("enrichmentEvidenceQueryUrl rejects negative cursor", () => {
++    assert.throws(
++      () => enrichmentEvidenceQueryUrl({ cursor: -1 }),
++      (err) => err.code === "invalid_params",
++    );
++  });
++
++  test("enrichmentEvidenceQueryUrl clamps limit above the MCP maximum", () => {
++    const url = enrichmentEvidenceQueryUrl({ limit: 500 });
++    assert.equal(url.searchParams.get("limit"), "100");
++  });
++
++  test("loadEnrichmentEvidenceList returns filtered rows with pagination meta", async () => {
++    const out = await loadEnrichmentEvidenceList(
++      { env: {}, readArtifact },
++      { missing_kinds: "openapi" },
++    );
++    assert.equal(out.returned, 1);
++    assert.equal(out.entries[0].netuid, 7);
++    assert.equal(out.entries[0].evidence_action, "replace-stale-evidence");
++  });
++
++  test("loadEnrichmentEvidenceList sorts and pages the collection", async () => {
++    const out = await loadEnrichmentEvidenceList(
++      { env: {}, readArtifact },
++      { sort: "priority_score", order: "desc", limit: 1 },
++    );
++    assert.equal(out.returned, 1);
++    assert.equal(out.total, 2);
++    assert.equal(out.entries[0].netuid, 7);
++    assert.equal(out.next_cursor, 1);
++  });
++
++  test("loadEnrichmentEvidenceList uses an injected readArtifact dep", async () => {
++    const out = await loadEnrichmentEvidenceList(
++      { env: {}, readArtifact: async () => ({ ok: false }) },
++      {},
++      {
++        readArtifact: async () => ({
++          ok: true,
++          data: {
++            entries: [{ netuid: 0, lane: "monitoring-followup" }],
++          },
++        }),
++      },
++    );
++    assert.equal(out.entries[0].netuid, 0);
++  });
++
++  test("loadEnrichmentEvidenceList maps artifact_not_found to not_found", async () => {
++    await assert.rejects(
++      () =>
++        loadEnrichmentEvidenceList(
++          {
++            env: {},
++            readArtifact: async () => ({
++              ok: false,
++              code: "artifact_not_found",
++            }),
++          },
++          {},
++        ),
++      (err) => err.code === "not_found",
++    );
++  });
++
++  test("loadEnrichmentEvidenceList surfaces other artifact failures", async () => {
++    await assert.rejects(
++      () =>
++        loadEnrichmentEvidenceList(
++          {
++            env: {},
++            readArtifact: async () => ({
++              ok: false,
++              code: "artifact_timeout",
++            }),
++          },
++          {},
++        ),
++      (err) =>
++        err.code === "artifact_timeout" &&
++        /enrichment-evidence\.json/.test(err.message),
++    );
++  });
++
++  test("loadEnrichmentEvidenceList rejects invalid list-query params from REST parity", async () => {
++    await assert.rejects(
++      () =>
++        loadEnrichmentEvidenceList(
++          { env: {}, readArtifact },
++          { fields: "not_a_column" },
++        ),
++      (err) => err.code === "invalid_params",
++    );
++  });
++
++  test("loadEnrichmentEvidenceList projects row fields when requested", async () => {
++    const out = await loadEnrichmentEvidenceList(
++      { env: {}, readArtifact },
++      { fields: "netuid,lane", limit: 1 },
++    );
++    assert.deepEqual(out.entries[0], { netuid: 7, lane: "direct-submission" });
++  });
++
++  test("loadEnrichmentEvidenceList omits nullable artifact metadata when absent", async () => {
++    const out = await loadEnrichmentEvidenceList(
++      {
++        env: {},
++        readArtifact: async () => ({
++          ok: true,
++          data: { entries: [{ netuid: 0, lane: "direct-submission" }] },
++        }),
++      },
++      {},
++    );
++    assert.equal(out.generated_at, null);
++    assert.equal(out.notes, null);
++  });
++
++  test("loadEnrichmentEvidenceList treats a non-array entries key as empty", async () => {
++    const out = await loadEnrichmentEvidenceList(
++      {
++        env: {},
++        readArtifact: async () => ({
++          ok: true,
++          data: { entries: null },
++        }),
++      },
++      {},
++    );
++    assert.deepEqual(out.entries, []);
++    assert.equal(out.total, 0);
++  });
++
++  test("loadEnrichmentEvidenceList falls back when pagination meta is absent", async () => {
++    const spy = vi.spyOn(listQuery, "applyQueryFilters").mockReturnValue({
++      data: { entries: [{ netuid: 9 }, { netuid: 10 }] },
++      meta: {},
++    });
++    try {
++      const out = await loadEnrichmentEvidenceList(
++        { env: {}, readArtifact },
++        {},
++      );
++      assert.equal(out.total, 2);
++      assert.equal(out.returned, 2);
++      assert.equal(out.limit, 2);
++      assert.equal(out.cursor, 0);
++      assert.equal(out.next_cursor, null);
++      assert.equal(out.sort, null);
++      assert.equal(out.order, null);
++    } finally {
++      spy.mockRestore();
++    }
++  });
++
++  test("loadEnrichmentEvidenceList rejects a malformed artifact payload", async () => {
++    await assert.rejects(
++      () =>
++        loadEnrichmentEvidenceList(
++          {
++            env: {},
++            readArtifact: async () => ({ ok: true, data: null }),
++          },
++          {},
++        ),
++      (err) => err.code === "not_found",
++    );
++  });
++
++  test("loadEnrichmentEvidenceList defaults code when the read result is bare", async () => {
++    await assert.rejects(
++      () =>
++        loadEnrichmentEvidenceList(
++          {
++            env: {},
++            readArtifact: async () => ({ ok: false }),
++          },
++          {},
++        ),
++      (err) => err.code === "artifact_unavailable",
++    );
++  });
++
++  test("MCP tool metadata and outputSchema compile", () => {
++    assert.equal(
++      LIST_ENRICHMENT_EVIDENCE_MCP_TOOL.name,
++      "list_enrichment_evidence",
++    );
++    assert.match(
++      LIST_ENRICHMENT_EVIDENCE_INSTRUCTIONS,
++      /list_enrichment_evidence/,
++    );
++    assert.ok(
++      new Ajv2020({ strict: false }).compile(
++        LIST_ENRICHMENT_EVIDENCE_OUTPUT_SCHEMA,
++      ),
++    );
++  });
++
++  test("MCP server exports wire list_enrichment_evidence at the bumped SemVer", () => {
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
++    assert.match(MCP_INSTRUCTIONS, /list_enrichment_evidence/);
++    const tool = MCP_TOOLS.find((t) => t.name === "list_enrichment_evidence");
++    assert.ok(tool);
++    assert.equal(tool.title, "List review enrichment evidence entries");
++  });
++});
+diff --git a/tests/enrichment-queue-mcp.test.mjs b/tests/enrichment-queue-mcp.test.mjs
+index e039548ff..93f9b22e9 100644
+--- a/tests/enrichment-queue-mcp.test.mjs
++++ b/tests/enrichment-queue-mcp.test.mjs
+@@ -348,7 +348,7 @@ describe("enrichment-queue-mcp", () => {
+   });
+ 
+   test("MCP server exports wire list_enrichment_queue at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /list_enrichment_queue/);
+     const tool = MCP_TOOLS.find((t) => t.name === "list_enrichment_queue");
+     assert.ok(tool);
+diff --git a/tests/gaps-mcp.test.mjs b/tests/gaps-mcp.test.mjs
+index 4671e353c..1296ace09 100644
+--- a/tests/gaps-mcp.test.mjs
++++ b/tests/gaps-mcp.test.mjs
+@@ -305,7 +305,7 @@ describe("gaps-mcp", () => {
+   });
+ 
+   test("MCP server exports wire list_gaps at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /list_gaps/);
+     const tool = MCP_TOOLS.find((t) => t.name === "list_gaps");
+     assert.ok(tool);
+diff --git a/tests/global-operational-health.test.mjs b/tests/global-operational-health.test.mjs
+index 23c1af2f7..04f20bd43 100644
+--- a/tests/global-operational-health.test.mjs
++++ b/tests/global-operational-health.test.mjs
+@@ -126,7 +126,7 @@ describe("global-operational-health", () => {
+   });
+ 
+   test("MCP server exports wire get_network_health at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /get_network_health/);
+     const tool = MCP_TOOLS.find((t) => t.name === "get_network_health");
+     assert.ok(tool?.handler);
+diff --git a/tests/health-history-mcp.test.mjs b/tests/health-history-mcp.test.mjs
+index 4c9d20411..02073d03a 100644
+--- a/tests/health-history-mcp.test.mjs
++++ b/tests/health-history-mcp.test.mjs
+@@ -284,7 +284,7 @@ describe("health-history-mcp — MCP metadata", () => {
+   });
+ 
+   test("MCP server exports wire get_health_history at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /get_health_history/);
+     const tool = MCP_TOOLS.find((t) => t.name === "get_health_history");
+     assert.ok(tool?.handler);
+diff --git a/tests/mcp-server.test.mjs b/tests/mcp-server.test.mjs
+index b1e2c6144..cb6ef0500 100644
+--- a/tests/mcp-server.test.mjs
++++ b/tests/mcp-server.test.mjs
+@@ -1557,6 +1557,75 @@ describe("MCP tools (injected deps)", () => {
+     assert.ok(validate(res.body.result.structuredContent));
+   });
+ 
++  test("list_enrichment_evidence returns filtered evidence rows", async () => {
++    const deps = makeDeps({
++      "/metagraph/review/enrichment-evidence.json": {
++        generated_at: "2026-07-01T00:00:00.000Z",
++        entries: [
++          {
++            netuid: 7,
++            evidence_action: "replace-stale-evidence",
++            missing_kinds: ["openapi"],
++            lane: "direct-submission",
++          },
++          {
++            netuid: 12,
++            evidence_action: "submit-new-evidence",
++            missing_kinds: ["website"],
++            lane: "maintainer-review",
++          },
++        ],
++      },
++    });
++    const res = await callTool(
++      "list_enrichment_evidence",
++      { missing_kinds: "openapi" },
++      { deps },
++    );
++    const out = res.body.result.structuredContent;
++    assert.equal(out.returned, 1);
++    assert.equal(out.entries[0].netuid, 7);
++    assert.equal(out.entries[0].evidence_action, "replace-stale-evidence");
++  });
++
++  test("list_enrichment_evidence reports not_found when the artifact is absent", async () => {
++    const res = await callTool(
++      "list_enrichment_evidence",
++      {},
++      { deps: makeDeps() },
++    );
++    assert.equal(res.body.result.isError, true);
++    assert.match(
++      res.body.result.content[0].text,
++      /Enrichment evidence snapshot unavailable/,
++    );
++  });
++
++  test("list_enrichment_evidence payload validates against its declared outputSchema", async () => {
++    const schema = listToolDefinitions().find(
++      (t) => t.name === "list_enrichment_evidence",
++    )?.outputSchema;
++    const deps = makeDeps({
++      "/metagraph/review/enrichment-evidence.json": {
++        generated_at: "2026-07-01T00:00:00.000Z",
++        entries: [
++          {
++            netuid: 7,
++            evidence_action: "replace-stale-evidence",
++            missing_kinds: ["openapi"],
++          },
++        ],
++      },
++    });
++    const res = await callTool(
++      "list_enrichment_evidence",
++      { limit: 1 },
++      { deps },
++    );
++    const validate = new Ajv2020({ strict: false }).compile(schema);
++    assert.ok(validate(res.body.result.structuredContent));
++  });
++
+   test("list_endpoint_pools returns filtered pool rows", async () => {
+     const deps = makeDeps({
+       "/metagraph/endpoint-pools.json": {
+diff --git a/tests/profiles-mcp.test.mjs b/tests/profiles-mcp.test.mjs
+index 9457f1856..4d5080d08 100644
+--- a/tests/profiles-mcp.test.mjs
++++ b/tests/profiles-mcp.test.mjs
+@@ -295,7 +295,7 @@ describe("profiles-mcp — MCP metadata", () => {
+   });
+ 
+   test("MCP server exports wire profile tools at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /list_profiles/);
+     assert.match(MCP_INSTRUCTIONS, /get_subnet_profile/);
+     for (const name of ["list_profiles", "get_subnet_profile"]) {
+diff --git a/tests/registry-coverage.test.mjs b/tests/registry-coverage.test.mjs
+index c60d9d670..0604b0565 100644
+--- a/tests/registry-coverage.test.mjs
++++ b/tests/registry-coverage.test.mjs
+@@ -109,7 +109,7 @@ describe("registry-coverage", () => {
+   });
+ 
+   test("MCP server exports wire get_coverage at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /get_coverage/);
+     const tool = MCP_TOOLS.find((t) => t.name === "get_coverage");
+     assert.ok(tool);
+diff --git a/tests/search-index-mcp.test.mjs b/tests/search-index-mcp.test.mjs
+index 55cca64d2..58fcb0214 100644
+--- a/tests/search-index-mcp.test.mjs
++++ b/tests/search-index-mcp.test.mjs
+@@ -314,7 +314,7 @@ describe("search-index-mcp", () => {
+   });
+ 
+   test("MCP server exports wire list_search_index at the bumped SemVer", () => {
+-    assert.equal(MCP_SERVER_VERSION, "1.71.0");
++    assert.equal(MCP_SERVER_VERSION, "1.72.0");
+     assert.match(MCP_INSTRUCTIONS, /list_search_index/);
+     const tool = MCP_TOOLS.find((t) => t.name === "list_search_index");
+     assert.ok(tool);

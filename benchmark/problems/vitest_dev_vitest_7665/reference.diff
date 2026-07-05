@@ -1,0 +1,2612 @@
+diff --git a/packages/browser/src/client/channel.ts b/packages/browser/src/client/channel.ts
+index 39f2f2dc237e..242f4aba02a6 100644
+--- a/packages/browser/src/client/channel.ts
++++ b/packages/browser/src/client/channel.ts
+@@ -1,25 +1,22 @@
+ import type { CancelReason } from '@vitest/runner'
+ import { getBrowserState } from './utils'
+ 
+-export interface IframeDoneEvent {
+-  type: 'done'
+-  filenames: string[]
+-  id: string
++export interface IframeViewportEvent {
++  event: 'viewport'
++  width: number
++  height: number
++  iframeId: string
+ }
+ 
+-export interface IframeErrorEvent {
+-  type: 'error'
+-  error: any
+-  errorType: string
+-  files: string[]
+-  id: string
++export interface IframeViewportFailEvent {
++  event: 'viewport:fail'
++  iframeId: string
++  error: string
+ }
+ 
+-export interface IframeViewportEvent {
+-  type: 'viewport'
+-  width: number
+-  height: number
+-  id: string
++export interface IframeViewportDoneEvent {
++  event: 'viewport:done'
++  iframeId: string
+ }
+ 
+ export interface GlobalChannelTestRunCanceledEvent {
+@@ -27,14 +24,35 @@ export interface GlobalChannelTestRunCanceledEvent {
+   reason: CancelReason
+ }
+ 
++export interface IframeExecuteEvent {
++  event: 'execute'
++  method: 'run' | 'collect'
++  files: string[]
++  iframeId: string
++  context: string
++}
++
++export interface IframeCleanupEvent {
++  event: 'cleanup'
++  iframeId: string
++}
++
++export interface IframePrepareEvent {
++  event: 'prepare'
++  iframeId: string
++}
++
+ export type GlobalChannelIncomingEvent = GlobalChannelTestRunCanceledEvent
+ 
+ export type IframeChannelIncomingEvent =
+   | IframeViewportEvent
+-  | IframeErrorEvent
+-  | IframeDoneEvent
+ 
+-export type IframeChannelOutgoingEvent = never
++export type IframeChannelOutgoingEvent =
++  | IframeExecuteEvent
++  | IframeCleanupEvent
++  | IframePrepareEvent
++  | IframeViewportFailEvent
++  | IframeViewportDoneEvent
+ 
+ export type IframeChannelEvent =
+   | IframeChannelIncomingEvent
+@@ -44,17 +62,3 @@ export const channel: BroadcastChannel = new BroadcastChannel(
+   `vitest:${getBrowserState().sessionId}`,
+ )
+ export const globalChannel: BroadcastChannel = new BroadcastChannel('vitest:global')
+-
+-export function waitForChannel(event: IframeChannelOutgoingEvent['type']): Promise<void> {
+-  return new Promise<void>((resolve) => {
+-    channel.addEventListener(
+-      'message',
+-      (e) => {
+-        if (e.data?.type === event) {
+-          resolve()
+-        }
+-      },
+-      { once: true },
+-    )
+-  })
+-}
+diff --git a/packages/browser/src/client/client.ts b/packages/browser/src/client/client.ts
+index a1ec6d73e406..2565eea0a6e8 100644
+--- a/packages/browser/src/client/client.ts
++++ b/packages/browser/src/client/client.ts
+@@ -53,11 +53,19 @@ function createClient() {
+   ctx.rpc = createBirpc<WebSocketBrowserHandlers, WebSocketBrowserEvents>(
+     {
+       onCancel: setCancel,
+-      async createTesters(files: string[]) {
+-        if (PAGE_TYPE !== 'orchestrator') {
+-          return
++      async createTesters(options) {
++        const orchestrator = getBrowserState().orchestrator
++        if (!orchestrator) {
++          throw new TypeError('Only orchestrator can create testers.')
++        }
++        return orchestrator.createTesters(options)
++      },
++      async cleanupTesters() {
++        const orchestrator = getBrowserState().orchestrator
++        if (!orchestrator) {
++          throw new TypeError('Only orchestrator can cleanup testers.')
+         }
+-        getBrowserState().createTesters?.(files)
++        return orchestrator.cleanupTesters()
+       },
+       cdpEvent(event: string, payload: unknown) {
+         const cdp = getBrowserState().cdp
+@@ -85,6 +93,7 @@ function createClient() {
+     {
+       post: msg => ctx.ws.send(msg),
+       on: fn => (onMessage = fn),
++      timeout: -1, // createTesters can take a while
+       serialize: e =>
+         stringify(e, (_, v) => {
+           if (v instanceof Error) {
+diff --git a/packages/browser/src/client/orchestrator.ts b/packages/browser/src/client/orchestrator.ts
+index 37054b21faaf..747364f995f0 100644
+--- a/packages/browser/src/client/orchestrator.ts
++++ b/packages/browser/src/client/orchestrator.ts
+@@ -1,5 +1,5 @@
+-import type { GlobalChannelIncomingEvent, IframeChannelEvent, IframeChannelIncomingEvent } from '@vitest/browser/client'
+-import type { SerializedConfig } from 'vitest'
++import type { GlobalChannelIncomingEvent, IframeChannelIncomingEvent, IframeChannelOutgoingEvent, IframeViewportDoneEvent, IframeViewportFailEvent } from '@vitest/browser/client'
++import type { BrowserTesterOptions, SerializedConfig } from 'vitest'
+ import { channel, client, globalChannel } from '@vitest/browser/client'
+ import { generateHash } from '@vitest/runner/utils'
+ import { relative } from 'pathe'
+@@ -9,16 +9,13 @@ import { getBrowserState, getConfig } from './utils'
+ const url = new URL(location.href)
+ const ID_ALL = '__vitest_all__'
+ 
+-class IframeOrchestrator {
++export class IframeOrchestrator {
+   private cancelled = false
+-  private runningFiles = new Set<string>()
++  private recreateNonIsolatedIframe = false
+   private iframes = new Map<string, HTMLIFrameElement>()
+ 
+-  public async init(testFiles: string[]) {
+-    debug('test files', testFiles.join(', '))
+-
+-    this.runningFiles.clear()
+-    testFiles.forEach(file => this.runningFiles.add(file))
++  constructor() {
++    debug('init orchestrator', getBrowserState().sessionId)
+ 
+     channel.addEventListener(
+       'message',
+@@ -30,73 +27,168 @@ class IframeOrchestrator {
+     )
+   }
+ 
+-  public async createTesters(testFiles: string[]) {
++  public async createTesters(options: BrowserTesterOptions): Promise<void> {
+     this.cancelled = false
+-    this.runningFiles.clear()
+-    testFiles.forEach(file => this.runningFiles.add(file))
+ 
+     const config = getConfig()
+-    debug('create testers', testFiles.join(', '))
++    debug('create testers', options.files.join(', '))
+     const container = await getContainer(config)
+ 
+     if (config.browser.ui) {
+       container.className = 'absolute origin-top mt-[8px]'
+       container.parentElement!.setAttribute('data-ready', 'true')
+-      container.textContent = ''
++      // in non-isolated mode this will also remove the iframe,
++      // so we only do this once
++      if (container.textContent) {
++        container.textContent = ''
++      }
+     }
+-    const { width, height } = config.browser.viewport
+-
+-    this.iframes.forEach(iframe => iframe.remove())
+-    this.iframes.clear()
+ 
+     if (config.browser.isolate === false) {
+-      debug('create iframe', ID_ALL)
+-      const iframe = this.createIframe(container, ID_ALL)
+-
+-      await setIframeViewport(iframe, width, height)
++      await this.runNonIsolatedTests(container, options)
+       return
+     }
+ 
+-    for (const file of testFiles) {
++    this.iframes.forEach(iframe => iframe.remove())
++    this.iframes.clear()
++
++    for (let i = 0; i < options.files.length; i++) {
+       if (this.cancelled) {
+-        done()
+         return
+       }
+ 
++      const file = options.files[i]
+       debug('create iframe', file)
+-      const iframe = this.createIframe(container, file)
+-
+-      await setIframeViewport(iframe, width, height)
+-
+-      await new Promise<void>((resolve) => {
+-        channel.addEventListener(
+-          'message',
+-          function handler(e: MessageEvent<IframeChannelEvent>) {
+-            // done and error can only be triggered by the previous iframe
+-            if (e.data.type === 'done' || e.data.type === 'error') {
+-              channel.removeEventListener('message', handler)
+-              resolve()
+-            }
+-          },
+-        )
+-      })
++
++      await this.runIsolatedTestInIframe(
++        container,
++        file,
++        options,
++      )
+     }
+   }
+ 
+-  private createIframe(container: HTMLDivElement, file: string) {
++  public async cleanupTesters(): Promise<void> {
++    const config = getConfig()
++    if (config.browser.isolate) {
++      // isolated mode assignes filepaths as ids
++      const files = Array.from(this.iframes.keys())
++      // when the run is completed, show the last file in the UI
++      const ui = getUiAPI()
++      if (ui && files[0]) {
++        const id = generateFileId(files[0])
++        ui.setCurrentFileId(id)
++      }
++      return
++    }
++    // we only cleanup non-isolated iframe because
++    // in isolated mode every iframe is cleaned up after the test
++    const iframe = this.iframes.get(ID_ALL)
++    if (!iframe) {
++      return
++    }
++    await sendEventToIframe({
++      event: 'cleanup',
++      iframeId: ID_ALL,
++    })
++    this.recreateNonIsolatedIframe = true
++  }
++
++  private async runNonIsolatedTests(container: HTMLDivElement, options: BrowserTesterOptions) {
++    if (this.recreateNonIsolatedIframe) {
++      // recreate a new non-isolated iframe during watcher reruns
++      // because we called "cleanup" in the previous run
++      // the iframe is not removed immediately to let the user see the last test
++      this.recreateNonIsolatedIframe = false
++      this.iframes.get(ID_ALL)!.remove()
++      this.iframes.delete(ID_ALL)
++      debug('recreate non-isolated iframe')
++    }
++
++    if (!this.iframes.has(ID_ALL)) {
++      debug('preparing non-isolated iframe')
++      await this.prepareIframe(container, ID_ALL)
++    }
++
++    const config = getConfig()
++    const { width, height } = config.browser.viewport
++    const iframe = this.iframes.get(ID_ALL)!
++
++    await setIframeViewport(iframe, width, height)
++    debug('run non-isolated tests', options.files.join(', '))
++    await sendEventToIframe({
++      event: 'execute',
++      iframeId: ID_ALL,
++      files: options.files,
++      method: options.method,
++      context: options.providedContext,
++    })
++    // we don't cleanup here because in non-isolated mode
++    // it is done after all tests finished running
++  }
++
++  private async runIsolatedTestInIframe(
++    container: HTMLDivElement,
++    file: string,
++    options: BrowserTesterOptions,
++  ) {
++    const config = getConfig()
++    const { width, height } = config.browser.viewport
++
+     if (this.iframes.has(file)) {
+       this.iframes.get(file)!.remove()
+       this.iframes.delete(file)
+     }
+ 
++    const iframe = await this.prepareIframe(container, file)
++    await setIframeViewport(iframe, width, height)
++    // running tests after the "prepare" event
++    await sendEventToIframe({
++      event: 'execute',
++      files: [file],
++      method: options.method,
++      iframeId: file,
++      context: options.providedContext,
++    })
++    // perform "cleanup" to cleanup resources and calculate the coverage
++    await sendEventToIframe({
++      event: 'cleanup',
++      iframeId: file,
++    })
++  }
++
++  private async prepareIframe(container: HTMLDivElement, iframeId: string) {
++    const iframe = this.createTestIframe(iframeId)
++    container.appendChild(iframe)
++
++    await new Promise<void>((resolve, reject) => {
++      iframe.onload = () => {
++        this.iframes.set(iframeId, iframe)
++        sendEventToIframe({
++          event: 'prepare',
++          iframeId,
++        }).then(resolve, reject)
++      }
++      iframe.onerror = (e) => {
++        if (typeof e === 'string') {
++          reject(new Error(e))
++        }
++        else if (e instanceof ErrorEvent) {
++          reject(e.error)
++        }
++        else {
++          reject(new Error(`Cannot load the iframe ${iframeId}.`))
++        }
++      }
++    })
++    return iframe
++  }
++
++  private createTestIframe(iframeId: string) {
+     const iframe = document.createElement('iframe')
++    const src = `${url.pathname}__vitest_test__/__test__/?sessionId=${getBrowserState().sessionId}&iframeId=${iframeId}`
+     iframe.setAttribute('loading', 'eager')
+-    iframe.setAttribute(
+-      'src',
+-      `${url.pathname}__vitest_test__/__test__/${
+-        getBrowserState().sessionId
+-      }/${encodeURIComponent(file)}`,
+-    )
++    iframe.setAttribute('src', src)
+     iframe.setAttribute('data-vitest', 'true')
+ 
+     iframe.style.border = 'none'
+@@ -105,9 +197,6 @@ class IframeOrchestrator {
+     iframe.setAttribute('allowfullscreen', 'true')
+     iframe.setAttribute('allow', 'clipboard-write;')
+     iframe.setAttribute('name', 'vitest-iframe')
+-
+-    this.iframes.set(file, iframe)
+-    container.appendChild(iframe)
+     return iframe
+   }
+ 
+@@ -123,107 +212,61 @@ class IframeOrchestrator {
+ 
+   private async onIframeEvent(e: MessageEvent<IframeChannelIncomingEvent>) {
+     debug('iframe event', JSON.stringify(e.data))
+-    switch (e.data.type) {
++    switch (e.data.event) {
+       case 'viewport': {
+-        const { width, height, id } = e.data
++        const { width, height, iframeId: id } = e.data
+         const iframe = this.iframes.get(id)
+         if (!iframe) {
+-          const error = new Error(`Cannot find iframe with id ${id}`)
++          const error = `Cannot find iframe with id ${id}`
+           channel.postMessage({
+-            type: 'viewport:fail',
+-            id,
+-            error: error.message,
+-          })
++            event: 'viewport:fail',
++            iframeId: id,
++            error,
++          } satisfies IframeViewportFailEvent)
+           await client.rpc.onUnhandledError(
+             {
+               name: 'Teardown Error',
+-              message: error.message,
++              message: error,
+             },
+             'Teardown Error',
+           )
+-          return
++          break
+         }
+         await setIframeViewport(iframe, width, height)
+-        channel.postMessage({ type: 'viewport:done', id })
+-        break
+-      }
+-      case 'done': {
+-        const filenames = e.data.filenames
+-        filenames.forEach(filename => this.runningFiles.delete(filename))
+-
+-        if (!this.runningFiles.size) {
+-          const ui = getUiAPI()
+-          // in isolated mode we don't change UI because it will slow down tests,
+-          // so we only select it when the run is done
+-          if (ui && filenames.length > 1) {
+-            const id = generateFileId(filenames[filenames.length - 1])
+-            ui.setCurrentFileId(id)
+-          }
+-          await done()
+-        }
+-        else {
+-          // keep the last iframe
+-          const iframeId = e.data.id
+-          this.iframes.get(iframeId)?.remove()
+-          this.iframes.delete(iframeId)
+-        }
+-        break
+-      }
+-      // error happened at the top level, this should never happen in user code, but it can trigger during development
+-      case 'error': {
+-        const iframeId = e.data.id
+-        this.iframes.delete(iframeId)
+-        await client.rpc.onUnhandledError(e.data.error, e.data.errorType)
+-        if (iframeId === ID_ALL) {
+-          this.runningFiles.clear()
+-        }
+-        else {
+-          this.runningFiles.delete(iframeId)
+-        }
+-        if (!this.runningFiles.size) {
+-          await done()
+-        }
++        channel.postMessage({ event: 'viewport:done', iframeId: id } satisfies IframeViewportDoneEvent)
+         break
+       }
+       default: {
+-          e.data satisfies never
++        // ignore responses
++        if (
++          typeof e.data.event === 'string'
++          && (e.data.event as string).startsWith('response:')
++        ) {
++          break
++        }
+ 
+-          await client.rpc.onUnhandledError(
+-            {
+-              name: 'Unexpected Event',
+-              message: `Unexpected event: ${(e.data as any).type}`,
+-            },
+-            'Unexpected Event',
+-          )
+-          await done()
++        await client.rpc.onUnhandledError(
++          {
++            name: 'Unexpected Event',
++            message: `Unexpected event: ${(e.data as any).event}`,
++          },
++          'Unexpected Event',
++        )
+       }
+     }
+   }
+ }
+ 
+-const orchestrator = new IframeOrchestrator()
+-
+-let promiseTesters: Promise<void> | undefined
+-getBrowserState().createTesters = async (files) => {
+-  await promiseTesters
+-  promiseTesters = orchestrator.createTesters(files).finally(() => {
+-    promiseTesters = undefined
+-  })
+-  await promiseTesters
+-}
+-
+-async function done() {
+-  await client.rpc.finishBrowserTests(getBrowserState().sessionId)
+-}
++getBrowserState().orchestrator = new IframeOrchestrator()
+ 
+ async function getContainer(config: SerializedConfig): Promise<HTMLDivElement> {
+   if (config.browser.ui) {
+     const element = document.querySelector('#tester-ui')
+     if (!element) {
+       return new Promise<HTMLDivElement>((resolve) => {
+-        setTimeout(() => {
++        queueMicrotask(() => {
+           resolve(getContainer(config))
+-        }, 30)
++        })
+       })
+     }
+     return element as HTMLDivElement
+@@ -231,17 +274,20 @@ async function getContainer(config: SerializedConfig): Promise<HTMLDivElement> {
+   return document.querySelector('#vitest-tester') as HTMLDivElement
+ }
+ 
+-client.waitForConnection().then(async () => {
+-  const testFiles = getBrowserState().files
+-
+-  await orchestrator.init(testFiles)
+-
+-  // if page was refreshed, there will be no test files
+-  // createTesters will be called again when tests are running in the UI
+-  if (testFiles.length) {
+-    await orchestrator.createTesters(testFiles)
+-  }
+-})
++async function sendEventToIframe(event: IframeChannelOutgoingEvent) {
++  channel.postMessage(event)
++  return new Promise<void>((resolve) => {
++    channel.addEventListener(
++      'message',
++      function handler(e) {
++        if (e.data.iframeId === event.iframeId && e.data.event === `response:${event.event}`) {
++          resolve()
++          channel.removeEventListener('message', handler)
++        }
++      },
++    )
++  })
++}
+ 
+ function generateFileId(file: string) {
+   const config = getConfig()
+diff --git a/packages/browser/src/client/public/error-catcher.js b/packages/browser/src/client/public/error-catcher.js
+index 77262bd488fb..081b9024f17a 100644
+--- a/packages/browser/src/client/public/error-catcher.js
++++ b/packages/browser/src/client/public/error-catcher.js
+@@ -77,9 +77,9 @@ async function reportUnexpectedError(
+ 
+   if (!state.runTests || !__vitest_worker__.current) {
+     channel.postMessage({
+-      type: 'done',
+-      filenames: state.files,
+-      id: state.iframeId,
++      // TODO: what to do in this case now?
++      event: 'response:???',
++      iframeId: state.iframeId,
+     })
+   }
+ }
+diff --git a/packages/browser/src/client/public/esm-client-injector.js b/packages/browser/src/client/public/esm-client-injector.js
+index 394baa032a4e..720d9e669c65 100644
+--- a/packages/browser/src/client/public/esm-client-injector.js
++++ b/packages/browser/src/client/public/esm-client-injector.js
+@@ -22,7 +22,6 @@
+     moduleCache,
+     config: { __VITEST_CONFIG__ },
+     viteConfig: { __VITEST_VITE_CONFIG__ },
+-    files: { __VITEST_FILES__ },
+     type: { __VITEST_TYPE__ },
+     sessionId: { __VITEST_SESSION_ID__ },
+     testerId: { __VITEST_TESTER_ID__ },
+diff --git a/packages/browser/src/client/tester/context.ts b/packages/browser/src/client/tester/context.ts
+index 463dcd45d709..888a5a172fdb 100644
+--- a/packages/browser/src/client/tester/context.ts
++++ b/packages/browser/src/client/tester/context.ts
+@@ -5,6 +5,7 @@ import type {
+   Locator,
+   UserEvent,
+ } from '../../../context'
++import type { IframeViewportEvent } from '../client'
+ import type { BrowserRunnerState } from '../utils'
+ import { ensureAwaited, getBrowserState, getWorkerState } from '../utils'
+ import { convertElementToCssSelector, processTimeoutOptions } from './utils'
+@@ -241,15 +242,20 @@ export function cdp(): BrowserRunnerState['cdp'] {
+ const screenshotIds: Record<string, Record<string, string>> = {}
+ export const page: BrowserPage = {
+   viewport(width, height) {
+-    const id = getBrowserState().iframeId
+-    channel.postMessage({ type: 'viewport', width, height, id })
++    const id = getBrowserState().iframeId!
++    channel.postMessage({
++      event: 'viewport',
++      width,
++      height,
++      iframeId: id,
++    } satisfies IframeViewportEvent)
+     return new Promise((resolve, reject) => {
+       channel.addEventListener('message', function handler(e) {
+-        if (e.data.type === 'viewport:done' && e.data.id === id) {
++        if (e.data.event === 'viewport:done' && e.data.iframeId === id) {
+           channel.removeEventListener('message', handler)
+           resolve()
+         }
+-        if (e.data.type === 'viewport:fail' && e.data.id === id) {
++        if (e.data.event === 'viewport:fail' && e.data.iframeId === id) {
+           channel.removeEventListener('message', handler)
+           reject(new Error(e.data.error))
+         }
+diff --git a/packages/browser/src/client/tester/logger.ts b/packages/browser/src/client/tester/logger.ts
+index c9fb2428c7c5..51d7602228e9 100644
+--- a/packages/browser/src/client/tester/logger.ts
++++ b/packages/browser/src/client/tester/logger.ts
+@@ -1,6 +1,7 @@
+ import { format, stringify } from 'vitest/utils'
+ import { getConfig } from '../utils'
+ import { rpc } from './rpc'
++import { getBrowserRunner } from './runner'
+ 
+ const { Date, console, performance } = globalThis
+ 
+@@ -141,7 +142,8 @@ function sendLog(
+     = getConfig().printConsoleTrace && !disableStack
+       ? new Error('STACK_TRACE').stack?.split('\n').slice(1).join('\n')
+       : undefined
+-  rpc().sendLog({
++  const runner = getBrowserRunner()
++  rpc().sendLog(runner?.method || 'run', {
+     origin,
+     content,
+     browser: true,
+diff --git a/packages/browser/src/client/tester/runner.ts b/packages/browser/src/client/tester/runner.ts
+index d8dd797d30de..bc42eeecf00b 100644
+--- a/packages/browser/src/client/tester/runner.ts
++++ b/packages/browser/src/client/tester/runner.ts
+@@ -1,8 +1,8 @@
+ import type { CancelReason, File, Suite, Task, TaskEventPack, TaskResultPack, VitestRunner } from '@vitest/runner'
+-import type { SerializedConfig, WorkerGlobalState } from 'vitest'
++import type { SerializedConfig, TestExecutionMethod, WorkerGlobalState } from 'vitest'
+ import type { VitestExecutor } from 'vitest/execute'
+ import type { VitestBrowserClientMocker } from './mocker'
+-import { globalChannel } from '@vitest/browser/client'
++import { globalChannel, onCancel } from '@vitest/browser/client'
+ import { page, userEvent } from '@vitest/browser/context'
+ import { loadDiffConfig, loadSnapshotSerializers, takeCoverageInsideWorker } from 'vitest/browser'
+ import { NodeBenchmarkRunner, VitestTestRunner } from 'vitest/runners'
+@@ -22,22 +22,33 @@ interface CoverageHandler {
+   takeCoverage: () => Promise<unknown>
+ }
+ 
++interface BrowserVitestRunner extends VitestRunner {
++  sourceMapCache: Map<string, any>
++  method: TestExecutionMethod
++  setMethod: (method: TestExecutionMethod) => void
++}
++
+ export function createBrowserRunner(
+   runnerClass: { new (config: SerializedConfig): VitestRunner },
+   mocker: VitestBrowserClientMocker,
+   state: WorkerGlobalState,
+   coverageModule: CoverageHandler | null,
+-): { new (options: BrowserRunnerOptions): VitestRunner & { sourceMapCache: Map<string, any> } } {
++): { new (options: BrowserRunnerOptions): BrowserVitestRunner } {
+   return class BrowserTestRunner extends runnerClass implements VitestRunner {
+     public config: SerializedConfig
+     hashMap = browserHashMap
+     public sourceMapCache = new Map<string, any>()
++    public method = 'run' as TestExecutionMethod
+ 
+     constructor(options: BrowserRunnerOptions) {
+       super(options.config)
+       this.config = options.config
+     }
+ 
++    setMethod(method: TestExecutionMethod) {
++      this.method = method
++    }
++
+     onBeforeTryTask: VitestRunner['onBeforeTryTask'] = async (...args) => {
+       await userEvent.cleanup()
+       await super.onBeforeTryTask?.(...args)
+@@ -59,7 +70,9 @@ export function createBrowserRunner(
+ 
+     onTaskFinished = async (task: Task) => {
+       if (this.config.browser.screenshotFailures && document.body.clientHeight > 0 && task.result?.state === 'fail') {
+-        const screenshot = await page.screenshot().catch((err) => {
++        const screenshot = await page.screenshot({
++          timeout: this.config.browser.providerOptions?.actionTimeout ?? 5_000,
++        }).catch((err) => {
+           console.error('[vitest] Failed to take a screenshot', err)
+         })
+         if (screenshot) {
+@@ -107,7 +120,7 @@ export function createBrowserRunner(
+     }
+ 
+     onCollectStart = (file: File) => {
+-      return rpc().onQueued(file)
++      return rpc().onQueued(this.method, file)
+     }
+ 
+     onCollected = async (files: File[]): Promise<unknown> => {
+@@ -121,15 +134,15 @@ export function createBrowserRunner(
+ 
+       if (this.config.includeTaskLocation) {
+         try {
+-          await updateFilesLocations(files, this.sourceMapCache)
++          await updateTestFilesLocations(files, this.sourceMapCache)
+         }
+         catch {}
+       }
+-      return rpc().onCollected(files)
++      return rpc().onCollected(this.method, files)
+     }
+ 
+     onTaskUpdate = (task: TaskResultPack[], events: TaskEventPack[]): Promise<void> => {
+-      return rpc().onTaskUpdate(task, events)
++      return rpc().onTaskUpdate(this.method, task, events)
+     }
+ 
+     importFile = async (filepath: string) => {
+@@ -143,18 +156,27 @@ export function createBrowserRunner(
+       const prefix = `/${/^\w:/.test(filepath) ? '@fs/' : ''}`
+       const query = `browserv=${hash}`
+       const importpath = `${prefix}${filepath}?${query}`.replace(/\/+/g, '/')
+-      await import(/* @vite-ignore */ importpath)
++      try {
++        await import(/* @vite-ignore */ importpath)
++      }
++      catch (err) {
++        throw new Error(`Failed to import test file ${filepath}`, { cause: err })
++      }
+     }
+   }
+ }
+ 
+-let cachedRunner: VitestRunner | null = null
++let cachedRunner: BrowserVitestRunner | null = null
++
++export function getBrowserRunner(): BrowserVitestRunner | null {
++  return cachedRunner
++}
+ 
+ export async function initiateRunner(
+   state: WorkerGlobalState,
+   mocker: VitestBrowserClientMocker,
+   config: SerializedConfig,
+-): Promise<VitestRunner> {
++): Promise<BrowserVitestRunner> {
+   if (cachedRunner) {
+     return cachedRunner
+   }
+@@ -173,6 +195,10 @@ export async function initiateRunner(
+   })
+   cachedRunner = runner
+ 
++  onCancel.then((reason) => {
++    runner.onCancel?.(reason)
++  })
++
+   const [diffOptions] = await Promise.all([
+     loadDiffConfig(config, executor as unknown as VitestExecutor),
+     loadSnapshotSerializers(config, executor as unknown as VitestExecutor),
+@@ -189,7 +215,7 @@ export async function initiateRunner(
+   return runner
+ }
+ 
+-async function updateFilesLocations(files: File[], sourceMaps: Map<string, any>) {
++async function updateTestFilesLocations(files: File[], sourceMaps: Map<string, any>) {
+   const promises = files.map(async (file) => {
+     const result = sourceMaps.get(file.filepath) || await rpc().getBrowserFileSourceMap(file.filepath)
+     if (!result) {
+diff --git a/packages/browser/src/client/tester/state.ts b/packages/browser/src/client/tester/state.ts
+index a1698446dbf8..2e740a9d8913 100644
+--- a/packages/browser/src/client/tester/state.ts
++++ b/packages/browser/src/client/tester/state.ts
+@@ -1,13 +1,10 @@
+ import type { BrowserRPC } from '@vitest/browser/client'
+ import type { WorkerGlobalState } from 'vitest'
+-import { parse } from 'flatted'
+ import { getBrowserState } from '../utils'
+ 
+ const config = getBrowserState().config
+ const sessionId = getBrowserState().sessionId
+ 
+-const providedContext = parse(getBrowserState().providedContext)
+-
+ const state: WorkerGlobalState = {
+   ctx: {
+     pool: 'browser',
+@@ -20,7 +17,8 @@ const state: WorkerGlobalState = {
+       name: 'browser',
+       options: null,
+     },
+-    providedContext,
++    // this is populated before tests run
++    providedContext: {},
+     invalidates: [],
+   },
+   onCancel: null as any,
+@@ -38,7 +36,7 @@ const state: WorkerGlobalState = {
+     environment: 0,
+     prepare: performance.now(),
+   },
+-  providedContext,
++  providedContext: {},
+ }
+ 
+ // @ts-expect-error not typed global
+diff --git a/packages/browser/src/client/tester/tester.ts b/packages/browser/src/client/tester/tester.ts
+index b5da1f70a85f..44e7abb9790e 100644
+--- a/packages/browser/src/client/tester/tester.ts
++++ b/packages/browser/src/client/tester/tester.ts
+@@ -1,5 +1,7 @@
++import type { BrowserRPC, IframeChannelEvent } from '@vitest/browser/client'
+ import { channel, client, onCancel } from '@vitest/browser/client'
+ import { page, server, userEvent } from '@vitest/browser/context'
++import { parse } from 'flatted'
+ import {
+   collectTests,
+   setupCommonEnv,
+@@ -17,32 +19,91 @@ import { createSafeRpc } from './rpc'
+ import { browserHashMap, initiateRunner } from './runner'
+ import { CommandsManager } from './utils'
+ 
+-const cleanupSymbol = Symbol.for('vitest:component-cleanup')
++const debugVar = getConfig().env.VITEST_BROWSER_DEBUG
++const debug = debugVar && debugVar !== 'false'
++  ? (...args: unknown[]) => client.rpc.debug?.(...args.map(String))
++  : undefined
++
++channel.addEventListener('message', async (e) => {
++  await client.waitForConnection()
++
++  const data = e.data
++  debug?.('event from orchestrator', JSON.stringify(e.data))
++
++  if (!isEvent(data)) {
++    const error = new Error(`Unknown message: ${JSON.stringify(e.data)}`)
++    unhandledError(error, 'Uknown Iframe Message')
++    return
++  }
++
++  // ignore events to other iframes
++  if (!('iframeId' in data) || data.iframeId !== getBrowserState().iframeId) {
++    return
++  }
++
++  switch (data.event) {
++    case 'execute': {
++      const { method, files, context } = data
++      const state = getWorkerState()
++      const parsedContext = parse(context)
++
++      state.ctx.providedContext = parsedContext
++      state.providedContext = parsedContext
++
++      if (method === 'collect') {
++        await executeTests('collect', files).catch(err => unhandledError(err, 'Collect Error'))
++      }
++      else {
++        await executeTests('run', files).catch(err => unhandledError(err, 'Run Error'))
++      }
++      break
++    }
++    case 'cleanup': {
++      await cleanup().catch(err => unhandledError(err, 'Cleanup Error'))
++      break
++    }
++    case 'prepare': {
++      await prepare().catch(err => unhandledError(err, 'Prepare Error'))
++      break
++    }
++    case 'viewport:done':
++    case 'viewport:fail':
++    case 'viewport': {
++      break
++    }
++    default: {
++      const error = new Error(`Unknown event: ${(data as any).event}`)
++      unhandledError(error, 'Uknown Event')
++    }
++  }
++
++  channel.postMessage({
++    event: `response:${data.event}`,
++    iframeId: getBrowserState().iframeId!,
++  })
++})
+ 
+ const url = new URL(location.href)
+ const reloadStart = url.searchParams.get('__reloadStart')
++const iframeId = url.searchParams.get('iframeId')!
+ 
+-function debug(...args: unknown[]) {
+-  const debug = getConfig().env.VITEST_BROWSER_DEBUG
+-  if (debug && debug !== 'false') {
+-    client.rpc.debug(...args.map(String))
+-  }
+-}
++const commands = new CommandsManager()
++getBrowserState().commands = commands
++getBrowserState().iframeId = iframeId
+ 
+-async function prepareTestEnvironment(files: string[]) {
+-  debug('trying to resolve runner', `${reloadStart}`)
++let contextSwitched = false
++
++async function prepareTestEnvironment() {
++  debug?.('trying to resolve runner', `${reloadStart}`)
+   const config = getConfig()
+ 
+   const rpc = createSafeRpc(client)
+ 
+   const state = getWorkerState()
+ 
+-  state.ctx.files = files
+   state.onCancel = onCancel
+   state.rpc = rpc as any
+ 
+-  getBrowserState().commands = new CommandsManager()
+-
+   const interceptor = createModuleMockerInterceptor()
+   const mocker = new VitestBrowserClientMocker(
+     interceptor,
+@@ -61,154 +122,137 @@ async function prepareTestEnvironment(files: string[]) {
+   const runner = await initiateRunner(state, mocker, config)
+   getBrowserState().runner = runner
+ 
+-  const version = url.searchParams.get('browserv') || ''
+-  files.forEach((filename) => {
+-    const currentVersion = browserHashMap.get(filename)
+-    if (!currentVersion || currentVersion[1] !== version) {
+-      browserHashMap.set(filename, version)
+-    }
+-  })
++  // webdiverio context depends on the iframe state, so we need to switch the context,
++  // we delay this in case the user doesn't use any userEvent commands to avoid the overhead
++  if (server.provider === 'webdriverio') {
++    let switchPromise: Promise<void> | null = null
+ 
+-  onCancel.then((reason) => {
+-    runner.onCancel?.(reason)
+-  })
++    commands.onCommand(async () => {
++      if (switchPromise) {
++        await switchPromise
++      }
++      // if this is the first command, make sure we switched the command context to an iframe
++      if (!contextSwitched) {
++        switchPromise = rpc.wdioSwitchContext('iframe').finally(() => {
++          switchPromise = null
++          contextSwitched = true
++        })
++        await switchPromise
++      }
++    })
++  }
++
++  state.durations.prepare = performance.now() - state.durations.prepare
+ 
+   return {
+     runner,
+     config,
+     state,
+-    rpc,
+-    commands: getBrowserState().commands,
+   }
+ }
+ 
+-function done(files: string[]) {
+-  channel.postMessage({
+-    type: 'done',
+-    filenames: files,
+-    id: getBrowserState().iframeId!,
+-  })
+-}
++let preparedData:
++  | Awaited<ReturnType<typeof prepareTestEnvironment>>
++  | undefined
+ 
+ async function executeTests(method: 'run' | 'collect', files: string[]) {
+-  await client.waitForConnection()
++  if (!preparedData) {
++    throw new Error(`Data was not properly initialized. This is a bug in Vitest. Please, open a new issue with reproduction.`)
++  }
+ 
+-  debug('client is connected to ws server')
++  debug?.('runner resolved successfully')
+ 
+-  let preparedData:
+-    | Awaited<ReturnType<typeof prepareTestEnvironment>>
+-    | undefined
+-    | false
++  const { runner, state } = preparedData
+ 
+-  // if importing /@id/ failed, we reload the page waiting until Vite prebundles it
+-  try {
+-    preparedData = await prepareTestEnvironment(files)
+-  }
+-  catch (error: any) {
+-    debug('runner cannot be loaded because it threw an error', error.stack || error.message)
+-    await client.rpc.onUnhandledError({
+-      name: error.name,
+-      message: error.message,
+-      stack: String(error.stack),
+-    }, 'Preload Error')
+-    done(files)
+-    return
+-  }
++  state.ctx.files = files
++  runner.setMethod(method)
+ 
+-  // page is reloading
+-  if (!preparedData) {
+-    debug('page is reloading, waiting for the next run')
+-    return
+-  }
++  const version = url.searchParams.get('browserv') || ''
++  files.forEach((filename) => {
++    const currentVersion = browserHashMap.get(filename)
++    if (!currentVersion || currentVersion[1] !== version) {
++      browserHashMap.set(filename, version)
++    }
++  })
+ 
+-  debug('runner resolved successfully')
++  debug?.('prepare time', state.durations.prepare, 'ms')
+ 
+-  const { config, runner, state, commands, rpc } = preparedData
++  for (const file of files) {
++    state.filepath = file
+ 
+-  state.durations.prepare = performance.now() - state.durations.prepare
++    if (method === 'run') {
++      await startTests([file], runner)
++    }
++    else {
++      await collectTests([file], runner)
++    }
++  }
++}
+ 
+-  debug('prepare time', state.durations.prepare, 'ms')
++async function prepare() {
++  preparedData = await prepareTestEnvironment()
+ 
+-  let contextSwitched = false
++  // page is reloading
++  debug?.('runner resolved successfully')
+ 
+-  // webdiverio context depends on the iframe state, so we need to switch the context,
+-  // we delay this in case the user doesn't use any userEvent commands to avoid the overhead
+-  if (server.provider === 'webdriverio') {
+-    let switchPromise: Promise<void> | null = null
++  const { config, state } = preparedData
+ 
+-    commands.onCommand(async () => {
+-      if (switchPromise) {
+-        await switchPromise
+-      }
+-      // if this is the first command, make sure we switched the command context to an iframe
+-      if (!contextSwitched) {
+-        switchPromise = rpc.wdioSwitchContext('iframe').finally(() => {
+-          switchPromise = null
+-          contextSwitched = true
+-        })
+-        await switchPromise
+-      }
+-    })
+-  }
++  state.durations.prepare = performance.now() - state.durations.prepare
+ 
+-  try {
+-    await Promise.all([
+-      setupCommonEnv(config),
+-      startCoverageInsideWorker(config.coverage, executor, { isolate: config.browser.isolate }),
+-      (async () => {
+-        const VitestIndex = await import('vitest')
+-        Object.defineProperty(window, '__vitest_index__', {
+-          value: VitestIndex,
+-          enumerable: false,
+-        })
+-      })(),
+-    ])
++  debug?.('prepare time', state.durations.prepare, 'ms')
++
++  await Promise.all([
++    setupCommonEnv(config),
++    startCoverageInsideWorker(config.coverage, executor, { isolate: config.browser.isolate }),
++    (async () => {
++      const VitestIndex = await import('vitest')
++      Object.defineProperty(window, '__vitest_index__', {
++        value: VitestIndex,
++        enumerable: false,
++      })
++    })(),
++  ])
++}
++
++async function cleanup() {
++  const state = getWorkerState()
++  const config = getConfig()
++  const rpc = state.rpc as any as BrowserRPC
+ 
+-    for (const file of files) {
+-      state.filepath = file
++  const cleanupSymbol = Symbol.for('vitest:component-cleanup')
+ 
+-      if (method === 'run') {
+-        await startTests([file], runner)
+-      }
+-      else {
+-        await collectTests([file], runner)
+-      }
+-    }
+-  }
+-  finally {
++  if (cleanupSymbol in page) {
+     try {
+-      if (cleanupSymbol in page) {
+-        (page[cleanupSymbol] as any)()
+-      }
+-      // need to cleanup for each tester
+-      // since playwright keyboard API is stateful on page instance level
+-      await userEvent.cleanup()
+-      if (contextSwitched) {
+-        await rpc.wdioSwitchContext('parent')
+-      }
++      await (page[cleanupSymbol] as any)()
+     }
+     catch (error: any) {
+-      await client.rpc.onUnhandledError({
+-        name: error.name,
+-        message: error.message,
+-        stack: String(error.stack),
+-      }, 'Cleanup Error')
++      await unhandledError(error, 'Cleanup Error')
+     }
+-    state.environmentTeardownRun = true
+-    await stopCoverageInsideWorker(config.coverage, executor, { isolate: config.browser.isolate }).catch((error) => {
+-      client.rpc.onUnhandledError({
+-        name: error.name,
+-        message: error.message,
+-        stack: String(error.stack),
+-      }, 'Coverage Error').catch(() => {})
+-    })
+-
+-    debug('finished running tests')
+-    done(files)
+   }
++  // need to cleanup for each tester
++  // since playwright keyboard API is stateful on page instance level
++  await userEvent.cleanup()
++    .catch(error => unhandledError(error, 'Cleanup Error'))
++
++  // if isolation is disabled, Vitest reuses the same iframe and we
++  // don't need to switch the context back at all
++  if (contextSwitched) {
++    await rpc.wdioSwitchContext('parent')
++      .catch(error => unhandledError(error, 'Cleanup Error'))
++  }
++  state.environmentTeardownRun = true
++  await stopCoverageInsideWorker(config.coverage, executor, { isolate: config.browser.isolate }).catch((error) => {
++    return unhandledError(error, 'Coverage Error')
++  })
+ }
+ 
+-// @ts-expect-error untyped global for internal use
+-window.__vitest_browser_runner__.runTests = files => executeTests('run', files)
+-// @ts-expect-error untyped global for internal use
+-window.__vitest_browser_runner__.collectTests = files => executeTests('collect', files)
++function unhandledError(e: Error, type: string) {
++  return client.rpc.onUnhandledError({
++    name: e.name,
++    message: e.message,
++    stack: e.stack,
++  }, type).catch(() => {})
++}
++function isEvent(data: unknown): data is IframeChannelEvent {
++  return typeof data === 'object' && !!data && 'event' in data
++}
+diff --git a/packages/browser/src/client/tester/unhandled.ts b/packages/browser/src/client/tester/unhandled.ts
+deleted file mode 100644
+index 3ddd5cd57896..000000000000
+--- a/packages/browser/src/client/tester/unhandled.ts
++++ /dev/null
+@@ -1,72 +0,0 @@
+-import { client } from '@vitest/browser/client'
+-
+-function on(event: string, listener: (...args: any[]) => void) {
+-  window.addEventListener(event, listener)
+-  return () => window.removeEventListener(event, listener)
+-}
+-
+-function serializeError(unhandledError: any) {
+-  if (typeof unhandledError !== 'object' || !unhandledError) {
+-    return {
+-      message: String(unhandledError),
+-    }
+-  }
+-
+-  return {
+-    name: unhandledError.name,
+-    message: unhandledError.message,
+-    stack: String(unhandledError.stack),
+-  }
+-}
+-
+-function catchWindowErrors(cb: (e: ErrorEvent) => void) {
+-  let userErrorListenerCount = 0
+-  function throwUnhandlerError(e: ErrorEvent) {
+-    if (userErrorListenerCount === 0 && e.error != null) {
+-      cb(e)
+-    }
+-    else {
+-      console.error(e.error)
+-    }
+-  }
+-  const addEventListener = window.addEventListener.bind(window)
+-  const removeEventListener = window.removeEventListener.bind(window)
+-  window.addEventListener('error', throwUnhandlerError)
+-  window.addEventListener = function (
+-    ...args: [any, any, any]
+-  ) {
+-    if (args[0] === 'error') {
+-      userErrorListenerCount++
+-    }
+-    return addEventListener.apply(this, args)
+-  }
+-  window.removeEventListener = function (
+-    ...args: [any, any, any]
+-  ) {
+-    if (args[0] === 'error' && userErrorListenerCount) {
+-      userErrorListenerCount--
+-    }
+-    return removeEventListener.apply(this, args)
+-  }
+-  return function clearErrorHandlers() {
+-    window.removeEventListener('error', throwUnhandlerError)
+-  }
+-}
+-
+-function registerUnexpectedErrors() {
+-  catchWindowErrors(event =>
+-    reportUnexpectedError('Error', event.error),
+-  )
+-  on('unhandledrejection', event =>
+-    reportUnexpectedError('Unhandled Rejection', event.reason))
+-}
+-
+-async function reportUnexpectedError(
+-  type: string,
+-  error: any,
+-) {
+-  const processedError = serializeError(error)
+-  await client.rpc.onUnhandledError(processedError, type)
+-}
+-
+-registerUnexpectedErrors()
+diff --git a/packages/browser/src/client/utils.ts b/packages/browser/src/client/utils.ts
+index 90fbad92210a..7a200a9c8a03 100644
+--- a/packages/browser/src/client/utils.ts
++++ b/packages/browser/src/client/utils.ts
+@@ -1,5 +1,6 @@
+ import type { VitestRunner } from '@vitest/runner'
+ import type { SerializedConfig, WorkerGlobalState } from 'vitest'
++import type { IframeOrchestrator } from './orchestrator'
+ import type { CommandsManager } from './tester/utils'
+ 
+ export async function importId(id: string): Promise<any> {
+@@ -78,8 +79,7 @@ export interface BrowserRunnerState {
+   sessionId: string
+   testerId: string
+   method: 'run' | 'collect'
+-  runTests?: (tests: string[]) => Promise<void>
+-  createTesters?: (files: string[]) => Promise<void>
++  orchestrator?: IframeOrchestrator
+   commands: CommandsManager
+   cdp?: {
+     on: (event: string, listener: (payload: any) => void) => void
+diff --git a/packages/browser/src/node/middlewares/testerMiddleware.ts b/packages/browser/src/node/middlewares/testerMiddleware.ts
+index 435ff7149ed1..10026d9c694d 100644
+--- a/packages/browser/src/node/middlewares/testerMiddleware.ts
++++ b/packages/browser/src/node/middlewares/testerMiddleware.ts
+@@ -9,7 +9,7 @@ export function createTesterMiddleware(browserServer: ParentBrowserProject): Con
+       return next()
+     }
+     const url = new URL(req.url, 'http://localhost')
+-    if (!url.pathname.startsWith(browserServer.prefixTesterUrl)) {
++    if (!url.pathname.startsWith(browserServer.prefixTesterUrl) || !url.searchParams.has('sessionId')) {
+       return next()
+     }
+ 
+diff --git a/packages/browser/src/node/plugin.ts b/packages/browser/src/node/plugin.ts
+index 7aec32370605..d1f75d3a9977 100644
+--- a/packages/browser/src/node/plugin.ts
++++ b/packages/browser/src/node/plugin.ts
+@@ -526,15 +526,6 @@ body {
+             : null,
+           ...parentServer.testerScripts,
+           ...testerTags,
+-          {
+-            tag: 'script',
+-            attrs: {
+-              'type': 'module',
+-              'data-vitest-append': '',
+-            },
+-            children: '{__VITEST_APPEND__}',
+-            injectTo: 'body',
+-          } as const,
+         ].filter(s => s != null)
+       },
+     },
+diff --git a/packages/browser/src/node/pool.ts b/packages/browser/src/node/pool.ts
+index 86dcf7a8b404..9a6177cea0c8 100644
+--- a/packages/browser/src/node/pool.ts
++++ b/packages/browser/src/node/pool.ts
+@@ -1,116 +1,59 @@
+-import type { BrowserProvider, ProcessPool, TestProject, TestSpecification, Vitest } from 'vitest/node'
++import type { DeferPromise } from '@vitest/utils'
++import type {
++  BrowserProvider,
++  ProcessPool,
++  TestProject,
++  TestSpecification,
++  Vitest,
++} from 'vitest/node'
+ import crypto from 'node:crypto'
+ import * as nodeos from 'node:os'
+-import { relative } from 'pathe'
++import { createDefer } from '@vitest/utils'
++import { stringify } from 'flatted'
+ import { createDebugger } from 'vitest/node'
+ 
+ const debug = createDebugger('vitest:browser:pool')
+ 
+-async function waitForTests(
+-  method: 'run' | 'collect',
+-  sessionId: string,
+-  project: TestProject,
+-  files: string[],
+-) {
+-  const context = project.vitest._browserSessions.createAsyncSession(method, sessionId, files, project)
+-  return await context
+-}
+-
+ export function createBrowserPool(vitest: Vitest): ProcessPool {
+   const providers = new Set<BrowserProvider>()
+ 
+-  const executeTests = async (method: 'run' | 'collect', project: TestProject, files: string[]) => {
+-    vitest.state.clearFiles(project, files)
+-    const browser = project.browser!
++  const numCpus
++    = typeof nodeos.availableParallelism === 'function'
++      ? nodeos.availableParallelism()
++      : nodeos.cpus().length
++
++  const threadsCount = vitest.config.watch
++    ? Math.max(Math.floor(numCpus / 2), 1)
++    : Math.max(numCpus - 1, 1)
+ 
+-    const threadsCount = getThreadsCount(project)
++  const projectPools = new WeakMap<TestProject, BrowserPool>()
+ 
+-    const provider = browser.provider
+-    providers.add(provider)
++  const ensurePool = (project: TestProject) => {
++    if (projectPools.has(project)) {
++      return projectPools.get(project)!
++    }
+ 
+-    const resolvedUrls = browser.vite.resolvedUrls
++    debug?.('creating pool for project %s', project.name)
++
++    const resolvedUrls = project.browser!.vite.resolvedUrls
+     const origin = resolvedUrls?.local[0] ?? resolvedUrls?.network[0]
+ 
+     if (!origin) {
+       throw new Error(
+-        `Can't find browser origin URL for project "${project.name}" when running tests for files "${files.join('", "')}"`,
++        `Can't find browser origin URL for project "${project.name}"`,
+       )
+     }
+ 
+-    async function setBreakpoint(sessionId: string, file: string) {
+-      if (!project.config.inspector.waitForDebugger) {
+-        return
+-      }
+-
+-      if (!provider.getCDPSession) {
+-        throw new Error('Unable to set breakpoint, CDP not supported')
+-      }
+-
+-      const session = await provider.getCDPSession(sessionId)
+-      await session.send('Debugger.enable', {})
+-      await session.send('Debugger.setBreakpointByUrl', {
+-        lineNumber: 0,
+-        urlRegex: escapePathToRegexp(file),
+-      })
+-    }
+-
+-    const filesPerThread = Math.ceil(files.length / threadsCount)
+-
+-    // TODO: make it smarter,
+-    // Currently if we run 4/4/4/4 tests, and one of the chunks ends,
+-    // but there are pending tests in another chunks, we can't redistribute them
+-    const chunks: string[][] = []
+-    for (let i = 0; i < files.length; i += filesPerThread) {
+-      const chunk = files.slice(i, i + filesPerThread)
+-      chunks.push(chunk)
+-    }
+-
+-    debug?.(
+-      `[%s] Running %s tests in %s chunks (%s threads)`,
+-      project.name || 'core',
+-      files.length,
+-      chunks.length,
+-      threadsCount,
+-    )
+-
+-    const orchestrators = [...browser.state.orchestrators.entries()]
+-
+-    const promises: Promise<void>[] = []
+-
+-    chunks.forEach((files, index) => {
+-      if (orchestrators[index]) {
+-        const [sessionId, orchestrator] = orchestrators[index]
+-        debug?.(
+-          'Reusing orchestrator (session %s) for files: %s',
+-          sessionId,
+-          [...files.map(f => relative(project.config.root, f))].join(', '),
+-        )
+-        const promise = waitForTests(method, sessionId, project, files)
+-        const tester = orchestrator.createTesters(files).catch((error) => {
+-          if (error instanceof Error && error.message.startsWith('[birpc] rpc is closed')) {
+-            return
+-          }
+-          return Promise.reject(error)
+-        })
+-        promises.push(promise, tester)
+-      }
+-      else {
+-        const sessionId = crypto.randomUUID()
+-        const waitPromise = waitForTests(method, sessionId, project, files)
+-        debug?.(
+-          'Opening a new session %s for files: %s',
+-          sessionId,
+-          [...files.map(f => relative(project.config.root, f))].join(', '),
+-        )
+-        const url = new URL('/', origin)
+-        url.searchParams.set('sessionId', sessionId)
+-        const page = provider
+-          .openPage(sessionId, url.toString(), () => setBreakpoint(sessionId, files[0]))
+-        promises.push(page, waitPromise)
+-      }
++    const pool: BrowserPool = new BrowserPool(project, {
++      maxWorkers: getThreadsCount(project),
++      origin,
++    })
++    projectPools.set(project, pool)
++    vitest.onCancel(() => {
++      pool.cancel()
+     })
+ 
+-    await Promise.all(promises)
++    return pool
+   }
+ 
+   const runWorkspaceTests = async (method: 'run' | 'collect', specs: TestSpecification[]) => {
+@@ -126,32 +69,35 @@ export function createBrowserPool(vitest: Vitest): ProcessPool {
+       isCancelled = true
+     })
+ 
+-    // TODO: parallelize tests instead of running them sequentially (based on CPU?)
+-    for (const [project, files] of groupedFiles.entries()) {
+-      if (isCancelled) {
+-        break
+-      }
+-      await project._initBrowserProvider()
++    // TODO: this might now be a good idea... should we run these in chunks?
++    await Promise.all(
++      [...groupedFiles.entries()].map(async ([project, files]) => {
++        await project._initBrowserProvider()
+ 
+-      if (!project.browser) {
+-        throw new TypeError(`The browser server was not initialized${project.name ? ` for the "${project.name}" project` : ''}. This is a bug in Vitest. Please, open a new issue with reproduction.`)
+-      }
+-      await executeTests(method, project, files)
+-    }
+-  }
++        if (!project.browser) {
++          throw new TypeError(`The browser server was not initialized${project.name ? ` for the "${project.name}" project` : ''}. This is a bug in Vitest. Please, open a new issue with reproduction.`)
++        }
+ 
+-  const numCpus
+-    = typeof nodeos.availableParallelism === 'function'
+-      ? nodeos.availableParallelism()
+-      : nodeos.cpus().length
++        if (isCancelled) {
++          return
++        }
++
++        const pool = ensurePool(project)
++        vitest.state.clearFiles(project, files)
++        providers.add(project.browser!.provider)
++
++        await pool.runTests(method, files)
++      }),
++    )
++  }
+ 
+   function getThreadsCount(project: TestProject) {
+     const config = project.config.browser
+-    if (!config.headless || !project.browser!.provider.supportsParallelism) {
+-      return 1
+-    }
+-
+-    if (!config.fileParallelism) {
++    if (
++      !config.headless
++      || !config.fileParallelism
++      || !project.browser!.provider.supportsParallelism
++    ) {
+       return 1
+     }
+ 
+@@ -159,9 +105,7 @@ export function createBrowserPool(vitest: Vitest): ProcessPool {
+       return project.config.maxWorkers
+     }
+ 
+-    return vitest.config.watch
+-      ? Math.max(Math.floor(numCpus / 2), 1)
+-      : Math.max(numCpus - 1, 1)
++    return threadsCount
+   }
+ 
+   return {
+@@ -183,3 +127,192 @@ export function createBrowserPool(vitest: Vitest): ProcessPool {
+ function escapePathToRegexp(path: string): string {
+   return path.replace(/[/\\.?*()^${}|[\]+]/g, '\\$&')
+ }
++
++class BrowserPool {
++  private _queue: string[] = []
++  private _promise: DeferPromise<void> | undefined
++  private _providedContext: string | undefined
++
++  private readySessions = new Set<string>()
++
++  constructor(
++    private project: TestProject,
++    private options: {
++      maxWorkers: number
++      origin: string
++    },
++  ) {}
++
++  public cancel(): void {
++    this._queue = []
++  }
++
++  public reject(error: Error): void {
++    this._promise?.reject(error)
++    this._promise = undefined
++    this.cancel()
++  }
++
++  get orchestrators() {
++    return this.project.browser!.state.orchestrators
++  }
++
++  async runTests(method: 'run' | 'collect', files: string[]): Promise<void> {
++    this._promise ??= createDefer<void>()
++
++    if (!files.length) {
++      this._promise.resolve()
++      return this._promise
++    }
++
++    this._providedContext = stringify(this.project.getProvidedContext())
++
++    this._queue.push(...files)
++
++    this.readySessions.forEach((sessionId) => {
++      if (this._queue.length) {
++        this.readySessions.delete(sessionId)
++        this.runNextTest(method, sessionId)
++      }
++    })
++
++    if (this.orchestrators.size >= this.options.maxWorkers) {
++      return this._promise
++    }
++
++    // open the minimum amount of tabs
++    // if there is only 1 file running, we don't need 8 tabs running
++    const workerCount = Math.min(
++      this.options.maxWorkers - this.orchestrators.size,
++      files.length,
++    )
++
++    const promises: Promise<void>[] = []
++    for (let i = 0; i < workerCount; i++) {
++      const sessionId = crypto.randomUUID()
++      const page = this.openPage(sessionId).then(() => {
++        // start running tests on the page when it's ready
++        this.runNextTest(method, sessionId)
++      })
++      promises.push(page)
++    }
++    await Promise.all(promises)
++    return this._promise
++  }
++
++  private async openPage(sessionId: string) {
++    const sessionPromise = this.project.vitest._browserSessions.createSession(
++      sessionId,
++      this.project,
++      this,
++    )
++    const url = new URL('/', this.options.origin)
++    url.searchParams.set('sessionId', sessionId)
++    const pagePromise = this.project.browser!.provider.openPage(
++      sessionId,
++      url.toString(),
++    )
++    await Promise.all([sessionPromise, pagePromise])
++  }
++
++  private getOrchestrator(sessionId: string) {
++    const orchestrator = this.orchestrators.get(sessionId)
++    if (!orchestrator) {
++      throw new Error(`Orchestrator not found for session ${sessionId}. This is a bug in Vitest. Please, open a new issue with reproduction.`)
++    }
++    return orchestrator
++  }
++
++  private finishSession(sessionId: string): void {
++    this.readySessions.add(sessionId)
++
++    // the last worker finished running tests
++    if (this.readySessions.size === this.orchestrators.size) {
++      this._promise?.resolve()
++      this._promise = undefined
++      debug?.('all tests finished running')
++    }
++  }
++
++  private runNextTest(method: 'run' | 'collect', sessionId: string): void {
++    const file = this._queue.shift()
++
++    if (!file) {
++      debug?.('[%s] no more tests to run', sessionId)
++      const isolate = this.project.config.browser.isolate
++      // we don't need to cleanup testers if isolation is enabled,
++      // because cleanup is done at the end of every test
++      if (isolate) {
++        this.finishSession(sessionId)
++        return
++      }
++
++      // we need to cleanup testers first because there is only
++      // one iframe and it does the cleanup only after everything is completed
++      const orchestrator = this.getOrchestrator(sessionId)
++      orchestrator.cleanupTesters()
++        .catch(error => this.reject(error))
++        .finally(() => this.finishSession(sessionId))
++      return
++    }
++
++    if (!this._promise) {
++      throw new Error(`Unexpected empty queue`)
++    }
++
++    const orchestrator = this.getOrchestrator(sessionId)
++    debug?.('[%s] run test %s', sessionId, file)
++
++    this.setBreakpoint(sessionId, file).then(() => {
++      // this starts running tests inside the orchestrator
++      orchestrator.createTesters(
++        {
++          method,
++          files: [file],
++          // this will be parsed by the test iframe, not the orchestrator
++          // so we need to stringify it first to avoid double serialization
++          providedContext: this._providedContext || '[{}]',
++        },
++      )
++        .then(() => {
++          debug?.('[%s] test %s finished running', sessionId, file)
++          this.runNextTest(method, sessionId)
++        })
++        .catch((error) => {
++          // if user cancells the test run manually, ignore the error and exit gracefully
++          if (
++            this.project.vitest.isCancelling
++            && error instanceof Error
++            && error.message.startsWith('Browser connection was closed while running tests')
++          ) {
++            this.cancel()
++            this._promise?.resolve()
++            this._promise = undefined
++            return
++          }
++          debug?.('[%s] error during %s test run: %s', sessionId, file, error)
++          this.reject(error)
++        })
++    }).catch(err => this.reject(err))
++  }
++
++  async setBreakpoint(sessionId: string, file: string) {
++    if (!this.project.config.inspector.waitForDebugger) {
++      return
++    }
++
++    const provider = this.project.browser!.provider
++
++    if (!provider.getCDPSession) {
++      throw new Error('Unable to set breakpoint, CDP not supported')
++    }
++
++    debug?.('[%s] set breakpoint for %s', sessionId, file)
++    const session = await provider.getCDPSession(sessionId)
++    await session.send('Debugger.enable', {})
++    await session.send('Debugger.setBreakpointByUrl', {
++      lineNumber: 0,
++      urlRegex: escapePathToRegexp(file),
++    })
++  }
++}
+diff --git a/packages/browser/src/node/projectParent.ts b/packages/browser/src/node/projectParent.ts
+index 703c88f17f1c..7b4e3a085956 100644
+--- a/packages/browser/src/node/projectParent.ts
++++ b/packages/browser/src/node/projectParent.ts
+@@ -198,7 +198,7 @@ export class ParentBrowserProject {
+       throw new Error(`CDP is not supported by the provider "${provider.name}".`)
+     }
+ 
+-    const promise = this.cdpSessionsPromises.get(rpcId) ?? await (async () => {
++    const session = await this.cdpSessionsPromises.get(rpcId) ?? await (async () => {
+       const promise = provider.getCDPSession!(sessionId).finally(() => {
+         this.cdpSessionsPromises.delete(rpcId)
+       })
+@@ -206,7 +206,6 @@ export class ParentBrowserProject {
+       return promise
+     })()
+ 
+-    const session = await promise
+     const rpc = (browser.state as BrowserServerState).testers.get(rpcId)
+     if (!rpc) {
+       throw new Error(`Tester RPC "${rpcId}" was not established.`)
+diff --git a/packages/browser/src/node/providers/playwright.ts b/packages/browser/src/node/providers/playwright.ts
+index 3d762ea6ca53..8b2943582ea9 100644
+--- a/packages/browser/src/node/providers/playwright.ts
++++ b/packages/browser/src/node/providers/playwright.ts
+@@ -14,6 +14,7 @@ import type {
+   BrowserModuleMocker,
+   BrowserProvider,
+   BrowserProviderInitializationOptions,
++  CDPSession,
+   TestProject,
+ } from 'vitest/node'
+ import { createManualModuleSource } from '@vitest/mocker/node'
+@@ -328,12 +329,6 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
+       })
+     }
+ 
+-    // unhandled page crashes will hang vitest process
+-    page.on('crash', () => {
+-      const session = this.project.vitest._browserSessions.getSession(sessionId)
+-      session?.reject(new Error('Page crashed when executing tests'))
+-    })
+-
+     return page
+   }
+ 
+@@ -343,12 +338,7 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
+     await browserPage.goto(url, { timeout: 0 })
+   }
+ 
+-  async getCDPSession(sessionid: string): Promise<{
+-    send: (method: string, params: any) => Promise<unknown>
+-    on: (event: string, listener: (...args: any[]) => void) => void
+-    off: (event: string, listener: (...args: any[]) => void) => void
+-    once: (event: string, listener: (...args: any[]) => void) => void
+-  }> {
++  async getCDPSession(sessionid: string): Promise<CDPSession> {
+     const page = this.getPage(sessionid)
+     const cdp = await page.context().newCDPSession(page)
+     return {
+diff --git a/packages/browser/src/node/rpc.ts b/packages/browser/src/node/rpc.ts
+index a22abef44464..01ae82d4e32c 100644
+--- a/packages/browser/src/node/rpc.ts
++++ b/packages/browser/src/node/rpc.ts
+@@ -58,13 +58,6 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+       )
+     }
+ 
+-    const method = searchParams.get('method') as 'run' | 'collect'
+-    if (method !== 'run' && method !== 'collect') {
+-      return error(
+-        new Error(`[vitest] Method query in ${request.url} is invalid. Method should be either "run" or "collect".`),
+-      )
+-    }
+-
+     if (type === 'orchestrator') {
+       const session = vitest._browserSessions.getSession(sessionId)
+       // it's possible the session was already resolved by the preview provider
+@@ -82,7 +75,7 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+     wss.handleUpgrade(request, socket, head, (ws) => {
+       wss.emit('connection', ws, request)
+ 
+-      const rpc = setupClient(project, rpcId, ws, method)
++      const rpc = setupClient(project, rpcId, ws)
+       const state = project.browser!.state as BrowserServerState
+       const clients = type === 'tester' ? state.testers : state.orchestrators
+       clients.set(rpcId, rpc)
+@@ -93,6 +86,13 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+         debug?.('[%s] Browser API disconnected from %s', rpcId, type)
+         clients.delete(rpcId)
+         globalServer.removeCDPHandler(rpcId)
++        if (type === 'orchestrator') {
++          vitest._browserSessions.destroySession(sessionId)
++        }
++        // this will reject any hanging methods if there are any
++        rpc.$close(
++          new Error(`[vitest] Browser connection was closed while running tests. Was the page closed unexpectedly?`),
++        )
+       })
+     })
+   })
+@@ -111,7 +111,7 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+     }
+   }
+ 
+-  function setupClient(project: TestProject, rpcId: string, ws: WebSocket, method: 'run' | 'collect') {
++  function setupClient(project: TestProject, rpcId: string, ws: WebSocket) {
+     const mockResolver = new ServerMockResolver(globalServer.vite, {
+       moduleDirectories: project.config.server?.deps?.moduleDirectories,
+     })
+@@ -126,7 +126,7 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+           }
+           vitest.state.catchError(error, type)
+         },
+-        async onQueued(file) {
++        async onQueued(method, file) {
+           if (method === 'collect') {
+             vitest.state.collectFiles(project, [file])
+           }
+@@ -134,7 +134,7 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+             await vitest._testRun.enqueued(project, file)
+           }
+         },
+-        async onCollected(files) {
++        async onCollected(method, files) {
+           if (method === 'collect') {
+             vitest.state.collectFiles(project, files)
+           }
+@@ -142,7 +142,7 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+             await vitest._testRun.collected(project, files)
+           }
+         },
+-        async onTaskUpdate(packs, events) {
++        async onTaskUpdate(method, packs, events) {
+           if (method === 'collect') {
+             vitest.state.updateTasks(packs)
+           }
+@@ -153,7 +153,7 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+         onAfterSuiteRun(meta) {
+           vitest.coverageProvider?.onAfterSuiteRun(meta)
+         },
+-        async sendLog(log) {
++        async sendLog(method, log) {
+           if (method === 'collect') {
+             vitest.state.updateUserLog(log)
+           }
+@@ -244,10 +244,6 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+           ) as any as BrowserCommandContext
+           return await commands[command](context, ...payload)
+         },
+-        finishBrowserTests(sessionId: string) {
+-          debug?.('[%s] Finishing browser tests for session', sessionId)
+-          return vitest._browserSessions.getSession(sessionId)?.resolve()
+-        },
+         resolveMock(rawId, importer, options) {
+           return mockResolver.resolveMock(rawId, importer, options)
+         },
+@@ -329,6 +325,7 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+         on: fn => ws.on('message', fn),
+         eventNames: ['onCancel', 'cdpEvent'],
+         serialize: (data: any) => stringify(data, stringifyReplace),
++        timeout: -1, // createTesters can take a long time
+         deserialize: parse,
+         onTimeoutError(functionName) {
+           throw new Error(`[vitest-api]: Timeout calling "${functionName}"`)
+diff --git a/packages/browser/src/node/serverOrchestrator.ts b/packages/browser/src/node/serverOrchestrator.ts
+index 7dcf60920125..3290f0c85d12 100644
+--- a/packages/browser/src/node/serverOrchestrator.ts
++++ b/packages/browser/src/node/serverOrchestrator.ts
+@@ -1,6 +1,7 @@
+ import type { IncomingMessage, ServerResponse } from 'node:http'
+ import type { ProjectBrowser } from './project'
+ import type { ParentBrowserProject } from './projectParent'
++import { stringify } from 'flatted'
+ import { replacer } from './utils'
+ 
+ export async function resolveOrchestrator(
+@@ -19,7 +20,6 @@ export async function resolveOrchestrator(
+   // because the user could refresh the page which would remove the session id from the url
+ 
+   const session = globalServer.vitest._browserSessions.getSession(sessionId!)
+-  const files = session?.files ?? []
+   const browserProject = (session?.project.browser as ProjectBrowser | undefined) || [...globalServer.children][0]
+ 
+   if (!browserProject) {
+@@ -36,12 +36,11 @@ export async function resolveOrchestrator(
+     __VITEST_VITE_CONFIG__: JSON.stringify({
+       root: browserProject.vite.config.root,
+     }),
+-    __VITEST_METHOD__: JSON.stringify(session?.method || 'run'),
+-    __VITEST_FILES__: JSON.stringify(files),
++    __VITEST_METHOD__: JSON.stringify('orchestrate'),
+     __VITEST_TYPE__: '"orchestrator"',
+     __VITEST_SESSION_ID__: JSON.stringify(sessionId),
+     __VITEST_TESTER_ID__: '"none"',
+-    __VITEST_PROVIDED_CONTEXT__: '{}',
++    __VITEST_PROVIDED_CONTEXT__: JSON.stringify(stringify(browserProject.project.getProvidedContext())),
+     __VITEST_API_TOKEN__: JSON.stringify(globalServer.vitest.config.api.token),
+   })
+ 
+diff --git a/packages/browser/src/node/serverTester.ts b/packages/browser/src/node/serverTester.ts
+index 70e3f7bf9604..92603616b07d 100644
+--- a/packages/browser/src/node/serverTester.ts
++++ b/packages/browser/src/node/serverTester.ts
+@@ -3,7 +3,6 @@ import type { Connect } from 'vite'
+ import type { ProjectBrowser } from './project'
+ import type { ParentBrowserProject } from './projectParent'
+ import crypto from 'node:crypto'
+-import { stringify } from 'flatted'
+ import { join } from 'pathe'
+ import { replacer } from './utils'
+ 
+@@ -23,7 +22,7 @@ export async function resolveTester(
+     )
+   }
+ 
+-  const { sessionId, testFile } = globalServer.resolveTesterUrl(url.pathname)
++  const sessionId = url.searchParams.get('sessionId') || 'none'
+   const session = globalServer.vitest._browserSessions.getSession(sessionId)
+ 
+   if (!session) {
+@@ -33,17 +32,6 @@ export async function resolveTester(
+   }
+ 
+   const project = globalServer.vitest.getProjectByName(session.project.name || '')
+-  const { testFiles } = await project.globTestFiles()
+-  // if decoded test file is "__vitest_all__" or not in the list of known files, run all tests
+-  const tests
+-    = testFile === '__vitest_all__'
+-      || !testFiles.includes(testFile)
+-      ? '__vitest_browser_runner__.files'
+-      : JSON.stringify([testFile])
+-  const iframeId = JSON.stringify(testFile)
+-  const files = session.files ?? []
+-  const method = session.method ?? 'run'
+-
+   const browserProject = (project.browser as ProjectBrowser | undefined) || [...globalServer.children][0]
+ 
+   if (!browserProject) {
+@@ -59,15 +47,14 @@ export async function resolveTester(
+   const injector = replacer(injectorJs, {
+     __VITEST_PROVIDER__: JSON.stringify(project.browser!.provider.name),
+     __VITEST_CONFIG__: JSON.stringify(browserProject.wrapSerializedConfig()),
+-    __VITEST_FILES__: JSON.stringify(files),
+     __VITEST_VITE_CONFIG__: JSON.stringify({
+       root: browserProject.vite.config.root,
+     }),
+     __VITEST_TYPE__: '"tester"',
+-    __VITEST_METHOD__: JSON.stringify(method),
++    __VITEST_METHOD__: JSON.stringify('none'),
+     __VITEST_SESSION_ID__: JSON.stringify(sessionId),
+     __VITEST_TESTER_ID__: JSON.stringify(crypto.randomUUID()),
+-    __VITEST_PROVIDED_CONTEXT__: JSON.stringify(stringify(project.getProvidedContext())),
++    __VITEST_PROVIDED_CONTEXT__: '{}',
+     __VITEST_API_TOKEN__: JSON.stringify(globalServer.vitest.config.api.token),
+   })
+ 
+@@ -81,17 +68,11 @@ export async function resolveTester(
+     const html = replacer(indexhtml, {
+       __VITEST_FAVICON__: globalServer.faviconUrl,
+       __VITEST_INJECTOR__: injector,
+-      __VITEST_APPEND__: `
+-    __vitest_browser_runner__.runningFiles = ${tests}
+-    __vitest_browser_runner__.iframeId = ${iframeId}
+-    __vitest_browser_runner__.${method === 'run' ? 'runTests' : 'collectTests'}(__vitest_browser_runner__.runningFiles)
+-    document.querySelector('script[data-vitest-append]').remove()
+-    `,
+     })
+     return html
+   }
+-  catch (err) {
+-    session.reject(err)
++  catch (err: any) {
++    session.fail(err)
+     next(err)
+   }
+ }
+diff --git a/packages/browser/src/node/types.ts b/packages/browser/src/node/types.ts
+index 73adf3054f03..96d373210e38 100644
+--- a/packages/browser/src/node/types.ts
++++ b/packages/browser/src/node/types.ts
+@@ -2,23 +2,31 @@ import type { MockedModuleSerialized } from '@vitest/mocker'
+ import type { ServerIdResolution, ServerMockResolution } from '@vitest/mocker/node'
+ import type { TaskEventPack, TaskResultPack } from '@vitest/runner'
+ import type { BirpcReturn } from 'birpc'
+-import type { AfterSuiteRunMeta, CancelReason, Reporter, RunnerTestFile, SnapshotResult, UserConsoleLog } from 'vitest'
++import type {
++  AfterSuiteRunMeta,
++  BrowserTesterOptions,
++  CancelReason,
++  Reporter,
++  RunnerTestFile,
++  SnapshotResult,
++  TestExecutionMethod,
++  UserConsoleLog,
++} from 'vitest'
+ 
+ export interface WebSocketBrowserHandlers {
+   resolveSnapshotPath: (testPath: string) => string
+   resolveSnapshotRawPath: (testPath: string, rawPath: string) => string
+   onUnhandledError: (error: unknown, type: string) => Promise<void>
+-  onQueued: (file: RunnerTestFile) => void
+-  onCollected: (files: RunnerTestFile[]) => Promise<void>
+-  onTaskUpdate: (packs: TaskResultPack[], events: TaskEventPack[]) => void
++  onQueued: (method: TestExecutionMethod, file: RunnerTestFile) => void
++  onCollected: (method: TestExecutionMethod, files: RunnerTestFile[]) => Promise<void>
++  onTaskUpdate: (method: TestExecutionMethod, packs: TaskResultPack[], events: TaskEventPack[]) => void
+   onAfterSuiteRun: (meta: AfterSuiteRunMeta) => void
+   onCancel: (reason: CancelReason) => void
+   getCountOfFailedTests: () => number
+   readSnapshotFile: (id: string) => Promise<string | null>
+   saveSnapshotFile: (id: string, content: string) => Promise<void>
+   removeSnapshotFile: (id: string) => Promise<void>
+-  sendLog: (log: UserConsoleLog) => void
+-  finishBrowserTests: (sessionId: string) => void
++  sendLog: (method: TestExecutionMethod, log: UserConsoleLog) => void
+   snapshotSaved: (snapshot: SnapshotResult) => void
+   debug: (...args: string[]) => void
+   resolveId: (
+@@ -66,7 +74,8 @@ export interface WebSocketEvents
+ 
+ export interface WebSocketBrowserEvents {
+   onCancel: (reason: CancelReason) => void
+-  createTesters: (files: string[]) => Promise<void>
++  createTesters: (options: BrowserTesterOptions) => Promise<void>
++  cleanupTesters: () => Promise<void>
+   cdpEvent: (event: string, payload: unknown) => void
+   resolveManualMock: (url: string) => Promise<{
+     url: string
+diff --git a/packages/expect/src/jest-expect.ts b/packages/expect/src/jest-expect.ts
+index b12e426fedca..62ec29beaeff 100644
+--- a/packages/expect/src/jest-expect.ts
++++ b/packages/expect/src/jest-expect.ts
+@@ -1206,7 +1206,7 @@ function ordinalOf(i: number) {
+ }
+ 
+ function formatCalls(spy: MockInstance, msg: string, showActualCall?: any) {
+-  if (spy.mock.calls) {
++  if (spy.mock.calls.length) {
+     msg += c.gray(
+       `\n\nReceived: \n\n${spy.mock.calls
+         .map((callArg, i) => {
+@@ -1243,29 +1243,31 @@ function formatReturns(
+   msg: string,
+   showActualReturn?: any,
+ ) {
+-  msg += c.gray(
+-    `\n\nReceived: \n\n${results
+-      .map((callReturn, i) => {
+-        let methodCall = c.bold(
+-          `  ${ordinalOf(i + 1)} ${spy.getMockName()} call return:\n\n`,
+-        )
+-        if (showActualReturn) {
+-          methodCall += diff(showActualReturn, callReturn.value, {
+-            omitAnnotationLines: true,
+-          })
+-        }
+-        else {
+-          methodCall += stringify(callReturn)
+-            .split('\n')
+-            .map(line => `    ${line}`)
+-            .join('\n')
+-        }
++  if (results.length) {
++    msg += c.gray(
++      `\n\nReceived: \n\n${results
++        .map((callReturn, i) => {
++          let methodCall = c.bold(
++            `  ${ordinalOf(i + 1)} ${spy.getMockName()} call return:\n\n`,
++          )
++          if (showActualReturn) {
++            methodCall += diff(showActualReturn, callReturn.value, {
++              omitAnnotationLines: true,
++            })
++          }
++          else {
++            methodCall += stringify(callReturn)
++              .split('\n')
++              .map(line => `    ${line}`)
++              .join('\n')
++          }
+ 
+-        methodCall += '\n'
+-        return methodCall
+-      })
+-      .join('\n')}`,
+-  )
++          methodCall += '\n'
++          return methodCall
++        })
++        .join('\n')}`,
++    )
++  }
+   msg += c.gray(
+     `\n\nNumber of calls: ${c.bold(spy.mock.calls.length)}\n`,
+   )
+diff --git a/packages/vitest/src/node/browser/sessions.ts b/packages/vitest/src/node/browser/sessions.ts
+index dfff4f8644df..c197a56c9ca5 100644
+--- a/packages/vitest/src/node/browser/sessions.ts
++++ b/packages/vitest/src/node/browser/sessions.ts
+@@ -1,7 +1,6 @@
+ import type { TestProject } from '../project'
+ import type { BrowserServerStateSession } from '../types/browser'
+ import { createDefer } from '@vitest/utils'
+-import { relative } from 'pathe'
+ 
+ export class BrowserSessions {
+   private sessions = new Map<string, BrowserServerStateSession>()
+@@ -10,27 +9,30 @@ export class BrowserSessions {
+     return this.sessions.get(sessionId)
+   }
+ 
+-  createAsyncSession(method: 'run' | 'collect', sessionId: string, files: string[], project: TestProject): Promise<void> {
++  destroySession(sessionId: string): void {
++    this.sessions.delete(sessionId)
++  }
++
++  createSession(sessionId: string, project: TestProject, pool: { reject: (error: Error) => void }): Promise<void> {
++    // this promise only waits for the WS connection with the orhcestrator to be established
+     const defer = createDefer<void>()
+ 
+     const timeout = setTimeout(() => {
+-      const tests = files.map(file => relative(project.config.root, file)).join('", "')
+-      defer.reject(new Error(`Failed to connect to the browser session "${sessionId}" [${project.name}] for "${tests}" within the timeout.`))
++      defer.reject(new Error(`Failed to connect to the browser session "${sessionId}" [${project.name}] within the timeout.`))
+     }, project.vitest.config.browser.connectTimeout ?? 60_000).unref()
+ 
+     this.sessions.set(sessionId, {
+-      files,
+-      method,
+       project,
+       connected: () => {
++        defer.resolve()
+         clearTimeout(timeout)
+       },
+-      resolve: () => {
++      // this fails the whole test run and cancels the pool
++      fail: (error: Error) => {
+         defer.resolve()
+         clearTimeout(timeout)
+-        this.sessions.delete(sessionId)
++        pool.reject(error)
+       },
+-      reject: defer.reject,
+     })
+     return defer
+   }
+diff --git a/packages/vitest/src/node/types/browser.ts b/packages/vitest/src/node/types/browser.ts
+index cd0afc36c861..d6b8d623a1f9 100644
+--- a/packages/vitest/src/node/types/browser.ts
++++ b/packages/vitest/src/node/types/browser.ts
+@@ -3,6 +3,7 @@ import type { CancelReason } from '@vitest/runner'
+ import type { Awaitable, ErrorWithDiff, ParsedStack } from '@vitest/utils'
+ import type { StackTraceParserOptions } from '@vitest/utils/source-map'
+ import type { ViteDevServer } from 'vite'
++import type { BrowserTesterOptions } from '../../types/browser'
+ import type { TestProject } from '../project'
+ import type { ApiConfig, ProjectConfig } from './config'
+ 
+@@ -244,16 +245,14 @@ export interface BrowserCommandContext {
+ }
+ 
+ export interface BrowserServerStateSession {
+-  files: string[]
+-  method: 'run' | 'collect'
+   project: TestProject
+   connected: () => void
+-  resolve: () => void
+-  reject: (v: unknown) => void
++  fail: (v: Error) => void
+ }
+ 
+ export interface BrowserOrchestrator {
+-  createTesters: (files: string[]) => Promise<void>
++  cleanupTesters: () => Promise<void>
++  createTesters: (options: BrowserTesterOptions) => Promise<void>
+   onCancel: (reason: CancelReason) => Promise<void>
+   $close: () => void
+ }
+diff --git a/packages/vitest/src/public/index.ts b/packages/vitest/src/public/index.ts
+index 1612dfbc4041..31fdcece33d9 100644
+--- a/packages/vitest/src/public/index.ts
++++ b/packages/vitest/src/public/index.ts
+@@ -179,6 +179,7 @@ export type WorkerContext = WorkerContext_
+ /** @deprecated import from `vitest/node` instead */
+ export type WorkerRPC = WorkerRPC_
+ 
++export type { BrowserTesterOptions } from '../types/browser'
+ export type {
+   AfterSuiteRunMeta,
+   ErrorWithDiff,
+@@ -243,6 +244,7 @@ export type {
+   ContextRPC,
+   ContextTestEnvironment,
+   ResolveIdFunction,
++  TestExecutionMethod,
+   WorkerGlobalState,
+ } from '../types/worker'
+ export type {
+diff --git a/packages/vitest/src/public/node.ts b/packages/vitest/src/public/node.ts
+index 89616f8cd179..23f7182e88c3 100644
+--- a/packages/vitest/src/public/node.ts
++++ b/packages/vitest/src/public/node.ts
+@@ -130,14 +130,13 @@ export type { TestRunResult } from '../node/types/tests'
+ export const TestFile: typeof _TestFile = _TestFile
+ export type { WorkerContext } from '../node/types/worker'
+ export { createViteLogger } from '../node/viteLogger'
++export { distDir, rootDir } from '../paths'
+ 
+ /**
+  * @deprecated Use `ModuleDiagnostic` instead
+  */
+ export type FileDiagnostic = _FileDiagnostic
+ 
+-export { distDir, rootDir } from '../paths'
+-
+ export type {
+   CollectLineNumbers as TypeCheckCollectLineNumbers,
+   CollectLines as TypeCheckCollectLines,
+@@ -147,6 +146,8 @@ export type {
+   RootAndTarget as TypeCheckRootAndTarget,
+ } from '../typecheck/types'
+ 
++export type { TestExecutionMethod as TestExecutionType } from '../types/worker'
++
+ export { createDebugger } from '../utils/debugger'
+ 
+ export type {
+diff --git a/packages/vitest/src/runtime/config.ts b/packages/vitest/src/runtime/config.ts
+index f9249182edcd..0383f144e237 100644
+--- a/packages/vitest/src/runtime/config.ts
++++ b/packages/vitest/src/runtime/config.ts
+@@ -134,9 +134,9 @@ export interface SerializedConfig {
+   standalone: boolean
+   logHeapUsage: boolean | undefined
+   coverage: SerializedCoverageConfig
+-  benchmark?: {
++  benchmark: {
+     includeSamples: boolean
+-  }
++  } | undefined
+ }
+ 
+ export interface SerializedCoverageConfig {
+diff --git a/packages/vitest/src/types/browser.ts b/packages/vitest/src/types/browser.ts
+new file mode 100644
+index 000000000000..11d7c2122425
+--- /dev/null
++++ b/packages/vitest/src/types/browser.ts
+@@ -0,0 +1,7 @@
++import type { TestExecutionMethod } from './worker'
++
++export interface BrowserTesterOptions {
++  method: TestExecutionMethod
++  files: string[]
++  providedContext: string
++}
+diff --git a/packages/vitest/src/types/worker.ts b/packages/vitest/src/types/worker.ts
+index f2681ea05ee9..05b511c4a742 100644
+--- a/packages/vitest/src/types/worker.ts
++++ b/packages/vitest/src/types/worker.ts
+@@ -20,6 +20,8 @@ export interface ContextTestEnvironment {
+   options: Record<string, any> | null
+ }
+ 
++export type TestExecutionMethod = 'run' | 'collect'
++
+ export interface ContextRPC {
+   pool: string
+   worker: string
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 98d056036756..12d254ae97b2 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -55,8 +55,8 @@ catalogs:
+       specifier: ^8.3.4
+       version: 8.3.4
+     birpc:
+-      specifier: 0.2.19
+-      version: 0.2.19
++      specifier: 2.3.0
++      version: 2.3.0
+     cac:
+       specifier: ^6.7.14
+       version: 6.7.14
+@@ -492,7 +492,7 @@ importers:
+         version: 9.10.1
+       birpc:
+         specifier: 'catalog:'
+-        version: 0.2.19
++        version: 2.3.0
+       flatted:
+         specifier: 'catalog:'
+         version: 3.3.3
+@@ -841,7 +841,7 @@ importers:
+         version: 0.7.2
+       birpc:
+         specifier: 'catalog:'
+-        version: 0.2.19
++        version: 2.3.0
+       codemirror:
+         specifier: ^5.65.18
+         version: 5.65.18
+@@ -1051,7 +1051,7 @@ importers:
+         version: 8.3.4
+       birpc:
+         specifier: 'catalog:'
+-        version: 0.2.19
++        version: 2.3.0
+       cac:
+         specifier: 'catalog:'
+         version: 6.7.14(patch_hash=a8f0f3517a47ce716ed90c0cfe6ae382ab763b021a664ada2a608477d0621588)
+@@ -1118,7 +1118,7 @@ importers:
+     dependencies:
+       birpc:
+         specifier: 'catalog:'
+-        version: 0.2.19
++        version: 2.3.0
+       flatted:
+         specifier: 'catalog:'
+         version: 3.3.3
+@@ -4658,6 +4658,9 @@ packages:
+   birpc@0.2.19:
+     resolution: {integrity: sha512-5WeXXAvTmitV1RqJFppT5QtUiz2p1mRSYU000Jkft5ZUCLJIk4uQriYNO50HknxKwM6jd8utNc66K1qGIwwWBQ==}
+ 
++  birpc@2.3.0:
++    resolution: {integrity: sha512-ijbtkn/F3Pvzb6jHypHRyve2QApOCZDR25D/VnkY2G/lBNcXCTsnsCxgY4k4PkVB7zfwzYbY3O9Lcqe3xufS5g==}
++
+   bl@4.1.0:
+     resolution: {integrity: sha512-1W07cM9gS6DcLperZfFSj+bWLtaPGSOHWhPiGzXmvVJbRLdG82sH/Kn8EtW1VqWVA54AKf2h5k5BbnIbwF3h6w==}
+ 
+@@ -12415,6 +12418,8 @@ snapshots:
+ 
+   birpc@0.2.19: {}
+ 
++  birpc@2.3.0: {}
++
+   bl@4.1.0:
+     dependencies:
+       buffer: 5.7.1
+diff --git a/pnpm-workspace.yaml b/pnpm-workspace.yaml
+index d2e7cf6aad72..9335cea22d7a 100644
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -21,7 +21,7 @@ catalog:
+   '@vitejs/plugin-vue': ^5.2.3
+   '@vueuse/core': ^12.8.2
+   acorn-walk: ^8.3.4
+-  birpc: 0.2.19
++  birpc: 2.3.0
+   cac: ^6.7.14
+   chai: ^5.2.0
+   debug: ^4.4.0
+diff --git a/test/browser/fixtures/browser-crash/vitest.config.ts b/test/browser/fixtures/browser-crash/vitest.config.ts
+index 3f23dfde5b97..f6fec5a38a0a 100644
+--- a/test/browser/fixtures/browser-crash/vitest.config.ts
++++ b/test/browser/fixtures/browser-crash/vitest.config.ts
+@@ -4,16 +4,30 @@ import { instances, provider } from '../../settings'
+ import { BrowserCommand } from 'vitest/node'
+ 
+ const forceCrash: BrowserCommand<[]> = async (context) => {
+-  const browser = context.context.browser().browserType().name()
+-  if (browser === 'chromium') {
+-    await context.page.goto('chrome://crash')
+-  }
++  if (context.provider.name === 'playwright') {
++    const browser = context.context.browser().browserType().name()
++    if (browser === 'chromium') {
++      await context.page.goto('chrome://crash')
++    }
+ 
+-  if (browser === 'firefox') {
+-    await context.page.goto('about:crashcontent')
+-  }
++    if (browser === 'firefox') {
++      await context.page.goto('about:crashcontent')
++    }
+ 
+-  throw new Error(`Browser crash not supported for ${browser}`)
++    throw new Error(`Browser crash not supported for ${browser}`)
++  }
++  if (context.provider.name === 'webdriverio') {
++    // @ts-expect-error not typed
++    const browser = context.browser as any
++    const name = context.project.config.browser.name
++    if (name === 'chrome') {
++      await browser.url('chrome://crash')
++    }
++    if (name === 'firefox') {
++      await browser.url('about:crashcontent')
++    }
++    throw new Error(`Browser crash not supported for ${name}`)
++  }
+ }
+ 
+ export default defineConfig({
+diff --git a/test/browser/fixtures/mocking-out-of-root/project1/vitest.config.ts b/test/browser/fixtures/mocking-out-of-root/project1/vitest.config.ts
+index 3f7b9dcdf2a0..15b50b920b95 100644
+--- a/test/browser/fixtures/mocking-out-of-root/project1/vitest.config.ts
++++ b/test/browser/fixtures/mocking-out-of-root/project1/vitest.config.ts
+@@ -12,6 +12,7 @@ export default defineConfig({
+       enabled: true,
+       provider: provider,
+       screenshotFailures: false,
++      headless: true,
+       instances,
+       headless: true,
+     },
+diff --git a/test/browser/setup.unit.ts b/test/browser/setup.unit.ts
+index dd69c73378c1..4cd3a2b24d82 100644
+--- a/test/browser/setup.unit.ts
++++ b/test/browser/setup.unit.ts
+@@ -1,3 +1,4 @@
++import type { BrowserInstanceOption } from 'vitest/node'
+ import { expect } from 'vitest'
+ 
+ interface SummaryOptions {
+@@ -5,12 +6,26 @@ interface SummaryOptions {
+ }
+ 
+ expect.extend({
+-  toReportPassedTest(stdout: string, testName: string, testProject?: string) {
+-    const includePattern = `✓ ${testProject ? `|${testProject}| ` : ''}${testName}`
+-    const pass = stdout.includes(`✓ ${testProject ? `|${testProject}| ` : ''}${testName}`)
++  toReportPassedTest(stdout: string, testName: string, testProject?: string | BrowserInstanceOption[]) {
++    const checks: BrowserInstanceOption[] | undefined = Array.isArray(testProject)
++      ? testProject
++      : (testProject && [{ browser: testProject }])
++
++    const pass = checks?.length
++      ? checks.every(({ browser }) => {
++          const includePattern = `✓ |${browser}| ${testName}`
++          return stdout.includes(includePattern)
++        })
++      : stdout.includes(`✓ ${testName}`)
++
+     return {
+       pass,
+-      message: () => `expected ${pass ? 'not ' : ''}to have "${includePattern}" in the report.\n\nstdout:\n${stdout}`,
++      message: () => {
++        const includePattern = checks?.length
++          ? checks.map(check => `✓ |${check}| ${testName}`).join('\n')
++          : `✓ ${testName}`
++        return `expected ${pass ? 'not ' : ''}to have "${includePattern}" in the report.\n\nstdout:\n${stdout}`
++      },
+     }
+   },
+   toReportSummaryTestFiles(stdout: string, { passed }: SummaryOptions) {
+@@ -42,7 +57,7 @@ declare module 'vitest' {
+   // eslint-disable-next-line unused-imports/no-unused-vars
+   interface Assertion<T = any> {
+     // eslint-disable-next-line ts/method-signature-style
+-    toReportPassedTest(testName: string, testProject?: string): void
++    toReportPassedTest(testName: string, testProject?: string | BrowserInstanceOption[]): void
+     // eslint-disable-next-line ts/method-signature-style
+     toReportSummaryTestFiles(options: SummaryOptions): void
+     // eslint-disable-next-line ts/method-signature-style
+diff --git a/test/browser/specs/browser-crash.test.ts b/test/browser/specs/browser-crash.test.ts
+index 89d0b950e64e..daaa1865bcd7 100644
+--- a/test/browser/specs/browser-crash.test.ts
++++ b/test/browser/specs/browser-crash.test.ts
+@@ -1,9 +1,7 @@
+ import { expect, test } from 'vitest'
+-import { instances, provider, runBrowserTests } from './utils'
++import { instances, runBrowserTests } from './utils'
+ 
+-// TODO handle webdriverio. Currently they
+-// expose no trustable way to detect browser crashes.
+-test.runIf(provider === 'playwright')('fails gracefully when browser crashes', async () => {
++test('fails gracefully when browser crashes', async () => {
+   const { stderr } = await runBrowserTests({
+     root: './fixtures/browser-crash',
+     reporters: [['verbose', { isTTY: false }]],
+@@ -13,5 +11,5 @@ test.runIf(provider === 'playwright')('fails gracefully when browser crashes', a
+     },
+   })
+ 
+-  expect(stderr).toContain('Page crashed when executing tests')
++  expect(stderr).toContain('Browser connection was closed while running tests. Was the page closed unexpectedly?')
+ })
+diff --git a/test/browser/specs/setup-file.test.ts b/test/browser/specs/setup-file.test.ts
+index 73699beb1b6e..4542555a82db 100644
+--- a/test/browser/specs/setup-file.test.ts
++++ b/test/browser/specs/setup-file.test.ts
+@@ -8,11 +8,14 @@ test('setup file imports the same modules', async () => {
+     {
+       root: './fixtures/setup-file',
+     },
++    undefined,
++    {},
++    {
++      // TODO 2025-03-26 remove after debugging
++      std: 'inherit',
++    },
+   )
+ 
+   expect(stderr).toReportNoErrors()
+-
+-  instances.forEach(({ browser }) => {
+-    expect(stdout).toReportPassedTest('module-equality.test.ts', browser)
+-  })
++  expect(stdout).toReportPassedTest('module-equality.test.ts', instances)
+ })
+diff --git a/test/browser/specs/utils.ts b/test/browser/specs/utils.ts
+index f46242609e6e..aa47f88985c4 100644
+--- a/test/browser/specs/utils.ts
++++ b/test/browser/specs/utils.ts
+@@ -1,5 +1,6 @@
+ import type { UserConfig as ViteUserConfig } from 'vite'
+ import type { UserConfig } from 'vitest/node'
++import type { VitestRunnerCLIOptions } from '../../test-utils'
+ import { runVitest } from '../../test-utils'
+ import { browser } from '../settings'
+ 
+@@ -9,6 +10,7 @@ export async function runBrowserTests(
+   config?: Omit<UserConfig, 'browser'> & { browser?: Partial<UserConfig['browser']> },
+   include?: string[],
+   viteOverrides?: Partial<ViteUserConfig>,
++  runnerOptions?: VitestRunnerCLIOptions,
+ ) {
+   return runVitest({
+     watch: false,
+@@ -18,5 +20,5 @@ export async function runBrowserTests(
+       headless: browser !== 'safari',
+       ...config?.browser,
+     } as UserConfig['browser'],
+-  }, include, 'test', viteOverrides)
++  }, include, 'test', viteOverrides, runnerOptions)
+ }
+diff --git a/test/browser/test/cdp.test.ts b/test/browser/test/cdp.test.ts
+index 026d9adbe200..fce095e4165a 100644
+--- a/test/browser/test/cdp.test.ts
++++ b/test/browser/test/cdp.test.ts
+@@ -7,9 +7,10 @@ describe.runIf(
+   it('cdp sends events correctly', async () => {
+     const messageAdded = vi.fn()
+ 
++    await cdp().send('Console.enable')
++
+     cdp().on('Console.messageAdded', messageAdded)
+ 
+-    await cdp().send('Console.enable')
+     onTestFinished(async () => {
+       await cdp().send('Console.disable')
+     })
+diff --git a/test/browser/vitest.config.mts b/test/browser/vitest.config.mts
+index 7f7e784d3e14..415e6663a7c1 100644
+--- a/test/browser/vitest.config.mts
++++ b/test/browser/vitest.config.mts
+@@ -58,7 +58,7 @@ export default defineConfig({
+           ? playwrightInstances
+           : webdriverioInstances,
+       provider,
+-      isolate: false,
++      // isolate: false,
+       testerScripts: [
+         {
+           content: 'globalThis.__injected = []',
+diff --git a/test/core/test/__snapshots__/mocked.test.ts.snap b/test/core/test/__snapshots__/mocked.test.ts.snap
+index 0e56affcf4bd..a2eb4faa5f69 100644
+--- a/test/core/test/__snapshots__/mocked.test.ts.snap
++++ b/test/core/test/__snapshots__/mocked.test.ts.snap
+@@ -74,10 +74,6 @@ Number of calls: 3
+ exports[`mocked function which fails on toReturnWith > zero call 1`] = `
+ "expected "spy" to return with: 2 at least once
+ 
+-Received: 
+-
+-
+-
+ Number of calls: 0
+ "
+ `;

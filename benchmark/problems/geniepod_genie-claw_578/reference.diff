@@ -1,0 +1,225 @@
+diff --git a/crates/genie-core/src/llm/local_provider.rs b/crates/genie-core/src/llm/local_provider.rs
+new file mode 100644
+index 00000000..c50b22d1
+--- /dev/null
++++ b/crates/genie-core/src/llm/local_provider.rs
+@@ -0,0 +1,65 @@
++//! Runtime `Provider` seam: the swappable completion surface an agent turn
++//! depends on, with the local model as the default implementation.
++//!
++//! Counterpart to [`super::provider`], which only validates whether an optional
++//! API provider is *eligible*. Here the turn depends on `&dyn Provider` rather
++//! than a concrete client, and [`LocalProvider`] wraps the on-device
++//! [`LlmClient`] as the default — identical behavior to calling it directly.
++
++use anyhow::Result;
++use async_trait::async_trait;
++
++use super::{LlmClient, LlmRequestHints, Message};
++
++/// Source of chat completions for an agent turn.
++///
++/// Prompt messages in, a completion string out; parsing that completion into a
++/// tool call or a plain reply stays in the agent loop and is provider-agnostic.
++/// Swapping the implementation changes only how the completion is produced,
++/// which is the seam the optional API-provider work plugs into.
++#[async_trait]
++pub trait Provider: Send + Sync {
++    /// Stable identifier for the underlying model surface.
++    fn provider_name(&self) -> &str;
++
++    /// Produce a completion for `messages`, honoring the token budget and the
++    /// optional cache-aware request hints.
++    async fn complete(
++        &self,
++        messages: &[Message],
++        max_tokens: Option<u32>,
++        hints: Option<&LlmRequestHints>,
++    ) -> Result<String>;
++}
++
++/// Default [`Provider`]: the on-device local model behind [`LlmClient`].
++///
++/// Borrows the client so the server keeps using it for the streaming and health
++/// paths that are not routed through `Provider`.
++pub struct LocalProvider<'a> {
++    llm: &'a LlmClient,
++}
++
++impl<'a> LocalProvider<'a> {
++    pub fn new(llm: &'a LlmClient) -> Self {
++        Self { llm }
++    }
++}
++
++#[async_trait]
++impl Provider for LocalProvider<'_> {
++    fn provider_name(&self) -> &str {
++        self.llm.backend_name()
++    }
++
++    async fn complete(
++        &self,
++        messages: &[Message],
++        max_tokens: Option<u32>,
++        hints: Option<&LlmRequestHints>,
++    ) -> Result<String> {
++        self.llm
++            .chat_with_format_and_hints(messages, max_tokens, None, hints)
++            .await
++    }
++}
+diff --git a/crates/genie-core/src/llm/mod.rs b/crates/genie-core/src/llm/mod.rs
+index b74eeec0..2514e2d7 100644
+--- a/crates/genie-core/src/llm/mod.rs
++++ b/crates/genie-core/src/llm/mod.rs
+@@ -1,5 +1,6 @@
+ mod genie_ai_runtime;
+ mod llama_cpp;
++mod local_provider;
+ mod mock;
+ mod openai_compat;
+ mod openai_compatible;
+@@ -12,6 +13,7 @@ use genie_common::config::{LlmBackendKind, ServiceEndpoint};
+ 
+ pub use genie_ai_runtime::GenieAiRuntimeBackend;
+ pub use llama_cpp::LlamaCppBackend;
++pub use local_provider::{LocalProvider, Provider};
+ pub use mock::MockLlmBackend;
+ pub use openai_compat::{LlmTimeouts, Message, ResponseFormat};
+ pub use openai_compatible::OpenAiCompatibleBackend;
+diff --git a/crates/genie-core/src/server.rs b/crates/genie-core/src/server.rs
+index bba1e847..10eaa6ac 100644
+--- a/crates/genie-core/src/server.rs
++++ b/crates/genie-core/src/server.rs
+@@ -14,7 +14,10 @@ use tokio::sync::{Mutex, Semaphore};
+ 
+ use crate::connectivity::{ConnectivityController, ConnectivityHealth, ConnectivityState};
+ use crate::conversation::ConversationStore;
+-use crate::llm::{LlmBackendClient, LlmClient, LlmRequestHints, Message, PrivacyProxyBackend};
++use crate::llm::{
++    LlmBackendClient, LlmClient, LlmRequestHints, LocalProvider, Message, PrivacyProxyBackend,
++    Provider,
++};
+ use crate::memory::{Memory, SharedMemory, with_shared_memory};
+ use crate::origin_auth::OriginResolver;
+ use crate::prompt::ModelFamily;
+@@ -1125,8 +1128,9 @@ async fn handle_chat_stream(
+     .await
+     {
+         tool_name = Some(tool_result.tool.clone());
++        let provider = LocalProvider::new(llm);
+         let summary = finalize_tool_turn(
+-            llm,
++            &provider,
+             conversations,
+             &conv_id,
+             &llm_response,
+@@ -1182,7 +1186,7 @@ async fn handle_chat_stream(
+ 
+ /// POST /api/chat
+ pub async fn process_chat_turn(
+-    llm: &LlmClient,
++    provider: &dyn Provider,
+     tools: &ToolDispatcher,
+     memory: &SharedMemory,
+     conversations: &ConversationStore,
+@@ -1277,13 +1281,14 @@ pub async fn process_chat_turn(
+                     error = %proxy_err,
+                     "PrivacyProxy escalation failed; falling back to local model"
+                 );
+-                llm.chat_with_hints(&messages, Some(512), &request_hints)
++                provider
++                    .complete(&messages, Some(512), Some(&request_hints))
+                     .await?
+             }
+         }
+     } else {
+-        match llm
+-            .chat_with_hints(&messages, Some(512), &request_hints)
++        match provider
++            .complete(&messages, Some(512), Some(&request_hints))
+             .await
+         {
+             Ok(r) => r,
+@@ -1331,7 +1336,7 @@ pub async fn process_chat_turn(
+     {
+         tool_name = Some(tool_result.tool.clone());
+         finalize_tool_turn(
+-            llm,
++            provider,
+             conversations,
+             conv_id,
+             &llm_response,
+@@ -1426,7 +1431,7 @@ fn finalize_direct_tool_turn(
+ }
+ 
+ async fn finalize_tool_turn(
+-    llm: &LlmClient,
++    provider: &dyn Provider,
+     conversations: &ConversationStore,
+     conv_id: &str,
+     llm_response: &str,
+@@ -1458,7 +1463,8 @@ async fn finalize_tool_turn(
+         );
+ 
+         let summary_hints = LlmRequestHints::tool_summary(conv_id, 128);
+-        llm.chat_with_hints(&summary_msgs, Some(128), &summary_hints)
++        provider
++            .complete(&summary_msgs, Some(128), Some(&summary_hints))
+             .await
+             .unwrap_or_else(|_| tool_result.output.clone())
+     } else {
+@@ -1617,8 +1623,9 @@ async fn handle_chat(
+         conv_id
+     };
+ 
++    let provider = LocalProvider::new(llm);
+     let turn = match process_chat_turn(
+-        llm,
++        &provider,
+         tools,
+         memory,
+         conversations,
+diff --git a/crates/genie-core/tests/provider_test.rs b/crates/genie-core/tests/provider_test.rs
+new file mode 100644
+index 00000000..006a49b2
+--- /dev/null
++++ b/crates/genie-core/tests/provider_test.rs
+@@ -0,0 +1,36 @@
++//! Runtime `Provider` seam (issue #567): the local model wrapped as the default
++//! provider delegates completions unchanged and is usable behind `&dyn Provider`.
++
++use genie_core::llm::{LlmClient, LocalProvider, Message, Provider};
++
++fn user(text: &str) -> Message {
++    Message {
++        role: "user".into(),
++        content: text.into(),
++    }
++}
++
++#[tokio::test]
++async fn local_provider_delegates_completion_to_the_wrapped_client() {
++    let llm = LlmClient::mock(["scripted reply"]);
++    let provider = LocalProvider::new(&llm);
++
++    let out = provider
++        .complete(&[user("hi")], Some(64), None)
++        .await
++        .unwrap();
++
++    assert_eq!(out, "scripted reply");
++    assert_eq!(provider.provider_name(), "mock");
++}
++
++#[tokio::test]
++async fn local_provider_is_usable_as_a_trait_object() {
++    let llm = LlmClient::mock(["dyn reply"]);
++    let local = LocalProvider::new(&llm);
++    let provider: &dyn Provider = &local;
++
++    let out = provider.complete(&[user("hi")], None, None).await.unwrap();
++
++    assert_eq!(out, "dyn reply");
++}

@@ -1,0 +1,377 @@
+diff --git a/packages/gittensory-miner/lib/claim-ledger.d.ts b/packages/gittensory-miner/lib/claim-ledger.d.ts
+new file mode 100644
+index 000000000..06f58fe49
+--- /dev/null
++++ b/packages/gittensory-miner/lib/claim-ledger.d.ts
+@@ -0,0 +1,43 @@
++export type ClaimStatus = "active" | "released" | "expired";
++
++export type ClaimEntry = {
++  id: number;
++  repoFullName: string;
++  issueNumber: number;
++  claimedAt: string;
++  status: ClaimStatus;
++  note: string | null;
++};
++
++export type RecordClaimInput = {
++  repoFullName: string;
++  issueNumber: number;
++  note?: string;
++};
++
++export type ListClaimsFilter = {
++  repoFullName?: string;
++  status?: ClaimStatus;
++};
++
++export type ClaimLedger = {
++  dbPath: string;
++  recordClaim(claim: RecordClaimInput): ClaimEntry;
++  releaseClaim(repoFullName: string, issueNumber: number): ClaimEntry | null;
++  listClaims(filter?: ListClaimsFilter): ClaimEntry[];
++  close(): void;
++};
++
++export const CLAIM_STATUSES: readonly ClaimStatus[];
++
++export function resolveClaimLedgerDbPath(env?: Record<string, string | undefined>): string;
++
++export function openClaimLedger(dbPath?: string): ClaimLedger;
++
++export function recordClaim(claim: RecordClaimInput): ClaimEntry;
++
++export function releaseClaim(repoFullName: string, issueNumber: number): ClaimEntry | null;
++
++export function listClaims(filter?: ListClaimsFilter): ClaimEntry[];
++
++export function closeDefaultClaimLedger(): void;
+diff --git a/packages/gittensory-miner/lib/claim-ledger.js b/packages/gittensory-miner/lib/claim-ledger.js
+new file mode 100644
+index 000000000..2e0dc90f5
+--- /dev/null
++++ b/packages/gittensory-miner/lib/claim-ledger.js
+@@ -0,0 +1,190 @@
++import { chmodSync, mkdirSync } from "node:fs";
++import { homedir } from "node:os";
++import { dirname, join } from "node:path";
++import { DatabaseSync } from "node:sqlite";
++
++// The miner's local soft-claim ledger (#2314): a 100% client-side record of "I'm working on issue #N in repo X",
++// so Phase 2's soft-claim adjudication (sibling issues) has somewhere to persist claims. Schema + CRUD only — no
++// adjudication logic, no network calls, no autonomous writes. The database only lives on this machine; this module
++// never uploads, syncs, or phones home. Mirrors the package's existing local-store pattern (run-state.js,
++// portfolio-queue.js, event-ledger.js) — plain JS + node:sqlite, not the hosted Worker's shared D1 `migrations/`.
++
++export const CLAIM_STATUSES = Object.freeze(["active", "released", "expired"]);
++
++const defaultDbFileName = "claim-ledger.sqlite3";
++let defaultClaimLedger = null;
++
++export function resolveClaimLedgerDbPath(env = process.env) {
++  const explicitPath = typeof env.GITTENSORY_MINER_CLAIM_LEDGER_DB === "string"
++    ? env.GITTENSORY_MINER_CLAIM_LEDGER_DB.trim()
++    : "";
++  if (explicitPath) return explicitPath;
++
++  const explicitConfigDir = typeof env.GITTENSORY_MINER_CONFIG_DIR === "string"
++    ? env.GITTENSORY_MINER_CONFIG_DIR.trim()
++    : "";
++  if (explicitConfigDir) return join(explicitConfigDir, defaultDbFileName);
++
++  const configHome = typeof env.XDG_CONFIG_HOME === "string" && env.XDG_CONFIG_HOME.trim()
++    ? env.XDG_CONFIG_HOME.trim()
++    : join(homedir(), ".config");
++  return join(configHome, "gittensory-miner", defaultDbFileName);
++}
++
++function normalizeDbPath(dbPath) {
++  const path = (dbPath ?? resolveClaimLedgerDbPath()).trim();
++  if (!path) throw new Error("invalid_claim_ledger_db_path");
++  return path;
++}
++
++function normalizeRepoFullName(repoFullName) {
++  if (typeof repoFullName !== "string") throw new Error("invalid_repo_full_name");
++  const [owner, repo, extra] = repoFullName.trim().split("/");
++  if (!owner || !repo || extra !== undefined) throw new Error("invalid_repo_full_name");
++  return `${owner}/${repo}`;
++}
++
++function normalizeIssueNumber(issueNumber) {
++  if (!Number.isInteger(issueNumber) || issueNumber < 1) throw new Error("invalid_issue_number");
++  return issueNumber;
++}
++
++/** Optional free-text note: omitted/nullish → null; a string is kept as-is; anything else is rejected. */
++function normalizeNote(note) {
++  if (note === undefined || note === null) return null;
++  if (typeof note !== "string") throw new Error("invalid_note");
++  return note;
++}
++
++function rowToClaim(row) {
++  return {
++    id: row.id,
++    repoFullName: row.repo_full_name,
++    issueNumber: row.issue_number,
++    claimedAt: row.claimed_at,
++    status: row.status,
++    note: row.note,
++  };
++}
++
++/**
++ * Opens the local claim ledger, creating the table on first use. `UNIQUE(repo_full_name, issue_number)` keeps ONE
++ * row per claimed issue, and `recordClaim` is a single atomic INSERT…ON CONFLICT statement (no read-then-write), so
++ * concurrent claims cannot duplicate a row. (#2314)
++ */
++export function openClaimLedger(dbPath = resolveClaimLedgerDbPath()) {
++  const resolvedPath = normalizeDbPath(dbPath);
++  mkdirSync(dirname(resolvedPath), { recursive: true, mode: 0o700 });
++  const db = new DatabaseSync(resolvedPath);
++  chmodSync(resolvedPath, 0o600);
++  db.exec("PRAGMA busy_timeout = 5000");
++  db.exec(`
++    CREATE TABLE IF NOT EXISTS miner_claims (
++      id INTEGER PRIMARY KEY AUTOINCREMENT,
++      repo_full_name TEXT NOT NULL,
++      issue_number INTEGER NOT NULL,
++      claimed_at TEXT NOT NULL,
++      status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'released', 'expired')),
++      note TEXT,
++      UNIQUE (repo_full_name, issue_number)
++    )
++  `);
++
++  // Idempotent claim in ONE atomic statement: insert a new active claim, or — only if the existing row is NOT
++  // already active — re-activate it (a released/expired claim can be re-claimed). The `WHERE status <> 'active'`
++  // guard makes re-claiming an already-active issue a true no-op (no row churn), never a duplicate row.
++  const recordStatement = db.prepare(`
++    INSERT INTO miner_claims (repo_full_name, issue_number, claimed_at, status, note)
++    VALUES (?, ?, ?, 'active', ?)
++    ON CONFLICT(repo_full_name, issue_number) DO UPDATE SET
++      claimed_at = excluded.claimed_at,
++      note = excluded.note,
++      status = 'active'
++    WHERE miner_claims.status <> 'active'
++  `);
++  const getStatement = db.prepare(
++    "SELECT * FROM miner_claims WHERE repo_full_name = ? AND issue_number = ?",
++  );
++  const releaseStatement = db.prepare(
++    "UPDATE miner_claims SET status = 'released' WHERE repo_full_name = ? AND issue_number = ?",
++  );
++  const listAllStatement = db.prepare("SELECT * FROM miner_claims ORDER BY id ASC");
++  const listRepoStatement = db.prepare(
++    "SELECT * FROM miner_claims WHERE repo_full_name = ? ORDER BY id ASC",
++  );
++  const listStatusStatement = db.prepare(
++    "SELECT * FROM miner_claims WHERE status = ? ORDER BY id ASC",
++  );
++  const listRepoStatusStatement = db.prepare(
++    "SELECT * FROM miner_claims WHERE repo_full_name = ? AND status = ? ORDER BY id ASC",
++  );
++
++  function normalizeStatusFilter(status) {
++    if (status === undefined) return undefined;
++    if (!CLAIM_STATUSES.includes(status)) throw new Error("invalid_status");
++    return status;
++  }
++
++  return {
++    dbPath: resolvedPath,
++    recordClaim(claim) {
++      const repoFullName = normalizeRepoFullName(claim?.repoFullName);
++      const issueNumber = normalizeIssueNumber(claim?.issueNumber);
++      const note = normalizeNote(claim?.note);
++      const claimedAt = new Date().toISOString();
++      recordStatement.run(repoFullName, issueNumber, claimedAt, note);
++      return rowToClaim(getStatement.get(repoFullName, issueNumber));
++    },
++    releaseClaim(repoFullName, issueNumber) {
++      const normalizedRepo = normalizeRepoFullName(repoFullName);
++      const normalizedIssue = normalizeIssueNumber(issueNumber);
++      releaseStatement.run(normalizedRepo, normalizedIssue);
++      const row = getStatement.get(normalizedRepo, normalizedIssue);
++      return row ? rowToClaim(row) : null;
++    },
++    listClaims(filter = {}) {
++      const repoFullName = filter.repoFullName === undefined
++        ? undefined
++        : normalizeRepoFullName(filter.repoFullName);
++      const status = normalizeStatusFilter(filter.status);
++
++      let rows;
++      if (repoFullName !== undefined && status !== undefined) {
++        rows = listRepoStatusStatement.all(repoFullName, status);
++      } else if (repoFullName !== undefined) {
++        rows = listRepoStatement.all(repoFullName);
++      } else if (status !== undefined) {
++        rows = listStatusStatement.all(status);
++      } else {
++        rows = listAllStatement.all();
++      }
++      return rows.map(rowToClaim);
++    },
++    close() {
++      db.close();
++    },
++  };
++}
++
++function getDefaultClaimLedger() {
++  defaultClaimLedger ??= openClaimLedger();
++  return defaultClaimLedger;
++}
++
++export function recordClaim(claim) {
++  return getDefaultClaimLedger().recordClaim(claim);
++}
++
++export function releaseClaim(repoFullName, issueNumber) {
++  return getDefaultClaimLedger().releaseClaim(repoFullName, issueNumber);
++}
++
++export function listClaims(filter) {
++  return getDefaultClaimLedger().listClaims(filter);
++}
++
++export function closeDefaultClaimLedger() {
++  if (!defaultClaimLedger) return;
++  defaultClaimLedger.close();
++  defaultClaimLedger = null;
++}
+diff --git a/packages/gittensory-miner/package.json b/packages/gittensory-miner/package.json
+index 7e175d4c5..f1c77d297 100644
+--- a/packages/gittensory-miner/package.json
++++ b/packages/gittensory-miner/package.json
+@@ -31,7 +31,7 @@
+     "lib"
+   ],
+   "scripts": {
+-    "build": "node --check bin/gittensory-miner.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/update-check.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js"
++    "build": "node --check bin/gittensory-miner.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/update-check.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/claim-ledger.js"
+   },
+   "dependencies": {
+     "@jsonbored/gittensory-engine": "0.1.0"
+diff --git a/test/unit/miner-claim-ledger.test.ts b/test/unit/miner-claim-ledger.test.ts
+new file mode 100644
+index 000000000..2b464e53f
+--- /dev/null
++++ b/test/unit/miner-claim-ledger.test.ts
+@@ -0,0 +1,113 @@
++import { mkdtempSync, rmSync, statSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  CLAIM_STATUSES,
++  closeDefaultClaimLedger,
++  openClaimLedger,
++  resolveClaimLedgerDbPath,
++} from "../../packages/gittensory-miner/lib/claim-ledger.js";
++
++const roots: string[] = [];
++const ledgers: Array<{ close(): void }> = [];
++
++function tempLedger() {
++  const root = mkdtempSync(join(tmpdir(), "gittensory-miner-claim-ledger-"));
++  roots.push(root);
++  const ledger = openClaimLedger(join(root, "nested", "claim-ledger.sqlite3"));
++  ledgers.push(ledger);
++  return ledger;
++}
++
++afterEach(() => {
++  for (const ledger of ledgers.splice(0)) ledger.close();
++  closeDefaultClaimLedger();
++  vi.useRealTimers();
++  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
++});
++
++describe("gittensory-miner claim ledger (#2314)", () => {
++  it("exposes the frozen status vocabulary", () => {
++    expect(CLAIM_STATUSES).toEqual(["active", "released", "expired"]);
++    expect(Object.isFrozen(CLAIM_STATUSES)).toBe(true);
++  });
++
++  it("resolves the DB path from env override, miner config dir, XDG config, then the home default", () => {
++    expect(resolveClaimLedgerDbPath({ GITTENSORY_MINER_CLAIM_LEDGER_DB: "/custom/c.sqlite3" })).toBe(
++      "/custom/c.sqlite3",
++    );
++    expect(resolveClaimLedgerDbPath({ GITTENSORY_MINER_CONFIG_DIR: "/custom/config" })).toBe(
++      "/custom/config/claim-ledger.sqlite3",
++    );
++    expect(resolveClaimLedgerDbPath({ XDG_CONFIG_HOME: "/xdg" })).toBe(
++      "/xdg/gittensory-miner/claim-ledger.sqlite3",
++    );
++    expect(resolveClaimLedgerDbPath({})).toMatch(/\/\.config\/gittensory-miner\/claim-ledger\.sqlite3$/);
++  });
++
++  it("creates the SQLite file with owner-only permissions and lists empty before any claim", () => {
++    const ledger = tempLedger();
++    expect(statSync(ledger.dbPath).mode & 0o077).toBe(0);
++    expect(ledger.listClaims()).toEqual([]);
++  });
++
++  it("records a claim and lists it back", () => {
++    const ledger = tempLedger();
++    const claim = ledger.recordClaim({ repoFullName: "JSONbored/gittensory", issueNumber: 2314, note: "mine" });
++    expect(claim).toMatchObject({
++      repoFullName: "JSONbored/gittensory",
++      issueNumber: 2314,
++      status: "active",
++      note: "mine",
++    });
++    expect(typeof claim.claimedAt).toBe("string");
++    expect(ledger.listClaims()).toEqual([claim]);
++    // A note is optional → null.
++    expect(ledger.recordClaim({ repoFullName: "o/a", issueNumber: 1 }).note).toBeNull();
++  });
++
++  it("is idempotent: re-claiming an already-active issue is a no-op, not a duplicate row", () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date("2026-07-03T00:00:00Z"));
++    const ledger = tempLedger();
++    const first = ledger.recordClaim({ repoFullName: "o/a", issueNumber: 7, note: "first" });
++    vi.setSystemTime(new Date("2026-07-03T01:00:00Z"));
++    const second = ledger.recordClaim({ repoFullName: "o/a", issueNumber: 7, note: "second" });
++    // Same row, unchanged (claimed_at + note preserved) — a true no-op while active.
++    expect(second).toEqual(first);
++    expect(ledger.listClaims({ repoFullName: "o/a" })).toHaveLength(1);
++  });
++
++  it("releases a claim, and re-claiming after release re-activates the same row", () => {
++    const ledger = tempLedger();
++    ledger.recordClaim({ repoFullName: "o/a", issueNumber: 9, note: "v1" });
++    const released = ledger.releaseClaim("o/a", 9);
++    expect(released?.status).toBe("released");
++    // Re-claim after release: same single row, back to active, note refreshed.
++    const reclaimed = ledger.recordClaim({ repoFullName: "o/a", issueNumber: 9, note: "v2" });
++    expect(reclaimed).toMatchObject({ status: "active", note: "v2", id: released?.id });
++    expect(ledger.listClaims({ repoFullName: "o/a" })).toHaveLength(1);
++    // Releasing an issue that was never claimed returns null.
++    expect(ledger.releaseClaim("o/a", 404)).toBeNull();
++  });
++
++  it("filters listClaims by repoFullName and/or status", () => {
++    const ledger = tempLedger();
++    ledger.recordClaim({ repoFullName: "o/a", issueNumber: 1 });
++    ledger.recordClaim({ repoFullName: "o/b", issueNumber: 1 });
++    ledger.recordClaim({ repoFullName: "o/a", issueNumber: 2 });
++    ledger.releaseClaim("o/a", 2);
++    expect(ledger.listClaims({ repoFullName: "o/a" }).map((c) => c.issueNumber)).toEqual([1, 2]);
++    expect(ledger.listClaims({ status: "active" }).map((c) => c.repoFullName)).toEqual(["o/a", "o/b"]);
++    expect(ledger.listClaims({ repoFullName: "o/a", status: "released" }).map((c) => c.issueNumber)).toEqual([2]);
++  });
++
++  it("rejects malformed inputs rather than persisting them", () => {
++    const ledger = tempLedger();
++    expect(() => ledger.recordClaim({ repoFullName: "no-slash", issueNumber: 1 })).toThrow("invalid_repo_full_name");
++    expect(() => ledger.recordClaim({ repoFullName: "o/a", issueNumber: 0 })).toThrow("invalid_issue_number");
++    expect(() => ledger.recordClaim({ repoFullName: "o/a", issueNumber: 1.5 })).toThrow("invalid_issue_number");
++    expect(() => ledger.listClaims({ status: "bogus" as never })).toThrow("invalid_status");
++  });
++});

@@ -1,0 +1,198 @@
+"""Tests for the objective scoring anchor (deterministic, structural)."""
+
+import os
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from benchmark.score import (  # noqa: E402
+    base_from_releases,
+    bump_level,
+    changed_modules,
+    is_release_subject,
+    module_recall,
+    objective_score,
+    parse_semver,
+    release_predicted,
+    release_signaled,
+)
+
+REVEALED = [
+    {"subject": "add plugin loader", "files": ["plugins/loader.py", "README.md"]},
+    {"subject": "refactor core engine", "files": ["core/engine.py"]},
+    {"subject": "Release v1.2.0", "files": ["CHANGELOG.md"]},
+]
+
+
+def test_changed_modules():
+    assert changed_modules(REVEALED) == {"plugins", "readme", "core", "changelog"}
+
+
+def test_module_recall_matches_by_name():
+    plan = [
+        {"title": "build plugin system", "theme": "plugins", "kind": "feature"},
+        {"title": "update readme", "kind": "docs"},
+    ]
+    res = module_recall(plan, REVEALED)
+    assert set(res["matched_modules"]) == {"plugins", "readme"}
+    assert res["module_recall"] == round(2 / 4, 3)  # core, changelog not anticipated
+
+
+def test_release_signals():
+    assert release_signaled(REVEALED) is True
+    assert release_predicted([{"title": "cut release", "kind": "release"}]) is True
+    assert release_predicted([{"title": "fix bug", "kind": "bugfix"}]) is False
+
+
+def test_objective_score_shape():
+    plan = [{"title": "prepare release v1.2.0", "kind": "release", "theme": "core"}]
+    score = objective_score(plan, REVEALED)
+    assert "module_recall" in score
+    assert score["release_signaled"] is True
+    assert score["release_predicted"] is True
+    assert score["release_match"] is True
+
+
+def test_empty_inputs():
+    res = module_recall([], [])
+    assert res["module_recall"] == 0.0
+    assert objective_score([], [])["release_match"] is True  # neither signaled nor predicted
+
+
+def test_is_release_subject_accepts_genuine_releases():
+    assert is_release_subject("Release v1.2.0")
+    assert is_release_subject("v1.2.0")
+    assert is_release_subject("1.2.0")
+    assert is_release_subject("release: 2.0.0")
+    assert is_release_subject("bump version to 2.0.0")
+    assert is_release_subject("update the changelog for the next cut")
+
+
+def test_is_release_subject_rejects_incidental_versions():
+    # Dependency bumps and version mentions are NOT releases.
+    assert not is_release_subject("chore(deps): bump lodash to v4.17.21")
+    assert not is_release_subject("upgrade numpy to 1.26.4")
+    assert not is_release_subject("fix crash in v1.2.0 parser")
+    assert not is_release_subject("docs: mention support for Python 3.11.0")
+    assert not is_release_subject("add retry logic")
+
+
+def test_release_signaled_ignores_dependency_bumps():
+    dep_bumps = [
+        {"subject": "chore(deps): bump lodash to v4.17.21", "files": ["package.json"]},
+        {"subject": "upgrade numpy to 1.26.4", "files": ["requirements.txt"]},
+    ]
+    assert release_signaled(dep_bumps) is False
+    # A genuine release in the window is still detected.
+    assert release_signaled(dep_bumps + [{"subject": "Release v2.0.0", "files": ["CHANGELOG.md"]}])
+
+
+def test_release_predicted_ignores_inline_version_but_honors_kind():
+    assert release_predicted([{"title": "bump pytest to 8.0.0", "kind": "dep"}]) is False
+    assert release_predicted([{"title": "prepare v1.2.0", "kind": "release"}]) is True   # kind
+    assert release_predicted([{"title": "Release v1.2.0", "kind": "misc"}]) is True      # subject
+
+
+def test_objective_score_no_false_release_match_on_dep_bumps():
+    # Window is only dep bumps; a plan that mentions a version must not score a release match.
+    revealed = [{"subject": "chore(deps): bump lodash to v4.17.21", "files": ["package.json"]}]
+    plan = [{"title": "upgrade deps to 2.0.0", "kind": "dep", "theme": "deps"}]
+    score = objective_score(plan, revealed)
+    assert score["release_signaled"] is False
+    assert score["release_predicted"] is False
+    assert score["release_match"] is True   # both correctly False -> agree
+
+
+def test_parse_semver_with_and_without_leading_v():
+    assert parse_semver("v1.2.0") == (1, 2, 0)
+    assert parse_semver("1.2.0") == (1, 2, 0)
+    assert parse_semver("Release v2.0.0") == (2, 0, 0)  # embedded in a subject line
+    assert parse_semver("1.4") == (1, 4, 0)             # missing patch -> 0
+    assert parse_semver("v3.1.4-rc2") == (3, 1, 4)      # pre-release suffix ignored
+    assert parse_semver("no version here") is None
+
+
+def test_bump_level_major_minor_patch():
+    assert bump_level((1, 2, 3), (2, 0, 0)) == "major"
+    assert bump_level((1, 2, 3), (1, 3, 0)) == "minor"
+    assert bump_level((1, 2, 3), (1, 2, 4)) == "patch"
+    assert bump_level((1, 2, 3), (1, 2, 3)) is None     # no change
+    assert bump_level((1, 2, 3), (1, 1, 0)) is None     # not a forward bump
+    assert bump_level(None, (1, 0, 0)) is None           # unknown base
+
+
+def _revealed_release(tag):
+    return [
+        {"subject": "refactor core engine", "files": ["core/engine.py"]},
+        {"subject": f"Release {tag}", "files": ["CHANGELOG.md"]},
+    ]
+
+
+def test_objective_score_bump_major():
+    score = objective_score(
+        [{"title": "cut release", "kind": "release"}],
+        _revealed_release("v2.0.0"),
+        version_bump="major", base_version="v1.4.2",
+    )
+    assert score["bump_actual"] == "major"
+    assert score["bump_match"] is True
+
+
+def test_objective_score_bump_minor_handles_no_leading_v():
+    # base tag without a leading v, revealed tag with one — both must parse.
+    score = objective_score(
+        [{"title": "cut release", "kind": "release"}],
+        _revealed_release("v1.5.0"),
+        version_bump="minor", base_version="1.4.2",
+    )
+    assert score["bump_actual"] == "minor"
+    assert score["bump_match"] is True
+
+
+def test_objective_score_bump_patch_and_mismatch():
+    revealed = _revealed_release("v1.4.3")
+    score = objective_score(
+        [{"title": "cut release", "kind": "release"}], revealed,
+        version_bump="minor", base_version="v1.4.2",
+    )
+    assert score["bump_actual"] == "patch"
+    assert score["bump_match"] is False       # agent said minor, actual was patch
+    # normalization: the agent predicting the right level (any case) matches.
+    assert objective_score([], revealed, version_bump="PATCH",
+                           base_version="v1.4.2")["bump_match"] is True
+
+
+def test_objective_score_bump_none_when_no_release_or_no_base():
+    # No release in the window -> no actual bump; predicting none is a match.
+    no_release = [{"subject": "refactor core engine", "files": ["core/engine.py"]}]
+    assert objective_score([], no_release, base_version="v1.4.2")["bump_actual"] is None
+    assert objective_score([], no_release, base_version="v1.4.2")["bump_match"] is True
+    # Release present but base unknown -> can't classify the delta.
+    assert objective_score([], _revealed_release("v2.0.0"),
+                           version_bump="major")["bump_actual"] is None
+
+
+def test_base_from_releases_picks_highest_tag():
+    releases = [{"tag": "v1.2.0"}, {"tag": "v1.10.0"}, {"tag": "v1.9.3"}]
+    assert base_from_releases(releases) == "v1.10.0"   # semver, not lexical, ordering
+    assert base_from_releases([]) is None
+
+
+def test_bump_actual_ignores_version_in_non_release_commit():
+    # Reviewer case: a non-release commit that merely names a version (e.g. a dep bump)
+    # must not produce a spurious bump_actual, even when its version is the highest around.
+    revealed = [
+        {"subject": "bump dep to v9.9.9", "files": ["requirements.txt"]},
+        {"subject": "Release v1.3.0", "files": ["CHANGELOG.md"]},
+    ]
+    score = objective_score([{"title": "cut release", "kind": "release"}], revealed,
+                            version_bump="minor", base_version="v1.2.0")
+    # Only the genuine release (v1.3.0) counts, so base v1.2.0 -> v1.3.0 is a minor bump —
+    # NOT a major driven by the incidental v9.9.9.
+    assert score["bump_actual"] == "minor"
+    assert score["bump_match"] is True
+    # And with only the non-release version present, there is no actual bump at all.
+    dep_only = [{"subject": "bump dep to v9.9.9", "files": ["requirements.txt"]}]
+    assert objective_score([], dep_only, base_version="v1.2.0")["bump_actual"] is None

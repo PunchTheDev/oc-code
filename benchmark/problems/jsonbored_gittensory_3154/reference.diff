@@ -1,0 +1,1087 @@
+diff --git a/packages/gittensory-engine/README.md b/packages/gittensory-engine/README.md
+index ed3085a1b..535e9785e 100644
+--- a/packages/gittensory-engine/README.md
++++ b/packages/gittensory-engine/README.md
+@@ -185,6 +185,65 @@ const result = computePairwiseCalibrationScore({
+ If every pairwise sample is unstable, the composite falls back to the objective-anchor score and records the failed
+ samples in `metrics` rather than averaging noise into the calibration signal.
+ 
++## Structured gate-verdict calibration
++
++`resolveGateVerdictCalibrationConfig()`, `ingestGateVerdictCalibrationSignals()`, and
++`computeGateVerdictCompositeCalibrationScore()` provide the pure engine contract for opt-in cross-product calibration.
++The hosted review stack remains responsible for loading the repo's current `.gittensory.yml` or private config; the
++engine contract is deliberately default-off and safe to call at ingestion time.
++
++The preferred config-as-code surface is:
++
++```yaml
++miner:
++  calibration:
++    shareStructuredGateVerdicts: true
++    structuredGateVerdictWeight: 0.2
++```
++
++Only `shareStructuredGateVerdicts: true` enables ingestion. Missing, malformed, or falsey values all fail closed to no
++sharing. The optional weight is non-negative and finite; malformed values fall back to the default.
++
++The accepted signal is intentionally narrow. It contains repo/run ids plus structured dimension outcomes such as
++`correctness`, `tests`, `security`, `scope`, `freshness`, `ci`, and `policy`. It has no fields for raw review text,
++secrets, trust scores, reward values, private rankings, or maintainer evidence.
++
++```ts
++import {
++  computeGateVerdictCompositeCalibrationScore,
++  ingestGateVerdictCalibrationSignals,
++} from "@jsonbored/gittensory-engine";
++
++const gateVerdicts = ingestGateVerdictCalibrationSignals([
++  {
++    repoFullName: "jsonbored/gittensory",
++    replayRunId: "replay-2026-07-04",
++    gateRunId: "gate-123",
++    optedIn: true,
++    dimensions: [
++      { dimension: "correctness", outcome: "pass" },
++      { dimension: "tests", outcome: "warn" },
++      { dimension: "security", outcome: "pass" },
++    ],
++  },
++]);
++
++const score = computeGateVerdictCompositeCalibrationScore({
++  objectiveAnchor: 0.65,
++  pairwise: 0.8,
++  gateVerdicts,
++});
++```
++
++The composite scorer renormalizes weights when a signal is absent. For example, if a repo opts out or no valid
++structured dimensions remain, the structured gate-verdict weight drops to zero and the objective/pairwise signals are
++renormalized. The returned audit trail records which opted-in repos contributed to the replay run and which rows were
++rejected because the repo was not opted in, had invalid ids, or exposed no recognized structured dimensions.
++
++`renderGateVerdictCalibrationAuditMarkdown(result)` turns the composite result into a deterministic local artifact with
++component scores, effective weights, contributing repos, dimension tables, rejected rows, and a contributing-repo
++summary. All caller-supplied ids and repo names are Markdown-escaped and newline-collapsed before rendering.
++
+ ## Plan templates
+ 
+ `plan-templates.ts` exports one builder per miner lifecycle stage (`analyze`, `plan`, `prepare`, `create`, `manage`).
+diff --git a/packages/gittensory-engine/src/gate-verdict-calibration.ts b/packages/gittensory-engine/src/gate-verdict-calibration.ts
+new file mode 100644
+index 000000000..0383a877e
+--- /dev/null
++++ b/packages/gittensory-engine/src/gate-verdict-calibration.ts
+@@ -0,0 +1,502 @@
++// Opt-in structured gate-verdict calibration signal (#3015).
++//
++// This module is the pure engine half of cross-product calibration. The hosted review stack can decide whether a
++// repo is currently opted in from its resolved `.gittensory.yml`/private config; the miner replay harness can then
++// ingest only the structured per-dimension verdict fields exposed here. No raw review text, secrets, trust values,
++// rewards, rankings, or maintainer evidence are represented in this type surface.
++
++import type { ObjectiveAnchorScore } from "./objective-anchor.js";
++import type { PairwiseCalibrationScore } from "./pairwise-calibration.js";
++
++export type GateVerdictCalibrationDimension =
++  | "correctness"
++  | "tests"
++  | "security"
++  | "maintainability"
++  | "scope"
++  | "freshness"
++  | "ci"
++  | "policy";
++
++export type GateVerdictCalibrationOutcome = "pass" | "warn" | "fail" | "unknown";
++
++export type GateVerdictCalibrationManifest = {
++  miner?: {
++    calibration?: {
++      /** Explicit maintainer opt-in. Default false. */
++      shareStructuredGateVerdicts?: unknown;
++      /** Optional weight for the structured gate-verdict signal when composed into a replay score. */
++      structuredGateVerdictWeight?: unknown;
++    } | null;
++  } | null;
++  calibration?: {
++    /** Back-compat/future-friendly alias, still explicit and default-off. */
++    shareStructuredGateVerdicts?: unknown;
++    structuredGateVerdictWeight?: unknown;
++  } | null;
++};
++
++export type GateVerdictCalibrationConfig = {
++  shareStructuredGateVerdicts: boolean;
++  structuredGateVerdictWeight: number;
++  warnings: string[];
++};
++
++export type GateVerdictCalibrationDimensionInput = {
++  dimension: GateVerdictCalibrationDimension | string;
++  outcome: GateVerdictCalibrationOutcome | string;
++  confidence?: number | undefined;
++};
++
++export type GateVerdictCalibrationSignalInput = {
++  repoFullName: string;
++  replayRunId: string;
++  gateRunId: string;
++  optedIn: boolean;
++  observedAt?: string | undefined;
++  dimensions: readonly GateVerdictCalibrationDimensionInput[];
++};
++
++export type GateVerdictCalibrationDimensionSignal = {
++  dimension: GateVerdictCalibrationDimension;
++  outcome: GateVerdictCalibrationOutcome;
++  confidence: number;
++  score: number;
++};
++
++export type GateVerdictCalibrationSignal = {
++  repoFullName: string;
++  replayRunId: string;
++  gateRunId: string;
++  observedAt: string | null;
++  dimensions: GateVerdictCalibrationDimensionSignal[];
++  score: number;
++};
++
++export type GateVerdictCalibrationIngestion = {
++  accepted: GateVerdictCalibrationSignal[];
++  rejected: Array<{
++    repoFullName: string;
++    replayRunId: string;
++    gateRunId: string;
++    reason: "not_opted_in" | "empty_dimensions" | "invalid_repo" | "invalid_run_id";
++  }>;
++};
++
++export type GateVerdictCalibrationWeights = {
++  objectiveAnchor?: number | undefined;
++  pairwiseJudge?: number | undefined;
++  structuredGateVerdict?: number | undefined;
++};
++
++export type GateVerdictCompositeCalibrationScore = {
++  compositeScore: number;
++  objectiveAnchorScore: number;
++  pairwiseJudgeScore: number | null;
++  structuredGateVerdictScore: number | null;
++  weights: {
++    objectiveAnchor: number;
++    pairwiseJudge: number;
++    structuredGateVerdict: number;
++  };
++  audit: {
++    contributingRepos: Array<{
++      repoFullName: string;
++      replayRunId: string;
++      gateRunId: string;
++      observedAt: string | null;
++      score: number;
++      dimensions: GateVerdictCalibrationDimensionSignal[];
++    }>;
++    rejected: GateVerdictCalibrationIngestion["rejected"];
++  };
++};
++
++const DIMENSION_ORDER: GateVerdictCalibrationDimension[] = [
++  "correctness",
++  "tests",
++  "security",
++  "maintainability",
++  "scope",
++  "freshness",
++  "ci",
++  "policy",
++];
++
++const OUTCOME_SCORE: Record<GateVerdictCalibrationOutcome, number> = {
++  pass: 1,
++  warn: 0.5,
++  fail: 0,
++  unknown: 0,
++};
++
++const DEFAULT_STRUCTURED_GATE_WEIGHT = 0.2;
++const DEFAULT_COMPOSITE_WEIGHTS = {
++  objectiveAnchor: 0.45,
++  pairwiseJudge: 0.35,
++  structuredGateVerdict: 0.2,
++};
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return Boolean(value && typeof value === "object" && !Array.isArray(value));
++}
++
++function finiteNonNegative(value: number | undefined, fallback: number): number {
++  if (value === undefined) return fallback;
++  if (!Number.isFinite(value) || value < 0) return 0;
++  return value;
++}
++
++function roundScore(value: number): number {
++  return Math.round(Math.min(1, Math.max(0, value)) * 1_000_000) / 1_000_000;
++}
++
++function normalizeRepoFullName(value: string): string | null {
++  const trimmed = value.trim().toLowerCase();
++  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/u.test(trimmed)) return null;
++  return trimmed;
++}
++
++function normalizeId(value: string): string | null {
++  const trimmed = value.trim();
++  if (!trimmed || trimmed.length > 160 || /[\r\n\0]/u.test(trimmed)) return null;
++  return trimmed;
++}
++
++function normalizeObservedAt(value: string | undefined): string | null {
++  if (!value) return null;
++  const ms = Date.parse(value);
++  if (!Number.isFinite(ms)) return null;
++  return new Date(ms).toISOString();
++}
++
++function normalizeBoolean(value: unknown): boolean | undefined {
++  if (typeof value === "boolean") return value;
++  if (typeof value !== "string") return undefined;
++  const normalized = value.trim().toLowerCase();
++  if (["true", "1", "yes", "on"].includes(normalized)) return true;
++  if (["false", "0", "no", "off"].includes(normalized)) return false;
++  return undefined;
++}
++
++function normalizeOptionalWeight(value: unknown): number | undefined {
++  if (value === undefined || value === null) return undefined;
++  const number = typeof value === "number" ? value : typeof value === "string" ? Number(value.trim()) : Number.NaN;
++  if (!Number.isFinite(number) || number < 0) return undefined;
++  return number;
++}
++
++function normalizeDimension(value: string): GateVerdictCalibrationDimension | null {
++  const normalized = value.trim().toLowerCase().replace(/[_\s-]+/gu, "_");
++  if (normalized === "quality" || normalized === "code_quality") return "correctness";
++  if (normalized === "test" || normalized === "coverage") return "tests";
++  if (normalized === "maintainability" || normalized === "maintenance") return "maintainability";
++  if (normalized === "size" || normalized === "blast_radius") return "scope";
++  if (normalized === "rebase" || normalized === "up_to_date") return "freshness";
++  if (normalized === "workflow" || normalized === "checks") return "ci";
++  if ((DIMENSION_ORDER as string[]).includes(normalized)) return normalized as GateVerdictCalibrationDimension;
++  return null;
++}
++
++function normalizeOutcome(value: string): GateVerdictCalibrationOutcome | null {
++  const normalized = value.trim().toLowerCase().replace(/[_\s-]+/gu, "_");
++  if (normalized === "ok" || normalized === "success" || normalized === "passed") return "pass";
++  if (normalized === "warning" || normalized === "advisory" || normalized === "hold") return "warn";
++  if (normalized === "block" || normalized === "blocked" || normalized === "failed") return "fail";
++  if ((["pass", "warn", "fail", "unknown"] as string[]).includes(normalized)) {
++    return normalized as GateVerdictCalibrationOutcome;
++  }
++  return null;
++}
++
++function clampConfidence(value: number | undefined): number {
++  if (value === undefined) return 1;
++  if (!Number.isFinite(value)) return 0;
++  return Math.min(1, Math.max(0, value));
++}
++
++function normalizeDimensions(
++  dimensions: readonly GateVerdictCalibrationDimensionInput[],
++): GateVerdictCalibrationDimensionSignal[] {
++  const byDimension = new Map<GateVerdictCalibrationDimension, GateVerdictCalibrationDimensionSignal>();
++  for (const item of dimensions) {
++    const dimension = normalizeDimension(item.dimension);
++    const outcome = normalizeOutcome(item.outcome);
++    if (!dimension || !outcome) continue;
++    const confidence = clampConfidence(item.confidence);
++    const score = roundScore(OUTCOME_SCORE[outcome] * confidence);
++    const existing = byDimension.get(dimension);
++    if (!existing || score < existing.score) {
++      byDimension.set(dimension, { dimension, outcome, confidence, score });
++    }
++  }
++  return DIMENSION_ORDER.flatMap((dimension) => {
++    const signal = byDimension.get(dimension);
++    return signal ? [signal] : [];
++  });
++}
++
++function averageSignals(signals: readonly GateVerdictCalibrationSignal[]): number | null {
++  if (signals.length === 0) return null;
++  return roundScore(signals.reduce((sum, signal) => sum + signal.score, 0) / signals.length);
++}
++
++function isGateVerdictCalibrationIngestion(value: unknown): value is GateVerdictCalibrationIngestion {
++  return isRecord(value) && Array.isArray(value.accepted) && Array.isArray(value.rejected);
++}
++
++function normalizeCompositeWeights(weights: GateVerdictCalibrationWeights | undefined): {
++  objectiveAnchor: number;
++  pairwiseJudge: number;
++  structuredGateVerdict: number;
++} {
++  const raw = {
++    objectiveAnchor: finiteNonNegative(weights?.objectiveAnchor, DEFAULT_COMPOSITE_WEIGHTS.objectiveAnchor),
++    pairwiseJudge: finiteNonNegative(weights?.pairwiseJudge, DEFAULT_COMPOSITE_WEIGHTS.pairwiseJudge),
++    structuredGateVerdict: finiteNonNegative(
++      weights?.structuredGateVerdict,
++      DEFAULT_COMPOSITE_WEIGHTS.structuredGateVerdict,
++    ),
++  };
++  const total = raw.objectiveAnchor + raw.pairwiseJudge + raw.structuredGateVerdict;
++  if (total <= 0) return DEFAULT_COMPOSITE_WEIGHTS;
++  return {
++    objectiveAnchor: raw.objectiveAnchor / total,
++    pairwiseJudge: raw.pairwiseJudge / total,
++    structuredGateVerdict: raw.structuredGateVerdict / total,
++  };
++}
++
++function markdownSafe(value: string): string {
++  return value.replace(/[\r\n]+/gu, " ").replace(/[\\`*_[\]<>|]/gu, "\\$&");
++}
++
++function markdownList(values: readonly string[]): string {
++  if (values.length === 0) return "- none";
++  return values.map((value) => `- ${markdownSafe(value)}`).join("\n");
++}
++
++function renderDimensionRows(dimensions: readonly GateVerdictCalibrationDimensionSignal[]): string {
++  if (dimensions.length === 0) return "| Dimension | Outcome | Confidence | Score |\n| --- | --- | ---: | ---: |\n";
++  return [
++    "| Dimension | Outcome | Confidence | Score |",
++    "| --- | --- | ---: | ---: |",
++    ...dimensions.map(
++      (dimension) =>
++        `| ${markdownSafe(dimension.dimension)} | ${markdownSafe(dimension.outcome)} | ${dimension.confidence.toFixed(
++          6,
++        )} | ${dimension.score.toFixed(6)} |`,
++    ),
++  ].join("\n");
++}
++
++function renderContributingRepo(signal: GateVerdictCompositeCalibrationScore["audit"]["contributingRepos"][number]): string {
++  return [
++    `### ${markdownSafe(signal.repoFullName)}`,
++    "",
++    `- replayRunId: ${markdownSafe(signal.replayRunId)}`,
++    `- gateRunId: ${markdownSafe(signal.gateRunId)}`,
++    `- observedAt: ${signal.observedAt ? markdownSafe(signal.observedAt) : "n/a"}`,
++    `- score: ${signal.score.toFixed(6)}`,
++    "",
++    renderDimensionRows(signal.dimensions),
++  ].join("\n");
++}
++
++function renderRejectedRow(row: GateVerdictCalibrationIngestion["rejected"][number]): string {
++  return `| ${markdownSafe(row.repoFullName)} | ${markdownSafe(row.replayRunId)} | ${markdownSafe(row.gateRunId)} | ${markdownSafe(
++    row.reason,
++  )} |`;
++}
++
++/**
++ * Resolve the explicit per-repo opt-in from a parsed `.gittensory.yml`-style object. Default is opted out. The
++ * preferred path is `miner.calibration.shareStructuredGateVerdicts`; `calibration.shareStructuredGateVerdicts` is
++ * accepted as a narrow alias so private-config surfaces can place the field at top level if needed.
++ */
++export function resolveGateVerdictCalibrationConfig(
++  manifest: GateVerdictCalibrationManifest | Record<string, unknown> | null | undefined,
++): GateVerdictCalibrationConfig {
++  const warnings: string[] = [];
++  const root = isRecord(manifest) ? manifest : {};
++  const miner = isRecord(root.miner) ? root.miner : {};
++  const minerCalibration = isRecord(miner.calibration) ? miner.calibration : {};
++  const topCalibration = isRecord(root.calibration) ? root.calibration : {};
++  const optInRaw =
++    minerCalibration.shareStructuredGateVerdicts ?? topCalibration.shareStructuredGateVerdicts ?? undefined;
++  const optIn = normalizeBoolean(optInRaw);
++  if (optInRaw !== undefined && optIn === undefined) {
++    warnings.push("miner.calibration.shareStructuredGateVerdicts must be a boolean-like value; defaulting to false.");
++  }
++  const weightRaw = minerCalibration.structuredGateVerdictWeight ?? topCalibration.structuredGateVerdictWeight;
++  const weight = normalizeOptionalWeight(weightRaw);
++  if (weightRaw !== undefined && weight === undefined) {
++    warnings.push("miner.calibration.structuredGateVerdictWeight must be a non-negative finite number; using default.");
++  }
++  return {
++    shareStructuredGateVerdicts: optIn === true,
++    structuredGateVerdictWeight: weight ?? DEFAULT_STRUCTURED_GATE_WEIGHT,
++    warnings,
++  };
++}
++
++/**
++ * Ingest only currently opted-in structured gate-verdict signals. The opt-in check happens at ingestion time, so a
++ * maintainer opt-out immediately prevents additional calibration rows from contributing even if older collected data
++ * exists elsewhere.
++ */
++export function ingestGateVerdictCalibrationSignals(
++  signals: readonly GateVerdictCalibrationSignalInput[],
++): GateVerdictCalibrationIngestion {
++  const accepted: GateVerdictCalibrationSignal[] = [];
++  const rejected: GateVerdictCalibrationIngestion["rejected"] = [];
++  for (const signal of signals) {
++    const repoFullName = normalizeRepoFullName(signal.repoFullName);
++    const replayRunId = normalizeId(signal.replayRunId);
++    const gateRunId = normalizeId(signal.gateRunId);
++    if (!repoFullName) {
++      rejected.push({
++        repoFullName: signal.repoFullName,
++        replayRunId: signal.replayRunId,
++        gateRunId: signal.gateRunId,
++        reason: "invalid_repo",
++      });
++      continue;
++    }
++    if (!replayRunId || !gateRunId) {
++      rejected.push({
++        repoFullName,
++        replayRunId: signal.replayRunId,
++        gateRunId: signal.gateRunId,
++        reason: "invalid_run_id",
++      });
++      continue;
++    }
++    if (!signal.optedIn) {
++      rejected.push({ repoFullName, replayRunId, gateRunId, reason: "not_opted_in" });
++      continue;
++    }
++    const dimensions = normalizeDimensions(signal.dimensions);
++    if (dimensions.length === 0) {
++      rejected.push({ repoFullName, replayRunId, gateRunId, reason: "empty_dimensions" });
++      continue;
++    }
++    accepted.push({
++      repoFullName,
++      replayRunId,
++      gateRunId,
++      observedAt: normalizeObservedAt(signal.observedAt),
++      dimensions,
++      score: roundScore(dimensions.reduce((sum, item) => sum + item.score, 0) / dimensions.length),
++    });
++  }
++  return { accepted, rejected };
++}
++
++export function computeGateVerdictCompositeCalibrationScore(input: {
++  objectiveAnchor: number | ObjectiveAnchorScore;
++  pairwise: number | PairwiseCalibrationScore | null;
++  gateVerdicts: GateVerdictCalibrationIngestion | readonly GateVerdictCalibrationSignalInput[];
++  weights?: GateVerdictCalibrationWeights | undefined;
++}): GateVerdictCompositeCalibrationScore {
++  const ingestion = isGateVerdictCalibrationIngestion(input.gateVerdicts)
++    ? input.gateVerdicts
++    : ingestGateVerdictCalibrationSignals(input.gateVerdicts);
++  const objectiveAnchorScore =
++    typeof input.objectiveAnchor === "number" ? roundScore(input.objectiveAnchor) : input.objectiveAnchor.score;
++  const pairwiseJudgeScore =
++    input.pairwise === null
++      ? null
++      : typeof input.pairwise === "number"
++        ? roundScore(input.pairwise)
++        : input.pairwise.pairwiseJudgeScore;
++  const structuredGateVerdictScore = averageSignals(ingestion.accepted);
++  const rawWeights = normalizeCompositeWeights(input.weights);
++  const usableWeights = {
++    objectiveAnchor: rawWeights.objectiveAnchor,
++    pairwiseJudge: pairwiseJudgeScore === null ? 0 : rawWeights.pairwiseJudge,
++    structuredGateVerdict: structuredGateVerdictScore === null ? 0 : rawWeights.structuredGateVerdict,
++  };
++  const total = usableWeights.objectiveAnchor + usableWeights.pairwiseJudge + usableWeights.structuredGateVerdict;
++  const weights =
++    total <= 0
++      ? { objectiveAnchor: 1, pairwiseJudge: 0, structuredGateVerdict: 0 }
++      : {
++          objectiveAnchor: usableWeights.objectiveAnchor / total,
++          pairwiseJudge: usableWeights.pairwiseJudge / total,
++          structuredGateVerdict: usableWeights.structuredGateVerdict / total,
++        };
++  const compositeScore = roundScore(
++    objectiveAnchorScore * weights.objectiveAnchor +
++      (pairwiseJudgeScore ?? 0) * weights.pairwiseJudge +
++      (structuredGateVerdictScore ?? 0) * weights.structuredGateVerdict,
++  );
++  return {
++    compositeScore,
++    objectiveAnchorScore,
++    pairwiseJudgeScore,
++    structuredGateVerdictScore,
++    weights,
++    audit: {
++      contributingRepos: ingestion.accepted.map((signal) => ({
++        repoFullName: signal.repoFullName,
++        replayRunId: signal.replayRunId,
++        gateRunId: signal.gateRunId,
++        observedAt: signal.observedAt,
++        score: signal.score,
++        dimensions: signal.dimensions,
++      })),
++      rejected: ingestion.rejected,
++    },
++  };
++}
++
++/**
++ * Render a deterministic, public-safe Markdown report for a structured gate-verdict calibration result. The report is
++ * local-run evidence: it includes aggregate scores, normalized weights, opted-in contributors, and rejected rows, but
++ * never accepts or emits raw review text or private scoring fields.
++ */
++export function renderGateVerdictCalibrationAuditMarkdown(result: GateVerdictCompositeCalibrationScore): string {
++  const lines = [
++    "# Structured Gate-Verdict Calibration",
++    "",
++    `Composite score: ${result.compositeScore.toFixed(6)}`,
++    "",
++    "## Component Scores",
++    "",
++    `- objectiveAnchor: ${result.objectiveAnchorScore.toFixed(6)}`,
++    `- pairwiseJudge: ${result.pairwiseJudgeScore === null ? "n/a" : result.pairwiseJudgeScore.toFixed(6)}`,
++    `- structuredGateVerdict: ${
++      result.structuredGateVerdictScore === null ? "n/a" : result.structuredGateVerdictScore.toFixed(6)
++    }`,
++    "",
++    "## Effective Weights",
++    "",
++    `- objectiveAnchor: ${result.weights.objectiveAnchor.toFixed(6)}`,
++    `- pairwiseJudge: ${result.weights.pairwiseJudge.toFixed(6)}`,
++    `- structuredGateVerdict: ${result.weights.structuredGateVerdict.toFixed(6)}`,
++    "",
++    "## Contributing Repos",
++    "",
++    result.audit.contributingRepos.length === 0
++      ? "_No opted-in structured gate-verdict signals contributed._"
++      : result.audit.contributingRepos.map(renderContributingRepo).join("\n\n"),
++    "",
++    "## Rejected Rows",
++    "",
++  ];
++
++  if (result.audit.rejected.length === 0) {
++    lines.push("- none");
++  } else {
++    lines.push(
++      "| Repo | Replay run | Gate run | Reason |",
++      "| --- | --- | --- | --- |",
++      ...result.audit.rejected.map(renderRejectedRow),
++    );
++  }
++
++  const contributingRepos = result.audit.contributingRepos.map((repo) => repo.repoFullName);
++  lines.push("", "## Contributing Repo Summary", "", markdownList(contributingRepos));
++  return `${lines.join("\n")}\n`;
++}
+diff --git a/packages/gittensory-engine/src/index.ts b/packages/gittensory-engine/src/index.ts
+index d013b0e0e..227e6180b 100644
+--- a/packages/gittensory-engine/src/index.ts
++++ b/packages/gittensory-engine/src/index.ts
+@@ -36,6 +36,23 @@ export {
+   type PairwiseCalibrationVerdict,
+   type PairwiseCalibrationWeights,
+ } from "./pairwise-calibration.js";
++export {
++  computeGateVerdictCompositeCalibrationScore,
++  ingestGateVerdictCalibrationSignals,
++  renderGateVerdictCalibrationAuditMarkdown,
++  resolveGateVerdictCalibrationConfig,
++  type GateVerdictCalibrationConfig,
++  type GateVerdictCalibrationDimension,
++  type GateVerdictCalibrationDimensionInput,
++  type GateVerdictCalibrationDimensionSignal,
++  type GateVerdictCalibrationIngestion,
++  type GateVerdictCalibrationManifest,
++  type GateVerdictCalibrationOutcome,
++  type GateVerdictCalibrationSignal,
++  type GateVerdictCalibrationSignalInput,
++  type GateVerdictCalibrationWeights,
++  type GateVerdictCompositeCalibrationScore,
++} from "./gate-verdict-calibration.js";
+ export * from "./governor/rate-limit.js";
+ export {
+   GOVERNOR_LEDGER_EVENT_TYPES,
+diff --git a/packages/gittensory-engine/test/gate-verdict-calibration.test.ts b/packages/gittensory-engine/test/gate-verdict-calibration.test.ts
+new file mode 100644
+index 000000000..283467f8b
+--- /dev/null
++++ b/packages/gittensory-engine/test/gate-verdict-calibration.test.ts
+@@ -0,0 +1,475 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++
++import {
++  computeGateVerdictCompositeCalibrationScore,
++  computePairwiseCalibrationScore,
++  ingestGateVerdictCalibrationSignals,
++  renderGateVerdictCalibrationAuditMarkdown,
++  resolveGateVerdictCalibrationConfig,
++  scoreObjectiveAnchor,
++} from "../dist/index.js";
++
++test("barrel: exports structured gate-verdict calibration APIs (#3015)", () => {
++  assert.equal(typeof resolveGateVerdictCalibrationConfig, "function");
++  assert.equal(typeof ingestGateVerdictCalibrationSignals, "function");
++  assert.equal(typeof computeGateVerdictCompositeCalibrationScore, "function");
++  assert.equal(typeof renderGateVerdictCalibrationAuditMarkdown, "function");
++});
++
++test("resolveGateVerdictCalibrationConfig defaults to opted out with the default structured weight", () => {
++  assert.deepEqual(resolveGateVerdictCalibrationConfig(undefined), {
++    shareStructuredGateVerdicts: false,
++    structuredGateVerdictWeight: 0.2,
++    warnings: [],
++  });
++  assert.deepEqual(resolveGateVerdictCalibrationConfig({}), {
++    shareStructuredGateVerdicts: false,
++    structuredGateVerdictWeight: 0.2,
++    warnings: [],
++  });
++});
++
++test("resolveGateVerdictCalibrationConfig honors the explicit maintainer opt-in path", () => {
++  const result = resolveGateVerdictCalibrationConfig({
++    miner: {
++      calibration: {
++        shareStructuredGateVerdicts: true,
++        structuredGateVerdictWeight: 0.4,
++      },
++    },
++  });
++
++  assert.deepEqual(result, {
++    shareStructuredGateVerdicts: true,
++    structuredGateVerdictWeight: 0.4,
++    warnings: [],
++  });
++});
++
++test("resolveGateVerdictCalibrationConfig accepts boolean-like private-config strings", () => {
++  const result = resolveGateVerdictCalibrationConfig({
++    miner: {
++      calibration: {
++        shareStructuredGateVerdicts: "yes",
++        structuredGateVerdictWeight: "0.35",
++      },
++    },
++  });
++
++  assert.equal(result.shareStructuredGateVerdicts, true);
++  assert.equal(result.structuredGateVerdictWeight, 0.35);
++  assert.deepEqual(result.warnings, []);
++});
++
++test("resolveGateVerdictCalibrationConfig keeps top-level calibration as an explicit alias", () => {
++  const result = resolveGateVerdictCalibrationConfig({
++    calibration: {
++      shareStructuredGateVerdicts: "on",
++      structuredGateVerdictWeight: 0.25,
++    },
++  });
++
++  assert.deepEqual(result, {
++    shareStructuredGateVerdicts: true,
++    structuredGateVerdictWeight: 0.25,
++    warnings: [],
++  });
++});
++
++test("resolveGateVerdictCalibrationConfig prefers miner.calibration over the top-level alias", () => {
++  const result = resolveGateVerdictCalibrationConfig({
++    miner: { calibration: { shareStructuredGateVerdicts: false, structuredGateVerdictWeight: 0.3 } },
++    calibration: { shareStructuredGateVerdicts: true, structuredGateVerdictWeight: 0.9 },
++  });
++
++  assert.equal(result.shareStructuredGateVerdicts, false);
++  assert.equal(result.structuredGateVerdictWeight, 0.3);
++});
++
++test("resolveGateVerdictCalibrationConfig warns and fails closed on malformed opt-in values", () => {
++  const result = resolveGateVerdictCalibrationConfig({
++    miner: {
++      calibration: {
++        shareStructuredGateVerdicts: "maybe",
++        structuredGateVerdictWeight: -1,
++      },
++    },
++  });
++
++  assert.equal(result.shareStructuredGateVerdicts, false);
++  assert.equal(result.structuredGateVerdictWeight, 0.2);
++  assert.deepEqual(result.warnings, [
++    "miner.calibration.shareStructuredGateVerdicts must be a boolean-like value; defaulting to false.",
++    "miner.calibration.structuredGateVerdictWeight must be a non-negative finite number; using default.",
++  ]);
++});
++
++test("ingestGateVerdictCalibrationSignals accepts only currently opted-in structured dimensions", () => {
++  const ingestion = ingestGateVerdictCalibrationSignals([
++    {
++      repoFullName: "JSONbored/Gittensory",
++      replayRunId: "replay-1",
++      gateRunId: "gate-1",
++      optedIn: true,
++      observedAt: "2026-07-04T17:00:00.000Z",
++      dimensions: [
++        { dimension: "correctness", outcome: "pass", confidence: 1 },
++        { dimension: "tests", outcome: "warn", confidence: 0.8 },
++        { dimension: "security", outcome: "fail", confidence: 0.9 },
++      ],
++    },
++  ]);
++
++  assert.deepEqual(ingestion.rejected, []);
++  assert.equal(ingestion.accepted.length, 1);
++  assert.equal(ingestion.accepted[0]!.repoFullName, "jsonbored/gittensory");
++  assert.equal(ingestion.accepted[0]!.score, 0.466667);
++  assert.deepEqual(ingestion.accepted[0]!.dimensions, [
++    { dimension: "correctness", outcome: "pass", confidence: 1, score: 1 },
++    { dimension: "tests", outcome: "warn", confidence: 0.8, score: 0.4 },
++    { dimension: "security", outcome: "fail", confidence: 0.9, score: 0 },
++  ]);
++});
++
++test("ingestGateVerdictCalibrationSignals rejects a mid-flight opt-out at ingestion time", () => {
++  const ingestion = ingestGateVerdictCalibrationSignals([
++    {
++      repoFullName: "jsonbored/gittensory",
++      replayRunId: "replay-2",
++      gateRunId: "gate-2",
++      optedIn: false,
++      dimensions: [{ dimension: "correctness", outcome: "pass" }],
++    },
++  ]);
++
++  assert.deepEqual(ingestion.accepted, []);
++  assert.deepEqual(ingestion.rejected, [
++    {
++      repoFullName: "jsonbored/gittensory",
++      replayRunId: "replay-2",
++      gateRunId: "gate-2",
++      reason: "not_opted_in",
++    },
++  ]);
++});
++
++test("ingestGateVerdictCalibrationSignals rejects malformed repo and run identifiers", () => {
++  const ingestion = ingestGateVerdictCalibrationSignals([
++    {
++      repoFullName: "not a repo",
++      replayRunId: "replay-3",
++      gateRunId: "gate-3",
++      optedIn: true,
++      dimensions: [{ dimension: "correctness", outcome: "pass" }],
++    },
++    {
++      repoFullName: "jsonbored/gittensory",
++      replayRunId: "",
++      gateRunId: "gate\nbad",
++      optedIn: true,
++      dimensions: [{ dimension: "correctness", outcome: "pass" }],
++    },
++  ]);
++
++  assert.deepEqual(ingestion.accepted, []);
++  assert.deepEqual(ingestion.rejected, [
++    { repoFullName: "not a repo", replayRunId: "replay-3", gateRunId: "gate-3", reason: "invalid_repo" },
++    {
++      repoFullName: "jsonbored/gittensory",
++      replayRunId: "",
++      gateRunId: "gate\nbad",
++      reason: "invalid_run_id",
++    },
++  ]);
++});
++
++test("ingestGateVerdictCalibrationSignals drops unknown dimensions/outcomes and rejects empty structured rows", () => {
++  const ingestion = ingestGateVerdictCalibrationSignals([
++    {
++      repoFullName: "jsonbored/gittensory",
++      replayRunId: "replay-4",
++      gateRunId: "gate-4",
++      optedIn: true,
++      dimensions: [
++        { dimension: "raw-review-text", outcome: "looks good" },
++        { dimension: "trust_score", outcome: "private" },
++      ],
++    },
++  ]);
++
++  assert.deepEqual(ingestion.accepted, []);
++  assert.deepEqual(ingestion.rejected, [
++    {
++      repoFullName: "jsonbored/gittensory",
++      replayRunId: "replay-4",
++      gateRunId: "gate-4",
++      reason: "empty_dimensions",
++    },
++  ]);
++});
++
++test("ingestGateVerdictCalibrationSignals maps aliases and keeps the stricter duplicate dimension outcome", () => {
++  const ingestion = ingestGateVerdictCalibrationSignals([
++    {
++      repoFullName: "jsonbored/gittensory",
++      replayRunId: "replay-5",
++      gateRunId: "gate-5",
++      optedIn: true,
++      dimensions: [
++        { dimension: "code_quality", outcome: "success" },
++        { dimension: "correctness", outcome: "warning", confidence: 0.5 },
++        { dimension: "workflow", outcome: "ok" },
++        { dimension: "up-to-date", outcome: "advisory" },
++      ],
++    },
++  ]);
++
++  assert.deepEqual(
++    ingestion.accepted[0]!.dimensions.map((dimension) => dimension.dimension),
++    ["correctness", "freshness", "ci"],
++  );
++  assert.deepEqual(ingestion.accepted[0]!.dimensions[0], {
++    dimension: "correctness",
++    outcome: "warn",
++    confidence: 0.5,
++    score: 0.25,
++  });
++});
++
++test("ingestGateVerdictCalibrationSignals normalizes malformed dates to null", () => {
++  const ingestion = ingestGateVerdictCalibrationSignals([
++    {
++      repoFullName: "jsonbored/gittensory",
++      replayRunId: "replay-6",
++      gateRunId: "gate-6",
++      optedIn: true,
++      observedAt: "not a date",
++      dimensions: [{ dimension: "correctness", outcome: "pass" }],
++    },
++  ]);
++
++  assert.equal(ingestion.accepted[0]!.observedAt, null);
++});
++
++test("computeGateVerdictCompositeCalibrationScore combines objective-anchor, pairwise, and structured gate scores", () => {
++  const objectiveAnchor = scoreObjectiveAnchor({
++    replayed: { paths: ["src/review/a.ts"], labels: ["feature"] },
++    revealed: { paths: ["src/review/b.ts"], labels: ["feature"] },
++  });
++  const pairwise = computePairwiseCalibrationScore({
++    objectiveAnchor,
++    samples: [{ attempts: [{ replayFirst: "replay_better", revealedFirst: "revealed_better" }] }],
++  });
++  const result = computeGateVerdictCompositeCalibrationScore({
++    objectiveAnchor,
++    pairwise,
++    gateVerdicts: [
++      {
++        repoFullName: "JSONbored/Gittensory",
++        replayRunId: "replay-7",
++        gateRunId: "gate-7",
++        optedIn: true,
++        dimensions: [
++          { dimension: "correctness", outcome: "pass" },
++          { dimension: "tests", outcome: "warn" },
++        ],
++      },
++    ],
++    weights: { objectiveAnchor: 2, pairwiseJudge: 1, structuredGateVerdict: 1 },
++  });
++
++  assert.equal(objectiveAnchor.score, 0.55);
++  assert.equal(pairwise.pairwiseJudgeScore, 1);
++  assert.equal(result.structuredGateVerdictScore, 0.75);
++  assert.deepEqual(result.weights, { objectiveAnchor: 0.5, pairwiseJudge: 0.25, structuredGateVerdict: 0.25 });
++  assert.equal(result.compositeScore, 0.7125);
++  assert.deepEqual(result.audit.contributingRepos.map((repo) => repo.repoFullName), ["jsonbored/gittensory"]);
++});
++
++test("computeGateVerdictCompositeCalibrationScore renormalizes when pairwise or structured signals are unavailable", () => {
++  const result = computeGateVerdictCompositeCalibrationScore({
++    objectiveAnchor: 0.6,
++    pairwise: null,
++    gateVerdicts: [],
++    weights: { objectiveAnchor: 1, pairwiseJudge: 1, structuredGateVerdict: 1 },
++  });
++
++  assert.equal(result.compositeScore, 0.6);
++  assert.deepEqual(result.weights, { objectiveAnchor: 1, pairwiseJudge: 0, structuredGateVerdict: 0 });
++  assert.equal(result.pairwiseJudgeScore, null);
++  assert.equal(result.structuredGateVerdictScore, null);
++});
++
++test("computeGateVerdictCompositeCalibrationScore carries rejected rows into the audit trail", () => {
++  const result = computeGateVerdictCompositeCalibrationScore({
++    objectiveAnchor: 0.5,
++    pairwise: 0.5,
++    gateVerdicts: [
++      {
++        repoFullName: "jsonbored/gittensory",
++        replayRunId: "replay-8",
++        gateRunId: "gate-8",
++        optedIn: false,
++        dimensions: [{ dimension: "correctness", outcome: "pass" }],
++      },
++    ],
++  });
++
++  assert.deepEqual(result.audit.contributingRepos, []);
++  assert.deepEqual(result.audit.rejected, [
++    {
++      repoFullName: "jsonbored/gittensory",
++      replayRunId: "replay-8",
++      gateRunId: "gate-8",
++      reason: "not_opted_in",
++    },
++  ]);
++});
++
++test("computeGateVerdictCompositeCalibrationScore averages multiple opted-in repos", () => {
++  const result = computeGateVerdictCompositeCalibrationScore({
++    objectiveAnchor: 0,
++    pairwise: null,
++    gateVerdicts: [
++      {
++        repoFullName: "owner/one",
++        replayRunId: "replay-9",
++        gateRunId: "gate-9a",
++        optedIn: true,
++        dimensions: [{ dimension: "correctness", outcome: "pass" }],
++      },
++      {
++        repoFullName: "owner/two",
++        replayRunId: "replay-9",
++        gateRunId: "gate-9b",
++        optedIn: true,
++        dimensions: [{ dimension: "correctness", outcome: "fail" }],
++      },
++    ],
++    weights: { objectiveAnchor: 0, structuredGateVerdict: 1 },
++  });
++
++  assert.equal(result.structuredGateVerdictScore, 0.5);
++  assert.equal(result.compositeScore, 0.5);
++  assert.deepEqual(
++    result.audit.contributingRepos.map((repo) => [repo.repoFullName, repo.score]),
++    [
++      ["owner/one", 1],
++      ["owner/two", 0],
++    ],
++  );
++});
++
++test("computeGateVerdictCompositeCalibrationScore does not expose raw review text or private score fields", () => {
++  const result = computeGateVerdictCompositeCalibrationScore({
++    objectiveAnchor: 0.5,
++    pairwise: 0.5,
++    gateVerdicts: [
++      {
++        repoFullName: "jsonbored/gittensory",
++        replayRunId: "replay-10",
++        gateRunId: "gate-10",
++        optedIn: true,
++        dimensions: [
++          { dimension: "correctness", outcome: "pass" },
++          { dimension: "rawReviewText", outcome: "pass" },
++          { dimension: "trustScore", outcome: "pass" },
++          { dimension: "reward", outcome: "pass" },
++        ],
++      },
++    ],
++  });
++  const serialized = JSON.stringify(result);
++
++  assert.equal(serialized.includes("rawReviewText"), false);
++  assert.equal(serialized.includes("trustScore"), false);
++  assert.equal(serialized.includes("reward"), false);
++  assert.equal(serialized.includes("private"), false);
++});
++
++test("renderGateVerdictCalibrationAuditMarkdown renders aggregate scores and contributing repo dimensions", () => {
++  const result = computeGateVerdictCompositeCalibrationScore({
++    objectiveAnchor: 0.5,
++    pairwise: 0.75,
++    gateVerdicts: [
++      {
++        repoFullName: "jsonbored/gittensory",
++        replayRunId: "replay-11",
++        gateRunId: "gate-11",
++        optedIn: true,
++        observedAt: "2026-07-04T17:30:00Z",
++        dimensions: [
++          { dimension: "correctness", outcome: "pass" },
++          { dimension: "tests", outcome: "warn" },
++        ],
++      },
++    ],
++  });
++  const markdown = renderGateVerdictCalibrationAuditMarkdown(result);
++
++  assert.ok(markdown.startsWith("# Structured Gate-Verdict Calibration\n\nComposite score:"));
++  assert.match(markdown, /## Component Scores\n\n- objectiveAnchor: 0\.500000\n- pairwiseJudge: 0\.750000/u);
++  assert.match(markdown, /### jsonbored\/gittensory/u);
++  assert.match(markdown, /\| correctness \| pass \| 1\.000000 \| 1\.000000 \|/u);
++  assert.match(markdown, /\| tests \| warn \| 1\.000000 \| 0\.500000 \|/u);
++});
++
++test("renderGateVerdictCalibrationAuditMarkdown reports empty contributors and unavailable optional signals", () => {
++  const result = computeGateVerdictCompositeCalibrationScore({
++    objectiveAnchor: 0.7,
++    pairwise: null,
++    gateVerdicts: [],
++  });
++  const markdown = renderGateVerdictCalibrationAuditMarkdown(result);
++
++  assert.match(markdown, /- pairwiseJudge: n\/a/u);
++  assert.match(markdown, /- structuredGateVerdict: n\/a/u);
++  assert.match(markdown, /_No opted-in structured gate-verdict signals contributed\._/u);
++  assert.match(markdown, /## Rejected Rows\n\n- none/u);
++});
++
++test("renderGateVerdictCalibrationAuditMarkdown includes rejected rows for auditability", () => {
++  const result = computeGateVerdictCompositeCalibrationScore({
++    objectiveAnchor: 0.5,
++    pairwise: 0.5,
++    gateVerdicts: [
++      {
++        repoFullName: "jsonbored/gittensory",
++        replayRunId: "replay-12",
++        gateRunId: "gate-12",
++        optedIn: false,
++        dimensions: [{ dimension: "correctness", outcome: "pass" }],
++      },
++    ],
++  });
++  const markdown = renderGateVerdictCalibrationAuditMarkdown(result);
++
++  assert.match(markdown, /\| Repo \| Replay run \| Gate run \| Reason \|/u);
++  assert.match(markdown, /\| jsonbored\/gittensory \| replay-12 \| gate-12 \| not\\_opted\\_in \|/u);
++});
++
++test("renderGateVerdictCalibrationAuditMarkdown escapes markdown controls and collapses newlines", () => {
++  const result = computeGateVerdictCompositeCalibrationScore({
++    objectiveAnchor: 0.5,
++    pairwise: 0.5,
++    gateVerdicts: {
++      accepted: [
++        {
++          repoFullName: "owner/repo_name",
++          replayRunId: "replay-*bold*\nnext",
++          gateRunId: "gate-`code`",
++          observedAt: null,
++          score: 1,
++          dimensions: [{ dimension: "policy", outcome: "pass", confidence: 1, score: 1 }],
++        },
++      ],
++      rejected: [],
++    },
++  });
++  const markdown = renderGateVerdictCalibrationAuditMarkdown(result);
++
++  assert.ok(markdown.includes("### owner/repo\\_name"));
++  assert.ok(markdown.includes("- replayRunId: replay-\\*bold\\* next"));
++  assert.ok(markdown.includes("- gateRunId: gate-\\`code\\`"));
++});

@@ -1,0 +1,604 @@
+diff --git a/packages/gittensory-engine/README.md b/packages/gittensory-engine/README.md
+index 25f4f3b36..82d71a305 100644
+--- a/packages/gittensory-engine/README.md
++++ b/packages/gittensory-engine/README.md
+@@ -89,6 +89,12 @@ injected-clock semantics for local miners.
+ They only deny on small, explicit AI-contribution ban phrases in `AI-USAGE.md` or `CONTRIBUTING.md`; ambiguous,
+ missing, or empty policy text stays allowed so discovery does not invent a ban.
+ 
++## Governor ledger
++
++`normalizeGovernorLedgerEvent` validates append-only governor decision rows before the local miner persists them.
++The vocabulary is fixed (`allowed`, `denied`, `throttled`, `kill_switch`) and unknown event types fail closed. This
++module defines the storage contract only — it does not wire into live governor enforcement yet. (#2328)
++
+ ## MinerGoalSpec
+ 
+ `MinerGoalSpec` is the type surface for a repo's `.gittensory-miner.yml` (miner-side analogue of `.gittensory.yml`).
+diff --git a/packages/gittensory-engine/src/governor-ledger.ts b/packages/gittensory-engine/src/governor-ledger.ts
+new file mode 100644
+index 000000000..aa7f44909
+--- /dev/null
++++ b/packages/gittensory-engine/src/governor-ledger.ts
+@@ -0,0 +1,85 @@
++import { isDeepStrictEqual } from "node:util";
++
++/** Immutable governor decision vocabulary — unknown values fail closed before insert. */
++export const GOVERNOR_LEDGER_EVENT_TYPES = Object.freeze([
++  "allowed",
++  "denied",
++  "throttled",
++  "kill_switch",
++] as const);
++
++export type GovernorLedgerEventType = (typeof GOVERNOR_LEDGER_EVENT_TYPES)[number];
++
++export type GovernorLedgerEvent = {
++  eventType: GovernorLedgerEventType;
++  repoFullName?: string | null | undefined;
++  actionClass: string;
++  decision: string;
++  reason: string;
++  payload?: Record<string, unknown> | undefined;
++};
++
++export type NormalizedGovernorLedgerEvent = {
++  eventType: GovernorLedgerEventType;
++  repoFullName: string | null;
++  actionClass: string;
++  decision: string;
++  reason: string;
++  payloadJson: string;
++};
++
++const governorEventTypeSet = new Set<string>(GOVERNOR_LEDGER_EVENT_TYPES);
++
++/* v8 ignore start -- Normalization helpers are covered through normalizeGovernorLedgerEvent export tests. */
++function normalizeRequiredString(value: unknown, code: string): string {
++  if (typeof value !== "string") throw new Error(code);
++  const trimmed = value.trim();
++  if (!trimmed) throw new Error(code);
++  return trimmed;
++}
++
++function normalizeOptionalRepoFullName(repoFullName: unknown): string | null {
++  if (repoFullName === undefined || repoFullName === null) return null;
++  if (typeof repoFullName !== "string") throw new Error("invalid_repo_full_name");
++  const [owner, repo, extra] = repoFullName.trim().split("/");
++  if (!owner || !repo || extra !== undefined) throw new Error("invalid_repo_full_name");
++  return `${owner}/${repo}`;
++}
++
++function serializePayload(payload: unknown): string {
++  if (payload === undefined) return "{}";
++  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
++    throw new Error("invalid_payload");
++  }
++  let json: string;
++  try {
++    json = JSON.stringify(payload);
++  } catch {
++    throw new Error("invalid_payload");
++  }
++  if (!isDeepStrictEqual(JSON.parse(json), payload)) {
++    throw new Error("invalid_payload");
++  }
++  return json;
++}
++/* v8 ignore stop */
++
++/**
++ * Validate and normalize a governor ledger row before append-only insert. Mirrors the structured-event shape of
++ * `logAudit` in `src/selfhost/audit.ts`, but for local SQLite storage. This module does NOT wire into live
++ * governor enforcement — it only defines the storage contract other issues will write into. (#2328)
++ */
++export function normalizeGovernorLedgerEvent(input: unknown): NormalizedGovernorLedgerEvent {
++  if (!input || typeof input !== "object") throw new Error("invalid_event");
++  const event = input as Partial<GovernorLedgerEvent>;
++  const eventType = normalizeRequiredString(event.eventType, "invalid_event_type");
++  if (!governorEventTypeSet.has(eventType)) throw new Error("invalid_event_type");
++  return {
++    eventType: eventType as GovernorLedgerEventType,
++    repoFullName: normalizeOptionalRepoFullName(event.repoFullName),
++    actionClass: normalizeRequiredString(event.actionClass, "invalid_action_class"),
++    decision: normalizeRequiredString(event.decision, "invalid_decision"),
++    reason: normalizeRequiredString(event.reason, "invalid_reason"),
++    payloadJson: serializePayload(event.payload),
++  };
++}
+diff --git a/packages/gittensory-engine/src/index.ts b/packages/gittensory-engine/src/index.ts
+index 342f9dd36..9b0bb8947 100644
+--- a/packages/gittensory-engine/src/index.ts
++++ b/packages/gittensory-engine/src/index.ts
+@@ -10,6 +10,13 @@ export {
+   type OpportunityRankInput,
+ } from "./opportunity-ranker.js";
+ export * from "./governor/rate-limit.js";
++export {
++  GOVERNOR_LEDGER_EVENT_TYPES,
++  normalizeGovernorLedgerEvent,
++  type GovernorLedgerEvent,
++  type GovernorLedgerEventType,
++  type NormalizedGovernorLedgerEvent,
++} from "./governor-ledger.js";
+ export * from "./plan-export.js";
+ export * from "./plan-templates.js";
+ export * from "./portfolio/queue.js";
+diff --git a/packages/gittensory-miner/README.md b/packages/gittensory-miner/README.md
+index 0f7725630..8e38bfba8 100644
+--- a/packages/gittensory-miner/README.md
++++ b/packages/gittensory-miner/README.md
+@@ -24,6 +24,10 @@ The package also includes a metadata-only ranker: `rankCandidateIssues` composes
+ (potential, feasibility, lane fit, freshness, dup risk) and returns fan-out candidates sorted by `rankScore`.
+ It never clones source and never writes to GitHub.
+ 
++The package also includes an append-only governor decision ledger: `initGovernorLedger` / `appendGovernorEvent`
++persist structured allow/deny/throttle/kill-switch outcomes in local SQLite for contributor audit. Insert-only —
++no enforcement wiring yet. (#2328)
++
+ ## Install
+ 
+ From a local checkout:
+diff --git a/packages/gittensory-miner/lib/governor-ledger.d.ts b/packages/gittensory-miner/lib/governor-ledger.d.ts
+new file mode 100644
+index 000000000..0a93b38fb
+--- /dev/null
++++ b/packages/gittensory-miner/lib/governor-ledger.d.ts
+@@ -0,0 +1,40 @@
++export type GovernorLedgerEntry = {
++  id: number;
++  ts: string;
++  eventType: string;
++  repoFullName: string | null;
++  actionClass: string;
++  decision: string;
++  reason: string;
++  payload: Record<string, unknown>;
++};
++
++export type AppendGovernorEventInput = {
++  eventType: string;
++  repoFullName?: string | null;
++  actionClass: string;
++  decision: string;
++  reason: string;
++  payload?: Record<string, unknown>;
++};
++
++export type ReadGovernorEventsFilter = {
++  repoFullName?: string | null;
++};
++
++export type GovernorLedger = {
++  dbPath: string;
++  appendGovernorEvent(event: AppendGovernorEventInput): GovernorLedgerEntry;
++  readGovernorEvents(filter?: ReadGovernorEventsFilter): GovernorLedgerEntry[];
++  close(): void;
++};
++
++export function resolveGovernorLedgerDbPath(env?: Record<string, string | undefined>): string;
++
++export function initGovernorLedger(dbPath?: string): GovernorLedger;
++
++export function appendGovernorEvent(event: AppendGovernorEventInput): GovernorLedgerEntry;
++
++export function readGovernorEvents(filter?: ReadGovernorEventsFilter): GovernorLedgerEntry[];
++
++export function closeDefaultGovernorLedger(): void;
+diff --git a/packages/gittensory-miner/lib/governor-ledger.js b/packages/gittensory-miner/lib/governor-ledger.js
+new file mode 100644
+index 000000000..0786d9235
+--- /dev/null
++++ b/packages/gittensory-miner/lib/governor-ledger.js
+@@ -0,0 +1,139 @@
++import { chmodSync, mkdirSync } from "node:fs";
++import { homedir } from "node:os";
++import { dirname, join } from "node:path";
++import { DatabaseSync } from "node:sqlite";
++import { normalizeGovernorLedgerEvent } from "@jsonbored/gittensory-engine";
++
++// Append-only governor decision ledger (#2328): every allowed/denied/throttled/kill-switch outcome lands in a
++// local SQLite table for contributor audit. IMMUTABILITY INVARIANT: INSERT + SELECT only — never UPDATE/DELETE.
++// This module does not enforce governor policy; it only persists structured events other phases will emit.
++
++const defaultDbFileName = "governor-ledger.sqlite3";
++let defaultGovernorLedger = null;
++
++export function resolveGovernorLedgerDbPath(env = process.env) {
++  const explicitPath = typeof env.GITTENSORY_MINER_GOVERNOR_LEDGER_DB === "string"
++    ? env.GITTENSORY_MINER_GOVERNOR_LEDGER_DB.trim()
++    : "";
++  if (explicitPath) return explicitPath;
++
++  const explicitConfigDir = typeof env.GITTENSORY_MINER_CONFIG_DIR === "string"
++    ? env.GITTENSORY_MINER_CONFIG_DIR.trim()
++    : "";
++  if (explicitConfigDir) return join(explicitConfigDir, defaultDbFileName);
++
++  const configHome = typeof env.XDG_CONFIG_HOME === "string" && env.XDG_CONFIG_HOME.trim()
++    ? env.XDG_CONFIG_HOME.trim()
++    : join(homedir(), ".config");
++  return join(configHome, "gittensory-miner", defaultDbFileName);
++}
++
++function normalizeDbPath(dbPath) {
++  const path = (dbPath ?? resolveGovernorLedgerDbPath()).trim();
++  if (!path) throw new Error("invalid_governor_ledger_db_path");
++  return path;
++}
++
++function normalizeOptionalRepoFullName(repoFullName) {
++  if (repoFullName === undefined || repoFullName === null) return undefined;
++  if (typeof repoFullName !== "string") throw new Error("invalid_repo_full_name");
++  const [owner, repo, extra] = repoFullName.trim().split("/");
++  if (!owner || !repo || extra !== undefined) throw new Error("invalid_repo_full_name");
++  return `${owner}/${repo}`;
++}
++
++function rowToEntry(row) {
++  return {
++    id: row.id,
++    ts: row.ts,
++    eventType: row.event_type,
++    repoFullName: row.repo_full_name,
++    actionClass: row.action_class,
++    decision: row.decision,
++    reason: row.reason,
++    payload: JSON.parse(row.payload_json),
++  };
++}
++
++/**
++ * Opens the append-only governor ledger, creating the table on first use. Rows are returned in ascending `id`
++ * order (insertion order). (#2328)
++ */
++export function initGovernorLedger(dbPath = resolveGovernorLedgerDbPath()) {
++  const resolvedPath = normalizeDbPath(dbPath);
++  mkdirSync(dirname(resolvedPath), { recursive: true, mode: 0o700 });
++  const db = new DatabaseSync(resolvedPath);
++  chmodSync(resolvedPath, 0o600);
++  db.exec("PRAGMA busy_timeout = 5000");
++  db.exec(`
++    CREATE TABLE IF NOT EXISTS governor_events (
++      id INTEGER PRIMARY KEY AUTOINCREMENT,
++      ts TEXT NOT NULL,
++      event_type TEXT NOT NULL,
++      repo_full_name TEXT,
++      action_class TEXT NOT NULL,
++      decision TEXT NOT NULL,
++      reason TEXT NOT NULL,
++      payload_json TEXT NOT NULL
++    )
++  `);
++  db.exec("CREATE INDEX IF NOT EXISTS idx_governor_events_repo ON governor_events (repo_full_name, id)");
++
++  const appendStatement = db.prepare(`
++    INSERT INTO governor_events (ts, event_type, repo_full_name, action_class, decision, reason, payload_json)
++    VALUES (?, ?, ?, ?, ?, ?, ?)
++  `);
++  const getByIdStatement = db.prepare("SELECT * FROM governor_events WHERE id = ?");
++  const readAllStatement = db.prepare("SELECT * FROM governor_events ORDER BY id ASC");
++  const readByRepoStatement = db.prepare(
++    "SELECT * FROM governor_events WHERE repo_full_name = ? ORDER BY id ASC",
++  );
++
++  return {
++    dbPath: resolvedPath,
++    appendGovernorEvent(event) {
++      const normalized = normalizeGovernorLedgerEvent(event);
++      const ts = new Date().toISOString();
++      const result = appendStatement.run(
++        ts,
++        normalized.eventType,
++        normalized.repoFullName,
++        normalized.actionClass,
++        normalized.decision,
++        normalized.reason,
++        normalized.payloadJson,
++      );
++      return rowToEntry(getByIdStatement.get(Number(result.lastInsertRowid)));
++    },
++    readGovernorEvents(filter = {}) {
++      const repoFullName = normalizeOptionalRepoFullName(filter.repoFullName);
++      const rows =
++        repoFullName === undefined
++          ? readAllStatement.all()
++          : readByRepoStatement.all(repoFullName);
++      return rows.map(rowToEntry);
++    },
++    close() {
++      db.close();
++    },
++  };
++}
++
++function getDefaultGovernorLedger() {
++  defaultGovernorLedger ??= initGovernorLedger();
++  return defaultGovernorLedger;
++}
++
++export function appendGovernorEvent(event) {
++  return getDefaultGovernorLedger().appendGovernorEvent(event);
++}
++
++export function readGovernorEvents(filter) {
++  return getDefaultGovernorLedger().readGovernorEvents(filter);
++}
++
++export function closeDefaultGovernorLedger() {
++  if (!defaultGovernorLedger) return;
++  defaultGovernorLedger.close();
++  defaultGovernorLedger = null;
++}
+diff --git a/packages/gittensory-miner/package.json b/packages/gittensory-miner/package.json
+index 2c73af25b..67b6d2565 100644
+--- a/packages/gittensory-miner/package.json
++++ b/packages/gittensory-miner/package.json
+@@ -31,7 +31,7 @@
+     "lib"
+   ],
+   "scripts": {
+-    "build": "node --check bin/gittensory-miner.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/update-check.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/claim-ledger.js && node --check lib/portfolio-queue.js && node --check lib/opportunity-ranker.js && node --check lib/plan-store.js && node --check lib/rejection-templates.js"
++    "build": "node --check bin/gittensory-miner.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/update-check.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/claim-ledger.js && node --check lib/portfolio-queue.js && node --check lib/opportunity-ranker.js && node --check lib/plan-store.js && node --check lib/rejection-templates.js && node --check lib/governor-ledger.js"
+   },
+   "dependencies": {
+     "@jsonbored/gittensory-engine": "0.1.0"
+diff --git a/test/unit/governor-ledger.test.ts b/test/unit/governor-ledger.test.ts
+new file mode 100644
+index 000000000..c0d1f2d98
+--- /dev/null
++++ b/test/unit/governor-ledger.test.ts
+@@ -0,0 +1,101 @@
++import { describe, expect, it } from "vitest";
++import {
++  GOVERNOR_LEDGER_EVENT_TYPES,
++  normalizeGovernorLedgerEvent,
++} from "../../packages/gittensory-engine/src/governor-ledger";
++
++describe("governor ledger normalization (#2328)", () => {
++  it("exposes the frozen governor event vocabulary", () => {
++    expect(GOVERNOR_LEDGER_EVENT_TYPES).toEqual(["allowed", "denied", "throttled", "kill_switch"]);
++    expect(Object.isFrozen(GOVERNOR_LEDGER_EVENT_TYPES)).toBe(true);
++  });
++
++  it.each(GOVERNOR_LEDGER_EVENT_TYPES.map((eventType) => [eventType]))(
++    "accepts a valid %s event with optional repo scope and payload",
++    (eventType) => {
++      expect(
++        normalizeGovernorLedgerEvent({
++          eventType,
++          repoFullName: "acme/widgets",
++          actionClass: "write",
++          decision: eventType === "allowed" ? "allow" : "block",
++          reason: "unit test",
++          payload: { attempt: 1 },
++        }),
++      ).toMatchObject({
++        eventType,
++        repoFullName: "acme/widgets",
++        actionClass: "write",
++        payloadJson: JSON.stringify({ attempt: 1 }),
++      });
++    },
++  );
++
++  it("defaults missing repo scope and payload to null and {}", () => {
++    expect(
++      normalizeGovernorLedgerEvent({
++        eventType: "denied",
++        actionClass: "write",
++        decision: "block",
++        reason: "house rule",
++      }),
++    ).toEqual({
++      eventType: "denied",
++      repoFullName: null,
++      actionClass: "write",
++      decision: "block",
++      reason: "house rule",
++      payloadJson: "{}",
++    });
++  });
++
++  it("rejects unknown event types before insert", () => {
++    expect(() =>
++      normalizeGovernorLedgerEvent({
++        eventType: "maybe",
++        actionClass: "write",
++        decision: "block",
++        reason: "nope",
++      }),
++    ).toThrow(/invalid_event_type/);
++  });
++
++  it("rejects malformed repo slugs, blank required strings, and lossy payloads", () => {
++    const base = {
++      eventType: "throttled",
++      actionClass: "write",
++      decision: "retry",
++      reason: "rate limit",
++    };
++    expect(() => normalizeGovernorLedgerEvent({ ...base, repoFullName: "bad" })).toThrow(
++      /invalid_repo_full_name/,
++    );
++    expect(() => normalizeGovernorLedgerEvent({ ...base, repoFullName: "a/b/c" })).toThrow(
++      /invalid_repo_full_name/,
++    );
++    expect(() => normalizeGovernorLedgerEvent({ ...base, repoFullName: 42 } as unknown)).toThrow(
++      /invalid_repo_full_name/,
++    );
++    expect(() => normalizeGovernorLedgerEvent({ ...base, actionClass: 0 } as unknown)).toThrow(
++      /invalid_action_class/,
++    );
++    expect(() => normalizeGovernorLedgerEvent({ ...base, decision: false } as unknown)).toThrow(
++      /invalid_decision/,
++    );
++    expect(() => normalizeGovernorLedgerEvent({ ...base, eventType: 1 } as unknown)).toThrow(
++      /invalid_event_type/,
++    );
++    expect(() => normalizeGovernorLedgerEvent({ ...base, reason: "  " })).toThrow(/invalid_reason/);
++    expect(() => normalizeGovernorLedgerEvent({ ...base, payload: null } as unknown)).toThrow(
++      /invalid_payload/,
++    );
++    expect(() => normalizeGovernorLedgerEvent({ ...base, payload: ["bad"] } as unknown)).toThrow(
++      /invalid_payload/,
++    );
++    expect(() =>
++      normalizeGovernorLedgerEvent({ ...base, payload: { value: undefined } }),
++    ).toThrow(/invalid_payload/);
++    expect(() => normalizeGovernorLedgerEvent(null)).toThrow(/invalid_event/);
++    expect(() => normalizeGovernorLedgerEvent("not-an-object")).toThrow(/invalid_event/);
++  });
++});
+diff --git a/test/unit/miner-governor-ledger.test.ts b/test/unit/miner-governor-ledger.test.ts
+new file mode 100644
+index 000000000..021a5ce98
+--- /dev/null
++++ b/test/unit/miner-governor-ledger.test.ts
+@@ -0,0 +1,146 @@
++import { mkdtempSync, rmSync, statSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("@jsonbored/gittensory-engine", async () => {
++  return import("../../packages/gittensory-engine/src/index");
++});
++
++import {
++  appendGovernorEvent,
++  closeDefaultGovernorLedger,
++  initGovernorLedger,
++  readGovernorEvents,
++  resolveGovernorLedgerDbPath,
++} from "../../packages/gittensory-miner/lib/governor-ledger.js";
++
++const roots: string[] = [];
++const ledgers: Array<{ close(): void }> = [];
++
++function tempLedger() {
++  const root = mkdtempSync(join(tmpdir(), "gittensory-miner-governor-ledger-"));
++  roots.push(root);
++  const ledger = initGovernorLedger(join(root, "nested", "governor-ledger.sqlite3"));
++  ledgers.push(ledger);
++  return ledger;
++}
++
++afterEach(() => {
++  for (const ledger of ledgers.splice(0)) ledger.close();
++  closeDefaultGovernorLedger();
++  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
++});
++
++describe("gittensory-miner governor ledger (#2328)", () => {
++  it("resolves the DB path from env override, miner config dir, XDG config, then the home default", () => {
++    expect(resolveGovernorLedgerDbPath({ GITTENSORY_MINER_GOVERNOR_LEDGER_DB: "/custom/g.sqlite3" })).toBe(
++      "/custom/g.sqlite3",
++    );
++    expect(resolveGovernorLedgerDbPath({ GITTENSORY_MINER_CONFIG_DIR: "/custom/config" })).toBe(
++      "/custom/config/governor-ledger.sqlite3",
++    );
++    expect(resolveGovernorLedgerDbPath({ XDG_CONFIG_HOME: "/xdg" })).toBe(
++      "/xdg/gittensory-miner/governor-ledger.sqlite3",
++    );
++    expect(resolveGovernorLedgerDbPath({})).toMatch(/\/\.config\/gittensory-miner\/governor-ledger\.sqlite3$/);
++  });
++
++  it("creates the SQLite file with owner-only permissions and reads empty before any append", () => {
++    const ledger = tempLedger();
++    expect(statSync(ledger.dbPath).mode & 0o077).toBe(0);
++    expect(ledger.readGovernorEvents()).toEqual([]);
++  });
++
++  it("append-only round-trips every governor decision field", () => {
++    const ledger = tempLedger();
++    const entry = ledger.appendGovernorEvent({
++      eventType: "denied",
++      repoFullName: "JSONbored/gittensory",
++      actionClass: "write",
++      decision: "block",
++      reason: "kill switch active",
++      payload: { rule: "global_kill_switch" },
++    });
++    expect(entry).toMatchObject({
++      id: 1,
++      eventType: "denied",
++      repoFullName: "JSONbored/gittensory",
++      actionClass: "write",
++      decision: "block",
++      reason: "kill switch active",
++      payload: { rule: "global_kill_switch" },
++    });
++    expect(ledger.readGovernorEvents()).toEqual([entry]);
++    expect(ledger.readGovernorEvents({ repoFullName: "JSONbored/gittensory" })).toEqual([entry]);
++    expect(ledger.readGovernorEvents({ repoFullName: "acme/other" })).toEqual([]);
++  });
++
++  it("rejects malformed events before insert and preserves insertion order", () => {
++    const ledger = tempLedger();
++    ledger.appendGovernorEvent({
++      eventType: "allowed",
++      actionClass: "analyze",
++      decision: "allow",
++      reason: "within budget",
++    });
++    expect(() =>
++      ledger.appendGovernorEvent({
++        eventType: "unknown",
++        actionClass: "write",
++        decision: "block",
++        reason: "bad type",
++      }),
++    ).toThrow(/invalid_event_type/);
++    expect(ledger.readGovernorEvents()).toHaveLength(1);
++  });
++
++  it("rejects invalid repo filter types before querying SQLite", () => {
++    const ledger = tempLedger();
++    expect(() => ledger.readGovernorEvents({ repoFullName: 42 as unknown as string })).toThrow(
++      /invalid_repo_full_name/,
++    );
++  });
++
++  it("records throttled and kill_switch outcomes for later audit", () => {
++    const ledger = tempLedger();
++    const throttled = ledger.appendGovernorEvent({
++      eventType: "throttled",
++      repoFullName: "acme/widgets",
++      actionClass: "write",
++      decision: "retry",
++      reason: "local rate limit",
++      payload: { retryAfterMs: 5000 },
++    });
++    const killSwitch = ledger.appendGovernorEvent({
++      eventType: "kill_switch",
++      actionClass: "write",
++      decision: "block",
++      reason: "operator halt",
++    });
++    expect(ledger.readGovernorEvents().map((row) => row.eventType)).toEqual(["throttled", "kill_switch"]);
++    expect(throttled.payload).toEqual({ retryAfterMs: 5000 });
++    expect(killSwitch.repoFullName).toBeNull();
++  });
++
++  it("uses the default singleton ledger helpers and closes cleanly", () => {
++    const root = mkdtempSync(join(tmpdir(), "gittensory-miner-governor-default-"));
++    roots.push(root);
++    const previousConfigDir = process.env.GITTENSORY_MINER_CONFIG_DIR;
++    process.env.GITTENSORY_MINER_CONFIG_DIR = root;
++    try {
++      const entry = appendGovernorEvent({
++        eventType: "allowed",
++        actionClass: "analyze",
++        decision: "allow",
++        reason: "within budget",
++      });
++      expect(readGovernorEvents()).toEqual([entry]);
++      closeDefaultGovernorLedger();
++      closeDefaultGovernorLedger();
++    } finally {
++      if (previousConfigDir === undefined) delete process.env.GITTENSORY_MINER_CONFIG_DIR;
++      else process.env.GITTENSORY_MINER_CONFIG_DIR = previousConfigDir;
++    }
++  });
++});

@@ -1,0 +1,1050 @@
+diff --git a/neuromorphic/pyproject.toml b/neuromorphic/pyproject.toml
+index 25a612b..276ac73 100644
+--- a/neuromorphic/pyproject.toml
++++ b/neuromorphic/pyproject.toml
+@@ -25,6 +25,11 @@ dev = [
+     # collection time in the neuromorphic-only CI environment.
+     "networkx>=3.2.0",
+ ]
++# Optional compiled kernels (M4 performance prototype).
++# Install with: uv run --extra compiled python -m pytest tests/test_compiled_stdp.py
++compiled = [
++    "numba>=0.59.0",
++]
+ # Experimental GPU synapse-op backend (issue #135 research spike, see
+ # gpu_synapse_ops.py / docs/GPU-SYNAPSE-BACKEND-FEASIBILITY.md). Not a
+ # default dependency: jax/jaxlib add ~90MB and are lazy-imported, so the
+diff --git a/neuromorphic/src/neuromorphic/compiled_kernels.py b/neuromorphic/src/neuromorphic/compiled_kernels.py
+new file mode 100644
+index 0000000..dcfd284
+--- /dev/null
++++ b/neuromorphic/src/neuromorphic/compiled_kernels.py
+@@ -0,0 +1,401 @@
++"""Compiled (Numba-JIT) kernels for the STDP + eligibility-trace hot path.
++
++When Numba is available and ``NEURO_COMPILED_STDP`` is not set to ``0``, this
++module exposes JIT-compiled versions of the two most expensive operations in
++the learning pipeline:
++
++  1. ``stdp_delta``             — fused LTP/LTD kernel (single pass, no temps)
++  2. ``neuromod_decay_sparse``  — fused neuromod + decay + clip + prune over the
++                                  active sparse eligibility set
++  3. ``neuromod_decay_full``    — same, but operating on the full array (used
++                                  when active-set tracking is abandoned at >80%)
++
++When Numba is unavailable (or ``NEURO_COMPILED_STDP=0``), the same public
++functions fall back to NumPy-equivalent implementations so ``synapses.py``
++needs no branching of its own.
++
++Performance note (Invariant 1):
++  Numba JIT-compiles lazily on the first call with ~100–300 ms overhead per
++  signature.  ``cache=True`` persists compiled artifacts to ``__pycache__``
++  so subsequent process starts reuse the cached binary.  ``fastmath=True``
++  lets LLVM reassociate floating-point operations; the resulting values remain
++  within float32 rounding of the NumPy reference (verified by the equivalence
++  tests in ``test_compiled_stdp.py``).
++
++Feature flag:
++  ``NEURO_COMPILED_STDP=0``  — disable compiled kernels (use NumPy fallback)
++  ``NEURO_COMPILED_STDP=1``  — enable when Numba is importable (default)
++"""
++
++from __future__ import annotations
++
++import logging
++import os
++
++import numpy as np
++
++logger = logging.getLogger(__name__)
++
++# ── Availability check ─────────────────────────────────────────────────────
++
++NUMBA_AVAILABLE: bool = False
++try:
++    import numba  # type: ignore[import-untyped]  # noqa: F401
++    NUMBA_AVAILABLE = True
++except ImportError:
++    pass
++
++_env = os.environ.get("NEURO_COMPILED_STDP", "1").lower().strip()
++COMPILED_STDP_ENABLED: bool = NUMBA_AVAILABLE and _env not in ("0", "false", "no")
++
++if COMPILED_STDP_ENABLED:
++    logger.debug("neuromorphic: Numba compiled STDP kernels active (cache=True)")
++else:
++    logger.debug(
++        "neuromorphic: Numba compiled STDP kernels disabled "
++        "(NUMBA_AVAILABLE=%s, NEURO_COMPILED_STDP=%r)",
++        NUMBA_AVAILABLE,
++        _env,
++    )
++
++
++# ── Numba JIT kernels (only defined when Numba is available) ───────────────
++
++if COMPILED_STDP_ENABLED:
++    import numba as _nb  # type: ignore[import-untyped]
++
++    @_nb.njit(cache=True, fastmath=True)
++    def _stdp_delta_njit(
++        dt_spike: np.ndarray,
++        a_plus: float,
++        tau_plus: float,
++        a_minus: float,
++        tau_minus: float,
++    ) -> np.ndarray:
++        """Fused LTP/LTD delta: single pass, no ltp_mask/ltd_mask temp arrays."""
++        n = len(dt_spike)
++        dw = np.empty(n, np.float32)
++        for i in range(n):
++            dt = dt_spike[i]
++            if dt >= 0.0:
++                dw[i] = np.float32(a_plus) * np.exp(np.float32(-dt / tau_plus))
++            else:
++                dw[i] = np.float32(-a_minus) * np.exp(np.float32(dt / tau_minus))
++        return dw
++
++    @_nb.njit(cache=True, fastmath=True)
++    def _neuromod_decay_sparse_njit(
++        eligibility: np.ndarray,
++        data: np.ndarray,
++        idx: np.ndarray,
++        modulator: float,
++        interval: int,
++        d_per_step: float,
++        w_min: float,
++        w_max: float,
++        prune_threshold: float,
++    ) -> np.ndarray:
++        """Fused neuromod + decay + clip over sparse active set; returns alive mask.
++
++        Uses per-entry effective gain so that a trace which decays below
++        prune_threshold mid-interval only accumulates weight change for the steps
++        it would have been alive — matching the per-step reference exactly.
++        """
++        n = len(idx)
++        alive = np.empty(n, _nb.boolean)
++        mod = np.float32(modulator)
++        d = np.float32(d_per_step)
++        pt = np.float32(prune_threshold)
++        # Full-interval decay applied to eligibility.
++        decay_total = np.float32(1.0)
++        for _ in range(interval):
++            decay_total *= d
++        for i in range(n):
++            k = idx[i]
++            e = eligibility[k]
++            # Step 0 always contributes; step j (j>0) contributes only if
++            # |e0 * d^j| > pt (entry was still alive at end of step j-1).
++            e_abs = e if e >= np.float32(0.0) else -e
++            step_pow = np.float32(1.0)
++            eff_gain = np.float32(0.0)
++            for j in range(interval):
++                eff_gain += step_pow
++                e_abs *= d
++                step_pow *= d
++                if e_abs <= pt:
++                    break  # pruned after step j; remaining steps don't contribute
++            dw = mod * e * eff_gain
++            w = data[k] + dw
++            if w < w_min:
++                w = w_min
++            elif w > w_max:
++                w = w_max
++            data[k] = np.float32(w)
++            e *= decay_total
++            eligibility[k] = e
++            alive[i] = e > pt or e < -pt
++        return alive
++
++    @_nb.njit(cache=True, fastmath=True)
++    def _neuromod_decay_sparse_masked_njit(
++        eligibility: np.ndarray,
++        data: np.ndarray,
++        idx: np.ndarray,
++        modulator: float,
++        interval: int,
++        d_per_step: float,
++        w_min: float,
++        w_max: float,
++        plasticity_mask: np.ndarray,
++        prune_threshold: float,
++    ) -> np.ndarray:
++        """Fused sparse neuromod + decay + clip with per-synapse plasticity mask."""
++        n = len(idx)
++        alive = np.empty(n, _nb.boolean)
++        mod = np.float32(modulator)
++        d = np.float32(d_per_step)
++        pt = np.float32(prune_threshold)
++        decay_total = np.float32(1.0)
++        for _ in range(interval):
++            decay_total *= d
++        for i in range(n):
++            k = idx[i]
++            e = eligibility[k]
++            e_abs = e if e >= np.float32(0.0) else -e
++            step_pow = np.float32(1.0)
++            eff_gain = np.float32(0.0)
++            for j in range(interval):
++                eff_gain += step_pow
++                e_abs *= d
++                step_pow *= d
++                if e_abs <= pt:
++                    break
++            dw = mod * e * eff_gain * plasticity_mask[k]
++            w = data[k] + dw
++            if w < w_min:
++                w = w_min
++            elif w > w_max:
++                w = w_max
++            data[k] = np.float32(w)
++            e *= decay_total
++            eligibility[k] = e
++            alive[i] = e > pt or e < -pt
++        return alive
++
++    @_nb.njit(cache=True, fastmath=True)
++    def _neuromod_decay_full_njit(
++        eligibility: np.ndarray,
++        data: np.ndarray,
++        modulator: float,
++        interval_gain: float,
++        decay: float,
++        w_min: float,
++        w_max: float,
++    ) -> None:
++        """Fused neuromod + decay + clip over the complete eligibility array."""
++        mod_gain = np.float32(modulator * interval_gain)
++        d = np.float32(decay)
++        for i in range(len(eligibility)):
++            dw = mod_gain * eligibility[i]
++            w = data[i] + dw
++            if w < w_min:
++                w = w_min
++            elif w > w_max:
++                w = w_max
++            data[i] = np.float32(w)
++            eligibility[i] *= d
++
++    @_nb.njit(cache=True, fastmath=True)
++    def _neuromod_decay_full_masked_njit(
++        eligibility: np.ndarray,
++        data: np.ndarray,
++        modulator: float,
++        interval_gain: float,
++        decay: float,
++        w_min: float,
++        w_max: float,
++        plasticity_mask: np.ndarray,
++    ) -> None:
++        """Full-array fused neuromod + decay + clip with per-synapse plasticity mask."""
++        mod_gain = np.float32(modulator * interval_gain)
++        d = np.float32(decay)
++        for i in range(len(eligibility)):
++            dw = mod_gain * eligibility[i] * plasticity_mask[i]
++            w = data[i] + dw
++            if w < w_min:
++                w = w_min
++            elif w > w_max:
++                w = w_max
++            data[i] = np.float32(w)
++            eligibility[i] *= d
++
++
++# ── Public interface ───────────────────────────────────────────────────────
++# Identical signature whether compiled (Numba) or fallback (NumPy).
++# synapses.py calls these unconditionally — no if/else at the call site.
++
++
++def stdp_delta(
++    dt_spike: np.ndarray,
++    a_plus: float,
++    tau_plus: float,
++    a_minus: float,
++    tau_minus: float,
++) -> np.ndarray:
++    """Compute STDP weight delta for a batch of spike-time differences.
++
++    Args:
++        dt_spike:  float32 array of ``post_time - pre_time`` values.
++        a_plus:    LTP amplitude (scalar; BCM-scaled path is handled by caller).
++        tau_plus:  LTP time constant (ms).
++        a_minus:   LTD amplitude.
++        tau_minus: LTD time constant (ms).
++
++    Returns:
++        float32 dw array, same length as dt_spike.
++        Positive (LTP) for dt >= 0; negative (LTD) for dt < 0.
++    """
++    if COMPILED_STDP_ENABLED:
++        return _stdp_delta_njit(
++            dt_spike,
++            float(a_plus),
++            float(tau_plus),
++            float(a_minus),
++            float(tau_minus),
++        )
++    # NumPy fallback — equivalent to the original synapses.py implementation
++    dw = np.empty(len(dt_spike), dtype=np.float32)
++    ltp = dt_spike >= 0.0
++    if ltp.any():
++        dw[ltp] = np.float32(a_plus) * np.exp(-dt_spike[ltp] / tau_plus).astype(np.float32)
++    ltd = ~ltp
++    if ltd.any():
++        dw[ltd] = np.float32(-a_minus) * np.exp(dt_spike[ltd] / tau_minus).astype(np.float32)
++    return dw
++
++
++def neuromod_decay_sparse(
++    eligibility: np.ndarray,
++    data: np.ndarray,
++    idx: np.ndarray,
++    modulator: float,
++    interval: int,
++    d_per_step: float,
++    w_min: float,
++    w_max: float,
++    prune_threshold: float,
++    plasticity_mask: np.ndarray | None = None,
++) -> np.ndarray:
++    """Apply neuromodulation + eligibility decay in-place on the active sparse set.
++
++    Mutates ``data[idx]`` and ``eligibility[idx]`` in-place.
++
++    Args:
++        eligibility:      Full nnz eligibility array.
++        data:             CSR weights.data (full nnz).
++        idx:              int32 active-set indices (subset of [0, nnz)).
++        modulator:        Neuromodulatory signal (averaged over interval).
++        interval:         Number of logical steps being batched.
++        d_per_step:       Per-step trace decay (``trace_decay`` from config).
++        w_min, w_max:     Weight bounds for hard clipping.
++        prune_threshold:  Entries with |e| <= this after decay are considered dead.
++        plasticity_mask:  Optional float32 per-synapse scaling (myelination/identity).
++
++    Returns:
++        Boolean array of length ``len(idx)`` — True for entries still alive
++        after decay.  Caller uses this to prune ``_elig_active``.
++    """
++    if COMPILED_STDP_ENABLED:
++        if plasticity_mask is not None:
++            return _neuromod_decay_sparse_masked_njit(
++                eligibility,
++                data,
++                idx,
++                float(modulator),
++                int(interval),
++                float(d_per_step),
++                float(w_min),
++                float(w_max),
++                plasticity_mask,
++                float(prune_threshold),
++            )
++        return _neuromod_decay_sparse_njit(
++            eligibility,
++            data,
++            idx,
++            float(modulator),
++            int(interval),
++            float(d_per_step),
++            float(w_min),
++            float(w_max),
++            float(prune_threshold),
++        )
++    # NumPy fallback — per-entry effective gain accounting for mid-interval pruning.
++    # Step 0 always contributes; step j (j>0) contributes only if the trace was
++    # still alive at the end of step j-1 (|e0 * d^j| > prune_threshold).
++    elig_slice = eligibility[idx]
++    abs_e = np.abs(elig_slice)
++    eff_gain = np.ones(len(idx), dtype=np.float32)
++    step_pow = np.float32(d_per_step)
++    e_check = abs_e * step_pow  # |e0 * d^1| — alive check after step 0
++    for _ in range(1, interval):
++        contributes = e_check > np.float32(prune_threshold)
++        if not contributes.any():
++            break
++        eff_gain[contributes] += step_pow
++        step_pow *= np.float32(d_per_step)
++        e_check *= np.float32(d_per_step)
++    dw = np.float32(modulator) * elig_slice * eff_gain
++    if plasticity_mask is not None:
++        dw *= plasticity_mask[idx]
++    data[idx] = np.clip(data[idx] + dw, w_min, w_max)
++    decay_total = np.float32(d_per_step ** interval)
++    elig_slice *= decay_total
++    eligibility[idx] = elig_slice
++    return np.abs(elig_slice) > prune_threshold
++
++
++def neuromod_decay_full(
++    eligibility: np.ndarray,
++    data: np.ndarray,
++    modulator: float,
++    interval_gain: float,
++    decay: float,
++    w_min: float,
++    w_max: float,
++    plasticity_mask: np.ndarray | None = None,
++) -> None:
++    """Apply neuromodulation + decay in-place on the entire eligibility array.
++
++    Used when active-set tracking was abandoned (>80% of nnz active).
++    Mutates both ``data`` and ``eligibility`` in-place.
++    """
++    if COMPILED_STDP_ENABLED:
++        if plasticity_mask is not None:
++            _neuromod_decay_full_masked_njit(
++                eligibility,
++                data,
++                float(modulator),
++                float(interval_gain),
++                float(decay),
++                float(w_min),
++                float(w_max),
++                plasticity_mask,
++            )
++        else:
++            _neuromod_decay_full_njit(
++                eligibility,
++                data,
++                float(modulator),
++                float(interval_gain),
++                float(decay),
++                float(w_min),
++                float(w_max),
++            )
++        return
++    # NumPy fallback
++    dw = np.float32(modulator) * eligibility * np.float32(interval_gain)
++    if plasticity_mask is not None:
++        dw *= plasticity_mask
++    data[:] = np.clip(data + dw, w_min, w_max)
++    eligibility *= np.float32(decay)
+diff --git a/neuromorphic/src/neuromorphic/synapses.py b/neuromorphic/src/neuromorphic/synapses.py
+index 02b7ec4..17381f1 100644
+--- a/neuromorphic/src/neuromorphic/synapses.py
++++ b/neuromorphic/src/neuromorphic/synapses.py
+@@ -7,6 +7,12 @@
+ 
+ import logging
+ 
++from neuromorphic.compiled_kernels import (
++    COMPILED_STDP_ENABLED,
++    stdp_delta as _compiled_stdp_delta,
++    neuromod_decay_sparse as _compiled_neuromod_decay_sparse,
++    neuromod_decay_full as _compiled_neuromod_decay_full,
++)
+ from neuromorphic.config import (
+     STDPParams, RSTDPParams, EligibilityTraceConfig, BCMConfig,
+     PruningConfig, MyelinationConfig, NeighborhoodConsolidationConfig,
+@@ -409,28 +415,23 @@ def update_weights_stdp(
+         active_idx = active_idx[in_window]
+         dt_spike = dt_spike[in_window]
+ 
+-        # LTP: post fires after pre (dt > 0), or simultaneous (dt == 0, Hebbian coincidence)
+-        ltp_mask = dt_spike >= 0
+-        dw = np.zeros(len(active_idx), dtype=np.float32)
+-
+         # BCM scaling: modulate A_plus AND A_minus per postsynaptic neuron
+         bcm_scale = self._get_bcm_scaling()
+-        if bcm_scale is not None and ltp_mask.any():
+-            # Per-synapse scaling based on postsynaptic neuron's BCM threshold
+-            a_plus_vec = np.float32(p.a_plus) * bcm_scale[rows[active_idx[ltp_mask]]]
+-            dw[ltp_mask] = a_plus_vec * np.exp(-dt_spike[ltp_mask] / p.tau_plus).astype(np.float32)
+-        else:
+-            dw[ltp_mask] = p.a_plus * np.exp(-dt_spike[ltp_mask] / p.tau_plus).astype(np.float32)
+-
+-        # LTD: pre fires after post (dt < 0)
+-        # H3: BCM also modulates LTD — active neurons resist BOTH potentiation and depression
+-        ltd_mask = dt_spike < 0
+-        if bcm_scale is not None and ltd_mask.any():
+-            # Inverse BCM for LTD: active neurons have reduced depression
+-            a_minus_vec = np.float32(p.a_minus) * bcm_scale[rows[active_idx[ltd_mask]]]
+-            dw[ltd_mask] = -a_minus_vec * np.exp(dt_spike[ltd_mask] / p.tau_minus).astype(np.float32)
++        if bcm_scale is None:
++            # Compiled kernel (or NumPy fallback): single fused pass, no temp mask arrays
++            dw = _compiled_stdp_delta(dt_spike, p.a_plus, p.tau_plus, p.a_minus, p.tau_minus)
+         else:
+-            dw[ltd_mask] = -p.a_minus * np.exp(dt_spike[ltd_mask] / p.tau_minus).astype(np.float32)
++            # BCM-scaled path: per-neuron amplitude, vectorized NumPy
++            # H3: BCM modulates both LTP and LTD — active neurons resist both
++            ltp_mask = dt_spike >= 0
++            dw = np.zeros(len(active_idx), dtype=np.float32)
++            if ltp_mask.any():
++                a_plus_vec = np.float32(p.a_plus) * bcm_scale[rows[active_idx[ltp_mask]]]
++                dw[ltp_mask] = a_plus_vec * np.exp(-dt_spike[ltp_mask] / p.tau_plus).astype(np.float32)
++            ltd_mask = dt_spike < 0
++            if ltd_mask.any():
++                a_minus_vec = np.float32(p.a_minus) * bcm_scale[rows[active_idx[ltd_mask]]]
++                dw[ltd_mask] = -a_minus_vec * np.exp(dt_spike[ltd_mask] / p.tau_minus).astype(np.float32)
+ 
+         # Compartment-aware credit assignment: scale dw by compartment activity
+         if compartment_activity < 1.0:
+@@ -505,15 +506,8 @@ def update_weights_rstdp(
+ 
+         dt_spike = post_spike_times[rows[active_idx]] - pre_spike_times[cols[active_idx]]
+ 
+-        # LTP: post fires after pre or simultaneous (Hebbian coincidence)
+-        ltp_mask = dt_spike >= 0
+-        dw = np.zeros(len(active_idx), dtype=np.float32)
+-        dw[ltp_mask] = p.a_plus * np.exp(-dt_spike[ltp_mask] / p.tau_plus).astype(np.float32)
+-
+-        ltd_mask = dt_spike < 0
+-        dw[ltd_mask] = -p.a_minus * np.exp(dt_spike[ltd_mask] / p.tau_minus).astype(np.float32)
+-
+-        # Modulate by reward signal
++        # Compiled kernel (or NumPy fallback): fused LTP/LTD, then reward modulation
++        dw = _compiled_stdp_delta(dt_spike, p.a_plus, p.tau_plus, p.a_minus, p.tau_minus)
+         dw *= np.float32(modulation)
+ 
+         # Compartment-aware credit assignment (before surprise bonus, which is global)
+@@ -716,11 +710,18 @@ def apply_neuromodulation_and_decay(
+ 
+         # Full-array path: _elig_active abandoned (>80% active) or never initialized
+         if self._elig_active is None:
+-            dw = np.float32(modulator_signal) * self.eligibility * interval_gain
+-            if plasticity_mask is not None and len(plasticity_mask) == len(self.eligibility):
+-                dw *= plasticity_mask
+-            data[:] = np.clip(data + dw, p.w_min, p.w_max)
+-            self.eligibility *= decay
++            _compiled_neuromod_decay_full(
++                self.eligibility,
++                data,
++                modulator_signal,
++                float(interval_gain),
++                float(decay),
++                p.w_min,
++                p.w_max,
++                plasticity_mask
++                if (plasticity_mask is not None and len(plasticity_mask) == len(self.eligibility))
++                else None,
++            )
+             return
+ 
+         # Periodic sweep: must run even when _elig_active is empty, to clean
+@@ -760,22 +761,22 @@ def apply_neuromodulation_and_decay(
+         # get_adolescent_plasticity_mask) scales identity synapses to 0.01,
+         # satisfying Claim 2's "plasticity->1%" requirement.
+ 
+-        elig_slice = self.eligibility[idx]
+-
+-        # Apply neuromodulation: dw = modulator * eligibility * geometric-gain * mask
+-        # interval_gain restores every-step equivalence over the batched interval
+-        # (see the comment where it is computed above).
+-        dw = np.float32(modulator_signal) * elig_slice * interval_gain
+-        if plasticity_mask is not None and len(plasticity_mask) == len(self.eligibility):
+-            dw *= plasticity_mask[idx]
+-        data[idx] = np.clip(data[idx] + dw, p.w_min, p.w_max)
+-
+-        # Decay eligibility traces (compensated for interval)
+-        elig_slice *= decay
+-        self.eligibility[idx] = elig_slice
+-
+-        # Prune near-zero entries from active set
+-        alive = np.abs(elig_slice) > self._elig_prune_threshold
++        # Fused: neuromod + decay + clip + prune in one pass over the active set.
++        # Per-entry effective gain handles mid-interval pruning correctly.
++        alive = _compiled_neuromod_decay_sparse(
++            self.eligibility,
++            data,
++            idx,
++            modulator_signal,
++            interval,
++            float(d),
++            p.w_min,
++            p.w_max,
++            float(self._elig_prune_threshold),
++            plasticity_mask
++            if (plasticity_mask is not None and len(plasticity_mask) == len(self.eligibility))
++            else None,
++        )
+         if not alive.all():
+             self._elig_active = idx[alive]
+ 
+diff --git a/neuromorphic/tests/test_compiled_stdp.py b/neuromorphic/tests/test_compiled_stdp.py
+new file mode 100644
+index 0000000..6ec1b64
+--- /dev/null
++++ b/neuromorphic/tests/test_compiled_stdp.py
+@@ -0,0 +1,480 @@
++"""Equivalence tests for the compiled STDP + eligibility-trace kernels.
++
++Invariant 1 (CLAUDE.md §2): "Any change to those intervals MUST preserve
++equivalence and be covered by an equivalence test."
++
++This file verifies that:
++  1. The compiled ``stdp_delta`` matches the NumPy reference to float32 precision.
++  2. The compiled ``neuromod_decay_sparse`` and ``neuromod_decay_full`` match
++     the NumPy reference to float32 precision.
++  3. End-to-end: ``SynapseGroup.apply_neuromodulation_and_decay`` with the
++     compiled path active produces the same weight changes as the NumPy-only
++     path — confirming the compiled kernel is a correct drop-in replacement.
++
++Tests skip when Numba is not installed or NEURO_COMPILED_STDP=0.
++Run with the compiled extra: uv run --extra dev --extra compiled python -m pytest tests/test_compiled_stdp.py
++"""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++import neuromorphic.compiled_kernels as _ck_mod
++from neuromorphic.compiled_kernels import (
++    COMPILED_STDP_ENABLED,
++    neuromod_decay_full,
++    neuromod_decay_sparse,
++    stdp_delta,
++)
++
++# Applied at class level to tests that require the Numba path to be active.
++# The NumPy-fallback tests (TestNumPyFallbackKernels) carry no such mark.
++_COMPILED_ONLY = pytest.mark.skipif(
++    not COMPILED_STDP_ENABLED,
++    reason="Numba not installed or NEURO_COMPILED_STDP=0 — compiled kernel tests skipped",
++)
++
++_RNG = np.random.default_rng(0)
++
++
++# ── stdp_delta equivalence ─────────────────────────────────────────────────
++
++
++@_COMPILED_ONLY
++class TestCompiledStdpDelta:
++    """Compiled stdp_delta output must match NumPy to float32 tolerance."""
++
++    _A_PLUS = 0.012
++    _A_MINUS = 0.010
++    _TAU_PLUS = 20.0
++    _TAU_MINUS = 20.0
++
++    def _numpy_ref(self, dt: np.ndarray) -> np.ndarray:
++        dw = np.empty(len(dt), dtype=np.float32)
++        ltp = dt >= 0.0
++        if ltp.any():
++            dw[ltp] = np.float32(self._A_PLUS) * np.exp(-dt[ltp] / self._TAU_PLUS).astype(np.float32)
++        ltd = ~ltp
++        if ltd.any():
++            dw[ltd] = np.float32(-self._A_MINUS) * np.exp(dt[ltd] / self._TAU_MINUS).astype(np.float32)
++        return dw
++
++    @pytest.mark.parametrize("n", [1, 100, 10_000])
++    def test_ltp_only(self, n):
++        dt = _RNG.uniform(1.0, 50.0, size=n).astype(np.float32)
++        np.testing.assert_allclose(
++            stdp_delta(dt, self._A_PLUS, self._TAU_PLUS, self._A_MINUS, self._TAU_MINUS),
++            self._numpy_ref(dt),
++            rtol=1e-5,
++            atol=1e-7,
++            err_msg="LTP-only mismatch: compiled vs NumPy",
++        )
++
++    @pytest.mark.parametrize("n", [1, 100, 10_000])
++    def test_ltd_only(self, n):
++        dt = -_RNG.uniform(1.0, 50.0, size=n).astype(np.float32)
++        np.testing.assert_allclose(
++            stdp_delta(dt, self._A_PLUS, self._TAU_PLUS, self._A_MINUS, self._TAU_MINUS),
++            self._numpy_ref(dt),
++            rtol=1e-5,
++            atol=1e-7,
++            err_msg="LTD-only mismatch: compiled vs NumPy",
++        )
++
++    def test_mixed_ltp_ltd(self):
++        dt = np.array([-20.0, -5.0, 0.0, 5.0, 20.0], dtype=np.float32)
++        np.testing.assert_allclose(
++            stdp_delta(dt, self._A_PLUS, self._TAU_PLUS, self._A_MINUS, self._TAU_MINUS),
++            self._numpy_ref(dt),
++            rtol=1e-5,
++            atol=1e-7,
++            err_msg="mixed LTP/LTD mismatch: compiled vs NumPy",
++        )
++
++    def test_sign_conventions(self):
++        """LTP (dt >= 0) must be positive; LTD (dt < 0) must be negative."""
++        dt = np.array([-10.0, 0.0, 10.0], dtype=np.float32)
++        dw = stdp_delta(dt, self._A_PLUS, self._TAU_PLUS, self._A_MINUS, self._TAU_MINUS)
++        assert dw[0] < 0.0, "LTD should produce negative delta"
++        assert dw[1] >= 0.0, "Simultaneous should produce non-negative delta (Hebbian)"
++        assert dw[2] > 0.0, "LTP should produce positive delta"
++
++
++# ── neuromod_decay_sparse equivalence ─────────────────────────────────────
++
++
++@_COMPILED_ONLY
++class TestCompiledNeuromodDecaySparse:
++    """Compiled neuromod_decay_sparse must match NumPy to float32 tolerance."""
++
++    _NNZ = 5_000
++    _W_MIN = np.float32(0.01)
++    _W_MAX = np.float32(1.0)
++    _PRUNE_THR = np.float32(1e-6)
++
++    def _make_arrays(self, seed: int = 0):
++        rng = np.random.default_rng(seed)
++        eligibility = (rng.random(self._NNZ).astype(np.float32) - 0.5) * 0.02
++        data = rng.uniform(0.1, 0.9, self._NNZ).astype(np.float32)
++        return eligibility, data
++
++    def _numpy_ref(self, elig, data, idx, modulator, interval, d_per_step, mask=None):
++        """Per-entry effective gain reference — matches the corrected kernel semantics."""
++        elig_slice = elig[idx].copy()
++        abs_e = np.abs(elig_slice)
++        eff_gain = np.ones(len(idx), dtype=np.float32)
++        step_pow = np.float32(d_per_step)
++        e_check = abs_e * step_pow
++        for _ in range(1, interval):
++            alive_k = e_check > np.float32(self._PRUNE_THR)
++            if not alive_k.any():
++                break
++            eff_gain[alive_k] += step_pow
++            step_pow *= np.float32(d_per_step)
++            e_check *= np.float32(d_per_step)
++        dw = np.float32(modulator) * elig_slice * eff_gain
++        if mask is not None:
++            dw *= mask[idx]
++        data[idx] = np.clip(data[idx] + dw, self._W_MIN, self._W_MAX)
++        decay_total = np.float32(d_per_step ** interval)
++        elig_slice *= decay_total
++        elig[idx] = elig_slice
++        return np.abs(elig_slice) > self._PRUNE_THR
++
++    @pytest.mark.parametrize("interval", [1, 3, 10])
++    def test_no_mask(self, interval):
++        d = 0.999
++        modulator = 0.5
++        idx = np.arange(self._NNZ // 2, dtype=np.int32)
++
++        elig_np, data_np = self._make_arrays(seed=interval)
++        elig_c, data_c = elig_np.copy(), data_np.copy()
++
++        alive_ref = self._numpy_ref(elig_np, data_np, idx, modulator, interval, d)
++        alive_c = neuromod_decay_sparse(
++            elig_c, data_c, idx, modulator, interval, d,
++            self._W_MIN, self._W_MAX, self._PRUNE_THR,
++        )
++
++        np.testing.assert_allclose(data_c[idx], data_np[idx], rtol=1e-5, atol=1e-7,
++                                   err_msg=f"weight mismatch (no mask, interval={interval})")
++        np.testing.assert_allclose(elig_c[idx], elig_np[idx], rtol=1e-5, atol=1e-7,
++                                   err_msg=f"eligibility mismatch (no mask, interval={interval})")
++        np.testing.assert_array_equal(alive_c, alive_ref,
++                                      err_msg=f"alive mask mismatch (interval={interval})")
++
++    @pytest.mark.parametrize("interval", [1, 3])
++    def test_with_mask(self, interval):
++        mask = np.random.default_rng(99).uniform(0.01, 1.0, self._NNZ).astype(np.float32)
++        d = 0.999
++        modulator = 0.3
++        idx = np.arange(self._NNZ // 2, dtype=np.int32)
++
++        elig_np, data_np = self._make_arrays(seed=7)
++        elig_c, data_c = elig_np.copy(), data_np.copy()
++
++        self._numpy_ref(elig_np, data_np, idx, modulator, interval, d, mask=mask)
++        neuromod_decay_sparse(
++            elig_c, data_c, idx, modulator, interval, d,
++            self._W_MIN, self._W_MAX, self._PRUNE_THR, plasticity_mask=mask,
++        )
++
++        np.testing.assert_allclose(data_c[idx], data_np[idx], rtol=1e-5, atol=1e-7,
++                                   err_msg=f"weight mismatch (masked, interval={interval})")
++        np.testing.assert_allclose(elig_c[idx], elig_np[idx], rtol=1e-5, atol=1e-7,
++                                   err_msg=f"eligibility mismatch (masked, interval={interval})")
++
++    def test_weight_clipping_enforced(self):
++        """Compiled kernel must honour w_min / w_max the same as NumPy clip."""
++        elig = np.full(100, 1.0, dtype=np.float32)   # large traces → big dw
++        data = np.full(100, 0.95, dtype=np.float32)  # weights near w_max
++        idx = np.arange(100, dtype=np.int32)
++        # After update data would exceed w_max=1.0 without clipping
++        neuromod_decay_sparse(
++            elig.copy(), data, idx, 5.0, 1, 0.999,
++            np.float32(0.01), np.float32(1.0), np.float32(1e-6),
++        )
++        assert data.max() <= 1.0 + 1e-6, "w_max violated by compiled kernel"
++        assert data.min() >= 0.01 - 1e-6, "w_min violated by compiled kernel"
++
++
++# ── neuromod_decay_full equivalence ───────────────────────────────────────
++
++
++@_COMPILED_ONLY
++class TestCompiledNeuromodDecayFull:
++    """Compiled neuromod_decay_full must match NumPy to float32 tolerance."""
++
++    _NNZ = 5_000
++    _W_MIN = np.float32(0.01)
++    _W_MAX = np.float32(1.0)
++
++    def _make_arrays(self, seed: int = 1):
++        rng = np.random.default_rng(seed)
++        elig = (rng.random(self._NNZ).astype(np.float32) - 0.5) * 0.02
++        data = rng.uniform(0.1, 0.9, self._NNZ).astype(np.float32)
++        return elig, data
++
++    @pytest.mark.parametrize("interval", [1, 3, 10])
++    def test_no_mask(self, interval):
++        d = 0.999
++        decay = np.float32(d**interval)
++        interval_gain = float((1.0 - d**interval) / (1.0 - d))
++        modulator = 0.4
++
++        elig_np, data_np = self._make_arrays(seed=interval)
++        elig_c, data_c = elig_np.copy(), data_np.copy()
++
++        dw = np.float32(modulator) * elig_np * np.float32(interval_gain)
++        data_np[:] = np.clip(data_np + dw, self._W_MIN, self._W_MAX)
++        elig_np *= decay
++
++        neuromod_decay_full(elig_c, data_c, modulator, interval_gain, decay, self._W_MIN, self._W_MAX)
++
++        np.testing.assert_allclose(data_c, data_np, rtol=1e-5, atol=1e-7,
++                                   err_msg=f"full-array weight mismatch (interval={interval})")
++        np.testing.assert_allclose(elig_c, elig_np, rtol=1e-5, atol=1e-7,
++                                   err_msg=f"full-array eligibility mismatch (interval={interval})")
++
++    def test_with_mask(self):
++        mask = np.random.default_rng(5).uniform(0.01, 1.0, self._NNZ).astype(np.float32)
++        d, modulator, interval = 0.999, 0.6, 3
++        decay = np.float32(d**interval)
++        interval_gain = float((1.0 - d**interval) / (1.0 - d))
++
++        elig_np, data_np = self._make_arrays()
++        elig_c, data_c = elig_np.copy(), data_np.copy()
++
++        dw = np.float32(modulator) * elig_np * np.float32(interval_gain) * mask
++        data_np[:] = np.clip(data_np + dw, self._W_MIN, self._W_MAX)
++        elig_np *= decay
++
++        neuromod_decay_full(elig_c, data_c, modulator, interval_gain, decay,
++                            self._W_MIN, self._W_MAX, plasticity_mask=mask)
++
++        np.testing.assert_allclose(data_c, data_np, rtol=1e-5, atol=1e-7)
++        np.testing.assert_allclose(elig_c, elig_np, rtol=1e-5, atol=1e-7)
++
++
++# ── End-to-end SynapseGroup integration ───────────────────────────────────
++
++
++@_COMPILED_ONLY
++class TestEndToEndCompiledEquivalence:
++    """SynapseGroup.apply_neuromodulation_and_decay compiled == NumPy.
++
++    Invariant 1 enforcement: the compiled path must produce weight changes
++    within float32 tolerance of the every-step NumPy reference.
++    """
++
++    def _make_sg(self, rng_seed: int = 7):
++        from neuromorphic.config import EligibilityTraceConfig
++        from neuromorphic.synapses import SynapseGroup
++
++        sg = SynapseGroup(
++            n_pre=100,
++            n_post=100,
++            sparsity=0.1,
++            init_weight=0.5,
++            plastic=True,
++            rng=np.random.default_rng(rng_seed),
++            eligibility_config=EligibilityTraceConfig(),
++        )
++        elig_seed = np.random.default_rng(rng_seed + 1)
++        sg.eligibility[:] = elig_seed.uniform(-0.01, 0.01, sg.nnz).astype(np.float32)
++        sg._elig_active = np.arange(sg.nnz, dtype=np.int32)
++        return sg
++
++    @pytest.mark.parametrize("interval", [1, 3])
++    @pytest.mark.parametrize("sparse_path", [True, False], ids=["sparse", "full-array"])
++    def test_compiled_matches_numpy_per_step(self, monkeypatch, interval, sparse_path):
++        """Compiled batched call == interval × every-step NumPy call.
++
++        Runs the batched compiled path and the per-step NumPy path on
++        identical initial state, then asserts weight-change agreement.
++        """
++        sg_c = self._make_sg()
++        sg_np = self._make_sg()
++
++        if not sparse_path:
++            sg_c._elig_active = None
++            sg_np._elig_active = None
++
++        # ── Compiled path (batched) ──
++        w_before = sg_c.weights.data.copy()
++        sg_c.apply_neuromodulation_and_decay(0.5, interval=interval)
++        dw_compiled = sg_c.weights.data - w_before
++
++        # ── NumPy path (per-step) ── patch compiled_kernels so dispatch falls back
++        monkeypatch.setattr(_ck_mod, "COMPILED_STDP_ENABLED", False)
++        w_before = sg_np.weights.data.copy()
++        for _ in range(interval):
++            sg_np.apply_neuromodulation_and_decay(0.5, interval=1)
++        dw_numpy = sg_np.weights.data - w_before
++
++        np.testing.assert_allclose(
++            dw_compiled,
++            dw_numpy,
++            rtol=1e-4,
++            atol=1e-7,
++            err_msg=(
++                f"compiled vs NumPy weight-change mismatch "
++                f"(interval={interval}, sparse_path={sparse_path})"
++            ),
++        )
++
++    def test_stdp_update_compiled_matches_numpy(self, monkeypatch):
++        """STDP delta from compiled kernel matches NumPy for non-BCM synapse groups."""
++        from neuromorphic.config import EligibilityTraceConfig
++        from neuromorphic.synapses import SynapseGroup
++
++        def make():
++            sg = SynapseGroup(
++                n_pre=50, n_post=50, sparsity=0.2, init_weight=0.5,
++                plastic=True, rng=np.random.default_rng(3),
++                eligibility_config=EligibilityTraceConfig(),
++            )
++            return sg
++
++        pre_sp = np.ones(50, dtype=bool)
++        post_sp = np.ones(50, dtype=bool)
++        pre_t = np.full(50, 1.0, dtype=np.float32)
++        post_t = np.full(50, 3.0, dtype=np.float32)  # post after pre → LTP
++
++        sg_c = make()
++        sg_c.update_weights_stdp(pre_sp, post_sp, pre_t, post_t, current_time=3.0)
++        elig_compiled = sg_c.eligibility.copy()
++
++        monkeypatch.setattr(_ck_mod, "COMPILED_STDP_ENABLED", False)
++        sg_np = make()
++        sg_np.update_weights_stdp(pre_sp, post_sp, pre_t, post_t, current_time=3.0)
++        elig_numpy = sg_np.eligibility.copy()
++
++        np.testing.assert_allclose(
++            elig_compiled,
++            elig_numpy,
++            rtol=1e-5,
++            atol=1e-7,
++            err_msg="STDP eligibility trace mismatch: compiled vs NumPy",
++        )
++
++
++# ── NumPy fallback coverage ────────────────────────────────────────────────
++# These tests carry no skip mark — they run regardless of Numba availability
++# and explicitly force the NumPy path by patching compiled_kernels directly.
++
++
++class TestNumPyFallbackKernels:
++    """Public API of compiled_kernels.py exercises its NumPy fallback correctly.
++
++    Patches _ck_mod.COMPILED_STDP_ENABLED = False so the dispatch inside each
++    public function takes the NumPy branch regardless of Numba presence.
++    """
++
++    def test_stdp_delta_fallback_sign_conventions(self, monkeypatch):
++        monkeypatch.setattr(_ck_mod, "COMPILED_STDP_ENABLED", False)
++        dt = np.array([-10.0, 0.0, 10.0], dtype=np.float32)
++        dw = stdp_delta(dt, 0.012, 20.0, 0.010, 20.0)
++        assert dw[0] < 0.0, "LTD should be negative"
++        assert dw[1] >= 0.0, "dt=0 should be non-negative (LTP boundary)"
++        assert dw[2] > 0.0, "LTP should be positive"
++
++    def test_stdp_delta_fallback_values(self, monkeypatch):
++        monkeypatch.setattr(_ck_mod, "COMPILED_STDP_ENABLED", False)
++        dt = np.array([10.0], dtype=np.float32)
++        dw = stdp_delta(dt, 0.012, 20.0, 0.010, 20.0)
++        expected = np.float32(0.012) * np.exp(np.float32(-10.0 / 20.0))
++        np.testing.assert_allclose(dw[0], expected, rtol=1e-5)
++
++    def test_neuromod_decay_sparse_fallback(self, monkeypatch):
++        monkeypatch.setattr(_ck_mod, "COMPILED_STDP_ENABLED", False)
++        elig = np.array([0.05, -0.03, 0.0], dtype=np.float32)
++        data = np.array([0.5, 0.6, 0.7], dtype=np.float32)
++        idx = np.array([0, 1], dtype=np.int32)
++        alive = neuromod_decay_sparse(
++            elig, data, idx, 1.0, 1, np.float32(0.999),
++            np.float32(0.01), np.float32(1.0), np.float32(1e-6),
++        )
++        assert alive.dtype == bool
++        assert len(alive) == 2
++        # large traces survive decay
++        assert alive[0] and alive[1]
++        # weights should have shifted
++        assert data[0] != 0.5
++
++    def test_neuromod_decay_full_fallback(self, monkeypatch):
++        monkeypatch.setattr(_ck_mod, "COMPILED_STDP_ENABLED", False)
++        elig = np.array([0.05, -0.03], dtype=np.float32)
++        data = np.array([0.5, 0.6], dtype=np.float32)
++        data_before = data.copy()
++        neuromod_decay_full(elig, data, 1.0, 1.0, np.float32(0.999),
++                            np.float32(0.01), np.float32(1.0))
++        assert not np.array_equal(data, data_before), "weights must change"
++        assert data.min() >= 0.01 - 1e-6
++        assert data.max() <= 1.0 + 1e-6
++
++    def test_neuromod_decay_sparse_fallback_with_mask(self, monkeypatch):
++        monkeypatch.setattr(_ck_mod, "COMPILED_STDP_ENABLED", False)
++        elig_orig = np.array([0.05, -0.03, 0.0], dtype=np.float32)
++        data = np.array([0.5, 0.6, 0.7], dtype=np.float32)
++        data_no_mask = data.copy()
++        idx = np.array([0, 1], dtype=np.int32)
++        mask = np.array([2.0, 0.5, 1.0], dtype=np.float32)  # per-synapse scale
++        # Both calls receive independent copies of elig so neither mutates the
++        # other's baseline (neuromod_decay_sparse writes back eligibility[idx]).
++        neuromod_decay_sparse(
++            elig_orig.copy(), data_no_mask, idx, 1.0, 1, np.float32(0.999),
++            np.float32(0.01), np.float32(1.0), np.float32(1e-6),
++        )
++        neuromod_decay_sparse(
++            elig_orig.copy(), data, idx, 1.0, 1, np.float32(0.999),
++            np.float32(0.01), np.float32(1.0), np.float32(1e-6),
++            plasticity_mask=mask,
++        )
++        # mask=2.0 on idx[0] should amplify the weight update; 0.5 attenuates idx[1]
++        delta_no_mask_0 = data_no_mask[0] - 0.5
++        delta_masked_0 = data[0] - 0.5
++        assert abs(delta_masked_0) > abs(delta_no_mask_0) - 1e-7, (
++            "mask=2.0 must amplify the weight change on idx[0]"
++        )
++        delta_no_mask_1 = data_no_mask[1] - 0.6
++        delta_masked_1 = data[1] - 0.6
++        assert abs(delta_masked_1) < abs(delta_no_mask_1) + 1e-7, (
++            "mask=0.5 must attenuate the weight change on idx[1]"
++        )
++        # idx[2] is not in active set — must be untouched
++        assert data[2] == 0.7
++
++    def test_neuromod_decay_full_fallback_with_mask(self, monkeypatch):
++        monkeypatch.setattr(_ck_mod, "COMPILED_STDP_ENABLED", False)
++        elig = np.array([0.05, -0.03], dtype=np.float32)
++        data = np.array([0.5, 0.6], dtype=np.float32)
++        data_zero_mask = data.copy()
++        mask_zero = np.zeros(2, dtype=np.float32)
++        neuromod_decay_full(
++            elig.copy(), data_zero_mask, 1.0, 1.0, np.float32(0.999),
++            np.float32(0.01), np.float32(1.0), plasticity_mask=mask_zero,
++        )
++        # zero mask means dw is zeroed → weights stay at their initial values
++        np.testing.assert_array_equal(
++            data_zero_mask, np.array([0.5, 0.6], dtype=np.float32),
++            err_msg="zero plasticity_mask must produce no weight change",
++        )
++        data_full_mask = data.copy()
++        mask_double = np.full(2, 2.0, dtype=np.float32)
++        neuromod_decay_full(
++            elig.copy(), data_full_mask, 1.0, 1.0, np.float32(0.999),
++            np.float32(0.01), np.float32(1.0), plasticity_mask=mask_double,
++        )
++        data_no_mask = data.copy()
++        neuromod_decay_full(
++            elig.copy(), data_no_mask, 1.0, 1.0, np.float32(0.999),
++            np.float32(0.01), np.float32(1.0),
++        )
++        np.testing.assert_allclose(
++            np.abs(data_full_mask - np.array([0.5, 0.6], dtype=np.float32)),
++            np.abs(data_no_mask - np.array([0.5, 0.6], dtype=np.float32)) * 2.0,
++            rtol=1e-5,
++            err_msg="mask=2.0 must double the weight delta vs no mask",
++        )

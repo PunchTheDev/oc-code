@@ -1,0 +1,941 @@
+diff --git a/client/src/adapter/types.ts b/client/src/adapter/types.ts
+index 8f75236562..15662b7d77 100644
+--- a/client/src/adapter/types.ts
++++ b/client/src/adapter/types.ts
+@@ -1205,6 +1205,8 @@ export type WaitingFor =
+   | { type: "RetargetChoice"; data: { player: PlayerId; stack_entry_index: number; scope: RetargetScope; current_targets: TargetRef[]; legal_new_targets: TargetRef[] } }
+   | { type: "ProliferateChoice"; data: { player: PlayerId; eligible: TargetRef[] } }
+   | { type: "TimeTravelChoice"; data: { player: PlayerId; eligible: TargetRef[]; phase: "Remove" | "Add" } }
++  | { type: "AssistChoosePlayer"; data: { player: PlayerId; candidates: PlayerId[]; max_generic: number; convoke_mode?: ConvokeMode } }
++  | { type: "AssistPayment"; data: { caster: PlayerId; chosen: PlayerId; max_generic: number; convoke_mode?: ConvokeMode } }
+   | { type: "ChooseObjectsSelection"; data: { player: PlayerId; eligible: TargetRef[]; trigger_event?: GameEvent } }
+   | { type: "ConniveDiscard"; data: { player: PlayerId; conniver_id: ObjectId; source_id: ObjectId; cards: ObjectId[]; count: number } }
+   | { type: "DiscardChoice"; data: { player: PlayerId; count: number; cards: ObjectId[]; source_id: ObjectId; effect_kind: string; up_to?: boolean; unless_filter?: TargetFilter } }
+@@ -1527,6 +1529,8 @@ export type GameAction =
+   // CR 702.99a: answer to CipherEncodeChoice — a creature to encode on, or null to decline.
+   | { type: "CipherEncode"; data: { creature: ObjectId | null } }
+   | { type: "ChooseClashOpponent"; data: { opponent: PlayerId } }
++  | { type: "ChooseAssistPlayer"; data: { player: PlayerId | null } }
++  | { type: "CommitAssistPayment"; data: { generic: number } }
+   | { type: "SetAutoPass"; data: { mode: { type: "UntilStackEmpty" } | { type: "UntilEndOfTurn" } } }
+   | { type: "CancelAutoPass" }
+   | { type: "SetPhaseStops"; data: { stops: Phase[] } }
+diff --git a/crates/engine/src/ai_support/candidates.rs b/crates/engine/src/ai_support/candidates.rs
+index dea50a0052..d531a16bc2 100644
+--- a/crates/engine/src/ai_support/candidates.rs
++++ b/crates/engine/src/ai_support/candidates.rs
+@@ -1966,6 +1966,49 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
+             }
+             actions
+         }
++        // CR 702.132a: Assist — caster may decline or pick any eligible helper.
++        WaitingFor::AssistChoosePlayer {
++            player, candidates, ..
++        } => {
++            let mut actions = vec![candidate(
++                GameAction::ChooseAssistPlayer { player: None },
++                TacticalClass::Selection,
++                Some(*player),
++            )];
++            for &helper in candidates {
++                actions.push(candidate(
++                    GameAction::ChooseAssistPlayer {
++                        player: Some(helper),
++                    },
++                    TacticalClass::Selection,
++                    Some(*player),
++                ));
++            }
++            actions
++        }
++        // CR 702.132a: Assist — the chosen player contributes nothing or the full
++        // amount they were offered (the engine validates feasibility on commit).
++        WaitingFor::AssistPayment {
++            chosen,
++            max_generic,
++            ..
++        } => {
++            let mut actions = vec![candidate(
++                GameAction::CommitAssistPayment { generic: 0 },
++                TacticalClass::Selection,
++                Some(*chosen),
++            )];
++            if *max_generic > 0 {
++                actions.push(candidate(
++                    GameAction::CommitAssistPayment {
++                        generic: *max_generic,
++                    },
++                    TacticalClass::Selection,
++                    Some(*chosen),
++                ));
++            }
++            actions
++        }
+         // CR 608.2c: ChooseObjectsIntoTrackedSet — choose any subset of the
+         // eligible battlefield permanents (or decline with an empty selection).
+         WaitingFor::ChooseObjectsSelection {
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index bd653cd39c..bfd2c74c78 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -21883,6 +21883,257 @@ mod tests {
+             .contains(&KeywordKind::Convoke));
+     }
+ 
++    // --- Assist (CR 702.132a) ---
++
++    fn make_assist_spell(state: &mut GameState) -> ObjectId {
++        let obj_id = create_creature_spell_in_hand(state, PlayerId(0));
++        state
++            .objects
++            .get_mut(&obj_id)
++            .unwrap()
++            .keywords
++            .push(crate::types::keywords::Keyword::Assist);
++        obj_id
++    }
++
++    #[test]
++    fn assist_offers_player_choice_with_generic_cost() {
++        let mut state = setup_game_at_main_phase();
++        let obj_id = make_assist_spell(&mut state);
++        // CR 601.2g: the caster must be able to afford the cost to begin the cast.
++        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
++        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
++
++        let result =
++            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(22), &mut Vec::new())
++                .expect("assist spell should begin casting");
++
++        match result {
++            WaitingFor::AssistChoosePlayer {
++                player,
++                candidates,
++                max_generic,
++                ..
++            } => {
++                assert_eq!(player, PlayerId(0));
++                assert_eq!(candidates, vec![PlayerId(1)]);
++                assert_eq!(
++                    max_generic, 3,
++                    "max_generic mirrors the cost's generic ({{3}}{{R}})"
++                );
++            }
++            other => panic!("expected AssistChoosePlayer, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn assist_no_offer_without_generic_component() {
++        let mut state = setup_game_at_main_phase();
++        let obj_id = make_assist_spell(&mut state);
++        // CR 702.132a: assist only applies when the total cost has a generic part.
++        state.objects.get_mut(&obj_id).unwrap().mana_cost = ManaCost::Cost {
++            shards: vec![ManaCostShard::Red, ManaCostShard::Red],
++            generic: 0,
++        };
++        add_mana(&mut state, PlayerId(0), ManaType::Red, 2);
++
++        let result =
++            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(22), &mut Vec::new())
++                .expect("assist spell should begin casting");
++
++        assert!(
++            !matches!(result, WaitingFor::AssistChoosePlayer { .. }),
++            "a pure-colored cost must not offer assist, got {result:?}"
++        );
++    }
++
++    #[test]
++    fn assist_no_offer_without_other_players() {
++        let mut state = setup_game_at_main_phase();
++        state
++            .players
++            .iter_mut()
++            .find(|p| p.id == PlayerId(1))
++            .unwrap()
++            .is_eliminated = true;
++        let obj_id = make_assist_spell(&mut state);
++        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
++        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
++
++        let result =
++            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(22), &mut Vec::new())
++                .expect("assist spell should begin casting");
++
++        assert!(
++            !matches!(result, WaitingFor::AssistChoosePlayer { .. }),
++            "with no eligible helper, assist must not be offered, got {result:?}"
++        );
++    }
++
++    #[test]
++    fn assist_decline_proceeds_to_normal_payment() {
++        let mut state = setup_game_at_main_phase();
++        let obj_id = make_assist_spell(&mut state);
++        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
++        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
++
++        let result =
++            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(22), &mut Vec::new())
++                .expect("assist spell should begin casting");
++        assert!(matches!(result, WaitingFor::AssistChoosePlayer { .. }));
++        state.waiting_for = result;
++
++        apply_as_current(&mut state, GameAction::ChooseAssistPlayer { player: None })
++            .expect("declining assist is legal");
++
++        assert!(
++            !matches!(
++                state.waiting_for,
++                WaitingFor::AssistChoosePlayer { .. } | WaitingFor::AssistPayment { .. }
++            ),
++            "declining assist must leave the assist steps, got {:?}",
++            state.waiting_for
++        );
++    }
++
++    #[test]
++    fn assist_contribution_spends_helper_mana() {
++        let mut state = setup_game_at_main_phase();
++        let obj_id = make_assist_spell(&mut state);
++        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
++        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
++        // CR 702.132a: the chosen player pays generic from their own mana.
++        add_mana(&mut state, PlayerId(1), ManaType::Colorless, 2);
++
++        let result =
++            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(22), &mut Vec::new())
++                .expect("assist spell should begin casting");
++        state.waiting_for = result;
++
++        apply_as_current(
++            &mut state,
++            GameAction::ChooseAssistPlayer {
++                player: Some(PlayerId(1)),
++            },
++        )
++        .expect("choosing an eligible helper is legal");
++        assert!(
++            matches!(state.waiting_for, WaitingFor::AssistPayment { chosen, .. } if chosen == PlayerId(1)),
++            "expected AssistPayment routed to the chosen player, got {:?}",
++            state.waiting_for
++        );
++
++        let p1_before = state
++            .players
++            .iter()
++            .find(|p| p.id == PlayerId(1))
++            .unwrap()
++            .mana_pool
++            .total();
++        apply_as_current(&mut state, GameAction::CommitAssistPayment { generic: 2 })
++            .expect("committing a feasible assist amount is legal");
++        let p1_after = state
++            .players
++            .iter()
++            .find(|p| p.id == PlayerId(1))
++            .unwrap()
++            .mana_pool
++            .total();
++
++        assert_eq!(
++            p1_before - p1_after,
++            2,
++            "the assisting player should have spent 2 generic mana"
++        );
++        assert!(
++            state.pending_cast.is_none(),
++            "the cast should finalize once assist + caster mana cover the cost"
++        );
++    }
++
++    #[test]
++    fn assist_commit_rejects_over_max_generic() {
++        let mut state = setup_game_at_main_phase();
++        let obj_id = make_assist_spell(&mut state);
++        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
++        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
++        add_mana(&mut state, PlayerId(1), ManaType::Colorless, 5);
++
++        let result =
++            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(22), &mut Vec::new())
++                .expect("assist spell should begin casting");
++        state.waiting_for = result;
++        apply_as_current(
++            &mut state,
++            GameAction::ChooseAssistPlayer {
++                player: Some(PlayerId(1)),
++            },
++        )
++        .unwrap();
++
++        // CR 702.132a: the helper may pay at most the spell's generic ({3}).
++        assert!(
++            apply_as_current(&mut state, GameAction::CommitAssistPayment { generic: 4 }).is_err(),
++            "contributing more than the cost's generic must be rejected"
++        );
++    }
++
++    #[test]
++    fn assist_cancel_after_commit_does_not_spend_helper_mana() {
++        // CR 601.2i: the helper's mana must not be spent if the caster cancels.
++        // The helper's tap/spend is deferred to finalize_cast, so a CancelCast at
++        // the (manual ⇒ cancellable) post-assist ManaPayment leaves them untouched.
++        use super::super::engine::apply_as_current;
++        let mut state = setup_game_at_main_phase();
++        let obj_id = make_assist_spell(&mut state);
++        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
++        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
++        add_mana(&mut state, PlayerId(1), ManaType::Colorless, 2);
++
++        // Manual payment keeps the post-assist ManaPayment cancellable.
++        let result = handle_cast_spell_with_payment_mode(
++            &mut state,
++            PlayerId(0),
++            obj_id,
++            CardId(22),
++            crate::types::game_state::CastPaymentMode::Manual,
++            &mut Vec::new(),
++        )
++        .expect("assist spell should begin casting");
++        state.waiting_for = result;
++        apply_as_current(
++            &mut state,
++            GameAction::ChooseAssistPlayer {
++                player: Some(PlayerId(1)),
++            },
++        )
++        .unwrap();
++        apply_as_current(&mut state, GameAction::CommitAssistPayment { generic: 2 })
++            .expect("committing assist is legal");
++
++        let p1_before = state
++            .players
++            .iter()
++            .find(|p| p.id == PlayerId(1))
++            .unwrap()
++            .mana_pool
++            .total();
++        apply_as_current(&mut state, GameAction::CancelCast).expect("the caster may cancel");
++        let p1_after = state
++            .players
++            .iter()
++            .find(|p| p.id == PlayerId(1))
++            .unwrap()
++            .mana_pool
++            .total();
++
++        assert_eq!(
++            (p1_before, p1_after),
++            (2, 2),
++            "cancelling the cast must not spend the assisting player's mana"
++        );
++    }
++
+     #[test]
+     fn cast_with_keyword_convoke_honors_from_exile_filter() {
+         let mut state = setup_game_at_main_phase();
+diff --git a/crates/engine/src/game/casting_costs.rs b/crates/engine/src/game/casting_costs.rs
+index 232e803571..e3f1722240 100644
+--- a/crates/engine/src/game/casting_costs.rs
++++ b/crates/engine/src/game/casting_costs.rs
+@@ -7,8 +7,8 @@ use crate::types::ability::{
+ };
+ use crate::types::events::{GameEvent, ManaTapState};
+ use crate::types::game_state::{
+-    CastPaymentMode, CastingVariant, ConvokeMode, CostResume, DistributionUnit, GameState,
+-    PayCostKind, PendingCast, PendingDiscardForCostResume, SpellCostSource, StackEntry,
++    AssistState, CastPaymentMode, CastingVariant, ConvokeMode, CostResume, DistributionUnit,
++    GameState, PayCostKind, PendingCast, PendingDiscardForCostResume, SpellCostSource, StackEntry,
+     StackEntryKind, StackPaidSnapshot, WaitingFor,
+ };
+ use crate::types::identifiers::{CardId, ObjectId};
+@@ -3797,6 +3797,28 @@ pub(super) fn pay_and_push_adventure(
+         return enter_payment_step(state, player, convoke_mode, events);
+     }
+ 
++    // CR 702.132a: Assist — the cost is now fully locked (no X / convoke / manual
++    // step pending), so before finalizing, a spell with assist and a generic
++    // component lets the caster choose another player to help pay it. Stash the
++    // pending cast so the assist answer handlers can resume via `enter_payment_step`.
++    if let Some((generic, candidates)) = assist_offer_params(state, player, object_id, cost) {
++        let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
++        pending.base_cost = base_cost.clone();
++        pending.casting_variant = casting_variant;
++        pending.cast_timing_permission = cast_timing_permission;
++        pending.distribute = distribute;
++        pending.origin_zone = origin_zone;
++        pending.payment_mode = payment_mode;
++        pending.assist_state = AssistState::Offered;
++        state.pending_cast = Some(Box::new(pending));
++        return Ok(WaitingFor::AssistChoosePlayer {
++            player,
++            candidates,
++            max_generic: generic,
++            convoke_mode: None,
++        });
++    }
++
+     // CR 107.4f + CR 601.2f: Pause before any Phyrexian shard would deduct life,
+     // whether life is optional or the only legal route. The resume handler calls
+     // `finalize_mana_payment_with_phyrexian_choices` which finishes the cast.
+@@ -5358,6 +5380,39 @@ pub(super) fn max_x_value_excluding(
+ ///
+ /// All sites that would otherwise construct `WaitingFor::ManaPayment` during a
+ /// cast must go through this helper so X-selection and auto-pay are never bypassed.
++/// CR 702.132a: If the spell `object_id` being cast by `player` has assist, its
++/// locked `cost` includes a generic component, and at least one other player is
++/// still in the game, return `(generic, candidates)` — the generic amount the
++/// helper may pay and the eligible helper players. Returns `None` when assist
++/// does not apply. Shared by the `enter_payment_step` (X / convoke / manual) and
++/// `pay_and_push_adventure` (direct auto-finalize) offer sites.
++fn assist_offer_params(
++    state: &GameState,
++    player: PlayerId,
++    object_id: ObjectId,
++    cost: &ManaCost,
++) -> Option<(u32, Vec<PlayerId>)> {
++    let generic = match cost {
++        ManaCost::Cost { generic, .. } if *generic > 0 => *generic,
++        _ => return None,
++    };
++    if !super::casting::effective_spell_keywords(state, player, object_id)
++        .contains(&Keyword::Assist)
++    {
++        return None;
++    }
++    let candidates: Vec<PlayerId> = state
++        .players
++        .iter()
++        .filter(|p| p.id != player && !p.is_eliminated)
++        .map(|p| p.id)
++        .collect();
++    if candidates.is_empty() {
++        return None;
++    }
++    Some((generic, candidates))
++}
++
+ pub fn enter_payment_step(
+     state: &mut GameState,
+     player: PlayerId,
+@@ -5434,6 +5489,30 @@ pub fn enter_payment_step(
+         return finish_pending_cost_or_cast(state, player, pending, events);
+     }
+ 
++    // CR 702.132a: Assist — once the total cost is locked (X chosen, modifiers
++    // applied) and before the caster pays, a spell with assist whose cost has a
++    // generic component lets the caster choose another player to help pay that
++    // generic mana. The offer is made once per cast (`assist_state`). This site
++    // covers the X / convoke / manual paths that funnel through `enter_payment_step`;
++    // `pay_and_push_adventure` covers the direct auto-finalize path.
++    let assist_offer = state.pending_cast.as_ref().and_then(|pending| {
++        if pending.assist_state != AssistState::NotOffered {
++            return None;
++        }
++        assist_offer_params(state, player, pending.object_id, &pending.cost)
++    });
++    if let Some((generic, candidates)) = assist_offer {
++        if let Some(pending) = state.pending_cast.as_mut() {
++            pending.assist_state = AssistState::Offered;
++        }
++        return Ok(WaitingFor::AssistChoosePlayer {
++            player,
++            candidates,
++            max_generic: generic,
++            convoke_mode,
++        });
++    }
++
+     // CR 601.2h: Auto-finalize when no player-level decision remains. Convoke requires
+     // the caster to choose which creatures to tap, so it always surfaces the modal.
+     if convoke_mode.is_none() {
+@@ -5464,6 +5543,39 @@ pub fn enter_payment_step(
+ /// Called both from the `(ManaPayment, PassPriority)` branch in the main engine
+ /// dispatcher and from `enter_payment_step` when classification skips the modal.
+ /// This is the single authority for completing a mana payment.
++/// CR 702.132a: At the non-cancellable commit point (just before `finalize_cast`),
++/// spend a committed Assist contribution by tapping the helper's mana sources for
++/// the agreed generic amount. This is deferred to here — rather than performed at
++/// `CommitAssistPayment` — so a `CancelCast` at any intervening (still-cancellable)
++/// payment step never leaves the helper's lands tapped or their mana spent. The
++/// caster's owed cost was already reduced by `generic` at commit time. A no-op for
++/// non-assist casts and for declined/uncommitted assists.
++pub(super) fn apply_committed_assist(
++    state: &mut GameState,
++    pending: &PendingCast,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EngineError> {
++    let AssistState::Committed { helper, generic } = pending.assist_state else {
++        return Ok(());
++    };
++    if generic == 0 {
++        return Ok(());
++    }
++    let probe = ManaCost::Cost {
++        shards: Vec::new(),
++        generic,
++    };
++    auto_tap_mana_sources(state, helper, &probe, events, None);
++    if let Some(p) = state.players.iter_mut().find(|p| p.id == helper) {
++        mana_payment::pay_cost(&mut p.mana_pool, &probe).map_err(|e| {
++            EngineError::ActionNotAllowed(format!(
++                "Assisting player could not pay {generic} generic mana at finalization: {e:?}"
++            ))
++        })?;
++    }
++    Ok(())
++}
++
+ pub fn finalize_mana_payment(
+     state: &mut GameState,
+     player: PlayerId,
+@@ -5522,6 +5634,10 @@ pub fn finalize_mana_payment(
+         .take()
+         .ok_or_else(|| EngineError::InvalidAction("No pending cast to finalize".to_string()))?;
+ 
++    // CR 702.132a: commit point reached — apply any committed Assist contribution
++    // (tap the helper's sources) now that the cast can no longer be cancelled.
++    apply_committed_assist(state, &pending, events)?;
++
+     if let Some(ability_index) = pending.activation_ability_index {
+         let excluded_sources = pending
+             .activation_cost
+@@ -5671,6 +5787,10 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
+         .take()
+         .ok_or_else(|| EngineError::InvalidAction("No pending cast to finalize".to_string()))?;
+ 
++    // CR 702.132a: commit point reached — apply any committed Assist contribution
++    // (tap the helper's sources) now that the cast can no longer be cancelled.
++    apply_committed_assist(state, &pending, events)?;
++
+     if let Some(ability_index) = pending.activation_ability_index {
+         let excluded_sources = pending
+             .activation_cost
+@@ -6036,6 +6156,7 @@ mod tests {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: CastPaymentMode::Auto,
++            assist_state: AssistState::NotOffered,
+         }
+     }
+ 
+@@ -9760,6 +9881,7 @@ mod tests {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: CastPaymentMode::Auto,
++            assist_state: AssistState::NotOffered,
+         };
+ 
+         let result = pay_additional_cost(
+@@ -9881,6 +10003,7 @@ mod tests {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: CastPaymentMode::Auto,
++            assist_state: AssistState::NotOffered,
+         };
+ 
+         let mut events = Vec::new();
+@@ -9971,6 +10094,7 @@ mod tests {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: CastPaymentMode::Auto,
++            assist_state: AssistState::NotOffered,
+         };
+ 
+         // Exactly one card is required. Selecting two must fail.
+@@ -10050,6 +10174,7 @@ mod tests {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: CastPaymentMode::Auto,
++            assist_state: AssistState::NotOffered,
+         };
+ 
+         // `red` is not in the legal-cards list, so the cost handler must reject
+@@ -10162,6 +10287,7 @@ mod tests {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: CastPaymentMode::Auto,
++            assist_state: AssistState::NotOffered,
+         };
+ 
+         let result = pay_additional_cost(
+diff --git a/crates/engine/src/game/engine.rs b/crates/engine/src/game/engine.rs
+index 22b1112e54..553926982d 100644
+--- a/crates/engine/src/game/engine.rs
++++ b/crates/engine/src/game/engine.rs
+@@ -6,8 +6,9 @@ use crate::types::ability::{EffectKind, KeywordAction, TargetRef};
+ use crate::types::actions::GameAction;
+ use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState, PlayerActionKind};
+ use crate::types::game_state::{
+-    ActionResult, AutoPassMode, AutoPassRequest, CastOfferKind, ConvokeMode, CostResume, GameState,
+-    LandPlayRecord, PayCostKind, RetargetScope, StackEntry, StackEntryKind, WaitingFor,
++    ActionResult, AssistState, AutoPassMode, AutoPassRequest, CastOfferKind, ConvokeMode,
++    CostResume, GameState, LandPlayRecord, PayCostKind, RetargetScope, StackEntry, StackEntryKind,
++    WaitingFor,
+ };
+ use crate::types::identifiers::{CardId, ObjectId};
+ use crate::types::match_config::MatchType;
+@@ -2780,6 +2781,115 @@ fn apply_action(
+             casting::apply_post_x_cost_modifiers(state, player, object_id);
+             casting_costs::enter_payment_step(state, player, convoke_mode, &mut events)?
+         }
++        // CR 702.132a: Assist — caster chooses another player to help pay generic,
++        // or declines. `assist_state` was set to `Offered` when the offer was made,
++        // so both branches simply (re)enter the payment step from where they resume.
++        (
++            WaitingFor::AssistChoosePlayer {
++                player,
++                candidates,
++                max_generic,
++                convoke_mode,
++            },
++            GameAction::ChooseAssistPlayer { player: chosen },
++        ) => {
++            let caster = *player;
++            let convoke_mode = *convoke_mode;
++            match chosen {
++                None => {
++                    // CR 702.132a: declining proceeds to normal payment by the caster.
++                    casting_costs::enter_payment_step(state, caster, convoke_mode, &mut events)?
++                }
++                Some(p) => {
++                    if !candidates.contains(&p) {
++                        return Err(EngineError::InvalidAction(format!(
++                            "Player {p:?} is not an eligible assist helper"
++                        )));
++                    }
++                    WaitingFor::AssistPayment {
++                        caster,
++                        chosen: p,
++                        max_generic: *max_generic,
++                        convoke_mode,
++                    }
++                }
++            }
++        }
++        (WaitingFor::AssistChoosePlayer { player, .. }, GameAction::CancelCast) => {
++            let player = *player;
++            match state.pending_cast.take() {
++                Some(pending) => {
++                    engine_casting::cancel_pending_cast(state, player, &pending, &mut events)
++                }
++                None => WaitingFor::Priority { player },
++            }
++        }
++        (WaitingFor::AssistChoosePlayer { .. }, GameAction::PassPriority) => {
++            return Err(EngineError::ActionNotAllowed(
++                "Must choose an assisting player or decline with ChooseAssistPlayer { player: None }, or CancelCast."
++                    .to_string(),
++            ));
++        }
++        // CR 702.132a: Assist — the chosen player commits how much generic mana to
++        // pay. The caster's owed generic is reduced now, and the commitment is
++        // recorded on the pending cast; the helper's sources are tapped only at
++        // `finalize_cast` (the non-cancellable commit), so a later CancelCast can
++        // never leak the helper's lands or spent mana.
++        (
++            WaitingFor::AssistPayment {
++                caster,
++                chosen,
++                max_generic,
++                convoke_mode,
++            },
++            GameAction::CommitAssistPayment { generic },
++        ) => {
++            let caster = *caster;
++            let chosen = *chosen;
++            let max_generic = *max_generic;
++            let convoke_mode = *convoke_mode;
++            if generic > max_generic {
++                return Err(EngineError::InvalidAction(format!(
++                    "Assist contribution {generic} exceeds the maximum {max_generic}"
++                )));
++            }
++            if generic > 0 {
++                use crate::types::mana::ManaCost;
++                // CR 702.132a: validate the helper can actually produce the committed
++                // generic (simulated auto-tap on a clone) before reducing the
++                // caster's cost. No real taps happen here — see `apply_committed_assist`.
++                let probe = ManaCost::Cost {
++                    shards: Vec::new(),
++                    generic,
++                };
++                let mut sim = state.clone();
++                let mut sink = Vec::new();
++                casting_costs::auto_tap_mana_sources(&mut sim, chosen, &probe, &mut sink, None);
++                let feasible = sim
++                    .players
++                    .iter()
++                    .find(|p| p.id == chosen)
++                    .is_some_and(|p| mana_payment::can_pay(&p.mana_pool, &probe));
++                if !feasible {
++                    return Err(EngineError::InvalidAction(format!(
++                        "Assisting player cannot produce {generic} generic mana"
++                    )));
++                }
++                // Reduce the caster's owed generic and record the commitment; the
++                // helper actually taps/spends at finalize.
++                let pending = state.pending_cast.as_mut().ok_or_else(|| {
++                    EngineError::InvalidAction("No pending cast for assist".to_string())
++                })?;
++                if let ManaCost::Cost { generic: owed, .. } = &mut pending.cost {
++                    *owed = owed.saturating_sub(generic);
++                }
++                pending.assist_state = AssistState::Committed {
++                    helper: chosen,
++                    generic,
++                };
++            }
++            casting_costs::enter_payment_step(state, caster, convoke_mode, &mut events)?
++        }
+         // CR 601.2h: Player has confirmed payment — delegate to the shared finalizer
+         // that both this branch and the auto-pay path in `enter_payment_step` share.
+         (WaitingFor::ManaPayment { player, .. }, GameAction::PassPriority) => {
+@@ -11028,6 +11138,7 @@ mod tests {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: crate::types::game_state::CastPaymentMode::Auto,
++            assist_state: AssistState::NotOffered,
+         }));
+         state.waiting_for = WaitingFor::ManaPayment {
+             player: PlayerId(0),
+@@ -11410,6 +11521,7 @@ mod tests {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: crate::types::game_state::CastPaymentMode::Auto,
++            assist_state: AssistState::NotOffered,
+         }));
+         state.waiting_for = WaitingFor::ManaPayment {
+             player: PlayerId(0),
+diff --git a/crates/engine/src/game/scenario.rs b/crates/engine/src/game/scenario.rs
+index bec29f7832..8ba3d66149 100644
+--- a/crates/engine/src/game/scenario.rs
++++ b/crates/engine/src/game/scenario.rs
+@@ -1534,6 +1534,8 @@ impl GameRunner {
+             WaitingFor::BattleProtectorChoice { .. } => "BattleProtectorChoice",
+             WaitingFor::ProliferateChoice { .. } => "ProliferateChoice",
+             WaitingFor::TimeTravelChoice { .. } => "TimeTravelChoice",
++            WaitingFor::AssistChoosePlayer { .. } => "AssistChoosePlayer",
++            WaitingFor::AssistPayment { .. } => "AssistPayment",
+             WaitingFor::ChooseObjectsSelection { .. } => "ChooseObjectsSelection",
+             WaitingFor::CopyRetarget { .. } => "CopyRetarget",
+             WaitingFor::AssignCombatDamage { .. } => "AssignCombatDamage",
+diff --git a/crates/engine/src/game/visibility.rs b/crates/engine/src/game/visibility.rs
+index 06e611e405..a17cb8ffae 100644
+--- a/crates/engine/src/game/visibility.rs
++++ b/crates/engine/src/game/visibility.rs
+@@ -712,6 +712,7 @@ mod tests {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: CastPaymentMode::Auto,
++            assist_state: crate::types::game_state::AssistState::NotOffered,
+         })
+     }
+ 
+diff --git a/crates/engine/src/types/actions.rs b/crates/engine/src/types/actions.rs
+index 9c8d762ebf..f410e66065 100644
+--- a/crates/engine/src/types/actions.rs
++++ b/crates/engine/src/types/actions.rs
+@@ -166,6 +166,18 @@ pub enum GameAction {
+     ChooseClashOpponent {
+         opponent: PlayerId,
+     },
++    /// CR 702.132a: Assist — the caster's answer to `WaitingFor::AssistChoosePlayer`.
++    /// `Some(p)` chooses player `p` (one of the prompt's `candidates`) to help pay
++    /// the generic mana; `None` declines and proceeds to normal payment.
++    ChooseAssistPlayer {
++        player: Option<PlayerId>,
++    },
++    /// CR 702.132a: Assist — the chosen player's answer to `WaitingFor::AssistPayment`.
++    /// `generic` is how much of the spell's generic mana they pay (0 = nothing),
++    /// capped at the prompt's `max_generic`.
++    CommitAssistPayment {
++        generic: u32,
++    },
+     /// CR 103.5 + 103.5b: A player's decision at a `WaitingFor::MulliganDecision`
+     /// prompt. See [`MulliganChoice`] for the three branches.
+     MulliganDecision {
+@@ -1280,6 +1292,8 @@ impl GameAction {
+             | GameAction::ChooseMutateMergeSide { .. }
+             | GameAction::CipherEncode { .. }
+             | GameAction::ChooseClashOpponent { .. }
++            | GameAction::ChooseAssistPlayer { .. }
++            | GameAction::CommitAssistPayment { .. }
+             | GameAction::ChooseBattleProtector { .. }
+             | GameAction::SetAutoPass { .. }
+             | GameAction::CancelAutoPass
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index 3ff344090d..20a5631419 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -132,6 +132,23 @@ pub enum ConvokeMode {
+     Improvise,
+ }
+ 
++/// CR 702.132a: Tracks the once-per-cast Assist offer/decision on a `PendingCast`.
++/// A typed enum (not a bool) so the offered-once guard and the committed
++/// contribution share one field. `Committed` defers the helper's actual mana
++/// spend to `finalize_cast`, so cancelling the cast never leaks tapped lands.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
++pub enum AssistState {
++    /// The Assist offer has not been made for this cast.
++    #[default]
++    NotOffered,
++    /// The offer was made and the caster declined (or contributed nothing).
++    Offered,
++    /// The caster chose `helper`, who will pay `generic` of the spell's generic
++    /// mana. The caster's owed cost is reduced by `generic` now; the helper's
++    /// sources are tapped only at `finalize_cast` (the non-cancellable commit).
++    Committed { helper: PlayerId, generic: u32 },
++}
++
+ /// CR 400.7: Snapshot of an object's characteristics at the time it left a public zone.
+ /// Used for event-context resolution when the object is no longer in its original zone.
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+@@ -1121,6 +1138,12 @@ pub struct PendingCast {
+     pub cancel_restore_prepared_source: Option<ObjectId>,
+     #[serde(default)]
+     pub payment_mode: CastPaymentMode,
++    /// CR 702.132a: Assist offer/decision for this cast. `NotOffered` until the
++    /// "choose another player" step is presented (so re-entering
++    /// `enter_payment_step` doesn't re-offer); `Committed` carries the helper and
++    /// the generic amount they will pay at `finalize_cast`.
++    #[serde(default)]
++    pub assist_state: AssistState,
+ }
+ 
+ fn default_origin_zone() -> Zone {
+@@ -1169,6 +1192,7 @@ impl PendingCast {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: CastPaymentMode::Auto,
++            assist_state: AssistState::NotOffered,
+         }
+     }
+ 
+@@ -1982,6 +2006,34 @@ pub enum WaitingFor {
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         convoke_mode: Option<ConvokeMode>,
+     },
++    /// CR 702.132a: Assist — when casting a spell with assist whose locked total
++    /// cost has a generic component, before the caster pays they MAY choose
++    /// another player to help pay the generic mana. The CASTER acts on this step
++    /// (`ChooseAssistPlayer`); choosing `None` declines and proceeds to normal
++    /// payment, choosing a player advances to `AssistPayment`. `max_generic` is
++    /// the generic component of the locked cost; `convoke_mode` threads through
++    /// to the eventual `ManaPayment`.
++    AssistChoosePlayer {
++        player: PlayerId,
++        candidates: Vec<PlayerId>,
++        max_generic: u32,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        convoke_mode: Option<ConvokeMode>,
++    },
++    /// CR 702.132a: Assist — the CHOSEN player decides how much of the spell's
++    /// generic mana to pay (`CommitAssistPayment { generic }`, 0 = contribute
++    /// nothing). `acting_player()` returns `chosen`, so authorization routes the
++    /// step to that player rather than the caster. `max_generic` is the most the
++    /// chosen player may contribute (capped to both the cost's generic and what
++    /// they can produce); the committed mana is applied to the caster's spell and
++    /// the cast resumes at normal `ManaPayment`.
++    AssistPayment {
++        caster: PlayerId,
++        chosen: PlayerId,
++        max_generic: u32,
++        #[serde(default, skip_serializing_if = "Option::is_none")]
++        convoke_mode: Option<ConvokeMode>,
++    },
+     /// CR 107.1b + CR 601.2f: Caster chooses the value of X for a pending cast
+     /// whose cost contains `ManaCostShard::X`. Usually fires after target
+     /// selection and before `ManaPayment`; fires before target selection when a
+@@ -3481,6 +3533,8 @@ impl WaitingFor {
+             WaitingFor::BattleProtectorChoice { .. } => "BattleProtectorChoice",
+             WaitingFor::ProliferateChoice { .. } => "ProliferateChoice",
+             WaitingFor::TimeTravelChoice { .. } => "TimeTravelChoice",
++            WaitingFor::AssistChoosePlayer { .. } => "AssistChoosePlayer",
++            WaitingFor::AssistPayment { .. } => "AssistPayment",
+             WaitingFor::ChooseObjectsSelection { .. } => "ChooseObjectsSelection",
+             WaitingFor::CategoryChoice { .. } => "CategoryChoice",
+             WaitingFor::CopyRetarget { .. } => "CopyRetarget",
+@@ -3602,6 +3656,7 @@ impl WaitingFor {
+             | WaitingFor::BattleProtectorChoice { player, .. }
+             | WaitingFor::ProliferateChoice { player, .. }
+             | WaitingFor::TimeTravelChoice { player, .. }
++            | WaitingFor::AssistChoosePlayer { player, .. }
+             | WaitingFor::ChooseObjectsSelection { player, .. }
+             | WaitingFor::CategoryChoice { player, .. }
+             | WaitingFor::CopyRetarget { player, .. }
+@@ -3628,6 +3683,9 @@ impl WaitingFor {
+             // authorized submitter without the call site needing to know
+             // which voting shape this is.
+             WaitingFor::VoteChoice { player, actor, .. } => Some(actor.resolve(*player)),
++            // CR 702.132a: the assisting (chosen) player acts on the payment step,
++            // not the caster — route authorization to them.
++            WaitingFor::AssistPayment { chosen, .. } => Some(*chosen),
+             WaitingFor::GameOver { .. } => None,
+         }
+     }
+@@ -6775,6 +6833,7 @@ mod tests {
+                 convoked_creatures: Vec::new(),
+                 cancel_restore_prepared_source: None,
+                 payment_mode: CastPaymentMode::Auto,
++                assist_state: AssistState::NotOffered,
+             })
+         }
+ 
+@@ -7101,6 +7160,7 @@ mod tests {
+             convoked_creatures: Vec::new(),
+             cancel_restore_prepared_source: None,
+             payment_mode: CastPaymentMode::Auto,
++            assist_state: AssistState::NotOffered,
+         });
+         let choose_x = WaitingFor::ChooseXValue {
+             player: PlayerId(0),
+diff --git a/crates/phase-ai/src/decision_kind.rs b/crates/phase-ai/src/decision_kind.rs
+index 4215bec843..dd596cd695 100644
+--- a/crates/phase-ai/src/decision_kind.rs
++++ b/crates/phase-ai/src/decision_kind.rs
+@@ -140,6 +140,10 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
+         | WaitingFor::BattleProtectorChoice { .. }
+         | WaitingFor::ProliferateChoice { .. }
+         | WaitingFor::TimeTravelChoice { .. }
++        // CR 702.132a: Assist offer / payment — casting-payment-adjacent choices,
++        // routed to the ability catch-all bucket like the other opt-in cast steps.
++        | WaitingFor::AssistChoosePlayer { .. }
++        | WaitingFor::AssistPayment { .. }
+         | WaitingFor::ChooseObjectsSelection { .. }
+         | WaitingFor::CategoryChoice { .. }
+         | WaitingFor::AssignCombatDamage { .. }
+diff --git a/crates/phase-ai/src/search.rs b/crates/phase-ai/src/search.rs
+index 5009d3d688..82ce63b909 100644
+--- a/crates/phase-ai/src/search.rs
++++ b/crates/phase-ai/src/search.rs
+@@ -738,6 +738,13 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
+             targets: Vec::new(),
+         }),
+ 
++        // CR 702.132a: Assist — default to not seeking help (decline the offer)
++        // and, if asked to contribute, contribute nothing.
++        WaitingFor::AssistChoosePlayer { .. } => {
++            Some(GameAction::ChooseAssistPlayer { player: None })
++        }
++        WaitingFor::AssistPayment { .. } => Some(GameAction::CommitAssistPayment { generic: 0 }),
++
+         // ChooseObjectsIntoTrackedSet: default to declining (empty selection).
+         WaitingFor::ChooseObjectsSelection { .. } => Some(GameAction::SelectTargets {
+             targets: Vec::new(),
+diff --git a/crates/server-core/src/game_action_payload_guard.rs b/crates/server-core/src/game_action_payload_guard.rs
+index f29c985d35..bedb87fede 100644
+--- a/crates/server-core/src/game_action_payload_guard.rs
++++ b/crates/server-core/src/game_action_payload_guard.rs
+@@ -351,6 +351,8 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
+         | GameAction::ChooseUntap { .. }
+         | GameAction::ChooseExert { .. }
+         | GameAction::ChooseClashOpponent { .. }
++        | GameAction::ChooseAssistPlayer { .. }
++        | GameAction::CommitAssistPayment { .. }
+         | GameAction::MulliganDecision { .. }
+         | GameAction::TapLandForMana { .. }
+         | GameAction::UntapLandForMana { .. }

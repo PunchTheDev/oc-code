@@ -1,0 +1,858 @@
+diff --git a/crates/engine/src/analysis/ability_graph.rs b/crates/engine/src/analysis/ability_graph.rs
+index 10b9ee81c9..c113a42740 100644
+--- a/crates/engine/src/analysis/ability_graph.rs
++++ b/crates/engine/src/analysis/ability_graph.rs
+@@ -921,6 +921,7 @@ fn effect_projection(effect: &Effect) -> Projection {
+         | Effect::ExileResolvingSpellInsteadOfGraveyard
+         | Effect::PreventDamage { .. }
+         | Effect::CreateDamageReplacement { .. }
++        | Effect::CreateDrawReplacement { .. }
+         | Effect::LoseTheGame { .. }
+         | Effect::WinTheGame { .. }
+         | Effect::RollDie { .. }
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index 2c5060ce0f..d7f13ab025 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -2745,6 +2745,12 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
+                 d.push(("recipient_object_filter".into(), fmt_target(f)));
+             }
+         }
++        Effect::CreateDrawReplacement { replacement_effect } => {
++            d.push((
++                "replacement_effect".into(),
++                crate::types::ability::effect_variant_name(replacement_effect).to_string(),
++            ));
++        }
+         Effect::ChooseFromZone { count, zone, .. } => {
+             d.push(("count".into(), count.to_string()));
+             d.push(("zone".into(), fmt_zone(zone)));
+diff --git a/crates/engine/src/game/effects/create_draw_replacement.rs b/crates/engine/src/game/effects/create_draw_replacement.rs
+new file mode 100644
+index 0000000000..3c599271fa
+--- /dev/null
++++ b/crates/engine/src/game/effects/create_draw_replacement.rs
+@@ -0,0 +1,360 @@
++use crate::types::ability::{
++    Effect, EffectError, EffectKind, ReplacementDefinition, ReplacementPlayerScope,
++    ResolvedAbility, RestrictionExpiry,
++};
++use crate::types::events::GameEvent;
++use crate::types::game_state::GameState;
++use crate::types::replacements::ReplacementEvent;
++
++/// CR 614.1a + CR 614.6 + CR 514.2 + CR 121.1: Resolve
++/// `Effect::CreateDrawReplacement` — install a one-shot, this-turn "the next
++/// time you would draw a card this turn, [effect] instead" draw replacement
++/// (Words of Worship: gain 5 life; Words of Wilding: create a 2/2 Bear token).
++///
++/// Mirrors `create_damage_replacement::resolve` for the `Draw` event class: it
++/// builds a `ReplacementDefinition` for `ReplacementEvent::Draw` whose
++/// substitute is carried in `runtime_execute` (a `ResolvedAbility`, so the
++/// heterogeneous payload Effect resolves through the post-replacement
++/// continuation drain in `draw_through_replacement`). The shield is one-shot
++/// (`consume_on_apply`, CR 614.6) and dropped at end-of-turn cleanup
++/// (`expiry: EndOfTurn`, CR 514.2).
++///
++/// Player scope: anchored at resolution time via `source_controller` +
++/// `valid_player: You` so "you would draw" follows the activating player even
++/// if the Words permanent leaves or changes controller before the draw (CR
++/// 113.7a / CR 611.2a). NOTE: `valid_card` is deliberately NOT set: a
++/// `ProposedEvent::Draw` has no `affected_object_id`, so a `valid_card:
++/// SelfRef` gate would never match.
++///
++/// The shield lives in `pending_damage_replacements` under the sentinel
++/// `ObjectId(0)` (same game-state pending slot used for resolution-time damage
++/// shields) so it survives source zone changes.
++pub fn resolve(
++    state: &mut GameState,
++    ability: &ResolvedAbility,
++    events: &mut Vec<GameEvent>,
++) -> Result<(), EffectError> {
++    let Effect::CreateDrawReplacement { replacement_effect } = &ability.effect else {
++        return Err(EffectError::InvalidParam(
++            "expected CreateDrawReplacement effect".to_string(),
++        ));
++    };
++
++    // CR 614.6: the substitute that runs once in place of the replaced draw.
++    // Capture it as a `ResolvedAbility` so the post-replacement continuation
++    // drain (`apply_post_replacement_resolved_effect`) dispatches it directly
++    // with the source/controller bound at install time (CR 121.1).
++    let substitute = ResolvedAbility::new(
++        (**replacement_effect).clone(),
++        vec![],
++        ability.source_id,
++        ability.controller,
++    );
++
++    // CR 614.1a + CR 113.7a: anchor the installing controller at resolution
++    // time so the shield outlives the source permanent's zone/controller.
++    let mut shield = ReplacementDefinition::new(ReplacementEvent::Draw);
++    shield.runtime_execute = Some(Box::new(substitute));
++    shield.consume_on_apply = true; // CR 614.6: one-shot ("the next time").
++    shield.expiry = Some(RestrictionExpiry::EndOfTurn); // CR 514.2: "this turn".
++    shield.source_controller = Some(ability.controller);
++    shield.valid_player = Some(ReplacementPlayerScope::You);
++
++    state.pending_damage_replacements.push(shield);
++
++    events.push(GameEvent::EffectResolved {
++        kind: EffectKind::CreateDrawReplacement,
++        source_id: ability.source_id,
++    });
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::game::scenario::{GameScenario, P0, P1};
++    use crate::types::ability::{QuantityExpr, TargetFilter};
++    use crate::types::card_type::CoreType;
++    use crate::types::identifiers::ObjectId;
++    use crate::types::player::PlayerId;
++    use crate::types::zones::Zone;
++
++    /// A bare `Draw 1` for the given player, hosted on `source`.
++    fn draw_one_for(player: PlayerId, source: ObjectId) -> ResolvedAbility {
++        ResolvedAbility::new(
++            Effect::Draw {
++                count: QuantityExpr::Fixed { value: 1 },
++                target: TargetFilter::Player,
++            },
++            vec![crate::types::ability::TargetRef::Player(player)],
++            source,
++            player,
++        )
++    }
++
++    fn gain_five_replacement(source: ObjectId, controller: PlayerId) -> ResolvedAbility {
++        ResolvedAbility::new(
++            Effect::CreateDrawReplacement {
++                replacement_effect: Box::new(Effect::GainLife {
++                    amount: QuantityExpr::Fixed { value: 5 },
++                    player: TargetFilter::Controller,
++                }),
++            },
++            vec![],
++            source,
++            controller,
++        )
++    }
++
++    /// Words of Worship, end-to-end: install the draw replacement, then run a
++    /// real draw for the controller. DISCRIMINATING: the card is NOT drawn
++    /// (hand unchanged) AND the controller gains 5 life AND the shield is
++    /// consumed. Reverting the EDIT-3 pre-zero fix makes the card ALSO get
++    /// drawn (hand +1) — this test fails. Reverting the variant makes the
++    /// effect Unimplemented — the card is drawn and no life gained — also fails.
++    #[test]
++    fn worship_next_draw_gains_life_no_card_drawn() {
++        let mut sc = GameScenario::new();
++        let source = sc.add_creature(P0, "Words of Worship", 0, 0).id();
++        let _top = sc.add_card_to_library_top(P0, "Mountain");
++        let mut state = sc.state;
++        let start_life = state.players[0].life;
++        let start_hand = state.players[0].hand.len();
++
++        let mut events = Vec::new();
++        resolve(&mut state, &gain_five_replacement(source, P0), &mut events).unwrap();
++        assert_eq!(
++            state.pending_damage_replacements.len(),
++            1,
++            "the draw-replacement shield must be installed in pending game state"
++        );
++        assert!(
++            state.objects[&source].replacement_definitions.is_empty(),
++            "shield must not depend on the source permanent staying on the battlefield"
++        );
++
++        let mut events = Vec::new();
++        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P0, source), &mut events)
++            .unwrap();
++
++        assert_eq!(
++            state.players[0].hand.len(),
++            start_hand,
++            "CR 614.6: the draw is replaced — no card is drawn"
++        );
++        assert_eq!(
++            state.players[0].life,
++            start_life + 5,
++            "the substitute (gain 5 life) must run in place of the draw"
++        );
++        assert!(
++            state.pending_damage_replacements[0].is_consumed,
++            "CR 614.6: the one-shot shield is consumed after firing"
++        );
++    }
++
++    /// CR 614.6: the shield is one-shot. A second draw the same turn is normal.
++    #[test]
++    fn one_shot_consumed_second_draw_is_normal() {
++        let mut sc = GameScenario::new();
++        let source = sc.add_creature(P0, "Words of Worship", 0, 0).id();
++        let first = sc.add_card_to_library_top(P0, "Mountain");
++        let second = sc.add_card_to_library_top(P0, "Forest");
++        let mut state = sc.state;
++
++        let mut events = Vec::new();
++        resolve(&mut state, &gain_five_replacement(source, P0), &mut events).unwrap();
++
++        // First draw: replaced (no card). `second` is on top now.
++        let mut events = Vec::new();
++        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P0, source), &mut events)
++            .unwrap();
++        assert!(!state.players[0].hand.contains(&second));
++
++        // Second draw: normal — top card lands in hand.
++        let mut events = Vec::new();
++        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P0, source), &mut events)
++            .unwrap();
++        assert!(
++            state.players[0].hand.contains(&second),
++            "the second draw this turn is unaffected by the consumed one-shot shield"
++        );
++        let _ = first;
++    }
++
++    /// CR 514.2: the shield expires at end-of-turn cleanup if unused; a draw on
++    /// the following turn is normal.
++    #[test]
++    fn expires_at_end_of_turn_if_unused() {
++        let mut sc = GameScenario::new();
++        let source = sc.add_creature(P0, "Words of Worship", 0, 0).id();
++        let top = sc.add_card_to_library_top(P0, "Mountain");
++        let mut state = sc.state;
++
++        let mut events = Vec::new();
++        resolve(&mut state, &gain_five_replacement(source, P0), &mut events).unwrap();
++        assert_eq!(state.pending_damage_replacements.len(), 1);
++
++        let mut cleanup_events = Vec::new();
++        crate::game::turns::execute_cleanup(&mut state, &mut cleanup_events);
++        assert!(
++            state.pending_damage_replacements.is_empty(),
++            "CR 514.2: the 'this turn' shield is dropped at end-of-turn cleanup"
++        );
++
++        let mut events = Vec::new();
++        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P0, source), &mut events)
++            .unwrap();
++        assert!(
++            state.players[0].hand.contains(&top),
++            "after the shield expires, the next-turn draw is normal"
++        );
++    }
++
++    /// Words of Wilding: payload is a Token. DISCRIMINATING: a 2/2 Bear enters
++    /// the battlefield and no card is drawn.
++    #[test]
++    fn wilding_creates_bear_instead() {
++        use crate::parser::oracle_effect::parse_effect;
++        let mut sc = GameScenario::new();
++        let source = sc.add_creature(P0, "Words of Wilding", 0, 0).id();
++        let _top = sc.add_card_to_library_top(P0, "Mountain");
++        let mut state = sc.state;
++        let start_hand = state.players[0].hand.len();
++        let bf_before = state
++            .objects
++            .values()
++            .filter(|o| o.zone == Zone::Battlefield && o.controller == P0)
++            .count();
++
++        let token_payload = parse_effect("create a 2/2 green Bear creature token");
++        assert!(
++            matches!(token_payload, Effect::Token { .. }),
++            "Wilding payload must parse to a Token effect, got {token_payload:?}"
++        );
++        let install = ResolvedAbility::new(
++            Effect::CreateDrawReplacement {
++                replacement_effect: Box::new(token_payload),
++            },
++            vec![],
++            source,
++            P0,
++        );
++
++        let mut events = Vec::new();
++        resolve(&mut state, &install, &mut events).unwrap();
++
++        let mut events = Vec::new();
++        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P0, source), &mut events)
++            .unwrap();
++
++        assert_eq!(
++            state.players[0].hand.len(),
++            start_hand,
++            "the draw is replaced by token creation — no card drawn"
++        );
++        let bears = state
++            .objects
++            .values()
++            .filter(|o| {
++                o.zone == Zone::Battlefield
++                    && o.controller == P0
++                    && o.card_types.core_types.contains(&CoreType::Creature)
++                    && o.card_types
++                        .subtypes
++                        .iter()
++                        .any(|s| s.eq_ignore_ascii_case("Bear"))
++            })
++            .count();
++        assert_eq!(bears, 1, "a 2/2 Bear token must be created instead");
++        let bf_after = state
++            .objects
++            .values()
++            .filter(|o| o.zone == Zone::Battlefield && o.controller == P0)
++            .count();
++        assert_eq!(
++            bf_after,
++            bf_before + 1,
++            "exactly one new permanent (the Bear)"
++        );
++    }
++
++    /// Source-player scope: the shield ("you would draw") does NOT replace an
++    /// opponent's draw this turn.
++    #[test]
++    fn does_not_affect_opponent_draw() {
++        let mut sc = GameScenario::new();
++        let source = sc.add_creature(P0, "Words of Worship", 0, 0).id();
++        let opp_top = sc.add_card_to_library_top(P1, "Island");
++        let mut state = sc.state;
++        let opp_start_life = state.players[1].life;
++
++        let mut events = Vec::new();
++        resolve(&mut state, &gain_five_replacement(source, P0), &mut events).unwrap();
++
++        let mut events = Vec::new();
++        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P1, source), &mut events)
++            .unwrap();
++
++        assert!(
++            state.players[1].hand.contains(&opp_top),
++            "the opponent's draw is unaffected — 'you would draw' is source-player scoped"
++        );
++        assert_eq!(
++            state.players[1].life, opp_start_life,
++            "the opponent does not gain the controller's substitute life"
++        );
++    }
++
++    /// CR 113.7a: the one-shot replacement survives the source leaving the
++    /// battlefield before the draw fires.
++    #[test]
++    fn survives_source_leaving_before_draw() {
++        let mut sc = GameScenario::new();
++        let source = sc.add_creature(P0, "Words of Worship", 0, 0).id();
++        let _top = sc.add_card_to_library_top(P0, "Mountain");
++        let mut state = sc.state;
++        let start_life = state.players[0].life;
++        let start_hand = state.players[0].hand.len();
++
++        let mut events = Vec::new();
++        resolve(&mut state, &gain_five_replacement(source, P0), &mut events).unwrap();
++        state.objects.get_mut(&source).unwrap().zone = Zone::Graveyard;
++
++        let mut events = Vec::new();
++        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P0, source), &mut events)
++            .unwrap();
++
++        assert_eq!(state.players[0].hand.len(), start_hand);
++        assert_eq!(state.players[0].life, start_life + 5);
++    }
++
++    /// CR 611.2a: the replacement stays scoped to the activating player even if
++    /// the source permanent changes controller before the draw.
++    #[test]
++    fn stays_scoped_to_activating_player_after_control_change() {
++        let mut sc = GameScenario::new();
++        let source = sc.add_creature(P0, "Words of Worship", 0, 0).id();
++        let p0_top = sc.add_card_to_library_top(P0, "Mountain");
++        let p1_top = sc.add_card_to_library_top(P1, "Island");
++        let mut state = sc.state;
++        let p0_start_life = state.players[0].life;
++
++        let mut events = Vec::new();
++        resolve(&mut state, &gain_five_replacement(source, P0), &mut events).unwrap();
++        state.objects.get_mut(&source).unwrap().controller = P1;
++
++        // P0's draw is still replaced (P0 activated the ability).
++        let mut events = Vec::new();
++        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P0, source), &mut events)
++            .unwrap();
++        assert!(!state.players[0].hand.contains(&p0_top));
++        assert_eq!(state.players[0].life, p0_start_life + 5);
++
++        // P1's draw is unaffected even though they now control the source.
++        let mut events = Vec::new();
++        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P1, source), &mut events)
++            .unwrap();
++        assert!(state.players[1].hand.contains(&p1_top));
++    }
++}
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index 9468908a12..44c77f9e24 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -66,6 +66,7 @@ pub mod copy_token_blocking;
+ pub mod counter;
+ pub mod counters;
+ pub mod create_damage_replacement;
++pub mod create_draw_replacement;
+ pub mod create_emblem;
+ pub mod create_token_copy_from_pool;
+ pub mod deal_damage;
+@@ -2939,6 +2940,9 @@ pub fn resolve_effect(
+         Effect::CreateDamageReplacement { .. } => {
+             create_damage_replacement::resolve(state, ability, events)
+         }
++        Effect::CreateDrawReplacement { .. } => {
++            create_draw_replacement::resolve(state, ability, events)
++        }
+         Effect::LoseTheGame { .. } => win_lose::resolve_lose(state, ability, events),
+         Effect::WinTheGame { .. } => win_lose::resolve_win(state, ability, events),
+         Effect::RollDie { .. } => roll_die::resolve(state, ability, events),
+diff --git a/crates/engine/src/game/printed_cards.rs b/crates/engine/src/game/printed_cards.rs
+index ebed2fbfda..b9274ec692 100644
+--- a/crates/engine/src/game/printed_cards.rs
++++ b/crates/engine/src/game/printed_cards.rs
+@@ -820,6 +820,12 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
+     match effect {
+         Effect::Intensify { .. } => {}
+         Effect::ApplyPerpetual { .. } => {}
++        // CR 614.11: A one-shot draw replacement nests its substitute Effect
++        // (Words of Worship/Wilding). Walk it so any conjure name it carries is
++        // surfaced (GainLife/Token carry none today, but it is a nested carrier).
++        Effect::CreateDrawReplacement { replacement_effect } => {
++            walk_effect(replacement_effect, out)
++        }
+         // Heist exiles a card from an opponent's library at random; it does not
+         // name a conjure card, so there is no static face to preload.
+         Effect::Heist { .. } | Effect::HeistExile => {}
+@@ -2982,6 +2988,22 @@ mod tests {
+         };
+         face.replacements.push(repl_optional);
+ 
++        // CR 614.11: CreateDrawReplacement nests its substitute Effect; the
++        // walker must descend into it (Words of Worship/Wilding class).
++        let draw_repl = Effect::CreateDrawReplacement {
++            replacement_effect: Box::new(Effect::Conjure {
++                cards: vec![ConjureCard {
++                    source: ConjureSource::Named {
++                        name: "draw_replacement".to_string(),
++                    },
++                    count: QuantityExpr::Fixed { value: 1 },
++                }],
++                destination: Zone::Hand,
++                tapped: false,
++            }),
++        };
++        walk_effect(&draw_repl, &mut names);
++
+         collect_conjure_names_from_face(&face, &mut names);
+ 
+         let expected = [
+@@ -3012,6 +3034,7 @@ mod tests {
+             "counter_source_static",
+             "unless_pay_ability",
+             "unless_pay_trigger",
++            "draw_replacement",
+         ];
+         for name in expected {
+             assert!(
+diff --git a/crates/engine/src/game/replacement.rs b/crates/engine/src/game/replacement.rs
+index dbc89d9eb8..5dfdd37f97 100644
+--- a/crates/engine/src/game/replacement.rs
++++ b/crates/engine/src/game/replacement.rs
+@@ -4866,6 +4866,25 @@ pub fn find_applicable_replacements(
+                     // it).
+                     let source_controller =
+                         repl_def.source_controller.unwrap_or(state.active_player);
++                    // CR 614.1a: Draw replacements hosted in pending state
++                    // (Words of Worship/Wilding) scope by the installing player
++                    // captured at resolution, not the source permanent's live
++                    // controller.
++                    if let ProposedEvent::Draw { player_id, .. } = event {
++                        let player_ok = match &repl_def.valid_player {
++                            Some(crate::types::ability::ReplacementPlayerScope::Opponent) => {
++                                *player_id != source_controller
++                            }
++                            Some(crate::types::ability::ReplacementPlayerScope::You) => {
++                                *player_id == source_controller
++                            }
++                            Some(crate::types::ability::ReplacementPlayerScope::AnyPlayer) => true,
++                            None => *player_id == source_controller,
++                        };
++                        if !player_ok {
++                            continue;
++                        }
++                    }
+                     if !apply_state_level_gates(
+                         repl_def,
+                         event,
+@@ -5502,14 +5521,28 @@ fn apply_single_replacement(
+             // the accept-side AST. The `draw_replacement_count` guard preserves
+             // the count-modifier path (Alhammarret's Archive: count -> 2*count).
+             if matches!(proposed, ProposedEvent::Draw { .. }) {
+-                if let Some(def) = ability {
+-                    let is_non_draw_substitute = !matches!(*def.effect, Effect::Draw { .. })
+-                        && !EventModifiers::has_only_event_modifier(Some(def))
+-                        && draw_replacement_count(state, rid, &proposed).is_none();
+-                    if is_non_draw_substitute {
+-                        if let ProposedEvent::Draw { count, .. } = &mut proposed {
+-                            *count = 0;
+-                        }
++                // CR 614.6 + CR 614.11: A one-shot draw replacement
++                // (Words of Worship/Wilding) carries its substitute in
++                // `runtime_execute` (`execute` is `None`), so the `ability`
++                // binding above is `None`. Inspect that slot too — a non-Draw,
++                // non-event-modifier substitute (GainLife / Token) must still
++                // pre-zero the draw, or the card is drawn AND the substitute
++                // runs (double). Damage/Jace/Abundance use `execute`, so
++                // `ability` is `Some` and this `runtime` branch never engages.
++                let is_non_draw_substitute = match ability {
++                    Some(def) => {
++                        !matches!(*def.effect, Effect::Draw { .. })
++                            && !EventModifiers::has_only_event_modifier(Some(def))
++                            && draw_replacement_count(state, rid, &proposed).is_none()
++                    }
++                    None => repl_def.runtime_execute.as_deref().is_some_and(|runtime| {
++                        !matches!(runtime.effect, Effect::Draw { .. })
++                            && !EventModifiers::is_event_modifier_effect(&runtime.effect)
++                    }),
++                };
++                if is_non_draw_substitute {
++                    if let ProposedEvent::Draw { count, .. } = &mut proposed {
++                        *count = 0;
+                     }
+                 }
+             }
+diff --git a/crates/engine/src/game/trigger_index.rs b/crates/engine/src/game/trigger_index.rs
+index 9fc8ab6b06..5635cf936e 100644
+--- a/crates/engine/src/game/trigger_index.rs
++++ b/crates/engine/src/game/trigger_index.rs
+@@ -812,6 +812,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
+         | EffectKind::ExileResolvingSpellInsteadOfGraveyard
+         | EffectKind::PreventDamage
+         | EffectKind::CreateDamageReplacement
++        | EffectKind::CreateDrawReplacement
+         | EffectKind::Regenerate
+         | EffectKind::RemoveAllDamage
+         | EffectKind::LoseTheGame
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index 847d2801ae..e213b44568 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -7504,6 +7504,15 @@ pub(super) fn parse_imperative_family_ast(
+         };
+     }
+ 
++    // CR 614.11 + CR 614.6: One-shot "the next time you would draw a card this
++    // turn, [effect] instead" delayed DRAW replacement (Words of Worship/
++    // Wilding). Also begins with "the next time", so intercepted here before the
++    // first-word verb dispatch. The detector is the prefix combinator inside
++    // `parse_oneshot_draw_replacement`; on failure it returns `None`.
++    if let Some(effect) = crate::parser::oracle_replacement::parse_oneshot_draw_replacement(lower) {
++        return Some(ImperativeFamilyAst::GainKeyword(effect));
++    }
++
+     // NOTE: when adding verbs here, also add them to IMPERATIVE_EXTRA_VERBS
+     // in game/gap_analysis.rs so the parser gap analyzer can classify them.
+     match first_word {
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 64bf140a1c..b493bf976f 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -4645,6 +4645,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
+         | Effect::ExileResolvingSpellInsteadOfGraveyard
+         | Effect::PreventDamage { .. }
+         | Effect::CreateDamageReplacement { .. }
++        | Effect::CreateDrawReplacement { .. }
+         | Effect::LoseTheGame { .. }
+         | Effect::WinTheGame { .. }
+         | Effect::RollDie { .. }
+diff --git a/crates/engine/src/parser/oracle_replacement.rs b/crates/engine/src/parser/oracle_replacement.rs
+index f5d07f80d7..98c5fb182c 100644
+--- a/crates/engine/src/parser/oracle_replacement.rs
++++ b/crates/engine/src/parser/oracle_replacement.rs
+@@ -4465,6 +4465,76 @@ pub(crate) fn parse_oneshot_damage_replacement(norm_lower: &str) -> Option<Effec
+     None
+ }
+ 
++/// CR 614.11 + CR 614.6 + CR 514.2: Parse a one-shot delayed DRAW replacement —
++/// "the next time you would draw a card this turn, [effect] instead" (Words of
++/// Worship: "you gain 5 life"; Words of Wilding: "create a 2/2 green Bear
++/// creature token"). Mirrors `parse_oneshot_damage_replacement` for the Draw
++/// event class, lowering to `Effect::CreateDrawReplacement { replacement_effect }`.
++///
++/// The detector IS the parser: the branch is gated by the `tag("the next time ")`
++/// prefix combinator + a `peek` for "would draw"; it returns `None` on any
++/// mismatch so it never shadows other "the next time" effects.
++///
++/// SCOPE: the substitute payload is parsed by the generic `parse_effect`, which
++/// does NOT honor a player-scoped subject ("each player", "each opponent", "that
++/// player"). Words of Wind ("each player returns a permanent...") and Words of
++/// Waste ("each opponent discards...") would mis-lower to a `Controller`-scoped
++/// effect, so those subject-scoped payloads are REJECTED here (return `None`) to
++/// stay an honest Unimplemented gap rather than a silently-wrong parse.
++pub(crate) fn parse_oneshot_draw_replacement(norm_lower: &str) -> Option<Effect> {
++    // CR 614.1a: "the next time ... would draw ... this turn ... instead".
++    let (after_prefix, _) = preceded(
++        tag::<_, _, OracleError<'_>>("the next time "),
++        peek(take_until::<_, _, OracleError<'_>>("would draw")),
++    )
++    .parse(norm_lower)
++    .ok()?;
++    if !nom_primitives::scan_contains(after_prefix, "would draw")
++        || !nom_primitives::scan_contains(after_prefix, "this turn")
++        || !nom_primitives::scan_contains(after_prefix, "instead")
++    {
++        return None;
++    }
++
++    // CR 614.6: isolate the substitute payload — the clause after "this turn,"
++    // up to (and excluding) the trailing "instead". Split with the shared nom
++    // combinator, never byte math.
++    let (_, (_, after_turn)) = nom_primitives::split_once_on(after_prefix, "this turn").ok()?;
++    let payload_text = after_turn.trim_start_matches([',', ' ']);
++    // Drop the trailing "instead" so the payload parser sees only the effect.
++    let payload_text = match nom_primitives::split_once_on(payload_text, "instead") {
++        Ok((_, (before, _))) => before,
++        Err(_) => payload_text,
++    }
++    .trim();
++
++    let payload = crate::parser::oracle_effect::parse_effect(payload_text);
++    // Honest-gap guard 1: an Unimplemented payload is not a clean replacement.
++    if matches!(payload, Effect::Unimplemented { .. }) {
++        return None;
++    }
++    // Honest-gap guard 2: player-scoped subjects ("each player", "each
++    // opponent", "that player", "target player/opponent") are NOT honored by
++    // bare `parse_effect` (it would emit a Controller-scoped effect, dropping
++    // the scope). Reject so Words of Wind/Waste stay honest Unimplemented gaps
++    // rather than silently-wrong parses. This is a leaf reject-check on the
++    // already-split payload, not dispatch.
++    if payload_text.starts_with("each ") // allow-noncombinator: leaf reject-guard on split payload
++        || payload_text.starts_with("target player") // allow-noncombinator
++        || payload_text.starts_with("target opponent") // allow-noncombinator
++        || payload_text.starts_with("that player") // allow-noncombinator
++        || payload_text.starts_with("each opponent") // allow-noncombinator
++        || payload_text.starts_with("each player")
++    // allow-noncombinator
++    {
++        return None;
++    }
++
++    Some(Effect::CreateDrawReplacement {
++        replacement_effect: Box::new(payload),
++    })
++}
++
+ /// CR 614.9 + CR 614.5: Parse the en-Kor cycle's one-shot redirection —
+ /// "the next N damage that would be dealt to ~ this turn is dealt to target
+ /// creature you control instead" (Nomads / Lancers / Outrider / Shaman / Spirit
+@@ -15198,11 +15268,95 @@ mod snapshot_tests {
+ 
+     #[test]
+     fn oneshot_rejects_unrelated_next_time_text() {
+-        // "the next time you draw" must not be hijacked by the damage parser.
++        // A draw-form "the next time" must not be hijacked by the DAMAGE parser
++        // (it has no "would deal" spine) — the draw parser claims it instead.
+         assert!(parse_oneshot_damage_replacement(
+             "the next time you would draw a card this turn, draw two cards instead"
+         )
+         .is_none());
++        // A genuinely-unrelated "the next time" (not draw, not damage) parses to
++        // neither one-shot replacement.
++        assert!(parse_oneshot_damage_replacement(
++            "the next time you would gain life this turn, you gain twice that much instead"
++        )
++        .is_none());
++        assert!(parse_oneshot_draw_replacement(
++            "the next time you would gain life this turn, you gain twice that much instead"
++        )
++        .is_none());
++    }
++
++    #[test]
++    fn oneshot_draw_replacement_worship_gains_life() {
++        // Words of Worship: "The next time you would draw a card this turn, you
++        // gain 5 life instead."
++        let effect = parse_oneshot_draw_replacement(
++            "the next time you would draw a card this turn, you gain 5 life instead",
++        )
++        .expect("Words of Worship draw replacement must parse");
++        match effect {
++            Effect::CreateDrawReplacement { replacement_effect } => {
++                assert!(
++                    matches!(*replacement_effect, Effect::GainLife { .. }),
++                    "payload must be GainLife, got {replacement_effect:?}"
++                );
++            }
++            other => panic!("expected CreateDrawReplacement, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn oneshot_draw_replacement_routes_through_parse_effect() {
++        // End-to-end through the imperative dispatch: the activated-ability body
++        // (after "{1}:") for Words of Worship routes to CreateDrawReplacement.
++        let effect = crate::parser::oracle_effect::parse_effect(
++            "the next time you would draw a card this turn, you gain 5 life instead",
++        );
++        assert!(
++            matches!(effect, Effect::CreateDrawReplacement { .. }),
++            "the imperative dispatch must route the draw form, got {effect:?}"
++        );
++    }
++
++    #[test]
++    fn oneshot_draw_replacement_wilding_creates_token() {
++        // Words of Wilding: "The next time you would draw a card this turn,
++        // create a 2/2 green Bear creature token instead."
++        let effect = parse_oneshot_draw_replacement(
++            "the next time you would draw a card this turn, create a 2/2 green bear creature token instead",
++        )
++        .expect("Words of Wilding draw replacement must parse");
++        match effect {
++            Effect::CreateDrawReplacement { replacement_effect } => {
++                assert!(
++                    matches!(*replacement_effect, Effect::Token { .. }),
++                    "payload must be a Token, got {replacement_effect:?}"
++                );
++            }
++            other => panic!("expected CreateDrawReplacement, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn oneshot_draw_replacement_rejects_player_scoped_payload() {
++        // GUARD: Words of Wind ("each player returns a permanent...") and Words
++        // of Waste ("each opponent discards...") have player-scoped payloads
++        // that bare `parse_effect` mis-scopes — they must stay HONEST
++        // Unimplemented gaps (return None), NOT silently-wrong CreateDrawReplacement.
++        assert!(
++            parse_oneshot_draw_replacement(
++                "the next time you would draw a card this turn, each player returns a permanent they control to its owner's hand instead"
++            )
++            .is_none(),
++            "Words of Wind (each-player payload) must remain an honest gap"
++        );
++        assert!(
++            parse_oneshot_draw_replacement(
++                "the next time you would draw a card this turn, each opponent discards a card instead"
++            )
++            .is_none(),
++            "Words of Waste (each-opponent payload) must remain an honest gap"
++        );
+     }
+ 
+     #[test]
+diff --git a/crates/engine/src/parser/swallow_check.rs b/crates/engine/src/parser/swallow_check.rs
+index 94d96a8fdb..557991bcb2 100644
+--- a/crates/engine/src/parser/swallow_check.rs
++++ b/crates/engine/src/parser/swallow_check.rs
+@@ -2592,6 +2592,12 @@ fn detect_duration_this_turn(
+         // to the one-shot effect (it expires at cleanup, CR 514.2), not a
+         // separate `duration` slot.
+         "CreateDamageReplacement",
++        // CR 614.11 + CR 514.2: `CreateDrawReplacement` is the one-shot draw
++        // replacement for "the next time you would draw a card this turn,
++        // [effect] instead" (Words of Worship/Wilding). Its "this turn" lifetime
++        // is inherent to the one-shot effect (expires at cleanup), not a
++        // separate `duration` slot — same as `CreateDamageReplacement` above.
++        "CreateDrawReplacement",
+         "AddTargetReplacement",
+         // CR 603.7c: A `CreateDelayedTrigger` with `WhenNextEvent` condition
+         // IS the "next [event] this turn" delayed-trigger scope (Chandra,
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index c8c4767b19..c437d0d48d 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -9654,6 +9654,14 @@ pub enum Effect {
+         #[serde(default, skip_serializing_if = "Option::is_none")]
+         recipient_object_filter: Option<TargetFilter>,
+     },
++    /// CR 614.1a + CR 614.6 + CR 514.2 + CR 121.1: install a one-shot, this-turn
++    /// "the next time you would draw a card this turn, [effect] instead" draw
++    /// replacement (Words of Worship/Wilding). Mirrors CreateDamageReplacement for
++    /// the Draw event class; the substitute is a heterogeneous Effect resolved via
++    /// the post-replacement continuation. RUNTIME: create_draw_replacement::resolve.
++    CreateDrawReplacement {
++        replacement_effect: Box<Effect>,
++    },
+     /// CR 104.3e: An effect may state that a player loses the game.
+     ///
+     /// `target` names the player who loses the game when the effect resolves:
+@@ -11854,7 +11862,10 @@ impl Effect {
+             // CR 702.50a: EpicCopy carries its targets inside the snapshotted
+             // spell ability, not in a top-level `target` field.
+             | Effect::EpicCopy { .. }
+-            | Effect::CreateDamageReplacement { .. } => None,
++            | Effect::CreateDamageReplacement { .. }
++            // CR 614.11: CreateDrawReplacement is non-targeted — "you would
++            // draw" scopes via the shield's source-player default, no slot.
++            | Effect::CreateDrawReplacement { .. } => None,
+             // CR 115.1: RevealUntil with a non-context player filter ("target
+             // opponent reveals...") requires a stack-time player target slot.
+             Effect::RevealUntil { player, .. } => {
+@@ -12048,6 +12059,7 @@ impl Effect {
+             | Effect::Conjure { .. }
+             | Effect::CreateDamageReplacement { .. }
+             | Effect::CreateDelayedTrigger { .. }
++            | Effect::CreateDrawReplacement { .. }
+             | Effect::CreateEmblem { .. }
+             | Effect::Discover { .. }
+             | Effect::Heist { .. }
+@@ -12275,6 +12287,7 @@ impl Effect {
+             | Effect::Conjure { .. }
+             | Effect::CreateDamageReplacement { .. }
+             | Effect::CreateDelayedTrigger { .. }
++            | Effect::CreateDrawReplacement { .. }
+             | Effect::CreateEmblem { .. }
+             | Effect::Discover { .. }
+             | Effect::Heist { .. }
+@@ -12465,6 +12478,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
+         Effect::ExileResolvingSpellInsteadOfGraveyard => "ExileResolvingSpellInsteadOfGraveyard",
+         Effect::PreventDamage { .. } => "PreventDamage",
+         Effect::CreateDamageReplacement { .. } => "CreateDamageReplacement",
++        Effect::CreateDrawReplacement { .. } => "CreateDrawReplacement",
+         Effect::LoseTheGame { .. } => "LoseTheGame",
+         Effect::WinTheGame { .. } => "WinTheGame",
+         Effect::RollDie { .. } => "RollDie",
+@@ -12689,6 +12703,7 @@ pub enum EffectKind {
+     ExileResolvingSpellInsteadOfGraveyard,
+     PreventDamage,
+     CreateDamageReplacement,
++    CreateDrawReplacement,
+     Regenerate,
+     RemoveAllDamage,
+     LoseTheGame,
+@@ -12930,6 +12945,7 @@ impl From<&Effect> for EffectKind {
+             }
+             Effect::PreventDamage { .. } => EffectKind::PreventDamage,
+             Effect::CreateDamageReplacement { .. } => EffectKind::CreateDamageReplacement,
++            Effect::CreateDrawReplacement { .. } => EffectKind::CreateDrawReplacement,
+             Effect::LoseTheGame { .. } => EffectKind::LoseTheGame,
+             Effect::WinTheGame { .. } => EffectKind::WinTheGame,
+             Effect::RollDie { .. } => EffectKind::RollDie,
+diff --git a/crates/phase-ai/src/policies/redundancy_avoidance.rs b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+index 025fd74e2c..9e9922f0df 100644
+--- a/crates/phase-ai/src/policies/redundancy_avoidance.rs
++++ b/crates/phase-ai/src/policies/redundancy_avoidance.rs
+@@ -587,6 +587,11 @@ fn redundancy_delta(
+         // later occurs — no static redundancy signal, same as the target
+         // replacement above.
+         | Effect::CreateDamageReplacement { .. }
++        // CR 614.11 + CR 614.6: CreateDrawReplacement installs a one-shot draw
++        // "shield" ("the next time you would draw a card this turn, [effect]
++        // instead"). Its value depends on whether a draw later occurs — no
++        // static redundancy signal, same as the damage replacement above.
++        | Effect::CreateDrawReplacement { .. }
+         // CR 614.12 + CR 303.4: ReturnAsAura installs an Aura conversion +
+         // attach pick. Its redundancy is the new Aura's grants vs. the
+         // existing static layer — out of scope for this policy.

@@ -1,0 +1,383 @@
+import { marked } from "marked";
+import sanitizeHtml from "sanitize-html";
+
+import { sameEntry } from "@/lib/entry-identity";
+import type { ContentEntry, DirectoryEntry } from "@/lib/content.server";
+
+export function stripCodeBlocks(markdown: string) {
+  const lines = String(markdown || "").split("\n");
+  const output: string[] = [];
+  let inCodeBlock = false;
+  let blankCount = 0;
+
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) continue;
+
+    if (!line.trim()) {
+      blankCount += 1;
+      if (blankCount <= 2) output.push("");
+      continue;
+    }
+
+    blankCount = 0;
+    output.push(line);
+  }
+
+  return output.join("\n").trim();
+}
+
+export async function renderMarkdown(markdown: string) {
+  const output = await marked.parse(markdown);
+  return sanitizeRenderedHtml(typeof output === "string" ? output : String(output));
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function sanitizeRenderedHtml(html: string) {
+  return sanitizeHtml(html, {
+    allowedTags: [
+      "a",
+      "blockquote",
+      "br",
+      "code",
+      "em",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "h5",
+      "h6",
+      "hr",
+      "img",
+      "li",
+      "ol",
+      "p",
+      "pre",
+      "strong",
+      "table",
+      "tbody",
+      "td",
+      "th",
+      "thead",
+      "tr",
+      "ul",
+    ],
+    allowedAttributes: {
+      "*": ["id"],
+      a: ["href", "title", "target", "rel"],
+      code: ["class"],
+      img: ["alt", "height", "src", "title", "width"],
+      th: ["align"],
+      td: ["align"],
+    },
+    allowedSchemes: ["http", "https", "mailto"],
+    allowedSchemesByTag: {
+      img: ["https"],
+    },
+    transformTags: {
+      a: (_tagName, attribs) => {
+        // Drop relative / scheme-less anchors. GFM autolinking turns bare paths in entry
+        // content (e.g. ".claude/hooks/foo.sh", "/utils/trpc") into site-relative links that
+        // Google then crawls as 404s. Real external URLs (http/https/mailto) stay linked.
+        const href = String(attribs.href ?? "");
+        if (!/^(https?:|mailto:)/i.test(href)) {
+          // Unwrap to a non-anchor (span is not in allowedTags, so sanitize-html drops the tag
+          // but keeps the text) — avoids leaving an orphaned, destination-less <a> in the DOM.
+          return { tagName: "span", attribs: {} };
+        }
+        return {
+          tagName: "a",
+          attribs: {
+            ...attribs,
+            rel: "nofollow noopener noreferrer",
+            target: "_blank",
+          },
+        };
+      },
+    },
+  });
+}
+
+export function htmlToPlainText(html: string) {
+  const text = sanitizeHtml(String(html || ""), {
+    allowedTags: [],
+    allowedAttributes: {},
+  });
+
+  let output = "";
+  let lastWasWhitespace = false;
+  for (const char of text.trim()) {
+    if (char === " " || char === "\n" || char === "\t" || char === "\r") {
+      if (!lastWasWhitespace) output += " ";
+      lastWasWhitespace = true;
+      continue;
+    }
+    output += char;
+    lastWasWhitespace = false;
+  }
+
+  return output.trim();
+}
+
+export function getPrimarySnippet(entry: ContentEntry) {
+  switch (entry.category) {
+    case "agents":
+    case "rules":
+      return {
+        title: "Copyable asset",
+        code: entry.body || entry.copySnippet || entry.usageSnippet,
+        language: "md",
+      };
+    case "hooks":
+      if (entry.configSnippet) {
+        return {
+          title: "Claude config",
+          code: entry.configSnippet,
+          language: "json",
+        };
+      }
+      return {
+        title: entry.scriptBody ? "Hook script" : "Usage",
+        code: entry.scriptBody || entry.copySnippet || entry.usageSnippet,
+        language: entry.scriptLanguage || "text",
+      };
+    case "mcp":
+    case "skills":
+    case "commands":
+      return {
+        title: entry.installCommand
+          ? "Install command"
+          : entry.commandSyntax
+            ? "Command syntax"
+            : "Usage",
+        code:
+          entry.installCommand || entry.commandSyntax || entry.copySnippet || entry.usageSnippet,
+        language: entry.scriptLanguage || "text",
+      };
+    case "statuslines":
+      return {
+        title: entry.configSnippet ? "Claude config" : entry.scriptBody ? "Source asset" : "Usage",
+        code: entry.configSnippet || entry.scriptBody || entry.copySnippet || entry.usageSnippet,
+        language: entry.configSnippet ? "json" : entry.scriptLanguage || "text",
+      };
+    case "collections":
+      return {
+        title: "Quick start",
+        code: entry.usageSnippet || entry.copySnippet || entry.body,
+        language: "text",
+      };
+    case "guides":
+      return {
+        title: "Quick summary",
+        code: entry.usageSnippet || entry.copySnippet || entry.body,
+        language: "text",
+      };
+    default:
+      return {
+        title: entry.copySnippet ? "Copyable asset" : "Usage",
+        code: entry.copySnippet || entry.usageSnippet || entry.body,
+        language: entry.scriptLanguage || "text",
+      };
+  }
+}
+
+export function getMetadataFallback(entry: ContentEntry) {
+  if (entry.category === "hooks") {
+    return {
+      title: "How to use this hook",
+      points: [
+        entry.trigger
+          ? `Register it under the \`${entry.trigger}\` hook event in your Claude Code configuration.`
+          : "Register it in your Claude Code hooks configuration.",
+        entry.documentationUrl
+          ? "Use the documentation link in the sidebar to confirm the event shape and required config."
+          : "Open the source file in GitHub to copy the exact implementation and adapt it to your project.",
+        "Keep the source file in your repo and test it locally before relying on it in production workflows.",
+      ],
+    };
+  }
+
+  if (entry.category === "collections") {
+    return {
+      title: "How to use this collection",
+      points: [
+        "Open the source file to review the assets included in the collection.",
+        "Pick the individual entries you want to use and add them to your Claude workflow one by one.",
+        "Collections need richer item metadata next, but the GitHub source still gives you the current canonical list.",
+      ],
+    };
+  }
+
+  if (entry.documentationUrl || entry.repoUrl) {
+    return {
+      title: "How to use this entry",
+      points: [
+        entry.documentationUrl
+          ? "Start with the documentation link in the sidebar for setup and usage details."
+          : "Open the repository in the sidebar for setup details.",
+        "Use the source link to inspect the exact file this directory entry was built from.",
+        "Copy the relevant snippet or config into your local Claude setup and test it before wider use.",
+      ],
+    };
+  }
+
+  return {
+    title: "How to use this entry",
+    points: [
+      "Open the GitHub source file in the sidebar.",
+      "Copy the content you need into your project or Claude configuration.",
+      "Test it locally and adapt it to your workflow before relying on it.",
+    ],
+  };
+}
+
+export function getDownloadHref(downloadUrl: string) {
+  if (downloadUrl.startsWith("/downloads/")) {
+    return `/api/download?asset=${encodeURIComponent(downloadUrl)}`;
+  }
+  return downloadUrl;
+}
+
+function hashString(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash << 5) - hash + value.charCodeAt(index);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+export function getRelatedEntries(entry: ContentEntry, allEntries: DirectoryEntry[]) {
+  const relatedPool = allEntries.filter((item) => !sameEntry(item, entry));
+  const entryTagSet = new Set((entry.tags ?? []).map((tag) => tag.toLowerCase()));
+  const anchorHash = hashString(`${entry.category}:${entry.slug}`);
+
+  return relatedPool
+    .map((item) => {
+      const sharedTagCount = (item.tags ?? []).reduce((count, tag) => {
+        return entryTagSet.has(tag.toLowerCase()) ? count + 1 : count;
+      }, 0);
+      const sameCategory = item.category === entry.category ? 1 : 0;
+      const hasDocs = item.documentationUrl ? 1 : 0;
+      const hasInstall = item.installCommand ? 1 : 0;
+      const dateScore = item.dateAdded ? new Date(item.dateAdded).getTime() : 0;
+      const closeness = Math.abs(hashString(`${item.category}:${item.slug}`) - anchorHash);
+
+      return {
+        item,
+        score: sharedTagCount * 8 + sameCategory * 3 + hasDocs + hasInstall,
+        dateScore,
+        closeness,
+      };
+    })
+    .sort((left, right) => {
+      if (right.score !== left.score) return right.score - left.score;
+      if (right.dateScore !== left.dateScore) return right.dateScore - left.dateScore;
+      return left.closeness - right.closeness;
+    })
+    .slice(0, 2)
+    .map((item) => item.item);
+}
+
+export function getCollectionItems(entry: ContentEntry, allEntries: DirectoryEntry[]) {
+  if (entry.category !== "collections" || !Array.isArray(entry.items)) return [];
+
+  return entry.items
+    .map((item) => {
+      const ref =
+        typeof item === "string"
+          ? item
+          : `${String(item.category || "")}/${String(item.slug || "")}`;
+      const [category, slug] = ref.split("/");
+      return {
+        category,
+        slug,
+        ref,
+        target:
+          allEntries.find(
+            (candidate) => candidate.category === category && candidate.slug === slug,
+          ) ?? null,
+      };
+    })
+    .filter((item) => item.target);
+}
+
+export function getTopFacts(entry: ContentEntry) {
+  const facts = [
+    entry.author ? { label: "Author", value: entry.author } : null,
+    entry.dateAdded ? { label: "Added", value: entry.dateAdded } : null,
+    entry.trigger ? { label: "Trigger", value: entry.trigger } : null,
+    entry.argumentHint ? { label: "Arguments", value: entry.argumentHint } : null,
+    entry.scriptLanguage ? { label: "Format", value: entry.scriptLanguage } : null,
+    entry.estimatedSetupTime ? { label: "Setup time", value: entry.estimatedSetupTime } : null,
+    entry.difficulty ? { label: "Difficulty", value: entry.difficulty } : null,
+    entry.category === "skills" && entry.skillType
+      ? { label: "Skill type", value: entry.skillType }
+      : null,
+    entry.category === "skills" && entry.skillLevel
+      ? { label: "Skill level", value: entry.skillLevel }
+      : null,
+    entry.category === "skills" && entry.verificationStatus
+      ? { label: "Verification", value: entry.verificationStatus }
+      : null,
+    entry.category === "skills" && entry.verifiedAt
+      ? { label: "Verified", value: entry.verifiedAt }
+      : null,
+  ];
+
+  return facts.filter((fact): fact is { label: string; value: string } => Boolean(fact));
+}
+
+export function getSourceSignals(entry: ContentEntry) {
+  const signals = [
+    entry.downloadTrust
+      ? {
+          label: "Package trust",
+          value:
+            entry.downloadTrust === "first-party"
+              ? "Verified first-party package"
+              : "External package, review before use",
+        }
+      : null,
+    entry.verificationStatus ? { label: "Verification", value: entry.verificationStatus } : null,
+    entry.verifiedAt ? { label: "Last verified", value: entry.verifiedAt } : null,
+    entry.contentUpdatedAt
+      ? { label: "Content updated", value: entry.contentUpdatedAt.slice(0, 10) }
+      : null,
+    entry.downloadSha256 ? { label: "Package checksum", value: entry.downloadSha256 } : null,
+    entry.sourceSubmissionUrl
+      ? { label: "Original submission", value: entry.sourceSubmissionUrl }
+      : null,
+    entry.importPrUrl ? { label: "Import PR", value: entry.importPrUrl } : null,
+    entry.reviewedBy
+      ? {
+          label: "Reviewed by",
+          value: entry.reviewedAt
+            ? `${entry.reviewedBy} on ${entry.reviewedAt.slice(0, 10)}`
+            : entry.reviewedBy,
+        }
+      : null,
+    entry.claimStatus ? { label: "Claim status", value: entry.claimStatus } : null,
+    entry.claimedBy
+      ? {
+          label: "Claimed by",
+          value: entry.claimedByUrl || entry.claimedBy,
+        }
+      : null,
+    entry.repoUrl ? { label: "Repository", value: entry.repoUrl } : null,
+    entry.documentationUrl ? { label: "Documentation", value: entry.documentationUrl } : null,
+    entry.githubUrl ? { label: "Content source", value: entry.githubUrl } : null,
+  ];
+
+  return signals.filter((signal): signal is { label: string; value: string } => Boolean(signal));
+}

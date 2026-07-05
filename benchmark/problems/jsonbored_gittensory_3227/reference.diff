@@ -1,0 +1,608 @@
+diff --git a/.env.example b/.env.example
+index 98f466297..d136d7d1c 100644
+--- a/.env.example
++++ b/.env.example
+@@ -66,20 +66,21 @@ GITTENSORY_REVIEW_ENRICHMENT=false
+ # dependency,lockfileDrift,secret,license,installScript,heavyDependency,actionPin,eol,redos
+ # provenance,codeowners,secretLog,assetWeight,typosquat,commitSignature,iacMisconfig,nativeBuild
+ # history,docCommentDrift,duplication,churnHotspot,blameLink,approvalIntegrity,ciCheckSignals
+-# undocumentedExport,staleBranch,commitHygiene,pendingReviewRequests,testRatio
++# undocumentedExport,staleBranch,commitHygiene,pendingReviewRequests,testRatio,migrationSafety
+ #
+ # Profile defaults:
+ # fast: dependency,lockfileDrift,secret,license,installScript,heavyDependency,actionPin,eol
+-# redos,provenance,secretLog,typosquat,iacMisconfig,nativeBuild,testRatio
++# redos,provenance,secretLog,typosquat,iacMisconfig,nativeBuild,testRatio,migrationSafety
+ # balanced (default): dependency,lockfileDrift,secret,license,installScript,heavyDependency
+ # actionPin,eol,redos,provenance,codeowners,secretLog,assetWeight,typosquat,commitSignature
+ # iacMisconfig,nativeBuild,history,docCommentDrift,duplication,churnHotspot,blameLink
+ # approvalIntegrity,ciCheckSignals,undocumentedExport,staleBranch,commitHygiene
+-# pendingReviewRequests,testRatio
++# pendingReviewRequests,testRatio,migrationSafety
+ # deep: dependency,lockfileDrift,secret,license,installScript,heavyDependency,actionPin,eol
+ # redos,provenance,codeowners,secretLog,assetWeight,typosquat,commitSignature,iacMisconfig
+ # nativeBuild,history,docCommentDrift,duplication,churnHotspot,blameLink,approvalIntegrity
+ # ciCheckSignals,undocumentedExport,staleBranch,commitHygiene,pendingReviewRequests,testRatio
++# migrationSafety
+ # END GENERATED REES ANALYZERS
+ 
+ # Submitter-reputation spend control (internal-only): downgrades new/burst/low-rep
+diff --git a/apps/gittensory-ui/src/lib/rees-analyzers.ts b/apps/gittensory-ui/src/lib/rees-analyzers.ts
+index 5f8536322..0ecd40f31 100644
+--- a/apps/gittensory-ui/src/lib/rees-analyzers.ts
++++ b/apps/gittensory-ui/src/lib/rees-analyzers.ts
+@@ -751,6 +751,28 @@ export const REES_ANALYZERS = [
+         "A cheap, always-available complement to the coverage-delta analyzer: works even when no CI coverage artifact exists.",
+     },
+   },
++  {
++    name: "migrationSafety",
++    title: "SQL migration safety",
++    category: "config",
++    cost: "local",
++    defaultEnabled: true,
++    profiles: ["fast", "balanced", "deep"],
++    requires: ["files"],
++    limits: {
++      maxFindings: 20,
++      maxLineChars: 2000,
++    },
++    docs: {
++      summary:
++        "Flags risky schema operations in added migration SQL: drops, renames, non-nullable columns without a default, and blocking table rewrites.",
++      looksAt: "Added lines in migration paths (migrations/, db/migrate/, *.sql).",
++      reports: "File, line, and public-safe rule kind — never SQL content.",
++      network: "Pure local analyzer. No external network call.",
++      notes:
++        "Detection is line-anchored single-statement shapes only; statements split across lines are skipped rather than tracked with cross-line state.",
++    },
++  },
+ ] as const satisfies readonly ReesAnalyzerDoc[];
+ 
+ export const REES_ANALYZER_NAMES = REES_ANALYZERS.map((analyzer) => analyzer.name);
+diff --git a/review-enrichment/analyzer-metadata.json b/review-enrichment/analyzer-metadata.json
+index 6de901666..d6e660968 100644
+--- a/review-enrichment/analyzer-metadata.json
++++ b/review-enrichment/analyzer-metadata.json
+@@ -842,6 +842,32 @@
+         "network": "Pure local analyzer. No external network call.",
+         "notes": "A cheap, always-available complement to the coverage-delta analyzer: works even when no CI coverage artifact exists."
+       }
++    },
++    {
++      "name": "migrationSafety",
++      "title": "SQL migration safety",
++      "category": "config",
++      "cost": "local",
++      "defaultEnabled": true,
++      "profiles": [
++        "fast",
++        "balanced",
++        "deep"
++      ],
++      "requires": [
++        "files"
++      ],
++      "limits": {
++        "maxFindings": 20,
++        "maxLineChars": 2000
++      },
++      "docs": {
++        "summary": "Flags risky schema operations in added migration SQL: drops, renames, non-nullable columns without a default, and blocking table rewrites.",
++        "looksAt": "Added lines in migration paths (migrations/, db/migrate/, *.sql).",
++        "reports": "File, line, and public-safe rule kind — never SQL content.",
++        "network": "Pure local analyzer. No external network call.",
++        "notes": "Detection is line-anchored single-statement shapes only; statements split across lines are skipped rather than tracked with cross-line state."
++      }
+     }
+   ]
+ }
+diff --git a/review-enrichment/src/analyzers/migration-safety.ts b/review-enrichment/src/analyzers/migration-safety.ts
+new file mode 100644
+index 000000000..b131d1c4d
+--- /dev/null
++++ b/review-enrichment/src/analyzers/migration-safety.ts
+@@ -0,0 +1,163 @@
++// SQL migration-safety linter (#2022). Flags risky schema operations in ADDED migration SQL — the changes that
++// can break running deployments mid-rollout: dropping tables/columns the old code still reads, renames (the old
++// code's names disappear), non-nullable columns added without a DEFAULT (inserts from old code fail), and
++// column-type changes that force a blocking table rewrite. Pure compute over added patch lines in migration
++// paths — no network, no SQL parsing beyond single-line statement shapes. Detection is deliberately
++// line-anchored: a statement split across lines is missed (fail-quiet) rather than tracked with cross-line
++// state, and each shape is a finite, documented DDL form — never a general SQL grammar.
++import type { EnrichRequest, MigrationSafetyFinding } from "../types.js";
++
++const MAX_FINDINGS = 20;
++const MAX_LINE_CHARS = 2000;
++
++// Migration SQL locations: a migrations/ directory (Wrangler/D1, Prisma, Flyway, …), Rails-style db/migrate/,
++// or any .sql file — the three forms named by #2022.
++const MIGRATION_PATH_RE = /(?:^|\/)(?:migrations?|db\/migrate)\/|\.sql$/i;
++
++// Dropping a table or column breaks any still-deployed reader/writer of the old schema.
++const DROP_RE = /\bDROP\s+(?:TABLE|COLUMN)\b/i;
++// Renames remove the old name in one step; running code that still uses it fails immediately. Covers the
++// standard forms: `ALTER TABLE a RENAME TO b`, `… RENAME [COLUMN] x TO y` (PostgreSQL/SQLite treat the
++// COLUMN keyword as optional), and MySQL's `RENAME TABLE a TO b`.
++const RENAME_RE = /\b(?:RENAME\s+TABLE\b|RENAME\s+(?:COLUMN\s+)?\S+\s+TO\b|RENAME\s+TO\b)/i;
++// `ADD [COLUMN] … NOT NULL` without a DEFAULT on the same line: inserts from not-yet-updated code omit the
++// column and fail. The lookahead keeps `ADD CONSTRAINT/PRIMARY/FOREIGN/UNIQUE/CHECK/INDEX/KEY …` out — those
++// are not column additions even when their line also contains `NOT NULL` (e.g. a CHECK on nullability).
++const ADD_COLUMN_RE =
++  /\bADD\s+(?!CONSTRAINT\b|PRIMARY\b|FOREIGN\b|UNIQUE\b|CHECK\b|INDEX\b|KEY\b)(?:COLUMN\s+)?\S/i;
++const NOT_NULL_RE = /\bNOT\s+NULL\b/i;
++const DEFAULT_RE = /\bDEFAULT\b/i;
++// Column-type changes rewrite (and lock) the whole table in most engines: Postgres
++// `ALTER COLUMN x [SET DATA] TYPE …` and MySQL `MODIFY [COLUMN] …`.
++const BLOCKING_REWRITE_RE =
++  /\bALTER\s+COLUMN\s+\S+\s+(?:SET\s+DATA\s+)?TYPE\b|\bMODIFY\s+(?:COLUMN\s+)?\S/i;
++
++function* patchLines(patch: string): Generator<string> {
++  let start = 0;
++  for (let i = 0; i <= patch.length; i++) {
++    if (i === patch.length || patch[i] === "\n") {
++      yield patch.slice(start, i);
++      start = i + 1;
++    }
++  }
++}
++
++type ScanLimits = {
++  maxFindings?: number;
++  signal?: AbortSignal;
++};
++
++/** Whether `path` is a migration SQL location this linter should scan. Pure. */
++export function isMigrationPath(path: string): boolean {
++  return MIGRATION_PATH_RE.test(path);
++}
++
++function pushFinding(
++  findings: MigrationSafetyFinding[],
++  seen: Set<string>,
++  file: string,
++  line: number,
++  kind: MigrationSafetyFinding["kind"],
++  maxFindings: number,
++): boolean {
++  const key = `${kind}:${line}`;
++  if (seen.has(key)) return false;
++  seen.add(key);
++  findings.push({ file, line, kind });
++  return findings.length >= maxFindings;
++}
++
++/** Scan one migration file's patch for risky schema statements on ADDED lines. Pure. */
++export function scanPatchForMigrationSafety(
++  path: string,
++  patch: string,
++  limits: ScanLimits = {},
++): MigrationSafetyFinding[] {
++  const maxFindings = limits.maxFindings ?? MAX_FINDINGS;
++  if (maxFindings <= 0) return [];
++
++  const findings: MigrationSafetyFinding[] = [];
++  const seen = new Set<string>();
++  let newLine = 0;
++  let inHunk = false;
++
++  for (const line of patchLines(patch)) {
++    if (limits.signal?.aborted) throw new Error("analyzer_aborted");
++    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
++    if (hunk) {
++      newLine = Number(hunk[1]);
++      inHunk = true;
++      continue;
++    }
++    // Skip pre-hunk preamble; inside a hunk `+++x`/`+++ x` is added content, not a header.
++    if (!inHunk) continue;
++    if (!line.startsWith("+")) {
++      // A `\ No newline at end of file` marker is not a content line, so it must not advance the
++      // new-file line counter — mirrors the sibling analyzers (e.g. iac-misconfig.ts).
++      if (!line.startsWith("-") && !line.startsWith("\\")) newLine++;
++      continue;
++    }
++
++    const rawBody = line.slice(1);
++    if (rawBody.length > MAX_LINE_CHARS) {
++      newLine++;
++      continue;
++    }
++    // Strip the trailing `--` SQL line comment before EVERY rule check: a full-comment line
++    // (`-- DROP TABLE users (old cleanup)`) must not be flagged, and a trailing comment must not vouch for
++    // the statement either (`ADD COLUMN age INTEGER NOT NULL; -- DEFAULT later` has no real DEFAULT).
++    // Block comments are not tracked (no cross-line state by design).
++    const body = rawBody.replace(/--.*$/, "");
++
++    if (
++      DROP_RE.test(body) &&
++      pushFinding(findings, seen, path, newLine, "drop", maxFindings)
++    ) {
++      return findings;
++    }
++    if (
++      RENAME_RE.test(body) &&
++      pushFinding(findings, seen, path, newLine, "rename", maxFindings)
++    ) {
++      return findings;
++    }
++    if (
++      ADD_COLUMN_RE.test(body) &&
++      NOT_NULL_RE.test(body) &&
++      !DEFAULT_RE.test(body) &&
++      pushFinding(findings, seen, path, newLine, "not-null-no-default", maxFindings)
++    ) {
++      return findings;
++    }
++    if (
++      BLOCKING_REWRITE_RE.test(body) &&
++      pushFinding(findings, seen, path, newLine, "blocking-rewrite", maxFindings)
++    ) {
++      return findings;
++    }
++
++    newLine++;
++  }
++
++  return findings;
++}
++
++/** Analyzer entrypoint: added migration SQL lines → risky schema-change findings. No network. */
++export async function scanMigrationSafety(
++  req: EnrichRequest,
++  signal?: AbortSignal,
++): Promise<MigrationSafetyFinding[]> {
++  const findings: MigrationSafetyFinding[] = [];
++  for (const file of req.files ?? []) {
++    if (signal?.aborted) throw new Error("analyzer_aborted");
++    if (!file.patch || !isMigrationPath(file.path)) continue;
++    for (const finding of scanPatchForMigrationSafety(file.path, file.patch, {
++      maxFindings: MAX_FINDINGS - findings.length,
++      signal,
++    })) {
++      findings.push(finding);
++      if (findings.length >= MAX_FINDINGS) return findings;
++    }
++  }
++  return findings;
++}
+diff --git a/review-enrichment/src/analyzers/registry.ts b/review-enrichment/src/analyzers/registry.ts
+index af6545df0..54a978739 100644
+--- a/review-enrichment/src/analyzers/registry.ts
++++ b/review-enrichment/src/analyzers/registry.ts
+@@ -25,6 +25,7 @@ import { secretAnalyzer } from "./secret/descriptor.js";
+ import { scanSecretLog } from "./secret-log.js";
+ import { scanStaleBranch } from "./stale-branch.js";
+ import { scanTestRatio } from "./test-ratio.js";
++import { scanMigrationSafety } from "./migration-safety.js";
+ import { scanTyposquat } from "./typosquat.js";
+ import { scanUndocumentedExport } from "./undocumented-export.js";
+ import type {
+@@ -709,6 +710,47 @@ export const ANALYZER_DESCRIPTORS = [
+     },
+     run: (req) => scanTestRatio(req),
+   }),
++  descriptor({
++    name: "migrationSafety",
++    title: "SQL migration safety",
++    category: "config",
++    cost: "local",
++    defaultEnabled: true,
++    requires: ["files"],
++    limits: { maxFindings: 20, maxLineChars: 2000 },
++    docs: {
++      summary:
++        "Flags risky schema operations in added migration SQL: drops, renames, non-nullable columns without a default, and blocking table rewrites.",
++      looksAt: "Added lines in migration paths (migrations/, db/migrate/, *.sql).",
++      reports: "File, line, and public-safe rule kind — never SQL content.",
++      network: "Pure local analyzer. No external network call.",
++      notes:
++        "Detection is line-anchored single-statement shapes only; statements split across lines are skipped rather than tracked with cross-line state.",
++    },
++    render: (findings, helpers) => {
++      if (!findings.length) return [];
++      const explain = (kind: (typeof findings)[number]["kind"]): string => {
++        switch (kind) {
++          case "drop":
++            return "drops a table or column; still-running deployments that read the old schema break immediately";
++          case "rename":
++            return "renames a table or column in one step; code still using the old name fails until fully rolled out";
++          case "not-null-no-default":
++            return "adds a NOT NULL column without a DEFAULT; inserts from not-yet-updated code omit it and fail";
++          case "blocking-rewrite":
++            return "changes a column type, which rewrites (and locks) the table in most engines while it runs";
++        }
++      };
++      const lines = ["### SQL migration safety (deploy-breaking schema changes)"];
++      for (const item of findings) {
++        lines.push(
++          `- ${helpers.safeCodeSpan(`${item.file}:${item.line}`)} — ${explain(item.kind)}`,
++        );
++      }
++      return lines;
++    },
++    run: (req, { signal }) => scanMigrationSafety(req, signal),
++  }),
+ ] as const satisfies readonly AnyAnalyzerDescriptor[];
+ 
+ export const ANALYZER_NAMES = ANALYZER_DESCRIPTORS.map(
+diff --git a/review-enrichment/src/render.ts b/review-enrichment/src/render.ts
+index c42b72df3..6f78f8c75 100644
+--- a/review-enrichment/src/render.ts
++++ b/review-enrichment/src/render.ts
+@@ -440,6 +440,7 @@ export function renderBrief(
+   lines.push(...renderDescriptorSection("commitHygiene", findings.commitHygiene));
+   lines.push(...renderDescriptorSection("pendingReviewRequests", findings.pendingReviewRequests));
+   lines.push(...renderDescriptorSection("testRatio", findings.testRatio));
++  lines.push(...renderDescriptorSection("migrationSafety", findings.migrationSafety));
+ 
+   if (!lines.length) return { promptSection: "", systemSuffix: "" };
+ 
+diff --git a/review-enrichment/src/types.ts b/review-enrichment/src/types.ts
+index 05ed52583..4fc71f5dd 100644
+--- a/review-enrichment/src/types.ts
++++ b/review-enrichment/src/types.ts
+@@ -394,6 +394,14 @@ export interface TestRatioFinding {
+   belowThreshold: boolean;
+ }
+ 
++/** A risky schema operation on an added migration-SQL line — a change that can break running deployments
++ *  mid-rollout (#2022, part of #1499). Reports the location + rule kind only, never SQL content. */
++export interface MigrationSafetyFinding {
++  file: string;
++  line: number;
++  kind: "drop" | "rename" | "not-null-no-default" | "blocking-rewrite";
++}
++
+ /** Structured analyzer output. Each analyzer fills its own key; more land as analyzers ship (#1477/#1478). */
+ export interface BriefFindings {
+   dependency?: DependencyFinding[];
+@@ -425,6 +433,7 @@ export interface BriefFindings {
+   commitHygiene?: CommitHygieneFinding[];
+   pendingReviewRequests?: PendingReviewRequestFinding[];
+   testRatio?: TestRatioFinding[];
++  migrationSafety?: MigrationSafetyFinding[];
+ }
+ 
+ /** A JSDoc/TSDoc block whose `@param` tags name parameters the adjacent function no longer declares — a
+diff --git a/review-enrichment/test/analyzer-registry.test.ts b/review-enrichment/test/analyzer-registry.test.ts
+index c84678192..a03c25c5a 100644
+--- a/review-enrichment/test/analyzer-registry.test.ts
++++ b/review-enrichment/test/analyzer-registry.test.ts
+@@ -39,6 +39,7 @@ const EXPECTED_ANALYZERS = [
+   "commitHygiene",
+   "pendingReviewRequests",
+   "testRatio",
++  "migrationSafety",
+ ];
+ 
+ test("analyzer descriptors cover the runtime registry in stable order", () => {
+diff --git a/review-enrichment/test/migration-safety.test.ts b/review-enrichment/test/migration-safety.test.ts
+new file mode 100644
+index 000000000..8ec4180b0
+--- /dev/null
++++ b/review-enrichment/test/migration-safety.test.ts
+@@ -0,0 +1,190 @@
++// Units for the SQL migration-safety linter (#2022). Own file (not enrichment.test.ts) so concurrent analyzer
++// PRs don't collide. No network involved — pure compute over added patch lines. Runs against the compiled dist/.
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import {
++  isMigrationPath,
++  scanPatchForMigrationSafety,
++  scanMigrationSafety,
++} from "../dist/analyzers/migration-safety.js";
++import { renderBrief } from "../dist/render.js";
++
++const patchOf = (lines) => `@@ -1,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join("\n")}`;
++
++test("isMigrationPath: recognizes migrations/, db/migrate/, and bare .sql paths", () => {
++  assert.equal(isMigrationPath("migrations/0001_init.sql"), true);
++  assert.equal(isMigrationPath("apps/api/migration/20240101_users.ts"), true);
++  assert.equal(isMigrationPath("db/migrate/20240101000000_add_users.rb"), true);
++  assert.equal(isMigrationPath("scripts/seed-data.sql"), true);
++  assert.equal(isMigrationPath("schema.sql"), true);
++  assert.equal(isMigrationPath("src/services/scoring.ts"), false);
++  assert.equal(isMigrationPath("docs/migrations.md"), false);
++});
++
++test("scanPatchForMigrationSafety: flags DROP TABLE and DROP COLUMN as drop", () => {
++  const findings = scanPatchForMigrationSafety(
++    "migrations/0002_cleanup.sql",
++    patchOf(["DROP TABLE legacy_events;", "ALTER TABLE users DROP COLUMN nickname;"]),
++  );
++  assert.deepEqual(findings, [
++    { file: "migrations/0002_cleanup.sql", line: 1, kind: "drop" },
++    { file: "migrations/0002_cleanup.sql", line: 2, kind: "drop" },
++  ]);
++});
++
++test("scanPatchForMigrationSafety: flags RENAME TO, RENAME [COLUMN], and RENAME TABLE as rename", () => {
++  const findings = scanPatchForMigrationSafety(
++    "migrations/0003_rename.sql",
++    patchOf([
++      "ALTER TABLE users RENAME TO members;",
++      "ALTER TABLE members RENAME COLUMN name TO full_name;",
++      // PostgreSQL/SQLite treat the COLUMN keyword as optional — the one-step column rename must
++      // still be caught without it.
++      "ALTER TABLE members RENAME name TO full_name;",
++      "RENAME TABLE old_logs TO logs;",
++    ]),
++  );
++  assert.deepEqual(
++    findings.map((f) => f.kind),
++    ["rename", "rename", "rename", "rename"],
++  );
++});
++
++test("scanPatchForMigrationSafety: flags ADD COLUMN ... NOT NULL without a DEFAULT, with or without the COLUMN keyword", () => {
++  const findings = scanPatchForMigrationSafety(
++    "migrations/0004_add.sql",
++    patchOf([
++      "ALTER TABLE users ADD COLUMN age INTEGER NOT NULL;",
++      "ALTER TABLE users ADD status TEXT NOT NULL;",
++    ]),
++  );
++  assert.deepEqual(
++    findings.map((f) => f.kind),
++    ["not-null-no-default", "not-null-no-default"],
++  );
++});
++
++test("scanPatchForMigrationSafety: a NOT NULL column WITH a DEFAULT on the same line is a safe additive change", () => {
++  const findings = scanPatchForMigrationSafety(
++    "migrations/0005_safe.sql",
++    patchOf([
++      "ALTER TABLE users ADD COLUMN age INTEGER NOT NULL DEFAULT 0;",
++      "ALTER TABLE users ADD COLUMN bio TEXT;",
++      "CREATE INDEX idx_users_age ON users(age);",
++    ]),
++  );
++  assert.deepEqual(findings, []);
++});
++
++test("scanPatchForMigrationSafety: ADD CONSTRAINT/PRIMARY/UNIQUE/CHECK lines are not column additions", () => {
++  const findings = scanPatchForMigrationSafety(
++    "migrations/0006_constraints.sql",
++    patchOf([
++      "ALTER TABLE users ADD CONSTRAINT chk_name CHECK (name IS NOT NULL);",
++      "ALTER TABLE users ADD UNIQUE (email);",
++      "ALTER TABLE users ADD PRIMARY KEY (id);",
++    ]),
++  );
++  assert.deepEqual(findings, []);
++});
++
++test("scanPatchForMigrationSafety: flags column-type changes (ALTER COLUMN TYPE / MODIFY COLUMN) as blocking-rewrite", () => {
++  const findings = scanPatchForMigrationSafety(
++    "migrations/0007_retype.sql",
++    patchOf([
++      "ALTER TABLE events ALTER COLUMN payload TYPE JSONB;",
++      "ALTER TABLE events ALTER COLUMN id SET DATA TYPE BIGINT;",
++      "ALTER TABLE users MODIFY COLUMN age BIGINT;",
++    ]),
++  );
++  assert.deepEqual(
++    findings.map((f) => f.kind),
++    ["blocking-rewrite", "blocking-rewrite", "blocking-rewrite"],
++  );
++});
++
++test("scanPatchForMigrationSafety: a -- comment line mentioning a risky statement is not flagged", () => {
++  const findings = scanPatchForMigrationSafety(
++    "migrations/0008_commented.sql",
++    patchOf(["-- DROP TABLE users (intentionally deferred to the next release)", "SELECT 1;"]),
++  );
++  assert.deepEqual(findings, []);
++});
++
++test("scanPatchForMigrationSafety: a DEFAULT mentioned only in a trailing -- comment does not vouch for the column", () => {
++  // The comment is stripped before the rules run, so this NOT NULL column really has no DEFAULT and is flagged.
++  const findings = scanPatchForMigrationSafety(
++    "migrations/0014_comment_default.sql",
++    patchOf(["ALTER TABLE users ADD COLUMN age INTEGER NOT NULL; -- DEFAULT later"]),
++  );
++  assert.deepEqual(findings, [
++    { file: "migrations/0014_comment_default.sql", line: 1, kind: "not-null-no-default" },
++  ]);
++});
++
++test("scanPatchForMigrationSafety: only ADDED lines are scanned — removed and context lines are ignored", () => {
++  const patch = [
++    "@@ -1,2 +1,2 @@",
++    "-DROP TABLE legacy_events;",
++    " DROP TABLE archived_events;",
++    "+CREATE TABLE new_events (id INTEGER);",
++  ].join("\n");
++  const findings = scanPatchForMigrationSafety("migrations/0009_ctx.sql", patch);
++  assert.deepEqual(findings, []);
++});
++
++test("scanPatchForMigrationSafety: new-file line numbers stay correct across context and removed lines", () => {
++  const patch = [
++    "@@ -10,3 +10,3 @@",
++    " CREATE TABLE t (id INTEGER);", // new-file line 10
++    "-ALTER TABLE t ADD COLUMN a INTEGER;", // removed, does not advance
++    "+ALTER TABLE t DROP COLUMN a;", // new-file line 11
++  ].join("\n");
++  const findings = scanPatchForMigrationSafety("migrations/0010_lines.sql", patch);
++  assert.deepEqual(findings, [{ file: "migrations/0010_lines.sql", line: 11, kind: "drop" }]);
++});
++
++test("scanPatchForMigrationSafety: enforces the maxFindings cap and dedupes repeat kinds on the same line", () => {
++  const lines = Array.from({ length: 30 }, (_, i) => `DROP TABLE t_${i};`);
++  const findings = scanPatchForMigrationSafety("migrations/0011_burst.sql", patchOf(lines), {
++    maxFindings: 5,
++  });
++  assert.equal(findings.length, 5);
++  assert.deepEqual(findings.map((f) => f.line), [1, 2, 3, 4, 5]);
++
++  assert.deepEqual(
++    scanPatchForMigrationSafety("migrations/0011_burst.sql", patchOf(lines), { maxFindings: 0 }),
++    [],
++  );
++});
++
++test("scanMigrationSafety: scans only migration paths and honors the global cap across files", async () => {
++  const dropLines = Array.from({ length: 15 }, (_, i) => `DROP TABLE a_${i};`);
++  const findings = await scanMigrationSafety({
++    repoFullName: "octo/repo",
++    prNumber: 1,
++    files: [
++      { path: "src/app.ts", patch: patchOf(["DROP TABLE not_sql_so_ignored;"]) },
++      { path: "migrations/0012_a.sql", patch: patchOf(dropLines) },
++      { path: "migrations/0013_b.sql", patch: patchOf(dropLines) },
++    ],
++  });
++  assert.equal(findings.length, 20); // 15 from the first migration + capped 5 from the second
++  assert.equal(findings.filter((f) => f.file === "migrations/0013_b.sql").length, 5);
++});
++
++test("scanMigrationSafety: no files yields no findings", async () => {
++  assert.deepEqual(await scanMigrationSafety({ repoFullName: "octo/repo", prNumber: 1 }), []);
++});
++
++test("renderBrief: migration-safety findings render location plus a public-safe explanation only", () => {
++  const { promptSection } = renderBrief({
++    migrationSafety: [
++      { file: "migrations/0002_cleanup.sql", line: 1, kind: "drop" },
++      { file: "migrations/0004_add.sql", line: 3, kind: "not-null-no-default" },
++    ],
++  });
++  assert.match(promptSection, /SQL migration safety/);
++  assert.match(promptSection, /migrations\/0002_cleanup\.sql:1/);
++  assert.match(promptSection, /NOT NULL column without a DEFAULT/);
++});
+diff --git a/src/review/enrichment-analyzer-names.ts b/src/review/enrichment-analyzer-names.ts
+index a94852c96..c43cee500 100644
+--- a/src/review/enrichment-analyzer-names.ts
++++ b/src/review/enrichment-analyzer-names.ts
+@@ -33,6 +33,7 @@ export const REES_ANALYZER_NAMES = [
+   "commitHygiene",
+   "pendingReviewRequests",
+   "testRatio",
++  "migrationSafety",
+ ] as const;
+ 
+ export type ReesAnalyzerName = (typeof REES_ANALYZER_NAMES)[number];
+diff --git a/test/unit/enrichment-wire.test.ts b/test/unit/enrichment-wire.test.ts
+index c2e4c637f..e57a212c0 100644
+--- a/test/unit/enrichment-wire.test.ts
++++ b/test/unit/enrichment-wire.test.ts
+@@ -626,7 +626,7 @@ describe("resolveReesAnalyzers", () => {
+       resolveReesAnalyzers(
+         env({
+           REES_ANALYZERS:
+-            "dependency,lockfileDrift,secret,license,installScript,heavyDependency,actionPin,eol,redos,provenance,codeowners,secretLog,assetWeight,typosquat,commitSignature,iacMisconfig,nativeBuild,history,docCommentDrift,duplication,churnHotspot,blameLink,approvalIntegrity,ciCheckSignals,undocumentedExport,staleBranch,commitHygiene,pendingReviewRequests,testRatio",
++            "dependency,lockfileDrift,secret,license,installScript,heavyDependency,actionPin,eol,redos,provenance,codeowners,secretLog,assetWeight,typosquat,commitSignature,iacMisconfig,nativeBuild,history,docCommentDrift,duplication,churnHotspot,blameLink,approvalIntegrity,ciCheckSignals,undocumentedExport,staleBranch,commitHygiene,pendingReviewRequests,testRatio,migrationSafety",
+         }),
+       ),
+     ).toEqual([
+@@ -659,6 +659,7 @@ describe("resolveReesAnalyzers", () => {
+       "commitHygiene",
+       "pendingReviewRequests",
+       "testRatio",
++      "migrationSafety",
+     ]);
+   });
+ 

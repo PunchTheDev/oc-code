@@ -1,0 +1,704 @@
+diff --git a/docs/GPU-SYNAPSE-BACKEND-FEASIBILITY.md b/docs/GPU-SYNAPSE-BACKEND-FEASIBILITY.md
+new file mode 100644
+index 0000000..b6b9956
+--- /dev/null
++++ b/docs/GPU-SYNAPSE-BACKEND-FEASIBILITY.md
+@@ -0,0 +1,214 @@
++# GPU Backend Feasibility for CSR Synapse Operations
++
++> **Status**: Research spike + feasibility report (issue #135, Phase 4 —
++> Real-Time Performance). Code: `neuromorphic/src/neuromorphic/gpu_synapse_ops.py`,
++> `neuromorphic/scripts/benchmark_gpu_synapse.py`, `neuromorphic/tests/test_gpu_synapse_ops.py`.
++>
++> **Recommendation: do not adopt yet.** On CPU, the JAX backend is
++> consistently 12–37× *slower* than the existing scipy implementation at
++> every scale tested. That doesn't prove a real GPU would also lose — no
++> GPU hardware was available to test — but it does mean this can't be
++> merged into the default runtime path on the evidence available today.
++> See [§6](#6-recommendation) for exactly what would change that.
++
++## 1. Context
++
++README's Known Limitations section already names the problem this issue
++is scoping:
++
++> The core simulation is Python + NumPy/SciPy. It runs and learns, but it
++> is not real-time at the ~1M-neuron scale on commodity hardware. Real-time
++> embodied use will require GPU/compiled kernels or neuromorphic hardware.
++
++`neuromorphic/src/neuromorphic/synapses.py`'s `SynapseGroup` already uses
++`scipy.sparse` CSR matrices with several rounds of CPU-specific hand
++optimization (see [§3](#3-why-only-compute_current-was-ported)) — this
++report evaluates whether CuPy or JAX can accelerate that further.
++
++**Environment note**: this spike was done on a machine with no GPU, no
++CUDA toolkit, and no `nvidia-smi` — confirmed at the start of this work.
++Every number below is CPU-only. That shapes both the methodology (§4) and
++why CuPy specifically could not be evaluated at all (§2).
++
++## 2. CuPy vs. JAX
++
++The issue proposed either CuPy or JAX. Only JAX was actually testable here:
++
++| | CuPy | JAX |
++|---|---|---|
++| Requires CUDA to run at all | **Yes** — no CPU mode exists | No — runs on CPU automatically when no GPU/TPU is visible |
++| Testable in this environment | No | Yes (`jax.devices()` → `[CpuDevice(id=0)]`) |
++| API | NumPy-compatible drop-in, separate from CPU code | Single `jax.numpy` API, same code runs on CPU/GPU/TPU |
++| "CPU fallback" (acceptance criterion 3) | Would require hand-writing a second numpy code path and switching between them | Comes for free from JAX's device model |
++
++Criterion 3 ("CPU fallback operates successfully without GPU hardware")
++is a much more natural fit for JAX than CuPy: with CuPy, "fallback" means
++maintaining two implementations and an `if gpu_available: ... else: ...`
++branch (the classic pattern that rots — the CPU branch silently drifts
++out of sync because it's rarely exercised in GPU-equipped dev environments).
++JAX's device-agnostic array API sidesteps that: `gpu_synapse_ops.py`
++has exactly one implementation, and it's the same code on CPU and GPU.
++For that reason alone, if a GPU backend is pursued later, **JAX is the
++better fit** — independent of the CPU performance results below.
++
++## 3. Why only `compute_current` was ported
++
++`SynapseGroup`'s hot paths fall into two categories:
++
++**Good GPU/JIT fit — ported (`gpu_synapse_ops.compute_current_jax`):**
++`compute_current` is a pure function: `weights @ spike_vector` (sparse-dense
++matvec), called every simulation step, with static input/output shapes for
++a given network size. This is exactly the shape JAX's `jax.jit` wants.
++
++**Poor GPU/JIT fit — deliberately NOT ported:**
++`update_weights_stdp`, `update_weights_rstdp`, `apply_neuromodulation_and_decay`,
++and `_gather_active_synapses` all:
++- **Mutate `weights.data` / `eligibility` in place.** JAX arrays are
++  immutable; this would need to become copy-on-write or move to a
++  functional-update pattern throughout `SynapseGroup`, not just these methods.
++- **Produce data-dependent output shapes.** `_gather_active_synapses`
++  returns an array sized by how many synapses are connected to neurons
++  that spiked *this step* — that count varies every call. `jax.jit`
++  requires static shapes; a data-dependent-size gather forces either
++  re-tracing on every distinct shape (defeating JIT) or a rewrite to a
++  fixed-size masked representation (dense boolean mask over all `nnz`,
++  which throws away the sparse-gather speedup the CPU code was written
++  to get in the first place — see the `nnz < 100_000` / `> 10_000_000`
++  branching in `_gather_active_synapses` and `compute_current`).
++- **Branch on runtime array sizes in Python** (`if nnz < 100_000 or ...`)
++  to pick between CSR-SpMV and CSC-column-gather strategies. `jax.jit`
++  traces Python control flow once per input *shape*; a strategy switch
++  keyed off `nnz`/firing-rate would need `jax.lax.cond`/`jax.lax.select`
++  rewrites throughout.
++
++Porting these properly is a substantially larger rewrite than this spike's
++scope — and per [§4](#4-methodology--results), there's no performance
++evidence yet that justifies taking that on.
++
++## 4. Methodology & results
++
++`scripts/benchmark_gpu_synapse.py` builds a real `SynapseGroup` (same class
++used in production, not a synthetic reimplementation) at three sizes chosen
++to straddle `compute_current`'s own CSR/CSC strategy thresholds (100K and
++10M nnz), and times `n` repeated calls to the existing CPU
++`compute_current()` against `compute_current_jax()` at each size, using the
++identical weight matrix and spike vector for both. Correctness is checked
++via `max(|jax_result - cpu_result|)`.
++
++Run with `cd neuromorphic && uv run --extra gpu python scripts/benchmark_gpu_synapse.py`.
++Raw output: `neuromorphic/benchmarks/gpu_synapse_spike.json`. Reproduced here:
++
++| Scale | nnz | scipy CPU (ms/call) | JAX CPU (ms/call) | Slowdown | Max \|diff\| |
++|---|---:|---:|---:|---:|---:|
++| small (2K×2K, 5% fire) | 79,218 | 0.041 | 1.528 | **37.5×** | 0.0 |
++| medium (20K×20K, 5% fire) | 3,980,284 | 3.289 | 40.208 | **12.2×** | 1.4×10⁻⁶ |
++| large (200K×200K, 2% fire) | 19,994,970 | 18.551 | 296.036 | **16.0×** | 0.0 |
++
++System: `Linux-6.17.0-35-generic-x86_64`, JAX 0.10.2, `jax.devices() == [CpuDevice(id=0)]`.
++
++**Correctness (acceptance criterion 1 — functional equivalence):** exact
++match or within float32 summation-order tolerance (~1e-6) at every scale,
++confirmed both here and in `tests/test_gpu_synapse_ops.py`'s parametrized
++equivalence suite (11 tests, including empty-weights, no-spikes, E/I-sign,
++and a JIT-cache-reuse-with-changed-weights regression check).
++
++**Performance (acceptance criterion 2 — measurable gains):** the opposite
++of a gain. JAX-on-CPU is 12–37× slower than `scipy.sparse`'s CSR/CSC SpMV
++at every tested scale, worsening at small scale rather than improving —
++`compute_current_jax` reconstructs a `jax.experimental.sparse.BCOO` from
++the scipy CSR matrix on every call (unavoidable, since weights actually
++change between STDP updates in production — caching that conversion
++would silently serve stale weights), and that conversion plus JIT
++dispatch overhead dominates at small problem sizes where scipy's C SpMV
++is already near-instant.
++
++**This does not, by itself, tell us what a real GPU would do.** GPU
++sparse SpMV wins (when it does) come from massive core-count parallelism
++on very large matrices, which this CPU-only run cannot exercise. But it
++does mean the current evidence gives no basis to expect a win — see [§6](#6-recommendation).
++
++**CPU fallback (acceptance criterion 3):** confirmed two ways —
++(a) JAX's own device selection: `jax.devices()` returns `[CpuDevice(id=0)]`
++automatically since no GPU/TPU is visible, no code branch required;
++(b) `gpu_synapse_ops.py` also handles jax not being *installed at all*
++(`gpu_backend_available() == False` → `_compute_current_numpy` fallback),
++verified by a test that monkeypatches jax's absence and by manually
++simulating an `ImportError` on `import jax` end-to-end.
++
++## 5. Dependency overhead & cross-platform compatibility (criterion 4)
++
++**Install size.** CPU-only `jax` + `jaxlib` + `ml-dtypes`: **~90MB**
++(`jax` 3.1MB + `ml-dtypes` 4.8MB + `jaxlib` 81.5MB), measured via
++`uv pip install jax` in this environment. A CUDA-enabled install
++(`jax[cuda12]` or similar) pulls a CUDA-specific `jaxlib` wheel plus
++matching cuDNN/cuBLAS libraries — commonly several hundred MB to ~1GB,
++though this could not be measured directly here (no CUDA toolkit present,
++and this sandbox's disk was already at 97% full mid-spike — installing a
++multi-hundred-MB CUDA wheel speculatively wasn't a responsible use of the
++shared environment). Either way, this is added as an **optional** extra
++(`pip install .[gpu]`, `neuromorphic/pyproject.toml`'s `gpu` group) —
++never a default dependency — so it doesn't affect the base install size
++for anyone not opting in.
++
++**Cross-platform.** `scipy.sparse` ships prebuilt wheels for essentially
++every platform Engram already targets (Linux x86_64/ARM64, macOS
++x86_64/ARM64, Windows). JAX's platform matrix is narrower: full CUDA GPU
++support is Linux x86_64-only; macOS has CPU support with limited/no Metal
++GPU acceleration; Windows GPU support requires WSL; ARM (relevant for
++Raspberry Pi / Jetson embedded targets — see README's hardware-integration
++limitation) has more limited official wheel coverage than x86_64. Since
++`neuromorphic` already declares `mujoco>=3.0.0` as a hard dependency with
++its own platform constraints, this isn't a new category of risk, but it
++does compound: an optional `gpu` extra should stay optional, not become
++a stealth requirement for any single code path.
++
++**Deployment footprint.** `docs/ARCHITECTURE.md` picked NATS partly for its
++"single 10MB binary, no dependencies" footprint. A ~90MB (CPU) to
++~1GB (CUDA) ML framework dependency is a different order of magnitude —
++fine as an opt-in extra for a workstation/cloud deployment profile, a poor
++fit for the embedded/robotics targets `sensory-gateway`/actuator work
++(#138) is oriented toward.
++
++**Fork-safety interaction, observed directly in this spike.** Running the
++full `neuromorphic` test suite with jax importable in the process (from
++`test_gpu_synapse_ops.py`) surfaced a real warning from unrelated tests:
++`persistence.py:397`'s background-save path calls `os.fork()`, and jax's
++multithreaded runtime is present in the parent process at that point —
++Python emits `RuntimeWarning: os.fork() was called ... JAX is
++multithreaded ... this will likely lead to a deadlock`. It didn't fail
++any test here, but it's a real, environment-independent risk (not
++specific to this sandbox) that would need addressing — e.g. skipping
++fork-based background save under `_FORK_BGSAVE` when jax is loaded, or
++isolating GPU-backend code to a separate process — before `jax` could
++safely become anything more than an opt-in, rarely-imported extra.
++
++## 6. Recommendation
++
++**Do not wire `gpu_synapse_ops.py` into `SynapseGroup.compute_current` as
++a live runtime option yet.** It is intentionally *not* imported or called
++anywhere outside its own tests/benchmark script in this PR — zero risk to
++the existing, already-tuned CPU hot path or to Invariant 1's "logically
++every step" equivalence guarantees, since nothing existing was modified.
++
++Revisit when any of the following changes:
++1. **Real CUDA GPU hardware is available** to benchmark against — the one
++   input this spike structurally could not provide. Re-run
++   `benchmark_gpu_synapse.py` on it before drawing conclusions either way.
++2. **The simulation moves toward GPU-resident state across steps**, rather
++   than converting scipy CSR → JAX BCOO and transferring host↔device on
++   every single step. Per-step round-trips are the classic reason
++   promising-on-paper GPU ops lose in practice; amortizing that requires
++   keeping weights/spikes on-device for many consecutive steps, which is
++   a materially bigger architectural change than this spike's scope.
++3. **STDP/eligibility-trace updates get a JIT-friendly (masked/dense)
++   rewrite** — until then, even a fast GPU `compute_current` would leave
++   the learning-rule updates (arguably the more expensive path at high
++   firing rates) on CPU, capping the achievable end-to-end speedup.
++
++## 7. Artifacts
++
++- `neuromorphic/src/neuromorphic/gpu_synapse_ops.py` — the spike implementation
++- `neuromorphic/tests/test_gpu_synapse_ops.py` — equivalence + fallback tests (skips cleanly without the `gpu` extra)
++- `neuromorphic/scripts/benchmark_gpu_synapse.py` — reproducible benchmark
++- `neuromorphic/benchmarks/gpu_synapse_spike.json` — raw results backing §4
++- `neuromorphic/pyproject.toml` — `gpu` optional extra (`jax>=0.4.20`)
+diff --git a/neuromorphic/benchmarks/gpu_synapse_spike.json b/neuromorphic/benchmarks/gpu_synapse_spike.json
+new file mode 100644
+index 0000000..d96c050
+--- /dev/null
++++ b/neuromorphic/benchmarks/gpu_synapse_spike.json
+@@ -0,0 +1,52 @@
++{
++  "timestamp": "2026-07-01T09:05:04Z",
++  "system": {
++    "platform": "Linux-6.17.0-35-generic-x86_64-with-glibc2.39",
++    "processor": "x86_64",
++    "python_version": "3.14.5",
++    "numpy_version": "2.5.0"
++  },
++  "gpu_backend_available": true,
++  "results": [
++    {
++      "scale": "small",
++      "n_pre": 2000,
++      "n_post": 2000,
++      "sparsity": 0.02,
++      "fire_rate": 0.05,
++      "nnz": 79218,
++      "cpu_ms_per_call": 0.04075624999870797,
++      "jax_ms_per_call": 1.5284180999998398,
++      "slowdown_factor": 37.50144088448502,
++      "max_abs_diff": 0.0
++    },
++    {
++      "scale": "medium",
++      "n_pre": 20000,
++      "n_post": 20000,
++      "sparsity": 0.01,
++      "fire_rate": 0.05,
++      "nnz": 3980284,
++      "cpu_ms_per_call": 3.2890331499999093,
++      "jax_ms_per_call": 40.20771304999755,
++      "slowdown_factor": 12.224781939336385,
++      "max_abs_diff": 1.430511474609375e-06
++    },
++    {
++      "scale": "large",
++      "n_pre": 200000,
++      "n_post": 200000,
++      "sparsity": 0.0005,
++      "fire_rate": 0.02,
++      "nnz": 19994970,
++      "cpu_ms_per_call": 18.551125150000303,
++      "jax_ms_per_call": 296.0364547000012,
++      "slowdown_factor": 15.957870603875278,
++      "max_abs_diff": 0.0
++    }
++  ],
++  "jax_version": "0.10.2",
++  "jax_devices": [
++    "cpu:0"
++  ]
++}
+\ No newline at end of file
+diff --git a/neuromorphic/pyproject.toml b/neuromorphic/pyproject.toml
+index d9be4e1..25a612b 100644
+--- a/neuromorphic/pyproject.toml
++++ b/neuromorphic/pyproject.toml
+@@ -25,6 +25,13 @@ dev = [
+     # collection time in the neuromorphic-only CI environment.
+     "networkx>=3.2.0",
+ ]
++# Experimental GPU synapse-op backend (issue #135 research spike, see
++# gpu_synapse_ops.py / docs/GPU-SYNAPSE-BACKEND-FEASIBILITY.md). Not a
++# default dependency: jax/jaxlib add ~90MB and are lazy-imported, so the
++# rest of neuromorphic works unmodified without this extra installed.
++gpu = [
++    "jax>=0.4.20",
++]
+ 
+ [tool.setuptools.packages.find]
+ where = ["src"]
+diff --git a/neuromorphic/scripts/benchmark_gpu_synapse.py b/neuromorphic/scripts/benchmark_gpu_synapse.py
+new file mode 100644
+index 0000000..39107f9
+--- /dev/null
++++ b/neuromorphic/scripts/benchmark_gpu_synapse.py
+@@ -0,0 +1,125 @@
++"""
++GPU synapse-op backend benchmark (issue #135 research spike).
++
++Compares SynapseGroup.compute_current's existing scipy CPU path against
++the experimental JAX backend (gpu_synapse_ops.compute_current_jax) at
++representative neuron/synapse counts, and verifies functional equivalence
++at each scale. Results feed docs/GPU-SYNAPSE-BACKEND-FEASIBILITY.md.
++
++This machine has no GPU/CUDA — jax runs on its CPU backend here, so these
++numbers show "JAX-on-CPU vs scipy-on-CPU", not a real GPU comparison. See
++the feasibility doc for how to read that honestly.
++
++Usage:
++    cd neuromorphic && uv run --extra gpu python scripts/benchmark_gpu_synapse.py
++    cd neuromorphic && uv run --extra gpu python scripts/benchmark_gpu_synapse.py --output benchmarks/gpu_synapse.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import platform
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++
++sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
++
++from neuromorphic.gpu_synapse_ops import compute_current_jax, gpu_backend_available
++from neuromorphic.synapses import SynapseGroup
++
++# (n_pre, n_post, sparsity, fire_rate) — chosen to span SynapseGroup.compute_current's
++# own adaptive-strategy thresholds (100K / 10M nnz) so results are meaningful
++# relative to the code being compared against, not arbitrary round numbers.
++SCALES = [
++    ("small", 2_000, 2_000, 0.02, 0.05),      # ~80K nnz — below the 100K CSC-gather threshold
++    ("medium", 20_000, 20_000, 0.01, 0.05),   # ~4M nnz — inside the CSC-gather range
++    ("large", 200_000, 200_000, 0.0005, 0.02),  # ~20M nnz — above the CSC-gather range
++]
++
++
++def _time_calls(fn, calls: int) -> float:
++    t0 = time.perf_counter()
++    for _ in range(calls):
++        fn()
++    return (time.perf_counter() - t0) / calls
++
++
++def run_scale(name, n_pre, n_post, sparsity, fire_rate, calls=20) -> dict:
++    rng = np.random.default_rng(0)
++    group = SynapseGroup(n_pre=n_pre, n_post=n_post, sparsity=sparsity, init_weight=0.3, rng=rng)
++    pre_spikes = rng.random(n_pre) < fire_rate
++
++    cpu_result = group.compute_current(pre_spikes)
++    t_cpu = _time_calls(lambda: group.compute_current(pre_spikes), calls)
++
++    if gpu_backend_available():
++        jax_result = compute_current_jax(group.weights, pre_spikes)  # warmup / jit compile
++        t_jax = _time_calls(lambda: compute_current_jax(group.weights, pre_spikes), calls)
++        max_abs_diff = float(np.max(np.abs(jax_result - cpu_result)))
++    else:
++        t_jax = None
++        max_abs_diff = None
++
++    return {
++        "scale": name,
++        "n_pre": n_pre,
++        "n_post": n_post,
++        "sparsity": sparsity,
++        "fire_rate": fire_rate,
++        "nnz": int(group.weights.nnz),
++        "cpu_ms_per_call": t_cpu * 1e3,
++        "jax_ms_per_call": t_jax * 1e3 if t_jax is not None else None,
++        "slowdown_factor": (t_jax / t_cpu) if t_jax is not None else None,
++        "max_abs_diff": max_abs_diff,
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--output", type=str, default=None, help="JSON output path")
++    parser.add_argument("--calls", type=int, default=20, help="Timed calls per scale")
++    args = parser.parse_args()
++
++    print(f"jax available: {gpu_backend_available()}")
++    if gpu_backend_available():
++        import jax
++        print(f"jax devices: {jax.devices()}")
++    print()
++
++    results = [run_scale(*scale, calls=args.calls) for scale in SCALES]
++
++    print(f"{'scale':<8} {'nnz':>10} {'scipy(ms)':>10} {'jax(ms)':>10} {'slowdown':>9} {'max|diff|':>10}")
++    for r in results:
++        jax_ms = f"{r['jax_ms_per_call']:.3f}" if r["jax_ms_per_call"] is not None else "n/a"
++        slow = f"{r['slowdown_factor']:.1f}x" if r["slowdown_factor"] is not None else "n/a"
++        diff = f"{r['max_abs_diff']:.2e}" if r["max_abs_diff"] is not None else "n/a"
++        print(f"{r['scale']:<8} {r['nnz']:>10} {r['cpu_ms_per_call']:>10.3f} {jax_ms:>10} {slow:>9} {diff:>10}")
++
++    output = {
++        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "system": {
++            "platform": platform.platform(),
++            "processor": platform.processor(),
++            "python_version": platform.python_version(),
++            "numpy_version": np.__version__,
++        },
++        "gpu_backend_available": gpu_backend_available(),
++        "results": results,
++    }
++    if gpu_backend_available():
++        import jax
++        output["jax_version"] = jax.__version__
++        output["jax_devices"] = [str(d) for d in jax.devices()]
++
++    if args.output:
++        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
++        Path(args.output).write_text(json.dumps(output, indent=2))
++        print(f"\nWrote {args.output}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/neuromorphic/src/neuromorphic/gpu_synapse_ops.py b/neuromorphic/src/neuromorphic/gpu_synapse_ops.py
+new file mode 100644
+index 0000000..42ea4ff
+--- /dev/null
++++ b/neuromorphic/src/neuromorphic/gpu_synapse_ops.py
+@@ -0,0 +1,121 @@
++"""Experimental GPU-accelerated CSR synapse ops (issue #135 research spike).
++
++Scope: this module ports ONLY the sparse-dense matrix-vector product in
++``SynapseGroup.compute_current`` (spike propagation) to JAX. STDP/R-STDP/
++BCM/eligibility-trace updates are deliberately NOT ported here — they use
++data-dependent-shape sparse gathering and in-place CSR-data mutation
++(``synapses.py``'s ``_gather_active_synapses`` / ``update_weights_stdp``),
++which fights JAX's static-shape JIT model and would need a substantial
++masked/dense-shadow rewrite to fit. See docs/GPU-SYNAPSE-BACKEND-FEASIBILITY.md
++for the full writeup, including why this module is NOT wired into
++``SynapseGroup`` as a live runtime option: CPU-only benchmarking here found
++it consistently slower than the existing hand-tuned scipy CPU path, so it
++is kept as a standalone, independently-tested module pending real GPU
++hardware validation.
++
++Design intent (per the issue's acceptance criteria):
++- Functional equivalence with the CPU implementation (see test_gpu_synapse_ops.py).
++- "GPU when available, CPU otherwise" comes from JAX's own device model —
++  the same code runs on whatever ``jax.devices()`` resolves to. No hand-rolled
++  CuPy-style try/except-GPU-then-numpy dance is needed.
++- No new hard dependency: jax/jaxlib are only imported inside functions here,
++  never at module import time, so the rest of neuromorphic works unmodified
++  without the optional ``gpu`` extra installed (``pip install .[gpu]``).
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++import numpy as np
++from scipy import sparse
++
++
++def gpu_backend_available() -> bool:
++    """True if jax is importable. Does not imply an actual GPU/TPU device —
++    JAX transparently falls back to its CPU backend when none is visible."""
++    try:
++        import jax  # noqa: F401
++    except ImportError:
++        return False
++    return True
++
++
++def _compute_current_numpy(
++    weights: sparse.csr_matrix,
++    pre_spikes: np.ndarray,
++    pre_output_sign: np.ndarray | None = None,
++) -> np.ndarray:
++    """Plain CPU fallback — the same computation as SynapseGroup.compute_current's
++    default (non-CSC-gather) path, used when jax isn't installed at all."""
++    n_post = weights.shape[0]
++    if weights.nnz == 0:
++        return np.zeros(n_post, dtype=np.float32)
++    if pre_output_sign is not None:
++        spike_vec = pre_spikes.astype(np.float32) * pre_output_sign
++    else:
++        spike_vec = pre_spikes.astype(np.float32)
++    return np.asarray(weights @ spike_vec).flatten().astype(np.float32)
++
++
++def compute_current_jax(
++    weights: sparse.csr_matrix,
++    pre_spikes: np.ndarray,
++    pre_output_sign: np.ndarray | None = None,
++) -> np.ndarray:
++    """JAX sparse matrix-vector product — functional equivalent of
++    SynapseGroup.compute_current's default CSR path.
++
++    Runs on GPU/TPU if jax.devices() resolves one, CPU otherwise — the
++    same code path either way (no separate GPU/CPU implementations to
++    keep in sync). Falls back to the pure-numpy path if jax is not
++    installed, so callers never need their own try/except around this.
++
++    Args:
++        weights: (n_post, n_pre) scipy CSR sparse weight matrix.
++        pre_spikes: boolean/float array (n_pre,) of which pre neurons spiked.
++        pre_output_sign: optional +1/-1 array (n_pre,) for E/I balance.
++
++    Returns:
++        float32 array (n_post,) of input currents — bit-for-bit equivalent
++        (within float32 summation-order tolerance) to the CPU implementation.
++    """
++    if not gpu_backend_available():
++        return _compute_current_numpy(weights, pre_spikes, pre_output_sign)
++
++    import jax.numpy as jnp
++    from jax.experimental import sparse as jsparse
++
++    n_post, n_pre = weights.shape
++    if weights.nnz == 0:
++        return np.zeros(n_post, dtype=np.float32)
++
++    if pre_output_sign is not None:
++        spike_vec = pre_spikes.astype(np.float32) * pre_output_sign
++    else:
++        spike_vec = pre_spikes.astype(np.float32)
++
++    bcoo = jsparse.BCOO.from_scipy_sparse(weights)
++    out = _jit_spmv(bcoo.data, bcoo.indices, jnp.asarray(spike_vec), n_post, n_pre)
++    return np.asarray(out, dtype=np.float32)
++
++
++_JIT_CACHE: dict[tuple[int, int], Any] = {}
++
++
++def _jit_spmv(data, indices, spike_vec, n_post: int, n_pre: int):
++    """JIT-compiled BCOO @ dense-vector matvec, cached per (n_post, n_pre)
++    shape so repeated calls at the same network size reuse the compiled
++    kernel instead of re-tracing every step."""
++    import jax
++    from jax.experimental import sparse as jsparse
++
++    key = (n_post, n_pre)
++    fn = _JIT_CACHE.get(key)
++    if fn is None:
++        def _mv(d, idx, s):
++            m = jsparse.BCOO((d, idx), shape=(n_post, n_pre))
++            return m @ s
++        fn = jax.jit(_mv)
++        _JIT_CACHE[key] = fn
++    return fn(data, indices, spike_vec)
+diff --git a/neuromorphic/tests/test_gpu_synapse_ops.py b/neuromorphic/tests/test_gpu_synapse_ops.py
+new file mode 100644
+index 0000000..c036f22
+--- /dev/null
++++ b/neuromorphic/tests/test_gpu_synapse_ops.py
+@@ -0,0 +1,143 @@
++"""Tests for the experimental GPU synapse-op backend (issue #135 spike).
++
++Covers the acceptance criteria from the issue:
++1. Functional equivalence with the existing CPU implementation
++   (SynapseGroup.compute_current).
++2. (Performance is measured separately — see scripts/benchmark_gpu_synapse.py
++   and docs/GPU-SYNAPSE-BACKEND-FEASIBILITY.md — not asserted in unit tests,
++   since CI hardware has no GPU and timing assertions would be flaky.)
++3. CPU fallback works without GPU hardware, and without jax installed at all.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++from scipy import sparse
++
++from neuromorphic.gpu_synapse_ops import (
++    _compute_current_numpy,
++    compute_current_jax,
++    gpu_backend_available,
++)
++from neuromorphic.synapses import SynapseGroup
++
++pytest.importorskip("jax", reason="jax not installed (optional 'gpu' extra)")
++
++
++def _random_synapse_group(n_pre, n_post, sparsity, seed=0) -> SynapseGroup:
++    rng = np.random.default_rng(seed)
++    return SynapseGroup(
++        n_pre=n_pre, n_post=n_post, sparsity=sparsity, init_weight=0.3, rng=rng,
++    )
++
++
++class TestFunctionalEquivalence:
++    """Criterion 1: spike branch shows functional equivalence with the CPU path."""
++
++    @pytest.mark.parametrize(
++        "n_pre,n_post,sparsity,fire_rate",
++        [
++            (200, 200, 0.05, 0.05),
++            (1000, 500, 0.02, 0.1),
++            (2000, 2000, 0.01, 0.03),
++        ],
++    )
++    def test_matches_cpu_compute_current(self, n_pre, n_post, sparsity, fire_rate):
++        group = _random_synapse_group(n_pre, n_post, sparsity)
++        rng = np.random.default_rng(1)
++        pre_spikes = rng.random(n_pre) < fire_rate
++
++        expected = group.compute_current(pre_spikes)
++        actual = compute_current_jax(group.weights, pre_spikes)
++
++        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
++        assert actual.dtype == np.float32
++
++    def test_matches_cpu_with_ei_sign(self):
++        group = _random_synapse_group(500, 400, 0.03)
++        rng = np.random.default_rng(2)
++        pre_spikes = rng.random(500) < 0.1
++        sign = rng.choice([-1.0, 1.0], size=500).astype(np.float32)
++
++        expected = group.compute_current(pre_spikes, pre_output_sign=sign)
++        actual = compute_current_jax(group.weights, pre_spikes, pre_output_sign=sign)
++
++        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
++
++    def test_no_spikes_returns_zeros(self):
++        group = _random_synapse_group(300, 200, 0.05)
++        pre_spikes = np.zeros(300, dtype=bool)
++
++        actual = compute_current_jax(group.weights, pre_spikes)
++
++        assert actual.shape == (200,)
++        assert np.all(actual == 0.0)
++
++    def test_empty_weights_returns_zeros(self):
++        empty = sparse.csr_matrix((50, 30), dtype=np.float32)
++        pre_spikes = np.ones(30, dtype=bool)
++
++        actual = compute_current_jax(empty, pre_spikes)
++
++        assert actual.shape == (50,)
++        assert np.all(actual == 0.0)
++
++    def test_repeated_calls_reuse_jit_cache_and_stay_correct(self):
++        """The per-shape JIT cache must not leak stale compiled state across
++        different weight *values* at the same (n_post, n_pre) shape."""
++        group = _random_synapse_group(300, 300, 0.05)
++        rng = np.random.default_rng(3)
++        pre_spikes = rng.random(300) < 0.1
++
++        first = compute_current_jax(group.weights, pre_spikes)
++
++        # Mutate weights in-place (same sparsity structure/shape) and re-run —
++        # the cached jit fn is keyed by shape, not by data, so it must still
++        # reflect the new weight values.
++        group.weights.data *= 2.0
++        second = compute_current_jax(group.weights, pre_spikes)
++
++        assert not np.allclose(first, second)
++        np.testing.assert_allclose(second, group.compute_current(pre_spikes), rtol=1e-5, atol=1e-6)
++
++
++class TestCPUFallback:
++    """Criterion 3: CPU fallback operates successfully without GPU hardware."""
++
++    def test_jax_runs_on_cpu_device_in_this_environment(self):
++        """This test environment has no GPU/TPU — confirms jax itself is
++        exercising its CPU backend, not silently skipping computation."""
++        import jax
++        assert all(d.platform == "cpu" for d in jax.devices())
++
++    def test_gpu_backend_available_true_when_jax_installed(self):
++        assert gpu_backend_available() is True
++
++    def test_pure_numpy_fallback_matches_cpu_compute_current(self):
++        """The no-jax-at-all fallback path (_compute_current_numpy) must also
++        stay correct, independent of whether jax happens to be installed."""
++        group = _random_synapse_group(400, 300, 0.04)
++        rng = np.random.default_rng(4)
++        pre_spikes = rng.random(400) < 0.08
++
++        expected = group.compute_current(pre_spikes)
++        actual = _compute_current_numpy(group.weights, pre_spikes)
++
++        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
++
++    def test_compute_current_jax_uses_numpy_fallback_when_backend_unavailable(self, monkeypatch):
++        """Simulates jax not being installed — compute_current_jax must still
++        return a correct result via the numpy fallback, not raise."""
++        import neuromorphic.gpu_synapse_ops as gpu_ops
++
++        monkeypatch.setattr(gpu_ops, "gpu_backend_available", lambda: False)
++
++        group = _random_synapse_group(250, 200, 0.05)
++        rng = np.random.default_rng(5)
++        pre_spikes = rng.random(250) < 0.1
++
++        expected = group.compute_current(pre_spikes)
++        actual = gpu_ops.compute_current_jax(group.weights, pre_spikes)
++
++        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)

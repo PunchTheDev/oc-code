@@ -1,0 +1,460 @@
+diff --git a/crates/engine/src/game/engine_modes.rs b/crates/engine/src/game/engine_modes.rs
+index 9173d07892..d2fe408cdd 100644
+--- a/crates/engine/src/game/engine_modes.rs
++++ b/crates/engine/src/game/engine_modes.rs
+@@ -436,8 +436,26 @@ fn handle_triggered_mode_choice(
+         .pending_trigger
+         .take()
+         .ok_or_else(|| EngineError::InvalidAction("No pending trigger".to_string()))?;
++    // CR 603.2 + CR 109.4: Re-establish the trigger event context for
++    // the duration of mode-target computation. The modal was paused for mode
++    // choice (`trigger_dispatch`) AFTER restoring the context to its pre-dispatch
++    // value, so `state.current_trigger_event` is now unset. A chosen mode body
++    // whose target filter references the triggering event — e.g. Grenzo, Havoc
++    // Raiser's "Goad target creature that player controls" (`ControllerRef::
++    // TriggeringPlayer`) — must resolve "that player" to the damaged player while
++    // its legal targets are computed here, exactly as the dispatch-time
++    // `filter_modes_by_target_legality` did. Without this, the Goad slot finds no
++    // legal target and `build_target_slots_labelled` errors ("No legal targets
++    // available"). Restored on every return path below.
++    let trigger_event_batch = state.pending_trigger_event_batch.clone();
++    let mode_context_snapshot = triggers::push_trigger_event_context(
++        state,
++        trigger.trigger_event.as_ref(),
++        &trigger_event_batch,
++        trigger.subject_match_count,
++    );
+     // CR 700.2 / CR 700.2b: slots + per-mode labels built together (Finding 4).
+-    let (target_slots, mode_labels) = build_target_slots_labelled(
++    let (target_slots, mode_labels) = match build_target_slots_labelled(
+         state,
+         &mode_abilities,
+         &indices,
+@@ -447,7 +465,13 @@ fn handle_triggered_mode_choice(
+         &resolved.context,
+         // CR 107.1b: Triggered abilities don't use a chosen X here.
+         None,
+-    )?;
++    ) {
++        Ok(pair) => pair,
++        Err(err) => {
++            triggers::restore_trigger_event_context(state, mode_context_snapshot);
++            return Err(err);
++        }
++    };
+     let target_constraints = target_constraints_from_modal(&modal);
+ 
+     trigger.ability = resolved;
+@@ -462,21 +486,33 @@ fn handle_triggered_mode_choice(
+             trigger.ability.target_selection_mode,
+             crate::types::ability::TargetSelectionMode::Random
+         ) {
+-            Some(random_select_targets_for_ability(
+-                state,
+-                &target_slots,
+-                &target_constraints,
+-            )?)
++            match random_select_targets_for_ability(state, &target_slots, &target_constraints) {
++                Ok(targets) => Some(targets),
++                Err(err) => {
++                    triggers::restore_trigger_event_context(state, mode_context_snapshot);
++                    return Err(err);
++                }
++            }
+         } else {
+-            auto_select_targets_for_ability(
++            match auto_select_targets_for_ability(
+                 state,
+                 &trigger.ability,
+                 &target_slots,
+                 &target_constraints,
+-            )?
++            ) {
++                Ok(targets) => targets,
++                Err(err) => {
++                    triggers::restore_trigger_event_context(state, mode_context_snapshot);
++                    return Err(err);
++                }
++            }
+         };
+ 
+         if let Some(targets) = resolved_targets {
++            // Targets resolved; the trigger event context is no longer needed
++            // here — the resulting stack entry carries `trigger_event` for the
++            // resolution-time re-establishment in `stack::resolve_top`.
++            triggers::restore_trigger_event_context(state, mode_context_snapshot);
+             let mut resolved = trigger.ability.clone();
+             assign_targets_in_chain(state, &mut resolved, &targets)?;
+             // CR 113.2c + CR 603.2 + CR 603.3b: `finalize_trigger_target_selection`
+@@ -499,16 +535,24 @@ fn handle_triggered_mode_choice(
+                 .pending_trigger
+                 .as_ref()
+                 .expect("pending trigger stored before target selection");
+-            let selection = begin_target_selection_for_ability(
++            let selection = match begin_target_selection_for_ability(
+                 state,
+                 &pending_trigger.ability,
+                 &target_slots,
+                 &target_constraints,
+-            )?;
++            ) {
++                Ok(selection) => selection,
++                Err(err) => {
++                    triggers::restore_trigger_event_context(state, mode_context_snapshot);
++                    return Err(err);
++                }
++            };
+             // CR 601.2c + CR 603.3d + CR 109.5: a targeted "of their choice" trigger
+             // routes target selection to the scoped (upkeep) player, not the source's
+             // controller. Magus is non-modal so this is defensive class-consistency
+             // with the non-modal path in `begin_pending_trigger_target_selection`.
++            // Snapshot all `pending_trigger` reads into locals here so the trigger
++            // event context can be restored (needs `&mut state`) before returning.
+             let player = pending_trigger
+                 .ability
+                 .target_chooser
+@@ -521,10 +565,15 @@ fn handle_triggered_mode_choice(
+                     )
+                 })
+                 .unwrap_or(player);
++            let trigger_controller = pending_trigger.controller;
++            let trigger_event = pending_trigger.trigger_event.clone();
++            // Slot legality computed; the pending `TriggerTargetSelection` carries
++            // `trigger_event` so the per-slot prompt re-establishes the context.
++            triggers::restore_trigger_event_context(state, mode_context_snapshot);
+             return Ok(WaitingFor::TriggerTargetSelection {
+                 player,
+-                trigger_controller: Some(pending_trigger.controller),
+-                trigger_event: pending_trigger.trigger_event.clone(),
++                trigger_controller: Some(trigger_controller),
++                trigger_event,
+                 trigger_events: state.pending_trigger_event_batch.clone(),
+                 target_slots,
+                 mode_labels,
+@@ -535,6 +584,9 @@ fn handle_triggered_mode_choice(
+             });
+         }
+     } else {
++        // No target slots for the chosen mode; the trigger event context is no
++        // longer needed during construction (the resolver re-establishes it).
++        triggers::restore_trigger_event_context(state, mode_context_snapshot);
+         // CR 603.3c: Mode chosen and no further input needed. Entry is already
+         // on the stack (pushed at modal pause-time); mutate its ability with
+         // the resolved mode and clear `pending_trigger_entry` so the resolver
+diff --git a/crates/engine/src/parser/oracle_modal.rs b/crates/engine/src/parser/oracle_modal.rs
+index 7ab8071369..f6b9c94cc0 100644
+--- a/crates/engine/src/parser/oracle_modal.rs
++++ b/crates/engine/src/parser/oracle_modal.rs
+@@ -932,11 +932,28 @@ pub(crate) fn lower_oracle_block(
+             // `GenericEffect` with no target, so without this threading the
+             // "Pick a Perk" mode emits an unresolvable `ParentTarget`.
+             let modal_subject = derive_modal_subject(&triggers);
++            // CR 109.4 + CR 115.1 + CR 506.2: Derive the relative-
++            // player scope the trigger condition establishes (e.g.
++            // `TriggeringPlayer` for a "deals combat damage to a player" trigger)
++            // so a `"that player controls"` / `"that player's library"` anaphor
++            // in a BULLET-LINE mode body resolves to the damaged player, not the
++            // caster. `trigger_line` is the bare trigger condition here (the
++            // modal header was split off as the effect by
++            // `split_triggered_modal_header`), so it is the condition text that
++            // the single-authority scope resolver expects. Without this, bullet-
++            // line modes hit the `unwrap_or(ControllerRef::You)` fallback in
++            // `oracle_target.rs` while the inline `"; or"` form (which threads the
++            // same scope via `try_parse_inline_modal`) resolved correctly — the
++            // two modal surface forms of Grenzo, Havoc Raiser disagreed (#2346).
++            let relative_player_scope = super::oracle_trigger::relative_player_scope_for_condition(
++                &trigger_line.to_lowercase(),
++            );
+             let mut modal_ability = build_modal_ability_with_subject(
+                 AbilityKind::Spell,
+                 &header,
+                 &modes,
+                 modal_subject,
++                relative_player_scope,
+                 host_self_reference,
+             );
+ 
+@@ -1163,16 +1180,32 @@ pub(crate) fn build_modal_ability(
+ ///
+ /// CR 303.4 + CR 702.103: `host_self_reference` propagates the enclosing
+ /// card's typed attachment-host self-reference into modal mode bodies.
++///
++/// CR 109.4 + CR 115.1 + CR 506.2: `relative_player_scope` threads
++/// the trigger condition's player binding (e.g. `TriggeringPlayer` for a "deals
++/// combat damage to a player" trigger) into every mode body so a `"that player
++/// controls"` / `"that player's library"` anaphor resolves to the player the
++/// condition introduced (the damaged player) rather than falling back to the
++/// caster (`ControllerRef::You`). This mirrors the inline `"; or"` modal path
++/// (`try_parse_inline_modal`); both must thread the same scope so bullet-line
++/// and inline modal forms of the same trigger agree (issue #2346).
+ fn build_modal_ability_with_subject(
+     kind: AbilityKind,
+     header: &ModalHeaderAst,
+     modes: &[ModeAst],
+     subject: Option<TargetFilter>,
++    relative_player_scope: Option<crate::types::ability::ControllerRef>,
+     host_self_reference: Option<TargetFilter>,
+ ) -> AbilityDefinition {
+     AbilityDefinition::new(kind, modal_marker_effect(header)).with_modal(
+         build_modal_choice(header, modes),
+-        lower_mode_abilities_with_subject(modes, kind, subject, host_self_reference),
++        lower_mode_abilities_with_scope(
++            modes,
++            kind,
++            subject,
++            relative_player_scope,
++            host_self_reference,
++        ),
+     )
+ }
+ 
+@@ -1313,7 +1346,7 @@ fn lower_mode_abilities_with_subject(
+ /// anaphora resolve to the correct player scope established by the trigger
+ /// condition (e.g. `TriggeringPlayer` for DamageDone triggers).
+ ///
+-/// CR 603.7c: For DamageDone triggers the damaged player is the triggering
++/// For DamageDone triggers the damaged player is the triggering
+ /// player; "that player" in each modal branch must resolve to them, not the
+ /// caster or `ParentTargetController`.
+ pub(crate) fn lower_mode_abilities_with_scope(
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index e8ba32b107..8ac6ea35f5 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -14316,6 +14316,82 @@ mod snapshot_tests;
+ #[path = "oracle_trigger_slicer_control_handoff_tests.rs"]
+ mod slicer_control_handoff_tests;
+ 
++/// Issue #2346 (bullet-line modal form): Grenzo, Havoc Raiser's printed Oracle
++/// text lists its modes as bullet lines (`\n\u{2022} ...`), which route through
++/// the `TriggeredModal` block path rather than the inline `"; or"` path. "that
++/// player" in each mode body must scope to the damaged player (`TriggeringPlayer`),
++/// not Grenzo's controller (`You`).
++#[cfg(test)]
++mod grenzo_bullet_modal_tests {
++    use crate::parser::oracle::parse_oracle_text;
++    use crate::types::ability::{AbilityDefinition, ControllerRef, Effect, TargetFilter};
++    use crate::types::TriggerMode;
++
++    /// Walk a chained `AbilityDefinition` collecting one effect per node (parent
++    /// then each nested `sub_ability`).
++    fn flatten_effects(def: &AbilityDefinition) -> Vec<&Effect> {
++        let mut out = Vec::new();
++        let mut node = Some(def);
++        while let Some(d) = node {
++            out.push(&*d.effect);
++            node = d.sub_ability.as_deref();
++        }
++        out
++    }
++
++    /// For a "deals combat damage to a player" trigger, the damaged player is
++    /// the triggering player; "that player controls" / "that player's library"
++    /// in the modes must resolve to them.
++    #[test]
++    fn damage_done_bullet_modal_uses_triggering_player_for_that_player() {
++        let parsed = parse_oracle_text(
++            "Whenever a creature you control deals combat damage to a player, choose one \u{2014}\n\u{2022} Goad target creature that player controls.\n\u{2022} Exile the top card of that player's library.",
++            "Grenzo, Havoc Raiser",
++            &[],
++            &["Creature".into()],
++            &["Goblin".into()],
++        );
++        let trigger = parsed
++            .triggers
++            .iter()
++            .find(|t| matches!(t.mode, TriggerMode::DamageDone))
++            .expect("DamageDone trigger must parse");
++        let execute = trigger.execute.as_ref().expect("execute must be Some");
++        let mode_abilities = &execute.mode_abilities;
++        assert_eq!(mode_abilities.len(), 2, "must have two modes");
++
++        let mode0_effects = flatten_effects(&mode_abilities[0]);
++        let goad_controller = mode0_effects
++            .iter()
++            .find_map(|e| match e {
++                Effect::Goad {
++                    target: TargetFilter::Typed(tf),
++                } => Some(tf.controller.clone()),
++                _ => None,
++            })
++            .unwrap_or_else(|| panic!("mode 0 must contain Goad, got {mode0_effects:?}"));
++        assert_eq!(
++            goad_controller,
++            Some(ControllerRef::TriggeringPlayer),
++            "BULLET Goad controller must be TriggeringPlayer (damaged player), got {goad_controller:?}",
++        );
++
++        let mode1_effects = flatten_effects(&mode_abilities[1]);
++        let exile_player = mode1_effects
++            .iter()
++            .find_map(|e| match e {
++                Effect::ExileTop { player, .. } => Some(player.clone()),
++                _ => None,
++            })
++            .unwrap_or_else(|| panic!("mode 1 must contain ExileTop, got {mode1_effects:?}"));
++        assert_eq!(
++            exile_player,
++            TargetFilter::TriggeringPlayer,
++            "BULLET ExileTop player must be TriggeringPlayer (damaged player), got {exile_player:?}",
++        );
++    }
++}
++
+ #[cfg(test)]
+ #[path = "oracle_trigger_controlled_chosen_type_enters_tests.rs"]
+ mod controlled_chosen_type_enters_tests;
+diff --git a/crates/engine/tests/grenzo_havoc_raiser_modal_2346.rs b/crates/engine/tests/grenzo_havoc_raiser_modal_2346.rs
+new file mode 100644
+index 0000000000..ca0940e2ea
+--- /dev/null
++++ b/crates/engine/tests/grenzo_havoc_raiser_modal_2346.rs
+@@ -0,0 +1,148 @@
++//! Grenzo, Havoc Raiser (issue #2346) — runtime proof that the bullet-line
++//! triggered-modal "that player" anaphor binds to the DAMAGED player.
++//!
++//! Grenzo's printed Oracle text:
++//!   "Whenever a creature you control deals combat damage to a player, choose
++//!    one —
++//!    • Goad target creature that player controls.
++//!    • Exile the top card of that player's library. ..."
++//!
++//! Those bullet modes route through the `TriggeredModal` block path (not the
++//! inline `"; or"` path). Before the fix, "that player controls" fell back to
++//! `ControllerRef::You` (Grenzo's controller), so the Goad mode could only
++//! target creatures the ACTIVE player controlled — the wrong player.
++//!
++//! CR 109.4 + CR 115.1 + CR 506.2: a "deals combat damage to a
++//! player" trigger establishes the damaged player as the triggering player;
++//! "that player controls" must resolve to them. This test fires the trigger
++//! by having P0's attacker deal combat damage to P1, selects the Goad mode,
++//! and asserts the only legal Goad targets are creatures P1 (the damaged
++//! player) controls — never P0's.
++//!
++//! Revert-fail: with the scope fix reverted, the Goad slot's legal targets are
++//! P0's creature (the bug), so the "no P0 creature is legal / P1's creature is
++//! legal" assertions fail.
++
++use engine::game::combat::AttackTarget;
++use engine::game::scenario::GameScenario;
++use engine::types::ability::TargetRef;
++use engine::types::actions::GameAction;
++use engine::types::game_state::WaitingFor;
++use engine::types::phase::Phase;
++use engine::types::player::PlayerId;
++
++const P0: PlayerId = PlayerId(0);
++const P1: PlayerId = PlayerId(1);
++
++const GRENZO_ORACLE: &str = "Whenever a creature you control deals combat damage to a player, choose one \u{2014}\n\u{2022} Goad target creature that player controls.\n\u{2022} Exile the top card of that player's library.";
++
++#[test]
++fn grenzo_bullet_modal_goad_targets_damaged_players_creatures() {
++    let mut scenario = GameScenario::new_n_player(2, 7);
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // P0 controls Grenzo (the trigger source) plus an attacker.
++    scenario.add_creature_from_oracle(P0, "Grenzo, Havoc Raiser", 2, 2, GRENZO_ORACLE);
++    let attacker = scenario.add_creature(P0, "Goblin Raider", 2, 2).id();
++    // P0 ALSO controls a creature — the pre-fix bug would make THIS the only
++    // legal Goad target (controller == You).
++    let p0_other = scenario.add_creature(P0, "Caster Sidekick", 1, 1).id();
++    // P1 (the player who will be damaged) controls TWO creatures — the Goad mode
++    // must be able to target them. Two are used so the engine surfaces a real
++    // target-selection prompt (a single legal target auto-resolves).
++    let p1_creature = scenario.add_creature(P1, "Foe Bear", 2, 2).id();
++    let p1_creature_b = scenario.add_creature(P1, "Foe Wolf", 3, 1).id();
++    // Library top so the (unused) exile mode would have something to exile.
++    scenario.with_library_top(P1, &["Top Card"]);
++
++    let mut runner = scenario.build();
++
++    // Advance to declare-attackers and swing at P1.
++    runner.advance_to_combat();
++    runner
++        .declare_attackers(&[(attacker, AttackTarget::Player(P1))])
++        .expect("declare attackers");
++
++    // Drive forward: combat damage to P1 fires Grenzo's trigger. The trigger
++    // controller (P0) is prompted to order triggers, choose the mode, then
++    // select a target. Select the Goad mode (index 0) and capture the legal
++    // targets the engine offers for the Goad slot.
++    let mut goad_legal_targets: Option<Vec<TargetRef>> = None;
++    for _ in 0..200 {
++        match runner.state().waiting_for.clone() {
++            WaitingFor::OrderTriggers { .. } => {
++                runner
++                    .act(GameAction::OrderTriggers { order: vec![0] })
++                    .or_else(|_| runner.act(GameAction::OrderTriggers { order: vec![] }))
++                    .expect("order triggers");
++            }
++            WaitingFor::AbilityModeChoice { .. } | WaitingFor::ModeChoice { .. } => {
++                runner
++                    .act(GameAction::SelectModes { indices: vec![0] })
++                    .expect("select Goad mode");
++            }
++            WaitingFor::TriggerTargetSelection {
++                target_slots,
++                selection,
++                ..
++            }
++            | WaitingFor::TargetSelection {
++                target_slots,
++                selection,
++                ..
++            } => {
++                // The current slot's legal targets are the discriminating proof.
++                let slot = target_slots
++                    .get(selection.current_slot)
++                    .expect("a current target slot");
++                goad_legal_targets = Some(slot.legal_targets.clone());
++                break;
++            }
++            WaitingFor::Priority { .. } => {
++                if runner.act(GameAction::PassPriority).is_err() {
++                    break;
++                }
++            }
++            WaitingFor::DeclareBlockers { .. } => {
++                runner
++                    .act(GameAction::DeclareBlockers {
++                        assignments: vec![],
++                    })
++                    .expect("no blocks");
++            }
++            _ => break,
++        }
++    }
++
++    let legal = goad_legal_targets
++        .expect("Grenzo's Goad mode must reach a target-selection prompt after combat damage");
++
++    let legal_objects: Vec<_> = legal
++        .iter()
++        .filter_map(|t| match t {
++            TargetRef::Object(id) => Some(*id),
++            TargetRef::Player(_) => None,
++        })
++        .collect();
++
++    // The damaged player (P1) is "that player"; only their creatures
++    // are legal Goad targets.
++    assert!(
++        legal_objects.contains(&p1_creature) && legal_objects.contains(&p1_creature_b),
++        "both of P1's creatures (the damaged player's) must be legal Goad targets, got {legal_objects:?}",
++    );
++    assert!(
++        !legal_objects.contains(&p0_other),
++        "P0's creature must NOT be a legal Goad target — 'that player' is the damaged player (P1), not Grenzo's controller (revert-fail proof), got {legal_objects:?}",
++    );
++
++    // Stronger: every legal Goad object is controlled by P1, none by P0.
++    for id in &legal_objects {
++        let controller = runner.state().objects.get(id).map(|o| o.controller);
++        assert_eq!(
++            controller,
++            Some(P1),
++            "every legal Goad target must be controlled by the damaged player P1, object {id:?} controller {controller:?}",
++        );
++    }
++}

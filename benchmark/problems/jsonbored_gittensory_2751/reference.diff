@@ -1,0 +1,399 @@
+diff --git a/packages/gittensory-miner/lib/portfolio-queue.d.ts b/packages/gittensory-miner/lib/portfolio-queue.d.ts
+new file mode 100644
+index 000000000..a79470af9
+--- /dev/null
++++ b/packages/gittensory-miner/lib/portfolio-queue.d.ts
+@@ -0,0 +1,40 @@
++export type QueueStatus = "queued" | "in_progress" | "done";
++
++export type QueueEntry = {
++  repoFullName: string;
++  identifier: string;
++  priority: number;
++  status: QueueStatus;
++  enqueuedAt: string;
++};
++
++export type EnqueueItem = {
++  repoFullName: string;
++  identifier: string;
++  priority?: number;
++};
++
++export type PortfolioQueueStore = {
++  dbPath: string;
++  enqueue(item: EnqueueItem): QueueEntry;
++  dequeueNext(): QueueEntry | null;
++  listQueue(repoFullName?: string): QueueEntry[];
++  markDone(repoFullName: string, identifier: string): QueueEntry | null;
++  close(): void;
++};
++
++export const QUEUE_STATUSES: readonly QueueStatus[];
++
++export function resolvePortfolioQueueDbPath(env?: Record<string, string | undefined>): string;
++
++export function initPortfolioQueueStore(dbPath?: string): PortfolioQueueStore;
++
++export function enqueue(item: EnqueueItem): QueueEntry;
++
++export function dequeueNext(): QueueEntry | null;
++
++export function listQueue(repoFullName?: string): QueueEntry[];
++
++export function markDone(repoFullName: string, identifier: string): QueueEntry | null;
++
++export function closeDefaultPortfolioQueueStore(): void;
+diff --git a/packages/gittensory-miner/lib/portfolio-queue.js b/packages/gittensory-miner/lib/portfolio-queue.js
+new file mode 100644
+index 000000000..09181edfd
+--- /dev/null
++++ b/packages/gittensory-miner/lib/portfolio-queue.js
+@@ -0,0 +1,192 @@
++import { chmodSync, mkdirSync } from "node:fs";
++import { homedir } from "node:os";
++import { dirname, join } from "node:path";
++import { DatabaseSync } from "node:sqlite";
++
++// The miner's local portfolio/queue store (#2292): a 100% client-side, prioritized backlog of candidate work
++// items across every repo the miner has been pointed at ("what should I look at next, across everything I'm
++// tracking"). The database only lives on this machine; this module never uploads, syncs, or phones home with its
++// contents. The `priority` field is a PLACEHOLDER numeric input in this foundation phase — later phases populate
++// it from the extracted reward-risk/scoring modules in `gittensory-engine`; it is not invented here.
++
++export const QUEUE_STATUSES = Object.freeze(["queued", "in_progress", "done"]);
++
++const defaultDbFileName = "portfolio-queue.sqlite3";
++let defaultPortfolioQueueStore = null;
++
++export function resolvePortfolioQueueDbPath(env = process.env) {
++  const explicitPath = typeof env.GITTENSORY_MINER_PORTFOLIO_QUEUE_DB === "string"
++    ? env.GITTENSORY_MINER_PORTFOLIO_QUEUE_DB.trim()
++    : "";
++  if (explicitPath) return explicitPath;
++
++  const explicitConfigDir = typeof env.GITTENSORY_MINER_CONFIG_DIR === "string"
++    ? env.GITTENSORY_MINER_CONFIG_DIR.trim()
++    : "";
++  if (explicitConfigDir) return join(explicitConfigDir, defaultDbFileName);
++
++  const configHome = typeof env.XDG_CONFIG_HOME === "string" && env.XDG_CONFIG_HOME.trim()
++    ? env.XDG_CONFIG_HOME.trim()
++    : join(homedir(), ".config");
++  return join(configHome, "gittensory-miner", defaultDbFileName);
++}
++
++function normalizeDbPath(dbPath) {
++  const raw = dbPath ?? resolvePortfolioQueueDbPath();
++  if (typeof raw !== "string" || !raw.trim()) throw new Error("invalid_portfolio_queue_db_path");
++  return raw.trim();
++}
++
++function normalizeRepoFullName(repoFullName) {
++  if (typeof repoFullName !== "string") throw new Error("invalid_repo_full_name");
++  const trimmed = repoFullName.trim();
++  const [owner, repo, extra] = trimmed.split("/");
++  if (!owner || !repo || extra !== undefined) throw new Error("invalid_repo_full_name");
++  return `${owner}/${repo}`;
++}
++
++function normalizeIdentifier(identifier) {
++  if (typeof identifier !== "string") throw new Error("invalid_identifier");
++  const trimmed = identifier.trim();
++  if (!trimmed) throw new Error("invalid_identifier");
++  return trimmed;
++}
++
++/** Priority is a placeholder numeric input; an omitted priority defaults to 0, a non-finite one is rejected. */
++function normalizePriority(priority) {
++  if (priority === undefined) return 0;
++  if (typeof priority !== "number" || !Number.isFinite(priority)) throw new Error("invalid_priority");
++  return priority;
++}
++
++function rowToEntry(row) {
++  return {
++    repoFullName: row.repo_full_name,
++    identifier: row.identifier,
++    priority: row.priority,
++    status: row.status,
++    enqueuedAt: row.enqueued_at,
++  };
++}
++
++/**
++ * Opens the local portfolio/queue store, creating the table on first use. Rows are ordered highest-priority-first
++ * with an insertion-order tie-break: `priority DESC, enqueued_at ASC, rowid ASC` — the implicit `rowid` guarantees
++ * FIFO order even when two items share a priority AND an `enqueued_at` timestamp. (#2292)
++ */
++export function initPortfolioQueueStore(dbPath = resolvePortfolioQueueDbPath()) {
++  const resolvedPath = normalizeDbPath(dbPath);
++  // The store is a persistent local file; the special in-memory path (':memory:') has no file to create or chmod.
++  if (resolvedPath !== ":memory:") {
++    mkdirSync(dirname(resolvedPath), { recursive: true, mode: 0o700 });
++  }
++  const db = new DatabaseSync(resolvedPath);
++  if (resolvedPath !== ":memory:") chmodSync(resolvedPath, 0o600);
++  // Wait (rather than fail) for a concurrent writer's lock so two queue instances on the same file serialize.
++  db.exec("PRAGMA busy_timeout = 5000");
++  db.exec(`
++    CREATE TABLE IF NOT EXISTS miner_portfolio_queue (
++      repo_full_name TEXT NOT NULL,
++      identifier TEXT NOT NULL,
++      priority REAL NOT NULL DEFAULT 0,
++      status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'in_progress', 'done')),
++      enqueued_at TEXT NOT NULL,
++      PRIMARY KEY (repo_full_name, identifier)
++    )
++  `);
++
++  // `rowid` is a stable, unique key assigned once at first insert (re-enqueue updates in place, never re-inserts),
++  // so it is a deterministic total-order tie-break: two items sharing a priority AND an `enqueued_at` timestamp
++  // still order by insertion.
++  const ORDER = "ORDER BY priority DESC, enqueued_at ASC, rowid ASC";
++  // Re-enqueueing an already-tracked item re-activates it IN PLACE: refresh its (placeholder) priority and reset it
++  // to 'queued', but KEEP the original `enqueued_at` and `rowid` so it holds its existing FIFO position rather than
++  // jumping the queue. (Restamping `enqueued_at` would be inconsistent — the fixed `rowid` still pins the old
++  // position whenever timestamps collide — so position is deliberately preserved instead.)
++  const enqueueStatement = db.prepare(`
++    INSERT INTO miner_portfolio_queue (repo_full_name, identifier, priority, status, enqueued_at)
++    VALUES (?, ?, ?, 'queued', ?)
++    ON CONFLICT(repo_full_name, identifier) DO UPDATE SET
++      priority = excluded.priority,
++      status = 'queued'
++  `);
++  const getStatement = db.prepare(
++    "SELECT * FROM miner_portfolio_queue WHERE repo_full_name = ? AND identifier = ?",
++  );
++  // Claim the highest-priority queued item ATOMICALLY: one UPDATE selects the ordered top row in a subquery and
++  // flips it to 'in_progress', RETURNING it — so two processes sharing the file can't both claim the same row (a
++  // separate SELECT-then-UPDATE would race).
++  const dequeueStatement = db.prepare(`
++    UPDATE miner_portfolio_queue SET status = 'in_progress'
++    WHERE rowid = (
++      SELECT rowid FROM miner_portfolio_queue WHERE status = 'queued' ${ORDER} LIMIT 1
++    )
++    RETURNING *
++  `);
++  const setStatusStatement = db.prepare(
++    "UPDATE miner_portfolio_queue SET status = ? WHERE repo_full_name = ? AND identifier = ?",
++  );
++  const listAllStatement = db.prepare(`SELECT * FROM miner_portfolio_queue ${ORDER}`);
++  const listRepoStatement = db.prepare(
++    `SELECT * FROM miner_portfolio_queue WHERE repo_full_name = ? ${ORDER}`,
++  );
++
++  return {
++    dbPath: resolvedPath,
++    enqueue(item) {
++      const repoFullName = normalizeRepoFullName(item?.repoFullName);
++      const identifier = normalizeIdentifier(item?.identifier);
++      const priority = normalizePriority(item?.priority);
++      const enqueuedAt = new Date().toISOString();
++      enqueueStatement.run(repoFullName, identifier, priority, enqueuedAt);
++      return rowToEntry(getStatement.get(repoFullName, identifier));
++    },
++    dequeueNext() {
++      const row = dequeueStatement.get();
++      return row ? rowToEntry(row) : null;
++    },
++    listQueue(repoFullName) {
++      const rows = repoFullName === undefined
++        ? listAllStatement.all()
++        : listRepoStatement.all(normalizeRepoFullName(repoFullName));
++      return rows.map(rowToEntry);
++    },
++    markDone(repoFullName, identifier) {
++      const normalizedRepo = normalizeRepoFullName(repoFullName);
++      const normalizedIdentifier = normalizeIdentifier(identifier);
++      setStatusStatement.run("done", normalizedRepo, normalizedIdentifier);
++      const row = getStatement.get(normalizedRepo, normalizedIdentifier);
++      return row ? rowToEntry(row) : null;
++    },
++    close() {
++      db.close();
++    },
++  };
++}
++
++function getDefaultPortfolioQueueStore() {
++  defaultPortfolioQueueStore ??= initPortfolioQueueStore();
++  return defaultPortfolioQueueStore;
++}
++
++export function enqueue(item) {
++  return getDefaultPortfolioQueueStore().enqueue(item);
++}
++
++export function dequeueNext() {
++  return getDefaultPortfolioQueueStore().dequeueNext();
++}
++
++export function listQueue(repoFullName) {
++  return getDefaultPortfolioQueueStore().listQueue(repoFullName);
++}
++
++export function markDone(repoFullName, identifier) {
++  return getDefaultPortfolioQueueStore().markDone(repoFullName, identifier);
++}
++
++export function closeDefaultPortfolioQueueStore() {
++  if (!defaultPortfolioQueueStore) return;
++  defaultPortfolioQueueStore.close();
++  defaultPortfolioQueueStore = null;
++}
+diff --git a/packages/gittensory-miner/package.json b/packages/gittensory-miner/package.json
+index f1c77d297..a6a844e6e 100644
+--- a/packages/gittensory-miner/package.json
++++ b/packages/gittensory-miner/package.json
+@@ -31,7 +31,7 @@
+     "lib"
+   ],
+   "scripts": {
+-    "build": "node --check bin/gittensory-miner.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/update-check.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/claim-ledger.js"
++    "build": "node --check bin/gittensory-miner.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/update-check.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/claim-ledger.js && node --check lib/portfolio-queue.js"
+   },
+   "dependencies": {
+     "@jsonbored/gittensory-engine": "0.1.0"
+diff --git a/test/unit/miner-portfolio-queue.test.ts b/test/unit/miner-portfolio-queue.test.ts
+new file mode 100644
+index 000000000..2470e88ec
+--- /dev/null
++++ b/test/unit/miner-portfolio-queue.test.ts
+@@ -0,0 +1,136 @@
++import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  QUEUE_STATUSES,
++  closeDefaultPortfolioQueueStore,
++  initPortfolioQueueStore,
++  resolvePortfolioQueueDbPath,
++} from "../../packages/gittensory-miner/lib/portfolio-queue.js";
++
++const roots: string[] = [];
++const stores: Array<{ close(): void }> = [];
++
++function tempStore() {
++  const root = mkdtempSync(join(tmpdir(), "gittensory-miner-portfolio-"));
++  roots.push(root);
++  const store = initPortfolioQueueStore(join(root, "nested", "portfolio-queue.sqlite3"));
++  stores.push(store);
++  return store;
++}
++
++afterEach(() => {
++  for (const store of stores.splice(0)) store.close();
++  closeDefaultPortfolioQueueStore();
++  vi.useRealTimers();
++  vi.unstubAllEnvs();
++  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
++});
++
++describe("gittensory-miner portfolio/queue store (#2292)", () => {
++  it("exposes the frozen status vocabulary", () => {
++    expect(QUEUE_STATUSES).toEqual(["queued", "in_progress", "done"]);
++    expect(Object.isFrozen(QUEUE_STATUSES)).toBe(true);
++  });
++
++  it("resolves the DB path from env override, miner config dir, XDG config, then the home default", () => {
++    expect(resolvePortfolioQueueDbPath({ GITTENSORY_MINER_PORTFOLIO_QUEUE_DB: "/custom/q.sqlite3" })).toBe(
++      "/custom/q.sqlite3",
++    );
++    expect(resolvePortfolioQueueDbPath({ GITTENSORY_MINER_CONFIG_DIR: "/custom/config" })).toBe(
++      "/custom/config/portfolio-queue.sqlite3",
++    );
++    expect(resolvePortfolioQueueDbPath({ XDG_CONFIG_HOME: "/xdg" })).toBe(
++      "/xdg/gittensory-miner/portfolio-queue.sqlite3",
++    );
++    expect(resolvePortfolioQueueDbPath({})).toMatch(/\/\.config\/gittensory-miner\/portfolio-queue\.sqlite3$/);
++  });
++
++  it("creates the SQLite file with owner-only permissions and reads empty before any write", () => {
++    const store = tempStore();
++    expect(existsSync(store.dbPath)).toBe(true);
++    expect(statSync(store.dbPath).mode & 0o077).toBe(0);
++    expect(store.listQueue()).toEqual([]);
++    expect(store.dequeueNext()).toBeNull(); // empty queue → null branch
++  });
++
++  it("defaults an omitted priority to 0 and enqueues as 'queued'", () => {
++    const entry = tempStore().enqueue({ repoFullName: "o/a", identifier: "x" });
++    expect(entry).toMatchObject({ repoFullName: "o/a", identifier: "x", priority: 0, status: "queued" });
++    expect(typeof entry.enqueuedAt).toBe("string");
++  });
++
++  it("dequeues highest-priority first, then by insertion order within a priority band", () => {
++    // Freeze the clock so same-priority items share enqueued_at — proving the rowid FIFO tie-break, not a timestamp.
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date("2026-07-03T00:00:00Z"));
++    const store = tempStore();
++    store.enqueue({ repoFullName: "o/a", identifier: "1", priority: 1 });
++    store.enqueue({ repoFullName: "o/a", identifier: "2", priority: 3 });
++    store.enqueue({ repoFullName: "o/a", identifier: "3", priority: 2 });
++    store.enqueue({ repoFullName: "o/a", identifier: "4", priority: 3 }); // ties #2 on priority + timestamp
++
++    expect(store.dequeueNext()?.identifier).toBe("2"); // p3, enqueued first
++    expect(store.dequeueNext()?.identifier).toBe("4"); // p3, enqueued second → rowid tie-break
++    expect(store.dequeueNext()?.identifier).toBe("3"); // p2
++    const last = store.dequeueNext();
++    expect(last).toMatchObject({ identifier: "1", status: "in_progress" }); // claimed
++    expect(store.dequeueNext()).toBeNull(); // nothing left queued → null branch
++  });
++
++  it("markDone excludes an item from future dequeueNext, and returns null for a missing item", () => {
++    const store = tempStore();
++    store.enqueue({ repoFullName: "o/a", identifier: "keep", priority: 1 });
++    store.enqueue({ repoFullName: "o/a", identifier: "skip", priority: 5 });
++    expect(store.markDone("o/a", "skip")?.status).toBe("done");
++    expect(store.dequeueNext()?.identifier).toBe("keep"); // higher-priority 'skip' is done → not returned
++    expect(store.markDone("o/a", "missing")).toBeNull(); // no such row → null branch
++  });
++
++  it("isolates listQueue by repo and lists everything when unfiltered", () => {
++    const store = tempStore();
++    store.enqueue({ repoFullName: "o/a", identifier: "1", priority: 1 });
++    store.enqueue({ repoFullName: "o/b", identifier: "1", priority: 2 });
++    store.enqueue({ repoFullName: "o/a", identifier: "2", priority: 3 });
++    expect(store.listQueue("o/a").map((entry) => entry.identifier)).toEqual(["2", "1"]); // priority DESC
++    expect(store.listQueue("o/b").map((entry) => entry.repoFullName)).toEqual(["o/b"]);
++    expect(store.listQueue().length).toBe(3);
++  });
++
++  it("re-enqueue re-activates a done item and refreshes its placeholder priority", () => {
++    const store = tempStore();
++    store.enqueue({ repoFullName: "o/a", identifier: "1", priority: 1 });
++    store.markDone("o/a", "1");
++    expect(store.dequeueNext()).toBeNull(); // done → nothing queued
++    const requeued = store.enqueue({ repoFullName: "o/a", identifier: "1", priority: 9 });
++    expect(requeued).toMatchObject({ status: "queued", priority: 9 });
++    expect(store.dequeueNext()?.identifier).toBe("1"); // re-queued → dequeuable again
++  });
++
++  it("re-enqueue keeps an item's FIFO position (no queue-jumping) even when timestamps collide", () => {
++    // Freeze the clock so A and B share an enqueued_at — the case where a restamp-vs-rowid inconsistency would show.
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date("2026-07-03T00:00:00Z"));
++    const store = tempStore();
++    store.enqueue({ repoFullName: "o/a", identifier: "A", priority: 1 });
++    store.enqueue({ repoFullName: "o/a", identifier: "B", priority: 1 });
++    store.enqueue({ repoFullName: "o/a", identifier: "A", priority: 1 }); // re-enqueue A: must stay in place, not move
++    expect(store.listQueue("o/a").map((entry) => entry.identifier)).toEqual(["A", "B"]);
++    expect(store.dequeueNext()?.identifier).toBe("A");
++    expect(store.dequeueNext()?.identifier).toBe("B");
++  });
++
++  it("rejects malformed inputs across the shared validation contract (enqueue, listQueue, markDone)", () => {
++    const store = tempStore();
++    expect(() => store.enqueue({ repoFullName: "no-slash", identifier: "1" })).toThrow("invalid_repo_full_name");
++    expect(() => store.enqueue({ repoFullName: "o/a", identifier: "  " })).toThrow("invalid_identifier");
++    expect(() => store.enqueue({ repoFullName: "o/a", identifier: "1", priority: Number.NaN })).toThrow(
++      "invalid_priority",
++    );
++    // listQueue and markDone enforce the same repo/identifier validation as enqueue.
++    expect(() => store.listQueue("no-slash")).toThrow("invalid_repo_full_name");
++    expect(() => store.markDone("no-slash", "1")).toThrow("invalid_repo_full_name");
++    expect(() => store.markDone("o/a", "  ")).toThrow("invalid_identifier");
++  });
++});
