@@ -1,0 +1,126 @@
+diff --git a/attention/hybrid.py b/attention/hybrid.py
+index 6c07007..c5d8282 100644
+--- a/attention/hybrid.py
++++ b/attention/hybrid.py
+@@ -161,10 +161,25 @@ def correlation_spectral_global_mix(
+         kernel = kernel * decay.view(1, 1, -1)
+         kernel = kernel / kernel.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+ 
+-    vf = torch.fft.fft(v_work, dim=-2)
+-    kernel_f = torch.fft.fft(kernel, dim=-1)[..., None]
+-    mixed = vf * kernel_f
+-    out = torch.fft.ifft(mixed, dim=-2).real
++    if causal:
++        # A circular convolution computes out[t] = sum_l kernel[l] * v[(t-l) % seq],
++        # so every lag l > t wraps onto v[seq + t - l] -- a FUTURE token. Masking
++        # far lags above does not prevent that. Zero-pad to 2*seq so the FFT
++        # computes a LINEAR convolution and only lags l <= t contribute.
++        length = 2 * seq
++        vf = torch.fft.fft(v_work, n=length, dim=-2)
++        kernel_f = torch.fft.fft(kernel, n=length, dim=-1)[..., None]
++        out = torch.fft.ifft(vf * kernel_f, dim=-2).real[..., :seq, :]
++        # Only the first t+1 taps land on real tokens, so renormalize by the
++        # kernel mass actually applied at t -- keeping each output a convex
++        # combination of the visible past (cf. _pooled_landmarks' denom).
++        mass = torch.cumsum(kernel, dim=-1).clamp_min(1e-12)[..., None]
++        out = out / mass
++    else:
++        # Non-causal: wraparound is intentional (a global circular mixer).
++        vf = torch.fft.fft(v_work, dim=-2)
++        kernel_f = torch.fft.fft(kernel, dim=-1)[..., None]
++        out = torch.fft.ifft(vf * kernel_f, dim=-2).real
+     return out.to(v.dtype)
+ 
+ 
+diff --git a/tests/test_attention_playground.py b/tests/test_attention_playground.py
+index dc5f238..65d37a1 100644
+--- a/tests/test_attention_playground.py
++++ b/tests/test_attention_playground.py
+@@ -134,6 +134,87 @@ def test_correlation_spectral_global_mix_preserves_shape_and_finiteness():
+     assert torch.isfinite(out).all()
+ 
+ 
++def _corr_sample(seq, dim=4, seed=0):
++    torch.manual_seed(seed)
++    return tuple(torch.randn(1, 2, seq, dim, dtype=torch.float64) for _ in range(3))
++
++
++def test_correlation_spectral_global_mix_causal_does_not_see_the_future():
++    """Regression for #154: the causal branch used a *circular* FFT convolution,
++    so lag l > t wrapped onto v[seq + t - l] -- a future token. Perturbing only
++    the last token of V must leave every earlier output untouched."""
++    if _skip_if_no_torch():
++        return
++    seq = 16
++    q, k, v = _corr_sample(seq, seed=0)
++    bumped = v.clone()
++    bumped[:, :, -1, :] += 100.0            # only the future-most token
++
++    for freq_decay in (0.0, 0.7):
++        base = correlation_spectral_global_mix(
++            q, k, v, causal=True, freq_decay=freq_decay)
++        moved = correlation_spectral_global_mix(
++            q, k, bumped, causal=True, freq_decay=freq_decay)
++        # every position before the last must be stable up to fp round-off
++        assert (moved - base)[:, :, :-1, :].abs().max() < 1e-9, freq_decay
++        # ...and the last position *must* react, or the kernel is degenerate
++        assert (moved - base)[:, :, -1, :].abs().max() > 1e-6, freq_decay
++
++
++def test_correlation_spectral_global_mix_causal_prefix_depends_only_on_prefix():
++    """out[:cut] must be unchanged when the tail of V is replaced entirely."""
++    if _skip_if_no_torch():
++        return
++    seq, cut = 16, 6
++    q, k, v = _corr_sample(seq, seed=1)
++    v2 = v.clone()
++    v2[:, :, cut:, :] = torch.randn_like(v2[:, :, cut:, :])
++    a = correlation_spectral_global_mix(q, k, v, causal=True)
++    b = correlation_spectral_global_mix(q, k, v2, causal=True)
++    assert (a - b)[:, :, :cut, :].abs().max() < 1e-9
++
++
++def test_correlation_spectral_global_mix_causal_preserves_constant_v():
++    """Each causal output is a convex combination of the visible past, so a
++    constant V must come back unchanged (no shrink from the zero padding)."""
++    if _skip_if_no_torch():
++        return
++    seq = 12
++    q, k, _ = _corr_sample(seq, seed=2)
++    v = torch.full((1, 2, seq, 4), 3.5, dtype=torch.float64)
++    out = correlation_spectral_global_mix(q, k, v, causal=True)
++    assert (out - 3.5).abs().max() < 1e-9
++
++
++def test_correlation_spectral_global_mix_noncausal_still_wraps():
++    """The non-causal branch is an intentional circular mixer -- unchanged."""
++    if _skip_if_no_torch():
++        return
++    q, k, v = _corr_sample(16, seed=3)
++    base = correlation_spectral_global_mix(q, k, v, causal=False)
++    bumped = v.clone()
++    bumped[:, :, -1, :] += 100.0
++    moved = correlation_spectral_global_mix(q, k, bumped, causal=False)
++    # wraparound means early positions DO move when causal=False
++    assert (moved - base)[:, :, :-1, :].abs().max() > 1e-3
++
++
++def test_correlation_hybrid_causal_does_not_see_the_future():
++    """The leak must not survive through the hybrid wrapper (#154)."""
++    if _skip_if_no_torch():
++        return
++    seq, window = 16, 2
++    q, k, v = _corr_sample(seq, seed=4)
++    bumped = v.clone()
++    bumped[:, :, -1, :] += 100.0
++    base = correlation_hybrid_attention(q, k, v, window=window, causal=True)
++    moved = correlation_hybrid_attention(q, k, bumped, window=window, causal=True)
++    # The local branch reads v[-1] only for queries within `window` of the end;
++    # before that horizon nothing may move once the global branch is causal.
++    horizon = seq - 1 - window
++    assert (moved - base)[:, :, :horizon, :].abs().max() < 1e-9
++
++
+ def test_landmark_global_attention_preserves_shape_and_finiteness():
+     if _skip_if_no_torch():
+         return

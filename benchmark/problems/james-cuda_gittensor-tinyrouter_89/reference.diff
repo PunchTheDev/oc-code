@@ -1,0 +1,380 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index d388cbb..2959885 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -37,6 +37,20 @@ WORKER-turn fix itself is intact after #62; only the test was stale. Full suite
+ green again.
+ **Follow-up:** the offline PR CI in #52 would have caught this; worth landing.
+ 
++## 2026-07-10 — govern job 403 on fork PR label write-back  #mistake #decision
++
++**Context:** PR-bot governance (`pr-bot.yml`) from #51; every fork PR failed the
++`govern` check on `ensure_labels.py` (issue #84, part 1). Routing-template false
++positives were fixed separately in #86 (issue #85).
++**Expected:** fork PRs run deterministic analysis even when `GITHUB_TOKEN` cannot
++create labels or post comments.
++**Actual:** `ensure_labels.py` raised on HTTP 403; `run_pr_bot.py` returned exit 1
++when label write-back was rejected.
++**Fix / decision:** treat 403 on label create / PR write-back as a warning (exit 0);
++analysis output is still printed. Routing detection unchanged on `main` (#86).
++**Follow-up:** if labels must be applied to fork PRs automatically, add a minimal
++`pull_request_target` workflow that only calls the labels API.
++
+ ## 2026-07-10 — Duplicate-detection gate (Gate 3) defeated by re-rolling SVF scales  #mistake #finding #decision
+ 
+ **Context:** auditing the anti-cheat gates in `scripts/pr_eval.py`. Gate 3
+diff --git a/scripts/repo_governance/ensure_labels.py b/scripts/repo_governance/ensure_labels.py
+index 6e21324..c83b1c2 100644
+--- a/scripts/repo_governance/ensure_labels.py
++++ b/scripts/repo_governance/ensure_labels.py
+@@ -51,7 +51,13 @@ def _request(method: str, url: str, token: str, payload: dict | None = None) ->
+         return exc.code, exc.read().decode("utf-8")
+ 
+ 
+-def ensure_labels(repo: str, token: str) -> None:
++def ensure_labels(repo: str, token: str) -> list[str]:
++    """Create missing governance labels.
++
++    Returns human-readable warnings for non-fatal failures (e.g. fork PRs where
++    ``GITHUB_TOKEN`` is read-only and cannot create labels).
++    """
++    warnings: list[str] = []
+     for spec in REQUIRED_LABELS:
+         url = f"{_API}/repos/{repo}/labels/{spec['name'].replace(':', '%3A')}"
+         status, _ = _request("GET", url, token)
+@@ -59,8 +65,16 @@ def ensure_labels(repo: str, token: str) -> None:
+             continue
+         create_url = f"{_API}/repos/{repo}/labels"
+         status, body = _request("POST", create_url, token, spec)
+-        if status not in (200, 201):
+-            raise RuntimeError(f"Failed to create label {spec['name']}: {status} {body}")
++        if status in (200, 201):
++            continue
++        if status == 403:
++            warnings.append(
++                f"Cannot create label {spec['name']!r}: token lacks write permission "
++                f"(fork PR workflows are read-only)."
++            )
++            continue
++        raise RuntimeError(f"Failed to create label {spec['name']}: {status} {body}")
++    return warnings
+ 
+ 
+ def main() -> int:
+@@ -69,7 +83,9 @@ def main() -> int:
+     if not repo or not token:
+         print("GITHUB_REPOSITORY and GITHUB_TOKEN are required.", file=sys.stderr)
+         return 1
+-    ensure_labels(repo, token)
++    warnings = ensure_labels(repo, token)
++    for note in warnings:
++        print(f"warning: {note}", file=sys.stderr)
+     print(f"Ensured governance labels on {repo}")
+     return 0
+ 
+diff --git a/scripts/repo_governance/run_pr_bot.py b/scripts/repo_governance/run_pr_bot.py
+index 4d0d859..800d72f 100644
+--- a/scripts/repo_governance/run_pr_bot.py
++++ b/scripts/repo_governance/run_pr_bot.py
+@@ -94,7 +94,16 @@ def main(argv: list[str] | None = None) -> int:
+                 token,
+             )
+     except urllib.error.HTTPError as exc:
+-        print(exc.read().decode("utf-8"), file=sys.stderr)
++        detail = exc.read().decode("utf-8")
++        if exc.code == 403:
++            print(
++                "warning: GitHub API rejected write-back (403); "
++                "analysis above is still valid for fork PRs.",
++                file=sys.stderr,
++            )
++            print(detail, file=sys.stderr)
++            return 0
++        print(detail, file=sys.stderr)
+         return 1
+     return 0
+ 
+diff --git a/src/trinity/adapters/loaders.py b/src/trinity/adapters/loaders.py
+index 563839b..339b9ac 100644
+--- a/src/trinity/adapters/loaders.py
++++ b/src/trinity/adapters/loaders.py
+@@ -58,7 +58,7 @@ def _try_load_hf(
+     The loaded dataset object, or ``None`` if loading was not possible.
+     """
+     try:
+-        from datasets import load_dataset  # type: ignore[import-not-found]
++        from datasets import load_dataset
+     except Exception:
+         return None
+     try:
+@@ -449,14 +449,14 @@ def load_split(
+ 
+     logical_split = (split or "test").strip().lower()
+     resolved_split = resolve_split(key, logical_split)
+-    tasks = _HF_LOADERS[key](resolved_split)
+-    used_toy = not tasks
+-    if used_toy:
+-        tasks = _toy_tasks(key)
++    loaded = _HF_LOADERS[key](resolved_split)
++    used_toy = not loaded
++    # Narrow on ``loaded`` itself: a separate ``used_toy`` bool cannot tell the
++    # type checker that the loader did not return None.
++    tasks = list(loaded) if loaded else _toy_tasks(key)
+     warn_on_toy_fallback(key, logical_split, used_toy=used_toy)
+ 
+     rng = random.Random(seed)
+-    tasks = list(tasks)
+     rng.shuffle(tasks)
+ 
+     if max_items is not None:
+diff --git a/src/trinity/adapters/mmlu_pro.py b/src/trinity/adapters/mmlu_pro.py
+index 32b197c..6b817d8 100644
+--- a/src/trinity/adapters/mmlu_pro.py
++++ b/src/trinity/adapters/mmlu_pro.py
+@@ -94,7 +94,7 @@ def _answer_letter(row: Any, n_options: int) -> str | None:
+ def _hf_mmlu_pro(split: str) -> list[Task] | None:
+     """Load MMLU-Pro from HuggingFace, or ``None`` on any failure."""
+     try:
+-        from datasets import load_dataset  # type: ignore[import-not-found]
++        from datasets import load_dataset
+     except Exception:
+         return None
+     resolved = resolve_split(BENCHMARK, split)
+diff --git a/src/trinity/adapters/swebench.py b/src/trinity/adapters/swebench.py
+index b799bfb..d43ebc0 100644
+--- a/src/trinity/adapters/swebench.py
++++ b/src/trinity/adapters/swebench.py
+@@ -210,7 +210,7 @@ def _row_get(row: Any, *keys: str, default: Any = None) -> Any:
+ def _hf_swebench(split: str) -> list[Task] | None:
+     """Load SWE-bench Verified from HuggingFace, or ``None`` on any failure."""
+     try:
+-        from datasets import load_dataset  # type: ignore[import-not-found]
++        from datasets import load_dataset
+     except Exception:
+         return None
+     try:
+diff --git a/src/trinity/coordinator/slm.py b/src/trinity/coordinator/slm.py
+index 1b657ce..ed14929 100644
+--- a/src/trinity/coordinator/slm.py
++++ b/src/trinity/coordinator/slm.py
+@@ -29,6 +29,7 @@
+ from __future__ import annotations
+ 
+ from pathlib import Path
++from typing import Any
+ 
+ import numpy as np
+ import yaml
+@@ -96,11 +97,14 @@ def __init__(
+         self._dtype = self._resolve_dtype(dtype)
+ 
+         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+-        self.model = AutoModelForCausalLM.from_pretrained(
++        # `from_pretrained` is a decorated classmethod, so its return type does not
++        # carry `.to`; bind through Any before moving the module to the device.
++        model: Any = AutoModelForCausalLM.from_pretrained(
+             model_name,
+             torch_dtype=self._dtype,
+             output_hidden_states=True,
+         )
++        self.model = model
+         self.model.to(device)
+         self.model.eval()
+         # The orthogonal SVD factors and head are not trained via autograd
+diff --git a/src/trinity/fugu/hf_backend.py b/src/trinity/fugu/hf_backend.py
+index dd62a54..5e82ab8 100644
+--- a/src/trinity/fugu/hf_backend.py
++++ b/src/trinity/fugu/hf_backend.py
+@@ -62,11 +62,14 @@ def __init__(self, cfg: HFBackendConfig, worker_names: list[str]):
+         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
+         if self.tokenizer.pad_token_id is None:
+             self.tokenizer.pad_token = self.tokenizer.eos_token
+-        self.model = AutoModelForCausalLM.from_pretrained(
++        # `from_pretrained` is a decorated classmethod, so its return type does not
++        # carry `.to`; bind through Any rather than chaining off the call.
++        model: Any = AutoModelForCausalLM.from_pretrained(
+             cfg.model_name,
+             torch_dtype=self.dtype,
+             trust_remote_code=True,
+-        ).to(self.device)
++        )
++        self.model = model.to(self.device)
+         self.model.train()
+         self.optimizer = torch.optim.AdamW(
+             self.model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+@@ -124,7 +127,8 @@ async def propose(
+ 
+         prompt_len = int(input_ids.shape[1])
+         gen_ids = out[0, prompt_len:]
+-        text = self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
++        # decode() is typed `str | list[str]`; a single sequence always yields str.
++        text = str(self.tokenizer.decode(gen_ids, skip_special_tokens=True)).strip()
+         text = f"{self.cfg.proposal_prefix}{text}".strip()
+         return Proposal(
+             text=text,
+diff --git a/src/trinity/fugu/workflow.py b/src/trinity/fugu/workflow.py
+index 272b69a..b652a11 100644
+--- a/src/trinity/fugu/workflow.py
++++ b/src/trinity/fugu/workflow.py
+@@ -30,6 +30,7 @@
+ import ast
+ import re
+ from dataclasses import dataclass, field
++from typing import Any
+ 
+ from trinity.roles import postprocess as _pp
+ from trinity.types import Role, Task
+@@ -391,7 +392,7 @@ async def _worker_call(
+ ) -> tuple[str, int, int]:
+     """Call one worker; return ``(raw_text, prompt_tokens, completion_tokens)``."""
+     messages = _worker_messages(task, subtask, context)
+-    kwargs = dict(temperature=temperature, max_tokens=max_tokens)
++    kwargs: dict[str, Any] = dict(temperature=temperature, max_tokens=max_tokens)
+     if reasoning is not None:
+         kwargs["reasoning"] = reasoning
+     if client is not None:
+@@ -468,7 +469,7 @@ async def run_workflow(
+             ptoks += p_pt
+             ctoks += p_ct
+             n_calls += 1  # the recursive proposal call
+-            if ok:
++            if ok and sub_wf is not None:
+                 sub_run = await run_workflow(
+                     sub_wf,
+                     sub_task,
+@@ -562,7 +563,9 @@ async def propose_and_run(
+     )
+     p_pt = getattr(prop, "prompt_tokens", 0)
+     p_ct = getattr(prop, "completion_tokens", 0)
+-    if not ok:
++    # parse_workflow returns (None, False) on failure; the `wf is None` arm is the
++    # same parse-gate failure, spelled out so the type checker can narrow `wf`.
++    if not ok or wf is None:
+         return WorkflowRun(
+             workflow=None, parsed_ok=False, steps=[], final_answer="",
+             raw_proposal=prop.text, n_llm_calls=1,
+diff --git a/src/trinity/optim/sep_cmaes.py b/src/trinity/optim/sep_cmaes.py
+index 1550271..4ac726f 100644
+--- a/src/trinity/optim/sep_cmaes.py
++++ b/src/trinity/optim/sep_cmaes.py
+@@ -50,7 +50,7 @@ def _import_cma():
+     """Import pycma lazily, so this module (and trinity.optim) imports cleanly on
+     boxes without `cma` — it is only needed when an optimizer is actually built."""
+     try:
+-        import cma  # type: ignore
++        import cma
+ 
+         return cma
+     except ImportError as exc:  # pragma: no cover - exercised only when missing.
+diff --git a/src/trinity/orchestration/session.py b/src/trinity/orchestration/session.py
+index 77807e7..2648779 100644
+--- a/src/trinity/orchestration/session.py
++++ b/src/trinity/orchestration/session.py
+@@ -13,7 +13,7 @@
+ """
+ from __future__ import annotations
+ 
+-from typing import Protocol
++from typing import Any, Protocol
+ 
+ from ..roles import postprocess as _pp
+ from ..roles import prompts as _prompts
+@@ -74,7 +74,7 @@ async def run_trajectory(
+         agent_name = pool_models[agent_idx % len(pool_models)]
+ 
+         messages = _prompts.build_messages(role, base_prompt, traj.turns)
+-        kwargs = dict(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
++        kwargs: dict[str, Any] = dict(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+         if client is not None:
+             kwargs["client"] = client
+         if reasoning is not None:
+diff --git a/tests/test_govern_fork_pr.py b/tests/test_govern_fork_pr.py
+new file mode 100644
+index 0000000..f4e7d69
+--- /dev/null
++++ b/tests/test_govern_fork_pr.py
+@@ -0,0 +1,84 @@
++"""Tests for fork-PR govern write-back permissions (issue #84, part 1)."""
++from __future__ import annotations
++
++import importlib
++import io
++import json
++import sys
++from pathlib import Path
++from unittest.mock import patch
++
++_REPO = Path(__file__).resolve().parents[1]
++_GOV = _REPO / "scripts" / "repo_governance"
++sys.path.insert(0, str(_GOV))
++
++ensure_labels = importlib.import_module("ensure_labels")
++run_pr_bot = importlib.import_module("run_pr_bot")
++
++
++class TestEnsureLabelsPermissions:
++    """Label bootstrap must not fail fork PR workflows on HTTP 403."""
++
++    def test_ensure_labels_tolerates_403_on_create(self):
++        def fake_request(method: str, url: str, token: str, payload=None):
++            if method == "GET":
++                return 404, ""
++            if method == "POST":
++                return 403, '{"message":"Resource not accessible by integration"}'
++            return 500, ""
++
++        with patch.object(ensure_labels, "_request", side_effect=fake_request):
++            warnings = ensure_labels.ensure_labels("owner/repo", "token")
++        assert warnings
++        assert all("write permission" in w for w in warnings)
++
++    def test_ensure_labels_main_exits_zero_with_warnings(self, capsys, monkeypatch):
++        monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
++        monkeypatch.setenv("GITHUB_TOKEN", "token")
++        with patch.object(
++            ensure_labels,
++            "ensure_labels",
++            return_value=["Cannot create label 'area:infra'"],
++        ):
++            code = ensure_labels.main()
++        assert code == 0
++        err = capsys.readouterr().err
++        assert "warning:" in err
++
++
++class TestRunPrBotWriteBack:
++    """PR-bot analysis must succeed even when label write-back is forbidden."""
++
++    def test_run_pr_bot_returns_zero_on_403(self, monkeypatch):
++        import urllib.error
++
++        pr_payload = json.dumps({"title": "fix: test", "body": "body"}).encode()
++
++        def fake_urlopen(req):
++            if "/pulls/" in req.full_url:
++                return io.BytesIO(pr_payload)
++            raise urllib.error.HTTPError(
++                req.full_url,
++                403,
++                "Forbidden",
++                hdrs=None,
++                fp=io.BytesIO(b'{"message":"forbidden"}'),
++            )
++
++        monkeypatch.setattr(run_pr_bot.subprocess, "check_output", lambda *a, **k: "README.md\n")
++        monkeypatch.setattr(run_pr_bot.urllib.request, "urlopen", fake_urlopen)
++        monkeypatch.setenv("GITHUB_TOKEN", "test-token")
++
++        code = run_pr_bot.main(
++            [
++                "--repo",
++                "owner/repo",
++                "--pr-number",
++                "1",
++                "--base-sha",
++                "abc",
++                "--head-sha",
++                "def",
++            ]
++        )
++        assert code == 0

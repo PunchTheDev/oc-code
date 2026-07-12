@@ -1,0 +1,773 @@
+diff --git a/.claude/skills/contributing-to-gittensory/reference.md b/.claude/skills/contributing-to-gittensory/reference.md
+index bd908e4d8..f494863f6 100644
+--- a/.claude/skills/contributing-to-gittensory/reference.md
++++ b/.claude/skills/contributing-to-gittensory/reference.md
+@@ -149,7 +149,9 @@ All tools are metadata-only (no source upload). Run in this order:
+ 6. `gittensory_predict_gate` — `{login, owner, repo, title, body, labels, linkedIssues}` → predicted
+    conclusion + blockers + warnings + readiness score.
+ 
+-(Auth'd extras: `gittensory_preflight_pr` / `…_local_diff` for lane fit + collision + queue health.)
++(Auth'd extras: `gittensory_preflight_pr` / `…_local_diff` for lane fit + collision + queue health;
++`gittensory_get_pr_ai_review_findings` — `{login, owner, repo, pullNumber}` → structured post-submission
++AI-review inline findings (category/path/severity) for your own PR.)
+ 
+ ---
+ 
+diff --git a/src/db/repositories.ts b/src/db/repositories.ts
+index 35960f6da..0faffcfe1 100644
+--- a/src/db/repositories.ts
++++ b/src/db/repositories.ts
+@@ -4499,19 +4499,20 @@ export async function getLatestPublishedAiReview(
+   repoFullName: string,
+   pullNumber: number,
+   mode: string,
+-): Promise<{ notes: string; reviewerCount: number; findings: AdvisoryFinding[]; metadata?: Record<string, unknown> | undefined } | null> {
++): Promise<{ notes: string; reviewerCount: number; findings: AdvisoryFinding[]; headSha?: string | undefined; metadata?: Record<string, unknown> | undefined } | null> {
+   const row = await env.DB
+     .prepare(
+-      "SELECT notes, reviewer_count AS reviewerCount, findings_json AS findingsJson, metadata_json AS metadataJson FROM ai_review_cache WHERE repo_full_name = ? AND pull_number = ? AND ai_review_mode = ? AND published_at IS NOT NULL ORDER BY published_at DESC LIMIT 1",
++      "SELECT notes, reviewer_count AS reviewerCount, head_sha AS headSha, findings_json AS findingsJson, metadata_json AS metadataJson FROM ai_review_cache WHERE repo_full_name = ? AND pull_number = ? AND ai_review_mode = ? AND published_at IS NOT NULL ORDER BY published_at DESC LIMIT 1",
+     )
+     .bind(repoFullName, pullNumber, mode)
+-    .first<{ notes: string; reviewerCount: number; findingsJson: string | null; metadataJson: string | null }>();
++    .first<{ notes: string; reviewerCount: number; headSha: string; findingsJson: string | null; metadataJson: string | null }>();
+   if (!row) return null;
+   const metadata = parseJson<Record<string, unknown>>(row.metadataJson, {});
+   return {
+     notes: row.notes,
+     reviewerCount: row.reviewerCount,
+     findings: parseJson<AdvisoryFinding[]>(row.findingsJson, []),
++    ...(row.headSha ? { headSha: row.headSha } : {}),
+     ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+   };
+ }
+diff --git a/src/mcp/pr-ai-review-findings.ts b/src/mcp/pr-ai-review-findings.ts
+new file mode 100644
+index 000000000..2b6d0b952
+--- /dev/null
++++ b/src/mcp/pr-ai-review-findings.ts
+@@ -0,0 +1,136 @@
++import { getLatestPublishedAiReview } from "../db/repositories";
++import { classifyFindingCategory, FINDING_CATEGORIES, isFindingCategory, type FindingCategory } from "../review/finding-category-classify";
++import type { InlineFinding } from "../services/ai-review";
++import { resolveRepositorySettings } from "../settings/repository-settings";
++
++/** Metadata key written by the review processor when caching a fresh AI review (#4519). */
++export const INLINE_FINDINGS_METADATA_KEY = "inlineFindings" as const;
++
++export type StructuredAiReviewFinding = {
++  category: FindingCategory;
++  path: string;
++  severity: InlineFinding["severity"];
++  line: number;
++  body: string;
++};
++
++export type PrAiReviewFindingsPayload =
++  | {
++      status: "ready";
++      repoFullName: string;
++      pullNumber: number;
++      login: string;
++      headSha: string | null;
++      findings: StructuredAiReviewFinding[];
++      categoryCounts: Partial<Record<FindingCategory, number>>;
++    }
++  | {
++      status: "not_found";
++      repoFullName: string;
++      pullNumber: number;
++      login: string;
++      findings: [];
++      categoryCounts: Record<string, never>;
++    }
++  | {
++      status: "ai_review_off";
++      repoFullName: string;
++      pullNumber: number;
++      login: string;
++      findings: [];
++      categoryCounts: Record<string, never>;
++    };
++
++function isInlineFindingSeverity(value: unknown): value is InlineFinding["severity"] {
++  return value === "blocker" || value === "nit";
++}
++
++/** Parse line-anchored findings persisted in `ai_review_cache.metadata_json.inlineFindings`. */
++export function parseStoredInlineFindings(metadata: Record<string, unknown> | undefined): InlineFinding[] {
++  const raw = metadata?.[INLINE_FINDINGS_METADATA_KEY];
++  if (!Array.isArray(raw)) return [];
++  const findings: InlineFinding[] = [];
++  for (const entry of raw) {
++    if (!entry || typeof entry !== "object") continue;
++    const candidate = entry as Record<string, unknown>;
++    if (typeof candidate.path !== "string" || candidate.path.length === 0) continue;
++    if (typeof candidate.body !== "string") continue;
++    if (!isInlineFindingSeverity(candidate.severity)) continue;
++    const line = candidate.line;
++    if (typeof line !== "number" || !Number.isInteger(line) || line < 1) continue;
++    findings.push({
++      path: candidate.path,
++      line,
++      severity: candidate.severity,
++      body: candidate.body,
++      ...(isFindingCategory(candidate.category) ? { category: candidate.category } : {}),
++    });
++  }
++  return findings;
++}
++
++/** Normalize inline findings to the structured MCP shape, applying the same category fallback as the PR comment. */
++export function buildStructuredAiReviewFindings(inlineFindings: InlineFinding[]): StructuredAiReviewFinding[] {
++  return inlineFindings.map((finding) => ({
++    category: finding.category ?? classifyFindingCategory(finding),
++    path: finding.path,
++    severity: finding.severity,
++    line: finding.line,
++    body: finding.body,
++  }));
++}
++
++/** Count findings per category using the same rules as `buildFindingCategoryCollapsible`. */
++export function buildFindingCategoryCounts(findings: StructuredAiReviewFinding[]): Partial<Record<FindingCategory, number>> {
++  const counts: Partial<Record<FindingCategory, number>> = {};
++  for (const finding of findings) {
++    counts[finding.category] = (counts[finding.category] ?? 0) + 1;
++  }
++  return counts;
++}
++
++/** Ordered category count rows matching the human-facing collapsible table (security-first). */
++export function orderedFindingCategoryCountRows(counts: Partial<Record<FindingCategory, number>>): Array<{ category: FindingCategory; count: number }> {
++  return FINDING_CATEGORIES.flatMap((category) => {
++    const count = counts[category];
++    if (!count) return [];
++    return [{ category, count }];
++  });
++}
++
++function sameLogin(value: string | null | undefined, login: string): boolean {
++  return typeof value === "string" && value.toLowerCase() === login.toLowerCase();
++}
++
++/** Load a submitted PR's published AI-review inline findings for MCP (#4519). */
++export async function loadPrAiReviewFindings(
++  env: Env,
++  args: { repoFullName: string; pullNumber: number; login: string },
++): Promise<PrAiReviewFindingsPayload> {
++  const base = { repoFullName: args.repoFullName, pullNumber: args.pullNumber, login: args.login.toLowerCase() };
++  const settings = await resolveRepositorySettings(env, args.repoFullName);
++  if (settings.aiReviewMode === "off") {
++    return { status: "ai_review_off", ...base, findings: [], categoryCounts: {} };
++  }
++
++  const published = await getLatestPublishedAiReview(env, args.repoFullName, args.pullNumber, settings.aiReviewMode);
++  if (!published) {
++    return { status: "not_found", ...base, findings: [], categoryCounts: {} };
++  }
++
++  const inlineFindings = parseStoredInlineFindings(published.metadata);
++  const findings = buildStructuredAiReviewFindings(inlineFindings);
++  return {
++    status: "ready",
++    ...base,
++    headSha: published.headSha ?? null,
++    findings,
++    categoryCounts: buildFindingCategoryCounts(findings),
++  };
++}
++
++export function assertContributorOwnsPullRequest(authorLogin: string | null | undefined, login: string): void {
++  if (!sameLogin(authorLogin, login)) {
++    throw new Error("Forbidden: this tool only returns AI-review findings for your own pull requests.");
++  }
++}
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index 6df29fa53..f325111f7 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -13,6 +13,7 @@ import {
+   runFindOpportunities,
+   validateFindOpportunitiesInput,
+ } from "./find-opportunities";
++import { loadPrAiReviewFindings, assertContributorOwnsPullRequest } from "./pr-ai-review-findings";
+ import {
+   MAX_ISSUE_RAG_OWNER_LENGTH,
+   MAX_ISSUE_RAG_REPO_LENGTH,
+@@ -855,6 +856,33 @@ const prOutcomeOutputSchema = {
+   outcomes: z.unknown().optional(),
+ };
+ 
++const loginRepoPullShape = {
++  login: z.string().min(1),
++  owner: z.string().min(1),
++  repo: z.string().min(1),
++  pullNumber: z.number().int().positive(),
++};
++
++const prAiReviewFindingsOutputSchema = {
++  status: z.enum(["ready", "not_found", "ai_review_off"]),
++  repoFullName: z.string().optional(),
++  pullNumber: z.number().optional(),
++  login: z.string().optional(),
++  headSha: z.string().nullable().optional(),
++  findings: z
++    .array(
++      z.object({
++        category: z.string(),
++        path: z.string(),
++        severity: z.enum(["blocker", "nit"]),
++        line: z.number(),
++        body: z.string(),
++      }),
++    )
++    .optional(),
++  categoryCounts: z.record(z.string(), z.number()).optional(),
++};
++
+ const predictGateShape = {
+   login: z.string().min(1),
+   owner: z.string().min(1),
+@@ -1638,6 +1666,17 @@ export class GittensoryMcp {
+       async (input) => this.toolResult(await this.prOutcomes(input.login, input.limit)),
+     );
+ 
++    server.registerTool(
++      "gittensory_get_pr_ai_review_findings",
++      {
++        description:
++          "Return a submitted pull request's real AI-review inline findings as structured JSON (category, path, severity, line, body) — the same categorization the PR comment uses. Post-submission only; self-scoped to the authenticated login's own PRs on repos you can access.",
++        inputSchema: loginRepoPullShape,
++        outputSchema: prAiReviewFindingsOutputSchema,
++      },
++      async (input) => this.toolResult(await this.getPrAiReviewFindings(input)),
++    );
++
+     server.registerTool(
+       "gittensory_list_notifications",
+       {
+@@ -2959,6 +2998,43 @@ export class GittensoryMcp {
+     };
+   }
+ 
++  private async getPrAiReviewFindings(input: z.infer<z.ZodObject<typeof loginRepoPullShape>>): Promise<ToolPayload> {
++    this.requireContributorAccess(input.login);
++    const repoFullName = `${input.owner}/${input.repo}`;
++    await this.requireRepoAccess(repoFullName);
++    const pullRequest = await getPullRequest(this.env, repoFullName, input.pullNumber);
++    if (!pullRequest) {
++      return {
++        summary: `No pull request ${repoFullName}#${input.pullNumber}.`,
++        data: {
++          status: "not_found",
++          repoFullName,
++          pullNumber: input.pullNumber,
++          login: input.login.toLowerCase(),
++          findings: [],
++          categoryCounts: {},
++        },
++      };
++    }
++    assertContributorOwnsPullRequest(pullRequest.authorLogin, input.login);
++    const payload = await loadPrAiReviewFindings(this.env, {
++      repoFullName,
++      pullNumber: input.pullNumber,
++      login: input.login,
++    });
++    const findingCount = payload.status === "ready" ? payload.findings.length : 0;
++    const summary =
++      payload.status === "ready"
++        ? `${findingCount} AI-review finding(s) on ${repoFullName}#${input.pullNumber}.`
++        : payload.status === "ai_review_off"
++          ? `AI review is off for ${repoFullName}; no findings to return for #${input.pullNumber}.`
++          : `No published AI review findings for ${repoFullName}#${input.pullNumber}.`;
++    return {
++      summary,
++      data: payload as unknown as Record<string, unknown>,
++    };
++  }
++
+   private async listNotifications(login: string): Promise<ToolPayload> {
+     this.requireContributorAccess(login);
+     const deliveries = await listNotificationDeliveriesForRecipient(this.env, login, { channel: "badge", limit: 50 });
+diff --git a/src/queue/processors.ts b/src/queue/processors.ts
+index ba6a0bedd..7e39e99c7 100644
+--- a/src/queue/processors.ts
++++ b/src/queue/processors.ts
+@@ -9941,6 +9941,12 @@ async function maybePublishPrPublicSurface(
+                     /* v8 ignore next -- runAiReviewForAdvisory (the sole path reaching here) always sets metadata on its "ok" returns; the nullish fallback is a type-level (optional field) safeguard, not a reachable runtime path. */
+                     ...(aiReview.metadata ?? {}),
+                     inputFingerprint,
++                    // Persist line-anchored findings for post-submission MCP readback (#4519). Inline comments
++                    // themselves are still only posted on a fresh review (see inlineFindings hoisting above);
++                    // this metadata is read-only structured output, not a cache-replay trigger.
++                    ...(aiReview.inlineFindings && aiReview.inlineFindings.length > 0
++                      ? { inlineFindings: aiReview.inlineFindings }
++                      : {}),
+                   },
+                 },
+               ).catch((error) => {
+diff --git a/src/services/subnet-interface.ts b/src/services/subnet-interface.ts
+index 3d5cdb4ad..cdc408d36 100644
+--- a/src/services/subnet-interface.ts
++++ b/src/services/subnet-interface.ts
+@@ -14,6 +14,7 @@ const CONTRIBUTION_MCP_TOOLS: ReadonlyArray<{ name: string; summary: string }> =
+   { name: "gittensory_validate_linked_issue", summary: "Confirm whether a planned PR has a linked issue before opening it." },
+   { name: "gittensory_preflight_pr", summary: "Preflight a planned PR for lane fit, duplicate risk, and review burden." },
+   { name: "gittensory_monitor_open_prs", summary: "Track your open PRs and what to clean up first." },
++  { name: "gittensory_get_pr_ai_review_findings", summary: "Read structured AI-review findings on your submitted PR (category, path, severity)." },
+   { name: "gittensory_list_notifications", summary: "See review feedback (e.g. changes requested) on your PRs." },
+   { name: "gittensory_agent_plan_next_work", summary: "Suggest useful next gittensor contribution actions from current repo and PR context." },
+ ];
+diff --git a/test/unit/ai-review-cache.test.ts b/test/unit/ai-review-cache.test.ts
+index 51445bb08..b89df9b0f 100644
+--- a/test/unit/ai-review-cache.test.ts
++++ b/test/unit/ai-review-cache.test.ts
+@@ -422,7 +422,7 @@ describe("AI review cache (#1)", () => {
+       // A newer head SHA exists (the contributor pushed again), but was never independently published.
+       await putCachedAiReview(env, "o/r", 51, "sha2", "block", { notes: "never published", reviewerCount: 1 });
+ 
+-      expect(await getLatestPublishedAiReview(env, "o/r", 51, "block")).toEqual({ notes: "first review", reviewerCount: 1, findings: [] });
++      expect(await getLatestPublishedAiReview(env, "o/r", 51, "block")).toEqual({ notes: "first review", reviewerCount: 1, findings: [], headSha: "sha1" });
+     });
+ 
+     it("respects the ai_review_mode filter, same as getCachedAiReview", async () => {
+@@ -430,7 +430,7 @@ describe("AI review cache (#1)", () => {
+       await putCachedAiReview(env, "o/r", 52, "sha1", "advisory", { notes: "advisory mode", reviewerCount: 1 });
+       await markAiReviewPublished(env, "o/r", 52, "sha1");
+       expect(await getLatestPublishedAiReview(env, "o/r", 52, "block")).toBeNull();
+-      expect(await getLatestPublishedAiReview(env, "o/r", 52, "advisory")).toEqual({ notes: "advisory mode", reviewerCount: 1, findings: [] });
++      expect(await getLatestPublishedAiReview(env, "o/r", 52, "advisory")).toEqual({ notes: "advisory mode", reviewerCount: 1, findings: [], headSha: "sha1" });
+     });
+ 
+     it("round-trips findings and metadata like getCachedAiReview", async () => {
+@@ -446,6 +446,7 @@ describe("AI review cache (#1)", () => {
+         notes: "held review",
+         reviewerCount: 2,
+         findings: [{ code: "ai_review_split", severity: "critical", title: "Split", detail: "One reviewer blocked." }],
++        headSha: "sha1",
+         metadata: { inputFingerprint: "fp-v1" },
+       });
+     });
+@@ -462,11 +463,22 @@ describe("AI review cache (#1)", () => {
+         await putCachedAiReview(env, "o/r", 54, "sha2", "block", { notes: "newer published review", reviewerCount: 1 });
+         await markAiReviewPublished(env, "o/r", 54, "sha2");
+ 
+-        expect(await getLatestPublishedAiReview(env, "o/r", 54, "block")).toEqual({ notes: "newer published review", reviewerCount: 1, findings: [] });
++        expect(await getLatestPublishedAiReview(env, "o/r", 54, "block")).toEqual({ notes: "newer published review", reviewerCount: 1, findings: [], headSha: "sha2" });
+       } finally {
+         vi.useRealTimers();
+       }
+     });
++
++    it("omits headSha from the payload when the stored head_sha is empty", async () => {
++      const env = createTestEnv();
++      await env.DB.prepare(
++        `INSERT INTO ai_review_cache (repo_full_name, pull_number, head_sha, ai_review_mode, notes, reviewer_count, findings_json, metadata_json, cacheable, published_at, created_at)
++         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++      )
++        .bind("o/r", 55, "", "block", "empty head", 1, "[]", "{}", 1, "2026-07-09T00:00:00.000Z", "2026-07-09T00:00:00.000Z")
++        .run();
++      expect(await getLatestPublishedAiReview(env, "o/r", 55, "block")).toEqual({ notes: "empty head", reviewerCount: 1, findings: [] });
++    });
+   });
+ 
+   describe("countPublishedAiReviewHeads — auto_pause_after_reviewed_commits (#2042)", () => {
+diff --git a/test/unit/mcp-pr-ai-review-findings.test.ts b/test/unit/mcp-pr-ai-review-findings.test.ts
+new file mode 100644
+index 000000000..ebd011bdd
+--- /dev/null
++++ b/test/unit/mcp-pr-ai-review-findings.test.ts
+@@ -0,0 +1,207 @@
++import { Client } from "@modelcontextprotocol/sdk/client/index.js";
++import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
++import { describe, expect, it } from "vitest";
++import { createSessionForGitHubUser, type AuthIdentity } from "../../src/auth/security";
++import {
++  markAiReviewPublished,
++  putCachedAiReview,
++  upsertPullRequestFromGitHub,
++  upsertRepositoryFromGitHub,
++  upsertRepositorySettings,
++} from "../../src/db/repositories";
++import { GittensoryMcp } from "../../src/mcp/server";
++import { INLINE_FINDINGS_METADATA_KEY } from "../../src/mcp/pr-ai-review-findings";
++import { createTestEnv } from "../helpers/d1";
++
++async function connect(env: Env, identity?: AuthIdentity): Promise<Client> {
++  const server = (identity ? new GittensoryMcp(env, identity) : new GittensoryMcp(env)).createServer();
++  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
++  await server.connect(serverTransport);
++  const client = new Client({ name: "gittensory-pr-ai-review-findings-test", version: "0.1.0" }, { capabilities: {} });
++  await client.connect(clientTransport);
++  return client;
++}
++
++const inlineFindings = [
++  { path: "src/db.ts", line: 12, severity: "blocker" as const, body: "This is vulnerable to SQL injection.", category: "security" as const },
++  { path: "src/util.ts", line: 4, severity: "nit" as const, body: "This will throw on an empty array." },
++];
++
++async function seedPublishedReview(env: Env): Promise<void> {
++  await upsertRepositoryFromGitHub(env, { name: "widgets", full_name: "acme/widgets", private: false, owner: { login: "acme" } });
++  await upsertRepositorySettings(env, { repoFullName: "acme/widgets", aiReviewMode: "block" });
++  await upsertPullRequestFromGitHub(env, "acme/widgets", {
++    number: 42,
++    title: "Fix widget cache",
++    state: "open",
++    user: { login: "miner1" },
++    head: { sha: "sha-reviewed" },
++    labels: [],
++    body: "Fixes #1",
++  });
++  await putCachedAiReview(env, "acme/widgets", 42, "sha-reviewed", "block", {
++    notes: "Two reviewers found issues.",
++    reviewerCount: 2,
++    metadata: { [INLINE_FINDINGS_METADATA_KEY]: inlineFindings },
++  });
++  await markAiReviewPublished(env, "acme/widgets", 42, "sha-reviewed");
++}
++
++describe("MCP gittensory_get_pr_ai_review_findings (#4519)", () => {
++  it("returns structured findings that match the PR comment category counts", async () => {
++    const env = createTestEnv();
++    await seedPublishedReview(env);
++    const result = await (await connect(env)).callTool({
++      name: "gittensory_get_pr_ai_review_findings",
++      arguments: { login: "miner1", owner: "acme", repo: "widgets", pullNumber: 42 },
++    });
++    expect(result.isError).toBeFalsy();
++    const data = result.structuredContent as {
++      status: string;
++      findings: Array<{ category: string; path: string; severity: string; line: number; body: string }>;
++      categoryCounts: Record<string, number>;
++      headSha: string;
++    };
++    expect(data.status).toBe("ready");
++    expect(data.headSha).toBe("sha-reviewed");
++    expect(data.findings).toHaveLength(2);
++    expect(data.categoryCounts).toEqual({ security: 1, correctness: 1 });
++    expect(data.findings[0]).toMatchObject({ category: "security", path: "src/db.ts", severity: "blocker", line: 12 });
++    expect(JSON.stringify(data)).not.toMatch(/wallet|hotkey|reward estimate|trust score/i);
++  });
++
++  it("returns not_found when no published AI review exists", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "widgets", full_name: "acme/widgets", private: false, owner: { login: "acme" } });
++    await upsertRepositorySettings(env, { repoFullName: "acme/widgets", aiReviewMode: "block" });
++    await upsertPullRequestFromGitHub(env, "acme/widgets", {
++      number: 7,
++      title: "Draft",
++      state: "open",
++      user: { login: "miner1" },
++      head: { sha: "sha-new" },
++      labels: [],
++      body: "x",
++    });
++    const result = await (await connect(env)).callTool({
++      name: "gittensory_get_pr_ai_review_findings",
++      arguments: { login: "miner1", owner: "acme", repo: "widgets", pullNumber: 7 },
++    });
++    expect(result.isError).toBeFalsy();
++    const data = result.structuredContent as { status: string; findings: unknown[]; categoryCounts: Record<string, never> };
++    expect(data.status).toBe("not_found");
++    expect(data.findings).toEqual([]);
++    expect(data.categoryCounts).toEqual({});
++    expect(JSON.stringify(result.content)).toMatch(/No published AI review findings for acme\/widgets#7/i);
++  });
++
++  it("returns not_found when the pull request row does not exist", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "widgets", full_name: "acme/widgets", private: false, owner: { login: "acme" } });
++    const result = await (await connect(env)).callTool({
++      name: "gittensory_get_pr_ai_review_findings",
++      arguments: { login: "miner1", owner: "acme", repo: "widgets", pullNumber: 404 },
++    });
++    expect(result.isError).toBeFalsy();
++    const data = result.structuredContent as { status: string; findings: unknown[] };
++    expect(data.status).toBe("not_found");
++    expect(data.findings).toEqual([]);
++    expect(JSON.stringify(result.content)).toMatch(/No pull request acme\/widgets#404/i);
++  });
++
++  it("returns a zero-finding ready summary when the published review has no inline findings", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "widgets", full_name: "acme/widgets", private: false, owner: { login: "acme" } });
++    await upsertRepositorySettings(env, { repoFullName: "acme/widgets", aiReviewMode: "block" });
++    await upsertPullRequestFromGitHub(env, "acme/widgets", {
++      number: 99,
++      title: "Clean",
++      state: "open",
++      user: { login: "miner1" },
++      head: { sha: "sha-clean" },
++      labels: [],
++      body: "x",
++    });
++    await putCachedAiReview(env, "acme/widgets", 99, "sha-clean", "block", { notes: "No inline findings.", reviewerCount: 1 });
++    await markAiReviewPublished(env, "acme/widgets", 99, "sha-clean");
++    const result = await (await connect(env)).callTool({
++      name: "gittensory_get_pr_ai_review_findings",
++      arguments: { login: "miner1", owner: "acme", repo: "widgets", pullNumber: 99 },
++    });
++    expect(result.isError).toBeFalsy();
++    expect((result.structuredContent as { status: string; findings: unknown[] }).status).toBe("ready");
++    expect(JSON.stringify(result.content)).toMatch(/0 AI-review finding\(s\)/i);
++  });
++
++  it("returns ai_review_off when the repo has AI review disabled", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "widgets", full_name: "acme/widgets", private: false, owner: { login: "acme" } });
++    await upsertRepositorySettings(env, { repoFullName: "acme/widgets", aiReviewMode: "off" });
++    await upsertPullRequestFromGitHub(env, "acme/widgets", {
++      number: 8,
++      title: "Draft",
++      state: "open",
++      user: { login: "miner1" },
++      head: { sha: "sha-new" },
++      labels: [],
++      body: "x",
++    });
++    const result = await (await connect(env)).callTool({
++      name: "gittensory_get_pr_ai_review_findings",
++      arguments: { login: "miner1", owner: "acme", repo: "widgets", pullNumber: 8 },
++    });
++    expect(result.isError).toBeFalsy();
++    expect((result.structuredContent as { status: string }).status).toBe("ai_review_off");
++    expect(JSON.stringify(result.content)).toMatch(/AI review is off for acme\/widgets/i);
++  });
++
++  it("forbids reading another contributor's PR findings", async () => {
++    const env = createTestEnv();
++    await seedPublishedReview(env);
++    const result = await (await connect(env)).callTool({
++      name: "gittensory_get_pr_ai_review_findings",
++      arguments: { login: "other-miner", owner: "acme", repo: "widgets", pullNumber: 42 },
++    });
++    expect(result.isError).toBe(true);
++    expect(JSON.stringify(result.content)).toMatch(/own pull requests/i);
++  });
++
++  it("is self-scoped: a session cannot read findings for another login", async () => {
++    const env = createTestEnv();
++    await seedPublishedReview(env);
++    const { session } = await createSessionForGitHubUser(env, { login: "miner1", id: 1 });
++    const result = await (await connect(env, { kind: "session", actor: "miner1", session })).callTool({
++      name: "gittensory_get_pr_ai_review_findings",
++      arguments: { login: "someone-else", owner: "acme", repo: "widgets", pullNumber: 42 },
++    });
++    expect(result.isError).toBe(true);
++    expect(JSON.stringify(result.content)).toMatch(/authenticated GitHub login/i);
++  });
++
++  it("is repo-scoped: a session cannot read findings from an inaccessible repo", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, {
++      name: "private-roadmap",
++      full_name: "victimco/private-roadmap",
++      private: true,
++      owner: { login: "victimco" },
++    });
++    await upsertRepositorySettings(env, { repoFullName: "victimco/private-roadmap", aiReviewMode: "block" });
++    await upsertPullRequestFromGitHub(env, "victimco/private-roadmap", {
++      number: 1,
++      title: "Secret",
++      state: "open",
++      user: { login: "miner1" },
++      head: { sha: "sha1" },
++      labels: [],
++      body: "x",
++    });
++    const { session } = await createSessionForGitHubUser(env, { login: "miner1", id: 1 });
++    const result = await (await connect(env, { kind: "session", actor: "miner1", session })).callTool({
++      name: "gittensory_get_pr_ai_review_findings",
++      arguments: { login: "miner1", owner: "victimco", repo: "private-roadmap", pullNumber: 1 },
++    });
++    expect(result.isError).toBe(true);
++    expect(JSON.stringify(result.content)).toMatch(/cannot access this repository/i);
++  });
++});
+diff --git a/test/unit/pr-ai-review-findings.test.ts b/test/unit/pr-ai-review-findings.test.ts
+new file mode 100644
+index 000000000..ea6067cea
+--- /dev/null
++++ b/test/unit/pr-ai-review-findings.test.ts
+@@ -0,0 +1,178 @@
++import { describe, expect, it } from "vitest";
++import {
++  assertContributorOwnsPullRequest,
++  buildFindingCategoryCounts,
++  buildStructuredAiReviewFindings,
++  INLINE_FINDINGS_METADATA_KEY,
++  loadPrAiReviewFindings,
++  orderedFindingCategoryCountRows,
++  parseStoredInlineFindings,
++} from "../../src/mcp/pr-ai-review-findings";
++import { markAiReviewPublished, putCachedAiReview, upsertRepositoryFromGitHub, upsertRepositorySettings } from "../../src/db/repositories";
++import { buildFindingCategoryCollapsible } from "../../src/review/unified-comment-bridge";
++import type { InlineFinding } from "../../src/services/ai-review";
++import { createTestEnv } from "../helpers/d1";
++
++const sampleFindings: InlineFinding[] = [
++  { path: "src/db.ts", line: 12, severity: "blocker", body: "This is vulnerable to SQL injection.", category: "security" },
++  { path: "src/util.ts", line: 4, severity: "nit", body: "This will throw on an empty array." },
++  { path: "src/app.test.ts", line: 9, severity: "blocker", body: "Assert the right value here." },
++];
++
++describe("parseStoredInlineFindings", () => {
++  it("returns an empty list when metadata is absent or malformed", () => {
++    expect(parseStoredInlineFindings(undefined)).toEqual([]);
++    expect(parseStoredInlineFindings({})).toEqual([]);
++    expect(parseStoredInlineFindings({ [INLINE_FINDINGS_METADATA_KEY]: "nope" })).toEqual([]);
++    expect(parseStoredInlineFindings({ [INLINE_FINDINGS_METADATA_KEY]: [{ path: "", line: 1, severity: "nit", body: "x" }] })).toEqual([]);
++    expect(parseStoredInlineFindings({ [INLINE_FINDINGS_METADATA_KEY]: [{ path: "a.ts", line: 0, severity: "nit", body: "x" }] })).toEqual([]);
++    expect(parseStoredInlineFindings({ [INLINE_FINDINGS_METADATA_KEY]: [{ path: "a.ts", line: 1, severity: "maybe", body: "x" }] })).toEqual([]);
++  });
++
++  it("skips non-object entries and findings whose body is not a string", () => {
++    expect(
++      parseStoredInlineFindings({
++        [INLINE_FINDINGS_METADATA_KEY]: [null, 42, { path: "src/a.ts", line: 2, severity: "nit", body: 99 }],
++      }),
++    ).toEqual([]);
++    expect(
++      parseStoredInlineFindings({
++        [INLINE_FINDINGS_METADATA_KEY]: [{ path: "src/a.ts", line: 2.5, severity: "nit", body: "fractional line" }],
++      }),
++    ).toEqual([]);
++  });
++
++  it("keeps valid inline findings and drops invalid category values", () => {
++    const parsed = parseStoredInlineFindings({
++      [INLINE_FINDINGS_METADATA_KEY]: [
++        { path: "src/a.ts", line: 2, severity: "blocker", body: "Fix me.", category: "security" },
++        { path: "src/b.ts", line: 3, severity: "nit", body: "Rename this.", category: "not-a-category" },
++      ],
++    });
++    expect(parsed).toEqual([
++      { path: "src/a.ts", line: 2, severity: "blocker", body: "Fix me.", category: "security" },
++      { path: "src/b.ts", line: 3, severity: "nit", body: "Rename this." },
++    ]);
++  });
++});
++
++describe("buildStructuredAiReviewFindings", () => {
++  it("matches the PR comment category collapsible counts for the same findings", () => {
++    const structured = buildStructuredAiReviewFindings(sampleFindings);
++    const collapsible = buildFindingCategoryCollapsible(
++      sampleFindings.map((finding) => ({ path: finding.path, body: finding.body, category: finding.category })),
++    );
++    expect(collapsible).not.toBeNull();
++    const counts = buildFindingCategoryCounts(structured);
++    expect(counts).toEqual({ security: 1, correctness: 1, tests: 1 });
++    expect(collapsible?.body).toContain("| Security | 1 |");
++    expect(collapsible?.body).toContain("| Correctness | 1 |");
++    expect(collapsible?.body).toContain("| Tests | 1 |");
++    expect(structured).toEqual([
++      {
++        category: "security",
++        path: "src/db.ts",
++        severity: "blocker",
++        line: 12,
++        body: "This is vulnerable to SQL injection.",
++      },
++      {
++        category: "correctness",
++        path: "src/util.ts",
++        severity: "nit",
++        line: 4,
++        body: "This will throw on an empty array.",
++      },
++      {
++        category: "tests",
++        path: "src/app.test.ts",
++        severity: "blocker",
++        line: 9,
++        body: "Assert the right value here.",
++      },
++    ]);
++  });
++
++  it("returns an empty structured list for no inline findings", () => {
++    expect(buildStructuredAiReviewFindings([])).toEqual([]);
++    expect(buildFindingCategoryCounts([])).toEqual({});
++    expect(buildFindingCategoryCounts([
++      { category: "correctness", path: "a.ts", severity: "nit", line: 1, body: "one" },
++      { category: "correctness", path: "b.ts", severity: "blocker", line: 2, body: "two" },
++    ])).toEqual({ correctness: 2 });
++  });
++});
++
++describe("orderedFindingCategoryCountRows", () => {
++  it("returns only categories with a non-zero count, in canonical order", () => {
++    expect(orderedFindingCategoryCountRows({ security: 2, style: 1 })).toEqual([
++      { category: "security", count: 2 },
++      { category: "style", count: 1 },
++    ]);
++    expect(orderedFindingCategoryCountRows({})).toEqual([]);
++  });
++});
++
++describe("loadPrAiReviewFindings", () => {
++  it("returns ready with empty findings when a published review has no inline metadata", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "widgets", full_name: "acme/widgets", private: false, owner: { login: "acme" } });
++    await upsertRepositorySettings(env, { repoFullName: "acme/widgets", aiReviewMode: "advisory" });
++    await putCachedAiReview(env, "acme/widgets", 11, "sha-empty", "advisory", { notes: "Clean review.", reviewerCount: 1 });
++    await markAiReviewPublished(env, "acme/widgets", 11, "sha-empty");
++
++    expect(await loadPrAiReviewFindings(env, { repoFullName: "acme/widgets", pullNumber: 11, login: "Miner1" })).toEqual({
++      status: "ready",
++      repoFullName: "acme/widgets",
++      pullNumber: 11,
++      login: "miner1",
++      headSha: "sha-empty",
++      findings: [],
++      categoryCounts: {},
++    });
++  });
++
++  it("returns ai_review_off and not_found on the expected branches", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "widgets", full_name: "acme/widgets", private: false, owner: { login: "acme" } });
++    await upsertRepositorySettings(env, { repoFullName: "acme/widgets", aiReviewMode: "off" });
++    expect(await loadPrAiReviewFindings(env, { repoFullName: "acme/widgets", pullNumber: 12, login: "miner1" })).toMatchObject({
++      status: "ai_review_off",
++      findings: [],
++      categoryCounts: {},
++    });
++
++    await upsertRepositorySettings(env, { repoFullName: "acme/widgets", aiReviewMode: "block" });
++    expect(await loadPrAiReviewFindings(env, { repoFullName: "acme/widgets", pullNumber: 12, login: "miner1" })).toMatchObject({
++      status: "not_found",
++      findings: [],
++      categoryCounts: {},
++    });
++  });
++
++  it("nulls headSha when the published row omits it from the repository read", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "widgets", full_name: "acme/widgets", private: false, owner: { login: "acme" } });
++    await upsertRepositorySettings(env, { repoFullName: "acme/widgets", aiReviewMode: "block" });
++    await env.DB.prepare(
++      `INSERT INTO ai_review_cache (repo_full_name, pull_number, head_sha, ai_review_mode, notes, reviewer_count, findings_json, metadata_json, cacheable, published_at, created_at)
++       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
++    )
++      .bind("acme/widgets", 13, "", "block", "held", 1, "[]", "{}", 1, "2026-07-09T00:00:00.000Z", "2026-07-09T00:00:00.000Z")
++      .run();
++
++    expect(await loadPrAiReviewFindings(env, { repoFullName: "acme/widgets", pullNumber: 13, login: "miner1" })).toMatchObject({
++      status: "ready",
++      headSha: null,
++      findings: [],
++    });
++  });
++});
++
++describe("assertContributorOwnsPullRequest", () => {
++  it("accepts a case-insensitive author match and rejects other authors", () => {
++    expect(() => assertContributorOwnsPullRequest("Miner1", "miner1")).not.toThrow();
++    expect(() => assertContributorOwnsPullRequest("other", "miner1")).toThrow(/own pull requests/i);
++    expect(() => assertContributorOwnsPullRequest(null, "miner1")).toThrow(/own pull requests/i);
++  });
++});

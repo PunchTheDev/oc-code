@@ -1,0 +1,146 @@
+diff --git a/meta-programmer/src/meta_programmer/sandbox_manager.py b/meta-programmer/src/meta_programmer/sandbox_manager.py
+index 46382ea..d50eb6c 100644
+--- a/meta-programmer/src/meta_programmer/sandbox_manager.py
++++ b/meta-programmer/src/meta_programmer/sandbox_manager.py
+@@ -29,7 +29,7 @@ class SandboxManager:
+     Sandboxes are isolated, resource-limited containers that:
+     - Have no network access
+     - Run with read-only filesystem
+-    - Have memory and CPU limits
++    - Have memory, CPU, PID, and disk-quota limits
+     - Auto-destroy after execution
+     """
+ 
+@@ -49,6 +49,11 @@ def __init__(self):
+         self.cpu_quota = int(os.environ.get("SANDBOX_CPU_QUOTA", "50000"))  # 50% of one core
+         self.timeout = int(os.environ.get("SANDBOX_TIMEOUT_SECONDS", "30"))
+         self.max_pids = int(os.environ.get("SANDBOX_MAX_PIDS", "100"))
++        # Disk quota for the writable /tmp tmpfs.  The root filesystem is
++        # read-only, so /tmp is the only place a sandboxed process can write.
++        # Capping its size prevents unbounded logging or temp-file creation
++        # from exhausting the host's disk or tmpfs memory pool.
++        self.tmp_size = os.environ.get("SANDBOX_TMP_SIZE", "50M")
+ 
+     @staticmethod
+     def _unavailable(detail: str) -> dict:
+@@ -141,7 +146,7 @@ async def run_tests(
+                     pids_limit=self.max_pids,
+                     detach=True,
+                     remove=True,  # Auto-destroy after completion
+-                    tmpfs={"/tmp": "size=50M"},  # Writable /tmp only
++                    tmpfs={"/tmp": f"size={self.tmp_size}"},  # Writable /tmp with disk quota
+                 )
+             except docker.errors.DockerException as e:
+                 logger.error("Sandbox spawn failed: %s", e)
+diff --git a/meta-programmer/tests/test_sandbox_containment_integration.py b/meta-programmer/tests/test_sandbox_containment_integration.py
+index a01d0a4..594b856 100644
+--- a/meta-programmer/tests/test_sandbox_containment_integration.py
++++ b/meta-programmer/tests/test_sandbox_containment_integration.py
+@@ -162,6 +162,27 @@ def _run(flags: list[str], payload: str) -> subprocess.CompletedProcess[str]:
+     "/tmp:size=50M",
+ ]
+ 
++# Disk-quota test baseline: tmpfs size raised to 200M → 100 MB write succeeds.
++_RELAXED_DISKQUOTA = [
++    "--network",
++    "none",
++    "--read-only",
++    "--cap-drop",
++    "ALL",
++    "--security-opt",
++    "no-new-privileges",
++    "--pids-limit",
++    "100",
++    "--memory",
++    "512m",
++    "--memory-swap",
++    "512m",
++    "--cpus",
++    "0.5",
++    "--tmpfs",
++    "/tmp:size=200M",  # 200 M → 100 MB write succeeds
++]
++
+ # Privilege test baseline: cap_drop and no-new-privileges both absent.
+ _WITHOUT_PRIVDROP = [
+     "--network",
+@@ -213,6 +234,28 @@ def _run(flags: list[str], payload: str) -> subprocess.CompletedProcess[str]:
+     b[i] = 1
+ """
+ 
++# Disk-quota: try to write 100 MB to /tmp (the only writable directory).
++# f.flush() after each 1 MB chunk forces the kernel to account the write
++# against the tmpfs quota immediately rather than buffering it.
++# Exits 0 if OSError (ENOSPC) fires before 100 MB (quota enforced),
++# exits 1 if the full 100 MB is written without error (quota absent/too large).
++_PAYLOAD_DISK = """\
++import sys
++chunk = b"A" * (1024 * 1024)
++written = 0
++try:
++    with open("/tmp/filltest", "wb") as f:
++        for _ in range(100):
++            f.write(chunk)
++            f.flush()
++            written += len(chunk)
++    print(f"wrote {written // (1024 * 1024)} MB without hitting quota", file=sys.stderr)
++    sys.exit(1)
++except OSError as e:
++    print(f"blocked after {written // (1024 * 1024)} MB: {e}", file=sys.stderr)
++    sys.exit(0)
++"""
++
+ # Privileges: read CapBnd and NoNewPrivs from /proc/self/status.
+ # Exit 0 if both guards are enforced (CapBnd=0, NoNewPrivs=1), else exit 1.
+ _PAYLOAD_PRIVILEGES = """\
+@@ -414,3 +457,28 @@ def test_privilege_escalation_prevention():
+         "guarded: --cap-drop ALL must zero CapBnd; "
+         "--security-opt no-new-privileges must set NoNewPrivs=1"
+     )
++
++
++def test_disk_quota_caps_tmpfs_writes():
++    """
++    Guard: --tmpfs /tmp:size=50M.
++    Payload: write 100 MB to /tmp (the only writable path; root FS is read-only).
++    Without guard (tmpfs size=200M): 100 MB write succeeds → payload exits 1.
++    With guard   (tmpfs size=50M):   ENOSPC raised before 100 MB → payload exits 0.
++
++    /tmp is the sole writable location because --read-only makes the root
++    overlay read-only.  Without a tmpfs size cap, a sandboxed process can
++    exhaust the host's RAM-backed tmpfs (or disk) through unbounded logging or
++    temporary-file creation without triggering any of the other guards.
++    """
++    baseline = _run(_RELAXED_DISKQUOTA, _PAYLOAD_DISK)
++    assert baseline.returncode != 0, (
++        "baseline: 100 MB write to /tmp must succeed under --tmpfs /tmp:size=200M "
++        "(payload exits 1 when not blocked by the quota)"
++    )
++
++    guarded = _run(_ALL, _PAYLOAD_DISK)
++    assert guarded.returncode == 0, (
++        "guarded: --tmpfs /tmp:size=50M must raise ENOSPC before 100 MB is written "
++        "(payload exits 0 when the disk quota fires)"
++    )
+diff --git a/sdk/src/activelearning/database.py b/sdk/src/activelearning/database.py
+index 8226c48..aeb8d68 100644
+--- a/sdk/src/activelearning/database.py
++++ b/sdk/src/activelearning/database.py
+@@ -145,7 +145,7 @@ async def execute(
+         params: tuple[Any, ...] = (),
+     ) -> aiosqlite.Cursor:
+         """Execute a SQL statement."""
+-        if not self._connection:
++        if self._connection is None:
+             raise RuntimeError("Database not initialized")
+         return await self._connection.execute(sql, params)
+ 
+@@ -155,7 +155,7 @@ async def executemany(
+         params_list: list[tuple[Any, ...]],
+     ) -> aiosqlite.Cursor:
+         """Execute a SQL statement with multiple parameter sets."""
+-        if not self._connection:
++        if self._connection is None:
+             raise RuntimeError("Database not initialized")
+         return await self._connection.executemany(sql, params_list)
+ 

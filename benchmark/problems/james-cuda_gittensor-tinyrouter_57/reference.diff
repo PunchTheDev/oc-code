@@ -1,0 +1,392 @@
+diff --git a/src/trinity/adapters/__init__.py b/src/trinity/adapters/__init__.py
+index a9dc35f..d3a1525 100644
+--- a/src/trinity/adapters/__init__.py
++++ b/src/trinity/adapters/__init__.py
+@@ -16,7 +16,7 @@
+ """
+ from __future__ import annotations
+ 
+-from .base import BenchmarkAdapter, TaskType
++from .base import BenchmarkAdapter, ScoringMode, TaskType
+ from .benchmarks import (
+     GpqaAdapter,
+     LiveCodeBenchAdapter,
+@@ -33,11 +33,22 @@
+     is_registered,
+     register_adapter,
+ )
++from .scoring import (
++    ScoringOutcome,
++    requires_execution,
++    score_item,
++    supports_execution,
++)
+ from .swebench import PatchReference, SweBenchAdapter, register_swebench_adapter
+ 
+ __all__ = [
+     "BenchmarkAdapter",
+     "TaskType",
++    "ScoringMode",
++    "ScoringOutcome",
++    "score_item",
++    "supports_execution",
++    "requires_execution",
+     "DelegatingBenchmarkAdapter",
+     "Math500Adapter",
+     "MmluAdapter",
+diff --git a/src/trinity/adapters/base.py b/src/trinity/adapters/base.py
+index 76e5124..0951efd 100644
+--- a/src/trinity/adapters/base.py
++++ b/src/trinity/adapters/base.py
+@@ -55,6 +55,31 @@ def __str__(self) -> str:  # pragma: no cover - trivial
+         return self.value
+ 
+ 
++class ScoringMode(str, Enum):
++    """How a benchmark's answers get graded (issue #16).
++
++    Separates two evaluation costs so the pipeline can run each without mixing
++    concerns:
++
++    ``CACHED``
++        Cheap scoring of a stored answer against the reference — a string/letter
++        compare (MMLU, math) or a local sandboxed code run (LiveCodeBench). Runs
++        in the ordinary scoring round.
++    ``EXECUTION``
++        Expensive live execution beyond scoring a stored answer — checking out a
++        repository and running its test harness (SWE-bench). Optional, and run
++        through a dedicated executor rather than the cached round.
++
++    An adapter declares one or both via :meth:`BenchmarkAdapter.scoring_modes`.
++    """
++
++    CACHED = "cached"
++    EXECUTION = "execution"
++
++    def __str__(self) -> str:  # pragma: no cover - trivial
++        return self.value
++
++
+ class BenchmarkAdapter(ABC):
+     """One benchmark, behind a uniform interface.
+ 
+@@ -124,6 +149,41 @@ def score_trajectory(self, traj: "Trajectory") -> float:
+         candidate = committed_answer(self.name, traj)
+         return self.score_output(candidate, traj.task.answer)
+ 
++    # -- Cached vs execution scoring (issue #16) ---------------------------- #
++    def scoring_modes(self) -> frozenset[ScoringMode]:
++        """Return the scoring paths this benchmark supports.
++
++        Defaults to ``{CACHED}`` — the common case (MMLU, math, code) is scored
++        cheaply from a stored answer. A benchmark that also needs a heavyweight
++        run (e.g. SWE-bench) overrides this to add :data:`ScoringMode.EXECUTION`.
++        The top-level dispatcher (:func:`trinity.adapters.scoring.score_item`)
++        reads this to route cheap and expensive benchmarks through one API.
++        """
++        return frozenset({ScoringMode.CACHED})
++
++    def score_cached(self, output: str, reference: Any) -> float:
++        """Cheap cached scoring: grade a stored answer against ``reference``.
++
++        Defaults to :meth:`score_output`, so every existing adapter keeps its
++        current cached behaviour unchanged. This is the path the ordinary scoring
++        round uses.
++        """
++        return self.score_output(output, reference)
++
++    def score_execution(
++        self, output: str, reference: Any, *, context: Any = None
++    ) -> float | None:
++        """Expensive execution scoring, or ``None`` if unavailable.
++
++        Default is ``None`` — most benchmarks do not need live execution. An
++        adapter declaring :data:`ScoringMode.EXECUTION` implements this to grade
++        via a heavyweight run; ``context`` carries whatever that run needs (e.g.
++        a prepared work-tree or an executor callable), supplied by the caller.
++        Returning ``None`` signals "could not execute" so the dispatcher falls
++        back to :meth:`score_cached` instead of guessing.
++        """
++        return None
++
+     def cache_baselines(self, task: "Task", pool: Any) -> dict[str, Any] | None:
+         """Optionally pre-compute per-model baseline answers/scores for ``task``.
+ 
+diff --git a/src/trinity/adapters/scoring.py b/src/trinity/adapters/scoring.py
+new file mode 100644
+index 0000000..71513e4
+--- /dev/null
++++ b/src/trinity/adapters/scoring.py
+@@ -0,0 +1,108 @@
++"""One top-level scoring API over cached and execution benchmarks (issue #16).
++
++The leaderboard / evaluator should grade a submission without knowing whether a
++benchmark is a cheap cached compare (MMLU, math) or an expensive live run
++(SWE-bench). This module is that seam: :func:`score_item` takes any
++:class:`~trinity.adapters.base.BenchmarkAdapter` and routes to the right path
++based on the adapter's declared :meth:`~trinity.adapters.base.BenchmarkAdapter.scoring_modes`,
++so benchmark-specific logic never leaks into the caller.
++
++Routing rule:
++
++* If the adapter supports :data:`ScoringMode.EXECUTION` **and** an
++  ``execution_context`` is supplied, try :meth:`score_execution`; use its result
++  unless it is ``None`` ("could not execute").
++* Otherwise (or on an execution miss) fall back to :meth:`score_cached`, the
++  cheap path every adapter supports by default.
++"""
++from __future__ import annotations
++
++from typing import Any
++
++from .base import BenchmarkAdapter, ScoringMode
++
++__all__ = ["ScoringOutcome", "supports_execution", "requires_execution", "score_item"]
++
++
++class ScoringOutcome:
++    """Result of :func:`score_item`: the reward plus which path produced it.
++
++    ``mode`` is the :class:`ScoringMode` actually used, so the caller can report
++    or meter cheap vs expensive scoring without re-deriving it.
++    """
++
++    __slots__ = ("reward", "mode")
++
++    def __init__(self, reward: float, mode: ScoringMode):
++        self.reward = reward
++        self.mode = mode
++
++    def __repr__(self) -> str:  # pragma: no cover - trivial
++        return f"ScoringOutcome(reward={self.reward}, mode={self.mode.value})"
++
++    def __eq__(self, other: object) -> bool:
++        return (
++            isinstance(other, ScoringOutcome)
++            and other.reward == self.reward
++            and other.mode == self.mode
++        )
++
++
++def supports_execution(adapter: BenchmarkAdapter) -> bool:
++    """Whether ``adapter`` declares the expensive :data:`ScoringMode.EXECUTION` path."""
++    return ScoringMode.EXECUTION in adapter.scoring_modes()
++
++
++def requires_execution(adapter: BenchmarkAdapter) -> bool:
++    """Whether ``adapter`` can *only* be scored by execution (no cached path).
++
++    Lets a pipeline skip such benchmarks in a cheap-only round instead of
++    silently mis-scoring them through the fallback.
++    """
++    modes = adapter.scoring_modes()
++    return ScoringMode.EXECUTION in modes and ScoringMode.CACHED not in modes
++
++
++def score_item(
++    adapter: BenchmarkAdapter,
++    output: str,
++    reference: Any,
++    *,
++    execution_context: Any = None,
++) -> ScoringOutcome:
++    """Grade ``output`` against ``reference`` via ``adapter``'s best available path.
++
++    The single entry point the evaluator uses for every benchmark. Prefers the
++    execution path when the adapter supports it and an ``execution_context`` is
++    given; otherwise (or if execution returns ``None``) uses the cached path.
++
++    Args:
++        adapter: The benchmark's adapter.
++        output: The model's answer (a letter, boxed value, code, or unified diff).
++        reference: The task's reference (``Task.answer``).
++        execution_context: Opaque payload handed to :meth:`score_execution` (e.g.
++            a prepared work-tree or an executor). ``None`` forces the cached path.
++
++    Returns:
++        A :class:`ScoringOutcome` with the binary reward and the mode used.
++
++    Raises:
++        ValueError: If the adapter declares no scoring modes at all.
++    """
++    modes = adapter.scoring_modes()
++    if not modes:
++        raise ValueError(f"adapter {adapter.name!r} declares no scoring modes")
++
++    if execution_context is not None and ScoringMode.EXECUTION in modes:
++        reward = adapter.score_execution(output, reference, context=execution_context)
++        if reward is not None:
++            return ScoringOutcome(float(reward), ScoringMode.EXECUTION)
++
++    if ScoringMode.CACHED in modes:
++        return ScoringOutcome(adapter.score_cached(output, reference), ScoringMode.CACHED)
++
++    # Execution-only adapter with no usable context: fall back to its own
++    # execution scorer without a context (may still return a value) rather than
++    # silently reporting a cached score it does not support.
++    reward = adapter.score_execution(output, reference, context=execution_context)
++    return ScoringOutcome(float(reward or 0.0), ScoringMode.EXECUTION)
+diff --git a/src/trinity/adapters/swebench.py b/src/trinity/adapters/swebench.py
+index aefc592..e28feec 100644
+--- a/src/trinity/adapters/swebench.py
++++ b/src/trinity/adapters/swebench.py
+@@ -30,7 +30,7 @@
+ 
+ from trinity.types import Task
+ 
+-from .base import BenchmarkAdapter, TaskType
++from .base import BenchmarkAdapter, ScoringMode, TaskType
+ from .registry import register_adapter
+ 
+ __all__ = [
+@@ -320,6 +320,25 @@ def build_prompt(self, task: Task) -> str:
+     def score_output(self, output: str, reference: Any) -> float:
+         return score_patch(output, reference)
+ 
++    def scoring_modes(self) -> frozenset[ScoringMode]:
++        # SWE-bench supports BOTH: a cheap cached exact-match (score_cached ->
++        # score_output) and an expensive live run (score_execution) — the
++        # motivating "define one or both" case for #16.
++        return frozenset({ScoringMode.CACHED, ScoringMode.EXECUTION})
++
++    def score_execution(self, output: str, reference: Any, *, context: Any = None) -> float | None:
++        """Grade a patch by live execution when an executor is supplied.
++
++        ``context`` is an executor callable ``(output, reference) -> float`` (e.g.
++        one built on the sandboxed patch runner, #18). Without one, execution is
++        unavailable here and this returns ``None`` so the dispatcher falls back to
++        the cached exact-match path.
++        """
++        if callable(context):
++            result = context(output, reference)
++            return None if result is None else float(result)
++        return None
++
+     def task_type(self) -> TaskType:
+         return TaskType.PATCH
+ 
+diff --git a/tests/test_scoring_modes.py b/tests/test_scoring_modes.py
+new file mode 100644
+index 0000000..e095d6d
+--- /dev/null
++++ b/tests/test_scoring_modes.py
+@@ -0,0 +1,119 @@
++"""Cached vs execution scoring split (issue #16).
++
++One top-level API — :func:`score_item` — grades both a cheap cached benchmark
++(MMLU/math) and an expensive execution benchmark (SWE-bench) without the caller
++knowing which is which. Offline.
++"""
++from __future__ import annotations
++
++from trinity.adapters import (
++    ScoringMode,
++    ScoringOutcome,
++    get_adapter,
++    requires_execution,
++    score_item,
++    supports_execution,
++)
++from trinity.adapters.base import BenchmarkAdapter, TaskType
++
++
++def test_default_adapter_is_cached_only():
++    for name in ("math500", "mmlu", "gpqa", "livecodebench", "mmlu_pro"):
++        modes = get_adapter(name).scoring_modes()
++        assert modes == frozenset({ScoringMode.CACHED})
++        assert not supports_execution(get_adapter(name))
++        assert not requires_execution(get_adapter(name))
++
++
++def test_swebench_declares_both_modes():
++    adapter = get_adapter("swebench_verified")
++    assert adapter.scoring_modes() == frozenset({ScoringMode.CACHED, ScoringMode.EXECUTION})
++    assert supports_execution(adapter)
++    assert not requires_execution(adapter)  # it also has a cached path
++
++
++def test_score_item_cached_path_for_mcq():
++    adapter = get_adapter("mmlu")
++    out = score_item(adapter, "The answer is B.", "B")
++    assert isinstance(out, ScoringOutcome)
++    assert out.reward == 1.0
++    assert out.mode is ScoringMode.CACHED
++    assert score_item(adapter, "The answer is A.", "B").reward == 0.0
++
++
++def test_score_item_falls_back_to_cached_without_context():
++    # SWE-bench supports execution, but with no execution_context the unified API
++    # must use the cached exact-match path, not error.
++    adapter = get_adapter("swebench_verified")
++    ref = {"gold_patch": "diff --git a/x b/x\n+fix\n"}
++    out = score_item(adapter, "diff --git a/x b/x\n+fix\n", ref)
++    assert out.mode is ScoringMode.CACHED
++    assert out.reward == 1.0
++
++
++def test_score_item_uses_execution_when_context_supplied():
++    adapter = get_adapter("swebench_verified")
++    ref = {"gold_patch": "diff --git a/x b/x\n+fix\n"}
++
++    # An injected executor (what the #18 runner plugs in as) reports the patch
++    # resolved regardless of exact-match — proving the execution path is taken.
++    calls = {"n": 0}
++
++    def executor(output, reference):
++        calls["n"] += 1
++        return 1.0
++
++    out = score_item(adapter, "totally different patch", ref, execution_context=executor)
++    assert out.mode is ScoringMode.EXECUTION
++    assert out.reward == 1.0
++    assert calls["n"] == 1
++    # Cached path would have scored this 0.0, so execution genuinely won.
++    assert score_item(adapter, "totally different patch", ref).reward == 0.0
++
++
++def test_execution_miss_falls_back_to_cached():
++    # If the executor returns None ("could not execute"), the dispatcher must
++    # fall back to the cached path rather than reporting None.
++    adapter = get_adapter("swebench_verified")
++    ref = {"gold_patch": "diff --git a/x b/x\n+fix\n"}
++    out = score_item(adapter, "diff --git a/x b/x\n+fix\n", ref, execution_context=lambda o, r: None)
++    assert out.mode is ScoringMode.CACHED
++    assert out.reward == 1.0
++
++
++def test_execution_only_adapter_skips_cached():
++    """An adapter with only EXECUTION is flagged so a cheap round can skip it."""
++
++    class _ExecOnly(BenchmarkAdapter):
++        name = "exec-only"
++
++        def load_tasks(self, split, max_items, seed=0):
++            return []
++
++        def build_prompt(self, task):
++            return task.prompt
++
++        def score_output(self, output, reference):
++            return 0.0
++
++        def task_type(self):
++            return TaskType.PATCH
++
++        def serialize_task(self, task):
++            return {"task_id": task.task_id}
++
++        def scoring_modes(self):
++            return frozenset({ScoringMode.EXECUTION})
++
++        def score_execution(self, output, reference, *, context=None):
++            return 1.0 if output == "good" else 0.0
++
++    adapter = _ExecOnly()
++    assert requires_execution(adapter)
++    # With a context, execution runs.
++    assert score_item(adapter, "good", None, execution_context={}).reward == 1.0
++    # Without a context, an execution-only adapter still routes to execution
++    # (its only path) rather than mis-reporting a cached score.
++    out = score_item(adapter, "good", None)
++    assert out.mode is ScoringMode.EXECUTION
++    assert out.reward == 1.0

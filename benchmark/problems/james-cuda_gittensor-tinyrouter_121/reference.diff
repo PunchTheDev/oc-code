@@ -1,0 +1,263 @@
+diff --git a/src/trinity/optim/fitness.py b/src/trinity/optim/fitness.py
+index c175960..c2c4422 100644
+--- a/src/trinity/optim/fitness.py
++++ b/src/trinity/optim/fitness.py
+@@ -218,8 +218,12 @@ def _task_reward(traj, cfg: FitnessConfig, max_turns: int) -> float:
+     if not cfg.shaping_active:
+         return correct
+     benchmark = (traj.task.benchmark or "").strip().lower()
+-    answer_text = traj.final_answer or ""
+-    has_ans = _reward.has_answer(benchmark, answer_text)
++    # Score the format bonus on the SAME text ``reward.score`` grades — the
++    # committed (non-verifier) answer — so "has an answer" stays consistent with
++    # "can be scored" (see ``reward.has_answer``). Reading ``final_answer`` alone
++    # denied the bonus to a run whose committed answer lived in an earlier turn.
++    committed = _reward.committed_answer(benchmark, traj)
++    has_ans = _reward.has_answer(benchmark, committed)
+     return shaped_reward(
+         int(round(correct)),
+         has_ans,
+diff --git a/src/trinity/orchestration/reward.py b/src/trinity/orchestration/reward.py
+index 5c5c438..35dde0d 100644
+--- a/src/trinity/orchestration/reward.py
++++ b/src/trinity/orchestration/reward.py
+@@ -119,24 +119,73 @@ def _committed_answer(benchmark: str, traj: Trajectory) -> str:
+     """Pick the text to score from a multi-turn trajectory.
+ 
+     ``_final_answer`` (last Worker output) is often a verbose derivation with no
+-    cleanly-extractable answer, while an answer DID appear in some turn. To avoid
+-    throwing away answers the system actually produced, score the MOST RECENT turn
+-    whose output yields an extractable answer for this task type; fall back to
+-    ``final_answer``. This applies equally to TRINITY and the random baseline (the
+-    single-model baseline is one turn, so it is unaffected) — a fair fix, not a thumb
+-    on the scale. See JOURNAL 2026-06-23 (MMLU extraction diagnosis).
++    cleanly-extractable answer, while an answer DID appear in an earlier turn. To
++    avoid throwing away answers the system actually produced, score the most
++    recent turn whose output yields an extractable answer for this task type;
++    fall back to ``final_answer``. This applies equally to TRINITY and the random
++    baseline (the single-model baseline is one turn, so it is unaffected) — a fair
++    fix, not a thumb on the scale. See JOURNAL 2026-06-23 (MMLU extraction).
++
++    Verifier turns are never eligible. A Verifier-ACCEPT run terminates *on* a
++    Verifier turn (see :func:`~trinity.orchestration.session.run_trajectory`), and
++    post-processing is pass-through (:mod:`trinity.roles.postprocess`), so the
++    Verifier's ``processed_output`` keeps its full critique — which routinely
++    mentions a choice letter or number it is only *discussing* ("the worker points
++    at B ... VERDICT: ACCEPT"). Scoring that text would credit or penalise the run
++    for the *checker's* words rather than an answer the solver committed. The
++    scored answer is the last non-verifier ``O_k``, matching
++    :func:`~trinity.orchestration.session._final_answer` and the
++    :func:`_terminating_role` contract. Prefer the most recent Worker turn, then
++    any other non-verifier turn.
+     """
+     key = (benchmark or "").strip().lower()
+     final = traj.final_answer or ""
+-    turns = getattr(traj, "turns", None) or []
+-
+     if has_answer(key, final):
+         return final
++
++    turns = getattr(traj, "turns", None) or []
++    # Worker turns are the answer-producing role; prefer them, then fall back to
++    # any other non-verifier turn (e.g. a Thinker that stated the result).
++    worker = _last_answerful_output(key, turns, role=Role.WORKER)
++    if worker is not None:
++        return worker
++    other = _last_answerful_output(key, turns, role=None)
++    if other is not None:
++        return other
++    return final
++
++
++def _last_answerful_output(
++    benchmark: str, turns: Sequence, *, role: Role | None
++) -> str | None:
++    """Return the newest turn output that carries an extractable answer.
++
++    Scans ``turns`` newest-first and returns the first ``processed_output`` that
++    :func:`has_answer` accepts for ``benchmark``.
++    :attr:`~trinity.types.Role.VERIFIER` turns are always skipped — the Verifier
++    checks the solution, it never sources the committed answer. When ``role`` is
++    given only turns of that role are considered; when ``role`` is ``None`` every
++    non-verifier turn is eligible.
++
++    Args:
++        benchmark: Benchmark identifier (case-insensitive), already lower-cased.
++        turns: The trajectory's turns, oldest-first.
++        role: Restrict to this role, or ``None`` for any non-verifier role.
++
++    Returns:
++        The matching ``processed_output``, or ``None`` when no eligible turn
++        carries an extractable answer.
++    """
+     for tr in reversed(turns):
++        tr_role = getattr(tr, "role", None)
++        if tr_role == Role.VERIFIER:
++            continue
++        if role is not None and tr_role != role:
++            continue
+         txt = getattr(tr, "processed_output", "") or ""
+-        if has_answer(key, txt):
++        if has_answer(benchmark, txt):
+             return txt
+-    return final
++    return None
+ 
+ 
+ def has_answer(benchmark: str, text: str) -> bool:
+diff --git a/tests/test_committed_answer_non_verifier.py b/tests/test_committed_answer_non_verifier.py
+new file mode 100644
+index 0000000..7510016
+--- /dev/null
++++ b/tests/test_committed_answer_non_verifier.py
+@@ -0,0 +1,150 @@
++"""The committed answer is chosen from a non-verifier turn.
++
++A Verifier-ACCEPT trajectory terminates *on* a Verifier turn whose
++post-processed output keeps its full critique (post-processing is pass-through).
++That critique routinely names a choice letter or number it is only *discussing*,
++so scoring it would credit or penalise the run for the checker's words instead of
++an answer the solver committed. ``reward._committed_answer`` must therefore skip
++Verifier turns and read the last non-verifier ``O_k`` — matching
++``session._final_answer`` and the ``_terminating_role`` contract.
++
++Pure / offline / numpy-free — imports only ``trinity.orchestration.reward``.
++"""
++from __future__ import annotations
++
++from trinity.orchestration import reward as R
++from trinity.orchestration.reward import committed_answer, score
++from trinity.types import Role, Task, Trajectory, TurnRecord
++
++
++def _turn(role: Role, text: str, *, verdict: str | None = None) -> TurnRecord:
++    return TurnRecord(
++        turn=0,
++        agent_name="pool-model",
++        role=role,
++        raw_output=text,
++        processed_output=text,
++        verdict=verdict,
++    )
++
++
++def _traj(benchmark: str, answer: str, turns: list[TurnRecord], final: str) -> Trajectory:
++    task = Task(task_id="q", benchmark=benchmark, prompt="p", answer=answer)
++    return Trajectory(task=task, turns=turns, final_answer=final, terminated_by="accept")
++
++
++# ---------------------------------------------------------------------------
++# The bug: a Verifier that discusses a DIFFERENT answer must not be scored.
++# ---------------------------------------------------------------------------
++def test_verifier_wrong_letter_does_not_override_worker_answer():
++    # Worker committed C (gold); a later Worker turn rephrased without a letter,
++    # so final_answer is unparseable; the terminal Verifier mentions B.
++    traj = _traj(
++        "mmlu",
++        "C",
++        turns=[
++            _turn(Role.WORKER, "Answer: C"),
++            _turn(Role.WORKER, "let me reconsider the whole approach"),
++            _turn(Role.VERIFIER, "Answer: B. VERDICT: ACCEPT", verdict="ACCEPT"),
++        ],
++        final="let me reconsider the whole approach",
++    )
++    # The committed answer is the Worker's C, never the Verifier's B.
++    assert committed_answer("mmlu", traj) == "Answer: C"
++    assert score(traj) == 1.0  # was 0.0 when the Verifier turn was scored
++
++
++def test_verifier_gold_letter_does_not_inflate_a_run_with_no_committed_answer():
++    # No worker turn ever produced a parseable letter; only the Verifier names
++    # the gold letter. Reading the Verifier would falsely credit the run.
++    traj = _traj(
++        "mmlu",
++        "C",
++        turns=[
++            _turn(Role.WORKER, "let me reconsider the whole approach"),
++            _turn(Role.VERIFIER, "Answer: C. VERDICT: ACCEPT", verdict="ACCEPT"),
++        ],
++        final="let me reconsider the whole approach",
++    )
++    assert committed_answer("mmlu", traj) == "let me reconsider the whole approach"
++    assert score(traj) == 0.0  # was 1.0 (false positive) when the Verifier was scored
++
++
++def test_math_verifier_number_is_ignored():
++    # Worker boxed 4 (gold); final rephrase drops it; Verifier muses "7".
++    traj = _traj(
++        "math500",
++        "4",
++        turns=[
++            _turn(Role.WORKER, r"so \boxed{4}"),
++            _turn(Role.WORKER, "on reflection I am unsure"),
++            _turn(Role.VERIFIER, "I would have said 7. VERDICT: ACCEPT", verdict="ACCEPT"),
++        ],
++        final="on reflection I am unsure",
++    )
++    assert committed_answer("math500", traj) == r"so \boxed{4}"
++    assert score(traj) == 1.0
++
++
++# ---------------------------------------------------------------------------
++# Fallback ordering: prefer Worker, then any other non-verifier turn.
++# ---------------------------------------------------------------------------
++def test_falls_back_to_thinker_when_no_worker_answer():
++    # Only the Thinker carried a parseable answer; Worker/Verifier did not.
++    traj = _traj(
++        "math500",
++        "9",
++        turns=[
++            _turn(Role.THINKER, r"so \boxed{9}"),
++            _turn(Role.WORKER, "restating the setup only"),
++            _turn(Role.VERIFIER, "sounds right, VERDICT: ACCEPT", verdict="ACCEPT"),
++        ],
++        final="restating the setup only",
++    )
++    assert committed_answer("math500", traj) == r"so \boxed{9}"
++    assert score(traj) == 1.0
++
++
++def test_recovers_worker_answer_past_unparseable_final():
++    # Regression: the original recovery still works when the Verifier has no answer.
++    traj = _traj(
++        "math500",
++        "4",
++        turns=[
++            _turn(Role.WORKER, r"\boxed{4}"),
++            _turn(Role.VERIFIER, "Looks good. VERDICT: ACCEPT", verdict="ACCEPT"),
++        ],
++        final="Looks good. VERDICT: ACCEPT",
++    )
++    assert committed_answer("math500", traj) == r"\boxed{4}"
++    assert score(traj) == 1.0
++
++
++def test_parseable_final_answer_is_used_directly():
++    # When the final answer already parses, it wins with no turn scan.
++    traj = _traj(
++        "mmlu",
++        "A",
++        turns=[_turn(Role.WORKER, "Answer: A")],
++        final="Answer: A",
++    )
++    assert committed_answer("mmlu", traj) == "Answer: A"
++    assert score(traj) == 1.0
++
++
++# ---------------------------------------------------------------------------
++# The shared selector directly.
++# ---------------------------------------------------------------------------
++def test_last_answerful_output_skips_verifier_and_honours_role():
++    turns = [
++        _turn(Role.THINKER, "Answer: A"),
++        _turn(Role.WORKER, "Answer: B"),
++        _turn(Role.VERIFIER, "Answer: D. VERDICT: ACCEPT", verdict="ACCEPT"),
++    ]
++    # role=WORKER -> the Worker's B (Verifier D is never eligible).
++    assert R._last_answerful_output("mmlu", turns, role=Role.WORKER) == "Answer: B"
++    # role=None -> newest non-verifier turn with an answer, i.e. the Worker's B.
++    assert R._last_answerful_output("mmlu", turns, role=None) == "Answer: B"
++    # A verifier-only set yields nothing.
++    only_verifier = [_turn(Role.VERIFIER, "Answer: D. VERDICT: ACCEPT", verdict="ACCEPT")]
++    assert R._last_answerful_output("mmlu", only_verifier, role=None) is None

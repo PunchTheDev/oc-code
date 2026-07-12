@@ -1,0 +1,137 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index 76bcb50..3eda8a1 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -18,6 +18,24 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
+ 
+ ---
+ 
++## 2026-07-09 — MMLU training silently trained on the 2-item toy set  #mistake #repro
++**Context:** issue #44 — auditing the data path for `python -m trinity.train --benchmark mmlu`.
++**Expected:** training draws minibatches from the real MMLU dataset.
++**Actual:** every minibatch came from the 2-item MMLU *toy set*, with no error or warning.
++**Root cause:** `train.py` calls `load_tasks(benchmark, "train", ...)`, and `_load_mmlu_hf`
++passed `split="train"` straight to `load_dataset("cais/mmlu", "all", split="train")`. But
++`cais/mmlu` has no `train` split (only `auxiliary_train`, `dev`, `validation`, `test`), so the
++load raised, `_try_load_hf` swallowed it and returned `None`, and `load_tasks` silently fell
++back to `_toy_tasks("mmlu")`. The load failed even with `datasets`+network available. (Eval is
++fine — it requests `"test"`. GPQA/LCB/math500 use split names that exist or map correctly.)
++**Fix / decision:** add `_mmlu_split_for_split` (mirroring `_lcb_version_for_split`) mapping
++`train` -> `auxiliary_train` (MMLU's designated training pool, same row schema as `test`) and
++passing `test`/`validation`/`dev` through, then route `_load_mmlu_hf` through it. Added
++`tests/test_dataset_mmlu_split.py` (offline) asserting the mapping never yields a non-existent
++split name.
++**Follow-up:** complementary to #7 (fail-loud-on-toy-fallback); this fixes the *reason* the MMLU
++load failed rather than only surfacing it.
++
+ ## 2026-07-09 — Submission eval now batches benchmark items + host alias fixed  #fix #perf #validator
+ **Context:** validator submission eval was still processing benchmark items one by one, and the remote
+ GPU host field used by the worker did not match the config dataclass.
+@@ -47,7 +65,6 @@ HF row parsing, and pass@1 scoring, and update the README to call out LiveCodeBe
+ automatic grader description.
+ **Follow-up:** if we later wire `configs/benchmarks.yaml` into a runtime loader, the module is now in
+ place.
+-
+ ## 2026-07-09 — role prompt assembly unit tests  #decision #repro
+ **Context:** ``roles/prompts.py`` implements SPEC §4.4 system contracts and the
+ ``render_transcript`` / ``build_messages`` helpers used by the inner loop, but had
+@@ -168,6 +185,20 @@ made it fail-safe — a missing/empty choice (or missing `message`) yields an em
+ (`text=""`, `finish_reason="error"`) while still accounting `usage`, mirroring the null-`content`
+ handling. Added `tests/test_pool_parse.py` (7 cases). Scoped to the parsing path only (not the imports)
+ so it stays independent of the separate `import sys` --selftest fix (#25).
++**Follow-up:** none — self-contained client-robustness fix.
++## 2026-07-08 — Remote eval used nonexistent settings.trinity_gpu_host  #mistake #fix
++**Context:** issue #46 reported that validator remote GPU evaluation failed before SSH with
++`AttributeError: 'Settings' object has no attribute 'trinity_gpu_host'`.
++**Expected:** `_remote_attempt()` should read the configured remote host from `Settings.trinity_remote_host`
++(`TRINITY_GPU_HOST` env).
++**Actual:** `eval_runner.py` referenced `settings.trinity_gpu_host`, which is not defined on `Settings`.
++**Root cause:** field rename/typo — config exposes `trinity_remote_host` but the runner still used the old name.
++**Fix / decision:** replaced both `trinity_gpu_host` references in `eval_runner.py` with
++`trinity_remote_host`; added `validator/tests/test_eval_runner_remote_host.py` to assert SSH host resolution
++uses the real Settings field.
++**Follow-up:** none.
++
++
+ ## 2026-07-08 — Remote GPU fallback is now explicit and configurable  #mistake #decision #repro
+ **Context:** issue #21 flagged that validator remote GPU failures could be hidden when execution silently
+ fell back to local CPU and still reported completion.
+diff --git a/src/trinity/orchestration/dataset.py b/src/trinity/orchestration/dataset.py
+index d7aeaeb..7ca15e2 100644
+--- a/src/trinity/orchestration/dataset.py
++++ b/src/trinity/orchestration/dataset.py
+@@ -141,9 +141,27 @@ def _load_math500_hf(split: str) -> list[Task] | None:
+     return tasks or None
+ 
+ 
++def _mmlu_split_for_split(split: str) -> str:
++    """Map a logical split onto a real ``cais/mmlu`` split name.
++
++    ``cais/mmlu`` has NO split named ``train`` — its splits are ``auxiliary_train``
++    (the designated training pool, same row schema as ``test``), ``dev``,
++    ``validation``, and ``test``. Requesting ``split="train"`` (as ``train.py``
++    does) therefore fails to load and silently falls back to the 2-item toy set.
++    Map ``train`` -> ``auxiliary_train`` and pass the real split names through.
++    """
++    s = (split or "").strip().lower()
++    if s in ("train", "auxiliary_train"):
++        return "auxiliary_train"
++    if s in ("dev", "validation", "val"):
++        return "validation" if s.startswith("val") else s
++    # Default / eval / anything else -> the graded test split.
++    return "test"
++
++
+ def _load_mmlu_hf(split: str) -> list[Task] | None:
+     """MMLU loader. answer = correct option LETTER ("A".."D")."""
+-    ds = _try_load_hf("cais/mmlu", name="all", split=split or "test")
++    ds = _try_load_hf("cais/mmlu", name="all", split=_mmlu_split_for_split(split))
+     if ds is None:
+         return None
+     tasks: list[Task] = []
+diff --git a/tests/test_dataset_mmlu_split.py b/tests/test_dataset_mmlu_split.py
+new file mode 100644
+index 0000000..49e991c
+--- /dev/null
++++ b/tests/test_dataset_mmlu_split.py
+@@ -0,0 +1,40 @@
++"""Offline unit tests for MMLU split-name mapping (dataset.py).
++
++Regression coverage for the bug where `train.py` requests the logical split
++"train", which `cais/mmlu` does not have (its training pool is `auxiliary_train`),
++causing the loader to silently fall back to the 2-item toy set. These tests are
++pure (no `datasets`, no network): they check the mapping helper resolves logical
++splits to real MMLU split names.
++"""
++from __future__ import annotations
++
++import pytest
++
++from trinity.orchestration.dataset import _mmlu_split_for_split
++
++# The only split names cais/mmlu (config "all") actually exposes.
++_VALID_MMLU_SPLITS = {"auxiliary_train", "dev", "validation", "test"}
++
++
++@pytest.mark.parametrize(
++    "logical, expected",
++    [
++        ("train", "auxiliary_train"),        # the bug: "train" must not pass through
++        ("auxiliary_train", "auxiliary_train"),
++        ("test", "test"),
++        ("", "test"),                        # default / unspecified -> graded split
++        ("validation", "validation"),
++        ("val", "validation"),
++        ("dev", "dev"),
++        ("TRAIN", "auxiliary_train"),        # case-insensitive
++    ],
++)
++def test_mmlu_split_mapping(logical, expected):
++    assert _mmlu_split_for_split(logical) == expected
++
++
++@pytest.mark.parametrize("logical", ["train", "test", "", "validation", "dev", "auxiliary_train"])
++def test_mmlu_split_always_valid(logical):
++    # Whatever the caller asks for, we must resolve to a split cais/mmlu has,
++    # so the load never fails purely because of a bad split name.
++    assert _mmlu_split_for_split(logical) in _VALID_MMLU_SPLITS

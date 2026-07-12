@@ -1,0 +1,218 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 150b1b5f..03306ade 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -19,6 +19,16 @@ All notable changes to this project are documented here. The format is based on
+   and the gap is reported only when both partitions scored a repo (#208).
+ 
+ ### Fixed
++- Benchmark gates (`benchmark/judge_gate.py`, `benchmark/regression.py`): the order-disagreement
++  recompute accepted an incoherent telemetry block where `disagree > dual_order_tasks` — impossible,
++  since `disagree` is a subset of `dual_order_tasks` (stale/hand-edited data). It produced a rate
++  above 1.0 (`_disagreement_rate_from_telemetry`) and, for a `--generalization` artifact, pooled the
++  fabricated count into a plausible-but-wrong overall rate that could flip `check_regression`'s
++  `no_judge_instability_increase` verdict and block an otherwise-fine candidate. The recompute now
++  requires `0 <= disagree <= dual_order_tasks`; `_disagreement_rate_from_telemetry` falls back to a
++  literal `disagreement_rate` (else `None`) on impossible counts, and `_partition_disagreement_counts`
++  signals the incoherent partition so `_disagreement` fails the pooled rate closed to `None` (the
++  gate then passes vacuously per Spec 016, which is updated to match) (#1283).
+ - Benchmark reporting (`benchmark/judge_wlt.py`): `summarize_judge_wlt` read only the top-level
+   `judge_report`, so a `--generalization` artifact (which nests a report under `tuned`/`held_out`
+   and emits none at the top level) reported `unavailable` for every generalization run — while its
+diff --git a/benchmark/judge_gate.py b/benchmark/judge_gate.py
+index 41c81e69..0f1c7132 100644
+--- a/benchmark/judge_gate.py
++++ b/benchmark/judge_gate.py
+@@ -171,7 +171,12 @@ def _disagreement_rate_from_telemetry(telemetry: dict) -> float | None:
+     disagreements = telemetry.get("disagree")
+     if disagreements is None:
+         disagreements = telemetry.get("disagreements")
+-    if _is_int(dual) and dual > 0 and _is_int(disagreements) and disagreements >= 0:
++    # Only a *coherent* count pair recomputes a rate: ``disagree`` cannot exceed the
++    # ``dual_order_tasks`` it is a subset of. An incoherent block (``disagree > dual``, e.g.
++    # stale/hand-edited telemetry) would otherwise yield a rate above 1.0 and false-fail the
++    # instability gates; treat it as underivable and fall through to the stored rate / None.
++    if (_is_int(dual) and dual > 0 and _is_int(disagreements)
++            and 0 <= disagreements <= dual):
+         return round(disagreements / dual, 3)
+     rate = telemetry.get("disagreement_rate")
+     return round(float(rate), 3) if _is_number(rate) else None
+diff --git a/benchmark/regression.py b/benchmark/regression.py
+index 0357cbd2..0aa7f957 100644
+--- a/benchmark/regression.py
++++ b/benchmark/regression.py
+@@ -102,8 +102,20 @@ def _round(value):
+     return round(float(value), 3) if _is_number(value) else None
+ 
+ 
+-def _partition_disagreement_counts(part: dict) -> tuple[int, int] | None:
+-    """Disagree/dual-order counts from one partition, preferring ``judge_order_stats``."""
++# Sentinel: a partition carried a usable telemetry block whose counts are impossible
++# (``disagree > dual_order_tasks``). Distinct from ``None`` (no usable telemetry at all): a
++# caller pooling partitions must fail the whole rate *closed* on corrupt data rather than
++# silently drop the bad partition and pool the rest.
++_INCOHERENT = object()
++
++
++def _partition_disagreement_counts(part: dict):
++    """Disagree/dual-order counts from one partition, preferring ``judge_order_stats``.
++
++    Returns ``(disagree, dual)`` for a coherent partition, ``None`` when no usable telemetry is
++    present, or :data:`_INCOHERENT` when a telemetry block has impossible counts
++    (``disagree > dual``) — which must not be pooled as a fabricated rate.
++    """
+     part = _dict(part)
+     for telemetry in (_dict(part.get("judge_order_stats")), _dict(part.get("judge_report"))):
+         if not telemetry:
+@@ -119,7 +131,10 @@ def _partition_disagreement_counts(part: dict) -> tuple[int, int] | None:
+         if disagreements is None:
+             disagreements = telemetry.get("disagreements")
+         if _is_int(dual) and dual > 0 and _is_int(disagreements) and disagreements >= 0:
+-            return int(disagreements), int(dual)
++            # ``disagree`` is a subset of ``dual_order_tasks``, so ``disagree > dual`` is
++            # impossible (stale/hand-edited telemetry); signal it rather than return a count
++            # pair that would inflate the pooled rate above 1.0.
++            return _INCOHERENT if disagreements > dual else (int(disagreements), int(dual))
+     return None
+ 
+ 
+@@ -145,6 +160,11 @@ def _disagreement(artifact) -> float | None:
+         total_dual = 0
+         for label in ("tuned", "held_out"):
+             counts = _partition_disagreement_counts(_dict(artifact.get(label)))
++            if counts is _INCOHERENT:
++                # A partition with impossible counts makes the pooled rate uninterpretable;
++                # fail closed to None so `no_judge_instability_increase` passes vacuously
++                # (spec 016) instead of blocking on a fabricated instability rise.
++                return None
+             if counts is None:
+                 continue
+             dis, dual = counts
+diff --git a/specs/016-benchmark-regression/spec.md b/specs/016-benchmark-regression/spec.md
+index c2dcb484..fd9ae9a5 100644
+--- a/specs/016-benchmark-regression/spec.md
++++ b/specs/016-benchmark-regression/spec.md
+@@ -80,7 +80,16 @@ constant.
+   `agree + disagree + tie` when all three are integers, else treat it as absent; it SHALL read the
+   disagreement count from `disagree` or, absent that, `disagreements`; and it SHALL return
+   `(disagreements, dual_order_tasks)` only when `dual_order_tasks` is an integer `> 0` and the
+-  disagreement count is an integer `>= 0`, otherwise `None`.
++  disagreement count is an integer with `0 <= disagreements <= dual_order_tasks`; when a usable
++  block instead has `disagreements > dual_order_tasks` it SHALL return the `_INCOHERENT`
++  sentinel; otherwise `None`.
++- **Incoherent counts (`disagree > dual_order_tasks`):** `disagree` is a subset of
++  `dual_order_tasks`, so `disagree > dual_order_tasks` is impossible telemetry (stale/hand-edited)
++  and would otherwise yield a rate above `1.0`. WHEN a telemetry block has usable integer counts
++  with `disagree > dual_order_tasks` THEN `_disagreement_rate_from_telemetry` SHALL NOT produce a
++  count-based rate (it SHALL fall back to a literal `disagreement_rate` key when present, else
++  `None`), and `_partition_disagreement_counts` SHALL signal `_INCOHERENT` so a pooling caller can
++  fail closed rather than sum a fabricated count.
+ - **Conflicting disagreement sources:** WHEN both `judge_order_stats` and `judge_report` are present
+   and imply **different** disagreement values THEN `judge_order_stats` SHALL win because it is
+   consulted first; `judge_report` SHALL be used only when `judge_order_stats` is absent or yields no
+@@ -93,7 +102,10 @@ constant.
+ - `_disagreement(artifact)` — WHEN the artifact carries both a `tuned` and a `held_out` key THEN it
+   SHALL sum both partitions' disagreement and dual-order counts and return
+   `total_disagree / total_dual` (or `None` when the summed dual-order total is `0`), mirroring the
+-  `disagreement_outlook` partition fix (#1037 / #1041); OTHERWISE it SHALL return the flat rate.
++  `disagreement_outlook` partition fix (#1037 / #1041); a partition with no usable telemetry is
++  skipped, but WHEN **any** partition is `_INCOHERENT` THEN `_disagreement` SHALL return `None` so
++  `no_judge_instability_increase` passes vacuously instead of blocking on a fabricated instability
++  rise; OTHERWISE it SHALL return the flat rate.
+ 
+ ### Gate evaluation (`check_regression`)
+ 
+diff --git a/tests/test_judge_gate.py b/tests/test_judge_gate.py
+index b34b4f68..fcaa6ca5 100644
+--- a/tests/test_judge_gate.py
++++ b/tests/test_judge_gate.py
+@@ -82,6 +82,18 @@ def test_stale_judge_report_disagreement_rate_is_recomputed_from_stats():
+     assert "low_disagreement" in failed_checks(result)
+ 
+ 
++def test_disagreement_rate_from_telemetry_rejects_impossible_counts():
++    # `disagree` is a subset of `dual_order_tasks`, so `disagree > dual` is impossible telemetry
++    # and must not yield a count-based rate above 1.0 (#1283). It falls through to a literal
++    # `disagreement_rate` when present, else None.
++    from benchmark.judge_gate import _disagreement_rate_from_telemetry as rate
++    assert rate({"dual_order_tasks": 5, "disagree": 8}) is None            # impossible -> no rate
++    assert rate({"dual_order_tasks": 5, "disagree": 8, "disagreement_rate": 0.2}) == 0.2  # stored fallback
++    assert rate({"dual_order_tasks": 10, "disagree": 2}) == 0.2            # coherent
++    assert rate({"dual_order_tasks": 5, "disagree": 5}) == 1.0            # boundary: == is coherent
++    assert rate({"dual_order_tasks": 5, "disagree": 0}) == 0.0
++
++
+ # --- multi-repo aggregates omit the top-level judge_dual_order flag -----------------------
+ # A single-repo run states judge_dual_order directly; a run_multi_replay aggregate does not, so
+ # the status is derived from the pooled dual-order task count (judge_report, else
+diff --git a/tests/test_regression.py b/tests/test_regression.py
+index f188ee4f..15a3238c 100644
+--- a/tests/test_regression.py
++++ b/tests/test_regression.py
+@@ -117,6 +117,40 @@ def test_disagreement_falls_back_to_report_when_stats_absent():
+     assert _disagreement(art) == 0.25
+ 
+ 
++def test_incoherent_partition_makes_pooled_disagreement_none():
++    # #1283: `disagree` is a subset of `dual_order_tasks`, so `disagree > dual` is impossible
++    # telemetry. Pooling it (8/5) would fabricate a rate; the whole pooled rate must be None so
++    # the gate fails closed rather than block a candidate on invented instability.
++    from benchmark.regression import _INCOHERENT, _disagreement, _partition_disagreement_counts
++    gen = {"tuned":    {"judge_order_stats": {"dual_order_tasks": 5, "disagree": 8}},   # impossible
++           "held_out": {"judge_order_stats": {"dual_order_tasks": 10, "disagree": 1}}}
++    assert _disagreement(gen) is None
++    # A coherent generalization artifact still pools correctly (6 / 20 = 0.3).
++    ok = {"tuned":    {"judge_order_stats": {"dual_order_tasks": 10, "disagree": 2}},
++          "held_out": {"judge_order_stats": {"dual_order_tasks": 10, "disagree": 4}}}
++    assert _disagreement(ok) == 0.3
++    # The three return states of the partition helper.
++    assert _partition_disagreement_counts({"judge_order_stats": {"dual_order_tasks": 5, "disagree": 8}}) is _INCOHERENT
++    assert _partition_disagreement_counts({"judge_order_stats": {"dual_order_tasks": 10, "disagree": 2}}) == (2, 10)
++    assert _partition_disagreement_counts({}) is None
++    # Boundary: disagree == dual is coherent (rate exactly 1.0), not incoherent.
++    assert _partition_disagreement_counts({"judge_order_stats": {"dual_order_tasks": 5, "disagree": 5}}) == (5, 5)
++
++
++def test_incoherent_partition_does_not_block_a_candidate():
++    # End-to-end: a candidate whose only defect is an impossible partition is NOT failed on a
++    # fabricated instability rise — no_judge_instability_increase passes vacuously (rate is None).
++    baseline = {"tuned": {"composite_mean": 0.60, "scored_repos": 2,
++                          "judge_order_stats": {"dual_order_tasks": 50, "disagree": 2}},
++                "held_out": {"composite_mean": 0.55, "scored_repos": 2}}
++    candidate = {"tuned": {"composite_mean": 0.70, "scored_repos": 2,
++                           "judge_order_stats": {"dual_order_tasks": 5, "disagree": 8}},  # impossible
++                 "held_out": {"composite_mean": 0.65, "scored_repos": 2}}
++    result = check_regression(candidate, baseline, max_disagreement_increase=0.1)
++    trust = next(c for c in result["checks"] if c["name"] == "no_judge_instability_increase")
++    assert trust["passed"] is True
++
++
+ def test_judge_instability_only_compared_when_both_report_it():
+     # One run judged single-order (no disagreement rate) -> the judge check passes vacuously.
+     result = check_regression(_run(0.60, disagreement=0.9), _run(0.60))   # baseline has none
+diff --git a/tests/test_spec_016_regression.py b/tests/test_spec_016_regression.py
+index 683e89ca..9868a5b3 100644
+--- a/tests/test_spec_016_regression.py
++++ b/tests/test_spec_016_regression.py
+@@ -180,6 +180,21 @@ def test_partition_counts_none_when_dual_missing_or_zero():
+         {"judge_order_stats": {"dual_order_tasks": 0, "disagree": 0}}) is None
+ 
+ 
++def test_partition_counts_signal_incoherent_and_disagreement_fails_closed():
++    # Spec: `disagree > dual_order_tasks` is impossible telemetry -> _partition_disagreement_counts
++    # returns the _INCOHERENT sentinel (distinct from None), and _disagreement fails the whole
++    # pooled rate closed to None rather than inventing a rate above 1.0.
++    from benchmark.regression import _INCOHERENT
++    assert _partition_disagreement_counts(
++        {"judge_order_stats": {"dual_order_tasks": 5, "disagree": 8}}) is _INCOHERENT
++    # Boundary: disagree == dual is coherent (rate 1.0), not incoherent.
++    assert _partition_disagreement_counts(
++        {"judge_order_stats": {"dual_order_tasks": 5, "disagree": 5}}) == (5, 5)
++    gen = {"tuned":    {"judge_order_stats": {"dual_order_tasks": 5, "disagree": 8}},
++           "held_out": {"judge_order_stats": {"dual_order_tasks": 10, "disagree": 1}}}
++    assert _disagreement(gen) is None
++
++
+ def test_conflicting_sources_stats_wins():
+     # Finding 1a: when judge_order_stats and judge_report DISAGREE, judge_order_stats wins because
+     # it is consulted first (a stale judge_report is ignored, mirroring check_judge).

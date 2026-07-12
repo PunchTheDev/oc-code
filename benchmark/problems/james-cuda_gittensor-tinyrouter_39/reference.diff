@@ -1,0 +1,243 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index 07110e6..025b8bc 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -18,6 +18,20 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
+ 
+ ---
+ 
++## 2026-07-10 — The default seed (0) made every CMA-ES run irreproducible  #mistake #gotcha #repro
++**Context:** `sep_cmaes.py` opens with "Thin, **deterministic** wrapper around the `cma` library" and documents `seed` as "RNG seed for reproducible sampling". Checking that claim before relying on it for receipt reproduction.
++**Expected:** `SepCMAES(n, seed=0)` twice in a row samples the same first population.
++**Actual:** it does not. Only *non-zero* seeds are honoured:
++```
++seed=0: identical first population? False   <-- the default everywhere
++seed=1: identical first population? True
++```
++**Root cause:** pycma special-cases the value. `cma.CMAOptions.defaults()["seed"]` documents itself as *"random number seed for `numpy.random`; `None` and `0` equate to `time`, `np.nan` means 'do nothing'"*. So `opts["seed"] = 0` means **seed from the clock**. And `0` was the default at every level: `SepCMAES(seed=0)`, `run(seed=0)`, `trinity.train --seed default=0`, and the class's own usage example on line 72. What hid it is that the *other* consumers of `args.seed` really are deterministic — `load_tasks(seed=...)` and `gen_rng = random.Random(seed*100000 + gen)` — so a re-run draws the same tasks in the same order and only the CMA-ES trajectory silently diverges. It looks reproducible until the fitness curve differs.
++**Fix / decision:** stop forwarding the seed to pycma. Pass `np.nan` (pycma's documented "do nothing") and call `np.random.seed(self.seed)` ourselves, since numpy treats `0` as an ordinary seed. This is behavior-preserving: pycma implements an honoured `seed=k` as exactly `np.random.seed(k)`, verified by a test that reconstructs the reference stream directly from `cma.CMAEvolutionStrategy` — so every previously-working seed keeps its byte-identical stream and archived fitness curves stay reproducible. `0` simply joins them. Rejected the tempting one-liner `seed or 1`, which would silently alias seeds 0 and 1 onto one stream (pinned by `test_zero_and_one_are_not_aliased`). Seeds outside `[0, 2**32-1]` now raise instead of reaching numpy.
++**Follow-up:** the wrapper still seeds the **global** `numpy.random` state — that is unchanged from before (pycma did it too), but it means constructing a `SepCMAES` perturbs unrelated numpy randomness in the process. Isolating it behind a `np.random.Generator` / pycma's `randn` option is worth doing separately. Also relevant to the receipt gate in `pr_eval.py`: a "plausible CMA-ES fitness curve" is only re-derivable now that the default seed is honoured.
++
++---
++
+ ## 2026-07-10 — Hidden-benchmark cached answers used a bare prompt, not the WORKER turn  #mistake #finding #decision
+ 
+ **Context:** `scripts/build_benchmark.py::_cache_answers` pre-computes each pool
+diff --git a/src/trinity/optim/sep_cmaes.py b/src/trinity/optim/sep_cmaes.py
+index 80b9a25..1550271 100644
+--- a/src/trinity/optim/sep_cmaes.py
++++ b/src/trinity/optim/sep_cmaes.py
+@@ -16,6 +16,10 @@
+   zeros vector is used if ``x0`` is None.
+ * ``sigma0 = 0.1`` by default; the coordinator L2-normalizes the hidden state so
+   this step size stays well-behaved at the W=0 start.
++* Sampling is reproducible for **every** seed in ``[0, 2**32 - 1]``. pycma treats
++  a ``seed`` option of ``0``/``None`` as "seed from the clock", so this wrapper
++  seeds ``numpy.random`` itself and disables pycma's own seeding rather than
++  forwarding the value (see ``_PYCMA_SEED_DISABLED``).
+ 
+ This module imports no torch and runs on CPU only. The expensive fitness
+ function (real SLM + real pool LLMs) is injected by the caller via :func:`run`
+@@ -28,6 +32,20 @@
+ 
+ import numpy as np
+ 
++_MAX_NUMPY_SEED: int = 2**32 - 1
++
++# pycma's own doc for its `seed` option reads:
++#     "random number seed for `numpy.random`; `None` and `0` equate to `time`,
++#      `np.nan` means 'do nothing'"
++# So handing pycma our seed directly would make `seed=0` -- the default at every
++# level of this repo -- a wall-clock seed, silently destroying reproducibility.
++# Instead we pass NaN ("do nothing") and seed numpy ourselves. pycma implements an
++# honoured integer seed as exactly `np.random.seed(seed)`, so every seed it used to
++# accept keeps its byte-identical sampling stream; only `0` changes, from
++# clock-seeded to deterministic like any other value.
++_PYCMA_SEED_DISABLED: float = float("nan")
++
++
+ def _import_cma():
+     """Import pycma lazily, so this module (and trinity.optim) imports cleanly on
+     boxes without `cma` — it is only needed when an optimizer is actually built."""
+@@ -96,14 +114,22 @@ def __init__(
+                 a non-zero identity start is desired).
+             popsize: Population size ``lambda``. If None, computed via
+                 :func:`default_popsize` (n=13312 -> 33).
+-            seed: RNG seed for reproducible sampling.
++            seed: RNG seed for reproducible sampling. Every value in
++                ``[0, 2**32 - 1]`` is honoured, ``0`` included; two optimizers
++                built with the same seed sample identical populations. Seeding
++                sets the global ``numpy.random`` state.
+             maxiter: Maximum number of generations ``T`` (TRINITY default 60).
+ 
+         Raises:
+-            ValueError: If ``x0`` is provided with a shape other than ``(n,)``.
++            ValueError: If ``x0`` is provided with a shape other than ``(n,)``,
++                or if ``seed`` is outside ``[0, 2**32 - 1]``.
+         """
+         if n < 1:
+             raise ValueError(f"n must be >= 1, got {n}")
++        if not 0 <= int(seed) <= _MAX_NUMPY_SEED:
++            raise ValueError(
++                f"seed must be in [0, {_MAX_NUMPY_SEED}], got {seed}"
++            )
+         self.n: int = int(n)
+         self.sigma0: float = float(sigma0)
+         self.seed: int = int(seed)
+@@ -122,14 +148,20 @@ def __init__(
+         # `verbose=-9` silences pycma's stdout/file logging. Strategy constants
+         # (c_sigma, d_sigma, c_1, c_mu, mu, recombination weights) all use the
+         # library's separable defaults per docs/SPEC.md §5.3.
++        #
++        # Seeding: pycma would reinterpret seed 0 as "seed from the clock", so we
++        # seed numpy ourselves and tell pycma to leave the RNG alone (see
++        # `_PYCMA_SEED_DISABLED`). This mutates the global numpy RNG exactly as
++        # pycma already did for an honoured seed -- no new global side effect.
+         opts = {
+             "CMA_diagonal": True,
+             "popsize": self._popsize,
+-            "seed": self.seed,
++            "seed": _PYCMA_SEED_DISABLED,
+             "maxiter": self.maxiter,
+             "verbose": -9,
+         }
+         cma = _import_cma()
++        np.random.seed(self.seed)
+         self._es = cma.CMAEvolutionStrategy(list(x0_vec), self.sigma0, opts)
+ 
+         # Track the best-so-far in MAXIMIZATION space (so callers never see the
+@@ -252,7 +284,8 @@ def run(
+         sigma0: Initial step size.
+         x0: Initial mean vector of shape ``(n,)``; defaults to ``zeros(n)``.
+         popsize: Population size ``lambda``; defaults to :func:`default_popsize`.
+-        seed: RNG seed.
++        seed: RNG seed. Honoured for every value in ``[0, 2**32 - 1]``, so two
++            runs with the same seed follow the same trajectory.
+         maxiter: Maximum number of generations ``T``.
+         verbose: If True, print a one-line summary per generation.
+ 
+diff --git a/tests/test_sep_cmaes_seed.py b/tests/test_sep_cmaes_seed.py
+new file mode 100644
+index 0000000..ed308d0
+--- /dev/null
++++ b/tests/test_sep_cmaes_seed.py
+@@ -0,0 +1,119 @@
++"""Seed determinism for the separable CMA-ES wrapper.
++
++Regression cover for the bug where ``SepCMAES(seed=0)`` -- the default at every
++level of the repo -- sampled from a wall-clock seed. pycma documents its ``seed``
++option as: *"`None` and `0` equate to `time`, `np.nan` means 'do nothing'"*, so
++forwarding a literal ``0`` opted the "deterministic wrapper" out of determinism.
++
++The fix seeds ``numpy.random`` directly and passes NaN to pycma. Because pycma
++implements an honoured integer seed as exactly ``np.random.seed(seed)``, streams
++for previously-working seeds must be unchanged -- that invariant is pinned by
++``test_nonzero_seed_stream_matches_pycmas_own_seeding`` below.
++"""
++from __future__ import annotations
++
++import numpy as np
++import pytest
++
++from trinity.optim.sep_cmaes import SepCMAES, run
++
++cma = pytest.importorskip("cma", reason="pycma is required to build SepCMAES")
++
++_N = 6
++
++
++def _first_population(seed: int) -> np.ndarray:
++    return np.asarray(SepCMAES(n=_N, sigma0=0.1, seed=seed, popsize=5).ask())
++
++
++# --------------------------------------------------------------------------- #
++# The bug: seed=0 must be reproducible
++# --------------------------------------------------------------------------- #
++def test_default_seed_is_reproducible():
++    """The regression: seed 0 previously drew a clock-seeded population."""
++    assert np.allclose(_first_population(0), _first_population(0))
++
++
++def test_default_seed_is_actually_zero():
++    """Guard the default, since the bug only bit because the default was 0."""
++    assert SepCMAES(n=_N).seed == 0
++
++
++def test_constructor_default_matches_explicit_zero():
++    a = np.asarray(SepCMAES(n=_N, sigma0=0.1, popsize=5).ask())
++    b = _first_population(0)
++    assert np.allclose(a, b)
++
++
++@pytest.mark.parametrize("seed", [0, 1, 7, 12345, 2**32 - 1])
++def test_every_seed_is_reproducible(seed):
++    assert np.allclose(_first_population(seed), _first_population(seed))
++
++
++def test_distinct_seeds_give_distinct_populations():
++    """Determinism must not collapse the seed space onto one stream."""
++    assert not np.allclose(_first_population(0), _first_population(1))
++    assert not np.allclose(_first_population(1), _first_population(2))
++
++
++def test_zero_and_one_are_not_aliased():
++    """A naive `seed or 1` fix would silently alias these two."""
++    assert not np.allclose(_first_population(0), _first_population(1))
++
++
++# --------------------------------------------------------------------------- #
++# Backwards compatibility: seeds pycma already honoured keep their exact stream
++# --------------------------------------------------------------------------- #
++@pytest.mark.parametrize("seed", [1, 7, 12345])
++def test_nonzero_seed_stream_matches_pycmas_own_seeding(seed):
++    """pycma's honoured `seed=k` is `np.random.seed(k)`; we must reproduce it.
++
++    This pins the claim that the fix is behavior-preserving for any seed that
++    already worked -- archived fitness curves stay reproducible.
++    """
++    np.random.seed(seed)
++    reference = cma.CMAEvolutionStrategy(
++        [0.0] * _N,
++        0.1,
++        {"CMA_diagonal": True, "popsize": 5, "seed": np.nan, "verbose": -9},
++    )
++    expected = np.asarray(reference.ask())
++
++    assert np.allclose(_first_population(seed), expected)
++
++
++# --------------------------------------------------------------------------- #
++# Seed validation
++# --------------------------------------------------------------------------- #
++@pytest.mark.parametrize("bad", [-1, -12345, 2**32])
++def test_out_of_range_seed_is_rejected(bad):
++    with pytest.raises(ValueError, match="seed must be in"):
++        SepCMAES(n=_N, seed=bad)
++
++
++def test_seed_is_recorded_verbatim():
++    assert SepCMAES(n=_N, seed=4321).seed == 4321
++
++
++# --------------------------------------------------------------------------- #
++# End-to-end: `run` follows the same trajectory twice
++# --------------------------------------------------------------------------- #
++def _sphere(theta: np.ndarray) -> float:
++    """Deterministic synthetic fitness (maximized), as in smoke test S7."""
++    return -float(np.sum(np.square(theta)))
++
++
++def test_run_is_reproducible_at_the_default_seed():
++    best_a, fit_a, hist_a = run(_sphere, n=_N, sigma0=0.1, seed=0, maxiter=3, popsize=5)
++    best_b, fit_b, hist_b = run(_sphere, n=_N, sigma0=0.1, seed=0, maxiter=3, popsize=5)
++
++    assert np.allclose(best_a, best_b)
++    assert fit_a == fit_b
++    assert [h["best_fitness"] for h in hist_a] == [h["best_fitness"] for h in hist_b]
++
++
++def test_run_diverges_across_seeds():
++    _, _, hist_a = run(_sphere, n=_N, sigma0=0.1, seed=0, maxiter=3, popsize=5)
++    _, _, hist_b = run(_sphere, n=_N, sigma0=0.1, seed=1, maxiter=3, popsize=5)
++
++    assert [h["best_fitness"] for h in hist_a] != [h["best_fitness"] for h in hist_b]

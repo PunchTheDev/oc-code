@@ -1,0 +1,185 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index cd6c540..3597b05 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -18,6 +18,25 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
+ 
+ ---
+ 
++## 2026-07-11 — Audit random-routing baseline was non-reproducible (shared rng under asyncio.gather)  #mistake #finding #decision
++
++**Context:** `scripts/audit_eval.py` is the SEALED, run-once "honest, ungameable"
++number. Its random-routing baseline averages 100 seeds; each seed fans all tasks
++out through `asyncio.gather`.
++**Expected:** a fixed seed → a byte-reproducible `random_routing` score.
++**Actual:** it wasn't. `_RandomAuditPolicy` held one shared `self.rng` and every
++concurrently-gathered trajectory drew from it, so turn-2+ routing draws were
++consumed in **network-completion order**, not seed order — the exact bug
++`trinity.eval.RandomPolicy` was already fixed for (via `task_rng(seed, task_id)`),
++but the audit script kept the old shared-rng form.
++**Root cause:** `decide` used `self.rng` and ignored the per-trajectory `rng`
++`run_trajectory` passes through; the audit loop never supplied one.
++**Fix / decision:** mirror `trinity.eval` — `decide` draws from the passed `rng`
++(instance rng only as a fallback), and the loop passes `rng=task_rng(seed_s,
++t.task_id)` per trajectory. Covered by `tests/test_audit_random_routing_seed.py`.
++**Follow-up:** the audit "held-out" guarantee is soft (samples train w/ a diff seed,
++not a provably-disjoint partition) — a larger, separate change.
++
+ ## 2026-07-10 — A null `usage` block crashed a successful inference call  #mistake #gotcha
+ **Context:** hardening `llm/openrouter_client.py` after #72 fixed the `content: null` case, to see whether the same present-but-null trap existed elsewhere in the response parsing.
+ **Expected:** a 200-OK response with `"usage": null` records zero tokens and returns the completion.
+diff --git a/scripts/audit_eval.py b/scripts/audit_eval.py
+index 6e981e2..3ac6caa 100644
+--- a/scripts/audit_eval.py
++++ b/scripts/audit_eval.py
+@@ -24,6 +24,7 @@
+ import argparse
+ import asyncio
+ import json
++import random
+ from pathlib import Path
+ from statistics import mean
+ 
+@@ -77,7 +78,7 @@ async def run_audit(args) -> dict:
+ 
+     # SPEC §1.3.4: budget-match the baselines to TRINITY, else the `best_single`
+     # comparison below is decided partly on token budget rather than on routing.
+-    from trinity.eval import single_model_budget
++    from trinity.eval import single_model_budget, task_rng
+ 
+     single_max_tokens = single_model_budget(args.max_tokens, args.max_turns)
+     print(f"[audit] budget-matched baselines: single-model max_tokens="
+@@ -127,17 +128,20 @@ async def one(task):
+     print(f"  TRINITY (trained)        = {s_trinity:.4f}")
+ 
+     # --- Random routing baseline (100 seeds) ---
+-    import random as _random
++    # Each trajectory draws from its OWN (seed, task_id)-seeded rng, so the
++    # baseline is invariant to asyncio scheduling. A single rng shared across the
++    # concurrently-gathered trajectories would consume draws in network-completion
++    # order, making the "sealed" audit number non-reproducible (mirrors the fix in
++    # trinity.eval.RandomPolicy / task_rng).
++    rand_policy = _RandomAuditPolicy(n_models)
+     rand_scores = []
+     for s in range(100):
+-        rng = _random.Random(_AUDIT_SEED * 10000 + s)
++        seed_s = _AUDIT_SEED * 10000 + s
+         async with httpx.AsyncClient() as cli:
+             rt = await asyncio.gather(*[
+                 run_trajectory(
+-                    t,
+-                    _RandomAuditPolicy(n_models, rng),
+-                    pool, pool_models, sample=False,
+-                    client=cli, **run_kwargs,
++                    t, rand_policy, pool, pool_models, sample=False,
++                    rng=task_rng(seed_s, t.task_id), client=cli, **run_kwargs,
+                 )
+                 for t in tasks
+             ])
+@@ -173,16 +177,24 @@ async def one(task):
+ 
+ 
+ class _RandomAuditPolicy:
+-    """Random routing — no GPU needed, no trinity imports."""
++    """Random routing — no GPU needed, no trinity imports.
+ 
+-    def __init__(self, n_models: int, rng):
++    ``decide`` draws from the per-trajectory ``rng`` that ``run_trajectory`` passes
++    through, so the routing choices depend only on ``(seed, task_id)`` and never on
++    asyncio scheduling. A shared instance rng consumed by concurrently-gathered
++    trajectories would make the audit's random baseline non-reproducible; the
++    instance rng is only a fallback for direct calls without a per-trajectory rng.
++    """
++
++    def __init__(self, n_models: int, rng: random.Random | None = None):
+         from trinity.types import ROLE_ORDER
+         self.n_models = n_models
+-        self.rng = rng
++        self.rng = rng if rng is not None else random.Random(0)
+         self._roles = ROLE_ORDER
+ 
+     def decide(self, transcript_text, *, sample=False, rng=None):
+-        return self.rng.randrange(self.n_models), self.rng.choice(self._roles)
++        r = rng if rng is not None else self.rng
++        return r.randrange(self.n_models), r.choice(self._roles)
+ 
+ 
+ def main() -> None:
+diff --git a/tests/test_audit_random_routing_seed.py b/tests/test_audit_random_routing_seed.py
+new file mode 100644
+index 0000000..4c04302
+--- /dev/null
++++ b/tests/test_audit_random_routing_seed.py
+@@ -0,0 +1,72 @@
++"""The audit's random-routing baseline must depend on (seed, task_id), not on
++asyncio scheduling.
++
++`run_audit` fans every task out through `asyncio.gather`. If all trajectories share
++one policy rng, the turn-2+ draws are consumed in network-completion order, so the
++"sealed", supposedly-reproducible audit number for `random_routing` varies run to
++run. `_RandomAuditPolicy.decide` now draws from the per-trajectory rng that
++`run_trajectory` passes through (seeded by `task_rng(seed, task_id)`); these tests
++pin that contract. No torch/network needed — the policy is pure.
++"""
++import importlib.util
++import sys
++from pathlib import Path
++
++_REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(_REPO / "src"))
++sys.path.insert(0, str(_REPO / "scripts"))
++
++_SCRIPT = _REPO / "scripts" / "audit_eval.py"
++_spec = importlib.util.spec_from_file_location("audit_eval", _SCRIPT)
++audit_eval = importlib.util.module_from_spec(_spec)
++sys.modules["audit_eval"] = audit_eval
++_spec.loader.exec_module(audit_eval)
++
++from trinity.eval import task_rng  # noqa: E402
++
++_RandomAuditPolicy = audit_eval._RandomAuditPolicy
++
++
++def _sequence(policy, task_id, seed, n=5):
++    """Simulate one trajectory's per-turn decisions from its own seeded rng."""
++    rng = task_rng(seed, task_id)
++    return [policy.decide("", rng=rng) for _ in range(n)]
++
++
++def test_decide_uses_the_passed_rng_and_is_deterministic():
++    policy = _RandomAuditPolicy(3)
++    # Same (seed, task_id) -> identical decision sequence, regardless of the
++    # instance's own rng state.
++    assert _sequence(policy, "taskA", seed=42) == _sequence(policy, "taskA", seed=42)
++
++
++def test_baseline_is_invariant_to_task_ordering():
++    policy = _RandomAuditPolicy(3)
++    task_ids = ["q0", "q1", "q2", "q3"]
++    seed = 314159265 * 10000
++
++    forward = {tid: _sequence(policy, tid, seed) for tid in task_ids}
++    reverse = {tid: _sequence(policy, tid, seed) for tid in reversed(task_ids)}
++
++    # Each task owns its rng, so a task's decisions never depend on when other
++    # concurrently-gathered tasks ran.
++    assert forward == reverse
++
++
++def test_passed_rng_overrides_the_instance_rng():
++    import random
++
++    a = _RandomAuditPolicy(3, rng=random.Random(1))
++    b = _RandomAuditPolicy(3, rng=random.Random(999))
++    # Different instance rngs, but the per-call rng decides -> identical result.
++    assert a.decide("", rng=random.Random(7)) == b.decide("", rng=random.Random(7))
++
++
++def test_agent_and_role_are_in_range():
++    from trinity.types import ROLE_ORDER
++
++    policy = _RandomAuditPolicy(3)
++    for _ in range(50):
++        agent, role = policy.decide("", rng=task_rng(1, "q"))
++        assert 0 <= agent < 3
++        assert role in ROLE_ORDER

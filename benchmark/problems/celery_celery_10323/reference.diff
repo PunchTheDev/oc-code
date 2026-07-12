@@ -1,0 +1,137 @@
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index cc2d87bded..decb0b0ffe 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -8,7 +8,7 @@
+ import sys
+ import time
+ import warnings
+-from collections import namedtuple
++from collections import deque, namedtuple
+ from datetime import timedelta
+ from functools import partial
+ from weakref import WeakValueDictionary
+@@ -207,7 +207,9 @@ def mark_as_failure(self, task_id, exc,
+                 chain_data = iter(request.chain)
+             except (AttributeError, TypeError):
+                 chain_data = tuple()
+-            for chain_elem in chain_data:
++            chain_elems = deque(chain_data)
++            while chain_elems:
++                chain_elem = chain_elems.popleft()
+                 # Reconstruct a `Context` object for the chained task which has
+                 # enough information to for backends to work with
+                 chain_elem_ctx = Context(chain_elem)
+@@ -227,16 +229,24 @@ def mark_as_failure(self, task_id, exc,
+                 # that we mark something as being complete as avoid stalling.
+                 if (
+                     store_result and state in states.PROPAGATE_STATES and
+-                    chain_elem_ctx.task_id is not None
++                    chain_elem_ctx.id is not None
+                 ):
+                     self.store_result(
+-                        chain_elem_ctx.task_id, exc, state,
++                        chain_elem_ctx.id, exc, state,
+                         traceback=traceback, request=chain_elem_ctx,
+                     )
+                 # If the chain element is a member of a chord, we also need
+                 # to call `on_chord_part_return()` as well to avoid stalls.
+                 if 'chord' in chain_elem_ctx.options:
+                     self.on_chord_part_return(chain_elem_ctx, state, exc)
++                # A chord step completes only when its body does, so the
++                # result that later steps and any enclosing chord wait on is
++                # the chord body, not the chord's own id. Descend into it so
++                # the failure reaches that result (see issue #9674).
++                if getattr(chain_elem_ctx, 'subtask_type', None) == 'chord':
++                    chord_body = (chain_elem_ctx.kwargs or {}).get('body')
++                    if chord_body is not None:
++                        chain_elems.append(chord_body)
+             # And finally we'll fire any errbacks
+             if call_errbacks and request.errbacks:
+                 self._call_task_errbacks(request, exc, traceback)
+diff --git a/t/integration/test_canvas.py b/t/integration/test_canvas.py
+index 5f605af6eb..42fd182f81 100644
+--- a/t/integration/test_canvas.py
++++ b/t/integration/test_canvas.py
+@@ -10,7 +10,7 @@
+ from celery import chain, chord, group, signature
+ from celery.backends.base import BaseKeyValueStoreBackend
+ from celery.canvas import StampingVisitor
+-from celery.exceptions import ImproperlyConfigured, TimeoutError
++from celery.exceptions import ChordError, ImproperlyConfigured, TimeoutError
+ from celery.result import AsyncResult, GroupResult, ResultSet
+ from celery.signals import before_task_publish, task_received
+ 
+@@ -3331,6 +3331,40 @@ def test_chord_error_in_nested_chain_does_not_crash(self, manager, caplog):
+             "chord_error_from_stack crashed with 'task_id must not be empty'"
+         )
+ 
++    @flaky
++    def test_chord_unlock_with_failed_task_in_nested_chain_member(self, manager):
++        """A failed task in a nested chain header member must error the chord.
++
++        Regression test for https://github.com/celery/celery/issues/9674
++        When a chord header member is a chain whose first task fails, the
++        chord waits on the body of the chain's uplifted chord. The failure
++        has to reach that body or chord_unlock retries without bound and
++        the callback never runs.
++        """
++        try:
++            manager.app.backend.ensure_chords_allowed()
++        except NotImplementedError as e:
++            raise pytest.skip(e.args[0])
++
++        c = chain(
++            group(
++                identity.si(1),
++                chain(
++                    fail.si(),
++                    group(identity.si(2), identity.si(3)),
++                    identity.si(4),
++                ),
++            ),
++            identity.s(),
++        )
++        result = c.apply_async()
++
++        # Without the fix chord_unlock retries without bound and this raises a
++        # TimeoutError (so keep this timeout small for fast failures); the fix
++        # propagates the failure so the chord errors.
++        with pytest.raises((ExpectedException, ChordError)):
++            result.get(timeout=TIMEOUT / 10)
++
+ 
+ class test_signature_serialization:
+     """
+diff --git a/t/unit/backends/test_base.py b/t/unit/backends/test_base.py
+index e1cacdd1e3..943813188d 100644
+--- a/t/unit/backends/test_base.py
++++ b/t/unit/backends/test_base.py
+@@ -635,6 +635,27 @@ def test_mark_as_failure__chord(self):
+         b.mark_as_failure('id', exc, request=request)
+         b.on_chord_part_return.assert_called_with(request, states.FAILURE, exc)
+ 
++    def test_mark_as_failure__chained_chord_propagates_to_body(self):
++        b = BaseBackend(app=self.app)
++        b.store_result = Mock()
++        b.on_chord_part_return = Mock()
++
++        inner_chord = chord(
++            group([signature('test.h1'), signature('test.h2')]),
++            signature('test.body', immutable=True),
++            app=self.app,
++        )
++        inner_chord.options['task_id'] = 'inner-chord-id'
++        inner_chord.body.options['task_id'] = 'chord-body-id'
++
++        request = Context()
++        request.chain = [dict(inner_chord)]
++        request.errbacks = []
++        b.mark_as_failure('fail-id', ValueError('boom'), request=request)
++
++        marked = [c.args[0] for c in b.store_result.call_args_list]
++        assert 'chord-body-id' in marked
++
+     def test_mark_as_revoked__chord(self):
+         b = BaseBackend(app=self.app)
+         b._store_result = Mock()

@@ -1,0 +1,687 @@
+diff --git a/CHANGES/12889.bugfix.rst b/CHANGES/12889.bugfix.rst
+new file mode 100644
+index 00000000000..96f4592888d
+--- /dev/null
++++ b/CHANGES/12889.bugfix.rst
+@@ -0,0 +1,5 @@
++``TraceConfig.on_response_chunk_received`` now fires for every chunk returned from
++``ClientResponse.content`` read methods (``read``, ``readany``, ``readchunk``,
++``readuntil``, ``read_nowait``, ``iter_chunked``, ``iter_any``, ``iter_chunks``).
++Previously the signal only fired once from ``ClientResponse.read()`` with the entire
++body, and direct ``.content`` access bypassed tracing entirely -- by :user:`Dreamsorcerer`.
+diff --git a/aiohttp/client_reqrep.py b/aiohttp/client_reqrep.py
+index 6c5501e61b1..197ff592bd1 100644
+--- a/aiohttp/client_reqrep.py
++++ b/aiohttp/client_reqrep.py
+@@ -57,7 +57,7 @@
+     HttpVersion11,
+     StreamWriter,
+ )
+-from .streams import StreamReader
++from .streams import EMPTY_PAYLOAD, StreamReader
+ from .typedefs import DEFAULT_JSON_DECODER, JSONDecoder, RawHeaders
+ 
+ try:
+@@ -496,6 +496,9 @@ async def start(self, connection: "Connection") -> "ClientResponse":
+         # payload
+         self.content = payload
+ 
++        if self._traces and payload is not EMPTY_PAYLOAD:
++            payload._on_chunk_received = self._on_chunk_response_received
++
+         # cookies
+         if cookie_hdrs := self.headers._md.getall(hdrs.SET_COOKIE, ()):
+             # Store raw cookie headers for CookieJar
+@@ -600,8 +603,14 @@ def _cleanup_writer(self) -> None:
+     def _notify_content(self) -> None:
+         content = self.content
+         # content can be None here, but the types are cheated elsewhere.
+-        if content and content.exception() is None:  # type: ignore[truthy-bool]
+-            set_exception(content, _CONNECTION_CLOSED_EXCEPTION)
++        if content:  # type: ignore[truthy-bool]
++            if content.exception() is None:
++                set_exception(content, _CONNECTION_CLOSED_EXCEPTION)
++            # The bound method installed in start() captures self, creating a
++            # response→payload→method→self cycle. Clear it eagerly so the
++            # response is reclaimable without waiting for cycle GC.
++            if content._on_chunk_received is not None:
++                content._on_chunk_received = None
+         self._released = True
+ 
+     async def wait_for_close(self) -> None:
+@@ -617,15 +626,19 @@ async def wait_for_close(self) -> None:
+                     raise
+         self.release()
+ 
++    async def _on_chunk_response_received(self, chunk: bytes) -> None:
++        try:
++            for trace in self._traces:
++                await trace.send_response_chunk_received(self.method, self.url, chunk)
++        except BaseException:
++            self.close()
++            raise
++
+     async def read(self) -> bytes:
+         """Read response payload."""
+         if self._body is None:
+             try:
+                 self._body = await self.content.read()
+-                for trace in self._traces:
+-                    await trace.send_response_chunk_received(
+-                        self.method, self.url, self._body
+-                    )
+             except BaseException:
+                 self.close()
+                 raise
+diff --git a/aiohttp/streams.py b/aiohttp/streams.py
+index 72d26e607d7..cdd365cada3 100644
+--- a/aiohttp/streams.py
++++ b/aiohttp/streams.py
+@@ -2,7 +2,7 @@
+ import collections
+ import sys
+ import warnings
+-from collections.abc import Awaitable, Callable
++from collections.abc import Awaitable, Callable, Coroutine
+ from typing import Final, Generic, TypeVar
+ 
+ from .base_protocol import BaseProtocol
+@@ -101,6 +101,7 @@ class StreamReader:
+         "_timer",
+         "_eof_callbacks",
+         "_eof_counter",
++        "_on_chunk_received",
+         "total_bytes",
+         "total_compressed_bytes",
+     )
+@@ -134,6 +135,9 @@ def __init__(
+         self._timer = TimerNoop() if timer is None else timer
+         self._eof_callbacks: list[Callable[[], None]] = []
+         self._eof_counter = 0
++        self._on_chunk_received: (
++            Callable[[bytes], Coroutine[None, None, None]] | None
++        ) = None
+         self.total_bytes = 0
+         self.total_compressed_bytes: int | None = None
+ 
+@@ -363,6 +367,14 @@ async def _wait(self, func_name: str) -> None:
+         finally:
+             self._waiter = None
+ 
++    async def _fire_chunk_received(self, chunk: bytes) -> None:
++        cb = self._on_chunk_received
++        assert cb is not None
++        # Run under the same per-stream timer that _wait() uses, so a hung
++        # trace handler is bounded by sock_read just like a hung socket read would be.
++        with self._timer:
++            await cb(chunk)
++
+     async def readline(self, *, max_line_length: int | None = None) -> bytes:
+         return await self.readuntil(max_size=max_line_length)
+ 
+@@ -403,6 +415,8 @@ async def readuntil(
+             if not_enough:
+                 await self._wait("readuntil")
+ 
++        if chunk and self._on_chunk_received is not None:
++            await self._fire_chunk_received(chunk)
+         return chunk
+ 
+     async def read(self, n: int = -1) -> bytes:
+@@ -414,6 +428,7 @@ async def read(self, n: int = -1) -> bytes:
+ 
+         if n < 0:
+             # Reading everything — remove decompression chunk limit.
++            # readany() fires the chunk hook for each block.
+             self.set_read_chunk_size(sys.maxsize)
+             blocks = []
+             while True:
+@@ -430,7 +445,10 @@ async def read(self, n: int = -1) -> bytes:
+         while not self._buffer and not self._eof:
+             await self._wait("read")
+ 
+-        return self._read_nowait(n)
++        chunk = self._read_nowait(n)
++        if chunk and self._on_chunk_received is not None:
++            await self._fire_chunk_received(chunk)
++        return chunk
+ 
+     async def readany(self) -> bytes:
+         if self._exception is not None:
+@@ -442,7 +460,10 @@ async def readany(self) -> bytes:
+         while not self._buffer and not self._eof:
+             await self._wait("readany")
+ 
+-        return self._read_nowait(-1)
++        chunk = self._read_nowait(-1)
++        if chunk and self._on_chunk_received is not None:
++            await self._fire_chunk_received(chunk)
++        return chunk
+ 
+     async def readchunk(self) -> tuple[bytes, bool]:
+         """Returns a tuple of (data, end_of_http_chunk).
+@@ -461,14 +482,20 @@ async def readchunk(self) -> tuple[bytes, bool]:
+                 if pos == self._cursor:
+                     return (b"", True)
+                 if pos > self._cursor:
+-                    return (self._read_nowait(pos - self._cursor), True)
++                    chunk = self._read_nowait(pos - self._cursor)
++                    if chunk and self._on_chunk_received is not None:
++                        await self._fire_chunk_received(chunk)
++                    return (chunk, True)
+                 internal_logger.warning(
+                     "Skipping HTTP chunk end due to data "
+                     "consumption beyond chunk boundary"
+                 )
+ 
+             if self._buffer:
+-                return (self._read_nowait_chunk(-1), False)
++                chunk = self._read_nowait_chunk(-1)
++                if chunk and self._on_chunk_received is not None:
++                    await self._fire_chunk_received(chunk)
++                return (chunk, False)
+                 # return (self._read_nowait(-1), False)
+ 
+             if self._eof:
+@@ -506,7 +533,13 @@ def read_nowait(self, n: int = -1) -> bytes:
+                 "Called while some coroutine is waiting for incoming data."
+             )
+ 
+-        return self._read_nowait(n)
++        chunk = self._read_nowait(n)
++        if chunk and (cb := self._on_chunk_received) is not None:
++            # read_nowait is sync but the hook is async; schedule it so the
++            # observability event still fires.
++            # TODO: Save and await this task.
++            asyncio.create_task(cb(chunk))  # type: ignore[unused-awaitable]
++        return chunk
+ 
+     def _read_nowait_chunk(self, n: int) -> bytes:
+         first_buffer = self._buffer[0]
+@@ -570,6 +603,19 @@ def __init__(self) -> None:
+         self._read_eof_chunk = False
+         self.total_bytes = 0
+ 
++    # Shadow the inherited slot with a property so the EMPTY_PAYLOAD singleton
++    # can't be polluted with a per-response hook that would leak across
++    # requests. EmptyStreamReader never delivers a chunk anyway.
++    @property
++    def _on_chunk_received(self) -> None:
++        return None
++
++    @_on_chunk_received.setter
++    def _on_chunk_received(
++        self, value: Callable[[bytes], Coroutine[None, None, None]] | None
++    ) -> None:
++        raise AttributeError("EmptyStreamReader._on_chunk_received is read-only")
++
+     def __repr__(self) -> str:
+         return "<%s>" % self.__class__.__name__
+ 
+diff --git a/docs/tracing_reference.rst b/docs/tracing_reference.rst
+index 21a28042702..528dc62bae7 100644
+--- a/docs/tracing_reference.rst
++++ b/docs/tracing_reference.rst
+@@ -237,6 +237,15 @@ Classes
+ 
+       .. versionadded:: 3.1
+ 
++      .. versionchanged:: 4.0
++
++         The signal now fires for every chunk returned from
++         ``ClientResponse.content``. Previously it only fired once from
++         :meth:`ClientResponse.read` with the full body, and direct
++         ``.content`` access did not fire it at all. For the synchronous
++         :meth:`StreamReader.read_nowait` the hook runs as a scheduled task,
++         not inline.
++
+    .. attribute:: on_request_redirect
+ 
+       Property that gives access to the signals that will be executed when a
+diff --git a/tests/test_client_response.py b/tests/test_client_response.py
+index 6288cc23a37..6f3fe961db3 100644
+--- a/tests/test_client_response.py
++++ b/tests/test_client_response.py
+@@ -19,7 +19,6 @@
+ from aiohttp.connector import Connection
+ from aiohttp.helpers import HeadersDictProxy, TimerNoop
+ from aiohttp.multipart import BadContentDispositionHeader
+-from aiohttp.tracing import Trace
+ 
+ 
+ class WriterMock(mock.AsyncMock):
+@@ -1385,49 +1384,6 @@ def test_redirect_history_in_exception() -> None:
+     assert (hist_response,) == cm.value.history
+ 
+ 
+-async def test_response_read_triggers_callback(session: ClientSession) -> None:
+-    loop = asyncio.get_running_loop()
+-    trace = mock.create_autospec(Trace, instance=True, spec_set=True)
+-    response_method = "get"
+-    response_url = URL("http://def-cl-resp.org")
+-    response_body = b"This is response"
+-
+-    response = ClientResponse(
+-        response_method,
+-        response_url,
+-        writer=WriterMock(),
+-        continue100=None,
+-        timer=TimerNoop(),
+-        loop=loop,
+-        session=session,
+-        traces=[trace],
+-        request_headers=CIMultiDict[str](),
+-        original_url=response_url,
+-        stream_writer=mock.create_autospec(
+-            AbstractStreamWriter, spec_set=True, instance=True
+-        ),
+-    )
+-
+-    def side_effect(*args: object, **kwargs: object) -> "asyncio.Future[bytes]":
+-        fut = loop.create_future()
+-        fut.set_result(response_body)
+-        return fut
+-
+-    h = {"Content-Type": "application/json;charset=cp1251"}
+-    response._headers = HeadersDictProxy(CIMultiDict(h))
+-    content = response.content = mock.Mock()
+-    content.read.side_effect = side_effect
+-
+-    res = await response.read()
+-    assert res == response_body
+-    assert response._connection is None
+-
+-    assert trace.send_response_chunk_received.called
+-    assert trace.send_response_chunk_received.call_args == mock.call(
+-        response_method, response_url, response_body
+-    )
+-
+-
+ def test_response_cookies(
+     event_loop: asyncio.AbstractEventLoop, session: ClientSession
+ ) -> None:
+diff --git a/tests/test_client_session.py b/tests/test_client_session.py
+index 1d6381a442f..2bdc4dfea0b 100644
+--- a/tests/test_client_session.py
++++ b/tests/test_client_session.py
+@@ -1038,6 +1038,107 @@ async def on_request_headers_sent(
+             assert gathered_req_headers["Custom-Header"] == "Custom value"
+ 
+ 
++async def test_response_chunk_received_via_content(
++    aiohttp_client: AiohttpClient,
++) -> None:
++    body = b"x" * 4096
++
++    async def handler(request: web.Request) -> web.StreamResponse:
++        resp = web.StreamResponse()
++        resp.content_length = len(body)
++        await resp.prepare(request)
++        await resp.write(body)
++        return resp
++
++    chunks: list[bytes] = []
++
++    async def on_response_chunk_received(
++        session: object,
++        context: object,
++        params: tracing.TraceResponseChunkReceivedParams,
++    ) -> None:
++        chunks.append(params.chunk)
++
++    trace_config = aiohttp.TraceConfig()
++    trace_config.on_response_chunk_received.append(on_response_chunk_received)
++
++    app = web.Application()
++    app.router.add_get("/", handler)
++    client = await aiohttp_client(app, trace_configs=[trace_config])
++
++    async with client.get("/") as resp:
++        async for _ in resp.content.iter_chunked(512):
++            pass
++        # Hook must fire per chunk delivered to the caller; together they
++        # must concatenate to the full body.
++        assert chunks
++        assert b"".join(chunks) == body
++
++
++async def test_response_chunk_received_hook_cleared_on_release(
++    aiohttp_client: AiohttpClient,
++) -> None:
++    async def handler(request: web.Request) -> web.Response:
++        return web.Response(body=b"x" * 256)
++
++    async def on_response_chunk_received(
++        session: object,
++        context: object,
++        params: tracing.TraceResponseChunkReceivedParams,
++    ) -> None:
++        assert False
++
++    trace_config = aiohttp.TraceConfig()
++    trace_config.on_response_chunk_received.append(on_response_chunk_received)
++
++    app = web.Application()
++    app.router.add_get("/", handler)
++    client = await aiohttp_client(app, trace_configs=[trace_config])
++
++    resp = await client.get("/")
++    assert resp.content._on_chunk_received is not None
++    resp.release()
++    assert resp.content._on_chunk_received is None
++
++    resp = await client.get("/")  # type: ignore[unreachable]
++    assert resp.content._on_chunk_received is not None
++    resp.close()
++    assert resp.content._on_chunk_received is None
++
++
++async def test_response_chunk_received_trace_failure_closes_response(
++    aiohttp_client: AiohttpClient,
++) -> None:
++    """A raising trace handler must tear down the response from .content too."""
++    body = b"x" * 4096
++
++    async def handler(request: web.Request) -> web.StreamResponse:
++        resp = web.StreamResponse()
++        resp.content_length = len(body)
++        await resp.prepare(request)
++        await resp.write(body)
++        return resp
++
++    async def on_response_chunk_received(
++        session: object,
++        context: object,
++        params: tracing.TraceResponseChunkReceivedParams,
++    ) -> None:
++        raise RuntimeError("boom")
++
++    trace_config = aiohttp.TraceConfig()
++    trace_config.on_response_chunk_received.append(on_response_chunk_received)
++
++    app = web.Application()
++    app.router.add_get("/", handler)
++    client = await aiohttp_client(app, trace_configs=[trace_config])
++
++    async with client.get("/") as resp:
++        with pytest.raises(RuntimeError, match="boom"):
++            await resp.content.readany()
++        assert resp.closed
++
++
+ async def test_request_tracing_url_params(aiohttp_client: AiohttpClient) -> None:
+     async def root_handler(request: web.Request) -> web.Response:
+         return web.Response()
+@@ -1163,7 +1264,8 @@ def to_url(path: str) -> URL:
+             assert to_trace_urls(on_request_end) == [to_url("/?x=0")]
+             assert to_trace_urls(on_request_exception) == []
+             assert to_trace_urls(on_request_chunk_sent) == []
+-            assert to_trace_urls(on_response_chunk_received) == [to_url("/?x=0")]
++            # Empty response body: no chunks are delivered to the caller.
++            assert to_trace_urls(on_response_chunk_received) == []
+             assert to_trace_urls(on_request_headers_sent) == [to_url("/?x=0")]
+ 
+     # Redirect
+@@ -1179,7 +1281,7 @@ def to_url(path: str) -> URL:
+             assert to_trace_urls(on_request_end) == [to_url("/")]
+             assert to_trace_urls(on_request_exception) == []
+             assert to_trace_urls(on_request_chunk_sent) == []
+-            assert to_trace_urls(on_response_chunk_received) == [to_url("/")]
++            assert to_trace_urls(on_response_chunk_received) == []
+             assert to_trace_urls(on_request_headers_sent) == [
+                 to_url("/redirect?x=0"),
+                 to_url("/"),
+diff --git a/tests/test_streams.py b/tests/test_streams.py
+index fce10a4ec14..eef6dfe242c 100644
+--- a/tests/test_streams.py
++++ b/tests/test_streams.py
+@@ -5,7 +5,7 @@
+ import gc
+ import types
+ from collections import defaultdict
+-from collections.abc import Iterator, Sequence
++from collections.abc import Callable, Coroutine, Iterator, Sequence
+ from itertools import groupby
+ from typing import TypeVar
+ from unittest import mock
+@@ -14,7 +14,7 @@
+ 
+ from aiohttp import streams
+ from aiohttp.base_protocol import BaseProtocol
+-from aiohttp.helpers import DEFAULT_CHUNK_SIZE
++from aiohttp.helpers import DEFAULT_CHUNK_SIZE, TimerContext
+ from aiohttp.http_exceptions import LineTooLong
+ 
+ DATA: bytes = b"line1\nline2\nline3\n"
+@@ -1104,6 +1104,210 @@ async def test_unread_empty(self) -> None:
+         assert stream.at_eof()
+ 
+ 
++class TestStreamReaderChunkHook:
++    """Cover the _on_chunk_received hook used to fan out chunks to client tracing."""
++
++    def _make_one(
++        self, cb: Callable[[bytes], Coroutine[None, None, None]] | None = None
++    ) -> tuple[streams.StreamReader, list[bytes]]:
++        protocol = mock.create_autospec(
++            BaseProtocol, spec_set=True, instance=True, _reading_paused=False
++        )
++        stream = streams.StreamReader(
++            protocol, DEFAULT_CHUNK_SIZE, loop=asyncio.get_running_loop()
++        )
++        seen: list[bytes] = []
++        if cb is None:
++
++            async def cb(chunk: bytes) -> None:
++                seen.append(chunk)
++
++        stream._on_chunk_received = cb
++        return stream, seen
++
++    async def test_readany_fires(self) -> None:
++        stream, seen = self._make_one()
++
++        async def feed_in_two_steps() -> None:
++            stream.feed_data(b"abc")
++            await asyncio.sleep(0)
++            stream.feed_data(b"def")
++
++        # Feed blocks one at a time, with readany() between, so each block
++        # is returned separately rather than drained together.
++        feeder = asyncio.create_task(feed_in_two_steps())
++        assert await stream.readany() == b"abc"
++        assert await stream.readany() == b"def"
++        await feeder
++        stream.feed_eof()
++        assert await stream.readany() == b""
++        assert seen == [b"abc", b"def"]
++
++    async def test_read_n_fires(self) -> None:
++        stream, seen = self._make_one()
++        stream.feed_data(b"abcdef")
++        stream.feed_eof()
++
++        assert await stream.read(3) == b"abc"
++        assert await stream.read(3) == b"def"
++        assert seen == [b"abc", b"def"]
++
++    async def test_read_all_fires_via_readany(self) -> None:
++        # read(-1) loops through readany(); the hook fires per readany() call,
++        # not per fed block (pre-fed buffer is drained in one shot).
++        stream, seen = self._make_one()
++        stream.feed_data(b"abc")
++        stream.feed_data(b"def")
++        stream.feed_eof()
++
++        assert await stream.read() == b"abcdef"
++        assert seen == [b"abcdef"]
++
++    async def test_readchunk_data_fires(self) -> None:
++        stream, seen = self._make_one()
++        stream.feed_data(b"abc")
++        stream.feed_eof()
++
++        data, end = await stream.readchunk()
++        assert (data, end) == (b"abc", False)
++        assert seen == [b"abc"]
++
++    async def test_readchunk_http_chunk_eof_does_not_fire(self) -> None:
++        # After the final http chunk, readchunk returns (b"", False) at EOF;
++        # that empty terminator must not fire the hook.
++        stream, seen = self._make_one()
++        stream.begin_http_chunk_receiving()
++        stream.feed_data(b"abc")
++        stream.end_http_chunk_receiving()
++        stream.feed_eof()
++
++        assert await stream.readchunk() == (b"abc", True)
++        assert await stream.readchunk() == (b"", False)
++        assert seen == [b"abc"]
++
++    async def test_readuntil_fires(self) -> None:
++        stream, seen = self._make_one()
++        stream.feed_data(b"line1\nline2\n")
++        stream.feed_eof()
++
++        assert await stream.readuntil() == b"line1\n"
++        assert await stream.readuntil() == b"line2\n"
++        assert seen == [b"line1\n", b"line2\n"]
++
++    async def test_readline_fires_once(self) -> None:
++        # readline chains through readuntil — must not double-fire.
++        stream, seen = self._make_one()
++        stream.feed_data(b"line1\n")
++        stream.feed_eof()
++
++        assert await stream.readline() == b"line1\n"
++        assert seen == [b"line1\n"]
++
++    async def test_readexactly_fires_via_read(self) -> None:
++        # readexactly chains through read(n) — each underlying read fires once.
++        stream, seen = self._make_one()
++        stream.feed_data(b"abcdef")
++        stream.feed_eof()
++
++        assert await stream.readexactly(6) == b"abcdef"
++        assert seen == [b"abcdef"]
++
++    async def test_empty_buffer_eof_does_not_fire(self) -> None:
++        stream, seen = self._make_one()
++        stream.feed_eof()
++
++        assert await stream.read() == b""
++        assert await stream.readany() == b""
++        assert await stream.readchunk() == (b"", False)
++        assert seen == []
++
++    async def test_iter_chunked_fires(self) -> None:
++        stream, seen = self._make_one()
++        stream.feed_data(b"abcdef")
++        stream.feed_eof()
++
++        collected = [chunk async for chunk in stream.iter_chunked(3)]
++        assert b"".join(collected) == b"abcdef"
++        assert b"".join(seen) == b"abcdef"
++
++    async def test_iter_any_fires(self) -> None:
++        # _read_nowait(-1) drains the buffer in a single call, so two
++        # pre-fed blocks come back as one chunk.
++        stream, seen = self._make_one()
++        stream.feed_data(b"abc")
++        stream.feed_data(b"def")
++        stream.feed_eof()
++
++        collected = [chunk async for chunk in stream.iter_any()]
++        assert collected == [b"abcdef"]
++        assert seen == [b"abcdef"]
++
++    async def test_iter_chunks_fires(self) -> None:
++        stream, seen = self._make_one()
++        stream.begin_http_chunk_receiving()
++        stream.feed_data(b"abc")
++        stream.end_http_chunk_receiving()
++        stream.begin_http_chunk_receiving()
++        stream.feed_data(b"def")
++        stream.end_http_chunk_receiving()
++        stream.feed_eof()
++
++        collected = [chunk async for chunk, _ in stream.iter_chunks()]
++        assert b"".join(collected) == b"abcdef"
++        assert seen == [b"abc", b"def"]
++
++    async def test_hook_runs_under_stream_timer(self) -> None:
++        # The per-stream timer (driven by sock_read) must bound the trace
++        # call, not just the wait for incoming bytes.
++        loop = asyncio.get_running_loop()
++        timer = TimerContext(loop)
++        protocol = mock.create_autospec(
++            BaseProtocol, spec_set=True, instance=True, _reading_paused=False
++        )
++        stream = streams.StreamReader(
++            protocol, DEFAULT_CHUNK_SIZE, timer=timer, loop=loop
++        )
++
++        async def cb(chunk: bytes) -> None:
++            await asyncio.sleep(60)  # simulate a hung exporter
++
++        stream._on_chunk_received = cb
++        stream.feed_data(b"abc")
++        stream.feed_eof()
++
++        async def fire_timeout() -> None:
++            await asyncio.sleep(0)
++            timer.timeout()
++
++        timeout_task = asyncio.create_task(fire_timeout())
++        with pytest.raises(asyncio.TimeoutError):
++            await stream.readany()
++        await timeout_task
++
++    async def test_read_nowait_fires_via_task(self) -> None:
++        # read_nowait is sync; the hook is async. The fire is scheduled,
++        # so it lands on the next event loop tick — not before read_nowait
++        # has returned.
++        stream, seen = self._make_one()
++        stream.feed_data(b"abc")
++
++        assert stream.read_nowait() == b"abc"
++        assert seen == []
++        await asyncio.sleep(0)
++        assert seen == [b"abc"]
++
++    async def test_hook_exception_propagates(self) -> None:
++        async def cb(chunk: bytes) -> None:
++            raise RuntimeError("boom")
++
++        stream, _ = self._make_one(cb)
++        stream.feed_data(b"abc")
++        stream.feed_eof()
++
++        with pytest.raises(RuntimeError, match="boom"):
++            await stream.readany()
++
++
+ async def test_empty_stream_reader() -> None:
+     s = streams.EmptyStreamReader()
+     assert str(s) is not None
+@@ -1134,6 +1338,20 @@ async def test_empty_stream_reader_iter_chunks() -> None:
+         await iter_chunks.__anext__()
+ 
+ 
++async def test_empty_stream_reader_on_chunk_received_is_read_only() -> None:
++    # EMPTY_PAYLOAD is a module-level singleton; allowing per-response hooks
++    # to be installed on it would leak across requests.
++    assert streams.EMPTY_PAYLOAD._on_chunk_received is None
++
++    async def cb(chunk: bytes) -> None:
++        assert False
++
++    with pytest.raises(AttributeError, match="read-only"):
++        streams.EMPTY_PAYLOAD._on_chunk_received = cb
++    # Singleton state untouched after the failed assignment.
++    assert streams.EMPTY_PAYLOAD._on_chunk_received is None
++
++
+ @pytest.fixture
+ async def buffer() -> streams.DataQueue[bytes]:
+     return streams.DataQueue(asyncio.get_running_loop())

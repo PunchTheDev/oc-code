@@ -1,0 +1,2815 @@
+diff --git a/client/src/App.tsx b/client/src/App.tsx
+index c6bf74f091..b5b301c0d6 100644
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -33,6 +33,7 @@ const DraftPodPage = lazy(() => import("./pages/DraftPodPage").then((m) => ({ de
+ const DraftSpectatorPage = lazy(() =>
+   import("./pages/DraftSpectatorPage").then((m) => ({ default: m.DraftSpectatorPage })),
+ );
++const ReplayPage = lazy(() => import("./pages/ReplayPage").then((m) => ({ default: m.ReplayPage })));
+ 
+ function DevStrict({ children }: { children: ReactNode }) {
+   if (!import.meta.env.DEV) return children;
+@@ -121,6 +122,7 @@ function AppContent() {
+             <Route path="/draft-spectator" element={<DraftSpectatorPage />} />
+           </Route>
+           <Route path="/game/:id" element={<GameRouteElement />} />
++          <Route path="/replay" element={<ReplayPage />} />
+         </Routes>
+       </Suspense>
+       </ErrorBoundary>
+diff --git a/client/src/adapter/engine-worker-client.ts b/client/src/adapter/engine-worker-client.ts
+index 6330f98bbe..5531f7e073 100644
+--- a/client/src/adapter/engine-worker-client.ts
++++ b/client/src/adapter/engine-worker-client.ts
+@@ -11,6 +11,7 @@ import type {
+   GameState,
+   LegalActionsResult,
+   MatchConfig,
++  ReplayHeader,
+   SubmitResult,
+   ViewerSnapshot,
+ } from "./types";
+@@ -378,6 +379,50 @@ export class EngineWorkerClient {
+     return this.request<BracketEstimate | null>({ type: "estimateBracketForDeck", deck });
+   }
+ 
++  // ── Replay system ──────────────────────────────────────────────────────
++  // Recording (hasReplayRecording / exportReplayLog) reads the in-progress
++  // recording WASM auto-starts alongside the live game. Playback
++  // (loadReplayForPlayback / replaySeek / replayLength / replayHeader /
++  // clearReplayPlayback) is independent of the live game entirely — a
++  // `ReplayAdapter` typically owns its own `EngineWorkerClient` instance so
++  // viewing a replay never touches an in-progress game's worker.
++
++  async hasReplayRecording(): Promise<boolean> {
++    return this.request<boolean>({ type: "hasReplayRecording" });
++  }
++
++  /** Serialize the current game's replay recording, suitable for downloading. */
++  async exportReplayLog(): Promise<string> {
++    return this.request<string>({ type: "exportReplayLog" });
++  }
++
++  /** Load a replay (the JSON `exportReplayLog` produced) for scrubbing. Returns the recorded action count. */
++  async loadReplayForPlayback(replayJson: string): Promise<number> {
++    return this.request<number>({ type: "loadReplayForPlayback", replayJson });
++  }
++
++  async replayLength(): Promise<number> {
++    return this.request<number>({ type: "replayLength" });
++  }
++
++  async replayHeader(): Promise<ReplayHeader | null> {
++    return this.request<ReplayHeader | null>({ type: "replayHeader" });
++  }
++
++  /**
++   * Seek the loaded replay to `target` (clamped to its length). Returns the
++   * raw `{ state, derived }` wire envelope (or `null`) — same shape
++   * `get_game_state` returns — so callers unwrap it the same way
++   * `wasm-adapter.ts`'s `unwrapClientGameState` does for live games.
++   */
++  async replaySeek(target: number): Promise<unknown> {
++    return this.request<unknown>({ type: "replaySeek", target });
++  }
++
++  async clearReplayPlayback(): Promise<void> {
++    await this.request<null>({ type: "clearReplayPlayback" });
++  }
++
+   dispose(): void {
+     for (const [, entry] of this.pending) {
+       if (entry.timer) clearTimeout(entry.timer);
+diff --git a/client/src/adapter/engine-worker.ts b/client/src/adapter/engine-worker.ts
+index 2cd7c50f65..60102a88a8 100644
+--- a/client/src/adapter/engine-worker.ts
++++ b/client/src/adapter/engine-worker.ts
+@@ -29,6 +29,13 @@ import init, {
+   set_multiplayer_mode,
+   resolve_all,
+   estimate_bracket_for_deck,
++  has_replay_recording,
++  export_replay_log,
++  load_replay_for_playback,
++  replay_length_js,
++  replay_header_js,
++  replay_seek_js,
++  clear_replay_playback,
+ } from "@wasm/engine";
+ 
+ import type { GameAction } from "./types";
+@@ -83,7 +90,14 @@ type EngineRequest =
+   | { type: "applySeatMutation"; id: number; stateJson: string; mutationJson: string }
+   | { type: "projectSeatView"; id: number; stateJson: string }
+   | { type: "resolveAll"; id: number; requester: number; aiSeatsJson: string; maxResolutions: number }
+-  | { type: "estimateBracketForDeck"; id: number; deck: BracketDeckRequest };
++  | { type: "estimateBracketForDeck"; id: number; deck: BracketDeckRequest }
++  | { type: "hasReplayRecording"; id: number }
++  | { type: "exportReplayLog"; id: number }
++  | { type: "loadReplayForPlayback"; id: number; replayJson: string }
++  | { type: "replayLength"; id: number }
++  | { type: "replayHeader"; id: number }
++  | { type: "replaySeek"; id: number; target: number }
++  | { type: "clearReplayPlayback"; id: number };
+ 
+ type EngineResponse =
+   | { type: "ready" }
+@@ -397,6 +411,54 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
+         break;
+       }
+ 
++      // ── Replay system ────────────────────────────────────────────────
++      // Recording lives alongside GAME_STATE in WASM (see initializeGame /
++      // submitAction above) — these calls just surface it. Playback
++      // (loadReplayForPlayback / replaySeek / replayLength / replayHeader /
++      // clearReplayPlayback) is independent of GAME_STATE entirely.
++
++      case "hasReplayRecording": {
++        result(msg.id, has_replay_recording());
++        break;
++      }
++
++      case "exportReplayLog": {
++        // export_replay_log / load_replay_for_playback return Result<T, JsValue>
++        // on the Rust side — wasm-bindgen throws on Err, which the outer
++        // try/catch around this switch already converts to an error response.
++        result(msg.id, export_replay_log());
++        break;
++      }
++
++      case "loadReplayForPlayback": {
++        result(msg.id, load_replay_for_playback(msg.replayJson));
++        break;
++      }
++
++      case "replayLength": {
++        result(msg.id, replay_length_js());
++        break;
++      }
++
++      case "replayHeader": {
++        result(msg.id, replay_header_js() ?? null);
++        break;
++      }
++
++      case "replaySeek": {
++        // replay_seek_js returns Result<JsValue, JsValue> on the Rust side —
++        // `null` only for "no replay loaded"; a reconstruction desync throws,
++        // which the outer try/catch around this switch converts to an error
++        // response instead of silently returning null for both cases.
++        result(msg.id, replay_seek_js(msg.target));
++        break;
++      }
++
++      case "clearReplayPlayback": {
++        clear_replay_playback();
++        result(msg.id, null);
++        break;
++      }
+     }
+   } catch (err) {
+     const id = "id" in msg ? (msg as { id: number }).id : -1;
+diff --git a/client/src/adapter/replay-adapter.ts b/client/src/adapter/replay-adapter.ts
+new file mode 100644
+index 0000000000..fc80b2f7c6
+--- /dev/null
++++ b/client/src/adapter/replay-adapter.ts
+@@ -0,0 +1,103 @@
++import type { BracketDeckRequest, BracketEstimate } from "../types/bracketEstimate";
++import type {
++  EngineAdapter,
++  GameAction,
++  GameState,
++  LegalActionsResult,
++  PlayerId,
++  ReplayHeader,
++  SubmitResult,
++} from "./types";
++import { EngineWorkerClient } from "./engine-worker-client";
++import { unwrapClientGameState } from "./wasm-adapter";
++
++/**
++ * Read-only adapter for the Replay Viewer. Backed by its own dedicated
++ * `EngineWorkerClient` — never the live game's worker — so loading or
++ * scrubbing a replay can never touch, or be touched by, an in-progress game.
++ *
++ * Only `loadReplay` / `seek` / `length` / `header` / `dispose` do real work.
++ * The rest of the `EngineAdapter` surface exists so a `ReplayAdapter` can sit
++ * in `useGameStore.adapter` the same way a live-game adapter does; the
++ * Replay Viewer always runs with `gameMode: "spectate"`, which already
++ * short-circuits `dispatchAction` before any of these would be reached (see
++ * `game/dispatch.ts`) — they no-op/throw here as a defense-in-depth
++ * backstop, not as the primary safety mechanism.
++ */
++export class ReplayAdapter implements EngineAdapter {
++  private client: EngineWorkerClient;
++
++  constructor() {
++    this.client = new EngineWorkerClient();
++  }
++
++  async initialize(): Promise<void> {
++    await this.client.initialize();
++    try {
++      await this.client.loadCardDbFromUrl();
++    } catch {
++      // Not fatal here: a replay whose header carries no deck data (e.g. a
++      // debug/sandbox game that started with empty libraries) reconstructs
++      // fine without a card database. Replays that *do* carry deck data
++      // require one — `reconstruct_initial_state` now fails loudly with
++      // `MissingCardDatabase` rather than silently skipping deck hydration,
++      // so `loadReplay` below will throw for those if this fetch failed.
++    }
++  }
++
++  /** Load a replay (the JSON `exportReplayLog`/`replayExport.ts` produced). Returns the recorded action count. */
++  async loadReplay(replayJson: string): Promise<number> {
++    return this.client.loadReplayForPlayback(replayJson);
++  }
++
++  async length(): Promise<number> {
++    return this.client.replayLength();
++  }
++
++  async header(): Promise<ReplayHeader | null> {
++    return this.client.replayHeader();
++  }
++
++  /** Seek to `target` (clamped to the replay's length) and return the reconstructed state, or `null` if none is loaded. */
++  async seek(target: number): Promise<GameState | null> {
++    const wrapped = await this.client.replaySeek(target);
++    if (wrapped == null) return null;
++    return unwrapClientGameState(wrapped);
++  }
++
++  initializeGame(): Promise<SubmitResult> {
++    return Promise.reject(
++      new Error("ReplayAdapter does not support initializeGame — call loadReplay instead"),
++    );
++  }
++
++  async submitAction(_action: GameAction, _actor: PlayerId): Promise<SubmitResult> {
++    return { events: [], log_entries: [] };
++  }
++
++  getState(): Promise<GameState> {
++    return Promise.reject(
++      new Error("ReplayAdapter has no single current state — call seek(index) instead"),
++    );
++  }
++
++  async getLegalActions(): Promise<LegalActionsResult> {
++    return { actions: [], autoPassRecommended: false, spellCosts: {}, legalActionsByObject: {} };
++  }
++
++  getAiAction(): Promise<GameAction | null> {
++    return Promise.resolve(null);
++  }
++
++  restoreState(): void {
++    // No-op — replay state is driven exclusively by seek(), never restored.
++  }
++
++  dispose(): void {
++    this.client.dispose();
++  }
++
++  async estimateBracket(_deck: BracketDeckRequest): Promise<BracketEstimate | null> {
++    return null;
++  }
++}
+diff --git a/client/src/adapter/types.ts b/client/src/adapter/types.ts
+index 786873cba9..22410eec83 100644
+--- a/client/src/adapter/types.ts
++++ b/client/src/adapter/types.ts
+@@ -214,6 +214,41 @@ export interface MatchScore {
+   draws: number;
+ }
+ 
++/** Name-only per-player deck list, mirroring the engine's `PlayerDeckList`. */
++export interface ReplayPlayerDeckList {
++  main_deck: string[];
++  sideboard: string[];
++  commander: string[];
++  planar_deck: string[];
++  scheme_deck: string[];
++  contraption_deck: string[];
++  sticker_sheets: string[];
++  signature_spell: string[];
++  bracket_tier: string;
++}
++
++/** Mirrors the engine's `DeckList` — the name-only deck payload `initializeGame` accepts. */
++export interface ReplayDeckList {
++  player: ReplayPlayerDeckList;
++  opponent: ReplayPlayerDeckList;
++  ai_decks: ReplayPlayerDeckList[];
++  ai_difficulties: string[];
++}
++
++/**
++ * Everything needed to reconstruct a recorded game's starting state — the
++ * non-action-sequence half of a replay recording. Mirrors the engine's
++ * `ReplayHeader` (`crates/engine/src/types/replay.rs`).
++ */
++export interface ReplayHeader {
++  format_config: FormatConfig;
++  match_config: MatchConfig;
++  player_count: number;
++  first_player: number | null;
++  seed: number;
++  deck_data: ReplayDeckList | null;
++}
++
+ export interface DeckCardCount {
+   name: string;
+   count: number;
+diff --git a/client/src/adapter/wasm-adapter.ts b/client/src/adapter/wasm-adapter.ts
+index 23b5bc6416..02aab78434 100644
+--- a/client/src/adapter/wasm-adapter.ts
++++ b/client/src/adapter/wasm-adapter.ts
+@@ -48,7 +48,7 @@ function isMemoryConstrainedDevice(): boolean {
+  *
+  * See `crates/engine/src/game/derived_views.rs`.
+  */
+-function unwrapClientGameState(raw: unknown): GameState {
++export function unwrapClientGameState(raw: unknown): GameState {
+   if (raw != null && typeof raw === "object" && "state" in raw) {
+     const wrapped = raw as { state: GameState; derived?: GameState["derived"] };
+     return { ...wrapped.state, derived: wrapped.derived ?? wrapped.state.derived };
+diff --git a/client/src/components/help/HelpSheet.tsx b/client/src/components/help/HelpSheet.tsx
+index 901dfbcf20..0c742cf549 100644
+--- a/client/src/components/help/HelpSheet.tsx
++++ b/client/src/components/help/HelpSheet.tsx
+@@ -8,6 +8,7 @@ import {
+   copyGameStateDebugSnapshot,
+   exportGameStateDebugZip,
+ } from "../../services/gameStateExport.ts";
++import { downloadCurrentReplay } from "../../services/replayExport.ts";
+ import { useCanActForWaitingState, usePlayerId } from "../../hooks/usePlayerId.ts";
+ import { useGameStore } from "../../stores/gameStore.ts";
+ import { useUiStore } from "../../stores/uiStore.ts";
+@@ -241,6 +242,21 @@ export function HelpSheet() {
+       });
+   };
+ 
++  const handleExportReplay = () => {
++    downloadCurrentReplay()
++      .then((filename) => {
++        setStatus(
++          filename
++            ? t("help.status.replayExported", { filename })
++            : t("help.status.replayExportUnavailable"),
++        );
++      })
++      .catch((err: unknown) => {
++        if (err instanceof DOMException && err.name === "AbortError") return;
++        setStatus(t("help.status.replayExportFailed"));
++      });
++  };
++
+   return (
+     <AnimatePresence>
+       {open && (
+@@ -356,6 +372,14 @@ export function HelpSheet() {
+                   >
+                     {t("help.exportState")}
+                   </button>
++                  <button
++                    type="button"
++                    disabled={!gameState}
++                    onClick={handleExportReplay}
++                    className="rounded-lg border border-white/10 bg-white/8 px-3 py-2 text-sm font-semibold text-slate-100 transition hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
++                  >
++                    {t("help.exportReplay")}
++                  </button>
+                   <button
+                     type="button"
+                     onClick={() => {
+diff --git a/client/src/components/menu/home/HomeDashboard.tsx b/client/src/components/menu/home/HomeDashboard.tsx
+index 1be5c3cc58..d18f3513a9 100644
+--- a/client/src/components/menu/home/HomeDashboard.tsx
++++ b/client/src/components/menu/home/HomeDashboard.tsx
+@@ -269,6 +269,34 @@ function CoverageCard() {
+   );
+ }
+ 
++/**
++ * Slim entry point to the Replay Viewer (`/replay`). Uses an inline SVG
++ * rather than a `/icons/sections/*.png` asset — those are curated section
++ * icons and this is a lightweight secondary link, not a primary bento tile.
++ */
++function ReplayLinkButton() {
++  const { t } = useTranslation("replay");
++  const navigate = useNavigate();
++  return (
++    <button
++      type="button"
++      onClick={() => navigate("/replay")}
++      className={`${INFO_CARD} flex w-full cursor-pointer items-center gap-2 text-left transition-colors hover:border-hairline-hover`}
++    >
++      <svg
++        xmlns="http://www.w3.org/2000/svg"
++        viewBox="0 0 20 20"
++        fill="currentColor"
++        aria-hidden="true"
++        className="h-3.5 w-3.5 shrink-0 opacity-70"
++      >
++        <path d="M3 4a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V4Zm5 2.5v7l6-3.5-6-3.5Z" />
++      </svg>
++      <span className={SECTION_LABEL}>{t("viewer.title")}</span>
++    </button>
++  );
++}
++
+ /* ------------------------------------------------------------- dashboard --- */
+ export function HomeDashboard() {
+   const { t } = useTranslation("menu");
+@@ -304,6 +332,7 @@ export function HomeDashboard() {
+           <ActiveDeckCard />
+           <CoverageCard />
+         </div>
++        <ReplayLinkButton />
+       </div>
+     </MenuShell>
+   );
+diff --git a/client/src/components/replay/ReplayControls.tsx b/client/src/components/replay/ReplayControls.tsx
+new file mode 100644
+index 0000000000..91ceccac7b
+--- /dev/null
++++ b/client/src/components/replay/ReplayControls.tsx
+@@ -0,0 +1,94 @@
++import { useTranslation } from "react-i18next";
++
++import { useReplayStore } from "../../stores/replayStore";
++
++const SPEED_OPTIONS = [0.5, 1, 2, 4, 8];
++
++/**
++ * Scrubber + playback transport for the Replay Viewer. Reads/drives
++ * `useReplayStore` exclusively — it never touches `useGameStore` directly,
++ * `replayStore.seek` is the only thing that mirrors a reconstructed state
++ * into the shared game store the board renders from.
++ */
++export function ReplayControls() {
++  const { t } = useTranslation("replay");
++
++  const currentIndex = useReplayStore((s) => s.currentIndex);
++  const totalActions = useReplayStore((s) => s.totalActions);
++  const isPlaying = useReplayStore((s) => s.isPlaying);
++  const playbackSpeed = useReplayStore((s) => s.playbackSpeed);
++  const error = useReplayStore((s) => s.error);
++  const seek = useReplayStore((s) => s.seek);
++  const stepBackward = useReplayStore((s) => s.stepBackward);
++  const stepForward = useReplayStore((s) => s.stepForward);
++  const play = useReplayStore((s) => s.play);
++  const pause = useReplayStore((s) => s.pause);
++  const setSpeed = useReplayStore((s) => s.setSpeed);
++
++  return (
++    <div className="flex w-full flex-col gap-2 border-t border-white/10 bg-black/70 px-4 py-3 backdrop-blur">
++      {error && (
++        <p className="text-xs text-red-400" role="alert">
++          {t("controls.seekError", { message: error })}
++        </p>
++      )}
++      <input
++        type="range"
++        min={0}
++        max={Math.max(totalActions, 0)}
++        value={currentIndex}
++        onChange={(e) => void seek(Number(e.target.value))}
++        className="w-full accent-amber-400"
++        aria-label={t("controls.actionOf", { current: currentIndex, total: totalActions })}
++      />
++      <div className="flex items-center justify-between gap-3 text-sm text-slate-200">
++        <div className="flex items-center gap-2">
++          <button
++            type="button"
++            onClick={() => void stepBackward()}
++            disabled={currentIndex <= 0}
++            className="rounded bg-white/10 px-2 py-1 hover:bg-white/20 disabled:opacity-40"
++            aria-label={t("controls.stepBack")}
++          >
++            «
++          </button>
++          <button
++            type="button"
++            onClick={() => (isPlaying ? pause() : play())}
++            className="rounded bg-amber-500/90 px-3 py-1 font-semibold text-black hover:bg-amber-400"
++          >
++            {isPlaying ? t("controls.pause") : t("controls.play")}
++          </button>
++          <button
++            type="button"
++            onClick={() => void stepForward()}
++            disabled={currentIndex >= totalActions}
++            className="rounded bg-white/10 px-2 py-1 hover:bg-white/20 disabled:opacity-40"
++            aria-label={t("controls.stepForward")}
++          >
++            »
++          </button>
++        </div>
++
++        <span className="tabular-nums text-slate-400">
++          {t("controls.actionOf", { current: currentIndex, total: totalActions })}
++        </span>
++
++        <label className="flex items-center gap-2 text-slate-400">
++          {t("controls.speed")}
++          <select
++            value={playbackSpeed}
++            onChange={(e) => setSpeed(Number(e.target.value))}
++            className="rounded bg-white/10 px-1.5 py-1 text-slate-100"
++          >
++            {SPEED_OPTIONS.map((speed) => (
++              <option key={speed} value={speed}>
++                {t("controls.speedValue", { value: speed })}
++              </option>
++            ))}
++          </select>
++        </label>
++      </div>
++    </div>
++  );
++}
+diff --git a/client/src/i18n/index.ts b/client/src/i18n/index.ts
+index 6fc23b1bd7..7c11a7ed57 100644
+--- a/client/src/i18n/index.ts
++++ b/client/src/i18n/index.ts
+@@ -15,6 +15,7 @@ export const NAMESPACES = [
+   "draft",
+   "settings",
+   "multiplayer",
++  "replay",
+ ] as const;
+ 
+ // Resources are eager-bundled and synchronous (see resources.ts), so init runs
+diff --git a/client/src/i18n/locales/de/common.json b/client/src/i18n/locales/de/common.json
+index 1ee4865819..b02f5c0dc5 100644
+--- a/client/src/i18n/locales/de/common.json
++++ b/client/src/i18n/locales/de/common.json
+@@ -110,6 +110,7 @@
+     "recoveryDescription": "Wenn sich eine Karte fehlerhaft verhält, exportiere zuerst den Zustand. Das erweiterte Debug-Panel steht zur Verfügung, wenn du das Spiel inspizieren oder anpassen musst.",
+     "copyState": "Zustand kopieren",
+     "exportState": "Zustand exportieren",
++    "exportReplay": "Wiederholung exportieren",
+     "openAdvancedDebug": "Erweitertes Debug öffnen",
+     "sections": {
+       "Flow": "Ablauf",
+@@ -120,7 +121,10 @@
+       "copied": "Spielzustand in die Zwischenablage kopiert.",
+       "copyFailed": "Spielzustand konnte nicht kopiert werden.",
+       "exported": "{{filename}} exportiert.",
+-      "exportFailed": "Spielzustand konnte nicht exportiert werden."
++      "exportFailed": "Spielzustand konnte nicht exportiert werden.",
++      "replayExported": "Wiederholung gespeichert als {{filename}}.",
++      "replayExportUnavailable": "Für diese Partie ist keine Wiederholungsaufzeichnung verfügbar.",
++      "replayExportFailed": "Die Wiederholung konnte nicht exportiert werden."
+     },
+     "prompt": {
+       "starting": "Das Spiel startet oder stellt den Zustand wieder her.",
+diff --git a/client/src/i18n/locales/de/replay.json b/client/src/i18n/locales/de/replay.json
+new file mode 100644
+index 0000000000..49fa9c4d64
+--- /dev/null
++++ b/client/src/i18n/locales/de/replay.json
+@@ -0,0 +1,26 @@
++{
++  "viewer": {
++    "title": "Wiederholungs-Viewer",
++    "eyebrow": "Eine aufgezeichnete Partie ansehen",
++    "chooseFile": "Wiederholungsdatei wählen",
++    "loading": "Wiederholung wird geladen…",
++    "errorGeneric": "Diese Wiederholungsdatei konnte nicht geladen werden.",
++    "backToMenu": "Zurück zum Menü"
++  },
++  "controls": {
++    "play": "Abspielen",
++    "pause": "Pause",
++    "stepBack": "Schritt zurück",
++    "stepForward": "Schritt vor",
++    "actionOf": "Aktion {{current}} / {{total}}",
++    "speed": "Geschwindigkeit",
++    "speedValue": "{{value}}x",
++    "seekError": "Dieser Punkt der Wiederholung konnte nicht rekonstruiert werden: {{message}}"
++  },
++  "export": {
++    "button": "Wiederholung exportieren",
++    "success": "Wiederholung gespeichert als {{filename}}",
++    "noRecording": "Für diese Partie ist keine Wiederholungsaufzeichnung verfügbar.",
++    "error": "Die Wiederholung konnte nicht exportiert werden."
++  }
++}
+diff --git a/client/src/i18n/locales/en/common.json b/client/src/i18n/locales/en/common.json
+index 82cda67395..821bdf1184 100644
+--- a/client/src/i18n/locales/en/common.json
++++ b/client/src/i18n/locales/en/common.json
+@@ -110,6 +110,7 @@
+     "recoveryDescription": "If a card misbehaves, export state first. The advanced debug panel is available when you need to inspect or adjust the game.",
+     "copyState": "Copy State",
+     "exportState": "Export State",
++    "exportReplay": "Export Replay",
+     "openAdvancedDebug": "Open Advanced Debug",
+     "sections": {
+       "Flow": "Flow",
+@@ -120,7 +121,10 @@
+       "copied": "Copied game state to clipboard.",
+       "copyFailed": "Could not copy game state.",
+       "exported": "Exported {{filename}}.",
+-      "exportFailed": "Could not export game state."
++      "exportFailed": "Could not export game state.",
++      "replayExported": "Replay saved as {{filename}}.",
++      "replayExportUnavailable": "No replay recording is available for this game.",
++      "replayExportFailed": "Could not export the replay."
+     },
+     "prompt": {
+       "starting": "The game is starting or restoring state.",
+diff --git a/client/src/i18n/locales/en/replay.json b/client/src/i18n/locales/en/replay.json
+new file mode 100644
+index 0000000000..e70293dfbf
+--- /dev/null
++++ b/client/src/i18n/locales/en/replay.json
+@@ -0,0 +1,26 @@
++{
++  "viewer": {
++    "title": "Replay Viewer",
++    "eyebrow": "Watch a recorded game",
++    "chooseFile": "Choose Replay File",
++    "loading": "Loading replay…",
++    "errorGeneric": "Couldn't load that replay file.",
++    "backToMenu": "Back to Menu"
++  },
++  "controls": {
++    "play": "Play",
++    "pause": "Pause",
++    "stepBack": "Step back",
++    "stepForward": "Step forward",
++    "actionOf": "Action {{current}} / {{total}}",
++    "speed": "Speed",
++    "speedValue": "{{value}}x",
++    "seekError": "Couldn't reconstruct this point in the replay: {{message}}"
++  },
++  "export": {
++    "button": "Export Replay",
++    "success": "Replay saved as {{filename}}",
++    "noRecording": "No replay recording is available for this game.",
++    "error": "Couldn't export the replay."
++  }
++}
+diff --git a/client/src/i18n/locales/es/common.json b/client/src/i18n/locales/es/common.json
+index 850f6d42a6..8d7cca4c44 100644
+--- a/client/src/i18n/locales/es/common.json
++++ b/client/src/i18n/locales/es/common.json
+@@ -110,6 +110,7 @@
+     "recoveryDescription": "Si una carta funciona mal, exporta el estado primero. El panel de depuración avanzada está disponible cuando necesites inspeccionar o ajustar la partida.",
+     "copyState": "Copiar estado",
+     "exportState": "Exportar estado",
++    "exportReplay": "Exportar repetición",
+     "openAdvancedDebug": "Abrir depuración avanzada",
+     "sections": {
+       "Flow": "Flujo",
+@@ -120,7 +121,10 @@
+       "copied": "Estado de la partida copiado al portapapeles.",
+       "copyFailed": "No se pudo copiar el estado de la partida.",
+       "exported": "Se exportó {{filename}}.",
+-      "exportFailed": "No se pudo exportar el estado de la partida."
++      "exportFailed": "No se pudo exportar el estado de la partida.",
++      "replayExported": "Repetición guardada como {{filename}}.",
++      "replayExportUnavailable": "No hay ninguna grabación de repetición disponible para esta partida.",
++      "replayExportFailed": "No se pudo exportar la repetición."
+     },
+     "prompt": {
+       "starting": "La partida se está iniciando o restaurando el estado.",
+diff --git a/client/src/i18n/locales/es/replay.json b/client/src/i18n/locales/es/replay.json
+new file mode 100644
+index 0000000000..f9f0c1c534
+--- /dev/null
++++ b/client/src/i18n/locales/es/replay.json
+@@ -0,0 +1,26 @@
++{
++  "viewer": {
++    "title": "Visor de repeticiones",
++    "eyebrow": "Mira una partida grabada",
++    "chooseFile": "Elegir archivo de repetición",
++    "loading": "Cargando repetición…",
++    "errorGeneric": "No se pudo cargar ese archivo de repetición.",
++    "backToMenu": "Volver al menú"
++  },
++  "controls": {
++    "play": "Reproducir",
++    "pause": "Pausar",
++    "stepBack": "Retroceder",
++    "stepForward": "Avanzar",
++    "actionOf": "Acción {{current}} / {{total}}",
++    "speed": "Velocidad",
++    "speedValue": "{{value}}x",
++    "seekError": "No se pudo reconstruir este punto de la repetición: {{message}}"
++  },
++  "export": {
++    "button": "Exportar repetición",
++    "success": "Repetición guardada como {{filename}}",
++    "noRecording": "No hay ninguna grabación disponible para esta partida.",
++    "error": "No se pudo exportar la repetición."
++  }
++}
+diff --git a/client/src/i18n/locales/fr/common.json b/client/src/i18n/locales/fr/common.json
+index 35aacf09bb..8faafca170 100644
+--- a/client/src/i18n/locales/fr/common.json
++++ b/client/src/i18n/locales/fr/common.json
+@@ -110,6 +110,7 @@
+     "recoveryDescription": "Si une carte se comporte mal, exportez d'abord l'état. Le panneau de débogage avancé est disponible lorsque vous devez inspecter ou ajuster la partie.",
+     "copyState": "Copier l'état",
+     "exportState": "Exporter l'état",
++    "exportReplay": "Exporter le replay",
+     "openAdvancedDebug": "Ouvrir le débogage avancé",
+     "sections": {
+       "Flow": "Déroulement",
+@@ -120,7 +121,10 @@
+       "copied": "État de la partie copié dans le presse-papiers.",
+       "copyFailed": "Impossible de copier l'état de la partie.",
+       "exported": "{{filename}} exporté.",
+-      "exportFailed": "Impossible d'exporter l'état de la partie."
++      "exportFailed": "Impossible d'exporter l'état de la partie.",
++      "replayExported": "Replay enregistré sous {{filename}}.",
++      "replayExportUnavailable": "Aucun enregistrement de replay n'est disponible pour cette partie.",
++      "replayExportFailed": "Impossible d'exporter le replay."
+     },
+     "prompt": {
+       "starting": "La partie démarre ou restaure son état.",
+diff --git a/client/src/i18n/locales/fr/replay.json b/client/src/i18n/locales/fr/replay.json
+new file mode 100644
+index 0000000000..d36e5976e2
+--- /dev/null
++++ b/client/src/i18n/locales/fr/replay.json
+@@ -0,0 +1,26 @@
++{
++  "viewer": {
++    "title": "Lecteur de replay",
++    "eyebrow": "Regarder une partie enregistrée",
++    "chooseFile": "Choisir un fichier de replay",
++    "loading": "Chargement du replay…",
++    "errorGeneric": "Impossible de charger ce fichier de replay.",
++    "backToMenu": "Retour au menu"
++  },
++  "controls": {
++    "play": "Lecture",
++    "pause": "Pause",
++    "stepBack": "Reculer",
++    "stepForward": "Avancer",
++    "actionOf": "Action {{current}} / {{total}}",
++    "speed": "Vitesse",
++    "speedValue": "{{value}}x",
++    "seekError": "Impossible de reconstruire ce point du replay : {{message}}"
++  },
++  "export": {
++    "button": "Exporter le replay",
++    "success": "Replay enregistré sous {{filename}}",
++    "noRecording": "Aucun enregistrement de replay n'est disponible pour cette partie.",
++    "error": "Impossible d'exporter le replay."
++  }
++}
+diff --git a/client/src/i18n/locales/it/common.json b/client/src/i18n/locales/it/common.json
+index 8ba4daad43..19a46fab81 100644
+--- a/client/src/i18n/locales/it/common.json
++++ b/client/src/i18n/locales/it/common.json
+@@ -110,6 +110,7 @@
+     "recoveryDescription": "Se una carta non funziona correttamente, esporta prima lo stato. Il pannello di debug avanzato è disponibile quando devi ispezionare o regolare la partita.",
+     "copyState": "Copia stato",
+     "exportState": "Esporta stato",
++    "exportReplay": "Esporta replay",
+     "openAdvancedDebug": "Apri debug avanzato",
+     "sections": {
+       "Flow": "Flusso",
+@@ -120,7 +121,10 @@
+       "copied": "Stato della partita copiato negli appunti.",
+       "copyFailed": "Impossibile copiare lo stato della partita.",
+       "exported": "Esportato {{filename}}.",
+-      "exportFailed": "Impossibile esportare lo stato della partita."
++      "exportFailed": "Impossibile esportare lo stato della partita.",
++      "replayExported": "Replay salvato come {{filename}}.",
++      "replayExportUnavailable": "Nessuna registrazione di replay disponibile per questa partita.",
++      "replayExportFailed": "Impossibile esportare il replay."
+     },
+     "prompt": {
+       "starting": "La partita sta iniziando o ripristinando lo stato.",
+diff --git a/client/src/i18n/locales/it/replay.json b/client/src/i18n/locales/it/replay.json
+new file mode 100644
+index 0000000000..a2a3d420dd
+--- /dev/null
++++ b/client/src/i18n/locales/it/replay.json
+@@ -0,0 +1,26 @@
++{
++  "viewer": {
++    "title": "Visualizzatore replay",
++    "eyebrow": "Guarda una partita registrata",
++    "chooseFile": "Scegli file di replay",
++    "loading": "Caricamento del replay…",
++    "errorGeneric": "Impossibile caricare questo file di replay.",
++    "backToMenu": "Torna al menu"
++  },
++  "controls": {
++    "play": "Riproduci",
++    "pause": "Pausa",
++    "stepBack": "Indietro",
++    "stepForward": "Avanti",
++    "actionOf": "Azione {{current}} / {{total}}",
++    "speed": "Velocità",
++    "speedValue": "{{value}}x",
++    "seekError": "Impossibile ricostruire questo punto del replay: {{message}}"
++  },
++  "export": {
++    "button": "Esporta replay",
++    "success": "Replay salvato come {{filename}}",
++    "noRecording": "Nessuna registrazione di replay disponibile per questa partita.",
++    "error": "Impossibile esportare il replay."
++  }
++}
+diff --git a/client/src/i18n/locales/pl/common.json b/client/src/i18n/locales/pl/common.json
+index 217b27ff34..2ac8fa64f5 100644
+--- a/client/src/i18n/locales/pl/common.json
++++ b/client/src/i18n/locales/pl/common.json
+@@ -110,6 +110,7 @@
+     "recoveryDescription": "Jeśli karta zachowuje się nieprawidłowo, najpierw wyeksportuj stan. Zaawansowany panel debugowania jest dostępny, gdy musisz sprawdzić lub dostosować grę.",
+     "copyState": "Kopiuj stan",
+     "exportState": "Eksportuj stan",
++    "exportReplay": "Eksportuj powtórkę",
+     "openAdvancedDebug": "Otwórz zaawansowane debugowanie",
+     "sections": {
+       "Flow": "Przebieg",
+@@ -120,7 +121,10 @@
+       "copied": "Skopiowano stan gry do schowka.",
+       "copyFailed": "Nie można skopiować stanu gry.",
+       "exported": "Wyeksportowano {{filename}}.",
+-      "exportFailed": "Nie można wyeksportować stanu gry."
++      "exportFailed": "Nie można wyeksportować stanu gry.",
++      "replayExported": "Powtórka zapisana jako {{filename}}.",
++      "replayExportUnavailable": "Brak dostępnego nagrania powtórki dla tej rozgrywki.",
++      "replayExportFailed": "Nie udało się wyeksportować powtórki."
+     },
+     "prompt": {
+       "starting": "Gra się rozpoczyna lub przywraca stan.",
+diff --git a/client/src/i18n/locales/pl/replay.json b/client/src/i18n/locales/pl/replay.json
+new file mode 100644
+index 0000000000..efaad4eb26
+--- /dev/null
++++ b/client/src/i18n/locales/pl/replay.json
+@@ -0,0 +1,26 @@
++{
++  "viewer": {
++    "title": "Przeglądarka powtórek",
++    "eyebrow": "Obejrzyj nagraną rozgrywkę",
++    "chooseFile": "Wybierz plik powtórki",
++    "loading": "Wczytywanie powtórki…",
++    "errorGeneric": "Nie udało się wczytać tego pliku powtórki.",
++    "backToMenu": "Powrót do menu"
++  },
++  "controls": {
++    "play": "Odtwórz",
++    "pause": "Wstrzymaj",
++    "stepBack": "Krok wstecz",
++    "stepForward": "Krok naprzód",
++    "actionOf": "Akcja {{current}} / {{total}}",
++    "speed": "Szybkość",
++    "speedValue": "{{value}}x",
++    "seekError": "Nie udało się odtworzyć tego momentu powtórki: {{message}}"
++  },
++  "export": {
++    "button": "Eksportuj powtórkę",
++    "success": "Powtórka zapisana jako {{filename}}",
++    "noRecording": "Brak dostępnego nagrania powtórki dla tej rozgrywki.",
++    "error": "Nie udało się wyeksportować powtórki."
++  }
++}
+diff --git a/client/src/i18n/locales/pt/common.json b/client/src/i18n/locales/pt/common.json
+index 8f748ecf0a..adc4136926 100644
+--- a/client/src/i18n/locales/pt/common.json
++++ b/client/src/i18n/locales/pt/common.json
+@@ -110,6 +110,7 @@
+     "recoveryDescription": "Se uma carta se comportar mal, exporte o estado primeiro. O painel de depuração avançada está disponível quando você precisar inspecionar ou ajustar o jogo.",
+     "copyState": "Copiar Estado",
+     "exportState": "Exportar Estado",
++    "exportReplay": "Exportar Replay",
+     "openAdvancedDebug": "Abrir Depuração Avançada",
+     "sections": {
+       "Flow": "Fluxo",
+@@ -120,7 +121,10 @@
+       "copied": "Estado do jogo copiado para a área de transferência.",
+       "copyFailed": "Não foi possível copiar o estado do jogo.",
+       "exported": "{{filename}} exportado.",
+-      "exportFailed": "Não foi possível exportar o estado do jogo."
++      "exportFailed": "Não foi possível exportar o estado do jogo.",
++      "replayExported": "Replay salvo como {{filename}}.",
++      "replayExportUnavailable": "Nenhuma gravação de replay disponível para esta partida.",
++      "replayExportFailed": "Não foi possível exportar o replay."
+     },
+     "prompt": {
+       "starting": "O jogo está iniciando ou restaurando o estado.",
+diff --git a/client/src/i18n/locales/pt/replay.json b/client/src/i18n/locales/pt/replay.json
+new file mode 100644
+index 0000000000..5b9fe7b3b8
+--- /dev/null
++++ b/client/src/i18n/locales/pt/replay.json
+@@ -0,0 +1,26 @@
++{
++  "viewer": {
++    "title": "Visualizador de replay",
++    "eyebrow": "Assista a uma partida gravada",
++    "chooseFile": "Escolher arquivo de replay",
++    "loading": "Carregando replay…",
++    "errorGeneric": "Não foi possível carregar esse arquivo de replay.",
++    "backToMenu": "Voltar ao menu"
++  },
++  "controls": {
++    "play": "Reproduzir",
++    "pause": "Pausar",
++    "stepBack": "Voltar",
++    "stepForward": "Avançar",
++    "actionOf": "Ação {{current}} / {{total}}",
++    "speed": "Velocidade",
++    "speedValue": "{{value}}x",
++    "seekError": "Não foi possível reconstruir este ponto do replay: {{message}}"
++  },
++  "export": {
++    "button": "Exportar replay",
++    "success": "Replay salvo como {{filename}}",
++    "noRecording": "Nenhuma gravação de replay disponível para esta partida.",
++    "error": "Não foi possível exportar o replay."
++  }
++}
+diff --git a/client/src/i18n/react-i18next.d.ts b/client/src/i18n/react-i18next.d.ts
+index f1cf0280d7..b4d0af49e9 100644
+--- a/client/src/i18n/react-i18next.d.ts
++++ b/client/src/i18n/react-i18next.d.ts
+@@ -9,6 +9,7 @@ import type draft from "./locales/en/draft.json";
+ import type game from "./locales/en/game.json";
+ import type menu from "./locales/en/menu.json";
+ import type multiplayer from "./locales/en/multiplayer.json";
++import type replay from "./locales/en/replay.json";
+ import type settings from "./locales/en/settings.json";
+ 
+ declare module "react-i18next" {
+@@ -22,6 +23,7 @@ declare module "react-i18next" {
+       draft: typeof draft;
+       settings: typeof settings;
+       multiplayer: typeof multiplayer;
++      replay: typeof replay;
+     };
+   }
+ }
+diff --git a/client/src/pages/ReplayPage.tsx b/client/src/pages/ReplayPage.tsx
+new file mode 100644
+index 0000000000..460726afac
+--- /dev/null
++++ b/client/src/pages/ReplayPage.tsx
+@@ -0,0 +1,128 @@
++import { useCallback, useEffect, useRef, useState } from "react";
++import { useTranslation } from "react-i18next";
++import { useNavigate } from "react-router";
++
++import { useAudioContext } from "../audio/useAudioContext";
++import { GameBoard } from "../components/board/GameBoard";
++import { ReplayControls } from "../components/replay/ReplayControls";
++import { ScreenChrome } from "../components/chrome/ScreenChrome";
++import { MenuParticles } from "../components/menu/MenuParticles";
++import { MenuPanel } from "../components/menu/MenuShell";
++import { menuButtonClass } from "../components/menu/buttonStyles";
++import { useReplayStore } from "../stores/replayStore";
++
++/**
++ * Stand-alone replay viewer. Deliberately does NOT use `GameProvider` /
++ * `GamePage`'s full chrome (multiplayer dialogs, animation overlays, action
++ * UI) — those are built for live, interactive games. This page renders the
++ * same `GameBoard` component a live game does (it reads from the shared
++ * `useGameStore` directly, no props needed) in read-only "spectate" mode —
++ * see `stores/replayStore.ts` — plus a scrubber/playback transport.
++ */
++export function ReplayPage() {
++  const { t } = useTranslation("replay");
++  const navigate = useNavigate();
++  useAudioContext("menu");
++
++  const fileInputRef = useRef<HTMLInputElement>(null);
++  const [pickerError, setPickerError] = useState<string | null>(null);
++
++  const isLoading = useReplayStore((s) => s.isLoading);
++  const storeError = useReplayStore((s) => s.error);
++  const loadReplay = useReplayStore((s) => s.loadReplay);
++  const unload = useReplayStore((s) => s.unload);
++  const isLoaded = useReplayStore((s) => s.adapter !== null);
++
++  useEffect(() => unload, [unload]);
++
++  const handleFileChosen = useCallback(
++    async (file: File) => {
++      setPickerError(null);
++      try {
++        const text = await file.text();
++        await loadReplay(text);
++      } catch (err) {
++        setPickerError(err instanceof Error ? err.message : String(err));
++      }
++    },
++    [loadReplay],
++  );
++
++  const handleBack = useCallback(() => {
++    unload();
++    navigate("/");
++  }, [unload, navigate]);
++
++  if (!isLoaded) {
++    return (
++      <div className="menu-scene relative flex min-h-screen flex-col overflow-hidden">
++        <MenuParticles />
++        <ScreenChrome onBack={() => navigate("/")} />
++        <div className="menu-scene__vignette" />
++        <div className="relative z-10 flex min-h-0 flex-1 flex-col px-4 pt-16 pb-6 sm:px-8">
++          <MenuPanel className="flex min-h-0 flex-1 flex-col gap-4">
++            <div>
++              <p className="text-[0.68rem] uppercase tracking-[0.22em] text-slate-500">
++                {t("viewer.eyebrow")}
++              </p>
++              <h1 className="text-2xl font-semibold text-white">{t("viewer.title")}</h1>
++            </div>
++
++            {isLoading && <p className="text-sm text-slate-400">{t("viewer.loading")}</p>}
++            {(pickerError || storeError) && (
++              <p className="text-sm text-red-300">
++                {pickerError ?? storeError ?? t("viewer.errorGeneric")}
++              </p>
++            )}
++
++            <input
++              ref={fileInputRef}
++              type="file"
++              accept=".json,application/json"
++              className="hidden"
++              onChange={(e) => {
++                const file = e.target.files?.[0];
++                e.target.value = "";
++                if (file) void handleFileChosen(file);
++              }}
++            />
++            <button
++              type="button"
++              className={menuButtonClass({ tone: "amber", size: "sm" })}
++              onClick={() => fileInputRef.current?.click()}
++              disabled={isLoading}
++            >
++              {t("viewer.chooseFile")}
++            </button>
++
++            <button
++              type="button"
++              className={menuButtonClass({ tone: "neutral", size: "sm" })}
++              onClick={() => navigate("/")}
++            >
++              {t("viewer.backToMenu")}
++            </button>
++          </MenuPanel>
++        </div>
++      </div>
++    );
++  }
++
++  return (
++    <div className="relative flex h-screen min-h-0 flex-col bg-gray-950">
++      <div className="absolute left-3 top-3 z-40">
++        <button
++          type="button"
++          onClick={handleBack}
++          className="rounded bg-black/60 px-3 py-1.5 text-xs font-semibold text-white hover:bg-black/80"
++        >
++          {t("viewer.backToMenu")}
++        </button>
++      </div>
++      <div className="relative z-10 flex min-h-0 flex-1 flex-col">
++        <GameBoard />
++      </div>
++      <ReplayControls />
++    </div>
++  );
++}
+diff --git a/client/src/services/replayExport.ts b/client/src/services/replayExport.ts
+new file mode 100644
+index 0000000000..69a3d19a39
+--- /dev/null
++++ b/client/src/services/replayExport.ts
+@@ -0,0 +1,92 @@
++import { WasmAdapter } from "../adapter/wasm-adapter";
++import { useGameStore } from "../stores/gameStore";
++
++interface FileSystemWritableFileStream {
++  write: (data: Blob) => Promise<void>;
++  close: () => Promise<void>;
++}
++
++interface FileSystemFileHandle {
++  createWritable: () => Promise<FileSystemWritableFileStream>;
++}
++
++interface SaveFilePickerOptions {
++  suggestedName?: string;
++  types?: Array<{
++    description: string;
++    accept: Record<string, string[]>;
++  }>;
++}
++
++type WindowWithSaveFilePicker = Window & {
++  showSaveFilePicker?: (options?: SaveFilePickerOptions) => Promise<FileSystemFileHandle>;
++};
++
++/**
++ * Whether the active game has an in-progress replay recording available to
++ * export. `false` for non-WASM adapters (online/P2P multiplayer — recording
++ * is local/AI-only in v1, see `crates/engine/src/types/replay.rs`) and
++ * before any game has started.
++ */
++export async function hasExportableReplay(): Promise<boolean> {
++  const adapter = useGameStore.getState().adapter;
++  if (!(adapter instanceof WasmAdapter)) return false;
++  const client = adapter.getEngineClient();
++  if (!client) return false;
++  return client.hasReplayRecording();
++}
++
++/**
++ * Serialize the active game's replay recording to a JSON string (the format
++ * `ReplayAdapter.loadReplay` / `pages/ReplayPage.tsx` read back). Returns
++ * `null` when the active adapter isn't a local/AI `WasmAdapter` or no
++ * recording is available.
++ */
++export async function exportCurrentReplayJson(): Promise<string | null> {
++  const adapter = useGameStore.getState().adapter;
++  if (!(adapter instanceof WasmAdapter)) return null;
++  const client = adapter.getEngineClient();
++  if (!client) return null;
++  if (!(await client.hasReplayRecording())) return null;
++  return client.exportReplayLog();
++}
++
++/**
++ * Export the active game's replay and trigger a browser download. Returns
++ * the saved filename, or `null` if no recording was available to export.
++ */
++export async function downloadCurrentReplay(): Promise<string | null> {
++  const json = await exportCurrentReplayJson();
++  if (json === null) return null;
++
++  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
++  const filename = `phase-replay-${stamp}.json`;
++  const blob = new Blob([json], { type: "application/json" });
++
++  const saveFilePicker = (window as WindowWithSaveFilePicker).showSaveFilePicker;
++  if (saveFilePicker) {
++    const handle = await saveFilePicker({
++      suggestedName: filename,
++      types: [
++        {
++          description: "Phase replay",
++          accept: { "application/json": [".json"] },
++        },
++      ],
++    });
++    const writable = await handle.createWritable();
++    await writable.write(blob);
++    await writable.close();
++    return filename;
++  }
++
++  const url = URL.createObjectURL(blob);
++  const anchor = document.createElement("a");
++  anchor.href = url;
++  anchor.download = filename;
++  document.body.appendChild(anchor);
++  anchor.click();
++  document.body.removeChild(anchor);
++  URL.revokeObjectURL(url);
++  return filename;
++}
+diff --git a/client/src/stores/replayStore.ts b/client/src/stores/replayStore.ts
+new file mode 100644
+index 0000000000..90921756e1
+--- /dev/null
++++ b/client/src/stores/replayStore.ts
+@@ -0,0 +1,171 @@
++import { create } from "zustand";
++
++import type { GameState, ReplayHeader } from "../adapter/types";
++import { ReplayAdapter } from "../adapter/replay-adapter";
++import { useGameStore } from "./gameStore";
++
++interface ReplayStoreState {
++  adapter: ReplayAdapter | null;
++  header: ReplayHeader | null;
++  /** Total recorded actions. Valid scrub positions are `0..=totalActions`. */
++  totalActions: number;
++  currentIndex: number;
++  isPlaying: boolean;
++  /** Actions advanced per second while playing. */
++  playbackSpeed: number;
++  isLoading: boolean;
++  error: string | null;
++}
++
++interface ReplayStoreActions {
++  /** Parse and load a replay log (the JSON `replayExport.ts`/`exportReplayLog` produced). */
++  loadReplay: (replayJson: string) => Promise<void>;
++  seek: (index: number) => Promise<void>;
++  stepForward: () => Promise<void>;
++  stepBackward: () => Promise<void>;
++  play: () => void;
++  pause: () => void;
++  setSpeed: (actionsPerSecond: number) => void;
++  /** Tear down the loaded replay and clear the shared game store. */
++  unload: () => void;
++}
++
++export type ReplayStore = ReplayStoreState & ReplayStoreActions;
++
++let playTimer: ReturnType<typeof setInterval> | null = null;
++
++function stopPlayTimer(): void {
++  if (playTimer !== null) {
++    clearInterval(playTimer);
++    playTimer = null;
++  }
++}
++
++/**
++ * Mirror the reconstructed state into the shared `gameStore` so the existing
++ * board UI (`GameBoard` and friends, which read from `useGameStore` directly
++ * rather than via props) renders it. `gameMode: "spectate"` — set once in
++ * `loadReplay` — already disables all action dispatch (see
++ * `game/dispatch.ts`, `hooks/usePlayerId.ts`), so this is read-only from the
++ * board's perspective without needing any GamePage/GameProvider changes.
++ */
++function pushStateToGameStore(state: GameState | null): void {
++  useGameStore.setState({
++    gameState: state,
++    waitingFor: state?.waiting_for ?? null,
++  });
++}
++
++const initialState: ReplayStoreState = {
++  adapter: null,
++  header: null,
++  totalActions: 0,
++  currentIndex: 0,
++  isPlaying: false,
++  playbackSpeed: 2,
++  isLoading: false,
++  error: null,
++};
++
++export const useReplayStore = create<ReplayStore>()((set, get) => ({
++  ...initialState,
++
++  loadReplay: async (replayJson) => {
++    get().unload();
++    set({ isLoading: true, error: null });
++
++    const adapter = new ReplayAdapter();
++    try {
++      await adapter.initialize();
++      const totalActions = await adapter.loadReplay(replayJson);
++      const header = await adapter.header();
++      const state = await adapter.seek(0);
++
++      useGameStore.setState({
++        gameId: "replay",
++        gameMode: "spectate",
++        adapter,
++        legalActions: [],
++        legalActionsByObject: {},
++        autoPassRecommended: false,
++        spellCosts: {},
++        stateHistory: [],
++        turnCheckpoints: [],
++      });
++      pushStateToGameStore(state);
++
++      set({ adapter, header, totalActions, currentIndex: 0, isLoading: false });
++    } catch (err) {
++      adapter.dispose();
++      set({ isLoading: false, error: err instanceof Error ? err.message : String(err) });
++      throw err;
++    }
++  },
++
++  seek: async (index) => {
++    const { adapter, totalActions } = get();
++    if (!adapter) return;
++    const clamped = Math.max(0, Math.min(index, totalActions));
++    try {
++      const state = await adapter.seek(clamped);
++      set({ currentIndex: clamped, error: null });
++      pushStateToGameStore(state);
++    } catch (err) {
++      // A reconstruction desync (ReplayError::Desync — see
++      // crates/engine/src/game/replay.rs) is a real failure, not "nothing to
++      // show": surface it instead of silently leaving the board on the last
++      // good frame. Caught here (rather than left to propagate) because
++      // `seek` is driven from fire-and-forget call sites (the scrubber
++      // input, the play-loop interval) that can't otherwise react to a
++      // rejected promise without producing an unhandled rejection.
++      get().pause();
++      set({ error: err instanceof Error ? err.message : String(err) });
++    }
++  },
++
++  stepForward: async () => {
++    await get().seek(get().currentIndex + 1);
++  },
++
++  stepBackward: async () => {
++    await get().seek(get().currentIndex - 1);
++  },
++
++  play: () => {
++    stopPlayTimer();
++    set({ isPlaying: true });
++    playTimer = setInterval(() => {
++      const { currentIndex, totalActions } = get();
++      if (currentIndex >= totalActions) {
++        get().pause();
++        return;
++      }
++      void get().seek(currentIndex + 1);
++    }, 1000 / Math.max(get().playbackSpeed, 0.1));
++  },
++
++  pause: () => {
++    stopPlayTimer();
++    set({ isPlaying: false });
++  },
++
++  setSpeed: (actionsPerSecond) => {
++    set({ playbackSpeed: actionsPerSecond });
++    if (get().isPlaying) {
++      get().play();
++    }
++  },
++
++  unload: () => {
++    stopPlayTimer();
++    get().adapter?.dispose();
++    set({ ...initialState });
++    useGameStore.setState({
++      gameId: null,
++      gameMode: null,
++      gameState: null,
++      adapter: null,
++      waitingFor: null,
++    });
++  },
++}));
+diff --git a/client/src/wasm/engine_wasm.d.ts b/client/src/wasm/engine_wasm.d.ts
+index 34b607c5ab..3653def709 100644
+--- a/client/src/wasm/engine_wasm.d.ts
++++ b/client/src/wasm/engine_wasm.d.ts
+@@ -41,6 +41,11 @@ export function classify_deck_js(names_js: any): any;
+  */
+ export function clear_game_state(): void;
+ 
++/**
++ * Discard the loaded replay (if any). Safe to call even when none is loaded.
++ */
++export function clear_replay_playback(): void;
++
+ /**
+  * CR 702.124: Of `candidates`, which can legally pair with `first_commander`
+  * as a co-commander? Applies the full partner family (generic Partner, Partner
+@@ -84,6 +89,13 @@ export function evaluate_deck_compatibility_js(request: any): any;
+  */
+ export function export_game_state_json(): string;
+ 
++/**
++ * Serialize the current game's replay recording to a JSON string — the
++ * format `load_replay_for_playback` reads back. Errors if no game has been
++ * initialized in this worker (or the recording was invalidated by undo).
++ */
++export function export_replay_log(): string;
++
+ /**
+  * Return the authoritative list of user-selectable formats as a typed array.
+  * The frontend treats this as the single source of truth for rendering
+@@ -174,6 +186,13 @@ export function get_stack_pressure(): any;
+ 
+ export function get_viewer_snapshot_js(player_id: number): any;
+ 
++/**
++ * Whether the current game has an in-progress replay recording. `false`
++ * before any game has started, or after the recording was invalidated by
++ * undo/restore (see `restore_game_state`).
++ */
++export function has_replay_recording(): boolean;
++
+ /**
+  * Initialize panic hook for better error messages in WASM.
+  * Called automatically on first use — safe to call multiple times.
+@@ -231,6 +250,18 @@ export function list_token_presets_js(): any;
+  */
+ export function load_card_database(json_str: string): number;
+ 
++/**
++ * Load a replay log (the JSON produced by `export_replay_log`) for
++ * scrubbing/playback. Independent of the live `GAME_STATE` — does not
++ * require, and does not affect, an active game. Uses the loaded `CARD_DB`
++ * to resolve the recorded deck list when reconstructing the starting
++ * state — and errors (rather than silently reconstructing empty
++ * libraries) if the replay carries deck data but no card database is
++ * loaded; see `ReplayError::MissingCardDatabase`. Returns the total number
++ * of recorded actions; valid `replay_seek_js` targets are `0..=length`.
++ */
++export function load_replay_for_playback(json_str: string): number;
++
+ /**
+  * Verify WASM integration works.
+  */
+@@ -242,6 +273,30 @@ export function ping(): string;
+  */
+ export function project_seat_view(state_json: string): any;
+ 
++/**
++ * The loaded replay's header (format/match config, player count, seed,
++ * deck data), or `null` if none is loaded. Lets the viewer show "vs. <deck>"
++ * chrome without re-deriving it from the action sequence.
++ */
++export function replay_header_js(): any;
++
++/**
++ * Total number of recorded actions in the loaded replay, or `0` if none is loaded.
++ */
++export function replay_length_js(): number;
++
++/**
++ * Seek the loaded replay to `target` (clamped to the recording's length) and
++ * return the reconstructed state at that point, wrapped the same way
++ * `get_game_state` wraps the live state. Returns `Ok(null)` only when no
++ * replay is loaded — a reconstruction desync (`ReplayError::Desync`, an
++ * engine-version mismatch between recording and playback, not a rules
++ * outcome) is a real failure and must not be silently swallowed into the
++ * same null the caller uses for "nothing loaded"; it throws instead, like
++ * every other fallible engine entry point that returns `Result<_, JsValue>`.
++ */
++export function replay_seek_js(target: number): any;
++
+ export function resolve_all(requester: number, ai_seats_json: string, max_resolutions: number): any;
+ 
+ /**
+@@ -356,6 +411,7 @@ export interface InitOutput {
+     readonly estimate_bracket_for_deck: (a: any) => [number, number, number];
+     readonly evaluate_deck_compatibility_js: (a: any) => [number, number, number];
+     readonly export_game_state_json: () => [number, number, number, number];
++    readonly export_replay_log: () => [number, number, number, number];
+     readonly getFormatRegistry: () => any;
+     readonly get_ai_action: (a: number, b: number, c: number) => [number, number, number];
+     readonly get_ai_scored_candidates: (a: number, b: number, c: number, d: bigint) => [number, number, number];
+@@ -365,13 +421,16 @@ export interface InitOutput {
+     readonly get_filtered_game_state: (a: number) => any;
+     readonly get_legal_actions_for_viewer_js: (a: number) => any;
+     readonly get_viewer_snapshot_js: (a: number) => any;
++    readonly has_replay_recording: () => number;
+     readonly initialize_game: (a: any, b: number, c: number, d: any, e: any, f: number, g: number) => any;
+     readonly isCardCommanderEligibleForFormat: (a: number, b: number, c: any) => number;
+     readonly is_card_commander_eligible: (a: number, b: number) => number;
+     readonly is_multiplayer_mode: () => number;
+     readonly load_card_database: (a: number, b: number) => [number, number, number];
++    readonly load_replay_for_playback: (a: number, b: number) => [number, number, number];
+     readonly ping: () => [number, number];
+     readonly project_seat_view: (a: number, b: number) => [number, number, number];
++    readonly replay_seek_js: (a: number) => [number, number, number];
+     readonly resolve_all: (a: number, b: number, c: number, d: number) => [number, number, number];
+     readonly restore_game_state: (a: number, b: number) => [number, number];
+     readonly resume_multiplayer_host_state: (a: number, b: number) => [number, number];
+@@ -381,13 +440,16 @@ export interface InitOutput {
+     readonly sideboardPolicyForFormat: (a: any) => [number, number, number];
+     readonly submit_action: (a: number, b: any) => any;
+     readonly take_last_panic_message: () => [number, number];
++    readonly clear_game_state: () => void;
+     readonly get_game_state: () => any;
+     readonly get_legal_actions_js: () => any;
+     readonly get_stack_pressure: () => any;
+     readonly init_panic_hook: () => void;
+-    readonly clear_game_state: () => void;
++    readonly replay_header_js: () => any;
+     readonly list_token_presets_js: () => any;
+     readonly create_initial_state: () => any;
++    readonly clear_replay_playback: () => void;
++    readonly replay_length_js: () => number;
+     readonly __wbindgen_malloc: (a: number, b: number) => number;
+     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+     readonly __wbindgen_exn_store: (a: number) => void;
+diff --git a/crates/engine-wasm/src/lib.rs b/crates/engine-wasm/src/lib.rs
+index e0794658cb..92a0547c18 100644
+--- a/crates/engine-wasm/src/lib.rs
++++ b/crates/engine-wasm/src/lib.rs
+@@ -19,13 +19,13 @@ use engine::game::{
+     is_commander_eligible, is_tiny_leader_eligible, load_and_hydrate_decks,
+     rehydrate_game_from_card_db, resolve_deck_list, start_game, start_game_with_starting_player,
+     validate_name_deck_for_format_full, BracketEstimate, DeckCompatibilityRequest, DeckList,
+-    PlayerDeckList,
++    PlayerDeckList, ReplayPlayer,
+ };
+ use engine::types::format::{FormatConfig, GameFormat};
+ use engine::types::identifiers::ObjectId;
+ use engine::types::mana::ManaCost;
+ use engine::types::match_config::MatchConfig;
+-use engine::types::{GameAction, GameState, PlayerId};
++use engine::types::{GameAction, GameState, PlayerId, ReplayHeader, ReplayLog};
+ 
+ use engine::game::resolve_player_deck_list;
+ use engine::starter_decks;
+@@ -90,6 +90,17 @@ thread_local! {
+     /// init/clear/resume; deliberately NOT invalidated on `restore_game_state`
+     /// so per-decision pool workers reuse the session.
+     static AI_SESSION_CACHE: Cell<SessionCache> = const { Cell::new(SessionCache::new_empty()) };
++    /// In-progress recording of GAME_STATE's actions for the Replay system.
++    /// Auto-started by `initialize_game` and appended to by `submit_action` on
++    /// every successfully-applied action. `None` before any game has started,
++    /// or after the recording was invalidated by undo/restore (see
++    /// `restore_game_state`). Independent of CARD_DB/GAME_STATE's own
++    /// take/set discipline but follows the same panic-resilient pattern.
++    static REPLAY_LOG: Cell<Option<ReplayLog>> = const { Cell::new(None) };
++    /// A loaded replay being scrubbed/played back by the Replay Viewer.
++    /// Entirely independent of GAME_STATE / REPLAY_LOG — loading or seeking a
++    /// replay never touches (or requires) a live game.
++    static REPLAY_PLAYER: Cell<Option<ReplayPlayer>> = const { Cell::new(None) };
+ }
+ 
+ /// Toggle the multiplayer enforcement flag. Called by multiplayer adapters
+@@ -230,6 +241,7 @@ pub fn take_last_panic_message() -> Option<String> {
+ pub fn clear_game_state() {
+     GAME_STATE.with(|cell| cell.set(None));
+     clear_ai_session_cache();
++    REPLAY_LOG.with(|cell| cell.set(None));
+ }
+ 
+ /// Verify WASM integration works.
+@@ -606,7 +618,7 @@ pub fn initialize_game(
+         }));
+     }
+ 
+-    let mut state = GameState::new(format_config, count, seed);
++    let mut state = GameState::new(format_config.clone(), count, seed);
+     state.debug_mode = true;
+     // Sandbox capability: in a P2P-host (WASM-authoritative) game, the
+     // `submit_action` gate checks `debug_permitted`, mirroring server-core's
+@@ -631,6 +643,14 @@ pub fn initialize_game(
+     // through for local 3-/4-player tables too.
+     state.set_match_config(match_config);
+ 
++    // Captured for the Replay system's `ReplayHeader` once the game actually
++    // starts (below) — `None` mirrors the empty-libraries `deck_data: null`
++    // path. Cloned at parse time rather than read back from `state` because
++    // the engine's resolved/hydrated deck shape (`DeckPayload`) is lossy
++    // relative to the name-only `DeckList` a replay needs to re-resolve from
++    // scratch on reconstruction.
++    let mut recorded_deck_list: Option<DeckList> = None;
++
+     // Load deck data if provided — resolve names via the loaded card database.
+     //
+     // Each failure mode below MUST surface as a hard error: a game that enters
+@@ -649,6 +669,7 @@ pub fn initialize_game(
+                 }));
+             }
+         };
++        recorded_deck_list = Some(deck_list.clone());
+ 
+         let card_db_missing = CARD_DB.with(|cell| cell.borrow().is_none());
+         if card_db_missing {
+@@ -805,6 +826,20 @@ pub fn initialize_game(
+         _ => start_game(&mut state),
+     };
+ 
++    // Auto-start the Replay recording for this game. Captures exactly the
++    // inputs this function was called with — reconstructing from the header
++    // alone (see `engine::game::replay::reconstruct_initial_state`) reproduces
++    // this same starting state byte-for-byte given the same seed.
++    let replay_header = ReplayHeader {
++        format_config,
++        match_config,
++        player_count: count,
++        first_player,
++        seed,
++        deck_data: recorded_deck_list,
++    };
++    REPLAY_LOG.with(|cell| cell.set(Some(ReplayLog::new(replay_header))));
++
+     GAME_STATE.with(|cell| cell.set(Some(state)));
+     clear_ai_session_cache();
+ 
+@@ -860,8 +895,16 @@ pub fn submit_action(actor: u8, action: JsValue) -> JsValue {
+         return handle_debug_create_card(card_name, owner, zone, attach_to, run_etb);
+     }
+ 
++    // Cloned before `apply` consumes `action` — recorded into REPLAY_LOG only
++    // on the success path below. CreateCard is handled above and never
++    // reaches here.
++    let action_for_replay = action.clone();
++    let is_debug_action = matches!(action, GameAction::Debug(_));
+     match with_state_mut(|state| match apply(state, actor, action) {
+-        Ok(result) => to_js(&result),
++        Ok(result) => {
++            record_replay_action(is_debug_action, actor, action_for_replay);
++            to_js(&result)
++        }
+         Err(e) => {
+             let error_msg = format!("Engine error: {}", e);
+             JsValue::from_str(&error_msg)
+@@ -872,6 +915,38 @@ pub fn submit_action(actor: u8, action: JsValue) -> JsValue {
+     }
+ }
+ 
++/// Record a successfully-applied action into REPLAY_LOG, or invalidate any
++/// in-progress recording if it was a (non-CreateCard) debug action.
++///
++/// Every `GameAction::Debug` variant other than `CreateCard` reaches this
++/// point (unlike CreateCard, they mutate state already tracked by
++/// `GameState` rather than resolving against the WASM-local `CardDatabase`,
++/// so they aren't intercepted earlier in `submit_action`) — but
++/// `reconstruct_initial_state` (`game/replay.rs`) never sets `debug_mode`
++/// when rebuilding a replay's starting state, so a recorded debug action
++/// would hit the `!state.debug_mode` gate in `apply` (`game/engine.rs`) and
++/// desync playback. Rather than recording it and failing later, invalidate
++/// any in-progress recording here — the same way
++/// `handle_debug_create_card_inner` invalidates it for CreateCard — so
++/// `export_replay_log` can't produce a log that silently can't be replayed.
++///
++/// Factored out of `submit_action` so it's testable under plain `cargo test`
++/// without going through `to_js`, which requires a JS runtime (see
++/// `handle_debug_create_card`'s doc comment for the same split).
++fn record_replay_action(is_debug_action: bool, actor: PlayerId, action_for_replay: GameAction) {
++    REPLAY_LOG.with(|cell| {
++        if is_debug_action {
++            cell.set(None);
++        } else {
++            let mut log = cell.take();
++            if let Some(log) = log.as_mut() {
++                log.push_action(actor, action_for_replay);
++            }
++            cell.set(log);
++        }
++    });
++}
++
+ fn handle_debug_create_card(
+     card_name: &str,
+     owner: PlayerId,
+@@ -879,6 +954,24 @@ fn handle_debug_create_card(
+     attach_to: Option<engine::game::game_object::AttachTarget>,
+     run_etb: bool,
+ ) -> JsValue {
++    match handle_debug_create_card_inner(card_name, owner, zone, attach_to, run_etb) {
++        Ok(result) => to_js(&result),
++        Err(msg) => JsValue::from_str(msg),
++    }
++}
++
++/// Mutation core of `handle_debug_create_card`, factored out so it can be
++/// exercised by native unit tests — the `#[wasm_bindgen]`-facing wrapper's
++/// success path calls `to_js`, which requires a JS runtime and panics under
++/// plain `cargo test`. See `bracket_estimate_tests::estimate_bracket_inner`
++/// for the same split.
++fn handle_debug_create_card_inner(
++    card_name: &str,
++    owner: PlayerId,
++    zone: engine::types::zones::Zone,
++    attach_to: Option<engine::game::game_object::AttachTarget>,
++    run_etb: bool,
++) -> Result<engine::types::game_state::ActionResult, &'static str> {
+     let face = CARD_DB.with(|cell| {
+         let db = cell.borrow();
+         let Some(db) = db.as_ref() else {
+@@ -888,20 +981,22 @@ fn handle_debug_create_card(
+             Some(face) => Ok(face.clone()),
+             None => Err("Engine error: card not found in database"),
+         }
+-    });
+-    let face = match face {
+-        Ok(f) => f,
+-        Err(msg) => return JsValue::from_str(msg),
+-    };
+-    match with_state_mut(|state| {
++    })?;
++    with_state_mut(|state| {
+         if !state.debug_mode {
+-            return JsValue::from_str(
+-                "Engine error: Debug actions require debug_mode to be enabled",
+-            );
++            return Err("Engine error: Debug actions require debug_mode to be enabled");
+         }
+         if !state.players.iter().any(|p| p.id == owner) {
+-            return JsValue::from_str("Engine error: Debug: invalid owner player id");
++            return Err("Engine error: Debug: invalid owner player id");
+         }
++        // Debug-spawned cards are resolved against the WASM-local CARD_DB and
++        // never recorded into REPLAY_LOG (unlike normal actions in
++        // `submit_action`), so a faithful replay can't reconstruct this
++        // mutation. Invalidate any in-progress recording here, the same way
++        // `restore_game_state` invalidates on a history-breaking state swap,
++        // so `export_replay_log` can't produce a log that silently omits a
++        // debug spawn.
++        REPLAY_LOG.with(|cell| cell.set(None));
+         // CR 400.7: For battlefield destination, stage the object in Hand
+         // first, then route through the real ETB pipeline so replacements,
+         // triggers, and SBAs all fire. Direct creation in Battlefield (the
+@@ -987,11 +1082,9 @@ fn handle_debug_create_card(
+         engine::game::public_state::bump_state_revision(state);
+         engine::game::public_state::mark_public_state_all_dirty(state);
+         engine::game::public_state::finalize_public_state(state);
+-        to_js(&result)
+-    }) {
+-        Ok(val) => val,
+-        Err(e) => e,
+-    }
++        Ok(result)
++    })
++    .unwrap_or(Err(NOT_INITIALIZED_ERR))
+ }
+ 
+ /// Get the current game state as a `ClientGameState` wire envelope
+@@ -1195,6 +1288,10 @@ pub fn restore_game_state(json_str: &str) -> Result<(), JsValue> {
+     });
+     finalize_public_state(&mut state);
+     GAME_STATE.with(|cell| cell.set(Some(state)));
++    // Restoring (undo, or resuming a save from a fresh worker that never saw
++    // `initialize_game`) invalidates any in-progress recording — the restored
++    // state's history no longer matches the recorded action sequence.
++    REPLAY_LOG.with(|cell| cell.set(None));
+     Ok(())
+ }
+ 
+@@ -1258,9 +1355,144 @@ pub fn resume_multiplayer_host_state(json_str: &str) -> Result<(), JsValue> {
+     GAME_STATE.with(|cell| cell.set(Some(state)));
+     MULTIPLAYER_MODE.with(|cell| cell.set(true));
+     clear_ai_session_cache();
++    // Multiplayer games are out of scope for v1 recording (see
++    // `crates/engine/src/types/replay.rs`); ensure no stale local-game
++    // recording from this worker's previous session lingers.
++    REPLAY_LOG.with(|cell| cell.set(None));
+     Ok(())
+ }
+ 
++// ── Replay system ───────────────────────────────────────────────────────
++//
++// Recording: `initialize_game` auto-starts a `ReplayLog` (REPLAY_LOG) and
++// `submit_action` appends every successfully-applied action to it. See
++// `engine::types::replay` and `engine::game::replay` for the reconstruction
++// model — a replay carries no per-turn snapshots, only the inputs needed to
++// reconstruct the starting state plus the ordered action sequence.
++//
++// Playback: entirely separate from the live game. `load_replay_for_playback`
++// parses an exported log into a `ReplayPlayer` (REPLAY_PLAYER) that the
++// Replay Viewer scrubs with `replay_seek_js`. Loading or seeking a replay
++// never touches GAME_STATE / REPLAY_LOG.
++
++/// Whether the current game has an in-progress replay recording. `false`
++/// before any game has started, or after the recording was invalidated by
++/// undo/restore (see `restore_game_state`).
++#[wasm_bindgen]
++pub fn has_replay_recording() -> bool {
++    REPLAY_LOG.with(|cell| {
++        let log = cell.take();
++        let present = log.is_some();
++        cell.set(log);
++        present
++    })
++}
++
++/// Serialize the current game's replay recording to a JSON string — the
++/// format `load_replay_for_playback` reads back. Errors if no game has been
++/// initialized in this worker (or the recording was invalidated by undo).
++#[wasm_bindgen]
++pub fn export_replay_log() -> Result<String, JsValue> {
++    REPLAY_LOG.with(|cell| {
++        let log = cell.take();
++        let result = match &log {
++            Some(log) => serde_json::to_string(log)
++                .map_err(|e| JsValue::from_str(&format!("Failed to serialize replay log: {e}"))),
++            None => Err(JsValue::from_str(
++                "No replay recording available. Start a game first, or it was \
++                 invalidated by an undo/restore.",
++            )),
++        };
++        cell.set(log);
++        result
++    })
++}
++
++/// Load a replay log (the JSON produced by `export_replay_log`) for
++/// scrubbing/playback. Independent of the live `GAME_STATE` — does not
++/// require, and does not affect, an active game. Uses the loaded `CARD_DB`
++/// to resolve the recorded deck list when reconstructing the starting
++/// state — and errors (rather than silently reconstructing empty
++/// libraries) if the replay carries deck data but no card database is
++/// loaded; see `ReplayError::MissingCardDatabase`. Returns the total number
++/// of recorded actions; valid `replay_seek_js` targets are `0..=length`.
++#[wasm_bindgen]
++pub fn load_replay_for_playback(json_str: &str) -> Result<u32, JsValue> {
++    let log: ReplayLog = serde_json::from_str(json_str)
++        .map_err(|e| JsValue::from_str(&format!("Failed to parse replay log: {e}")))?;
++    let player = CARD_DB
++        .with(|cell| {
++            let db = cell.borrow();
++            ReplayPlayer::load(log, db.as_ref())
++        })
++        .map_err(|e| JsValue::from_str(&format!("Engine error: {e}")))?;
++    let len = player.len();
++    REPLAY_PLAYER.with(|cell| cell.set(Some(player)));
++    Ok(len)
++}
++
++/// Total number of recorded actions in the loaded replay, or `0` if none is loaded.
++#[wasm_bindgen]
++pub fn replay_length_js() -> u32 {
++    REPLAY_PLAYER.with(|cell| {
++        let player = cell.take();
++        let len = player.as_ref().map(ReplayPlayer::len).unwrap_or(0);
++        cell.set(player);
++        len
++    })
++}
++
++/// The loaded replay's header (format/match config, player count, seed,
++/// deck data), or `null` if none is loaded. Lets the viewer show "vs. <deck>"
++/// chrome without re-deriving it from the action sequence.
++#[wasm_bindgen]
++pub fn replay_header_js() -> JsValue {
++    REPLAY_PLAYER.with(|cell| {
++        let player = cell.take();
++        let header = player
++            .as_ref()
++            .map(|p| to_js(p.header()))
++            .unwrap_or(JsValue::NULL);
++        cell.set(player);
++        header
++    })
++}
++
++/// Seek the loaded replay to `target` (clamped to the recording's length) and
++/// return the reconstructed state at that point, wrapped the same way
++/// `get_game_state` wraps the live state. Returns `Ok(null)` only when no
++/// replay is loaded — a reconstruction desync (`ReplayError::Desync`, an
++/// engine-version mismatch between recording and playback, not a rules
++/// outcome) is a real failure and must not be silently swallowed into the
++/// same null the caller uses for "nothing loaded"; it throws instead, like
++/// every other fallible engine entry point that returns `Result<_, JsValue>`.
++#[wasm_bindgen]
++pub fn replay_seek_js(target: u32) -> Result<JsValue, JsValue> {
++    REPLAY_PLAYER.with(|cell| {
++        let mut player = cell.take();
++        let result = match player.as_mut() {
++            Some(player) => match player.seek(target) {
++                Ok(state) => Ok(to_js(
++                    &engine::game::derived_views::ClientGameStateRef::wrap(
++                        state,
++                        Some(PlayerId(0)),
++                    ),
++                )),
++                Err(e) => Err(JsValue::from_str(&format!("Engine error: {e}"))),
++            },
++            None => Ok(JsValue::NULL),
++        };
++        cell.set(player);
++        result
++    })
++}
++
++/// Discard the loaded replay (if any). Safe to call even when none is loaded.
++#[wasm_bindgen]
++pub fn clear_replay_playback() {
++    REPLAY_PLAYER.with(|cell| cell.set(None));
++}
++
+ /// Get the AI's chosen action for the current game state.
+ /// `difficulty` is one of: "VeryEasy", "Easy", "Medium", "Hard", "VeryHard",
+ /// "CEDH" (case-insensitive; see `AiDifficulty::from_label`).
+@@ -1416,6 +1648,24 @@ pub fn resolve_all(
+     with_state_mut(|state| {
+         let mut rng = rand::rng();
+         let mut result = resolve_all_inner(state, requester, &ai_seats, max_resolutions, &mut rng);
++        // A Resolve All burst applies real actions directly via
++        // `apply_action_boundary_with_stack_limit` (bypassing `submit_action`,
++        // which is the only other place REPLAY_LOG is appended to) — without
++        // this, an exported replay would silently omit every action a player
++        // fast-forwarded through, and playback would desync from the game
++        // they actually played. `recorded_actions` is `#[serde(skip)]`, so
++        // draining it here has no effect on the JS-visible result shape.
++        if !result.recorded_actions.is_empty() {
++            REPLAY_LOG.with(|cell| {
++                let mut log = cell.take();
++                if let Some(log) = log.as_mut() {
++                    for (actor, action) in result.recorded_actions.drain(..) {
++                        log.push_action(actor, action);
++                    }
++                }
++                cell.set(log);
++            });
++        }
+         result.events.clear();
+         result.log_entries.clear();
+         Ok(to_js(&result))
+@@ -1908,3 +2158,218 @@ mod tests {
+         assert_eq!(restored.objects[&object_id].name, "Legacy Card");
+     }
+ }
++
++#[cfg(test)]
++mod replay_bridge_tests {
++    use super::*;
++    use engine::types::game_state::WaitingFor;
++
++    /// Exercises the bridge wiring (auto-start in `initialize_game`, append
++    /// in `submit_action`, clear in `restore_game_state`) through the
++    /// inner helpers rather than the `#[wasm_bindgen]` entry points
++    /// themselves — those return their result via `to_js`, which calls the
++    /// real `JSON.parse` JS binding and panics outside a wasm32 runtime (see
++    /// `bracket_estimate_tests` / `resolve_all_tests` above, which follow the
++    /// same convention). Deterministic reconstruction itself is covered
++    /// end-to-end by `crates/engine/src/game/replay.rs`'s tests; this test's
++    /// job is narrower — proving the thread-local plumbing actually fires.
++    #[test]
++    fn replay_log_records_actions_and_survives_export_import_round_trip() {
++        clear_game_state();
++        clear_replay_playback();
++
++        let mut state = GameState::new_two_player(99);
++        let start_result = start_game(&mut state);
++        let _ = start_result;
++
++        let header = ReplayHeader {
++            format_config: state.format_config.clone(),
++            match_config: state.match_config,
++            player_count: state.players.len() as u8,
++            first_player: Some(state.active_player.0),
++            seed: state.rng_seed,
++            deck_data: None,
++        };
++        REPLAY_LOG.with(|cell| cell.set(Some(ReplayLog::new(header))));
++        GAME_STATE.with(|cell| cell.set(Some(state)));
++
++        assert!(
++            has_replay_recording(),
++            "seeding REPLAY_LOG must be observable via has_replay_recording"
++        );
++
++        // Mirror what `submit_action` does on every successful action: apply,
++        // then record it via the same `record_replay_action` helper.
++        for _ in 0..6 {
++            let waiting = with_state(|state| state.waiting_for.clone()).expect("game initialized");
++            let WaitingFor::Priority { player } = waiting else {
++                break;
++            };
++            let applied =
++                with_state_mut(|state| apply(state, player, GameAction::PassPriority).is_ok())
++                    .expect("game initialized");
++            assert!(
++                applied,
++                "passing priority while waiting on it is always legal"
++            );
++            record_replay_action(false, player, GameAction::PassPriority);
++        }
++
++        let replay_json =
++            export_replay_log().expect("a recording should exist after at least one action");
++        assert!(
++            replay_json.contains("PassPriority"),
++            "exported JSON should contain the recorded actions"
++        );
++
++        let length =
++            load_replay_for_playback(&replay_json).expect("exported replay should load back");
++        assert!(
++            length >= 4,
++            "expected several recorded priority passes, got {length}"
++        );
++        assert_eq!(replay_length_js(), length);
++
++        clear_replay_playback();
++        assert_eq!(
++            replay_length_js(),
++            0,
++            "clear_replay_playback should drop the loaded replay"
++        );
++        clear_game_state();
++    }
++
++    #[test]
++    fn restore_game_state_invalidates_the_in_progress_recording() {
++        clear_game_state();
++
++        let state = GameState::new_two_player(7);
++        REPLAY_LOG.with(|cell| {
++            cell.set(Some(ReplayLog::new(ReplayHeader {
++                format_config: state.format_config.clone(),
++                match_config: state.match_config,
++                player_count: state.players.len() as u8,
++                first_player: Some(0),
++                seed: state.rng_seed,
++                deck_data: None,
++            })))
++        });
++        assert!(has_replay_recording());
++
++        let json = serde_json::to_string(&state).unwrap();
++        restore_game_state(&json).expect("restore should succeed");
++
++        assert!(
++            !has_replay_recording(),
++            "undo/restore must invalidate the recording — it no longer matches \
++             the restored state's history"
++        );
++
++        clear_game_state();
++    }
++
++    #[test]
++    fn debug_create_card_invalidates_the_in_progress_recording() {
++        use engine::database::CardDatabase;
++
++        clear_game_state();
++        let db = CardDatabase::from_json_str(
++            r#"{
++                "test card": {
++                    "name": "Test Card",
++                    "mana_cost": { "type": "NoCost" },
++                    "card_type": { "supertypes": [], "core_types": ["Creature"], "subtypes": [] },
++                    "power": "1",
++                    "toughness": "1",
++                    "loyalty": null,
++                    "defense": null,
++                    "oracle_text": null,
++                    "abilities": [],
++                    "triggers": [],
++                    "static_abilities": [],
++                    "replacements": [],
++                    "keywords": []
++                }
++            }"#,
++        )
++        .unwrap();
++        CARD_DB.with(|c| *c.borrow_mut() = Some(db));
++
++        let mut state = GameState::new_two_player(11);
++        state.debug_mode = true;
++        REPLAY_LOG.with(|cell| {
++            cell.set(Some(ReplayLog::new(ReplayHeader {
++                format_config: state.format_config.clone(),
++                match_config: state.match_config,
++                player_count: state.players.len() as u8,
++                first_player: Some(0),
++                seed: state.rng_seed,
++                deck_data: None,
++            })))
++        });
++        GAME_STATE.with(|cell| cell.set(Some(state)));
++        assert!(has_replay_recording());
++
++        let result = handle_debug_create_card_inner(
++            "Test Card",
++            PlayerId(0),
++            engine::types::zones::Zone::Hand,
++            None,
++            true,
++        );
++        assert!(
++            result.is_ok(),
++            "debug create-card should succeed in this fixture: {result:?}"
++        );
++
++        assert!(
++            !has_replay_recording(),
++            "a debug-spawned card is never appended to REPLAY_LOG (the WASM \
++             bridge resolves it against CARD_DB before reaching `apply`), so \
++             any in-progress recording must be invalidated rather than left \
++             to silently omit the mutation"
++        );
++
++        clear_game_state();
++        CARD_DB.with(|c| *c.borrow_mut() = None);
++    }
++
++    /// A non-`CreateCard` debug action (e.g. `DrawCards`) reaches
++    /// `record_replay_action` through the normal `submit_action` path — it
++    /// is not intercepted earlier the way `CreateCard` is. `reconstruct_initial_state`
++    /// never enables `debug_mode`, so a recorded debug action would fail the
++    /// `!state.debug_mode` gate in `apply` on playback and desync the replay.
++    /// Recording must be invalidated instead, mirroring the CreateCard case.
++    #[test]
++    fn non_create_card_debug_action_invalidates_the_in_progress_recording() {
++        clear_game_state();
++
++        let state = GameState::new_two_player(13);
++        REPLAY_LOG.with(|cell| {
++            cell.set(Some(ReplayLog::new(ReplayHeader {
++                format_config: state.format_config.clone(),
++                match_config: state.match_config,
++                player_count: state.players.len() as u8,
++                first_player: Some(0),
++                seed: state.rng_seed,
++                deck_data: None,
++            })))
++        });
++        assert!(has_replay_recording());
++
++        let debug_action = GameAction::Debug(engine::types::actions::DebugAction::DrawCards {
++            player_id: PlayerId(0),
++            count: 1,
++        });
++        record_replay_action(true, PlayerId(0), debug_action);
++
++        assert!(
++            !has_replay_recording(),
++            "a non-CreateCard debug action must invalidate any in-progress \
++             recording too — replay reconstruction never enables debug_mode, \
++             so recording it would produce a replay that desyncs on playback"
++        );
++
++        clear_game_state();
++    }
++}
+diff --git a/crates/engine/src/game/engine_resolve_batch.rs b/crates/engine/src/game/engine_resolve_batch.rs
+index b8926164e3..7b103a352c 100644
+--- a/crates/engine/src/game/engine_resolve_batch.rs
++++ b/crates/engine/src/game/engine_resolve_batch.rs
+@@ -21,6 +21,15 @@ pub struct ResolveAllFastForwardResult {
+     /// Stack depth at this chunk's entry. The frontend latches the first
+     /// chunk's `total` as the storm-origin denominator for progress display.
+     pub total: u32,
++    /// Every action applied during this batch (including priority passes
++    /// fast-forwarded by `seed_remaining_priority_cycle_passes`, which are
++    /// semantically equivalent to — but bypass — an explicit `PassPriority`
++    /// through `apply`), in submission order. `#[serde(skip)]`: this is
++    /// consumed in-process by the WASM bridge to extend the Replay system's
++    /// recording (see `crates/engine-wasm/src/lib.rs::resolve_all`) and must
++    /// never reach the JS-visible result shape.
++    #[serde(skip)]
++    pub recorded_actions: Vec<(PlayerId, GameAction)>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq)]
+@@ -61,6 +70,7 @@ where
+     let mut log_entries = Vec::new();
+     let mut items_resolved = 0u32;
+     let mut deferred_display_pending = false;
++    let mut recorded_actions: Vec<(PlayerId, GameAction)> = Vec::new();
+ 
+     for _ in 0..max_iterations {
+         let semantic_priority_seat = match &state.waiting_for {
+@@ -98,12 +108,14 @@ where
+             }
+         };
+ 
++        let mut seeded_actions: Vec<(PlayerId, GameAction)> = Vec::new();
+         if matches!(action, GameAction::PassPriority) && !state.stack.is_empty() {
+             match seed_remaining_priority_cycle_passes(
+                 state,
+                 semantic_priority_seat,
+                 requester,
+                 &mut choose_non_requester_action,
++                &mut seeded_actions,
+             ) {
+                 PriorityCycleFastForward::Seeded | PriorityCycleFastForward::CannotSeed => {}
+                 PriorityCycleFastForward::Stop => break,
+@@ -113,6 +125,7 @@ where
+         let remaining_resolution_cap = resolution_cap.saturating_sub(items_resolved).max(1);
+         let stack_resolution_limit =
+             matches!(action, GameAction::PassPriority).then_some(remaining_resolution_cap);
++        let action_for_record = action.clone();
+         let Ok(boundary) = apply_action_boundary_with_stack_limit(
+             state,
+             actor,
+@@ -122,6 +135,19 @@ where
+         ) else {
+             break;
+         };
++        // `actor` holds priority right now (per `WaitingFor::Priority`), so a
++        // legal replay must submit its action before any of the seeded
++        // passes below — those represent *later* seats in the priority
++        // rotation. Seeding mutates `state.priority_passes` directly ahead
++        // of this `apply` call (see `seed_remaining_priority_cycle_passes`)
++        // so the engine's own full-cycle-resolved check fires correctly,
++        // but that internal mutation order must not leak into the recorded
++        // order: `apply` rejects an action from any actor other than the
++        // current `WaitingFor` seat, so recording the seeded entries first
++        // would make the exported replay un-submittable from the original
++        // state.
++        recorded_actions.push((actor, action_for_record));
++        recorded_actions.extend(seeded_actions);
+ 
+         if matches!(mode, PublicFinalizeMode::DeferredDisplay) {
+             deferred_display_pending = true;
+@@ -153,6 +179,7 @@ where
+         log_entries,
+         items_resolved,
+         total: total as u32,
++        recorded_actions,
+     }
+ }
+ 
+@@ -161,6 +188,7 @@ fn seed_remaining_priority_cycle_passes<F>(
+     current_seat: PlayerId,
+     requester: PlayerId,
+     choose_non_requester_action: &mut F,
++    seeded_actions: &mut Vec<(PlayerId, GameAction)>,
+ ) -> PriorityCycleFastForward
+ where
+     F: FnMut(&GameState, PlayerId) -> ResolveAllCallbackDecision,
+@@ -187,12 +215,22 @@ where
+                     ResolveAllCallbackDecision::Stop => return PriorityCycleFastForward::Stop,
+                 }
+             }
+-            seeded.push(representative);
++            seeded.push((representative, actor));
+         }
+     }
+ 
+-    for seat in seeded {
++    // These representatives never went through `apply` — they're the
++    // documented fast-forward shortcut over an explicit `PassPriority` each
++    // (see the module doc comment). Recorded as if they had been, so replay
++    // reconstruction (which only knows how to replay via `apply`) reproduces
++    // the same end state. Appended to a caller-local scratch buffer, not
++    // directly to the batch's `recorded_actions` — the caller must record
++    // `current_seat`'s own pass *before* these (it holds priority right
++    // now), even though the state mutation below necessarily happens before
++    // `current_seat`'s actual `apply` call. See the call site.
++    for (seat, actor) in seeded {
+         state.priority_passes.insert(seat);
++        seeded_actions.push((actor, GameAction::PassPriority));
+     }
+ 
+     PriorityCycleFastForward::Seeded
+@@ -380,6 +418,24 @@ mod tests {
+                 .any(|event| matches!(event, GameEvent::PriorityPassed { .. })),
+             "Resolve All seeds accepted priority passes instead of emitting every intermediate pass"
+         );
++        // Both the requester's own pass (which does go through `apply`) and
++        // the fast-forward-seeded pass (PlayerId(1), bypassing `apply`
++        // entirely — see `seed_remaining_priority_cycle_passes`) must be
++        // captured so an exported replay of a Resolve-All-driven game
++        // doesn't silently omit real state transitions. The requester must
++        // be recorded *first*: it holds priority in the original state, and
++        // a replay reconstructing from that state can only legally submit
++        // PlayerId(1)'s pass after PlayerId(0)'s — `apply` rejects an
++        // action from any actor that isn't the current `WaitingFor` seat.
++        assert_eq!(
++            result.recorded_actions,
++            vec![
++                (PlayerId(0), GameAction::PassPriority),
++                (PlayerId(1), GameAction::PassPriority),
++            ],
++            "every action applied (or fast-forward-equivalent pass) during the batch must be \
++             recorded in an order a fresh replay reconstruction can legally submit through apply"
++        );
+     }
+ 
+     #[test]
+diff --git a/crates/engine/src/game/mod.rs b/crates/engine/src/game/mod.rs
+index 7bdb2f6039..f58f0f0b86 100644
+--- a/crates/engine/src/game/mod.rs
++++ b/crates/engine/src/game/mod.rs
+@@ -129,6 +129,7 @@ pub mod priority;
+ pub mod public_state;
+ pub mod quantity;
+ pub mod replacement;
++pub mod replay;
+ pub mod restrictions;
+ pub mod room;
+ pub(crate) mod sacrifice;
+@@ -198,6 +199,7 @@ pub use keywords::parse_keywords;
+ pub use mana_payment::{can_pay, pay_from_pool, produce_mana, PaymentError};
+ pub use printed_cards::rehydrate_game_from_card_db;
+ pub use public_state::finalize_public_state;
++pub use replay::{reconstruct_initial_state, ReplayError, ReplayPlayer};
+ pub use triggers::process_triggers;
+ pub use visibility::{filter_events_for_viewer, filter_state_for_viewer};
+ pub use zones::{
+diff --git a/crates/engine/src/game/replay.rs b/crates/engine/src/game/replay.rs
+new file mode 100644
+index 0000000000..6d6f408f3e
+--- /dev/null
++++ b/crates/engine/src/game/replay.rs
+@@ -0,0 +1,426 @@
++//! Deterministic action-based replay reconstruction.
++//!
++//! A recorded game (`ReplayLog`) carries no per-turn state — only the inputs
++//! needed to reconstruct its starting state (`ReplayHeader`) and the ordered
++//! sequence of actions that were submitted and accepted. Because `apply` is a
++//! pure reducer over a `GameState` seeded from a fixed RNG seed, replaying the
++//! same actions against the same starting state reproduces the original game
++//! exactly. `ReplayPlayer` wraps that reconstruction with sparse checkpoint
++//! caching so scrubbing to an arbitrary point doesn't re-simulate the whole
++//! game from turn 1 every time.
++
++use std::collections::BTreeMap;
++
++use thiserror::Error;
++
++use crate::database::CardDatabase;
++use crate::types::game_state::GameState;
++use crate::types::player::PlayerId;
++use crate::types::replay::{RecordedAction, ReplayHeader, ReplayLog};
++
++use super::deck_loading::{load_and_hydrate_decks, resolve_deck_list};
++use super::engine::{apply, start_game, start_game_with_starting_player};
++
++/// Checkpoints are cached every `CHECKPOINT_INTERVAL` actions, bounding cache
++/// size to roughly `len / CHECKPOINT_INTERVAL` snapshots while keeping any
++/// `seek` to at most this many replayed actions from the nearest one.
++/// `GameState::clone()` is O(log n) (the `im`-backed structural-sharing
++/// containers documented in CLAUDE.md), so caching at this granularity is
++/// cheap relative to re-running `apply` from scratch.
++const CHECKPOINT_INTERVAL: u32 = 20;
++
++#[derive(Debug, Error)]
++pub enum ReplayError {
++    /// An action that was recorded as having succeeded failed to re-apply
++    /// during reconstruction. This means the recording and the engine version
++    /// replaying it have diverged (e.g. an engine change altered behavior for
++    /// a state this recording depends on) — it is not a normal rules outcome.
++    #[error("replay action {index} desynced reconstruction: {message}")]
++    Desync { index: u32, message: String },
++    /// The header carries deck data (the recorded game was not started with
++    /// empty libraries) but no `CardDatabase` was supplied to resolve it.
++    /// Silently skipping deck hydration in this case would reconstruct a
++    /// *different* starting state (empty libraries) than the one the
++    /// original game actually had — a wrong-but-quiet result is worse than
++    /// failing loudly here.
++    #[error(
++        "replay requires a card database to resolve its recorded deck data, but none was loaded"
++    )]
++    MissingCardDatabase,
++}
++
++/// Reconstruct the state immediately after `start_game` (before any recorded
++/// action has been applied) from a `ReplayHeader` alone. Reuses the same
++/// canonical init sequence every transport (WASM, server-core) already
++/// shares — see `load_and_hydrate_decks` — so reconstruction can't drift from
++/// how the original game was actually started.
++///
++/// Errors with `ReplayError::MissingCardDatabase` when `header.deck_data` is
++/// `Some` but `db` is `None` — that combination can only reconstruct a
++/// wrong starting state (empty libraries instead of the recorded deck), so
++/// it isn't accepted silently. `db: None` is only valid when
++/// `header.deck_data` is also `None` (a format that genuinely starts with
++/// empty libraries).
++pub fn reconstruct_initial_state(
++    header: &ReplayHeader,
++    db: Option<&CardDatabase>,
++) -> Result<GameState, ReplayError> {
++    let mut state = GameState::new(
++        header.format_config.clone(),
++        header.player_count,
++        header.seed,
++    );
++    // CR 732.2a: project the combo-detector opt-in onto `loop_detection` via the
++    // single authority shared by every transport, so a replay of a detector-on
++    // game reconstructs with the same runtime gate the original game had.
++    state.set_match_config(header.match_config);
++
++    // Mirror `initialize_game`: local WASM games always run with
++    // `debug_mode = true`, and sandbox games (`allow_debug_actions`) pre-seed
++    // `debug_permitted` for every seat before the first action. Without this,
++    // a replay that contains `GrantDebugPermission` or `RevokeDebugPermission`
++    // actions (which are NOT `GameAction::Debug(_)` and therefore DO get
++    // recorded) applies them against an empty `debug_permitted` set instead of
++    // the pre-seeded one, producing a different permission state — and any
++    // subsequent `Debug(_)` actions replayed through `apply` fail outright
++    // because `debug_mode` would be `false`.
++    state.debug_mode = true;
++    if state.format_config.allow_debug_actions {
++        for i in 0..header.player_count {
++            state.debug_permitted.insert(PlayerId(i));
++        }
++    }
++
++    match (&header.deck_data, db) {
++        (Some(deck_data), Some(db)) => {
++            let payload = resolve_deck_list(db, deck_data);
++            load_and_hydrate_decks(&mut state, &payload, Some(db));
++            state.all_card_names = db.card_names().into();
++        }
++        (Some(_), None) => return Err(ReplayError::MissingCardDatabase),
++        (None, _) => {}
++    }
++
++    match header.first_player {
++        Some(0) => start_game_with_starting_player(&mut state, PlayerId(0)),
++        Some(1) => start_game_with_starting_player(&mut state, PlayerId(1)),
++        _ => start_game(&mut state),
++    };
++    Ok(state)
++}
++
++/// Deterministic playback over a `ReplayLog`. Holds sparse cached
++/// checkpoints (see `CHECKPOINT_INTERVAL`) so repeated scrubbing doesn't
++/// re-simulate the whole game on every call.
++#[derive(Debug)]
++pub struct ReplayPlayer {
++    log: ReplayLog,
++    checkpoints: BTreeMap<u32, GameState>,
++    /// Holds the most recently reconstructed state when `seek` lands on a
++    /// non-checkpoint-aligned index, so `seek` can return a borrow of `self`
++    /// without caching every single scrubbed-through position.
++    scratch: Option<GameState>,
++}
++
++impl ReplayPlayer {
++    /// Build a player for `log`, eagerly reconstructing the index-0
++    /// (post-`start_game`) checkpoint. `db` is forwarded to
++    /// `reconstruct_initial_state`, which errors if `log.header.deck_data`
++    /// is `Some` and `db` is `None` — see that function's doc comment.
++    pub fn load(log: ReplayLog, db: Option<&CardDatabase>) -> Result<Self, ReplayError> {
++        let initial = reconstruct_initial_state(&log.header, db)?;
++        let mut checkpoints = BTreeMap::new();
++        checkpoints.insert(0, initial);
++        Ok(Self {
++            log,
++            checkpoints,
++            scratch: None,
++        })
++    }
++
++    /// Total number of recorded actions. Valid `seek` targets are `0..=len()`.
++    pub fn len(&self) -> u32 {
++        self.log.actions.len() as u32
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.log.actions.is_empty()
++    }
++
++    pub fn header(&self) -> &ReplayHeader {
++        &self.log.header
++    }
++
++    pub fn action_at(&self, index: u32) -> Option<&RecordedAction> {
++        self.log.actions.get(index as usize)
++    }
++
++    /// Reconstruct and return the state immediately after action `target`
++    /// has been applied (`target == 0` is the post-`start_game` state before
++    /// any action). Clamped to `len()`.
++    pub fn seek(&mut self, target: u32) -> Result<&GameState, ReplayError> {
++        let target = target.min(self.len());
++
++        if self.checkpoints.contains_key(&target) {
++            return Ok(self.checkpoints.get(&target).expect("just checked"));
++        }
++
++        let state = self.replay_from_nearest_checkpoint(target)?;
++        if target.is_multiple_of(CHECKPOINT_INTERVAL) || target == self.len() {
++            self.checkpoints.insert(target, state);
++            return Ok(self.checkpoints.get(&target).expect("just inserted"));
++        }
++
++        self.scratch = Some(state);
++        Ok(self.scratch.as_ref().expect("just set"))
++    }
++
++    fn replay_from_nearest_checkpoint(&self, target: u32) -> Result<GameState, ReplayError> {
++        let (&start_idx, base) = self
++            .checkpoints
++            .range(..=target)
++            .next_back()
++            .expect("index 0 checkpoint is always present");
++        let mut state = base.clone();
++        for recorded in &self.log.actions[start_idx as usize..target as usize] {
++            apply(&mut state, recorded.actor, recorded.action.clone()).map_err(|e| {
++                ReplayError::Desync {
++                    index: recorded.seq,
++                    message: e.to_string(),
++                }
++            })?;
++        }
++        Ok(state)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::types::actions::GameAction;
++    use crate::types::format::FormatConfig;
++    use crate::types::game_state::WaitingFor;
++    use crate::types::match_config::MatchConfig;
++
++    fn two_player_header(seed: u64) -> ReplayHeader {
++        ReplayHeader {
++            format_config: FormatConfig::standard(),
++            match_config: MatchConfig::default(),
++            player_count: 2,
++            first_player: Some(0),
++            seed,
++            deck_data: None,
++        }
++    }
++
++    /// If the live state is sitting on a priority decision, return the
++    /// `(actor, action)` pair that passes it — the simplest fully-generic
++    /// action available regardless of deck contents, which is exactly why
++    /// this test can run with `deck_data: None` (no CardDatabase needed).
++    fn next_priority_pass(state: &GameState) -> Option<(PlayerId, GameAction)> {
++        match state.waiting_for {
++            WaitingFor::Priority { player } => Some((player, GameAction::PassPriority)),
++            _ => None,
++        }
++    }
++
++    #[test]
++    fn replay_player_reconstructs_every_recorded_index() {
++        let header = two_player_header(99);
++        let mut live = reconstruct_initial_state(&header, None)
++            .expect("deck_data is None, so reconstruction cannot fail");
++
++        let mut log = ReplayLog::new(header);
++        let mut live_snapshots = vec![live.clone()];
++
++        // Pass priority a handful of times — enough to walk through several
++        // phases of turn 1 without reaching turn 2's draw step (which would
++        // lose the game to CR 704.5b against an empty library).
++        for _ in 0..8 {
++            let Some((actor, action)) = next_priority_pass(&live) else {
++                break;
++            };
++            apply(&mut live, actor, action.clone())
++                .expect("passing priority while waiting on it is always legal");
++            log.push_action(actor, action);
++            live_snapshots.push(live.clone());
++        }
++
++        assert!(
++            log.actions.len() >= 4,
++            "expected several priority passes to have been recorded"
++        );
++        assert_eq!(log.actions.len(), live_snapshots.len() - 1);
++
++        let mut player =
++            ReplayPlayer::load(log, None).expect("deck_data is None, so load cannot fail");
++        assert_eq!(player.len(), live_snapshots.len() as u32 - 1);
++
++        for (index, expected) in live_snapshots.iter().enumerate() {
++            let got = player
++                .seek(index as u32)
++                .unwrap_or_else(|e| panic!("seek({index}) desynced: {e}"));
++            assert_eq!(
++                got.turn_number, expected.turn_number,
++                "turn_number at {index}"
++            );
++            assert_eq!(got.phase, expected.phase, "phase at {index}");
++            assert_eq!(
++                got.active_player, expected.active_player,
++                "active_player at {index}"
++            );
++            assert_eq!(
++                got.waiting_for, expected.waiting_for,
++                "waiting_for at {index}"
++            );
++        }
++    }
++
++    #[test]
++    fn replay_player_seeks_out_of_order_and_caches_correctly() {
++        let header = two_player_header(42);
++        let mut live = reconstruct_initial_state(&header, None)
++            .expect("deck_data is None, so reconstruction cannot fail");
++        let mut log = ReplayLog::new(header);
++
++        for _ in 0..6 {
++            let Some((actor, action)) = next_priority_pass(&live) else {
++                break;
++            };
++            apply(&mut live, actor, action.clone()).unwrap();
++            log.push_action(actor, action);
++        }
++        let total = log.actions.len() as u32;
++        assert!(total >= 3);
++
++        let mut player =
++            ReplayPlayer::load(log, None).expect("deck_data is None, so load cannot fail");
++
++        // Seek forward, then back, then forward again — exercises both the
++        // checkpoint-cache hit path and the nearest-checkpoint replay path.
++        let last = player.seek(total).unwrap().clone();
++        let first = player.seek(0).unwrap().clone();
++        let last_again = player.seek(total).unwrap().clone();
++
++        assert_eq!(first.turn_number, 1);
++        assert_eq!(last.waiting_for, last_again.waiting_for);
++        assert_eq!(last.phase, last_again.phase);
++    }
++
++    #[test]
++    fn reconstruct_initial_state_fails_loudly_without_card_database() {
++        let mut header = two_player_header(13);
++        header.deck_data = Some(crate::game::deck_loading::DeckList::default());
++
++        let err = reconstruct_initial_state(&header, None)
++            .expect_err("deck_data present with no CardDatabase must error, not silently reconstruct empty libraries");
++        assert!(matches!(err, ReplayError::MissingCardDatabase));
++
++        // ReplayPlayer::load propagates the same failure.
++        let log = ReplayLog::new(header);
++        let load_err = ReplayPlayer::load(log, None)
++            .expect_err("load must surface the same MissingCardDatabase failure");
++        assert!(matches!(load_err, ReplayError::MissingCardDatabase));
++    }
++
++    #[test]
++    fn sandbox_game_reconstruct_pre_seeds_debug_permitted_matching_initialize_game() {
++        // `initialize_game` seeds `debug_permitted` for every seat when
++        // `allow_debug_actions` is true. Without the parallel seeding in
++        // `reconstruct_initial_state`, a replay that contains
++        // `GrantDebugPermission` or `RevokeDebugPermission` actions (which
++        // are recorded, unlike `Debug(_)` ones) applies them against an
++        // empty set, producing a different permission state and desyncing
++        // the reconstruction from the original game.
++        let sandbox_config = FormatConfig::standard().with_sandbox();
++        let header = ReplayHeader {
++            format_config: sandbox_config,
++            match_config: MatchConfig::default(),
++            player_count: 2,
++            first_player: Some(0),
++            seed: 7,
++            deck_data: None,
++        };
++
++        let state = reconstruct_initial_state(&header, None)
++            .expect("deck_data is None, so reconstruction cannot fail");
++
++        // Both seats must be in debug_permitted, mirroring initialize_game.
++        assert!(
++            state.debug_mode,
++            "sandbox reconstruct must have debug_mode = true, matching initialize_game"
++        );
++        assert!(
++            state.debug_permitted.contains(&PlayerId(0)),
++            "seat 0 must be in debug_permitted after sandbox reconstruction"
++        );
++        assert!(
++            state.debug_permitted.contains(&PlayerId(1)),
++            "seat 1 must be in debug_permitted after sandbox reconstruction"
++        );
++
++        // A non-sandbox game must leave debug_permitted empty.
++        let non_sandbox_header = two_player_header(7);
++        let non_sandbox = reconstruct_initial_state(&non_sandbox_header, None)
++            .expect("non-sandbox deck_data is None");
++        assert!(
++            non_sandbox.debug_permitted.is_empty(),
++            "non-sandbox reconstruct must leave debug_permitted empty"
++        );
++
++        // Replaying a RevokeDebugPermission action against the correctly
++        // pre-seeded state must produce the same permission set as the live
++        // game — if the set were empty (the pre-fix bug), remove would be a
++        // no-op and the reconstructed state would diverge.
++        let mut live = reconstruct_initial_state(&header, None).unwrap();
++        let mut log = ReplayLog::new(header.clone());
++
++        apply(
++            &mut live,
++            PlayerId(0),
++            GameAction::RevokeDebugPermission {
++                player_id: PlayerId(1),
++            },
++        )
++        .expect("host revoking P1 permission must be accepted in a sandbox game");
++        log.push_action(
++            PlayerId(0),
++            GameAction::RevokeDebugPermission {
++                player_id: PlayerId(1),
++            },
++        );
++        assert!(
++            live.debug_permitted.contains(&PlayerId(0)),
++            "host must still be in debug_permitted after revoking P1"
++        );
++        assert!(
++            !live.debug_permitted.contains(&PlayerId(1)),
++            "P1 must be removed from debug_permitted after revoke"
++        );
++
++        // Reconstruct to the same point via replay.
++        let mut player = ReplayPlayer::load(log, None).unwrap();
++        let replayed = player.seek(1).unwrap();
++        assert_eq!(
++            replayed.debug_permitted, live.debug_permitted,
++            "replayed debug_permitted must match live game after RevokeDebugPermission"
++        );
++    }
++
++    #[test]
++    fn replay_player_seek_clamps_to_length_and_handles_empty_log() {
++        let header = two_player_header(7);
++        let log = ReplayLog::new(header);
++        let mut player =
++            ReplayPlayer::load(log, None).expect("deck_data is None, so load cannot fail");
++
++        assert_eq!(player.len(), 0);
++        assert!(player.is_empty());
++
++        // Seeking past the end of an empty log clamps to 0, not an error.
++        let state = player
++            .seek(50)
++            .expect("empty log still has the initial state");
++        assert_eq!(state.turn_number, 1);
++    }
++}
+diff --git a/crates/engine/src/types/mod.rs b/crates/engine/src/types/mod.rs
+index 75772a0364..1436df04df 100644
+--- a/crates/engine/src/types/mod.rs
++++ b/crates/engine/src/types/mod.rs
+@@ -18,6 +18,7 @@ pub mod phase;
+ pub mod player;
+ pub mod proposed_event;
+ pub mod replacements;
++pub mod replay;
+ pub mod statics;
+ pub mod stickers;
+ pub mod triggers;
+@@ -58,6 +59,7 @@ pub use phase::Phase;
+ pub use player::{Player, PlayerId};
+ pub use proposed_event::{ProposedEvent, ReplacementId};
+ pub use replacements::ReplacementEvent;
++pub use replay::{RecordedAction, ReplayHeader, ReplayLog};
+ pub use statics::StaticMode;
+ pub use stickers::{AppliedSticker, StickerKind, StickerLocator};
+ pub use triggers::{TriggerEventKey, TriggerMode};
+diff --git a/crates/engine/src/types/replay.rs b/crates/engine/src/types/replay.rs
+new file mode 100644
+index 0000000000..6ca2563459
+--- /dev/null
++++ b/crates/engine/src/types/replay.rs
+@@ -0,0 +1,65 @@
++use serde::{Deserialize, Serialize};
++
++use super::actions::GameAction;
++use super::format::FormatConfig;
++use super::match_config::MatchConfig;
++use super::player::PlayerId;
++use crate::game::deck_loading::DeckList;
++
++/// Everything needed to reconstruct a game's starting state, deterministically,
++/// from scratch. Mirrors the inputs `initialize_game` already accepts at the
++/// WASM boundary — a replay's header is just those inputs captured at game
++/// start instead of thrown away.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ReplayHeader {
++    pub format_config: FormatConfig,
++    pub match_config: MatchConfig,
++    pub player_count: u8,
++    /// CR 103.1: `Some(0)` / `Some(1)` for an explicit starting player,
++    /// `None` for the engine's own d20 contest.
++    pub first_player: Option<u8>,
++    pub seed: u64,
++    /// `None` when the game was started with empty libraries (no deck data
++    /// supplied), mirroring `initialize_game`'s `deck_data: null` path.
++    pub deck_data: Option<DeckList>,
++}
++
++/// One submitted-and-accepted action, in submission order.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct RecordedAction {
++    /// Position of this action within the recording — equal to its index in
++    /// `ReplayLog::actions`. Carried explicitly (rather than relying solely on
++    /// vector position) so a recording can be sliced/filtered without losing
++    /// the ability to report "this was action #N" to a human.
++    pub seq: u32,
++    pub actor: PlayerId,
++    pub action: GameAction,
++}
++
++/// A complete, deterministic recording of a game: the inputs needed to
++/// reconstruct its starting state, plus every action that was submitted and
++/// accepted afterward. Replaying `actions` against the state produced by
++/// `header` reproduces the original game turn-for-turn — see
++/// `crate::game::replay`.
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct ReplayLog {
++    pub header: ReplayHeader,
++    pub actions: Vec<RecordedAction>,
++}
++
++impl ReplayLog {
++    pub fn new(header: ReplayHeader) -> Self {
++        Self {
++            header,
++            actions: Vec::new(),
++        }
++    }
++
++    /// Append a successfully-applied action to the recording. Callers must
++    /// only record actions after `apply` returned `Ok` — a rejected action
++    /// never touched game state and replaying it would desync reconstruction.
++    pub fn push_action(&mut self, actor: PlayerId, action: GameAction) {
++        let seq = self.actions.len() as u32;
++        self.actions.push(RecordedAction { seq, actor, action });
++    }
++}

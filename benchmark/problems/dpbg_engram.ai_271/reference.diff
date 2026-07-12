@@ -1,0 +1,323 @@
+diff --git a/launcher/supervisor.py b/launcher/supervisor.py
+index 42fed30..e5db7ed 100644
+--- a/launcher/supervisor.py
++++ b/launcher/supervisor.py
+@@ -19,6 +19,13 @@
+ from pathlib import Path
+ 
+ from .registry import ROOT, Service
++from .supervisor_alerts import (
++    emit_service_flap_alert,
++    flap_threshold,
++    flap_window_seconds,
++    record_restart,
++    should_emit_flap_alert,
++)
+ 
+ logger = logging.getLogger("launcher.supervisor")
+ 
+@@ -56,6 +63,9 @@ def __init__(self, name: str, proc: subprocess.Popen, color: str, svc: Service)
+         # Set once the process has been alive for svc.readiness_timeout seconds.
+         self.ready = threading.Event()
+         self.restart_count = 0
++        # Rolling restart timestamps (monotonic) for flap detection (issue #261).
++        self.restart_times: list[float] = []
++        self.flap_alerts_emitted = 0
+ 
+ 
+ class Supervisor:
+@@ -187,12 +197,38 @@ def _manage(self, mp: ManagedProcess) -> None:
+             with self._print_lock:
+                 print(f"{prefix}*** exited (code {code}) ***", flush=True)
+ 
+-            # Long-lived processes get a fresh backoff budget.
++            # Long-lived processes get a fresh backoff budget and flap history.
+             if uptime >= _BACKOFF_RESET:
+                 delay = _BACKOFF_INITIAL
++                mp.restart_times.clear()
++                mp.flap_alerts_emitted = 0
+ 
+             actual_delay = min(delay, _BACKOFF_MAX)
+             mp.restart_count += 1
++            now = time.monotonic()
++            window_restarts = record_restart(
++                mp.restart_times,
++                now=now,
++                window_seconds=flap_window_seconds(),
++            )
++            threshold = flap_threshold()
++            if should_emit_flap_alert(len(window_restarts), threshold, mp.flap_alerts_emitted):
++                alert = emit_service_flap_alert(
++                    service_name=mp.name,
++                    restart_count=mp.restart_count,
++                    restarts_in_window=len(window_restarts),
++                    window_seconds=flap_window_seconds(),
++                    threshold=threshold,
++                    exit_code=code,
++                    uptime_seconds=uptime,
++                )
++                mp.flap_alerts_emitted = len(window_restarts) // threshold
++                with self._print_lock:
++                    print(
++                        f"{prefix}*** ALERT: {alert['message']} ***",
++                        flush=True,
++                    )
++
+             logger.info(
+                 "restarting %s in %.1fs (attempt %d)",
+                 mp.name,
+diff --git a/launcher/supervisor_alerts.py b/launcher/supervisor_alerts.py
+new file mode 100644
+index 0000000..4a47a6b
+--- /dev/null
++++ b/launcher/supervisor_alerts.py
+@@ -0,0 +1,89 @@
++"""Structured operator alerts for launcher supervisor events (issue #261)."""
++
++from __future__ import annotations
++
++import json
++import logging
++import os
++from typing import Any
++
++logger = logging.getLogger("launcher.supervisor")
++
++SERVICE_FLAP_EVENT = "supervisor.service_flap"
++
++_DEFAULT_FLAP_THRESHOLD = 3
++_DEFAULT_FLAP_WINDOW_S = 60.0
++
++
++def flap_threshold() -> int:
++    """Restarts within the flap window before an operator alert fires."""
++    raw = os.environ.get("SUPERVISOR_FLAP_THRESHOLD", str(_DEFAULT_FLAP_THRESHOLD))
++    try:
++        value = int(raw)
++    except ValueError:
++        return _DEFAULT_FLAP_THRESHOLD
++    return max(1, value)
++
++
++def flap_window_seconds() -> float:
++    """Rolling window (seconds) used to count restart flaps."""
++    raw = os.environ.get("SUPERVISOR_FLAP_WINDOW_S", str(_DEFAULT_FLAP_WINDOW_S))
++    try:
++        value = float(raw)
++    except ValueError:
++        return _DEFAULT_FLAP_WINDOW_S
++    return max(1.0, value)
++
++
++def record_restart(
++    restart_times: list[float],
++    *,
++    now: float,
++    window_seconds: float,
++) -> list[float]:
++    """Append a restart timestamp and drop entries outside the rolling window."""
++    restart_times.append(now)
++    cutoff = now - window_seconds
++    kept = [t for t in restart_times if t >= cutoff]
++    restart_times[:] = kept
++    return kept
++
++
++def should_emit_flap_alert(
++    restarts_in_window: int,
++    threshold: int,
++    alerts_emitted: int,
++) -> bool:
++    """Return True when a new flap alert should fire (threshold, 2x, 3x, …)."""
++    if restarts_in_window < threshold:
++        return False
++    return restarts_in_window // threshold > alerts_emitted
++
++
++def emit_service_flap_alert(
++    *,
++    service_name: str,
++    restart_count: int,
++    restarts_in_window: int,
++    window_seconds: float,
++    threshold: int,
++    exit_code: int,
++    uptime_seconds: float,
++) -> dict[str, Any]:
++    """Emit a structured operator-facing flap alert (JSON log + return payload)."""
++    payload: dict[str, Any] = {
++        "event": SERVICE_FLAP_EVENT,
++        "service": service_name,
++        "restart_count": restart_count,
++        "restarts_in_window": restarts_in_window,
++        "window_seconds": window_seconds,
++        "threshold": threshold,
++        "exit_code": exit_code,
++        "uptime_seconds": round(uptime_seconds, 3),
++        "message": (
++            f"Service {service_name!r} restarted {restarts_in_window} times in "
++            f"{window_seconds:.0f}s (threshold={threshold}) — possible crash loop"
++        ),
++    }
++    logger.warning("%s", json.dumps(payload, default=str))
++    return payload
+diff --git a/launcher/tests/test_supervisor.py b/launcher/tests/test_supervisor.py
+index f9c67ce..3f5af72 100644
+--- a/launcher/tests/test_supervisor.py
++++ b/launcher/tests/test_supervisor.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import io
++import json
+ import os
+ import signal
+ import subprocess
+@@ -25,6 +26,7 @@
+     ManagedProcess,
+     Supervisor,
+ )
++from launcher.supervisor_alerts import SERVICE_FLAP_EVENT
+ 
+ # ---------------------------------------------------------------------------
+ # Helpers
+@@ -399,6 +401,67 @@ def _fake_spawn(s: Service) -> FakePopen:
+ 
+         assert mp.restart_count == 0
+ 
++    def test_flap_alert_emitted_after_threshold_restarts(
++        self,
++        caplog: pytest.LogCaptureFixture,
++        monkeypatch: pytest.MonkeyPatch,
++    ) -> None:
++        """Crossing the flap threshold emits structured JSON + console alert."""
++        monkeypatch.setenv("SUPERVISOR_FLAP_THRESHOLD", "2")
++        monkeypatch.setenv("SUPERVISOR_FLAP_WINDOW_S", "120")
++
++        import logging
++
++        with (
++            patch("launcher.supervisor._BACKOFF_INITIAL", 0.05),
++            patch("launcher.supervisor._BACKOFF_MAX", 0.05),
++            caplog.at_level(logging.WARNING, logger="launcher.supervisor"),
++        ):
++            sup = _make_supervisor()
++            svc = _svc(readiness_timeout=100.0)
++            spawns: list[FakePopen] = []
++
++            def _fake_spawn(s: Service) -> FakePopen:
++                fp = FakePopen([])
++                spawns.append(fp)
++                return fp
++
++            sup._spawn = _fake_spawn  # type: ignore[method-assign]
++
++            first = _fake_spawn(svc)
++            mp = ManagedProcess(svc.name, first, "", svc)
++            sup.procs.append(mp)
++
++            t = threading.Thread(target=sup._manage, args=(mp,), daemon=True)
++            t.start()
++
++            first.exit(1)
++            deadline = time.time() + 2.0
++            while time.time() < deadline and mp.proc is first:
++                time.sleep(0.02)
++            assert mp.proc is not first
++
++            mp.proc.exit(1)
++            deadline = time.time() + 2.0
++            while time.time() < deadline and mp.flap_alerts_emitted < 1:
++                time.sleep(0.02)
++
++            flap_logs = [
++                json.loads(r.message)
++                for r in caplog.records
++                if r.levelno >= logging.WARNING and SERVICE_FLAP_EVENT in r.message
++            ]
++            assert mp.flap_alerts_emitted == 1
++            assert len(flap_logs) == 1
++            assert flap_logs[0]["event"] == SERVICE_FLAP_EVENT
++            assert flap_logs[0]["service"] == svc.name
++            assert flap_logs[0]["restarts_in_window"] == 2
++            assert flap_logs[0]["threshold"] == 2
++
++            sup._stopping = True
++            mp.proc.exit(0)
++            t.join(timeout=2.0)
++
+ 
+ # ---------------------------------------------------------------------------
+ # Process-group cleanup
+diff --git a/launcher/tests/test_supervisor_alerts.py b/launcher/tests/test_supervisor_alerts.py
+new file mode 100644
+index 0000000..8be687d
+--- /dev/null
++++ b/launcher/tests/test_supervisor_alerts.py
+@@ -0,0 +1,66 @@
++"""Tests for supervisor flap alerting (issue #261)."""
++
++from __future__ import annotations
++
++import json
++import logging
++
++import pytest
++
++from launcher.supervisor_alerts import (
++    SERVICE_FLAP_EVENT,
++    emit_service_flap_alert,
++    flap_threshold,
++    flap_window_seconds,
++    record_restart,
++    should_emit_flap_alert,
++)
++
++
++class TestFlapDetectionHelpers:
++    def test_record_restart_prunes_old_timestamps(self) -> None:
++        times: list[float] = [10.0, 20.0]
++        kept = record_restart(times, now=75.0, window_seconds=60.0)
++        assert kept == [20.0, 75.0]
++        assert times == [20.0, 75.0]
++
++    def test_should_emit_at_threshold(self) -> None:
++        assert should_emit_flap_alert(3, threshold=3, alerts_emitted=0) is True
++        assert should_emit_flap_alert(2, threshold=3, alerts_emitted=0) is False
++
++    def test_should_emit_again_at_next_multiple(self) -> None:
++        assert should_emit_flap_alert(6, threshold=3, alerts_emitted=1) is True
++        assert should_emit_flap_alert(5, threshold=3, alerts_emitted=1) is False
++        assert should_emit_flap_alert(6, threshold=3, alerts_emitted=2) is False
++
++    def test_emit_service_flap_alert_json(self, caplog: pytest.LogCaptureFixture) -> None:
++        with caplog.at_level(logging.WARNING, logger="launcher.supervisor"):
++            payload = emit_service_flap_alert(
++                service_name="kernel",
++                restart_count=3,
++                restarts_in_window=3,
++                window_seconds=60.0,
++                threshold=3,
++                exit_code=1,
++                uptime_seconds=0.02,
++            )
++
++        assert payload["event"] == SERVICE_FLAP_EVENT
++        assert payload["service"] == "kernel"
++        assert payload["restarts_in_window"] == 3
++        assert len(caplog.records) == 1
++        assert json.loads(caplog.records[0].message) == payload
++
++    def test_flap_threshold_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        monkeypatch.setenv("SUPERVISOR_FLAP_THRESHOLD", "5")
++        assert flap_threshold() == 5
++
++    def test_flap_window_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        monkeypatch.setenv("SUPERVISOR_FLAP_WINDOW_S", "120")
++        assert flap_window_seconds() == 120.0
++
++    def test_invalid_env_falls_back_to_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
++        monkeypatch.setenv("SUPERVISOR_FLAP_THRESHOLD", "not-a-number")
++        monkeypatch.setenv("SUPERVISOR_FLAP_WINDOW_S", "oops")
++        assert flap_threshold() == 3
++        assert flap_window_seconds() == 60.0

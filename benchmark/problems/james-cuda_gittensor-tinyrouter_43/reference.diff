@@ -1,0 +1,428 @@
+diff --git a/src/trinity/adapters/__init__.py b/src/trinity/adapters/__init__.py
+index 6b49863..a9dc35f 100644
+--- a/src/trinity/adapters/__init__.py
++++ b/src/trinity/adapters/__init__.py
+@@ -25,6 +25,7 @@
+     register_builtin_adapters,
+ )
+ from .builtin import DelegatingBenchmarkAdapter
++from .mmlu_pro import MmluProAdapter, register_mmlu_pro_adapter
+ from .registry import (
+     available_adapters,
+     clear_registry,
+@@ -44,6 +45,7 @@
+     "LiveCodeBenchAdapter",
+     "SweBenchAdapter",
+     "PatchReference",
++    "MmluProAdapter",
+     "register_adapter",
+     "get_adapter",
+     "is_registered",
+@@ -51,9 +53,11 @@
+     "clear_registry",
+     "register_builtin_adapters",
+     "register_swebench_adapter",
++    "register_mmlu_pro_adapter",
+ ]
+ 
+ # Register the built-in benchmarks on import so `get_adapter("math500")` works
+ # without the caller having to bootstrap the registry.
+ register_builtin_adapters()
+ register_swebench_adapter()
++register_mmlu_pro_adapter()
+diff --git a/src/trinity/adapters/mmlu_pro.py b/src/trinity/adapters/mmlu_pro.py
+new file mode 100644
+index 0000000..bae512a
+--- /dev/null
++++ b/src/trinity/adapters/mmlu_pro.py
+@@ -0,0 +1,209 @@
++"""MMLU-Pro benchmark adapter (issue #12).
++
++MMLU-Pro extends MMLU to **ten** answer options (A-J) and harder, reasoning-heavy
++questions. It reuses the shared multiple-choice scoring path — the reward module's
++choice extractor and reference normaliser were widened to A-J, and ``mmlu_pro`` is
++in ``reward.CHOICE_BENCHMARKS`` — so this adapter only has to load and format the
++ten-option questions.
++
++* :func:`load_mmlu_pro_tasks` — lazy/guarded HuggingFace loader
++  (``TIGER-Lab/MMLU-Pro``) with an offline toy fallback. Each task's ``answer`` is
++  the correct option **letter** (A-J).
++* :class:`MmluProAdapter` — task type :data:`TaskType.MCQ`; scoring delegates to
++  :func:`trinity.orchestration.reward.score_text`.
++
++This module imports only stdlib + :class:`trinity.types` + the reward scorer
++(``datasets`` is lazy), so it has no dataset-module dependency and cannot form an
++import cycle.
++"""
++from __future__ import annotations
++
++from typing import Any
++
++from trinity.orchestration import reward as _reward
++from trinity.types import Task
++
++from .base import BenchmarkAdapter, TaskType
++from .registry import register_adapter
++
++__all__ = [
++    "BENCHMARK",
++    "CHOICE_LETTERS",
++    "format_mcq",
++    "load_mmlu_pro_tasks",
++    "MmluProAdapter",
++    "register_mmlu_pro_adapter",
++]
++
++#: Canonical benchmark name this adapter registers under.
++BENCHMARK = "mmlu_pro"
++
++#: HuggingFace dataset id for MMLU-Pro.
++_HF_DATASET = "TIGER-Lab/MMLU-Pro"
++
++#: Option letters, up to ten (A-J). Kept in sync with reward._CHOICE_LETTERS.
++CHOICE_LETTERS: str = "ABCDEFGHIJ"
++
++
++def format_mcq(question: str, choices: list[Any]) -> str:
++    """Render a (up to ten-option) multiple-choice question with lettered options.
++
++    Asks the model to end with a single answer letter so the shared choice
++    extractor can read it reliably.
++    """
++    lines = [question.strip(), ""]
++    for letter, choice in zip(CHOICE_LETTERS, choices):
++        lines.append(f"{letter}. {choice}")
++    lines.append("")
++    lines.append("Answer with the single letter of the correct option.")
++    return "\n".join(lines)
++
++
++def _row_get(row: Any, *keys: str, default: Any = None) -> Any:
++    for k in keys:
++        try:
++            if k in row and row[k] is not None:
++                return row[k]
++        except TypeError:
++            break
++    return default
++
++
++def _answer_letter(row: Any, n_options: int) -> str | None:
++    """Resolve an MMLU-Pro row's answer to a single option letter (A-J).
++
++    MMLU-Pro rows carry both ``answer`` (the letter) and ``answer_index`` (0-based);
++    prefer the explicit letter, fall back to the index.
++    """
++    letter = _row_get(row, "answer")
++    if isinstance(letter, str) and len(letter.strip()) == 1:
++        up = letter.strip().upper()
++        if up in CHOICE_LETTERS[:n_options]:
++            return up
++    idx = _row_get(row, "answer_index")
++    try:
++        idx = int(idx)
++    except (TypeError, ValueError):
++        return None
++    if 0 <= idx < n_options and idx < len(CHOICE_LETTERS):
++        return CHOICE_LETTERS[idx]
++    return None
++
++
++def _hf_mmlu_pro(split: str) -> list[Task] | None:
++    """Load MMLU-Pro from HuggingFace, or ``None`` on any failure."""
++    try:
++        from datasets import load_dataset  # type: ignore import-not-found
++    except Exception:
++        return None
++    try:
++        ds = load_dataset(_HF_DATASET, split=split or "test")
++    except Exception:
++        return None
++
++    tasks: list[Task] = []
++    for i, row in enumerate(ds):
++        question = _row_get(row, "question", default="")
++        options = _row_get(row, "options", "choices", default=None)
++        if not question or not options:
++            continue
++        options = list(options)
++        letter = _answer_letter(row, len(options))
++        if letter is None:
++            continue
++        tasks.append(
++            Task(
++                task_id=str(_row_get(row, "question_id", default=f"mmlu_pro-{i}")),
++                benchmark=BENCHMARK,
++                prompt=format_mcq(str(question), options),
++                answer=letter,
++                meta={
++                    "source": _HF_DATASET,
++                    "category": _row_get(row, "category"),
++                    "n_options": len(options),
++                    "choices": options,
++                },
++            )
++        )
++    return tasks or None
++
++
++def _toy_mmlu_pro() -> list[Task]:
++    """Tiny ten-option questions so smoke tests run with zero network."""
++    q1 = [
++        "Nitrogen", "Oxygen", "Carbon", "Helium", "Hydrogen",
++        "Neon", "Argon", "Iron", "Gold", "Silver",
++    ]
++    q2 = [
++        "2", "3", "5", "7", "11", "13", "17", "19", "23", "29",
++    ]
++    return [
++        Task(
++            task_id="mmlu_pro-toy-0",
++            benchmark=BENCHMARK,
++            prompt=format_mcq("Which element has the chemical symbol 'O'?", q1),
++            answer="B",  # Oxygen
++            meta={"source": "toy", "n_options": 10, "choices": q1},
++        ),
++        Task(
++            task_id="mmlu_pro-toy-1",
++            benchmark=BENCHMARK,
++            prompt=format_mcq("Which of these is the 4th smallest prime number?", q2),
++            answer="D",  # 7 (2,3,5,7)
++            meta={"source": "toy", "n_options": 10, "choices": q2},
++        ),
++    ]
++
++
++def load_mmlu_pro_tasks(split: str, max_items: int | None, seed: int = 0) -> list[Task]:
++    """Load MMLU-Pro as a deterministic list of :class:`Task`.
++
++    Tries HuggingFace (lazy/guarded); on any failure falls back to the built-in
++    toy set. Applies a ``seed``-seeded shuffle and truncates to ``max_items``, so
++    repeated calls with identical arguments return identical lists.
++    """
++    import random
++
++    tasks = _hf_mmlu_pro(split) or _toy_mmlu_pro()
++    rng = random.Random(seed)
++    tasks = list(tasks)
++    rng.shuffle(tasks)
++    if max_items is not None:
++        tasks = tasks[: max(0, int(max_items))]
++    return tasks
++
++
++class MmluProAdapter(BenchmarkAdapter):
++    """MMLU-Pro: ten-option multiple choice, scored through the shared MCQ path."""
++
++    name = BENCHMARK
++
++    def load_tasks(self, split: str, max_items: int | None, seed: int = 0) -> list[Task]:
++        return load_mmlu_pro_tasks(split, max_items, seed=seed)
++
++    def build_prompt(self, task: Task) -> str:
++        return task.prompt
++
++    def score_output(self, output: str, reference: Any) -> float:
++        return _reward.score_text(self.name, output, reference)
++
++    def task_type(self) -> TaskType:
++        return TaskType.MCQ
++
++    def serialize_task(self, task: Task) -> dict[str, Any]:
++        return {
++            "task_id": task.task_id,
++            "benchmark": task.benchmark,
++            "prompt": task.prompt,
++            "reference": task.answer,
++            "task_type": TaskType.MCQ.value,
++            "meta": dict(task.meta),
++        }
++
++
++def register_mmlu_pro_adapter() -> None:
++    """Register the MMLU-Pro adapter (idempotent-friendly)."""
++    from .registry import is_registered
++
++    if not is_registered(BENCHMARK):
++        register_adapter(BENCHMARK, MmluProAdapter())
+diff --git a/src/trinity/orchestration/reward.py b/src/trinity/orchestration/reward.py
+index bdf43f5..ccf73d1 100644
+--- a/src/trinity/orchestration/reward.py
++++ b/src/trinity/orchestration/reward.py
+@@ -63,7 +63,14 @@
+ # Benchmark routing tables. Keys are matched case-insensitively against
+ # ``Task.benchmark`` (which the dataset loaders set, e.g. "math500").
+ MATH_BENCHMARKS: frozenset[str] = frozenset({"math500", "math", "aime", "aime2025"})
+-CHOICE_BENCHMARKS: frozenset[str] = frozenset({"mmlu", "gpqa", "gpqa-diamond", "gpqa_diamond"})
++CHOICE_BENCHMARKS: frozenset[str] = frozenset(
++    {"mmlu", "mmlu_pro", "mmlu-pro", "gpqa", "gpqa-diamond", "gpqa_diamond"}
++)
++
++# Multiple-choice option letters, in order. MMLU/GPQA use A-D; MMLU-Pro uses up
++# to A-J (issue #12). The choice extractor and reference normaliser both range
++# over this, so widening it here widens both consistently.
++_CHOICE_LETTERS: str = "ABCDEFGHIJ"
+ CODE_BENCHMARKS: frozenset[str] = frozenset(
+     {"livecodebench", "lcb", "bigcodebench", "bigcode"}
+ )
+@@ -441,11 +448,11 @@ def _ref_to_str(reference: object) -> str:
+ _CHOICE_PATTERNS: tuple[re.Pattern[str], ...] = (
+     # Require the captured letter to be followed by a delimiter or end-of-word,
+     # so "the answer Beats..." does NOT match "B" (P2 review fix).
+-    re.compile(r"answer\s*(?:is|:)?\s*\(?\s*([A-D])\s*(?:[\).:]|\b)(?![A-Za-z])", re.I),
+-    re.compile(r"\\boxed\s*\{\s*\(?\s*([A-D])\s*\)?\s*\}", re.I),
+-    re.compile(r"\bfinal\s+answer\s*[:=]?\s*\(?\s*([A-D])(?![A-Za-z])", re.I),
+-    re.compile(r"\boption\s*\(?\s*([A-D])(?![A-Za-z])", re.I),
+-    re.compile(r"^\s*\(?\s*([A-D])\s*[\).:]", re.M),
++    re.compile(r"answer\s*(?:is|:)?\s*\(?\s*([A-J])\s*(?:[\).:]|\b)(?![A-Za-z])", re.I),
++    re.compile(r"\\boxed\s*\{\s*\(?\s*([A-J])\s*\)?\s*\}", re.I),
++    re.compile(r"\bfinal\s+answer\s*[:=]?\s*\(?\s*([A-J])(?![A-Za-z])", re.I),
++    re.compile(r"\boption\s*\(?\s*([A-J])(?![A-Za-z])", re.I),
++    re.compile(r"^\s*\(?\s*([A-J])\s*[\).:]", re.M),
+ )
+ 
+ 
+@@ -480,7 +487,7 @@ def extract_choice_letter(text: str) -> str | None:
+     # it is essentially just the letter (e.g. "B", "(C)", "D."). This avoids the
+     # English article "A" in prose like "A nice approach" being read as a choice.
+     for line in reversed([ln.strip() for ln in text.splitlines() if ln.strip()]):
+-        m = re.fullmatch(r"\(?\s*([A-D])\s*\)?[.:]?", line, re.I)
++        m = re.fullmatch(r"\(?\s*([A-J])\s*\)?[.:]?", line, re.I)
+         if m:
+             return m.group(1).upper()
+         break  # only inspect the final non-empty line
+@@ -512,12 +519,12 @@ def _normalize_reference_letter(reference: object) -> str | None:
+         if letter is not None:
+             return letter
+         s = reference.strip().upper()
+-        return s if s in {"A", "B", "C", "D"} else None
++        return s if s in set(_CHOICE_LETTERS) else None
+     if isinstance(reference, bool):
+         return None
+     if isinstance(reference, int):
+-        if 0 <= reference <= 3:
+-            return "ABCD"[reference]
++        if 0 <= reference < len(_CHOICE_LETTERS):
++            return _CHOICE_LETTERS[reference]
+         return None
+     return None
+ 
+diff --git a/tests/test_benchmark_registry.py b/tests/test_benchmark_registry.py
+index dbd48c4..e0002e3 100644
+--- a/tests/test_benchmark_registry.py
++++ b/tests/test_benchmark_registry.py
+@@ -18,6 +18,7 @@
+     is_registered,
+     register_adapter,
+     register_builtin_adapters,
++    register_mmlu_pro_adapter,
+     register_swebench_adapter,
+ )
+ from trinity.orchestration.dataset import SUPPORTED_BENCHMARKS
+@@ -36,7 +37,8 @@ def test_builtins_registered_for_every_supported_benchmark():
+         assert is_registered(name)
+         assert isinstance(get_adapter(name), BenchmarkAdapter)
+     # The registry exposes at least the supported benchmarks; additional adapters
+-    # (e.g. the SWE-bench Verified adapter, #17) may also be registered.
++    # (e.g. the SWE-bench Verified (#17) and MMLU-Pro (#12) adapters) may also be
++    # registered.
+     assert set(SUPPORTED_BENCHMARKS) <= set(available_adapters())
+ 
+ 
+@@ -219,9 +221,11 @@ def serialize_task(self, task):
+         assert get_adapter("unit-test-bench").score_output("x", "x") == 1.0
+     finally:
+         # Never leak test state into other tests: restore the real registry
+-        # (both the built-in benchmarks and the SWE-bench adapter, #17).
++        # (the built-in benchmarks plus the SWE-bench (#17) and MMLU-Pro (#12)
++        # adapters).
+         clear_registry()
+         register_builtin_adapters()
+         register_swebench_adapter()
++        register_mmlu_pro_adapter()
+ 
+     assert set(SUPPORTED_BENCHMARKS) <= set(available_adapters())
+diff --git a/tests/test_mmlu_pro_adapter.py b/tests/test_mmlu_pro_adapter.py
+new file mode 100644
+index 0000000..d3cbc6f
+--- /dev/null
++++ b/tests/test_mmlu_pro_adapter.py
+@@ -0,0 +1,78 @@
++"""MMLU-Pro adapter + A-J choice scoring (issue #12).
++
++Offline via the toy fallback (ten-option questions), no network.
++"""
++from __future__ import annotations
++
++from trinity.adapters import TaskType, get_adapter
++from trinity.adapters.mmlu_pro import (
++    BENCHMARK,
++    MmluProAdapter,
++    format_mcq,
++    load_mmlu_pro_tasks,
++)
++from trinity.orchestration.reward import extract_choice_letter, score_text
++
++
++def test_registered_and_typed_as_mcq():
++    adapter = get_adapter(BENCHMARK)
++    assert isinstance(adapter, MmluProAdapter)
++    assert adapter.name == "mmlu_pro"
++    assert adapter.task_type() is TaskType.MCQ
++
++
++def test_load_tasks_returns_ten_option_tasks():
++    tasks = load_mmlu_pro_tasks("test", max_items=5, seed=0)
++    assert tasks
++    t = tasks[0]
++    assert t.benchmark == "mmlu_pro"
++    assert t.meta["n_options"] == 10
++    # The rendered prompt exposes options past D (proves >A-D support).
++    assert "J." in t.prompt
++    assert t.answer in "ABCDEFGHIJ"
++
++
++def test_load_tasks_deterministic_and_capped():
++    a = load_mmlu_pro_tasks("test", max_items=1, seed=5)
++    b = load_mmlu_pro_tasks("test", max_items=1, seed=5)
++    assert [t.task_id for t in a] == [t.task_id for t in b]
++    assert len(a) <= 1
++
++
++def test_scoring_extracts_letters_beyond_A_D():
++    # The shared extractor now reads E-J, not just A-D.
++    assert extract_choice_letter("The answer is G.") == "G"
++    assert extract_choice_letter("Final answer: J") == "J"
++    # And A-D still works (no regression).
++    assert extract_choice_letter("the answer is (B)") == "B"
++
++
++def test_mmlu_pro_scored_through_shared_mcq_path():
++    adapter = get_adapter(BENCHMARK)
++    assert adapter.score_output("The answer is H.", "H") == 1.0
++    assert adapter.score_output("The answer is H.", "C") == 0.0
++    # Reference given as a 0-based index resolves to a letter (H == index 7).
++    assert score_text("mmlu_pro", "Answer: H", 7) == 1.0
++
++
++def test_toy_answers_are_correct():
++    """The toy items' declared answers match their option lists."""
++    adapter = get_adapter(BENCHMARK)
++    for t in load_mmlu_pro_tasks("test", max_items=None, seed=0):
++        # Each toy task is self-consistent: scoring its own answer letter passes.
++        assert adapter.score_output(f"The answer is {t.answer}.", t.answer) == 1.0
++
++
++def test_format_mcq_letters_up_to_j():
++    prompt = format_mcq("Q?", [f"opt{i}" for i in range(10)])
++    for letter in "ABCDEFGHIJ":
++        assert f"{letter}." in prompt
++
++
++def test_serialize_task_shape():
++    adapter = get_adapter(BENCHMARK)
++    task = load_mmlu_pro_tasks("test", max_items=1, seed=0)[0]
++    item = adapter.serialize_task(task)
++    assert item["benchmark"] == "mmlu_pro"
++    assert item["task_type"] == TaskType.MCQ.value
++    assert item["reference"] == task.answer

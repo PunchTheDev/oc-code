@@ -1,0 +1,166 @@
+diff --git a/src/trinity/adapters/mmlu_pro.py b/src/trinity/adapters/mmlu_pro.py
+index bae512a..32b197c 100644
+--- a/src/trinity/adapters/mmlu_pro.py
++++ b/src/trinity/adapters/mmlu_pro.py
+@@ -25,6 +25,7 @@
+ 
+ from .base import BenchmarkAdapter, TaskType
+ from .registry import register_adapter
++from .split_policy import resolve_split, warn_on_toy_fallback
+ 
+ __all__ = [
+     "BENCHMARK",
+@@ -93,11 +94,12 @@ def _answer_letter(row: Any, n_options: int) -> str | None:
+ def _hf_mmlu_pro(split: str) -> list[Task] | None:
+     """Load MMLU-Pro from HuggingFace, or ``None`` on any failure."""
+     try:
+-        from datasets import load_dataset  # type: ignore import-not-found
++        from datasets import load_dataset  # type: ignore[import-not-found]
+     except Exception:
+         return None
++    resolved = resolve_split(BENCHMARK, split)
+     try:
+-        ds = load_dataset(_HF_DATASET, split=split or "test")
++        ds = load_dataset(_HF_DATASET, split=resolved)
+     except Exception:
+         return None
+ 
+@@ -164,7 +166,10 @@ def load_mmlu_pro_tasks(split: str, max_items: int | None, seed: int = 0) -> lis
+     """
+     import random
+ 
+-    tasks = _hf_mmlu_pro(split) or _toy_mmlu_pro()
++    hf_tasks = _hf_mmlu_pro(split)
++    used_toy = hf_tasks is None
++    tasks = hf_tasks if hf_tasks is not None else _toy_mmlu_pro()
++    warn_on_toy_fallback(BENCHMARK, split, used_toy=used_toy)
+     rng = random.Random(seed)
+     tasks = list(tasks)
+     rng.shuffle(tasks)
+diff --git a/src/trinity/adapters/split_policy.py b/src/trinity/adapters/split_policy.py
+new file mode 100644
+index 0000000..9d970d5
+--- /dev/null
++++ b/src/trinity/adapters/split_policy.py
+@@ -0,0 +1,49 @@
++"""Shared split-resolution helpers for benchmark loaders."""
++from __future__ import annotations
++
++import warnings
++
++__all__ = [
++    "ToyFallbackWarning",
++    "resolve_split",
++    "warn_on_toy_fallback",
++]
++
++#: Logical split names that do not exist upstream, mapped per benchmark.
++#: MMLU-Pro publishes only ``validation`` and ``test``; training callers use
++#: ``train``, which we map to ``validation`` (issue #50).
++_SPLIT_ALIASES: dict[str, dict[str, str]] = {
++    "mmlu_pro": {
++        "train": "validation",
++        "training": "validation",
++    },
++}
++
++
++class ToyFallbackWarning(UserWarning):
++    """A loader substituted the offline toy set for real benchmark data."""
++
++
++def resolve_split(benchmark: str, split: str) -> str:
++    """Map a logical split to the upstream dataset split name.
++
++    Benchmarks absent from :data:`_SPLIT_ALIASES` pass ``split`` through unchanged.
++    """
++    key = (benchmark or "").strip().lower()
++    logical = (split or "test").strip().lower()
++    return _SPLIT_ALIASES.get(key, {}).get(logical, logical)
++
++
++def warn_on_toy_fallback(benchmark: str, split: str, *, used_toy: bool) -> None:
++    """Emit :class:`ToyFallbackWarning` when the toy set stands in for real data."""
++    if not used_toy:
++        return
++    warnings.warn(
++        (
++            f"{benchmark!r} split {split!r} fell back to the offline toy set. "
++            "Training or protocol builds on this split will not use real benchmark "
++            "data unless HuggingFace loading succeeds."
++        ),
++        ToyFallbackWarning,
++        stacklevel=3,
++    )
+diff --git a/tests/test_mmlu_pro_train_split.py b/tests/test_mmlu_pro_train_split.py
+new file mode 100644
+index 0000000..4e92c35
+--- /dev/null
++++ b/tests/test_mmlu_pro_train_split.py
+@@ -0,0 +1,66 @@
++"""Tests for MMLU-Pro train-split resolution (issue #50)."""
++from __future__ import annotations
++
++import sys
++import types
++import warnings
++
++import pytest
++
++from trinity.adapters.mmlu_pro import BENCHMARK, load_mmlu_pro_tasks
++from trinity.adapters.split_policy import ToyFallbackWarning, resolve_split
++
++
++def _install_fake_mmlu_pro_datasets() -> None:
++    """Simulate TIGER-Lab/MMLU-Pro with only validation and test splits."""
++    real_splits = {"TIGER-Lab/MMLU-Pro": {"validation", "test"}}
++
++    def load_dataset(path, name=None, split=None, **kwargs):
++        if split not in real_splits[path]:
++            raise ValueError(
++                f"Unknown split {split!r}. Should be one of {sorted(real_splits[path])}."
++            )
++        return [
++            {
++                "question": f"q-{split}-{i}",
++                "options": [f"opt{j}" for j in range(10)],
++                "answer": "C",
++                "answer_index": 2,
++                "category": "math",
++                "question_id": f"{split}-{i}",
++            }
++            for i in range(50)
++        ]
++
++    mod = types.ModuleType("datasets")
++    mod.load_dataset = load_dataset
++    sys.modules["datasets"] = mod
++
++
++def test_resolve_split_maps_train_to_validation():
++    assert resolve_split("mmlu_pro", "train") == "validation"
++    assert resolve_split("mmlu_pro", "test") == "test"
++
++
++def test_train_loads_validation_not_toy_set():
++    _install_fake_mmlu_pro_datasets()
++    tasks = load_mmlu_pro_tasks("train", max_items=5, seed=0)
++    assert len(tasks) == 5
++    assert all(not t.task_id.startswith("mmlu_pro-toy-") for t in tasks)
++    assert tasks[0].meta["source"] == "TIGER-Lab/MMLU-Pro"
++
++
++def test_test_split_loads_real_rows():
++    _install_fake_mmlu_pro_datasets()
++    tasks = load_mmlu_pro_tasks("test", max_items=3, seed=0)
++    assert len(tasks) == 3
++    assert tasks[0].task_id.startswith("test-")
++
++
++def test_toy_fallback_emits_warning_when_hf_missing(monkeypatch):
++    monkeypatch.setattr("trinity.adapters.mmlu_pro._hf_mmlu_pro", lambda _split: None)
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always", ToyFallbackWarning)
++        tasks = load_mmlu_pro_tasks("train", max_items=None, seed=0)
++    assert len(tasks) == 2
++    assert any(isinstance(w.message, ToyFallbackWarning) for w in caught)

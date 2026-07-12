@@ -1,0 +1,502 @@
+diff --git a/src/review/maintainer-recap-wire.ts b/src/review/maintainer-recap-wire.ts
+index 10d5357b3..d5a88b680 100644
+--- a/src/review/maintainer-recap-wire.ts
++++ b/src/review/maintainer-recap-wire.ts
+@@ -6,14 +6,12 @@
+ import { listRepositories } from "../db/repositories";
+ import { isAgentConfigured } from "../settings/autonomy";
+ import { resolveRepositorySettings } from "../settings/repository-settings";
+-import { loadGatePrecisionReport } from "../services/gate-precision";
+ import { buildRepoOutcomeCalibration } from "../services/outcome-calibration";
+-import { buildMaintainerRecap, type MaintainerRecapRepoInput } from "../services/maintainer-recap";
+-import { deliverRecapToDiscord } from "../services/notify-discord";
++import { runMaintainerRecap, type MaintainerRecapRepoInput, type RunMaintainerRecapResult } from "../services/maintainer-recap";
++import { loadGatePrecisionReport } from "../services/gate-precision";
+ import { loadRepoFocusManifest } from "../signals/focus-manifest-loader";
+ import { resolveGittensorySelfRepoFullName } from "../config/gittensory-repo-focus-manifest";
+-import { errorMessage, nowIso } from "../utils/json";
+-import type { RecapReport } from "../types";
++import { errorMessage } from "../utils/json";
+ 
+ /** A manifest-sourced enable/cadence override (#2250) -- the `maintainerRecap` block of the gittensory
+  *  self-repo's `.gittensory.yml` (see FocusManifestMaintainerRecapConfig). `present: false` (no block, or the
+@@ -125,14 +123,11 @@ export async function resolveMaintainerRecapManifestOverride(env: Env): Promise<
+ }
+ 
+ /**
+- * Build the cross-repo RecapReport (#2239) over the recap's scan repos and deliver it to Discord. A per-repo
+- * aggregator failure is logged and that repo is skipped -- one repo's D1 hiccup must not blank the whole
+- * digest (mirrors ops-wire.ts's runOpsAlerts). deliverRecapToDiscord itself never throws (best-effort webhook).
++ * Load aggregator inputs for every scan repo, then delegate to {@link runMaintainerRecap} for build → format →
++ * dual-channel delivery. A per-repo aggregator failure is logged and that repo is skipped — one repo's D1 hiccup
++ * must not blank the whole digest (mirrors ops-wire.ts's runOpsAlerts).
+  */
+-export async function runMaintainerRecapJob(
+-  env: Env,
+-  windowDays?: number,
+-): Promise<{ report: RecapReport; delivery: { sent: boolean; reason?: string } }> {
++export async function runMaintainerRecapJob(env: Env, windowDays?: number): Promise<RunMaintainerRecapResult> {
+   const resolvedWindowDays = windowDays ?? DEFAULT_RECAP_WINDOW_DAYS;
+   const repoNames = await recapScanRepos(env);
+   const repos: MaintainerRecapRepoInput[] = [];
+@@ -149,7 +144,5 @@ export async function runMaintainerRecapJob(
+       );
+     }
+   }
+-  const report = buildMaintainerRecap({ generatedAt: nowIso(), windowDays: resolvedWindowDays, repos });
+-  const delivery = await deliverRecapToDiscord(env, report);
+-  return { report, delivery };
++  return runMaintainerRecap(env, { windowDays: resolvedWindowDays, repos });
+ }
+diff --git a/src/services/maintainer-recap.ts b/src/services/maintainer-recap.ts
+index 329d2304c..da0381bec 100644
+--- a/src/services/maintainer-recap.ts
++++ b/src/services/maintainer-recap.ts
+@@ -11,9 +11,11 @@
+ // PREDICTION precision; this is MULTI-repo and sourced from the realized gate-block + recommendation-outcome
+ // calibration ledgers (blocked-then-merged false positives, maintainer overrides, recommendation reversals).
+ import { PUBLIC_LOCAL_PATH_SCRUB_PATTERN, PUBLIC_UNSAFE_PATTERN } from "../signals/redaction";
++import { deliverRecapToDiscord, deliverRecapToSlack } from "./notify-discord";
+ import type { GatePrecisionReport } from "./gate-precision";
+ import type { OutcomeCalibration } from "./outcome-calibration";
+ import type { MaintainerRecapRepo, RecapReport } from "../types";
++import { nowIso } from "../utils/json";
+ 
+ const DEFAULT_WINDOW_DAYS = 7;
+ const MIN_WINDOW_DAYS = 1;
+@@ -150,3 +152,50 @@ export function formatMaintainerRecap(report: RecapReport): string {
+   ];
+   return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd()}\n`;
+ }
++
++export type RunMaintainerRecapResult =
++  | { skipped: true; reason: "disabled" }
++  | {
++      skipped: false;
++      report: RecapReport;
++      formatted: string;
++      delivery: {
++        discord: { sent: boolean; reason?: string };
++        slack: { sent: boolean; reason?: string };
++      };
++    };
++
++/**
++ * End-to-end maintainer recap orchestration (#2252): build (or accept an injected report) →
++ * {@link formatMaintainerRecap} → fan out to Discord + Slack independently. Each deliverer is best-effort and
++ * never throws, so a single-channel outage does not abort the other. When `enabled === false`, short-circuits
++ * before any I/O (the flag-OFF arm mirrored by the cron/job processor).
++ */
++export async function runMaintainerRecap(
++  env: Env,
++  options: {
++    windowDays?: number;
++    generatedAt?: string;
++    repos?: MaintainerRecapRepoInput[];
++    /** Pre-built report for test injection; skips {@link buildMaintainerRecap} when set. */
++    report?: RecapReport;
++    /** When explicitly false, short-circuits before build/format/delivery. Default: run. */
++    enabled?: boolean;
++  } = {},
++): Promise<RunMaintainerRecapResult> {
++  if (options.enabled === false) return { skipped: true, reason: "disabled" };
++
++  const report =
++    options.report ??
++    buildMaintainerRecap({
++      generatedAt: options.generatedAt ?? nowIso(),
++      windowDays: options.windowDays,
++      repos: options.repos ?? [],
++    });
++  const formatted = formatMaintainerRecap(report);
++  const [discord, slack] = await Promise.all([
++    deliverRecapToDiscord(env, report, formatted),
++    deliverRecapToSlack(env, report, formatted),
++  ]);
++  return { skipped: false, report, formatted, delivery: { discord, slack } };
++}
+diff --git a/src/services/notify-discord.ts b/src/services/notify-discord.ts
+index dc2046b12..5c0f893e7 100644
+--- a/src/services/notify-discord.ts
++++ b/src/services/notify-discord.ts
+@@ -157,10 +157,15 @@ export async function notifyActionToDiscord(
+  * operator-level digest spanning many repos (`report.repos`), so there is no single repo to route by: it posts to
+  * the flat global `DISCORD_WEBHOOK_URL`. Best-effort and observable, mirroring `sendReviewRecapToDiscord`: an
+  * unset/invalid webhook or a send failure is recorded to the audit ledger (`maintainer_recap_notification.discord`)
+- * and returned as `{ sent: false, reason }` but never thrown, so a Discord outage never breaks the recap job. The
+- * `RecapReport` is already public-safe (buildMaintainerRecap sanitizes every free-text field), so no re-scrub here.
++ * and returned as `{ sent: false, reason }` but never thrown, so a Discord outage never breaks the recap job.
++ * When {@link runMaintainerRecap} passes a {@link formatMaintainerRecap} body, the embed description uses that
++ * redacted markdown instead of raw {@link RecapReport.summary} lines.
+  */
+-export async function deliverRecapToDiscord(env: Env, report: RecapReport): Promise<{ sent: boolean; reason?: string }> {
++export async function deliverRecapToDiscord(
++  env: Env,
++  report: RecapReport,
++  formattedBody?: string,
++): Promise<{ sent: boolean; reason?: string }> {
+   const targetKey = `maintainer-recap:${report.windowDays}d`;
+   const auditMeta = { windowDays: report.windowDays, repoCount: report.repos.length };
+   const url = envString(env, "DISCORD_WEBHOOK_URL");
+@@ -169,12 +174,13 @@ export async function deliverRecapToDiscord(env: Env, report: RecapReport): Prom
+     await recordAuditEvent(env, { eventType: "maintainer_recap_notification.discord", actor: "gittensory", targetKey, outcome: "denied", detail: reason, metadata: auditMeta });
+     return { sent: false, reason };
+   }
++  const description = (formattedBody ?? report.summary.join("\n")).slice(0, 1800);
+   const body = {
+     username: "Gittensory",
+     embeds: [
+       {
+         title: `Maintainer recap · ${report.repos.length} repo(s) · ${report.windowDays}d`,
+-        description: report.summary.join("\n").slice(0, 1800),
++        description,
+         color: 0x0969da,
+         fields: [
+           { name: "Reviewed", value: `${report.totals.reviewed}`, inline: true },
+@@ -200,9 +206,43 @@ export async function deliverRecapToDiscord(env: Env, report: RecapReport): Prom
+   }
+ }
+ 
++/**
++ * Deliver a maintainer recap digest (#2246, the Slack channel of #1963) as a Block Kit mrkdwn section. Sibling of
++ * {@link deliverRecapToDiscord} — posts the already-{@link formatMaintainerRecap}-redacted body to `SLACK_WEBHOOK_URL`.
++ * Best-effort: never throws; records `maintainer_recap_notification.slack` audit events.
++ */
++export async function deliverRecapToSlack(
++  env: Env,
++  report: RecapReport,
++  formattedBody: string,
++): Promise<{ sent: boolean; reason?: string }> {
++  const targetKey = `maintainer-recap:${report.windowDays}d`;
++  const auditMeta = { windowDays: report.windowDays, repoCount: report.repos.length };
++  const webhookUrl = envString(env, "SLACK_WEBHOOK_URL");
++  if (!webhookUrl || !isValidSlackWebhook(webhookUrl)) {
++    const reason = webhookUrl ? "invalid_webhook" : "missing_webhook";
++    await recordAuditEvent(env, { eventType: "maintainer_recap_notification.slack", actor: "gittensory", targetKey, outcome: "denied", detail: reason, metadata: auditMeta });
++    return { sent: false, reason };
++  }
++  const body = {
++    text: `Maintainer recap (${report.windowDays}d)`,
++    blocks: [{ type: "section", text: { type: "mrkdwn", text: escapeSlackMrkdwnText(formattedBody).slice(0, 2900) } }],
++  };
++  try {
++    await postWebhook(webhookUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(10_000) }, "slack");
++    await recordAuditEvent(env, { eventType: "maintainer_recap_notification.slack", actor: "gittensory", targetKey, outcome: "completed", detail: "sent", metadata: auditMeta });
++    return { sent: true };
++  } catch (error) {
++    const detail = errorMessage(error).slice(0, 160);
++    console.warn(JSON.stringify({ event: "maintainer_recap_slack_failed", message: detail }));
++    await recordAuditEvent(env, { eventType: "maintainer_recap_notification.slack", actor: "gittensory", targetKey, outcome: "error", detail, metadata: auditMeta });
++    return { sent: false, reason: detail };
++  }
++}
++
+ /** Slack incoming-webhook URL validation — only `https://hooks.slack.com/services/…`. Exported so other
+- *  Slack senders (e.g. the recap digest's {@link deliverRecapToSlack}, review-recap.ts) reuse the SAME
+- *  validation instead of re-typing the host/path allowlist. */
++ *  Slack senders (e.g. review-recap.ts's per-repo {@link deliverRecapToSlack}) reuse the SAME validation
++ *  instead of re-typing the host/path allowlist. */
+ export function isValidSlackWebhook(url: string): boolean {
+   try {
+     const parsed = new URL(url);
+diff --git a/test/unit/maintainer-recap-wire.test.ts b/test/unit/maintainer-recap-wire.test.ts
+index ea56ff71d..9b9b4f249 100644
+--- a/test/unit/maintainer-recap-wire.test.ts
++++ b/test/unit/maintainer-recap-wire.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import { isRecapEnabled, resolveMaintainerRecapManifestOverride, runMaintainerRecapJob, shouldFireMaintainerRecap } from "../../src/review/maintainer-recap-wire";
++import type { RunMaintainerRecapResult } from "../../src/services/maintainer-recap";
+ import { updatePullRequestSlopAssessment, upsertPullRequestFromGitHub, upsertRepositorySettings } from "../../src/db/repositories";
+ import { upsertRepoFocusManifest } from "../../src/signals/focus-manifest-loader";
+ import { createTestEnv } from "../helpers/d1";
+@@ -8,6 +9,12 @@ const SELF_REPO = "JSONbored/gittensory";
+ 
+ const HOOK = "https://discord.com/api/webhooks/123/abc";
+ 
++function ranRecap(result: RunMaintainerRecapResult): Extract<RunMaintainerRecapResult, { skipped: false }> {
++  expect(result.skipped).toBe(false);
++  if (result.skipped) throw new Error("expected recap job to run");
++  return result;
++}
++
+ // Wrap env.DB.prepare so any SQL matching `pattern` throws, exercising a fail-safe catch; every other
+ // query delegates to the real test DB unchanged. Mirrors ops-wire.test.ts's poisonDbPrepare.
+ function poisonDbPrepare(env: Env, pattern: RegExp): void {
+@@ -169,9 +176,10 @@ describe("runMaintainerRecapJob — cross-repo digest (#1963, #2248)", () => {
+     await seedMergedPr(env, "owner/beta", 2);
+     const posted = stubDiscordFetch();
+ 
+-    const { report, delivery } = await runMaintainerRecapJob(env);
++    const { report, delivery } = ranRecap(await runMaintainerRecapJob(env));
+ 
+-    expect(delivery).toEqual({ sent: true });
++    expect(delivery.discord).toEqual({ sent: true });
++    expect(delivery.slack.sent).toBe(false);
+     expect(report.windowDays).toBe(7); // default when omitted
+     expect(report.repos.map((r) => r.repoFullName).sort()).toEqual(["owner/alpha", "owner/beta"]);
+     expect(report.totals.merged).toBe(3); // 1 (alpha) + 2 (beta)
+@@ -184,7 +192,7 @@ describe("runMaintainerRecapJob — cross-repo digest (#1963, #2248)", () => {
+     await seedMergedPr(env, "owner/alpha", 1);
+     stubDiscordFetch();
+ 
+-    const { report } = await runMaintainerRecapJob(env, 30);
++    const { report } = ranRecap(await runMaintainerRecapJob(env, 30));
+ 
+     expect(report.windowDays).toBe(30);
+   });
+@@ -198,7 +206,7 @@ describe("runMaintainerRecapJob — cross-repo digest (#1963, #2248)", () => {
+     await seedMergedPr(env, "owner/unconfigured", 1);
+     stubDiscordFetch();
+ 
+-    const { report } = await runMaintainerRecapJob(env);
++    const { report } = ranRecap(await runMaintainerRecapJob(env));
+ 
+     expect(report.repos.map((r) => r.repoFullName)).toEqual(["owner/configured"]);
+   });
+@@ -214,7 +222,7 @@ describe("runMaintainerRecapJob — cross-repo digest (#1963, #2248)", () => {
+     poisonDbPrepare(env, /"repository_settings"/i);
+     stubDiscordFetch();
+ 
+-    const { report } = await runMaintainerRecapJob(env);
++    const { report } = ranRecap(await runMaintainerRecapJob(env));
+ 
+     expect(report.repos.map((r) => r.repoFullName).sort()).toEqual(["owner/alpha", "owner/beta"]);
+   });
+@@ -228,10 +236,11 @@ describe("runMaintainerRecapJob — cross-repo digest (#1963, #2248)", () => {
+     const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
+     stubDiscordFetch();
+ 
+-    const { report, delivery } = await runMaintainerRecapJob(env); // resolves (never throws)
++    const { report, delivery } = ranRecap(await runMaintainerRecapJob(env)); // resolves (never throws)
+ 
+     expect(report.repos).toEqual([]);
+-    expect(delivery).toEqual({ sent: true });
++    expect(delivery.discord).toEqual({ sent: true });
++    expect(delivery.slack.sent).toBe(false);
+     const logged = warnings.mock.calls.map((c) => String(c[0])).find((line) => line.includes("maintainer_recap_repo_error") && line.includes("owner/alpha"));
+     expect(logged).toBeDefined();
+   });
+@@ -240,10 +249,11 @@ describe("runMaintainerRecapJob — cross-repo digest (#1963, #2248)", () => {
+     const env = createTestEnv({ DISCORD_WEBHOOK_URL: HOOK });
+     stubDiscordFetch();
+ 
+-    const { report, delivery } = await runMaintainerRecapJob(env);
++    const { report, delivery } = ranRecap(await runMaintainerRecapJob(env));
+ 
+     expect(report.repos).toEqual([]);
+     expect(report.totals.gateFalsePositiveRate).toBeNull();
+-    expect(delivery).toEqual({ sent: true });
++    expect(delivery.discord).toEqual({ sent: true });
++    expect(delivery.slack.sent).toBe(false);
+   });
+ });
+diff --git a/test/unit/maintainer-recap.test.ts b/test/unit/maintainer-recap.test.ts
+index 08057220e..e30ec8651 100644
+--- a/test/unit/maintainer-recap.test.ts
++++ b/test/unit/maintainer-recap.test.ts
+@@ -1,8 +1,12 @@
+-import { describe, expect, it } from "vitest";
+-import { buildMaintainerRecap, type MaintainerRecapRepoInput } from "../../src/services/maintainer-recap";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { buildMaintainerRecap, runMaintainerRecap, type MaintainerRecapRepoInput } from "../../src/services/maintainer-recap";
+ import type { OutcomeCalibration } from "../../src/services/outcome-calibration";
++import type { RecapReport } from "../../src/types";
++import { createTestEnv } from "../helpers/d1";
+ 
+ const GEN = "2026-07-08T00:00:00.000Z";
++const DISCORD_HOOK = "https://discord.com/api/webhooks/123/abc";
++const SLACK_HOOK = "https://hooks.slack.com/services/T00/B00/xxxyyyzzz";
+ 
+ /** Build one repo's injected inputs from the handful of counts this builder actually reads. */
+ function repoInput(
+@@ -96,3 +100,124 @@ describe("buildMaintainerRecap (#2239)", () => {
+     expect(report.repos[0]?.repoFullName).not.toContain("/Users/secret");
+   });
+ });
++
++function envWithBothWebhooks(): Env {
++  return createTestEnv({ DISCORD_WEBHOOK_URL: DISCORD_HOOK, SLACK_WEBHOOK_URL: SLACK_HOOK }) as Env;
++}
++
++/** Record fetch calls to Discord/Slack webhooks only (ignore manifest/settings fetches). */
++function stubRecapChannelFetch(): Array<{ url: string; body: string }> {
++  const calls: Array<{ url: string; body: string }> = [];
++  vi.stubGlobal("fetch", async (url: RequestInfo | URL, init?: RequestInit) => {
++    const target = String(url);
++    if (target === DISCORD_HOOK || target === SLACK_HOOK) {
++      calls.push({ url: target, body: init?.body ? String(init.body) : "" });
++    }
++    return new Response(null, { status: 204 });
++  });
++  return calls;
++}
++
++function leakyRecapReport(): RecapReport {
++  return {
++    generatedAt: GEN,
++    windowDays: 7,
++    repos: [
++      {
++        repoFullName: "acme/widgets /Users/secret/leak",
++        reviewed: 3,
++        merged: 2,
++        closed: 1,
++        gateFalsePositives: 0,
++        gateOverrides: 0,
++        reversals: 0,
++      },
++    ],
++    totals: {
++      reviewed: 3,
++      merged: 2,
++      closed: 1,
++      blocked: 0,
++      gateFalsePositives: 0,
++      gateOverrides: 0,
++      reversals: 0,
++      gateFalsePositiveRate: null,
++    },
++    summary: ["Clean recap line.", "payout was 500 tao last window", "path /root/secrets/config.json here"],
++  };
++}
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
++
++describe("runMaintainerRecap (#2252 end-to-end orchestration)", () => {
++  it("builds an empty report when neither report nor repos are injected (repos ?? [] absent arm)", async () => {
++    stubRecapChannelFetch();
++    const result = await runMaintainerRecap(envWithBothWebhooks(), {});
++    expect(result.skipped).toBe(false);
++    if (result.skipped) return;
++    expect(result.report.repos).toEqual([]);
++    expect(result.formatted).toContain("_No repositories in this window._");
++    expect(result.formatted).toContain("(n/a)");
++  });
++
++  it("short-circuits when enabled is false — no build/format/fetch (flag-OFF arm)", async () => {
++    const calls = stubRecapChannelFetch();
++    const result = await runMaintainerRecap(envWithBothWebhooks(), { enabled: false, repos: [repoInput("owner/repo")] });
++    expect(result).toEqual({ skipped: true, reason: "disabled" });
++    expect(calls).toHaveLength(0);
++  });
++
++  it("builds, formats, and fans out to BOTH channels when both webhooks are configured", async () => {
++    const calls = stubRecapChannelFetch();
++    const result = await runMaintainerRecap(envWithBothWebhooks(), { repos: [repoInput("owner/repo-a", { blocked: 4, blockedThenMerged: 1, totalResolved: 2, merged: 1, closed: 1 })] });
++    expect(result.skipped).toBe(false);
++    if (result.skipped) return;
++    expect(result.formatted).toContain("# Maintainer recap");
++    expect(result.formatted).toMatch(/\(\d+%\)/);
++    expect(result.delivery.discord).toEqual({ sent: true });
++    expect(result.delivery.slack).toEqual({ sent: true });
++    expect(calls.map((c) => c.url).sort()).toEqual([DISCORD_HOOK, SLACK_HOOK].sort());
++    expect(calls.some((c) => c.url === DISCORD_HOOK && c.body.includes("Maintainer recap"))).toBe(true);
++    expect(calls.some((c) => c.url === SLACK_HOOK && c.body.includes("Maintainer recap"))).toBe(true);
++  });
++
++  it("still delivers to Slack when Discord fetch fails (Discord outage must not abort Slack)", async () => {
++    vi.stubGlobal("fetch", async (url: RequestInfo | URL, init?: RequestInit) => {
++      if (String(url) === DISCORD_HOOK) throw new Error("discord down");
++      if (String(url) === SLACK_HOOK) return new Response(null, { status: 204 });
++      return new Response(null, { status: 204 });
++    });
++    const result = await runMaintainerRecap(envWithBothWebhooks(), { repos: [repoInput("owner/repo")] });
++    expect(result.skipped).toBe(false);
++    if (result.skipped) return;
++    expect(result.delivery.discord).toEqual({ sent: false, reason: "discord down" });
++    expect(result.delivery.slack).toEqual({ sent: true });
++  });
++
++  it("still delivers to Discord when Slack fetch fails (Slack outage must not abort Discord)", async () => {
++    vi.stubGlobal("fetch", async (url: RequestInfo | URL) => {
++      if (String(url) === SLACK_HOOK) throw new Error("slack down");
++      return new Response(null, { status: 204 });
++    });
++    const result = await runMaintainerRecap(envWithBothWebhooks(), { repos: [repoInput("owner/repo")] });
++    expect(result.skipped).toBe(false);
++    if (result.skipped) return;
++    expect(result.delivery.discord).toEqual({ sent: true });
++    expect(result.delivery.slack).toEqual({ sent: false, reason: "slack down" });
++  });
++
++  it("redacts reward/path terms in BOTH channel payloads via formatMaintainerRecap", async () => {
++    const calls = stubRecapChannelFetch();
++    const result = await runMaintainerRecap(envWithBothWebhooks(), { report: leakyRecapReport() });
++    expect(result.skipped).toBe(false);
++    if (result.skipped) return;
++    expect(result.delivery.discord.sent).toBe(true);
++    expect(result.delivery.slack.sent).toBe(true);
++    for (const call of calls) {
++      expect(call.body.toLowerCase()).not.toMatch(/payout|\/users\/secret|\/root\/secrets/);
++      expect(call.body).toMatch(/redacted/);
++    }
++  });
++});
+diff --git a/test/unit/notify-discord.test.ts b/test/unit/notify-discord.test.ts
+index 23bb0d249..6e525792c 100644
+--- a/test/unit/notify-discord.test.ts
++++ b/test/unit/notify-discord.test.ts
+@@ -1,9 +1,10 @@
+ import { afterEach, describe, expect, it, vi } from "vitest";
+-import { deliverRecapToDiscord, notifyActionToDiscord, notifyActionToSlack, resolveDiscordWebhook } from "../../src/services/notify-discord";
++import { deliverRecapToDiscord, deliverRecapToSlack, notifyActionToDiscord, notifyActionToSlack, resolveDiscordWebhook } from "../../src/services/notify-discord";
+ import { createTestEnv } from "../helpers/d1";
+ import type { RecapReport } from "../../src/types";
+ 
+ const HOOK = "https://discord.com/api/webhooks/123/abc";
++const SLACK_HOOK = "https://hooks.slack.com/services/T00/B00/xxxyyyzzz";
+ const FALLBACK = "https://discord.com/api/webhooks/999/zzz";
+ const ORIG_DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+ 
+@@ -304,3 +305,48 @@ describe("deliverRecapToDiscord (#2245 maintainer recap → Discord)", () => {
+     expect(await recapAudit(env)).toEqual([expect.objectContaining({ outcome: "error", detail: "network down" })]);
+   });
+ });
++
++const FORMATTED_RECAP = "# Maintainer recap\n\n- Sample summary line.\n";
++
++async function maintainerRecapSlackAudit(env: Env): Promise<Array<{ outcome: string; detail: string }>> {
++  const rows = await env.DB.prepare("select outcome, detail from audit_events where event_type = ? order by created_at").bind("maintainer_recap_notification.slack").all<{ outcome: string; detail: string }>();
++  return rows.results ?? [];
++}
++
++describe("deliverRecapToSlack (#2246 maintainer RecapReport → Slack)", () => {
++  it("posts the formatted recap to SLACK_WEBHOOK_URL and records a completed audit when configured", async () => {
++    let posted: { url: string; body: string } | null = null;
++    vi.stubGlobal("fetch", async (url: RequestInfo | URL, init?: RequestInit) => {
++      posted = { url: String(url), body: init?.body ? String(init.body) : "" };
++      return new Response(null, { status: 204 });
++    });
++    const env = withEnv({ SLACK_WEBHOOK_URL: SLACK_HOOK });
++    expect(await deliverRecapToSlack(env, SAMPLE_RECAP, FORMATTED_RECAP)).toEqual({ sent: true });
++    expect(posted!.url).toBe(SLACK_HOOK);
++    const parsed = JSON.parse(posted!.body) as { blocks: { text: { text: string } }[] };
++    expect(parsed.blocks[0]?.text.text).toContain("Maintainer recap");
++    expect(await maintainerRecapSlackAudit(env)).toEqual([expect.objectContaining({ outcome: "completed", detail: "sent" })]);
++  });
++
++  it("no-ops when SLACK_WEBHOOK_URL is unset", async () => {
++    const calls = stubFetch();
++    const env = createTestEnv();
++    expect(await deliverRecapToSlack(env, SAMPLE_RECAP, FORMATTED_RECAP)).toEqual({ sent: false, reason: "missing_webhook" });
++    expect(calls).toEqual([]);
++  });
++
++  it("no-ops when SLACK_WEBHOOK_URL fails validation", async () => {
++    const calls = stubFetch();
++    const env = withEnv({ SLACK_WEBHOOK_URL: "http://hooks.slack.com/services/T/B/X" });
++    expect(await deliverRecapToSlack(env, SAMPLE_RECAP, FORMATTED_RECAP)).toEqual({ sent: false, reason: "invalid_webhook" });
++    expect(calls).toEqual([]);
++  });
++
++  it("swallows a send failure — best-effort, never throws", async () => {
++    vi.stubGlobal("fetch", async () => {
++      throw new Error("slack network down");
++    });
++    const env = withEnv({ SLACK_WEBHOOK_URL: SLACK_HOOK });
++    expect(await deliverRecapToSlack(env, SAMPLE_RECAP, FORMATTED_RECAP)).toEqual({ sent: false, reason: "slack network down" });
++  });
++});

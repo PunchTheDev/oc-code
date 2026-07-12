@@ -1,0 +1,333 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index f362c47..5cce47b 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -18,6 +18,26 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
+ 
+ ---
+ 
++## 2026-07-10 — pack_submission priced ledger with flat blended rate, not in/out split  #mistake #finding #decision
++**Context:** wiring training receipts (`scripts/pack_submission.py`) to the verified
++cost ledger after #87 landed `trinity.llm.cost_ledger`.
++**Expected:** `receipt.json` → `total_cost_usd` matches
++`scripts/cost_report.py --ledger` on the same file (per-model prompt vs
++completion rates).
++**Actual:** pack used a hard-coded ``0.90 * (p + c) / 1M`` for every model.
++Example — 1M prompt tokens on qwen3.5-35b-a3b: cost_report charges **$0.14**;
++pack wrote **$0.90** into the receipt. Gate 4 (`pr_eval.py`) cross-checks
++``total_cost_usd`` against a plausible training spend, so receipts disagreed
++with maintainer tooling and could false-pass or false-fail the minimum-cost gate.
++**Root cause:** ledger verification was centralized in #87, but dollar pricing
++still lived only in `cost_report.py` while pack kept a stale blended shortcut.
++**Fix / decision:** add `trinity.llm.openrouter_pricing` as the single rate table
+++ `token_cost` / `verified_ledger_total_usd` helpers; route both
++`cost_report.py` and `pack_submission.py` through it. Covered by
++`tests/test_openrouter_pricing.py`.
++**Follow-up:** `trinity.fugu.cost.PRICES` and oracle-ceiling defaults remain a
++separate table — dedupe is tracked in the open refactor PR #8.
++
+ ## 2026-07-10 — Cost-ledger verifier hashed a different JSON string than the writer  #mistake #decision
+ **Context:** checking the token-cost ledger path used by training, `cost_report.py`,
+ and submission packing.
+diff --git a/scripts/cost_report.py b/scripts/cost_report.py
+index 27615c3..13f8316 100644
+--- a/scripts/cost_report.py
++++ b/scripts/cost_report.py
+@@ -22,15 +22,15 @@
+ import sys
+ 
+ from trinity.llm.cost_ledger import read_ledger_entries, verify_ledger_chain
++from trinity.llm.openrouter_pricing import (
++    OPENROUTER_POOL_PRICES,
++    default_blended_rates,
++    token_cost,
++)
+ 
+-# ---- OpenRouter prices ($ per 1M tokens), (input, output). ----
+-PRICES = {
+-    "qwen3.5-35b-a3b": (0.14, 1.00),
+-    "minimax-m3":      (0.30, 1.20),
+-    "deepseek-v4-flash": (0.09, 0.18),
+-}
+-_DEFAULT_BLENDED_IN = sum(p[0] for p in PRICES.values()) / len(PRICES)
+-_DEFAULT_BLENDED_OUT = sum(p[1] for p in PRICES.values()) / len(PRICES)
++# Back-compat alias for scripts/tests that import PRICES from cost_report.
++PRICES = OPENROUTER_POOL_PRICES
++_DEFAULT_BLENDED_IN, _DEFAULT_BLENDED_OUT = default_blended_rates()
+ 
+ 
+ def cost(prompt_tok: int, completion_tok: int, in_rate: float, out_rate: float) -> float:
+@@ -58,8 +58,7 @@ def report_ledger(path: str) -> None:
+     print(f"{'model':18s} {'calls':>8s} {'prompt_tok':>12s} {'compl_tok':>12s} {'$':>9s}")
+     print("-" * 64)
+     for m, (p, c, n) in sorted(per.items()):
+-        ir, orr = PRICES.get(m, (_DEFAULT_BLENDED_IN, _DEFAULT_BLENDED_OUT))
+-        d = cost(p, c, ir, orr)
++        d = token_cost(m, p, c)
+         total += d
+         print(f"{m:18s} {n:8d} {p:12d} {c:12d} {d:9.3f}")
+     print("-" * 64)
+diff --git a/scripts/pack_submission.py b/scripts/pack_submission.py
+index d237f35..ec21fd3 100644
+--- a/scripts/pack_submission.py
++++ b/scripts/pack_submission.py
+@@ -37,21 +37,10 @@ def _estimate_cost() -> float:
+     ledger_path = os.environ.get("TRINITY_COST_LEDGER")
+     if not ledger_path:
+         return 0.0
+-    try:
+-        from trinity.llm.cost_ledger import read_ledger_entries, verify_ledger_chain
+-
+-        valid, _, _ = verify_ledger_chain(ledger_path)
+-        if not valid:
+-            return 0.0
+-
+-        total = 0.0
+-        pricing = {"qwen3.5-35b-a3b": 0.90, "minimax-m3": 0.90, "deepseek-v4-flash": 0.90}
+-        for entry in read_ledger_entries(ledger_path):
+-            price = pricing.get(entry.model, 0.90)
+-            total += price * entry.total_tokens / 1_000_000
+-        return round(total, 4)
+-    except Exception:
+-        return 0.0
++    from trinity.llm.openrouter_pricing import verified_ledger_total_usd
++
++    total = verified_ledger_total_usd(ledger_path)
++    return round(total, 4) if total is not None else 0.0
+ 
+ 
+ def build_receipt(run_dir: Path, benchmark: str) -> dict:
+diff --git a/src/trinity/llm/openrouter_pricing.py b/src/trinity/llm/openrouter_pricing.py
+new file mode 100644
+index 0000000..a226e5d
+--- /dev/null
++++ b/src/trinity/llm/openrouter_pricing.py
+@@ -0,0 +1,101 @@
++"""OpenRouter per-model token pricing for ledger cost totals.
++
++The default model pool's OpenRouter rates ($/1M prompt and completion tokens)
++must be applied consistently anywhere the repo turns a verified cost ledger
++into dollars — ``scripts/cost_report.py --ledger`` and the training receipt
++written by ``scripts/pack_submission.py``.
++
++A single blended rate multiplied by ``prompt + completion`` token counts
++mis-prices every model in the pool because input and output are billed at
++different rates. This module is the single source of truth for those rates and
++for summing :class:`~trinity.llm.cost_ledger.LedgerEntry` rows.
++"""
++from __future__ import annotations
++
++from pathlib import Path
++
++from trinity.llm.cost_ledger import LedgerEntry, read_ledger_entries, verify_ledger_chain
++
++__all__ = [
++    "OPENROUTER_POOL_PRICES",
++    "default_blended_rates",
++    "normalize_model_slug",
++    "resolve_rates",
++    "token_cost",
++    "sum_entry_costs",
++    "sum_ledger_cost",
++    "verified_ledger_total_usd",
++]
++
++# OpenRouter prices, $/1M tokens (prompt, completion). Keep in sync with
++# scripts/oracle_ceiling.py::_DEFAULT_PRICES and configs/models.yaml pool.
++OPENROUTER_POOL_PRICES: dict[str, tuple[float, float]] = {
++    "qwen3.5-35b-a3b": (0.14, 1.00),
++    "minimax-m3": (0.30, 1.20),
++    "deepseek-v4-flash": (0.09, 0.18),
++}
++
++
++def normalize_model_slug(model: str) -> str:
++    """Strip an OpenRouter provider prefix from a model slug."""
++    return model.rsplit("/", 1)[-1]
++
++
++def default_blended_rates() -> tuple[float, float]:
++    """Return the arithmetic mean of pool in/out rates (for unknown models)."""
++    if not OPENROUTER_POOL_PRICES:
++        return (0.0, 0.0)
++    ins = [p[0] for p in OPENROUTER_POOL_PRICES.values()]
++    outs = [p[1] for p in OPENROUTER_POOL_PRICES.values()]
++    return (sum(ins) / len(ins), sum(outs) / len(outs))
++
++
++def resolve_rates(model: str) -> tuple[float, float]:
++    """Return ``(price_in, price_out)`` in $/1M tokens for ``model``.
++
++    Known pool slugs use their table entry. Unknown slugs fall back to the
++    blended default so a ledger with a new model name still produces a finite
++    total instead of silently dropping rows.
++    """
++    slug = normalize_model_slug(model)
++    return OPENROUTER_POOL_PRICES.get(slug, default_blended_rates())
++
++
++def token_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
++    """Price one API call from per-million in/out rates."""
++    in_rate, out_rate = resolve_rates(model)
++    pt = int(prompt_tokens)
++    ct = int(completion_tokens)
++    return pt / 1e6 * in_rate + ct / 1e6 * out_rate
++
++
++def sum_entry_costs(entries: list[LedgerEntry]) -> float:
++    """Sum dollar cost for parsed ledger rows (no hash verification)."""
++    return sum(
++        token_cost(entry.model, entry.prompt_tokens, entry.completion_tokens)
++        for entry in entries
++    )
++
++
++def sum_ledger_cost(path: str | Path) -> float:
++    """Sum dollar cost for a ledger file without verifying the hash chain."""
++    return sum_entry_costs(read_ledger_entries(path))
++
++
++def verified_ledger_total_usd(path: str | Path) -> float | None:
++    """Return total ledger spend in USD when the hash chain is intact.
++
++    Args:
++        path: ``cost_ledger.jsonl`` written by :func:`openrouter_client._ledger_append`.
++
++    Returns:
++        Rounded total cost, or ``None`` when verification fails or the path is
++        unreadable.
++    """
++    try:
++        valid, _, _ = verify_ledger_chain(path)
++        if not valid:
++            return None
++        return sum_ledger_cost(path)
++    except OSError:
++        return None
+diff --git a/tests/test_openrouter_pricing.py b/tests/test_openrouter_pricing.py
+new file mode 100644
+index 0000000..cf00dce
+--- /dev/null
++++ b/tests/test_openrouter_pricing.py
+@@ -0,0 +1,121 @@
++"""Offline tests for OpenRouter ledger pricing (per-model in/out split).
++
++Regression cover for the bug where ``pack_submission._estimate_cost`` priced
++every ledger row as ``0.90 * (prompt + completion) / 1M`` instead of applying
++the same per-million input/output rates as ``scripts/cost_report.py``.
++"""
++from __future__ import annotations
++
++import importlib.util
++import sys
++from pathlib import Path
++
++import pytest
++
++from trinity.llm import cost_ledger as CL
++from trinity.llm import openrouter_pricing as OP
++
++_REPO = Path(__file__).resolve().parents[1]
++_PACK = _REPO / "scripts" / "pack_submission.py"
++_spec = importlib.util.spec_from_file_location("pack_submission", _PACK)
++pack_submission = importlib.util.module_from_spec(_spec)
++sys.modules["pack_submission"] = pack_submission
++_spec.loader.exec_module(pack_submission)
++
++
++# --------------------------------------------------------------------------- #
++# Rate resolution
++# --------------------------------------------------------------------------- #
++def test_resolve_rates_returns_pool_table_for_known_slug():
++    assert OP.resolve_rates("qwen3.5-35b-a3b") == (0.14, 1.00)
++    assert OP.resolve_rates("openrouter/qwen3.5-35b-a3b") == (0.14, 1.00)
++
++
++def test_resolve_rates_falls_back_to_blended_default_for_unknown():
++    default_in, default_out = OP.default_blended_rates()
++    assert OP.resolve_rates("unknown-model") == (default_in, default_out)
++
++
++def test_token_cost_splits_prompt_and_completion_rates():
++    # 1M prompt @ 0.14 + 1M completion @ 1.00 = 1.14 for qwen
++    assert OP.token_cost("qwen3.5-35b-a3b", 1_000_000, 1_000_000) == pytest.approx(1.14)
++
++
++def test_flat_blended_formula_differs_from_split_pricing():
++    """The old bug: one rate on (p+c) is not the same as split in/out."""
++    prompt_only = 1_000_000
++    completion_only = 0
++    split = OP.token_cost("qwen3.5-35b-a3b", prompt_only, completion_only)
++    flat_bug = 0.90 * (prompt_only + completion_only) / 1_000_000
++    assert split == pytest.approx(0.14)
++    assert flat_bug == pytest.approx(0.90)
++    assert split != pytest.approx(flat_bug)
++
++
++@pytest.mark.parametrize(
++    "model, prompt, completion, expected",
++    [
++        ("qwen3.5-35b-a3b", 1_000_000, 0, 0.14),
++        ("qwen3.5-35b-a3b", 0, 1_000_000, 1.00),
++        ("minimax-m3", 1_000_000, 1_000_000, 1.50),
++        ("deepseek-v4-flash", 2_000_000, 500_000, 0.27),
++    ],
++)
++def test_token_cost_matches_manual_arithmetic(model, prompt, completion, expected):
++    in_rate, out_rate = OP.resolve_rates(model)
++    manual = prompt / 1e6 * in_rate + completion / 1e6 * out_rate
++    assert OP.token_cost(model, prompt, completion) == pytest.approx(manual)
++    assert OP.token_cost(model, prompt, completion) == pytest.approx(expected)
++
++
++# --------------------------------------------------------------------------- #
++# Ledger totals
++# --------------------------------------------------------------------------- #
++def test_sum_entry_costs_aggregates_multiple_models(tmp_path: Path):
++    ledger = tmp_path / "ledger.jsonl"
++    CL.append_ledger_entry(ledger, "qwen3.5-35b-a3b", 1_000_000, 0)
++    CL.append_ledger_entry(ledger, "minimax-m3", 0, 1_000_000)
++    entries = CL.read_ledger_entries(ledger)
++    # 0.14 (qwen prompt) + 1.20 (minimax completion)
++    assert OP.sum_entry_costs(entries) == pytest.approx(1.34)
++
++
++def test_verified_ledger_total_usd_requires_intact_chain(tmp_path: Path):
++    ledger = tmp_path / "ledger.jsonl"
++    CL.append_ledger_entry(ledger, "deepseek-v4-flash", 1_000_000, 1_000_000)
++    total = OP.verified_ledger_total_usd(ledger)
++    assert total == pytest.approx(0.27)
++
++
++def test_verified_ledger_total_usd_returns_none_on_tampered_chain(tmp_path: Path):
++    ledger = tmp_path / "ledger.jsonl"
++    CL.append_ledger_entry(ledger, "qwen3.5-35b-a3b", 100, 50)
++    text = ledger.read_text(encoding="utf-8")
++    ledger.write_text(text.replace('"p":100', '"p":999'), encoding="utf-8")
++    assert OP.verified_ledger_total_usd(ledger) is None
++
++
++def test_verified_ledger_total_usd_returns_none_for_missing_file(tmp_path: Path):
++    assert OP.verified_ledger_total_usd(tmp_path / "missing.jsonl") is None
++
++
++# --------------------------------------------------------------------------- #
++# pack_submission integration
++# --------------------------------------------------------------------------- #
++def test_pack_submission_estimate_cost_matches_pricing_module(tmp_path: Path, monkeypatch):
++    ledger = tmp_path / "ledger.jsonl"
++    CL.append_ledger_entry(ledger, "qwen3.5-35b-a3b", 2_000_000, 500_000)
++    monkeypatch.setenv("TRINITY_COST_LEDGER", str(ledger))
++    assert pack_submission._estimate_cost() == round(OP.verified_ledger_total_usd(ledger), 4)
++
++
++def test_pack_submission_estimate_cost_zero_without_ledger(monkeypatch):
++    monkeypatch.delenv("TRINITY_COST_LEDGER", raising=False)
++    assert pack_submission._estimate_cost() == 0.0
++
++
++def test_pack_submission_estimate_cost_zero_on_broken_chain(tmp_path: Path, monkeypatch):
++    ledger = tmp_path / "ledger.jsonl"
++    ledger.write_text('{"m":"qwen3.5-35b-a3b","p":1,"c":2}\n', encoding="utf-8")
++    monkeypatch.setenv("TRINITY_COST_LEDGER", str(ledger))
++    assert pack_submission._estimate_cost() == 0.0

@@ -1,0 +1,1393 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index 3597b05..470047f 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -37,6 +37,25 @@ t.task_id)` per trajectory. Covered by `tests/test_audit_random_routing_seed.py`
+ **Follow-up:** the audit "held-out" guarantee is soft (samples train w/ a diff seed,
+ not a provably-disjoint partition) — a larger, separate change.
+ 
++## 2026-07-10 — Miners had no offline path to run pr_eval gates before opening a PR  #finding #decision
++**Context:** routing-head submissions were rejected only after opening a PR, when
++``scripts/pr_eval.py`` ran gates 1–4 embedded in an 850-line maintainer script.
++**Expected:** the same anti-cheat checks (rate limit, weights, duplicate head,
++receipt plausibility) runnable locally with no GPU and no OpenRouter spend.
++**Actual:** gate logic was not importable; miners discovered failures post-PR. A
++fifth gap also existed: ``receipt.json`` ``total_cost_usd`` was never
++cross-checked against a verified ``TRINITY_COST_LEDGER`` total, so fabricated
++receipts could disagree with the append-only ledger.
++**Fix / decision:** add ``trinity.submission`` (pack loader, gate classes,
++``PreflightRunner``) plus ``scripts/preflight_submission.py`` for miners.
++``pr_eval.py`` now imports the shared gates and runs gate 5
++(ledger/receipt cost consistency) before any GPU work. Shared OpenRouter pricing
++lives in ``trinity.llm.openrouter_pricing`` so ``cost_report.py``,
++``pack_submission.py``, and the new gate agree on dollar totals. Covered by
++``tests/test_submission_preflight.py``.
++**Follow-up:** wire the preflight CLI into CONTRIBUTING/SUBMITTING docs when the
++maintainer is ready to advertise it.
++
+ ## 2026-07-10 — A null `usage` block crashed a successful inference call  #mistake #gotcha
+ **Context:** hardening `llm/openrouter_client.py` after #72 fixed the `content: null` case, to see whether the same present-but-null trap existed elsewhere in the response parsing.
+ **Expected:** a 200-OK response with `"usage": null` records zero tokens and returns the completion.
+diff --git a/scripts/pr_eval.py b/scripts/pr_eval.py
+index 4ea63b8..7daf390 100644
+--- a/scripts/pr_eval.py
++++ b/scripts/pr_eval.py
+@@ -18,7 +18,6 @@
+ import argparse
+ import asyncio
+ import base64
+-import calendar
+ import hashlib
+ import json
+ import os
+@@ -33,18 +32,38 @@
+ _REPO = Path(__file__).resolve().parents[1]
+ sys.path.insert(0, str(_REPO / "src"))
+ 
+-# ---- Constants ----
+-_EXPECTED_HEAD_PARAMS = 6144   # 6 × 1024
+-_EXPECTED_SVF_PARAMS = 7168    # 7 × 1024
+-_EXPECTED_TOTAL = _EXPECTED_HEAD_PARAMS + _EXPECTED_SVF_PARAMS  # 13312
+-_MIN_TRAINING_COST = 15.0       # plausible minimum for a full CMA-ES run
+-_MAX_WEIGHT_MAGNITUDE = 1e6     # weights beyond this are degenerate
+-_COPY_THRESHOLD = 0.999          # cosine similarity threshold for duplicate detection
+-_OVERFIT_HARD_REJECT = 0.10      # eval-audit gap above this = reject
+-_OVERFIT_PENALTY = 0.05          # gap above this = 0.85 penalty
+-_RATE_LIMIT_WINDOW_DAYS = 7
+-_RATE_LIMIT_MAX_SUBMISSIONS = 1
+-_POOL_MODELS = ["qwen3.5-35b-a3b", "minimax-m3", "deepseek-v4-flash"]
++from trinity.submission.constants import (
++    DEFAULT_POOL_MODELS,
++    DUPLICATE_HEAD_COSINE_THRESHOLD,
++    EXPECTED_TOTAL_PARAMS,
++    MAX_WEIGHT_MAGNITUDE,
++    MIN_TRAINING_COST_USD,
++    RATE_LIMIT_MAX_SUBMISSIONS,
++    RATE_LIMIT_WINDOW_DAYS,
++)
++from trinity.submission.gates import (
++    check_duplicate as _check_duplicate,
++    check_rate_limit as _check_rate_limit,
++    cosine_similarity as _cosine_similarity,
++    parse_utc_timestamp as _parse_utc_timestamp,
++    rate_limit_entries as _rate_limit_entries,
++    validate_ledger_receipt_cost,
++    validate_receipt as _validate_receipt,
++    validate_weights as _validate_weights,
++)
++
++# Back-compat aliases for tests that import pr_eval directly.
++_EXPECTED_HEAD_PARAMS = 6144
++_EXPECTED_SVF_PARAMS = 7168
++_EXPECTED_TOTAL = EXPECTED_TOTAL_PARAMS
++_MIN_TRAINING_COST = MIN_TRAINING_COST_USD
++_MAX_WEIGHT_MAGNITUDE = MAX_WEIGHT_MAGNITUDE
++_COPY_THRESHOLD = DUPLICATE_HEAD_COSINE_THRESHOLD
++_OVERFIT_HARD_REJECT = 0.10
++_OVERFIT_PENALTY = 0.05
++_RATE_LIMIT_WINDOW_DAYS = RATE_LIMIT_WINDOW_DAYS
++_RATE_LIMIT_MAX_SUBMISSIONS = RATE_LIMIT_MAX_SUBMISSIONS
++_POOL_MODELS = list(DEFAULT_POOL_MODELS)
+ 
+ 
+ # ==========================================================================
+@@ -134,274 +153,7 @@ def _load_submission(submission_dir: Path) -> Optional[Tuple[np.ndarray, np.ndar
+     return head_W.astype(np.float32), svf_scales.astype(np.float32), receipt
+ 
+ 
+-# ==========================================================================
+-# Gate 1: Rate Limiting
+-# ==========================================================================
+-
+-def _parse_utc_timestamp(ts_str: str) -> Optional[float]:
+-    """Parse a ``YYYY-MM-DDTHH:MM:SSZ`` UTC stamp to a Unix epoch (seconds).
+-
+-    Leaderboard timestamps are written in UTC (``time.gmtime`` + trailing ``Z``,
+-    see :func:`_update_leaderboard`), so they must be read back as UTC. Using
+-    ``time.mktime`` here would interpret the struct as *local* time and skew the
+-    epoch by the maintainer host's UTC offset — silently shifting the rate-limit
+-    window by hours on any non-UTC box. ``calendar.timegm`` is the UTC inverse of
+-    ``time.gmtime`` and is timezone-independent.
+-
+-    Returns ``None`` if ``ts_str`` is empty or not in the expected format.
+-    """
+-    if not ts_str:
+-        return None
+-    try:
+-        return float(calendar.timegm(time.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ")))
+-    except (ValueError, OSError):
+-        return None
+-
+-
+-def _rate_limit_entries(bench_entry: dict) -> list:
+-    """Entries that consume the weekly submission slot.
+-
+-    Prefer ``attempts`` (every eval that passed Gate 1). Fall back to
+-    ``history`` for leaderboards written before attempts were recorded — that
+-    log only contained wins, which is the hole this gate used to have.
+-    """
+-    attempts = bench_entry.get("attempts")
+-    if attempts is not None:
+-        return attempts
+-    return bench_entry.get("history", [])
+-
+-
+-def _check_rate_limit(miner_name: str, benchmark: str, leaderboard: dict) -> Optional[str]:
+-    """Check if miner has exceeded the submission rate limit.
+-
+-    Counts prior *attempts* (not only approved wins). Returns None if allowed,
+-    or an error string if rate-limited.
+-    """
+-    bench_entry = leaderboard.get("benchmarks", {}).get(benchmark, {})
+-    entries = _rate_limit_entries(bench_entry)
+-
+-    cutoff = time.time() - _RATE_LIMIT_WINDOW_DAYS * 86400
+-    recent = 0
+-    for entry in entries:
+-        ts = _parse_utc_timestamp(entry.get("timestamp", ""))
+-        if ts is None:
+-            continue
+-        if entry.get("miner") == miner_name and ts > cutoff:
+-            recent += 1
+-
+-    if recent >= _RATE_LIMIT_MAX_SUBMISSIONS:
+-        return f"rate_limited: {recent} submission(s) in the last {_RATE_LIMIT_WINDOW_DAYS} days (max {_RATE_LIMIT_MAX_SUBMISSIONS})"
+-    return None
+-
+-
+-# ==========================================================================
+-# Gate 2: Weight Validation
+-# ==========================================================================
+-
+-def _validate_weights(head_W: np.ndarray, svf_scales: np.ndarray) -> Optional[str]:
+-    """Validate weight array integrity. Returns None if clean, error string if corrupt."""
+-    # Param count
+-    if head_W.size + svf_scales.size != _EXPECTED_TOTAL:
+-        return f"param_count: got {head_W.size + svf_scales.size}, expected {_EXPECTED_TOTAL}"
+-    if head_W.shape != (6, 1024):
+-        return f"head_shape: got {head_W.shape}, expected (6, 1024)"
+-
+-    # NaN / Inf
+-    if np.any(np.isnan(head_W)) or np.any(np.isnan(svf_scales)):
+-        return "weights_contain_NaN"
+-    if np.any(np.isinf(head_W)) or np.any(np.isinf(svf_scales)):
+-        return "weights_contain_Inf"
+-
+-    # Extreme magnitudes
+-    if np.any(np.abs(head_W) > _MAX_WEIGHT_MAGNITUDE):
+-        return f"head_weights_exceed_max: max_abs={np.max(np.abs(head_W)):.1f}"
+-    if np.any(np.abs(svf_scales) > _MAX_WEIGHT_MAGNITUDE):
+-        return f"svf_scales_exceed_max: max_abs={np.max(np.abs(svf_scales)):.1f}"
+-
+-    # All-zeros head (untrained)
+-    if np.allclose(head_W, 0.0):
+-        return "head_weights_all_zeros"
+-
+-    # SVF scales too close to zero (would zero out the SLM)
+-    if np.allclose(svf_scales, 0.0):
+-        return "svf_scales_all_zeros"
+-
+-    # Head norm implausibly tiny after training (should be > 0.01 after 60 gens)
+-    head_norm = float(np.linalg.norm(head_W))
+-    if head_norm < 0.001:
+-        return f"head_weight_norm_too_small: {head_norm:.6f}"
+-
+-    return None
+-
+-
+-# ==========================================================================
+-# Gate 3: Duplicate Detection
+-# ==========================================================================
+-
+-def _check_duplicate(head_W: np.ndarray, svf_scales: np.ndarray,
+-                     submissions_root: Path,
+-                     current_miner: str, current_gen: int) -> Optional[str]:
+-    """Reject a submission whose trained routing HEAD duplicates a prior one.
+-
+-    The routing head is the trained artifact that "original work" refers to: it
+-    alone decides which pool model and role each query is sent to, so it is what
+-    a copy would steal. The SVF singular-value scales, by contrast, start at the
+-    identity (all 1.0) and move only a little, so *every* submission's SVF block
+-    is near-identical to every other's regardless of who trained it.
+-
+-    Folding both blocks into one cosine (the previous behaviour) let that
+-    near-constant SVF block — which is also the larger of the two (7168 vs 6144
+-    values) — dominate the similarity. A copied head could then slip under the
+-    threshold just by re-rolling the meaningless SVF scales: with an identical
+-    head, the concatenated cosine falls to ~0.9986, below the 0.999 gate. So the
+-    gate now compares the HEAD blocks directly; the SVF cosine is reported for
+-    context but never masks a copied head.
+-
+-    Returns None if unique, or an error string naming the matched submission and
+-    both per-block similarities.
+-    """
+-    head = np.asarray(head_W, dtype=np.float64).ravel()
+-    svf = np.asarray(svf_scales, dtype=np.float64).ravel()
+-
+-    def _match(other_hw: np.ndarray, other_sv: np.ndarray) -> Optional[tuple[float, float]]:
+-        other_head = np.asarray(other_hw, dtype=np.float64).ravel()
+-        if other_head.size != head.size:
+-            return None  # different head geometry -> not comparable
+-        h_sim = _cosine_similarity(head, other_head)
+-        s_sim = _cosine_similarity(svf, np.asarray(other_sv, dtype=np.float64).ravel())
+-        return (h_sim, s_sim) if h_sim > _COPY_THRESHOLD else None
+-
+-    # Check all submission directories.
+-    for sub_dir in sorted(submissions_root.glob("*/*/")):
+-        parts = sub_dir.relative_to(submissions_root).parts
+-        if len(parts) < 2:
+-            continue
+-        other_miner, other_gen = parts[0], parts[1]
+-        if other_miner == current_miner and other_gen == str(current_gen):
+-            continue  # skip self
+-
+-        hw_path = sub_dir / "head_weights.npy"
+-        sv_path = sub_dir / "svf_scales.npy"
+-        if not hw_path.exists() or not sv_path.exists():
+-            continue
+-
+-        try:
+-            other_hw = np.load(str(hw_path))
+-            other_sv = np.load(str(sv_path))
+-        except (ValueError, OSError):
+-            continue
+-
+-        hit = _match(other_hw, other_sv)
+-        if hit is not None:
+-            return (f"duplicate_of_{other_miner}_gen_{other_gen}"
+-                    f"_head_sim_{hit[0]:.4f}_svf_sim_{hit[1]:.4f}")
+-
+-    # Also check the current king from the leaderboard.
+-    lb = _load_leaderboard()
+-    for bench_name, bench_entry in lb.get("benchmarks", {}).items():
+-        king_miner = bench_entry.get("best_miner", "")
+-        king_gen = bench_entry.get("best_generation", 0)
+-        if king_miner and king_miner != current_miner:
+-            king_dir = submissions_root / king_miner / str(king_gen)
+-            hw_path = king_dir / "head_weights.npy"
+-            sv_path = king_dir / "svf_scales.npy"
+-            if hw_path.exists() and sv_path.exists():
+-                try:
+-                    king_hw = np.load(str(hw_path))
+-                    king_sv = np.load(str(sv_path))
+-                except (ValueError, OSError):
+-                    continue
+-                hit = _match(king_hw, king_sv)
+-                if hit is not None:
+-                    return (f"duplicate_of_king_{king_miner}_gen_{king_gen}"
+-                            f"_head_sim_{hit[0]:.4f}_svf_sim_{hit[1]:.4f}")
+-
+-    return None
+-
+-
+-def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+-    a, b = np.asarray(a, dtype=np.float64).ravel(), np.asarray(b, dtype=np.float64).ravel()
+-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+-    if na == 0.0 or nb == 0.0:
+-        return 1.0 if na == nb else 0.0
+-    return float(np.dot(a, b) / (na * nb))
+-
+-
+-# ==========================================================================
+-# Gate 4: Receipt Cross-Validation
+-# ==========================================================================
+-
+-def _validate_receipt(receipt: dict) -> Optional[str]:
+-    """Cross-validate receipt fields for plausibility. Returns None if plausible."""
+-    # Cost must be non-zero and above minimum
+-    cost = receipt.get("total_cost_usd", 0.0)
+-    if cost <= 0.0:
+-        return "receipt_cost_zero_or_missing"
+-    if cost < _MIN_TRAINING_COST:
+-        return f"receipt_cost_too_low: ${cost:.2f} < ${_MIN_TRAINING_COST:.2f} minimum"
+-
+-    # Fitness history
+-    history = receipt.get("fitness_history", [])
+-    if not history or len(history) < 3:
+-        return "receipt_fitness_history_too_short: need >= 3 entries"
+-
+-    # Extract fitness values
+-    values = []
+-    for entry in history:
+-        if isinstance(entry, dict):
+-            v = entry.get("gen_mean_fitness", entry.get("mean_fitness", entry.get("best_fitness")))
+-        elif isinstance(entry, (int, float)):
+-            v = entry
+-        else:
+-            continue
+-        if v is not None:
+-            values.append(float(v))
+-
+-    if len(values) < 3:
+-        return "receipt_fitness_history_no_valid_values"
+-
+-    # First generation should not be perfect
+-    if values[0] > 0.98:
+-        return f"receipt_fitness_starts_too_high: {values[0]:.4f}"
+-
+-    # Should not be a flat line
+-    if max(values) - min(values) < 0.001:
+-        return "receipt_fitness_flat_line"
+-
+-    # Should not be perfectly monotonic (real CMA-ES is noisy)
+-    diffs = [values[i+1] - values[i] for i in range(len(values)-1)]
+-    if len(diffs) > 3 and all(d >= 0 for d in diffs):
+-        return "receipt_fitness_too_perfect: monotonically increasing"
+-
+-    # Generation count should match history length
+-    claimed_gens = receipt.get("generations", 0)
+-    if claimed_gens > 0 and abs(claimed_gens - len(history)) > 5:
+-        return f"receipt_generations_mismatch: claimed {claimed_gens}, history has {len(history)}"
+-
+-    # Best fitness is the best CANDIDATE ever evaluated (es.best()); cross-check
+-    # it against the per-generation PEAK series (gen_max_fitness / max_fitness),
+-    # NOT the population MEANS in `values`. With m_cma binary-reward tasks per
+-    # candidate, fitness is granular and the population best sits well above any
+-    # generation mean, so comparing best_fitness to max(values) rejects honest
+-    # receipts. The shape checks above stay on the means, where they belong.
+-    best_fitness = receipt.get("best_fitness", 0.0)
+-    if best_fitness > 0.0:
+-        peaks = []
+-        for entry in history:
+-            if isinstance(entry, dict):
+-                p = entry.get("gen_max_fitness", entry.get("max_fitness", entry.get("best_fitness")))
+-            elif isinstance(entry, (int, float)):
+-                p = entry
+-            else:
+-                continue
+-            if p is not None:
+-                peaks.append(float(p))
+-        if peaks:
+-            peak_max = max(peaks)
+-            if abs(best_fitness - peak_max) > 0.1:
+-                return f"receipt_best_fitness_mismatch: claimed {best_fitness:.4f}, history peak {peak_max:.4f}"
+-
+-    return None
++# Gate implementations live in trinity.submission.gates (imported above).
+ 
+ 
+ # ==========================================================================
+@@ -694,7 +446,8 @@ async def evaluate_pr(pr_number: int, benchmark: str,
+     # GATE 3: Duplicate Detection (cosine similarity vs all history)
+     # ══════════════════════════════════════════════════════════════
+     submissions_root = _REPO / "submissions"
+-    err = _check_duplicate(head_W, svf_scales, submissions_root, miner_name, generation)
++    err = _check_duplicate(head_W, svf_scales, submissions_root, miner_name, generation,
++                           leaderboard=lb, load_leaderboard=_load_leaderboard)
+     if err:
+         return _reject(err)
+ 
+@@ -705,7 +458,15 @@ async def evaluate_pr(pr_number: int, benchmark: str,
+     if err:
+         return _reject(err)
+ 
+-    print("[pr_eval] All 4 pre-eval gates passed ✓\n")
++    # ══════════════════════════════════════════════════════════════
++    # GATE 5: Ledger / receipt cost consistency (offline, no GPU)
++    # ══════════════════════════════════════════════════════════════
++    ledger_path = os.environ.get("TRINITY_COST_LEDGER")
++    err = validate_ledger_receipt_cost(receipt, ledger_path)
++    if err:
++        return _reject(err)
++
++    print("[pr_eval] All 5 pre-eval gates passed ✓\n")
+ 
+     # ══════════════════════════════════════════════════════════════
+     # Load benchmark + encoder (GPU work starts here)
+diff --git a/scripts/preflight_submission.py b/scripts/preflight_submission.py
+new file mode 100644
+index 0000000..bae6e60
+--- /dev/null
++++ b/scripts/preflight_submission.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""Run offline anti-cheat gates on a routing-head submission before opening a PR.
++
++Mirrors ``scripts/pr_eval.py`` gates 1–5 (rate limit, weights, duplicate,
++receipt plausibility, ledger/receipt cost consistency) with **no GPU** and
++**no OpenRouter API** calls. Use this after ``pack_submission.py`` to catch
++rejections locally.
++
++Usage::
++
++    export TRINITY_COST_LEDGER=~/trinity/cost_ledger.jsonl   # optional, gate 5
++    python scripts/preflight_submission.py --submission alice/1 --benchmark math500
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import sys
++from pathlib import Path
++
++_REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(_REPO / "src"))
++
++from trinity.submission.preflight import PreflightRunner  # noqa: E402
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description="Offline submission preflight (no GPU/API)")
++    ap.add_argument(
++        "--submission",
++        required=True,
++        help="Path under submissions/, e.g. alice/1",
++    )
++    ap.add_argument("--benchmark", default="math500", help="Benchmark name (math500 or mmlu)")
++    ap.add_argument(
++        "--ledger",
++        default=None,
++        help="Cost ledger path (defaults to TRINITY_COST_LEDGER env var)",
++    )
++    ap.add_argument(
++        "--repo-root",
++        default=str(_REPO),
++        help="Repository root containing submissions/ and leaderboard.json",
++    )
++    args = ap.parse_args()
++
++    ledger_path = args.ledger or os.environ.get("TRINITY_COST_LEDGER")
++    runner = PreflightRunner(
++        repo_root=Path(args.repo_root),
++        benchmark=args.benchmark,
++        ledger_path=ledger_path,
++    )
++    report = runner.run(args.submission)
++
++    print(f"\n{'=' * 60}")
++    print(f"[preflight] submissions/{args.submission} — {args.benchmark}")
++    print(f"{'=' * 60}")
++    for line in report.summary_lines():
++        print(line)
++
++    if not report.passed:
++        failure = report.first_failure
++        code = failure.reason if failure else "preflight_failed"
++        print(f"\n[preflight] REJECTED: {code}", file=sys.stderr)
++        sys.exit(1)
++
++    print("\n[preflight] Ready to open a PR.")
++    sys.exit(0)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/trinity/submission/__init__.py b/src/trinity/submission/__init__.py
+new file mode 100644
+index 0000000..9ebf75f
+--- /dev/null
++++ b/src/trinity/submission/__init__.py
+@@ -0,0 +1,59 @@
++"""Offline validation for routing-head submission packs."""
++
++from trinity.submission.constants import (
++    DEFAULT_POOL_MODELS,
++    DUPLICATE_HEAD_COSINE_THRESHOLD,
++    EXPECTED_HEAD_SHAPE,
++    EXPECTED_TOTAL_PARAMS,
++    MIN_TRAINING_COST_USD,
++    RATE_LIMIT_MAX_SUBMISSIONS,
++    RATE_LIMIT_WINDOW_DAYS,
++)
++from trinity.submission.gates import (
++    GateResult,
++    OFFLINE_GATES,
++    PreflightContext,
++    SubmissionGate,
++    check_duplicate,
++    check_rate_limit,
++    cosine_similarity,
++    parse_utc_timestamp,
++    rate_limit_entries,
++    run_gate,
++    run_offline_gates,
++    validate_ledger_receipt_cost,
++    validate_receipt,
++    validate_weights,
++)
++from trinity.submission.pack import SubmissionPack, load_submission_pack, parse_submission_identity
++from trinity.submission.preflight import PreflightReport, PreflightRunner, load_leaderboard_json
++
++__all__ = [
++    "DEFAULT_POOL_MODELS",
++    "DUPLICATE_HEAD_COSINE_THRESHOLD",
++    "EXPECTED_HEAD_SHAPE",
++    "EXPECTED_TOTAL_PARAMS",
++    "MIN_TRAINING_COST_USD",
++    "RATE_LIMIT_MAX_SUBMISSIONS",
++    "RATE_LIMIT_WINDOW_DAYS",
++    "GateResult",
++    "OFFLINE_GATES",
++    "PreflightContext",
++    "PreflightReport",
++    "PreflightRunner",
++    "SubmissionGate",
++    "SubmissionPack",
++    "check_duplicate",
++    "check_rate_limit",
++    "cosine_similarity",
++    "load_leaderboard_json",
++    "load_submission_pack",
++    "parse_submission_identity",
++    "parse_utc_timestamp",
++    "rate_limit_entries",
++    "run_gate",
++    "run_offline_gates",
++    "validate_ledger_receipt_cost",
++    "validate_receipt",
++    "validate_weights",
++]
+diff --git a/src/trinity/submission/constants.py b/src/trinity/submission/constants.py
+new file mode 100644
+index 0000000..42d79ef
+--- /dev/null
++++ b/src/trinity/submission/constants.py
+@@ -0,0 +1,25 @@
++"""Frozen constants for routing-head submission validation."""
++
++from __future__ import annotations
++
++# Head W is 6 roles × 1024 hidden; SVF scales are 7 × 1024 singular values.
++EXPECTED_HEAD_PARAMS: int = 6 * 1024
++EXPECTED_SVF_PARAMS: int = 7 * 1024
++EXPECTED_TOTAL_PARAMS: int = EXPECTED_HEAD_PARAMS + EXPECTED_SVF_PARAMS
++EXPECTED_HEAD_SHAPE: tuple[int, int] = (6, 1024)
++
++MIN_TRAINING_COST_USD: float = 15.0
++MAX_WEIGHT_MAGNITUDE: float = 1e6
++DUPLICATE_HEAD_COSINE_THRESHOLD: float = 0.999
++
++RATE_LIMIT_WINDOW_DAYS: int = 7
++RATE_LIMIT_MAX_SUBMISSIONS: int = 1
++
++# Receipt cost vs verified ledger may differ by rounding across many rows.
++LEDGER_RECEIPT_COST_TOLERANCE_USD: float = 0.05
++
++DEFAULT_POOL_MODELS: tuple[str, ...] = (
++    "qwen3.5-35b-a3b",
++    "minimax-m3",
++    "deepseek-v4-flash",
++)
+diff --git a/src/trinity/submission/gates.py b/src/trinity/submission/gates.py
+new file mode 100644
+index 0000000..c60d55c
+--- /dev/null
++++ b/src/trinity/submission/gates.py
+@@ -0,0 +1,370 @@
++"""Offline anti-cheat gates for routing-head submissions (pr_eval gates 1–5).
++
++These checks run with no GPU and no OpenRouter calls. ``scripts/pr_eval.py``
++imports this module; miners can run the same logic locally via
++``scripts/preflight_submission.py`` before opening a PR.
++"""
++from __future__ import annotations
++
++import calendar
++import time
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any, Callable, Optional
++
++import numpy as np
++
++from trinity.llm.openrouter_pricing import verified_ledger_total_usd
++from trinity.submission.constants import (
++    DUPLICATE_HEAD_COSINE_THRESHOLD,
++    EXPECTED_HEAD_SHAPE,
++    EXPECTED_TOTAL_PARAMS,
++    LEDGER_RECEIPT_COST_TOLERANCE_USD,
++    MAX_WEIGHT_MAGNITUDE,
++    MIN_TRAINING_COST_USD,
++    RATE_LIMIT_MAX_SUBMISSIONS,
++    RATE_LIMIT_WINDOW_DAYS,
++)
++from trinity.submission.pack import SubmissionPack
++
++__all__ = [
++    "GateResult",
++    "PreflightContext",
++    "SubmissionGate",
++    "parse_utc_timestamp",
++    "rate_limit_entries",
++    "check_rate_limit",
++    "validate_weights",
++    "check_duplicate",
++    "cosine_similarity",
++    "validate_receipt",
++    "validate_ledger_receipt_cost",
++    "OFFLINE_GATES",
++    "run_gate",
++    "run_offline_gates",
++]
++
++
++@dataclass(frozen=True)
++class GateResult:
++    """Outcome of one gate or the full offline preflight chain."""
++
++    gate: str
++    ok: bool
++    reason: str | None = None
++
++    @property
++    def failed(self) -> bool:
++        return not self.ok
++
++
++@dataclass
++class PreflightContext:
++    """Runtime inputs shared across gates."""
++
++    benchmark: str
++    leaderboard: dict[str, Any]
++    submissions_root: Path
++    pr_number: int | None = None
++    ledger_path: str | None = None
++    load_leaderboard: Callable[[], dict[str, Any]] | None = None
++
++
++class SubmissionGate:
++    """Named gate with a stable identifier for logging and tests."""
++
++    name: str
++    _check: Callable[[SubmissionPack, PreflightContext], Optional[str]]
++
++    def __init__(self, name: str, check: Callable[[SubmissionPack, PreflightContext], Optional[str]]):
++        self.name = name
++        self._check = check
++
++    def run(self, pack: SubmissionPack, ctx: PreflightContext) -> GateResult:
++        reason = self._check(pack, ctx)
++        return GateResult(gate=self.name, ok=reason is None, reason=reason)
++
++
++def parse_utc_timestamp(ts_str: str) -> Optional[float]:
++    """Parse ``YYYY-MM-DDTHH:MM:SSZ`` to a UTC Unix epoch."""
++    if not ts_str:
++        return None
++    try:
++        return float(calendar.timegm(time.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ")))
++    except (ValueError, OSError):
++        return None
++
++
++def rate_limit_entries(bench_entry: dict[str, Any]) -> list[dict[str, Any]]:
++    attempts = bench_entry.get("attempts")
++    if attempts is not None:
++        return list(attempts)
++    return list(bench_entry.get("history", []))
++
++
++def check_rate_limit(
++    miner_name: str,
++    benchmark: str,
++    leaderboard: dict[str, Any],
++) -> Optional[str]:
++    bench_entry = leaderboard.get("benchmarks", {}).get(benchmark, {})
++    entries = rate_limit_entries(bench_entry)
++    cutoff = time.time() - RATE_LIMIT_WINDOW_DAYS * 86400
++    recent = 0
++    for entry in entries:
++        ts = parse_utc_timestamp(entry.get("timestamp", ""))
++        if ts is None:
++            continue
++        if entry.get("miner") == miner_name and ts > cutoff:
++            recent += 1
++    if recent >= RATE_LIMIT_MAX_SUBMISSIONS:
++        return (
++            f"rate_limited: {recent} submission(s) in the last "
++            f"{RATE_LIMIT_WINDOW_DAYS} days (max {RATE_LIMIT_MAX_SUBMISSIONS})"
++        )
++    return None
++
++
++def validate_weights(head_W: np.ndarray, svf_scales: np.ndarray) -> Optional[str]:
++    if head_W.size + svf_scales.size != EXPECTED_TOTAL_PARAMS:
++        return f"param_count: got {head_W.size + svf_scales.size}, expected {EXPECTED_TOTAL_PARAMS}"
++    if head_W.shape != EXPECTED_HEAD_SHAPE:
++        return f"head_shape: got {head_W.shape}, expected {EXPECTED_HEAD_SHAPE}"
++    if np.any(np.isnan(head_W)) or np.any(np.isnan(svf_scales)):
++        return "weights_contain_NaN"
++    if np.any(np.isinf(head_W)) or np.any(np.isinf(svf_scales)):
++        return "weights_contain_Inf"
++    if np.any(np.abs(head_W) > MAX_WEIGHT_MAGNITUDE):
++        return f"head_weights_exceed_max: max_abs={np.max(np.abs(head_W)):.1f}"
++    if np.any(np.abs(svf_scales) > MAX_WEIGHT_MAGNITUDE):
++        return f"svf_scales_exceed_max: max_abs={np.max(np.abs(svf_scales)):.1f}"
++    if np.allclose(head_W, 0.0):
++        return "head_weights_all_zeros"
++    if np.allclose(svf_scales, 0.0):
++        return "svf_scales_all_zeros"
++    head_norm = float(np.linalg.norm(head_W))
++    if head_norm < 0.001:
++        return f"head_weight_norm_too_small: {head_norm:.6f}"
++    return None
++
++
++def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
++    a_arr = np.asarray(a, dtype=np.float64).ravel()
++    b_arr = np.asarray(b, dtype=np.float64).ravel()
++    na, nb = np.linalg.norm(a_arr), np.linalg.norm(b_arr)
++    if na == 0.0 or nb == 0.0:
++        return 1.0 if na == nb else 0.0
++    return float(np.dot(a_arr, b_arr) / (na * nb))
++
++
++def check_duplicate(
++    head_W: np.ndarray,
++    svf_scales: np.ndarray,
++    submissions_root: Path,
++    current_miner: str,
++    current_gen: int,
++    *,
++    leaderboard: dict[str, Any] | None = None,
++    load_leaderboard: Callable[[], dict[str, Any]] | None = None,
++) -> Optional[str]:
++    head = np.asarray(head_W, dtype=np.float64).ravel()
++    svf = np.asarray(svf_scales, dtype=np.float64).ravel()
++
++    def _match(other_hw: np.ndarray, other_sv: np.ndarray) -> Optional[tuple[float, float]]:
++        other_head = np.asarray(other_hw, dtype=np.float64).ravel()
++        if other_head.size != head.size:
++            return None
++        h_sim = cosine_similarity(head, other_head)
++        s_sim = cosine_similarity(svf, np.asarray(other_sv, dtype=np.float64).ravel())
++        return (h_sim, s_sim) if h_sim > DUPLICATE_HEAD_COSINE_THRESHOLD else None
++
++    for sub_dir in sorted(submissions_root.glob("*/*/")):
++        parts = sub_dir.relative_to(submissions_root).parts
++        if len(parts) < 2:
++            continue
++        other_miner, other_gen = parts[0], parts[1]
++        if other_miner == current_miner and other_gen == str(current_gen):
++            continue
++        hw_path = sub_dir / "head_weights.npy"
++        sv_path = sub_dir / "svf_scales.npy"
++        if not hw_path.exists() or not sv_path.exists():
++            continue
++        try:
++            other_hw = np.load(str(hw_path))
++            other_sv = np.load(str(sv_path))
++        except (ValueError, OSError):
++            continue
++        hit = _match(other_hw, other_sv)
++        if hit is not None:
++            return (
++                f"duplicate_of_{other_miner}_gen_{other_gen}"
++                f"_head_sim_{hit[0]:.4f}_svf_sim_{hit[1]:.4f}"
++            )
++
++    lb = leaderboard if leaderboard is not None else (
++        load_leaderboard() if load_leaderboard is not None else {}
++    )
++    for _bench_name, bench_entry in lb.get("benchmarks", {}).items():
++        king_miner = bench_entry.get("best_miner", "")
++        king_gen = bench_entry.get("best_generation", 0)
++        if not king_miner or king_miner == current_miner:
++            continue
++        king_dir = submissions_root / king_miner / str(king_gen)
++        hw_path = king_dir / "head_weights.npy"
++        sv_path = king_dir / "svf_scales.npy"
++        if not (hw_path.exists() and sv_path.exists()):
++            continue
++        try:
++            king_hw = np.load(str(hw_path))
++            king_sv = np.load(str(sv_path))
++        except (ValueError, OSError):
++            continue
++        hit = _match(king_hw, king_sv)
++        if hit is not None:
++            return (
++                f"duplicate_of_king_{king_miner}_gen_{king_gen}"
++                f"_head_sim_{hit[0]:.4f}_svf_sim_{hit[1]:.4f}"
++            )
++    return None
++
++
++def validate_receipt(receipt: dict[str, Any]) -> Optional[str]:
++    cost = receipt.get("total_cost_usd", 0.0)
++    if cost <= 0.0:
++        return "receipt_cost_zero_or_missing"
++    if cost < MIN_TRAINING_COST_USD:
++        return f"receipt_cost_too_low: ${cost:.2f} < ${MIN_TRAINING_COST_USD:.2f} minimum"
++
++    history = receipt.get("fitness_history", [])
++    if not history or len(history) < 3:
++        return "receipt_fitness_history_too_short: need >= 3 entries"
++
++    values: list[float] = []
++    for entry in history:
++        if isinstance(entry, dict):
++            v = entry.get("gen_mean_fitness", entry.get("mean_fitness", entry.get("best_fitness")))
++        elif isinstance(entry, (int, float)):
++            v = entry
++        else:
++            continue
++        if v is not None:
++            values.append(float(v))
++    if len(values) < 3:
++        return "receipt_fitness_history_no_valid_values"
++    if values[0] > 0.98:
++        return f"receipt_fitness_starts_too_high: {values[0]:.4f}"
++    if max(values) - min(values) < 0.001:
++        return "receipt_fitness_flat_line"
++    diffs = [values[i + 1] - values[i] for i in range(len(values) - 1)]
++    if len(diffs) > 3 and all(d >= 0 for d in diffs):
++        return "receipt_fitness_too_perfect: monotonically increasing"
++
++    claimed_gens = receipt.get("generations", 0)
++    if claimed_gens > 0 and abs(claimed_gens - len(history)) > 5:
++        return f"receipt_generations_mismatch: claimed {claimed_gens}, history has {len(history)}"
++
++    best_fitness = receipt.get("best_fitness", 0.0)
++    if best_fitness > 0.0:
++        peaks: list[float] = []
++        for entry in history:
++            if isinstance(entry, dict):
++                p = entry.get("gen_max_fitness", entry.get("max_fitness", entry.get("best_fitness")))
++            elif isinstance(entry, (int, float)):
++                p = entry
++            else:
++                continue
++            if p is not None:
++                peaks.append(float(p))
++        if peaks:
++            peak_max = max(peaks)
++            if abs(best_fitness - peak_max) > 0.1:
++                return (
++                    f"receipt_best_fitness_mismatch: claimed {best_fitness:.4f}, "
++                    f"history peak {peak_max:.4f}"
++                )
++    return None
++
++
++def validate_ledger_receipt_cost(
++    receipt: dict[str, Any],
++    ledger_path: str | None,
++) -> Optional[str]:
++    """Gate 5: receipt ``total_cost_usd`` must match the verified ledger total."""
++    if not ledger_path:
++        return None
++    receipt_cost = float(receipt.get("total_cost_usd", 0.0))
++    if receipt_cost <= 0.0:
++        return None
++    ledger_total = verified_ledger_total_usd(ledger_path)
++    if ledger_total is None:
++        return "ledger_cost_unverifiable: TRINITY_COST_LEDGER failed hash-chain verification"
++    delta = abs(receipt_cost - ledger_total)
++    if delta > LEDGER_RECEIPT_COST_TOLERANCE_USD:
++        return (
++            f"ledger_receipt_cost_mismatch: receipt ${receipt_cost:.4f} vs "
++            f"verified ledger ${ledger_total:.4f} (delta ${delta:.4f})"
++        )
++    return None
++
++
++def _gate_rate_limit(pack: SubmissionPack, ctx: PreflightContext) -> Optional[str]:
++    return check_rate_limit(pack.miner, ctx.benchmark, ctx.leaderboard)
++
++
++def _gate_weights(pack: SubmissionPack, ctx: PreflightContext) -> Optional[str]:
++    del ctx
++    return validate_weights(pack.head_weights, pack.svf_scales)
++
++
++def _gate_duplicate(pack: SubmissionPack, ctx: PreflightContext) -> Optional[str]:
++    return check_duplicate(
++        pack.head_weights,
++        pack.svf_scales,
++        ctx.submissions_root,
++        pack.miner,
++        pack.generation,
++        leaderboard=ctx.leaderboard,
++        load_leaderboard=ctx.load_leaderboard,
++    )
++
++
++def _gate_receipt(pack: SubmissionPack, ctx: PreflightContext) -> Optional[str]:
++    del ctx
++    if not pack.receipt:
++        return "receipt_missing"
++    return validate_receipt(pack.receipt)
++
++
++def _gate_ledger_cost(pack: SubmissionPack, ctx: PreflightContext) -> Optional[str]:
++    if not pack.receipt:
++        return None
++    return validate_ledger_receipt_cost(pack.receipt, ctx.ledger_path)
++
++
++OFFLINE_GATES: tuple[SubmissionGate, ...] = (
++    SubmissionGate("rate_limit", _gate_rate_limit),
++    SubmissionGate("weights", _gate_weights),
++    SubmissionGate("duplicate", _gate_duplicate),
++    SubmissionGate("receipt", _gate_receipt),
++    SubmissionGate("ledger_cost", _gate_ledger_cost),
++)
++
++
++def run_gate(gate: SubmissionGate, pack: SubmissionPack, ctx: PreflightContext) -> GateResult:
++    return gate.run(pack, ctx)
++
++
++def run_offline_gates(
++    pack: SubmissionPack,
++    ctx: PreflightContext,
++    *,
++    gates: tuple[SubmissionGate, ...] = OFFLINE_GATES,
++) -> list[GateResult]:
++    """Run gates in order; continues through all gates when ``collect_all=True`` is needed."""
++    results: list[GateResult] = []
++    for gate in gates:
++        result = run_gate(gate, pack, ctx)
++        results.append(result)
++        if result.failed:
++            break
++    return results
+diff --git a/src/trinity/submission/pack.py b/src/trinity/submission/pack.py
+new file mode 100644
+index 0000000..c9042d8
+--- /dev/null
++++ b/src/trinity/submission/pack.py
+@@ -0,0 +1,83 @@
++"""Load a routing-head submission directory into typed artifacts."""
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++
++__all__ = ["SubmissionPack", "load_submission_pack", "parse_submission_identity"]
++
++
++@dataclass(frozen=True)
++class SubmissionPack:
++    """One miner generation's submission artifacts."""
++
++    path: Path
++    miner: str
++    generation: int
++    head_weights: np.ndarray
++    svf_scales: np.ndarray
++    receipt: dict[str, Any]
++
++    @property
++    def has_receipt(self) -> bool:
++        return bool(self.receipt)
++
++
++def parse_submission_identity(submission_dir: Path, submissions_root: Path) -> tuple[str, int]:
++    """Infer miner name and generation from ``submissions/<miner>/<gen>/`` layout."""
++    rel = submission_dir.resolve().relative_to(submissions_root.resolve())
++    parts = rel.parts
++    if len(parts) < 2:
++        return submission_dir.name, 0
++    miner = parts[0]
++    try:
++        generation = int(parts[1])
++    except ValueError:
++        generation = 0
++    return miner, generation
++
++
++def load_submission_pack(
++    submission_dir: Path,
++    *,
++    submissions_root: Path | None = None,
++) -> SubmissionPack | None:
++    """Load ``head_weights.npy``, ``svf_scales.npy``, and optional ``receipt.json``.
++
++    Returns ``None`` when required weight files are missing or unreadable.
++    """
++    root = submissions_root or submission_dir.parent.parent
++    miner, generation = parse_submission_identity(submission_dir, root)
++
++    hw_path = submission_dir / "head_weights.npy"
++    sv_path = submission_dir / "svf_scales.npy"
++    rc_path = submission_dir / "receipt.json"
++
++    if not hw_path.exists() or not sv_path.exists():
++        return None
++
++    try:
++        head_weights = np.load(str(hw_path)).astype(np.float32)
++        svf_scales = np.load(str(sv_path)).astype(np.float32)
++    except (ValueError, OSError):
++        return None
++
++    receipt: dict[str, Any] = {}
++    if rc_path.exists():
++        try:
++            receipt = json.loads(rc_path.read_text(encoding="utf-8"))
++        except (json.JSONDecodeError, OSError):
++            receipt = {}
++
++    return SubmissionPack(
++        path=submission_dir,
++        miner=miner,
++        generation=generation,
++        head_weights=head_weights,
++        svf_scales=svf_scales,
++        receipt=receipt,
++    )
+diff --git a/src/trinity/submission/preflight.py b/src/trinity/submission/preflight.py
+new file mode 100644
+index 0000000..24ae3ba
+--- /dev/null
++++ b/src/trinity/submission/preflight.py
+@@ -0,0 +1,105 @@
++"""Orchestrate offline submission preflight checks."""
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any
++
++from trinity.submission.gates import (
++    GateResult,
++    PreflightContext,
++    run_offline_gates,
++)
++from trinity.submission.pack import SubmissionPack, load_submission_pack
++
++__all__ = ["PreflightReport", "PreflightRunner", "load_leaderboard_json"]
++
++
++@dataclass
++class PreflightReport:
++    """Aggregated outcome of an offline preflight run."""
++
++    pack: SubmissionPack
++    benchmark: str
++    results: list[GateResult] = field(default_factory=list)
++
++    @property
++    def passed(self) -> bool:
++        return bool(self.results) and all(r.ok for r in self.results)
++
++    @property
++    def first_failure(self) -> GateResult | None:
++        for result in self.results:
++            if result.failed:
++                return result
++        return None
++
++    def summary_lines(self) -> list[str]:
++        lines = [
++            f"miner={self.pack.miner} generation={self.pack.generation} benchmark={self.benchmark}",
++        ]
++        for result in self.results:
++            status = "PASS" if result.ok else "FAIL"
++            detail = "" if result.ok else f" — {result.reason}"
++            lines.append(f"  [{status}] {result.gate}{detail}")
++        if self.passed:
++            lines.append("All offline gates passed.")
++        return lines
++
++
++class PreflightRunner:
++    """Run the same offline gates as ``pr_eval`` on a local submission directory."""
++
++    def __init__(
++        self,
++        *,
++        repo_root: Path,
++        benchmark: str,
++        leaderboard: dict[str, Any] | None = None,
++        ledger_path: str | None = None,
++    ) -> None:
++        self.repo_root = repo_root
++        self.benchmark = benchmark
++        self.leaderboard = leaderboard if leaderboard is not None else load_leaderboard_json(repo_root)
++        self.ledger_path = ledger_path
++        self.submissions_root = repo_root / "submissions"
++
++    def run(self, submission_subpath: str | Path) -> PreflightReport:
++        submission_dir = self.submissions_root / str(submission_subpath)
++        pack = load_submission_pack(submission_dir, submissions_root=self.submissions_root)
++        if pack is None:
++            import numpy as _np
++
++            stub = SubmissionPack(
++                path=submission_dir,
++                miner=submission_dir.name,
++                generation=0,
++                head_weights=_np.array([], dtype=_np.float32),
++                svf_scales=_np.array([], dtype=_np.float32),
++                receipt={},
++            )
++            return PreflightReport(
++                pack=stub,
++                benchmark=self.benchmark,
++                results=[GateResult("load", False, "submission_incomplete: missing weight files")],
++            )
++
++        ctx = PreflightContext(
++            benchmark=self.benchmark,
++            leaderboard=self.leaderboard,
++            submissions_root=self.submissions_root,
++            ledger_path=self.ledger_path,
++        )
++        results = run_offline_gates(pack, ctx)
++        return PreflightReport(pack=pack, benchmark=self.benchmark, results=results)
++
++
++def load_leaderboard_json(repo_root: Path) -> dict[str, Any]:
++    lb_path = repo_root / "leaderboard.json"
++    if not lb_path.exists():
++        return {"benchmarks": {}}
++    try:
++        return json.loads(lb_path.read_text(encoding="utf-8"))
++    except (json.JSONDecodeError, OSError):
++        return {"benchmarks": {}}
+diff --git a/tests/test_submission_preflight.py b/tests/test_submission_preflight.py
+new file mode 100644
+index 0000000..cdadf95
+--- /dev/null
++++ b/tests/test_submission_preflight.py
+@@ -0,0 +1,241 @@
++"""Offline tests for trinity.submission preflight and gate modules."""
++from __future__ import annotations
++
++import json
++import subprocess
++import sys
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from trinity.llm import cost_ledger as CL
++from trinity.submission.constants import EXPECTED_HEAD_SHAPE
++from trinity.submission.gates import (
++    GateResult,
++    OFFLINE_GATES,
++    PreflightContext,
++    check_duplicate,
++    validate_ledger_receipt_cost,
++    validate_receipt,
++    validate_weights,
++)
++from trinity.submission.pack import load_submission_pack, parse_submission_identity
++from trinity.submission.preflight import PreflightRunner
++
++_REPO = Path(__file__).resolve().parents[1]
++_HEAD_SHAPE = EXPECTED_HEAD_SHAPE
++_N_SVF = 7168
++
++
++def _rand_head(seed: int) -> np.ndarray:
++    return np.random.default_rng(seed).normal(0, 0.05, _HEAD_SHAPE).astype(np.float32)
++
++
++def _near_identity_svf(seed: int, std: float = 0.02) -> np.ndarray:
++    return (1.0 + np.random.default_rng(seed).normal(0, std, _N_SVF)).astype(np.float32)
++
++
++def _honest_receipt(cost: float = 21.5) -> dict:
++    gens = [
++        (0.30, 0.50, 0.50), (0.42, 0.58, 0.58), (0.39, 0.61, 0.61),
++        (0.55, 0.69, 0.69), (0.58, 0.66, 0.69), (0.60, 0.72, 0.72),
++    ]
++    return {
++        "total_cost_usd": cost,
++        "generations": len(gens),
++        "best_fitness": 0.72,
++        "fitness_history": [
++            {"generation": i, "mean_fitness": m, "max_fitness": mx, "best_fitness": b}
++            for i, (m, mx, b) in enumerate(gens)
++        ],
++    }
++
++
++def _write_submission(
++    root: Path,
++    miner: str,
++    gen: int,
++    *,
++    head: np.ndarray | None = None,
++    svf: np.ndarray | None = None,
++    receipt: dict | None = None,
++) -> Path:
++    d = root / miner / str(gen)
++    d.mkdir(parents=True, exist_ok=True)
++    np.save(d / "head_weights.npy", head if head is not None else _rand_head(gen))
++    np.save(d / "svf_scales.npy", svf if svf is not None else _near_identity_svf(gen))
++    if receipt is not None:
++        (d / "receipt.json").write_text(json.dumps(receipt), encoding="utf-8")
++    return d
++
++
++# --------------------------------------------------------------------------- #
++# Pack loading
++# --------------------------------------------------------------------------- #
++def test_parse_submission_identity_from_layout(tmp_path: Path):
++    subs = tmp_path / "submissions"
++    pack_dir = _write_submission(subs, "alice", 3)
++    miner, gen = parse_submission_identity(pack_dir, subs)
++    assert miner == "alice"
++    assert gen == 3
++
++
++def test_load_submission_pack_round_trip(tmp_path: Path):
++    subs = tmp_path / "submissions"
++    receipt = _honest_receipt()
++    pack_dir = _write_submission(subs, "bob", 1, receipt=receipt)
++    pack = load_submission_pack(pack_dir, submissions_root=subs)
++    assert pack is not None
++    assert pack.miner == "bob"
++    assert pack.generation == 1
++    assert pack.head_weights.shape == _HEAD_SHAPE
++    assert pack.receipt["best_fitness"] == 0.72
++
++
++def test_load_submission_pack_missing_weights_returns_none(tmp_path: Path):
++    subs = tmp_path / "submissions"
++    d = subs / "carol" / "1"
++    d.mkdir(parents=True)
++    assert load_submission_pack(d, submissions_root=subs) is None
++
++
++# --------------------------------------------------------------------------- #
++# Gate 2: weights
++# --------------------------------------------------------------------------- #
++def test_validate_weights_accepts_trained_head():
++    assert validate_weights(_rand_head(1), _near_identity_svf(1)) is None
++
++
++def test_validate_weights_rejects_all_zero_head():
++    head = np.zeros(_HEAD_SHAPE, dtype=np.float32)
++    assert validate_weights(head, _near_identity_svf(1)) == "head_weights_all_zeros"
++
++
++def test_validate_weights_rejects_nan():
++    head = _rand_head(1)
++    head[0, 0] = np.nan
++    assert validate_weights(head, _near_identity_svf(1)) == "weights_contain_NaN"
++
++
++# --------------------------------------------------------------------------- #
++# Gate 4: receipt
++# --------------------------------------------------------------------------- #
++def test_validate_receipt_accepts_honest_pack_receipt():
++    assert validate_receipt(_honest_receipt()) is None
++
++
++def test_validate_receipt_rejects_fabricated_best_fitness():
++    receipt = _honest_receipt()
++    receipt["best_fitness"] = 0.99
++    reason = validate_receipt(receipt)
++    assert reason is not None
++    assert reason.startswith("receipt_best_fitness_mismatch")
++
++
++# --------------------------------------------------------------------------- #
++# Gate 5: ledger / receipt cost
++# --------------------------------------------------------------------------- #
++def test_ledger_cost_gate_skipped_without_ledger_env():
++    assert validate_ledger_receipt_cost(_honest_receipt(), None) is None
++
++
++def test_ledger_cost_gate_passes_when_totals_match(tmp_path: Path):
++    ledger = tmp_path / "ledger.jsonl"
++    CL.append_ledger_entry(ledger, "qwen3.5-35b-a3b", 2_000_000, 500_000)
++    from trinity.llm.openrouter_pricing import verified_ledger_total_usd
++
++    total = verified_ledger_total_usd(ledger)
++    assert total is not None
++    receipt = _honest_receipt(cost=round(total, 4))
++    assert validate_ledger_receipt_cost(receipt, str(ledger)) is None
++
++
++def test_ledger_cost_gate_fails_on_mismatch(tmp_path: Path):
++    ledger = tmp_path / "ledger.jsonl"
++    CL.append_ledger_entry(ledger, "minimax-m3", 1_000_000, 1_000_000)
++    receipt = _honest_receipt(cost=1.0)
++    reason = validate_ledger_receipt_cost(receipt, str(ledger))
++    assert reason is not None
++    assert reason.startswith("ledger_receipt_cost_mismatch")
++
++
++def test_ledger_cost_gate_fails_on_tampered_chain(tmp_path: Path):
++    ledger = tmp_path / "ledger.jsonl"
++    CL.append_ledger_entry(ledger, "qwen3.5-35b-a3b", 100, 50)
++    text = ledger.read_text(encoding="utf-8")
++    ledger.write_text(text.replace('"p":100', '"p":999'), encoding="utf-8")
++    receipt = _honest_receipt(cost=21.5)
++    assert validate_ledger_receipt_cost(receipt, str(ledger)) == (
++        "ledger_cost_unverifiable: TRINITY_COST_LEDGER failed hash-chain verification"
++    )
++
++
++# --------------------------------------------------------------------------- #
++# Gate 3: duplicate (head-only)
++# --------------------------------------------------------------------------- #
++def test_check_duplicate_catches_copied_head_with_rerolled_svf(tmp_path: Path):
++    head = _rand_head(1)
++    _write_submission(tmp_path, "alice", 1, head=head, svf=_near_identity_svf(10))
++    err = check_duplicate(
++        head, _near_identity_svf(999, std=0.05), tmp_path, "bob", 1, leaderboard={"benchmarks": {}}
++    )
++    assert err is not None and err.startswith("duplicate_of_alice_gen_1")
++
++
++# --------------------------------------------------------------------------- #
++# Preflight runner + CLI
++# --------------------------------------------------------------------------- #
++def test_preflight_runner_passes_clean_submission(tmp_path: Path, monkeypatch):
++    subs = tmp_path / "submissions"
++    _write_submission(subs, "dana", 1, receipt=_honest_receipt())
++    (tmp_path / "leaderboard.json").write_text(json.dumps({"benchmarks": {}}))
++    runner = PreflightRunner(repo_root=tmp_path, benchmark="math500")
++    report = runner.run("dana/1")
++    assert report.passed
++    assert len(report.results) == len(OFFLINE_GATES)
++    assert "All offline gates passed." in report.summary_lines()[-1]
++
++
++def test_preflight_runner_fails_on_duplicate(tmp_path: Path):
++    subs = tmp_path / "submissions"
++    head = _rand_head(7)
++    _write_submission(subs, "king", 1, head=head, receipt=_honest_receipt())
++    _write_submission(subs, "eve", 2, head=head, receipt=_honest_receipt())
++    (tmp_path / "leaderboard.json").write_text(json.dumps({"benchmarks": {}}))
++    runner = PreflightRunner(repo_root=tmp_path, benchmark="math500")
++    report = runner.run("eve/2")
++    assert not report.passed
++    failure = report.first_failure
++    assert failure is not None
++    assert failure.gate == "duplicate"
++
++
++def test_preflight_cli_exits_zero_on_pass(tmp_path: Path, monkeypatch):
++    subs = tmp_path / "submissions"
++    _write_submission(subs, "frank", 1, receipt=_honest_receipt())
++    (tmp_path / "leaderboard.json").write_text(json.dumps({"benchmarks": {}}))
++    proc = subprocess.run(
++        [
++            sys.executable,
++            str(_REPO / "scripts" / "preflight_submission.py"),
++            "--submission",
++            "frank/1",
++            "--benchmark",
++            "math500",
++            "--repo-root",
++            str(tmp_path),
++        ],
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert proc.returncode == 0
++    assert "All offline gates passed." in proc.stdout
++
++
++def test_gate_result_failed_property():
++    ok = GateResult("weights", True)
++    bad = GateResult("receipt", False, "receipt_missing")
++    assert not ok.failed
++    assert bad.failed

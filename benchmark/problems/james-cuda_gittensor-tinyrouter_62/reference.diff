@@ -1,0 +1,173 @@
+diff --git a/scripts/build_benchmark.py b/scripts/build_benchmark.py
+index f496352..94dde9d 100644
+--- a/scripts/build_benchmark.py
++++ b/scripts/build_benchmark.py
+@@ -77,8 +77,12 @@ def _sample_pool(benchmark: str, counts: Dict[str, int]) -> List[Any]:
+     return protocol.sample_pool(load_tasks, benchmark, counts, seed=_BENCHMARK_SEED)
+ 
+ 
+-async def _cache_answers(items: List[Dict], pool, pool_models: List[str]) -> None:
+-    """Call each model ONCE per question (temp=0) and cache the answer.
++async def _cache_answers(
++    task_item_pairs: List[tuple[Any, Dict]],
++    pool,
++    pool_models: List[str],
++) -> None:
++    """Call each model once per task (temp=0) and cache the answer.
+ 
+     The cached answers back the 70%-weighted single-turn score, so they must be
+     produced with the SAME single-turn invocation the router is trained and
+@@ -91,18 +95,22 @@ async def _cache_answers(items: List[Dict], pool, pool_models: List[str]) -> Non
+     """
+     import httpx
+ 
++    from trinity.adapters import get_adapter
+     from trinity.roles.prompts import build_messages
+     from trinity.types import Role
+ 
+     async with httpx.AsyncClient() as client:
+-        for item in items:
++        for task, item in task_item_pairs:
++            benchmark = getattr(task, "benchmark", None) or item.get("benchmark", "math500")
++            adapter = get_adapter(str(benchmark))
++            prompt = adapter.build_prompt(task)
+             for model_name in pool_models:
+                 if item["model_answers"].get(model_name):
+                     continue  # already cached
+                 try:
+                     res = await pool.chat(
+                         model_name,
+-                        build_messages(Role.WORKER, item["question_text"], []),
++                        build_messages(Role.WORKER, prompt, []),
+                         max_tokens=4096, temperature=0.0, top_p=1.0,
+                         client=client,
+                     )
+@@ -147,6 +155,10 @@ async def build_benchmark(benchmark: str, output_dir: str, password: str) -> str
+     bench_dir = Path(output_dir) / benchmark
+     bench_dir.mkdir(parents=True, exist_ok=True)
+ 
++    from trinity.adapters import get_adapter
++
++    get_adapter(benchmark)  # fail fast if the benchmark has no adapter
++
+     print(f"Building hidden benchmark for: {benchmark}")
+     print(f"  Seed: {_BENCHMARK_SEED} (SEALED — never change)")
+     print(f"  Output: {bench_dir}")
+@@ -165,11 +177,15 @@ async def build_benchmark(benchmark: str, output_dir: str, password: str) -> str
+     # Convert to items with a stable, protocol-defined id. A pool-global index
+     # feeds the deterministic id fallback so ids never collide across splits.
+     items_by_split: Dict[str, List[Dict]] = {}
++    cache_pairs: List[tuple[Any, Dict]] = []
+     idx = 0
+     for name in protocol.SPLIT_ORDER:
+         built = []
+         for t in task_splits[name]:
+-            built.append(_task_to_item(t, idx))
++            item = _task_to_item(t, idx)
++            built.append(item)
++            if name != "live":
++                cache_pairs.append((t, item))
+             idx += 1
+         items_by_split[name] = built
+ 
+@@ -193,13 +209,13 @@ async def build_benchmark(benchmark: str, output_dir: str, password: str) -> str
+     pool_models = list(pool.models.keys())
+ 
+     all_cacheable = eval_items + audit_items
+-    total_calls = len(all_cacheable) * len(pool_models)
++    total_calls = len(cache_pairs) * len(pool_models)
+     est_cost = total_calls * 0.003
+-    print(f"\nPre-computing cached answers: {len(all_cacheable)} questions × "
++    print(f"\nPre-computing cached answers: {len(cache_pairs)} questions × "
+           f"{len(pool_models)} models = {total_calls} API calls")
+     print(f"Estimated cost: ~${est_cost:.2f}")
+ 
+-    await _cache_answers(all_cacheable, pool, pool_models)
++    await _cache_answers(cache_pairs, pool, pool_models)
+     print("  Caching complete.")
+ 
+     # Save encrypted files
+@@ -257,8 +273,11 @@ def main() -> None:
+     ap = argparse.ArgumentParser(
+         description="Build the hidden benchmark for the TinyRouter accuracy competition"
+     )
++    from trinity.adapters import available_adapters
++
+     ap.add_argument("--benchmark", required=True,
+-                    help="Benchmark name (math500 or mmlu)")
++                    choices=available_adapters(),
++                    help="Registered benchmark name (via adapter registry)")
+     ap.add_argument("--output-dir", default=None, dest="output_dir",
+                     help="Output directory (default: $TINYROUTER_BENCHMARK_DIR or "
+                          "../tinyrouter-benchmark/)")
+diff --git a/tests/test_build_benchmark_adapters.py b/tests/test_build_benchmark_adapters.py
+new file mode 100644
+index 0000000..2042139
+--- /dev/null
++++ b/tests/test_build_benchmark_adapters.py
+@@ -0,0 +1,65 @@
++"""Tests that build_benchmark routes through benchmark adapters (issue #15)."""
++from __future__ import annotations
++
++import asyncio
++import importlib.util
++import sys
++from pathlib import Path
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++_REPO = Path(__file__).resolve().parents[1]
++
++
++def _load_build_benchmark():
++    spec = importlib.util.spec_from_file_location(
++        "build_benchmark",
++        _REPO / "scripts" / "build_benchmark.py",
++    )
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules["build_benchmark"] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++@pytest.fixture(scope="module")
++def build_benchmark():
++    return _load_build_benchmark()
++
++
++def test_task_to_item_uses_registered_adapter(build_benchmark):
++    from trinity.adapters import get_adapter
++
++    adapter = get_adapter("math500")
++    task = adapter.load_tasks("test", max_items=1, seed=0)[0]
++    item = build_benchmark._task_to_item(task, 0)
++    assert item["benchmark"] == "math500"
++    assert item["question_text"] == task.prompt
++    assert item["correct_answer"] == task.answer
++    assert item["model_answers"] == {}
++
++
++def test_cache_answers_uses_adapter_build_prompt(build_benchmark):
++    from trinity.adapters import get_adapter
++    from trinity.roles.prompts import build_messages
++    from trinity.types import Role
++
++    adapter = get_adapter("math500")
++    task = adapter.load_tasks("test", max_items=1, seed=0)[0]
++    item = {
++        "question_id": task.task_id,
++        "benchmark": "math500",
++        "question_text": "stale prompt",
++        "model_answers": {},
++    }
++    pool = MagicMock()
++    pool.chat = AsyncMock(return_value=MagicMock(text="cached"))
++    pool.models = {"m1": {}}
++
++    asyncio.run(build_benchmark._cache_answers([(task, item)], pool, ["m1"]))
++
++    pool.chat.assert_awaited_once()
++    expected_messages = build_messages(Role.WORKER, adapter.build_prompt(task), [])
++    assert pool.chat.await_args.args[1] == expected_messages
++    assert item["model_answers"]["m1"] == "cached"

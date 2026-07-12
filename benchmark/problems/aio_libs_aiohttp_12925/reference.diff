@@ -1,0 +1,909 @@
+diff --git a/CHANGES/3287.breaking.rst b/CHANGES/3287.breaking.rst
+new file mode 100644
+index 00000000000..ddfcf49d4a9
+--- /dev/null
++++ b/CHANGES/3287.breaking.rst
+@@ -0,0 +1,3 @@
++The ``request_factory`` (usually provided by aiohttp) callable must now accept ``pre_handler_error``.
++
++Users of the low-level ``aiohttp.Server`` (without an ``Application``) now receive malformed requests via their handler with ``BaseRequest.pre_handler_error`` set to an ``HTTPBadRequest`` and must emit the error response themselves; ``Application`` users are unaffected -- by :user:`Dreamsorcerer`.
+diff --git a/CHANGES/3287.feature.rst b/CHANGES/3287.feature.rst
+new file mode 100644
+index 00000000000..d7c4e98a19f
+--- /dev/null
++++ b/CHANGES/3287.feature.rst
+@@ -0,0 +1 @@
++Bad request responses caused by parser errors now pass through the application's middleware chain, allowing middleware (and ``on_response_prepare`` handlers) to modify them -- by :user:`Dreamsorcerer`.
+diff --git a/aiohttp/web_app.py b/aiohttp/web_app.py
+index 1ff6e48bac2..5a10bc25d96 100644
+--- a/aiohttp/web_app.py
++++ b/aiohttp/web_app.py
+@@ -33,9 +33,11 @@
+     Domain,
+     MaskDomain,
+     MatchedSubAppResource,
++    MatchInfoError,
+     PrefixedSubAppResource,
+     SystemRoute,
+     UrlDispatcher,
++    UrlMappingMatchInfo,
+ )
+ 
+ __all__ = ("Application", "CleanupError")
+@@ -364,7 +366,11 @@ def _prepare_middleware(self) -> Iterator[Middleware]:
+         yield _fix_request_current_app(self)
+ 
+     async def _handle(self, request: Request) -> StreamResponse:
+-        match_info = await self._router.resolve(request)
++        match_info: UrlMappingMatchInfo
++        if (err := request._pre_handler_error) is not None:
++            match_info = MatchInfoError(err)
++        else:
++            match_info = await self._router.resolve(request)
+         match_info.add_app(self)
+         match_info.freeze()
+ 
+diff --git a/aiohttp/web_middlewares.py b/aiohttp/web_middlewares.py
+index 5e26fe354cb..cf6f482250f 100644
+--- a/aiohttp/web_middlewares.py
++++ b/aiohttp/web_middlewares.py
+@@ -3,10 +3,14 @@
+ from typing import TYPE_CHECKING, TypeVar
+ 
+ from .typedefs import Handler, Middleware
+-from .web_exceptions import HTTPMove, HTTPPermanentRedirect
++from .web_exceptions import (
++    HTTPMethodNotAllowed,
++    HTTPMove,
++    HTTPNotFound,
++    HTTPPermanentRedirect,
++)
+ from .web_request import Request
+ from .web_response import StreamResponse
+-from .web_urldispatcher import SystemRoute
+ 
+ __all__ = (
+     "middleware",
+@@ -81,7 +85,9 @@ def normalize_path_middleware(
+     assert correct_configuration, "Cannot both remove and append slash"
+ 
+     async def impl(request: Request, handler: Handler) -> StreamResponse:
+-        if isinstance(request.match_info.route, SystemRoute):
++        if isinstance(
++            request.match_info.http_exception, (HTTPNotFound, HTTPMethodNotAllowed)
++        ):
+             paths_to_check = []
+             if "?" in request.raw_path:
+                 path, query = request.raw_path.split("?", 1)
+diff --git a/aiohttp/web_protocol.py b/aiohttp/web_protocol.py
+index 3a5be452090..21bc93811db 100644
+--- a/aiohttp/web_protocol.py
++++ b/aiohttp/web_protocol.py
+@@ -11,11 +11,17 @@
+ from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar, Union, cast
+ 
+ import yarl
++from multidict import CIMultiDict
+ from propcache import under_cached_property
+ 
+ from .abc import AbstractAccessLogger, AbstractAsyncAccessLogger, AbstractStreamWriter
+ from .base_protocol import PAUSE_RESUME_READING_ERRORS, BaseProtocol
+-from .helpers import DEFAULT_CHUNK_SIZE, ceil_timeout, frozen_dataclass_decorator
++from .helpers import (
++    DEFAULT_CHUNK_SIZE,
++    HeadersDictProxy,
++    ceil_timeout,
++    frozen_dataclass_decorator,
++)
+ from .http import (
+     HttpProcessingError,
+     HttpRequestParser,
+@@ -24,11 +30,10 @@
+     StreamWriter,
+     WebSocketReader,
+ )
+-from .http_exceptions import BadHttpMethod
+ from .log import access_logger, server_logger
+ from .streams import EMPTY_PAYLOAD, StreamReader
+ from .tcp_helpers import tcp_keepalive
+-from .web_exceptions import HTTPException, HTTPInternalServerError
++from .web_exceptions import HTTPBadRequest, HTTPException, HTTPInternalServerError
+ from .web_log import AccessLogger
+ from .web_request import BaseRequest
+ from .web_response import Response, StreamResponse
+@@ -54,6 +59,7 @@
+         "RequestHandler[_Request]",
+         AbstractStreamWriter,
+         "asyncio.Task[None]",
++        HTTPBadRequest | None,
+     ],
+     _Request,
+ ]
+@@ -68,8 +74,8 @@
+     "UNKNOWN",
+     "/",
+     HttpVersion10,
+-    {},  # type: ignore[arg-type]
+-    {},  # type: ignore[arg-type]
++    HeadersDictProxy(CIMultiDict()),
++    (),
+     True,
+     None,
+     False,
+@@ -234,7 +240,6 @@ def __init__(
+         )
+         super().__init__(loop, parser)
+ 
+-        # _request_count is the number of requests processed with the same connection.
+         self._request_count = 0
+         self._keepalive = False
+         self._current_request: _Request | None = None
+@@ -609,6 +614,13 @@ async def _handle_request(
+             finally:
+                 self._current_request = None
+         except HTTPException as exc:
++            # Uncaught parser error
++            if request._pre_handler_error is exc:
++                self.logger.warning(
++                    "Error handling request from %s",
++                    request.remote,
++                    exc_info=exc.__cause__,
++                )
+             resp = Response(
+                 status=exc.status, reason=exc.reason, text=exc.text, headers=exc.headers
+             )
+@@ -678,11 +690,12 @@ async def start(self) -> None:
+ 
+             manager.requests_count += 1
+             writer = StreamWriter(self, loop)
+-            if not isinstance(message, _ErrInfo):
+-                request_handler = self._request_handler
+-            else:
+-                # make request_factory work
+-                request_handler = self._make_error_handler(message)
++            pre_handler_error: HTTPBadRequest | None = None
++            if isinstance(message, _ErrInfo):
++                pre_handler_error = HTTPBadRequest(
++                    text=message.message, content_type="text/plain"
++                )
++                pre_handler_error.__cause__ = message.exc
+                 message = ERROR
+ 
+             # Important don't hold a reference to the current task
+@@ -694,10 +707,11 @@ async def start(self) -> None:
+                 self,
+                 writer,
+                 self._task_handler or asyncio.current_task(loop),  # type: ignore[arg-type]
++                pre_handler_error,
+             )
+             try:
+                 # a new task is used for copy context vars (#3406)
+-                coro = self._handle_request(request, start, request_handler)
++                coro = self._handle_request(request, start, self._request_handler)
+                 if sys.version_info >= (3, 12):
+                     task = asyncio.Task(coro, loop=loop, eager_start=True)
+                 else:
+@@ -841,18 +855,9 @@ def handle_error(
+         Returns HTTP response with specific status code. Logs additional
+         information. It always closes current connection.
+         """
+-        if self._request_count == 1 and isinstance(exc, BadHttpMethod):
+-            # BadHttpMethod is common when a client sends non-HTTP
+-            # or encrypted traffic to an HTTP port. This is expected
+-            # to happen when connected to the public internet so we log
+-            # it at the debug level as to not fill logs with noise.
+-            self.logger.debug(
+-                "Error handling request from %s", request.remote, exc_info=exc
+-            )
+-        else:
+-            self.log_exception(
+-                "Error handling request from %s", request.remote, exc_info=exc
+-            )
++        self.log_exception(
++            "Error handling request from %s", request.remote, exc_info=exc
++        )
+ 
+         # some data already got sent, connection is broken
+         if request.writer.output_size > 0:
+@@ -890,13 +895,3 @@ def handle_error(
+         resp.force_close()
+ 
+         return resp
+-
+-    def _make_error_handler(
+-        self, err_info: _ErrInfo
+-    ) -> Callable[[BaseRequest], Awaitable[StreamResponse]]:
+-        async def handler(request: BaseRequest) -> StreamResponse:
+-            return self.handle_error(
+-                request, err_info.status, err_info.exc, err_info.message
+-            )
+-
+-        return handler
+diff --git a/aiohttp/web_request.py b/aiohttp/web_request.py
+index 745681e699d..642f4e47387 100644
+--- a/aiohttp/web_request.py
++++ b/aiohttp/web_request.py
+@@ -9,7 +9,16 @@
+ from collections.abc import Iterator, Mapping, MutableMapping
+ from re import Pattern
+ from types import MappingProxyType
+-from typing import TYPE_CHECKING, Any, Final, Optional, TypeVar, cast, overload
++from typing import (
++    TYPE_CHECKING,
++    Any,
++    Final,
++    Optional,
++    TypedDict,
++    TypeVar,
++    cast,
++    overload,
++)
+ from urllib.parse import parse_qsl
+ 
+ from multidict import CIMultiDict, MultiDict, MultiDictProxy
+@@ -70,6 +79,12 @@
+ _T = TypeVar("_T")
+ 
+ 
++class _CloneKwargs(TypedDict, total=False):
++    scheme: str
++    host: str
++    remote: str
++
++
+ @frozen_dataclass_decorator
+ class FileField:
+     name: str
+@@ -112,6 +127,7 @@ class BaseRequest(MutableMapping[str | RequestKey[Any], Any], HeadersMixin):
+ 
+     _post: MultiDictProxy[str | bytes | FileField] | None = None
+     _read_bytes: bytes | None = None
++    _pre_handler_error: HTTPBadRequest | None = None
+ 
+     def __init__(
+         self,
+@@ -127,10 +143,13 @@ def __init__(
+         scheme: str | None = None,
+         host: str | None = None,
+         remote: str | None = None,
++        pre_handler_error: HTTPBadRequest | None = None,
+     ) -> None:
+         self._message = message
+         self._protocol = protocol
+         self._payload_writer = payload_writer
++        if pre_handler_error is not None:
++            self._pre_handler_error = pre_handler_error
+ 
+         self._payload = payload
+         self._headers: HeadersDictProxy = message.headers
+@@ -207,7 +226,7 @@ def clone(
+ 
+         message = self._message._replace(**dct)
+ 
+-        kwargs: dict[str, str] = {}
++        kwargs: _CloneKwargs = {}
+         if scheme is not sentinel:
+             kwargs["scheme"] = scheme
+         if host is not sentinel:
+@@ -226,6 +245,7 @@ def clone(
+             self._loop,
+             client_max_size=client_max_size,
+             state=self._state.copy(),
++            pre_handler_error=self._pre_handler_error,
+             **kwargs,
+         )
+ 
+@@ -249,6 +269,10 @@ def writer(self) -> AbstractStreamWriter:
+     def client_max_size(self) -> int:
+         return self._client_max_size
+ 
++    @property
++    def pre_handler_error(self) -> HTTPBadRequest | None:
++        return self._pre_handler_error
++
+     @reify
+     def rel_url(self) -> URL:
+         return self._rel_url
+@@ -868,8 +892,7 @@ def config_dict(self) -> ChainMapProxy:
+ 
+     async def _prepare_hook(self, response: StreamResponse) -> None:
+         match_info = self._match_info
+-        if match_info is None:
+-            return
++        assert match_info is not None
+         for app in match_info._apps:
+             if on_response_prepare := app.on_response_prepare:
+                 await on_response_prepare.send(self, response)
+diff --git a/aiohttp/web_runner.py b/aiohttp/web_runner.py
+index 82c3bd277f8..d0262793763 100644
+--- a/aiohttp/web_runner.py
++++ b/aiohttp/web_runner.py
+@@ -11,6 +11,7 @@
+ from .streams import StreamReader
+ from .typedefs import PathLike
+ from .web_app import Application
++from .web_exceptions import HTTPBadRequest
+ from .web_log import AccessLogger
+ from .web_protocol import RequestHandler
+ from .web_request import BaseRequest, Request
+@@ -436,6 +437,7 @@ def _make_request(
+         protocol: RequestHandler[Request],
+         writer: AbstractStreamWriter,
+         task: "asyncio.Task[None]",
++        pre_handler_error: HTTPBadRequest | None,
+         _cls: type[Request] = Request,
+     ) -> Request:
+         loop = asyncio.get_running_loop()
+@@ -447,6 +449,7 @@ def _make_request(
+             task,
+             loop,
+             client_max_size=self.app._client_max_size,
++            pre_handler_error=pre_handler_error,
+         )
+ 
+     async def _cleanup_server(self) -> None:
+diff --git a/aiohttp/web_server.py b/aiohttp/web_server.py
+index e4decdf0f6f..66a65e0ceb8 100644
+--- a/aiohttp/web_server.py
++++ b/aiohttp/web_server.py
+@@ -8,6 +8,7 @@
+ from .abc import AbstractStreamWriter
+ from .http_parser import RawRequestMessage
+ from .streams import StreamReader
++from .web_exceptions import HTTPBadRequest
+ from .web_protocol import RequestHandler
+ from .web_request import BaseRequest
+ from .web_response import StreamResponse
+@@ -22,6 +23,7 @@
+         "RequestHandler[_Request]",
+         AbstractStreamWriter,
+         "asyncio.Task[None]",
++        HTTPBadRequest | None,
+     ],
+     _Request,
+ ]
+@@ -67,8 +69,6 @@ def __init__(
+         self._loop = asyncio.get_running_loop()
+         self._connections: dict[RequestHandler[_Request], asyncio.Transport] = {}
+         self._kwargs = kwargs
+-        # requests_count is the number of requests being processed by the server
+-        # for the lifetime of the server.
+         self.requests_count = 0
+         self.request_handler = handler
+         self.request_factory = request_factory or self._make_request  # type: ignore[assignment]
+@@ -101,8 +101,17 @@ def _make_request(
+         protocol: RequestHandler[BaseRequest],
+         writer: AbstractStreamWriter,
+         task: "asyncio.Task[None]",
++        pre_handler_error: HTTPBadRequest | None,
+     ) -> BaseRequest:
+-        return BaseRequest(message, payload, protocol, writer, task, self._loop)
++        return BaseRequest(
++            message,
++            payload,
++            protocol,
++            writer,
++            task,
++            self._loop,
++            pre_handler_error=pre_handler_error,
++        )
+ 
+     def pre_shutdown(self) -> None:
+         for conn in self._connections:
+diff --git a/docs/web_advanced.rst b/docs/web_advanced.rst
+index 44ceed5f1c8..0d7e82b3215 100644
+--- a/docs/web_advanced.rst
++++ b/docs/web_advanced.rst
+@@ -665,6 +665,48 @@ Produced output::
+    Middleware 2 finished
+    Middleware 1 finished
+ 
++Middlewares also run for responses synthesized from malformed HTTP
++requests (HTTP 400). For such a request
++:attr:`~aiohttp.web.BaseRequest.pre_handler_error` is set to the
++:exc:`HTTPBadRequest` that the handler raises, and its ``__cause__``
++holds the underlying parser exception. As long as an exception doesn't
++propagate out of a middleware, the middleware can modify -- or replace
++-- every response the server sends.
++
++.. versionchanged:: 4.0
++
++   Malformed requests are now dispatched through the middleware chain.
++
++A middleware can use this to change how malformed requests are
++logged. By default aiohttp logs every parser error at the ``warning``
++level; the middleware below changes it to a ``debug`` level::
++
++    async def log_debug_parser_errors_middleware(
++        request: web.Request,
++        handler: Callable[[web.Request], Awaitable[web.StreamResponse]],
++    ) -> web.StreamResponse:
++        try:
++            return await handler(request)
++        except web.HTTPException as exc:
++            if request.pre_handler_error is None:
++                raise  # A normal HTTP error from the app, not a parser error.
++
++            request.protocol.logger.debug(
++                "Error handling request from %s",
++                # Or for reverse proxy with trusted header:
++                # request.headers.get("X-Forwarded-For")
++                request.remote,
++                exc_info=exc.__cause__,
++            )
++            # Returning a response (rather than re-raising) suppresses
++            # aiohttp's own error logging with the call above.
++            return web.Response(
++                status=exc.status,
++                reason=exc.reason,
++                text=exc.text,
++                headers=exc.headers,
++            )
++
+ Request Body Stream Consumption
+ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ 
+diff --git a/docs/web_reference.rst b/docs/web_reference.rst
+index d4a4f891557..6b6d6aa06c3 100644
+--- a/docs/web_reference.rst
++++ b/docs/web_reference.rst
+@@ -167,6 +167,22 @@ and :ref:`aiohttp-web-signals` handlers.
+ 
+       Read-only :class:`int` property.
+ 
++   .. attribute:: pre_handler_error
++
++      An :exc:`HTTPBadRequest` set by the protocol when the parser
++      could not parse the incoming bytes, otherwise ``None``. The
++      original parser exception is available as ``__cause__``.
++
++      Users of the low-level :class:`aiohttp.web.Server` (without an
++      :class:`Application`) must inspect this attribute and emit
++      the error response themselves. :class:`Application` users
++      receive the error via the middleware chain and do not need
++      to read this directly.
++
++      Read-only :exc:`HTTPBadRequest` or ``None`` property.
++
++      .. versionadded:: 4.0
++
+    .. attribute:: path_qs
+ 
+       The URL including PATH_INFO and the query string. e.g.,
+diff --git a/tests/test_web_app.py b/tests/test_web_app.py
+index de0e0cb2aac..3012c6b0157 100644
+--- a/tests/test_web_app.py
++++ b/tests/test_web_app.py
+@@ -1,4 +1,5 @@
+ import asyncio
++import logging
+ import sys
+ from collections.abc import AsyncIterator, Callable, Iterator
+ from contextlib import asynccontextmanager
+@@ -6,9 +7,10 @@
+ from unittest import mock
+ 
+ import pytest
+-from pytest_aiohttp import AiohttpClient
++from pytest_aiohttp import AiohttpClient, AiohttpServer
+ 
+-from aiohttp import log, web
++from aiohttp import hdrs, log, web
++from aiohttp.http_exceptions import HttpProcessingError
+ from aiohttp.typedefs import Handler
+ 
+ 
+@@ -649,3 +651,160 @@ def test_forbid_changing_frozen_app() -> None:
+ def test_app_boolean() -> None:
+     app = web.Application()
+     assert app
++
++
++async def _read_response(
++    reader: asyncio.StreamReader,
++) -> tuple[bytes, dict[str, str], bytes]:
++    head = b""
++    while b"\r\n\r\n" not in head:
++        chunk = await reader.read(4096)
++        assert chunk, "connection closed before headers complete"
++        head += chunk
++    header_block, _, body = head.partition(b"\r\n\r\n")
++    status_line, *header_lines = header_block.split(b"\r\n")
++    headers = {}
++    for line in header_lines:
++        name, _, value = line.partition(b":")
++        headers[name.decode().strip().lower()] = value.decode().strip()
++    return status_line, headers, body
++
++
++@asynccontextmanager
++async def _raw_request(
++    host: str, port: int, payload: bytes
++) -> AsyncIterator[asyncio.StreamReader]:
++    reader, writer = await asyncio.open_connection(host, port)
++    try:
++        writer.write(payload)
++        await writer.drain()
++        yield reader
++    finally:
++        writer.close()
++        await writer.wait_closed()
++
++
++async def test_parser_error_passes_through_middleware(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    async def server_header(
++        request: web.Request, handler: Handler
++    ) -> web.StreamResponse:
++        try:
++            return await handler(request)
++        except web.HTTPException as exc:
++            exc.headers[hdrs.SERVER] = "custom"
++            raise
++
++    app = web.Application(middlewares=[server_header])
++    server = await aiohttp_server(app)
++
++    async with _raw_request(server.host, server.port, b"garbage\r\n\r\n") as reader:
++        status_line, headers, _ = await _read_response(reader)
++        assert await reader.read() == b""
++
++    assert status_line.startswith(b"HTTP/1.0 400 ")
++    assert headers["server"] == "custom"
++
++
++async def test_parser_error_middleware_can_catch(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    captured: list[BaseException | None] = []
++
++    async def catcher(request: web.Request, handler: Handler) -> web.StreamResponse:
++        try:
++            return await handler(request)
++        except web.HTTPBadRequest as exc:
++            captured.append(exc.__cause__)
++            return web.Response(status=418, text="teapot")
++
++    app = web.Application(middlewares=[catcher])
++    server = await aiohttp_server(app)
++
++    async with _raw_request(server.host, server.port, b"garbage\r\n\r\n") as reader:
++        status_line, _, body = await _read_response(reader)
++        body += await reader.read()
++
++    assert status_line.startswith(b"HTTP/1.0 418 ")
++    assert body.endswith(b"teapot")
++    assert len(captured) == 1
++    assert isinstance(captured[0], HttpProcessingError)
++
++
++async def test_parser_error_match_info_exposes_http_exception(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    seen: list[web.HTTPException | None] = []
++
++    async def inspector(request: web.Request, handler: Handler) -> web.StreamResponse:
++        seen.append(request.match_info.http_exception)
++        return await handler(request)
++
++    app = web.Application(middlewares=[inspector])
++    server = await aiohttp_server(app)
++
++    async with _raw_request(server.host, server.port, b"garbage\r\n\r\n") as reader:
++        await _read_response(reader)
++
++    assert len(seen) == 1
++    assert isinstance(seen[0], web.HTTPBadRequest)
++
++
++async def test_parser_error_middleware_suppresses_log(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    async def swallow(request: web.Request, handler: Handler) -> web.StreamResponse:
++        try:
++            return await handler(request)
++        except web.HTTPBadRequest:
++            return web.Response(status=204)
++
++    logger = mock.create_autospec(logging.Logger, spec_set=True, instance=True)
++    app = web.Application(middlewares=[swallow])
++    server = await aiohttp_server(app, logger=logger)
++
++    async with _raw_request(server.host, server.port, b"garbage\r\n\r\n") as reader:
++        status_line, _, _ = await _read_response(reader)
++
++    assert status_line.startswith(b"HTTP/1.0 204 ")
++    logger.exception.assert_not_called()
++    logger.debug.assert_not_called()
++    logger.warning.assert_not_called()
++
++
++async def test_parser_error_propagated_is_logged(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    logger = mock.create_autospec(logging.Logger, spec_set=True, instance=True)
++    app = web.Application()
++    server = await aiohttp_server(app, logger=logger)
++
++    async with _raw_request(server.host, server.port, b"garbage\r\n\r\n") as reader:
++        await _read_response(reader)
++
++    # garbage triggers BadHttpMethod; logged at warning level by default.
++    assert logger.warning.called
++    assert "Error handling request" in logger.warning.call_args.args[0]
++
++
++async def test_parser_error_on_response_prepare_fires(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    fired = False
++
++    async def hook(request: web.Request, response: web.StreamResponse) -> None:
++        nonlocal fired
++        fired = True
++        response.headers[hdrs.SERVER] = "from-signal"
++
++    app = web.Application()
++    app.on_response_prepare.append(hook)
++    server = await aiohttp_server(app)
++
++    async with _raw_request(server.host, server.port, b"garbage\r\n\r\n") as reader:
++        status_line, headers, _ = await _read_response(reader)
++
++    assert status_line.startswith(b"HTTP/1.0 400 ")
++    assert fired
++    assert headers["server"] == "from-signal"
+diff --git a/tests/test_web_middleware.py b/tests/test_web_middleware.py
+index e37817b9b87..6e881d2488a 100644
+--- a/tests/test_web_middleware.py
++++ b/tests/test_web_middleware.py
+@@ -1,8 +1,9 @@
++import asyncio
+ from collections.abc import Awaitable, Callable, Iterable
+ from typing import NoReturn
+ 
+ import pytest
+-from pytest_aiohttp import AiohttpClient
++from pytest_aiohttp import AiohttpClient, AiohttpServer
+ from yarl import URL
+ 
+ from aiohttp import web, web_app
+@@ -415,6 +416,55 @@ async def handle(request: web.Request) -> web.StreamResponse:
+         assert resp.url.query == URL("//google.com").query
+ 
+ 
++async def test_normalize_path_skips_parser_error(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    # Regression: normalize_path_middleware used to redirect SystemRoute
++    # matches indiscriminately. After parser errors started flowing through
++    # the middleware chain (issue #3287) the dummy "/" rel_url on a
++    # malformed request would match a real "/" route and trigger 301.
++    async def root(request: web.Request) -> NoReturn:
++        pytest.fail("root handler should not run for a parser-errored request")
++
++    app = web.Application(middlewares=[web.normalize_path_middleware()])
++    app.router.add_get("/", root)
++    server = await aiohttp_server(app)
++
++    reader, writer = await asyncio.open_connection(server.host, server.port)
++    try:
++        writer.write(b"garbage\r\n\r\n")
++        await writer.drain()
++        head = b""
++        while b"\r\n\r\n" not in head:
++            chunk = await reader.read(4096)
++            assert chunk, "connection closed before headers complete"
++            head += chunk
++    finally:
++        writer.close()
++        await writer.wait_closed()
++
++    assert head.startswith(b"HTTP/1.0 400 ")
++
++
++async def test_normalize_path_redirects_method_not_allowed(
++    aiohttp_client: AiohttpClient,
++) -> None:
++    # A 405 is a routing failure (the path matched a resource, but not for this
++    # method), so normalize_path_middleware should still try alternate paths:
++    # POST /foo has no POST route, but POST /foo/ does.
++    async def handler(request: web.Request) -> web.Response:
++        assert False
++
++    app = web.Application(middlewares=[web.normalize_path_middleware()])
++    app.router.add_get("/foo", handler)
++    app.router.add_post("/foo/", handler)
++    client = await aiohttp_client(app)
++
++    resp = await client.post("/foo", allow_redirects=False)
++    assert resp.status == 308
++    assert resp.headers["Location"] == "/foo/"
++
++
+ async def test_bug_3669(aiohttp_client: AiohttpClient) -> None:
+     async def paymethod(request: web.Request) -> NoReturn:
+         assert False
+diff --git a/tests/test_web_request.py b/tests/test_web_request.py
+index 3ad652916d9..9dd919caf09 100644
+--- a/tests/test_web_request.py
++++ b/tests/test_web_request.py
+@@ -851,6 +851,13 @@ def test_clone_override_client_max_size() -> None:
+     assert req2.client_max_size == 2048
+ 
+ 
++def test_clone_preserves_pre_handler_error() -> None:
++    req = make_mocked_request("GET", "/path")
++    err = web.HTTPBadRequest(text="bad")
++    req._pre_handler_error = err
++    assert req.clone().pre_handler_error is err
++
++
+ def test_clone_method() -> None:
+     req = make_mocked_request("GET", "/path")
+     req2 = req.clone(method="POST")
+diff --git a/tests/test_web_server.py b/tests/test_web_server.py
+index 52ed10bf00a..25c9b14f9bb 100644
+--- a/tests/test_web_server.py
++++ b/tests/test_web_server.py
+@@ -9,7 +9,7 @@
+ from pytest_aiohttp import AiohttpClient, AiohttpRawServer, AiohttpServer
+ 
+ from aiohttp import client, web
+-from aiohttp.http_exceptions import BadHttpMethod, BadStatusLine
++from aiohttp.http_exceptions import BadStatusLine
+ 
+ 
+ async def test_simple_server(
+@@ -71,55 +71,10 @@ async def handler(request: web.BaseRequest) -> NoReturn:
+     )
+ 
+ 
+-async def test_raw_server_logs_invalid_method_with_loop_debug(
+-    aiohttp_raw_server: AiohttpRawServer, aiohttp_client: AiohttpClient
+-) -> None:
+-    exc = BadHttpMethod(b"\x16\x03\x03\x01F\x01".decode(), "error")
+-
+-    async def handler(request: web.BaseRequest) -> NoReturn:
+-        raise exc
+-
+-    loop = asyncio.get_running_loop()
+-    loop.set_debug(True)
+-    logger = mock.Mock()
+-    server = await aiohttp_raw_server(handler, logger=logger)
+-    cli = await aiohttp_client(server)  # type: ignore[var-annotated]
+-    resp = await cli.get("/path/to")
+-    assert resp.status == 500
+-    assert resp.headers["Content-Type"].startswith("text/plain")
+-
+-    txt = await resp.text()
+-    assert "Traceback (most recent call last):\n" in txt
+-
+-    # BadHttpMethod should be logged as debug
+-    # on the first request since the client may
+-    # be probing for TLS/SSL support which is
+-    # expected to fail
+-    logger.debug.assert_called_with(
+-        "Error handling request from %s", cli.host, exc_info=exc
+-    )
+-    logger.debug.reset_mock()
+-
+-    # Now make another connection to the server
+-    # to make sure that the exception is logged
+-    # at debug on a second fresh connection
+-    cli2 = await aiohttp_client(server)  # type: ignore[var-annotated]
+-    resp = await cli2.get("/path/to")
+-    assert resp.status == 500
+-    assert resp.headers["Content-Type"].startswith("text/plain")
+-    # BadHttpMethod should be logged as debug
+-    # on the first request since the client may
+-    # be probing for TLS/SSL support which is
+-    # expected to fail
+-    logger.debug.assert_called_with(
+-        "Error handling request from %s", cli.host, exc_info=exc
+-    )
+-
+-
+-async def test_raw_server_logs_invalid_method_without_loop_debug(
++async def test_raw_server_logs_bad_status_line_as_exception(
+     aiohttp_raw_server: AiohttpRawServer, aiohttp_client: AiohttpClient
+ ) -> None:
+-    exc = BadHttpMethod(b"\x16\x03\x03\x01F\x01".decode(), "error")
++    exc = BadStatusLine(b"\x16\x03\x03\x01F\x01".decode(), "error")
+ 
+     async def handler(request: web.BaseRequest) -> NoReturn:
+         raise exc
+@@ -136,69 +91,42 @@ async def handler(request: web.BaseRequest) -> NoReturn:
+     txt = await resp.text()
+     assert "Traceback (most recent call last):\n" not in txt
+ 
+-    # BadHttpMethod should be logged as debug
+-    # on the first request since the client may
+-    # be probing for TLS/SSL support which is
+-    # expected to fail
+-    logger.debug.assert_called_with(
+-        "Error handling request from %s", cli.host, exc_info=exc
+-    )
+-
+-
+-async def test_raw_server_logs_invalid_method_second_request(
+-    aiohttp_raw_server: AiohttpRawServer, aiohttp_client: AiohttpClient
+-) -> None:
+-    exc = BadHttpMethod(b"\x16\x03\x03\x01F\x01".decode(), "error")
+-    request_count = 0
+-
+-    async def handler(request: web.BaseRequest) -> web.Response:
+-        nonlocal request_count
+-        request_count += 1
+-        if request_count == 2:
+-            raise exc
+-        return web.Response()
+-
+-    loop = asyncio.get_running_loop()
+-    loop.set_debug(False)
+-    logger = mock.Mock()
+-    server = await aiohttp_raw_server(handler, logger=logger)
+-    cli = await aiohttp_client(server)  # type: ignore[var-annotated]
+-    resp = await cli.get("/path/to")
+-    assert resp.status == 200
+-    resp = await cli.get("/path/to")
+-    assert resp.status == 500
+-    assert resp.headers["Content-Type"].startswith("text/plain")
+-    # BadHttpMethod should be logged as an exception
+-    # if its not the first request since we know
+-    # that the client already was speaking HTTP
+     logger.exception.assert_called_with(
+         "Error handling request from %s", cli.host, exc_info=exc
+     )
+ 
+ 
+-async def test_raw_server_logs_bad_status_line_as_exception(
++async def test_raw_server_parser_error_visible_to_handler(
+     aiohttp_raw_server: AiohttpRawServer, aiohttp_client: AiohttpClient
+ ) -> None:
+-    exc = BadStatusLine(b"\x16\x03\x03\x01F\x01".decode(), "error")
++    async def handler(request: web.BaseRequest) -> web.Response:
++        if (err := request.pre_handler_error) is not None:
++            return web.Response(status=err.status, text=f"raw saw: {err.__cause__!r}")
++        return web.Response(text="ok")
+ 
+-    async def handler(request: web.BaseRequest) -> NoReturn:
+-        raise exc
++    server = await aiohttp_raw_server(handler)
+ 
+-    loop = asyncio.get_running_loop()
+-    loop.set_debug(False)
+-    logger = mock.Mock()
+-    server = await aiohttp_raw_server(handler, logger=logger)
+     cli = await aiohttp_client(server)  # type: ignore[var-annotated]
+     resp = await cli.get("/path/to")
+-    assert resp.status == 500
+-    assert resp.headers["Content-Type"].startswith("text/plain")
++    assert resp.status == 200
++    assert await resp.text() == "ok"
+ 
+-    txt = await resp.text()
+-    assert "Traceback (most recent call last):\n" not in txt
++    reader, writer = await asyncio.open_connection(server.host, server.port)
++    try:
++        writer.write(b"garbage\r\n\r\n")
++        await writer.drain()
++        head = b""
++        while b"\r\n\r\n" not in head:
++            chunk = await reader.read(4096)
++            assert chunk, "connection closed before headers complete"
++            head += chunk
++        body = head.partition(b"\r\n\r\n")[2] + await reader.read()
++    finally:
++        writer.close()
++        await writer.wait_closed()
+ 
+-    logger.exception.assert_called_with(
+-        "Error handling request from %s", cli.host, exc_info=exc
+-    )
++    assert head.startswith(b"HTTP/1.0 400 ")
++    assert b"BadHttpMethod" in body
+ 
+ 
+ async def test_raw_server_handler_timeout(

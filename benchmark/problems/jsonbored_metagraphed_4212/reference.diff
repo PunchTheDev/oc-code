@@ -1,0 +1,321 @@
+diff --git a/apps/ui/src/lib/metagraphed/queries.chain-events-stats.test.ts b/apps/ui/src/lib/metagraphed/queries.chain-events-stats.test.ts
+new file mode 100644
+index 000000000..c32169aa8
+--- /dev/null
++++ b/apps/ui/src/lib/metagraphed/queries.chain-events-stats.test.ts
+@@ -0,0 +1,111 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { ApiResult } from "./client";
++import { apiFetch } from "./client";
++import { chainEventsStatsQuery } from "./queries";
++
++vi.mock("./client", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("./client")>();
++  return { ...actual, apiFetch: vi.fn() };
++});
++
++const mockedApiFetch = vi.mocked(apiFetch);
++
++function resolveWith(data: unknown): void {
++  mockedApiFetch.mockResolvedValue({
++    data,
++    meta: {} as ApiResult<unknown>["meta"],
++    url: "/api/v1/chain-events/stats",
++  });
++}
++
++async function runQuery(blocks?: number) {
++  const opts = blocks == null ? chainEventsStatsQuery() : chainEventsStatsQuery(blocks);
++  if (!opts.queryFn) throw new Error("expected a queryFn");
++  return opts.queryFn({
++    signal: new AbortController().signal,
++    queryKey: opts.queryKey,
++    meta: undefined,
++  } as unknown as Parameters<NonNullable<typeof opts.queryFn>>[0]);
++}
++
++describe("chainEventsStatsQuery", () => {
++  beforeEach(() => {
++    mockedApiFetch.mockReset();
++  });
++
++  it("passes the blocks param and normalizes busiest-first rows", async () => {
++    resolveWith({
++      window_blocks: 1000,
++      groups: 2,
++      activity: [
++        { pallet: "Balances", method: "Transfer", count: 200593 },
++        { pallet: "System", method: "ExtrinsicSuccess", count: 24307 },
++      ],
++    });
++    const res = await runQuery(1000);
++    expect(mockedApiFetch).toHaveBeenCalledWith(
++      "/api/v1/chain-events/stats",
++      expect.objectContaining({ params: { blocks: 1000 } }),
++    );
++    expect(res.data.window_blocks).toBe(1000);
++    expect(res.data.groups).toBe(2);
++    expect(res.data.activity).toHaveLength(2);
++    expect(res.data.activity[0]).toEqual({
++      pallet: "Balances",
++      method: "Transfer",
++      count: 200593,
++    });
++  });
++
++  it("defaults to a 1000-block window", async () => {
++    resolveWith({});
++    await runQuery();
++    expect(mockedApiFetch).toHaveBeenCalledWith(
++      "/api/v1/chain-events/stats",
++      expect.objectContaining({ params: { blocks: 1000 } }),
++    );
++  });
++
++  it("degrades a cold / junk store to a schema-stable empty card", async () => {
++    for (const raw of [{}, null, "x", { groups: "nope", activity: "nope" }]) {
++      resolveWith(raw);
++      const res = await runQuery(500);
++      expect(res.data.groups).toBe(0);
++      expect(res.data.activity).toEqual([]);
++      // window_blocks falls through to the requested block count on a cold store
++      expect(res.data.window_blocks).toBe(500);
++    }
++  });
++
++  it("drops malformed rows (missing pallet or count) and preserves a null method", async () => {
++    resolveWith({
++      groups: 3,
++      activity: [
++        { method: "Transfer", count: 5 }, // no pallet -> dropped
++        { pallet: "Balances", count: "nope" }, // junk count -> dropped
++        { pallet: "SubtensorModule", count: 5169 }, // no method -> kept, method null
++      ],
++    });
++    const res = await runQuery();
++    expect(res.data.activity).toHaveLength(1);
++    expect(res.data.activity[0]).toEqual({
++      pallet: "SubtensorModule",
++      method: null,
++      count: 5169,
++    });
++  });
++
++  it("caps the rendered rows at the top 100 groups", async () => {
++    resolveWith({
++      groups: 150,
++      activity: Array.from({ length: 150 }, (_, i) => ({
++        pallet: `Pallet${i}`,
++        method: "M",
++        count: 150 - i,
++      })),
++    });
++    const res = await runQuery();
++    expect(res.data.activity).toHaveLength(100);
++    expect(res.data.activity[0]?.count).toBe(150);
++  });
++});
+diff --git a/apps/ui/src/lib/metagraphed/queries.ts b/apps/ui/src/lib/metagraphed/queries.ts
+index a26069a6e..f701a1e96 100644
+--- a/apps/ui/src/lib/metagraphed/queries.ts
++++ b/apps/ui/src/lib/metagraphed/queries.ts
+@@ -53,6 +53,8 @@ import type {
+   ChainActivityDay,
+   ChainCalls,
+   ChainCallEntry,
++  ChainEventsStats,
++  ChainEventsStatsEntry,
+   ChainFees,
+   ChainFeeDay,
+   ChainFeePayer,
+@@ -194,6 +196,9 @@ const MAX_ACCOUNT_HISTORY_DAYS = 180;
+ const MAX_ACCOUNT_DAY_EVENT_KINDS = 32;
+ const MAX_CHAIN_ACTIVITY_DAYS = 31;
+ const MAX_CHAIN_CALLS = 12;
++// The endpoint returns the top 100 pallet.method groups, busiest first.
++const MAX_CHAIN_EVENT_GROUPS = 100;
++const DEFAULT_CHAIN_EVENT_BLOCKS = 1000;
+ const MAX_CHAIN_SIGNERS = 20;
+ const MAX_CHAIN_FEE_DAYS = 31;
+ const MAX_CHAIN_FEE_PAYERS = 12;
+@@ -2776,6 +2781,49 @@ export const chainCallsQuery = (window: ChainWindow = "7d") =>
+     staleTime: STALE_SHORT,
+   });
+ 
++function normalizeChainEventsStatsEntry(raw: unknown): ChainEventsStatsEntry | null {
++  if (!isRecord(raw)) return null;
++  const pallet = firstString(raw.pallet);
++  const count = coerceFiniteNumber(raw.count);
++  if (!pallet || count == null) return null;
++  return {
++    pallet,
++    method: firstString(raw.method) ?? null,
++    count,
++  };
++}
++
++// #3489: raw all-events tier pallet.method distribution from
++// /api/v1/chain-events/stats — the raw-tier sibling of chainCallsQuery's D1
++// /chain/calls aggregate. Takes a block window (default 1000, capped 5000
++// server-side); returns the distinct group count and the busiest-first rows.
++// A cold store (before the all-events backfill) yields groups: 0, activity: [].
++export const chainEventsStatsQuery = (blocks: number = DEFAULT_CHAIN_EVENT_BLOCKS) =>
++  queryOptions({
++    queryKey: k("chain-events-stats", blocks),
++    queryFn: async ({ signal }) => {
++      const res = await apiFetch<unknown>("/api/v1/chain-events/stats", {
++        params: { blocks },
++        signal,
++      });
++      const d = isRecord(res.data) ? res.data : {};
++      return {
++        data: {
++          window_blocks: firstFiniteNumber(d.window_blocks) ?? blocks,
++          groups: firstFiniteNumber(d.groups) ?? 0,
++          activity: normalizeChainRows(
++            d.activity,
++            MAX_CHAIN_EVENT_GROUPS,
++            normalizeChainEventsStatsEntry,
++          ),
++        } as ChainEventsStats,
++        meta: res.meta,
++        url: res.url,
++      } as ApiResult<ChainEventsStats>;
++    },
++    staleTime: STALE_SHORT,
++  });
++
+ export const chainSignersQuery = (window: ChainWindow = "7d") =>
+   queryOptions({
+     queryKey: k("chain-signers", window),
+diff --git a/apps/ui/src/lib/metagraphed/types.ts b/apps/ui/src/lib/metagraphed/types.ts
+index af46ee248..6c9b2837a 100644
+--- a/apps/ui/src/lib/metagraphed/types.ts
++++ b/apps/ui/src/lib/metagraphed/types.ts
+@@ -1845,6 +1845,22 @@ export interface ChainCalls {
+   call_count: number;
+   calls: ChainCallEntry[];
+ }
++
++// #3489: raw all-events tier (ADR 0013) pallet.method distribution from
++// GET /api/v1/chain-events/stats — the raw-tier counterpart to ChainCalls
++// (the D1 /chain/calls aggregate). No schema_version/observed_at envelope; the
++// endpoint returns the block window it scanned, the distinct pallet.method
++// group count, and the count-descending activity rows.
++export interface ChainEventsStatsEntry {
++  pallet: string;
++  method: string | null;
++  count: number;
++}
++export interface ChainEventsStats {
++  window_blocks: number;
++  groups: number;
++  activity: ChainEventsStatsEntry[];
++}
+ export interface ChainSignerEntry {
+   signer: string;
+   tx_count: number;
+diff --git a/apps/ui/src/routes/explorer.tsx b/apps/ui/src/routes/explorer.tsx
+index 8e253c465..6116c6e71 100644
+--- a/apps/ui/src/routes/explorer.tsx
++++ b/apps/ui/src/routes/explorer.tsx
+@@ -20,6 +20,7 @@ import {
+   chainActivityQuery,
+   chainCallsQuery,
+   chainEventsInfiniteQuery,
++  chainEventsStatsQuery,
+   chainFeesQuery,
+   chainSignersQuery,
+   chainStakeTransfersQuery,
+@@ -27,7 +28,7 @@ import {
+ import { formatNumber } from "@/lib/metagraphed/format";
+ import { shortHash } from "@/lib/metagraphed/blocks";
+ import { extrinsicCall } from "@/lib/metagraphed/extrinsics";
+-import type { ChainCalls, ChainEvent } from "@/lib/metagraphed/types";
++import type { ChainCalls, ChainEvent, ChainEventsStats } from "@/lib/metagraphed/types";
+ 
+ const explorerSearchSchema = z.object({
+   window: fallback(z.enum(["7d", "30d"]), "7d").default("7d"),
+@@ -92,6 +93,7 @@ function ExplorerPage() {
+           "/api/v1/chain/signers",
+           "/api/v1/chain/stake-transfers",
+           "/api/v1/chain-events",
++          "/api/v1/chain-events/stats",
+         ]}
+       />
+     </AppShell>
+@@ -234,6 +236,58 @@ function CallMixSection({ calls }: { calls: ChainCalls }) {
+   );
+ }
+ 
++// #3489: raw all-events tier (ADR 0013) pallet.method distribution from
++// /api/v1/chain-events/stats — the raw-tier sibling of the curated CallMixSection
++// above (D1 /chain/calls). Same ranked-list-with-proportional-bar idiom, capped
++// to the busiest 10 rows; the header reports the distinct group count and the
++// block window scanned. Empty until the all-events backfill runs.
++function PalletEventMixSection({ stats }: { stats: ChainEventsStats }) {
++  const rows = stats.activity.slice(0, 10);
++  const cap = Math.max(1, ...rows.map((r) => r.count));
++
++  return (
++    <section className="rounded-lg border border-border bg-card p-5">
++      <div className="mb-4 flex items-center justify-between">
++        <h2 className="font-mono text-[11px] uppercase tracking-[0.18em] text-ink-muted">
++          Pallet event mix
++        </h2>
++        <span className="font-mono text-[11px] text-ink-muted">
++          {formatNumber(stats.groups)} groups · {formatNumber(stats.window_blocks)} blocks
++        </span>
++      </div>
++      {rows.length > 0 ? (
++        <ul className="space-y-1.5">
++          {rows.map((r) => {
++            const pct = Math.max(2, Math.round((r.count / cap) * 100));
++            const label = r.method ? `${r.pallet}.${r.method}` : r.pallet;
++            return (
++              <li key={label} className="grid grid-cols-[10rem_1fr_auto] items-center gap-2">
++                <span
++                  className="truncate font-mono text-[10px] uppercase tracking-widest text-ink-muted"
++                  title={label}
++                >
++                  {label}
++                </span>
++                <span className="relative h-1.5 overflow-hidden rounded-full bg-surface">
++                  <span
++                    className="absolute inset-y-0 left-0 rounded-full"
++                    style={{ width: `${pct}%`, background: "var(--chart-1)" }}
++                  />
++                </span>
++                <span className="font-mono text-[10px] tabular-nums text-ink-strong">
++                  {formatNumber(r.count)}
++                </span>
++              </li>
++            );
++          })}
++        </ul>
++      ) : (
++        <p className="font-mono text-[12px] text-ink-muted">No raw pallet events indexed yet.</p>
++      )}
++    </section>
++  );
++}
++
+ function ExplorerDashboard() {
+   const search = Route.useSearch();
+   const navigate = useNavigate({ from: Route.fullPath });
+@@ -244,6 +298,7 @@ function ExplorerDashboard() {
+   const calls = useSuspenseQuery(chainCallsQuery(win)).data.data;
+   const signers = useSuspenseQuery(chainSignersQuery(win)).data.data;
+   const stakeTransfers = useSuspenseQuery(chainStakeTransfersQuery(win)).data.data;
++  const eventMix = useSuspenseQuery(chainEventsStatsQuery()).data.data;
+ 
+   // The API returns newest-day-first; sparklines want chronological order.
+   const chrono = [...activity.days].reverse();
+@@ -586,6 +641,7 @@ function ExplorerDashboard() {
+           </p>
+         )}
+       </section>
++      <PalletEventMixSection stats={eventMix} />
+     </div>
+   );
+ }

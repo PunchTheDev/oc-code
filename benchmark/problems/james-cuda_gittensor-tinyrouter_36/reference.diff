@@ -1,0 +1,718 @@
+diff --git a/docs/BENCHMARK_PROTOCOL.md b/docs/BENCHMARK_PROTOCOL.md
+new file mode 100644
+index 0000000..a768833
+--- /dev/null
++++ b/docs/BENCHMARK_PROTOCOL.md
+@@ -0,0 +1,77 @@
++# Hidden Benchmark Sampling Protocol
++
++> Frozen protocol for how each hidden benchmark's **eval / audit / live** sets are
++> sampled and sealed. Executable form: [`scripts/benchmark_protocol.py`](../scripts/benchmark_protocol.py).
++> Builder that follows it: [`scripts/build_benchmark.py`](../scripts/build_benchmark.py).
++
++The goal is that a benchmark rebuild is **deterministic** (same questions, same
++splits, every time) and **auditable** (the public hash pins exactly what was
++built, down to which question is in which split). Nothing below may change after
++a benchmark is first built for the competition — a change silently invalidates
++every score computed against the old set.
++
++## 1. Sealed seed
++
++- `SEALED_SEED = 271828182` (first 9 digits of *e*). Arbitrary but **fixed
++  forever**. It alone determines which questions are drawn and their order.
++- Every random step in the build is seeded from it, so the build has no
++  dependence on wall-clock time, process, or `PYTHONHASHSEED`.
++
++## 2. Split policy
++
++- Splits, in carve order: **`eval` → `audit` → `live`** (`SPLIT_ORDER`).
++- One task **pool** is sampled, then split into **contiguous, non-overlapping**
++  slices in that order: `eval` takes the first `N_eval`, `audit` the next
++  `N_audit`, `live` the next `N_live`. Every task lands in exactly one split.
++- `live` items are stored **without** cached model answers (they are scored by
++  live API calls); `eval` and `audit` items carry cached answers.
++
++## 3. Sample counts
++
++| split | default count | purpose |
++|-------|---------------|---------|
++| eval  | 150 | the scored set a submission is graded on |
++| audit | 50  | held-out overfit check (eval–audit gap gate) |
++| live  | 20  | live-API spot check, no cached answers |
++
++- A benchmark may override counts in `_SPLIT_COUNT_OVERRIDES`; an override is a
++  visible, reviewable protocol edit.
++- The pool is loaded with a fixed **margin** of `SAMPLE_MARGIN = 50` extra tasks
++  (`pool_size = eval + audit + live + 50`) so parse/dedupe drops cannot shrink a
++  split. The margin is fixed, so the pool size — and thus the selection — is
++  deterministic.
++
++## 4. Stable identifiers
++
++- Each item's `question_id` is the task's own stable id (`math500-3`,
++  `mmlu-17`, …) when present, else `sha256(benchmark, index, prompt)` truncated.
++- The builtin `hash()` is **never** used for ids — its value is randomised per
++  process, which would make the audit hash non-reproducible.
++
++## 5. Rebuild / integrity hash
++
++- The public `content_hash` (`hash.txt`) is `manifest_hash(splits)`: a SHA-256
++  over every item's identity fields **and its split label**, canonicalised and
++  sorted by `(split, question_id)`.
++- Hashed fields: `question_id`, `benchmark`, `task_type`, `question_text`,
++  `correct_answer`. Cached model answers/scores are **excluded** — they come from
++  live API calls and must not perturb the identity hash.
++- Because the split label is hashed, a rebuild that keeps the same questions but
++  reshuffles them across eval/audit/live produces a **different** hash. (The old
++  question-text-only digest did not catch this.)
++- The hash is invariant to input ordering (items are sorted first) but sensitive
++  to any change in content or placement.
++
++## 6. Public metadata
++
++`build_manifest()` writes `meta.json` — the committable audit record:
++
++- `seed`, `protocol_version`, `split_order`
++- per-split `counts`
++- `content_hash`
++- the full sorted `question_ids` per split
++- `pool_models`, `created_at` (the only non-deterministic fields; excluded from
++  the hash)
++
++Committing `hash.txt` and `meta.json` lets anyone verify the hidden benchmark has
++not changed without revealing the questions themselves.
+diff --git a/scripts/benchmark_protocol.py b/scripts/benchmark_protocol.py
+new file mode 100644
+index 0000000..14a6819
+--- /dev/null
++++ b/scripts/benchmark_protocol.py
+@@ -0,0 +1,267 @@
++#!/usr/bin/env python3
++"""The frozen hidden-benchmark sampling protocol.
++
++This module is the single source of truth for **how** a hidden benchmark is
++sampled and sealed, so `build_benchmark.py` follows one documented, deterministic
++rule and any rebuild is auditable. The full protocol is written up in
++`docs/BENCHMARK_PROTOCOL.md`; this file is its executable form.
++
++It is deliberately **pure** — no network, no encryption, no filesystem — so the
++protocol can be unit-tested offline and reused by any auditor. `build_benchmark.py`
++supplies the (impure) task loader, model pool, and encryption around it.
++
++The protocol has five frozen parts (issue #14):
++
++1. Sealed seed        — `SEALED_SEED`, fixed forever; determines the question set.
++2. Split policy       — `SPLIT_ORDER` + `split_counts()`; disjoint eval/audit/live
++                        slices taken in order from one deterministically sampled pool.
++3. Sample counts      — per-benchmark counts (default 150/50/20) + a fixed margin.
++4. Rebuild/integrity  — `manifest_hash()` pins the FULL protocol-relevant content
++                        AND each item's split assignment, so a rebuild that reshuffles
++                        the same questions across splits changes the hash.
++5. Public metadata    — `build_manifest()` produces the committable, deterministic
++                        audit record (hash, seed, per-split counts, id list).
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import random
++from typing import Any, Callable, Iterable, Mapping
++
++# --------------------------------------------------------------------------- #
++# 1. Sealed seed — NEVER change after the first build.
++# --------------------------------------------------------------------------- #
++#: First 9 digits of e. Arbitrary but fixed forever: it fully determines which
++#: questions are drawn and how they split. Changing it invalidates every score.
++SEALED_SEED: int = 271828182
++
++# --------------------------------------------------------------------------- #
++# 2 & 3. Split policy and sample counts.
++# --------------------------------------------------------------------------- #
++#: The canonical split names, in the order they are carved from the pool. The
++#: pool is sampled once; eval takes the first N_eval, audit the next N_audit,
++#: live the next N_live — so the three sets are disjoint by construction.
++SPLIT_ORDER: tuple[str, ...] = ("eval", "audit", "live")
++
++#: Default per-split question counts. A benchmark may override via
++#: ``_SPLIT_COUNT_OVERRIDES``; everything else uses this.
++DEFAULT_SPLIT_COUNTS: Mapping[str, int] = {"eval": 150, "audit": 50, "live": 20}
++
++#: Per-benchmark overrides (benchmark name -> {split: count}). Empty by default;
++#: kept explicit so a count change is a visible, reviewable protocol edit.
++_SPLIT_COUNT_OVERRIDES: Mapping[str, Mapping[str, int]] = {}
++
++#: Extra tasks loaded beyond the total needed, so that items which fail to parse
++#: or dedupe do not shrink a split below its count. Fixed so the pool size — and
++#: therefore the selection — is deterministic.
++SAMPLE_MARGIN: int = 50
++
++
++def split_counts(benchmark: str) -> dict[str, int]:
++    """Return the frozen per-split question counts for ``benchmark``.
++
++    Falls back to :data:`DEFAULT_SPLIT_COUNTS` when the benchmark has no override.
++    The returned dict is a fresh copy ordered by :data:`SPLIT_ORDER`.
++    """
++    key = (benchmark or "").strip().lower()
++    counts = dict(_SPLIT_COUNT_OVERRIDES.get(key, DEFAULT_SPLIT_COUNTS))
++    return {name: int(counts[name]) for name in SPLIT_ORDER}
++
++
++def total_needed(counts: Mapping[str, int]) -> int:
++    """Total questions across all splits (excludes :data:`SAMPLE_MARGIN`)."""
++    return sum(int(counts[name]) for name in SPLIT_ORDER)
++
++
++def pool_size(counts: Mapping[str, int]) -> int:
++    """Number of tasks to sample into the pool before splitting (counts + margin)."""
++    return total_needed(counts) + SAMPLE_MARGIN
++
++
++# --------------------------------------------------------------------------- #
++# Deterministic sampling + splitting.
++# --------------------------------------------------------------------------- #
++def sample_pool(
++    load_tasks: Callable[..., list[Any]],
++    benchmark: str,
++    counts: Mapping[str, int],
++    *,
++    seed: int = SEALED_SEED,
++) -> list[Any]:
++    """Sample the deterministic, ordered task pool for ``benchmark``.
++
++    ``load_tasks`` is the project's ``trinity.orchestration.dataset.load_tasks``
++    (injected so this module stays free of dataset/network imports). It is called
++    for the ``"train"`` split with ``max_items = pool_size * 3`` and the sealed
++    ``seed``; the result is then shuffled once more with a ``seed``-seeded RNG and
++    truncated to ``pool_size``. Both steps are seeded, so the pool is identical on
++    every rebuild.
++
++    Args:
++        load_tasks: ``(benchmark, split, max_items, seed) -> list`` task loader.
++        benchmark: Benchmark name.
++        counts: Per-split counts (from :func:`split_counts`).
++        seed: Sampling seed (defaults to the sealed seed).
++
++    Returns:
++        The ordered task pool, length ``min(pool_size, available)``.
++    """
++    size = pool_size(counts)
++    tasks = list(load_tasks(benchmark, "train", max_items=size * 3, seed=seed))
++    random.Random(seed).shuffle(tasks)
++    return tasks[:size]
++
++
++def select_splits(tasks: list[Any], counts: Mapping[str, int]) -> dict[str, list[Any]]:
++    """Carve ``tasks`` into disjoint eval/audit/live splits, in :data:`SPLIT_ORDER`.
++
++    Splits are contiguous, non-overlapping slices taken in order, so any given
++    task lands in exactly one split. Raises if the pool is too small to satisfy
++    the counts (a silent short split would corrupt the frozen protocol).
++
++    Raises:
++        ValueError: If ``tasks`` has fewer items than ``total_needed(counts)``.
++    """
++    need = total_needed(counts)
++    if len(tasks) < need:
++        raise ValueError(
++            f"pool has {len(tasks)} tasks but the protocol needs {need} "
++            f"({', '.join(f'{n}={counts[n]}' for n in SPLIT_ORDER)})"
++        )
++    splits: dict[str, list[Any]] = {}
++    cursor = 0
++    for name in SPLIT_ORDER:
++        n = int(counts[name])
++        splits[name] = tasks[cursor : cursor + n]
++        cursor += n
++    return splits
++
++
++# --------------------------------------------------------------------------- #
++# Stable identifiers (no builtin hash() — that is per-process randomised).
++# --------------------------------------------------------------------------- #
++def question_id(benchmark: str, index: int, prompt: str, existing: Any = None) -> str:
++    """Return a stable question id, identical across processes and rebuilds.
++
++    Prefers a task's own ``task_id`` (``existing``) when present — those are
++    already deterministic (``math500-3``, ``mmlu-17``, ...). Otherwise derives one
++    from ``sha256(benchmark, index, prompt)``; crucially it never uses the builtin
++    ``hash()``, whose value depends on ``PYTHONHASHSEED`` and so differs run to run,
++    which would make the audit hash non-reproducible.
++    """
++    if existing:
++        return str(existing)
++    digest = hashlib.sha256(f"{benchmark}\x1f{index}\x1f{prompt}".encode("utf-8")).hexdigest()
++    return f"{(benchmark or 'q').strip().lower()}-{digest[:12]}"
++
++
++#: Benchmark -> task-type classification, frozen as part of the protocol so a
++#: rebuild labels items identically. Mirrors the reward module's families.
++_MATH = frozenset({"math500", "math", "aime", "aime2025"})
++_KNOWLEDGE = frozenset({"mmlu", "gpqa", "gpqa-diamond", "gpqa_diamond"})
++
++
++def task_type(benchmark: str) -> str:
++    """Classify a benchmark into the frozen item task-type ('math'|'knowledge'|'code')."""
++    key = (benchmark or "").strip().lower()
++    if key in _MATH:
++        return "math"
++    if key in _KNOWLEDGE:
++        return "knowledge"
++    return "code"
++
++
++# --------------------------------------------------------------------------- #
++# 4. Rebuild / integrity hash.
++# --------------------------------------------------------------------------- #
++#: Item fields that are part of the frozen identity of a benchmark. Cached model
++#: answers/scores are deliberately excluded — they are populated by live API calls
++#: and must not change the integrity hash.
++_HASHED_ITEM_FIELDS: tuple[str, ...] = (
++    "question_id",
++    "benchmark",
++    "task_type",
++    "question_text",
++    "correct_answer",
++)
++
++
++def _canonical_item(split: str, item: Mapping[str, Any]) -> dict[str, Any]:
++    """Project one item down to its hash-relevant fields, tagged with its split."""
++    canon: dict[str, Any] = {"split": split}
++    for field in _HASHED_ITEM_FIELDS:
++        canon[field] = item.get(field)
++    return canon
++
++
++def manifest_hash(splits: Mapping[str, Iterable[Mapping[str, Any]]]) -> str:
++    """Return the SHA-256 audit hash over all items AND their split assignment.
++
++    Unlike a hash over question text alone, this pins *which* questions are in
++    *which* split: reshuffling the same pool across eval/audit/live changes the
++    hash, so a rebuild is auditable down to the split. Items are canonicalised to
++    :data:`_HASHED_ITEM_FIELDS`, tagged with their split, and sorted by
++    ``(split rank, question_id)`` before hashing, so the result is invariant to
++    input ordering but sensitive to content and placement.
++
++    Args:
++        splits: Mapping of split name -> iterable of item dicts.
++
++    Returns:
++        Hex SHA-256 digest.
++    """
++    rank = {name: i for i, name in enumerate(SPLIT_ORDER)}
++    canon = [
++        _canonical_item(split, item)
++        for split in splits
++        for item in splits[split]
++    ]
++    canon.sort(key=lambda c: (rank.get(c["split"], len(rank)), str(c["question_id"])))
++    blob = json.dumps(canon, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
++    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
++
++
++# --------------------------------------------------------------------------- #
++# 5. Public metadata / manifest.
++# --------------------------------------------------------------------------- #
++def build_manifest(
++    benchmark: str,
++    splits: Mapping[str, list[Mapping[str, Any]]],
++    *,
++    seed: int = SEALED_SEED,
++    pool_models: list[str] | None = None,
++    created_at: str | None = None,
++) -> dict[str, Any]:
++    """Build the public, committable audit record for a built benchmark.
++
++    Everything here except ``created_at`` and ``pool_models`` is a deterministic
++    function of the sampled splits, so two rebuilds agree on ``content_hash``,
++    per-split counts, and the full sorted ``question_ids`` per split.
++
++    Args:
++        benchmark: Benchmark name.
++        splits: The built splits (split name -> item dicts).
++        seed: The sampling seed used (recorded for the audit trail).
++        pool_models: Model names whose answers were cached (informational).
++        created_at: ISO timestamp; supplied by the caller (kept out of the hash).
++
++    Returns:
++        A JSON-serialisable manifest dict.
++    """
++    counts = {name: len(splits.get(name, [])) for name in SPLIT_ORDER}
++    ids = {
++        name: sorted(str(item.get("question_id")) for item in splits.get(name, []))
++        for name in SPLIT_ORDER
++    }
++    return {
++        "benchmark": benchmark,
++        "seed": seed,
++        "protocol_version": 1,
++        "split_order": list(SPLIT_ORDER),
++        "counts": counts,
++        "content_hash": manifest_hash(splits),
++        "question_ids": ids,
++        "pool_models": list(pool_models or []),
++        "created_at": created_at,
++    }
+diff --git a/scripts/build_benchmark.py b/scripts/build_benchmark.py
+index 34443c5..d25f7ff 100644
+--- a/scripts/build_benchmark.py
++++ b/scripts/build_benchmark.py
+@@ -36,9 +36,15 @@
+ 
+ _REPO = Path(__file__).resolve().parents[1]
+ sys.path.insert(0, str(_REPO / "src"))
++sys.path.insert(0, str(Path(__file__).resolve().parent))  # sibling scripts/ modules
++
++import benchmark_protocol as protocol  # noqa: E402  (needs the sys.path insert above)
+ 
+ # ---- SEALED SEED — never change after first build ----
+-_BENCHMARK_SEED: int = 271828182  # first 9 digits of e — arbitrary but fixed forever
++# The sampling protocol (seed, split counts, integrity hash) is frozen in
++# scripts/benchmark_protocol.py; see docs/BENCHMARK_PROTOCOL.md. Kept as a local
++# alias so the build log and file headers keep printing the seed.
++_BENCHMARK_SEED: int = protocol.SEALED_SEED
+ 
+ 
+ def _derive_key(password: str, salt: bytes) -> bytes:
+@@ -64,15 +70,11 @@ def _encrypt_json(data: dict, password: str) -> str:
+     return base64.b64encode(combined).decode("ascii")
+ 
+ 
+-def _load_tasks(benchmark: str, count: int) -> List[Any]:
+-    """Load tasks from HF datasets with the sealed seed."""
++def _sample_pool(benchmark: str, counts: Dict[str, int]) -> List[Any]:
++    """Sample the deterministic task pool per the frozen protocol (sealed seed)."""
+     from trinity.orchestration.dataset import load_tasks
+-    import random as _random
+ 
+-    rng = _random.Random(_BENCHMARK_SEED)
+-    tasks = load_tasks(benchmark, "train", max_items=count * 3, seed=_BENCHMARK_SEED)
+-    rng.shuffle(tasks)
+-    return tasks[:count]
++    return protocol.sample_pool(load_tasks, benchmark, counts, seed=_BENCHMARK_SEED)
+ 
+ 
+ async def _cache_answers(items: List[Dict], pool, pool_models: List[str]) -> None:
+@@ -97,21 +99,21 @@ async def _cache_answers(items: List[Dict], pool, pool_models: List[str]) -> Non
+                     item["model_answers"][model_name] = ""
+ 
+ 
+-def _task_to_item(task: Any) -> Dict:
+-    """Convert a trinity Task to a benchmark item dict."""
+-    benchmark = getattr(task, "benchmark", "math500") or "math500"
+-    b_lower = benchmark.lower().strip()
+-    if b_lower in ("math500", "math", "aime", "aime2025"):
+-        task_type = "math"
+-    elif b_lower in ("mmlu", "gpqa", "gpqa-diamond", "gpqa_diamond"):
+-        task_type = "knowledge"
+-    else:
+-        task_type = "code"
++def _task_to_item(task: Any, index: int) -> Dict:
++    """Convert a trinity Task to a benchmark item dict (shape unchanged).
+ 
++    ``index`` is the task's position in the sampled pool; it only feeds the
++    deterministic id fallback (``protocol.question_id``) for tasks without a
++    stable ``task_id``.
++    """
++    benchmark = getattr(task, "benchmark", "math500") or "math500"
++    prompt = getattr(task, "prompt", "")
+     return {
+-        "question_id": getattr(task, "task_id", f"q_{hash(task.prompt) % 100000}"),
+-        "question_text": getattr(task, "prompt", ""),
+-        "task_type": task_type,
++        "question_id": protocol.question_id(
++            benchmark, index, prompt, existing=getattr(task, "task_id", None)
++        ),
++        "question_text": prompt,
++        "task_type": protocol.task_type(benchmark),
+         "benchmark": benchmark,
+         "correct_answer": getattr(task, "answer", None),
+         "model_answers": {},
+@@ -131,31 +133,35 @@ async def build_benchmark(benchmark: str, output_dir: str, password: str) -> str
+     print(f"  Output: {bench_dir}")
+     print()
+ 
+-    # Determine task counts based on benchmark type
+-    eval_count = 150
+-    audit_count = 50
+-    live_count = 20
+-    total_needed = eval_count + audit_count + live_count
++    # Per-split counts come from the frozen protocol (default 150/50/20).
++    counts = protocol.split_counts(benchmark)
++    total_needed = protocol.total_needed(counts)
+ 
+-    # Load tasks
++    # Load the deterministic pool, then carve disjoint splits per the protocol.
+     print(f"Loading {total_needed}+ tasks from {benchmark}...")
+-    tasks = _load_tasks(benchmark, total_needed + 50)  # 50 extra margin
++    tasks = _sample_pool(benchmark, counts)
+     print(f"  Loaded {len(tasks)} tasks")
+-
+-    # Split: first eval_size are eval, next audit_size are audit, next live_size are live
+-    eval_tasks = tasks[:eval_count]
+-    audit_tasks = tasks[eval_count:eval_count + audit_count]
+-    live_tasks = tasks[eval_count + audit_count:eval_count + audit_count + live_count]
+-
+-    eval_items = [_task_to_item(t) for t in eval_tasks]
+-    audit_items = [_task_to_item(t) for t in audit_tasks]
+-    live_items_raw = [_task_to_item(t) for t in live_tasks]
+-
+-    # Live items don't need cached answers (they get live API calls)
+-    # But we need to strip model_answers expectation
++    task_splits = protocol.select_splits(tasks, counts)
++
++    # Convert to items with a stable, protocol-defined id. A pool-global index
++    # feeds the deterministic id fallback so ids never collide across splits.
++    items_by_split: Dict[str, List[Dict]] = {}
++    idx = 0
++    for name in protocol.SPLIT_ORDER:
++        built = []
++        for t in task_splits[name]:
++            built.append(_task_to_item(t, idx))
++            idx += 1
++        items_by_split[name] = built
++
++    eval_items = items_by_split["eval"]
++    audit_items = items_by_split["audit"]
++
++    # Live items don't need cached answers (they get live API calls), so strip
++    # the model_answers field.
+     live_items = [
+         {k: v for k, v in item.items() if k != "model_answers"}
+-        for item in live_items_raw
++        for item in items_by_split["live"]
+     ]
+ 
+     print(f"  Eval:  {len(eval_items)} questions")
+@@ -197,26 +203,24 @@ async def build_benchmark(benchmark: str, output_dir: str, password: str) -> str
+         password,
+     ))
+ 
+-    # Compute content hash (over the unencrypted data, for audit)
+-    h = hashlib.sha256()
+-    for item in sorted(eval_items + audit_items + live_items, key=lambda x: x["question_id"]):
+-        h.update(item["question_text"].encode("utf-8"))
+-    content_hash = h.hexdigest()
++    # Integrity hash over the unencrypted data, per the frozen protocol. Unlike a
++    # question-text-only digest, manifest_hash also pins each item's SPLIT, so a
++    # rebuild that reshuffles the same questions across eval/audit/live is caught.
++    splits = {"eval": eval_items, "audit": audit_items, "live": live_items}
++    content_hash = protocol.manifest_hash(splits)
+ 
+     # Write unencrypted hash file (public — miners can verify benchmark hasn't changed)
+     (bench_dir / "hash.txt").write_text(f"{content_hash}\n")
+ 
+-    # Write metadata
+-    meta = {
+-        "benchmark": benchmark,
+-        "seed": _BENCHMARK_SEED,
+-        "eval_count": len(eval_items),
+-        "audit_count": len(audit_items),
+-        "live_count": len(live_items),
+-        "content_hash": content_hash,
+-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+-        "pool_models": pool_models,
+-    }
++    # Write the public, committable audit manifest (deterministic apart from the
++    # timestamp and pool list).
++    meta = protocol.build_manifest(
++        benchmark,
++        splits,
++        seed=_BENCHMARK_SEED,
++        pool_models=pool_models,
++        created_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++    )
+     (bench_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+ 
+     print(f"\n  Benchmark hash: {content_hash}")
+diff --git a/tests/test_benchmark_protocol.py b/tests/test_benchmark_protocol.py
+new file mode 100644
+index 0000000..62e17ef
+--- /dev/null
++++ b/tests/test_benchmark_protocol.py
+@@ -0,0 +1,184 @@
++"""Frozen hidden-benchmark sampling protocol (issue #14).
++
++Offline: exercises determinism, disjoint splits, stable ids, and the auditable
++integrity hash without any network, GPU, or encryption. The task pool uses
++`trinity.orchestration.dataset.load_tasks`, which falls back to the built-in toy
++sets when `datasets`/network are unavailable.
++"""
++from __future__ import annotations
++
++import importlib.util
++import sys
++from pathlib import Path
++
++_REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(_REPO / "src"))
++
++
++def _load_protocol():
++    spec = importlib.util.spec_from_file_location(
++        "benchmark_protocol", _REPO / "scripts" / "benchmark_protocol.py"
++    )
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules["benchmark_protocol"] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++P = _load_protocol()
++
++
++def _fake_task(i: int, benchmark: str = "math500"):
++    """A minimal task-like object (duck-typed: task_id / benchmark / prompt / answer)."""
++    class _T:
++        task_id = f"{benchmark}-{i}"
++        prompt = f"question number {i}?"
++        answer = str(i)
++    _T.benchmark = benchmark
++    return _T()
++
++
++def _loader(pool):
++    """A load_tasks stand-in returning a deterministic slice of `pool`."""
++    def load_tasks(benchmark, split, max_items, seed=0):
++        return list(pool[:max_items])
++    return load_tasks
++
++
++def _small_counts():
++    # Small counts so the pool fits the toy/fake sets; margin still applies.
++    return {"eval": 3, "audit": 2, "live": 1}
++
++
++# --------------------------------------------------------------------------- #
++# Counts / pool sizing
++# --------------------------------------------------------------------------- #
++def test_split_counts_default_and_order():
++    c = P.split_counts("math500")
++    assert list(c) == list(P.SPLIT_ORDER)          # ordered eval, audit, live
++    assert c == {"eval": 150, "audit": 50, "live": 20}
++    assert P.total_needed(c) == 220
++    assert P.pool_size(c) == 220 + P.SAMPLE_MARGIN
++
++
++# --------------------------------------------------------------------------- #
++# Deterministic sampling + disjoint splits
++# --------------------------------------------------------------------------- #
++def test_sample_pool_is_deterministic():
++    counts = _small_counts()
++    pool = [_fake_task(i) for i in range(P.pool_size(counts))]
++    a = P.sample_pool(_loader(pool), "math500", counts)
++    b = P.sample_pool(_loader(pool), "math500", counts)
++    assert [t.task_id for t in a] == [t.task_id for t in b]
++    assert len(a) == P.pool_size(counts)
++
++
++def test_select_splits_disjoint_and_sized():
++    counts = _small_counts()
++    pool = [_fake_task(i) for i in range(P.pool_size(counts))]
++    tasks = P.sample_pool(_loader(pool), "math500", counts)
++    splits = P.select_splits(tasks, counts)
++    assert [len(splits[n]) for n in P.SPLIT_ORDER] == [3, 2, 1]
++    ids = [t.task_id for n in P.SPLIT_ORDER for t in splits[n]]
++    assert len(ids) == len(set(ids))  # no task appears in two splits
++
++
++def test_select_splits_raises_when_pool_too_small():
++    counts = _small_counts()
++    tasks = [_fake_task(i) for i in range(P.total_needed(counts) - 1)]
++    try:
++        P.select_splits(tasks, counts)
++        assert False, "expected ValueError for undersized pool"
++    except ValueError as exc:
++        assert "needs" in str(exc)
++
++
++# --------------------------------------------------------------------------- #
++# Stable ids (no builtin hash())
++# --------------------------------------------------------------------------- #
++def test_question_id_prefers_existing():
++    assert P.question_id("math500", 0, "p", existing="math500-7") == "math500-7"
++
++
++def test_question_id_fallback_is_stable_and_not_builtin_hash():
++    import hashlib
++
++    got = P.question_id("mmlu", 4, "why is the sky blue?")
++    # Deterministic and independent of PYTHONHASHSEED — recompute the spec.
++    digest = hashlib.sha256("mmlu\x1f4\x1fwhy is the sky blue?".encode()).hexdigest()
++    assert got == f"mmlu-{digest[:12]}"
++    assert got == P.question_id("mmlu", 4, "why is the sky blue?")
++
++
++def test_task_type_classification():
++    assert P.task_type("math500") == "math"
++    assert P.task_type("mmlu") == "knowledge"
++    assert P.task_type("livecodebench") == "code"
++
++
++# --------------------------------------------------------------------------- #
++# Integrity hash: deterministic, order-invariant, split- and content-sensitive
++# --------------------------------------------------------------------------- #
++def _item(qid, split_bench="math500", text="t", answer="a"):
++    return {
++        "question_id": qid,
++        "benchmark": split_bench,
++        "task_type": "math",
++        "question_text": text,
++        "correct_answer": answer,
++        "model_answers": {"m": "cached"},  # excluded from the hash
++    }
++
++
++def _splits():
++    return {
++        "eval": [_item("q1"), _item("q2")],
++        "audit": [_item("q3")],
++        "live": [_item("q4")],
++    }
++
++
++def test_manifest_hash_is_deterministic_and_order_invariant():
++    s = _splits()
++    h1 = P.manifest_hash(s)
++    shuffled = {"eval": [s["eval"][1], s["eval"][0]], "audit": s["audit"], "live": s["live"]}
++    assert P.manifest_hash(shuffled) == h1  # sorting makes input order irrelevant
++
++
++def test_manifest_hash_ignores_cached_answers():
++    s = _splits()
++    h1 = P.manifest_hash(s)
++    s["eval"][0]["model_answers"] = {"m": "DIFFERENT"}
++    assert P.manifest_hash(s) == h1  # cached answers are not part of identity
++
++
++def test_manifest_hash_pins_split_assignment():
++    """Moving a question from eval to audit (same set) must change the hash."""
++    s = _splits()
++    h1 = P.manifest_hash(s)
++    moved = {"eval": [s["eval"][0]], "audit": s["audit"] + [s["eval"][1]], "live": s["live"]}
++    assert P.manifest_hash(moved) != h1
++
++
++def test_manifest_hash_sensitive_to_content():
++    s = _splits()
++    h1 = P.manifest_hash(s)
++    s["audit"][0]["correct_answer"] = "changed"
++    assert P.manifest_hash(s) != h1
++
++
++# --------------------------------------------------------------------------- #
++# Public manifest
++# --------------------------------------------------------------------------- #
++def test_build_manifest_shape_and_determinism():
++    import json
++
++    s = _splits()
++    m1 = P.build_manifest("math500", s, pool_models=["m"], created_at="2026-01-01T00:00:00Z")
++    m2 = P.build_manifest("math500", s, pool_models=["m"], created_at="2026-01-01T00:00:00Z")
++    assert m1 == m2
++    assert m1["seed"] == P.SEALED_SEED
++    assert m1["counts"] == {"eval": 2, "audit": 1, "live": 1}
++    assert m1["content_hash"] == P.manifest_hash(s)
++    assert m1["question_ids"]["eval"] == ["q1", "q2"]  # sorted
++    json.dumps(m1)  # must be JSON-serialisable

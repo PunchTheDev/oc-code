@@ -1,0 +1,171 @@
+"""Extract the public-safe fields from a real score_pr_delta / combine_dual_target() result,
+for the public leaderboard feed the maintainer bot publishes to the project's GitHub Pages site
+(gittensor-vanguard.github.io/vanguarstew) after every real (non-offline) agent/ PR score.
+
+This is the one place that decides what's safe to publish. The rule is the same one the whole
+hidden-repo-set mechanism already runs on: the SCORING MECHANISM is public (composite deltas,
+bands, per-repo breakdowns), but a PRIVATE repo target's identity never is.
+
+  - The public target's ``per_repo`` breakdown is safe to publish verbatim: those are
+    ``benchmark/repo_sets/curated.json``'s repos, already public knowledge.
+  - The private target contributes ONLY its composite delta -- never its diff, never its
+    per-repo breakdown (which would leak which repos are in the hidden set), never anything
+    else from its ``diff`` payload.
+
+Two DIFFERENT deltas can appear on one entry:
+  - The per-PR band's delta (``public``/``private`` top-level keys) is against the base
+    branch's state at the moment this PR was scored -- a SHIFTING baseline that moves every
+    time a PR merges. This is what decides the perf:* label; it answers "was this PR a real
+    improvement over what came immediately before it."
+  - ``since_anchor`` (optional) is against a FIXED, named release (e.g. v0.5.0) that never
+    moves until the anchor itself is rolled forward. This answers "how much better is the
+    agent now than at our last tagged release" -- the cumulative-progress line, not a
+    per-PR eligibility check. Carries both ``composite_delta`` AND the absolute
+    ``composite_score``/``anchor_score`` scalars, so the leaderboard page can draw a
+    growing bar per PR, not just a signed delta. See _since_anchor_fields().
+
+Pure data transformation: no I/O, no network, no repo-set opinions of its own.
+"""
+
+from __future__ import annotations
+
+import datetime
+import json
+
+
+def _round(value):
+    return round(float(value), 4) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _safe_per_repo(public_report: dict) -> list:
+    """The public target's per-repo composite deltas -- repo names included, since
+    curated.json's repos are already public. Malformed/missing entries are skipped rather
+    than raising, matching this project's usual "coerce or default, don't crash" policy."""
+    per_repo = (((public_report or {}).get("diff") or {}).get("per_repo")) or []
+    if not isinstance(per_repo, list):
+        return []
+    out = []
+    for entry in per_repo:
+        if not isinstance(entry, dict):
+            continue
+        repo = entry.get("repo")
+        delta = _round((entry.get("composite_mean") or {}).get("delta"))
+        if isinstance(repo, str) and repo:
+            out.append({"repo": repo, "composite_delta": delta})
+    return out
+
+
+def _since_anchor_fields(since_anchor: dict | None) -> dict | None:
+    """The public-safe subset of a since-anchor comparison (candidate vs. a FIXED, named
+    release -- e.g. v0.5.0 -- rather than the shifting `test`-branch baseline every per-PR
+    score already uses). Same privacy rule as the per-PR public/private split: the private
+    target contributes only scalar composite figures, never a per-repo breakdown.
+
+    ``since_anchor`` is expected to carry ``{"anchor": <name>, "public": <score_pr_delta
+    result>, "private": <score_pr_delta result>}`` -- the same shape score_pr_delta() already
+    returns for each target, just diffed against the cached anchor baseline instead of the
+    current base branch. ``None`` (no anchor comparison was run) passes through as ``None``.
+
+    Besides ``composite_delta``, this also surfaces ``composite_score`` (the candidate's own
+    absolute composite mean) and ``anchor_score`` (the anchor's absolute composite mean, i.e.
+    ``diff.composite_mean.candidate``/``.baseline``) -- both are scalar aggregates, not a
+    per-repo breakdown, so publishing them carries the same privacy profile as the delta
+    already published; they're what let the leaderboard page draw an absolute, growing bar
+    per PR (like sparkinfer's optimization-journey chart) instead of only a signed delta.
+    """
+    if not isinstance(since_anchor, dict):
+        return None
+
+    def _scores(report):
+        composite = ((report or {}).get("diff") or {}).get("composite_mean") or {}
+        return {
+            "composite_delta": _round(composite.get("delta")),
+            "composite_score": _round(composite.get("candidate")),
+            "anchor_score": _round(composite.get("baseline")),
+        }
+
+    return {
+        "anchor": since_anchor.get("anchor"),
+        "public": _scores(since_anchor.get("public")),
+        "private": _scores(since_anchor.get("private")),
+    }
+
+
+def to_leaderboard_entry(
+    combined: dict, pr_number: int, timestamp: str | None = None, since_anchor: dict | None = None,
+) -> dict:
+    """Build one public leaderboard-feed entry from a combine_dual_target() result.
+
+    ``timestamp`` defaults to now (UTC, ISO-8601) -- pass an explicit value only for
+    deterministic tests. NEVER includes the private target's per-repo data or diff; only its
+    composite_delta survives into the entry.
+
+    ``since_anchor``, when given, adds a SEPARATE cumulative-progress field: the same PR's
+    delta against a fixed, named release (not the per-PR band's shifting base-branch
+    baseline) -- see _since_anchor_fields(). Omitted from the entry entirely when not given,
+    rather than a null placeholder, so old feed entries (scored before an anchor existed)
+    and new ones are both valid without every reader needing to handle a null case.
+    """
+    public = combined.get("public") or {}
+    private = combined.get("private") or {}
+    entry = {
+        "timestamp": timestamp or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "pr_number": pr_number,
+        "band": combined.get("band"),
+        "label": combined.get("label"),
+        "public": {
+            "composite_delta": _round((public.get("composite_deltas") or {}).get("composite_mean")),
+            "per_repo": _safe_per_repo(public),
+        },
+        "private": {
+            "composite_delta": _round((private.get("composite_deltas") or {}).get("composite_mean")),
+        },
+    }
+    fields = _since_anchor_fields(since_anchor)
+    if fields is not None:
+        entry["since_anchor"] = fields
+    return entry
+
+
+def to_anchor_entry(
+    anchor_name: str, public_artifact: dict, private_artifact: dict, timestamp: str | None = None,
+) -> dict:
+    """Build the standalone anchor-baseline record for the leaderboard page: the anchor
+    release's OWN absolute composite score on each target, independent of any PR ever being
+    scored against it.
+
+    Unlike a leaderboard entry (which only exists once a real PR has been scored),
+    this is published once -- whenever the anchor is (re)generated, see
+    codex-dev/anchor_baseline.sh -- so the leaderboard's base bar has a real value to show
+    from the moment the anchor exists, not only after the first PR lands. Inputs are raw
+    ``run_eval --out`` artifacts (NOT a score_pr_delta result -- there's nothing to diff the
+    anchor against, it IS the reference point), so this reads ``composite_mean`` directly off
+    each artifact's top level. Both scores are scalar aggregates, same privacy profile as
+    everything else this module publishes -- no per-repo breakdown, no repo identities.
+    """
+    return {
+        "anchor": anchor_name,
+        "timestamp": timestamp or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "public_score": _round((public_artifact or {}).get("composite_mean")),
+        "private_score": _round((private_artifact or {}).get("composite_mean")),
+    }
+
+
+def append_entry(path: str, entry: dict, max_entries: int = 500) -> list:
+    """Append ``entry`` to the JSON array stored at ``path`` (creating it if missing), and
+    return the updated list. Keeps at most ``max_entries`` (oldest dropped first) so the public
+    feed can't grow unbounded. Does not write ``path`` if it exists but doesn't parse as a JSON
+    array -- raises instead, since a corrupt feed file should be loud, not silently replaced."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+    except FileNotFoundError:
+        existing = []
+    if not isinstance(existing, list):
+        raise ValueError(f"{path} does not contain a JSON array")
+    existing.append(entry)
+    if len(existing) > max_entries:
+        existing = existing[-max_entries:]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2)
+    return existing

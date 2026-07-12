@@ -1,0 +1,1321 @@
+diff --git a/packages/gittensory-mcp/bin/gittensory-mcp.js b/packages/gittensory-mcp/bin/gittensory-mcp.js
+index 298f3b60c..8e84a456e 100755
+--- a/packages/gittensory-mcp/bin/gittensory-mcp.js
++++ b/packages/gittensory-mcp/bin/gittensory-mcp.js
+@@ -215,6 +215,15 @@ const findOpportunitiesShape = {
+   limit: z.number().int().min(1).max(50).optional(),
+ };
+ 
++const issueRagShape = {
++  owner: z.string(),
++  repo: z.string(),
++  title: z.string(),
++  body: z.string().optional(),
++  labels: z.array(z.string()).optional(),
++  topK: z.number().int().min(1).max(12).optional(),
++};
++
+ const lintPrTextShape = {
+   commitMessages: z.array(z.string()).max(50).optional(),
+   prBody: z.string().optional(),
+@@ -380,6 +389,10 @@ const STDIO_TOOL_DESCRIPTORS = [
+     name: "gittensory_find_opportunities",
+     description: "Cross-repo discovery: find high-fit contribution opportunities across registered Gittensor repos. Returns a ranked, public-safe list filtered by your MinerGoalSpec (lane, min rank score, languages). Metadata-only, no GitHub writes.",
+   },
++  {
++    name: "gittensory_retrieve_issue_context",
++    description: "Repo-scoped issue-centric RAG retrieval for the miner analyze phase. Returns related file paths and retrieval scores from issue title/body/labels — metadata only, never source text.",
++  },
+   {
+     name: "gittensory_lint_pr_text",
+     description: "Lint a commit message + PR body against the gittensor traceability/no-issue-rationale and Conventional Commit rubric before submitting. Returns a deterministic verdict (strong/adequate/weak) plus specific public-safe fixes. No source upload.",
+@@ -596,6 +609,25 @@ server.registerTool(
+   },
+ );
+ 
++server.registerTool(
++  "gittensory_retrieve_issue_context",
++  {
++    description: stdioToolDescription("gittensory_retrieve_issue_context"),
++    inputSchema: issueRagShape,
++  },
++  async ({ owner, repo, title, body, labels, topK }) => {
++    const payload = {
++      owner,
++      repo,
++      title,
++      ...(body ? { body } : {}),
++      ...(labels && labels.length > 0 ? { labels } : {}),
++      ...(topK != null ? { topK } : {}),
++    };
++    return toolResult("Gittensory issue-centric RAG context.", await apiPost("/v1/issue-rag/retrieve", payload));
++  },
++);
++
+ server.registerTool(
+   "gittensory_lint_pr_text",
+   {
+diff --git a/src/api/routes.ts b/src/api/routes.ts
+index 6869489a4..a7296171f 100644
+--- a/src/api/routes.ts
++++ b/src/api/routes.ts
+@@ -183,6 +183,7 @@ import {
+   loadControlPanelRoleSummary,
+ } from "../services/control-panel-roles";
+ import { runFindOpportunities, validateFindOpportunitiesInput, type FindOpportunitiesInput } from "../mcp/find-opportunities";
++import { runIssueRagRetrieval, validateIssueRagInput, type IssueRagInput } from "../mcp/issue-rag";
+ import {
+   buildMcpCompatibilityMetadata,
+   LATEST_RECOMMENDED_MCP_VERSION,
+@@ -2853,6 +2854,21 @@ export function createApp() {
+     return c.json(result);
+   });
+ 
++  app.post(ISSUE_RAG_RETRIEVE_PATH, async (c) => {
++    const identity = await authenticateRequestIdentity(c);
++    /* v8 ignore next -- Protected middleware rejects unauthenticated private routes before route-specific guards. */
++    if (!identity) return c.json({ error: "unauthorized" }, 401);
++    const body = await c.req.json().catch(() => null);
++    const parsed = validateIssueRagInput((body ?? {}) as IssueRagInput);
++    if (!parsed.ok) {
++      return c.json({ status: "invalid_request", repoFullName: "", reason: parsed.reason, telemetry: { attempted: false, injected: false, retrievedPaths: [] } }, 400);
++    }
++    const forbidden = await requireApiRepoReadAccess(c, identity, parsed.value.repoFullName);
++    if (forbidden) return forbidden;
++    const result = await runIssueRagRetrieval(c.env, parsed.value);
++    return c.json(result);
++  });
++
+   app.post("/v1/preflight/pr", async (c) => {
+     const body = await c.req.json().catch(() => null);
+     const parsed = preflightSchema.safeParse(body);
+@@ -5211,6 +5227,7 @@ function contributorEvidenceFromProfile(profile: {
+ const EXTENSION_PULL_CONTEXT_PATH = "/v1/extension/pull-context";
+ const EXTENSION_PULL_CONTEXT_SCOPE = "extension:pull_context";
+ const OPPORTUNITIES_FIND_PATH = "/v1/opportunities/find";
++const ISSUE_RAG_RETRIEVE_PATH = "/v1/issue-rag/retrieve";
+ const LINT_PR_TEXT_PATH = "/v1/lint/pr-text";
+ const VALIDATE_FOCUS_MANIFEST_PATH = "/v1/validate/focus-manifest";
+ const LINT_SLOP_RISK_PATH = "/v1/lint/slop-risk";
+@@ -5280,6 +5297,7 @@ function canSessionAccessPath(env: Env, identity: Extract<AuthIdentity, { kind:
+   if (isRepoAgentPendingActionsPath(path)) return true; // list-only: requireRepoMaintainer; decision POSTs require server tokens
+   if (isRepoContributorIssueDraftGeneratePath(path)) return true;
+   if (path === OPPORTUNITIES_FIND_PATH) return true;
++  if (path === ISSUE_RAG_RETRIEVE_PATH) return true;
+   if (path === LINT_PR_TEXT_PATH || path === VALIDATE_FOCUS_MANIFEST_PATH || path === LINT_SLOP_RISK_PATH || path === LINT_ISSUE_SLOP_PATH) return true;
+   if (path === EXTENSION_PULL_CONTEXT_PATH && isExtensionScopedSession(identity)) return true;
+   // Contributor extension scope reaches only `/v1/extension/contributors/<login>/*`; the handler's
+diff --git a/src/auth/rate-limit.ts b/src/auth/rate-limit.ts
+index 207c87562..c360062fb 100644
+--- a/src/auth/rate-limit.ts
++++ b/src/auth/rate-limit.ts
+@@ -117,6 +117,7 @@ export function routeClassForPath(path: string): RateLimitClass {
+     path.includes("/miner-dashboard/refresh") ||
+     path.includes("/open-pr-monitor") ||
+     path === "/v1/opportunities/find" ||
++    path === "/v1/issue-rag/retrieve" ||
+     // Maintainer BYOK config: POST /ai-key and /linear-key both run PBKDF2 (100k iters) + an encrypted D1
+     // upsert per request.
+     /\/(?:ai-(?:key|review)|linear-key)$/.test(path) ||
+diff --git a/src/mcp/issue-rag.ts b/src/mcp/issue-rag.ts
+new file mode 100644
+index 000000000..1e517ed37
+--- /dev/null
++++ b/src/mcp/issue-rag.ts
+@@ -0,0 +1,106 @@
++// Hosted `gittensory_retrieve_issue_context` (#4293): metadata-only issue-centric RAG retrieval for the
++// miner analyze phase. Composes `buildIssueRagQuery` and runs `retrieveContextWithMetrics` server-side
++// via a hosted API round-trip (stdio MCP proxies to `/v1/issue-rag/retrieve`). Returns retrieved paths
++// and scores only — never chunk bodies or source text.
++
++import { buildIssueRagQuery } from "../../packages/gittensory-engine/src/issue-rag-query";
++import { PREFLIGHT_LIMITS } from "../signals/preflight-limits";
++import { emptyIssueRagTelemetry, normalizeIssueRagTopK, retrieveIssueRagContext, type IssueRagTelemetry } from "../review/issue-rag-retrieval";
++
++export const MAX_ISSUE_RAG_OWNER_LENGTH = 39;
++export const MAX_ISSUE_RAG_REPO_LENGTH = 100;
++
++export type IssueRagInput = {
++  owner: string;
++  repo: string;
++  title: string;
++  body?: string | undefined;
++  labels?: string[] | undefined;
++  topK?: number | undefined;
++};
++
++export type IssueRagResult = {
++  status: "ok" | "invalid_request" | "query_too_short";
++  repoFullName: string;
++  reason?: string | undefined;
++  telemetry: IssueRagTelemetry;
++};
++
++function cleanLabels(labels: string[] | undefined): string[] | undefined {
++  if (!labels) return undefined;
++  const cleaned = labels.map((label) => label.trim()).filter(Boolean).slice(0, PREFLIGHT_LIMITS.labels);
++  return cleaned.length > 0 ? cleaned : undefined;
++}
++
++export function validateIssueRagInput(
++  input: IssueRagInput,
++): { ok: true; value: IssueRagInput & { repoFullName: string } } | { ok: false; reason: string } {
++  const owner = typeof input.owner === "string" ? input.owner.trim() : "";
++  const repo = typeof input.repo === "string" ? input.repo.trim() : "";
++  const title = typeof input.title === "string" ? input.title.trim() : "";
++  if (!owner || !repo) return { ok: false, reason: "owner_and_repo_required" };
++  if (!title) return { ok: false, reason: "title_required" };
++  if (owner.length > MAX_ISSUE_RAG_OWNER_LENGTH) return { ok: false, reason: "owner_too_long" };
++  if (repo.length > MAX_ISSUE_RAG_REPO_LENGTH) return { ok: false, reason: "repo_too_long" };
++  if (title.length > PREFLIGHT_LIMITS.titleChars) return { ok: false, reason: "title_too_long" };
++  const body = typeof input.body === "string" ? input.body.slice(0, PREFLIGHT_LIMITS.bodyChars) : undefined;
++  const labels = cleanLabels(input.labels);
++  if (labels) {
++    for (const label of labels) {
++      if (label.length > PREFLIGHT_LIMITS.labelChars) return { ok: false, reason: "invalid_labels" };
++    }
++  }
++  const topK = input.topK;
++  if (topK !== undefined && (!Number.isFinite(topK) || topK < 1 || topK > 12)) {
++    return { ok: false, reason: "invalid_top_k" };
++  }
++  return {
++    ok: true,
++    value: {
++      owner,
++      repo,
++      title,
++      ...(body !== undefined ? { body } : {}),
++      ...(labels ? { labels } : {}),
++      ...(topK !== undefined ? { topK: normalizeIssueRagTopK(topK) } : {}),
++      repoFullName: `${owner}/${repo}`,
++    },
++  };
++}
++
++export async function runIssueRagRetrieval(env: Env, input: IssueRagInput): Promise<IssueRagResult> {
++  const validated = validateIssueRagInput(input);
++  if (!validated.ok) {
++    return {
++      status: "invalid_request",
++      repoFullName: "",
++      reason: validated.reason,
++      telemetry: emptyIssueRagTelemetry(),
++    };
++  }
++  const { queryText } = buildIssueRagQuery({
++    title: validated.value.title,
++    body: validated.value.body,
++    labels: validated.value.labels,
++  });
++  if (!queryText) {
++    return {
++      status: "query_too_short",
++      repoFullName: validated.value.repoFullName,
++      reason: "issue_query_below_retrieval_floor",
++      telemetry: emptyIssueRagTelemetry(),
++    };
++  }
++  const retrieved = await retrieveIssueRagContext(env, {
++    repoFullName: validated.value.repoFullName,
++    title: validated.value.title,
++    body: validated.value.body,
++    labels: validated.value.labels,
++    topK: validated.value.topK,
++  });
++  return {
++    status: "ok",
++    repoFullName: retrieved.repoFullName,
++    telemetry: retrieved.telemetry,
++  };
++}
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index f214c397c..6df29fa53 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -13,6 +13,12 @@ import {
+   runFindOpportunities,
+   validateFindOpportunitiesInput,
+ } from "./find-opportunities";
++import {
++  MAX_ISSUE_RAG_OWNER_LENGTH,
++  MAX_ISSUE_RAG_REPO_LENGTH,
++  runIssueRagRetrieval,
++  validateIssueRagInput,
++} from "./issue-rag";
+ import {
+   authenticatePrivateToken,
+   extractBearerToken,
+@@ -248,6 +254,15 @@ const checkBeforeStartShape = {
+   plannedPaths: z.array(z.string().max(PREFLIGHT_LIMITS.changedFileChars)).max(PREFLIGHT_LIMITS.changedFiles).optional(),
+ };
+ 
++const issueRagShape = {
++  owner: z.string().max(MAX_ISSUE_RAG_OWNER_LENGTH),
++  repo: z.string().max(MAX_ISSUE_RAG_REPO_LENGTH),
++  title: z.string().max(PREFLIGHT_LIMITS.titleChars),
++  body: z.string().max(PREFLIGHT_LIMITS.bodyChars).optional(),
++  labels: z.array(z.string().max(PREFLIGHT_LIMITS.labelChars)).max(PREFLIGHT_LIMITS.labels).optional(),
++  topK: z.number().int().min(1).max(12).optional(),
++};
++
+ const findOpportunitiesShape = {
+   targets: z
+     .array(
+@@ -1055,6 +1070,26 @@ const checkBeforeStartOutputSchema = {
+   report: z.unknown().optional(),
+ };
+ 
++const issueRagOutputSchema = {
++  status: z.string().optional(),
++  repoFullName: z.string().optional(),
++  reason: z.string().optional(),
++  telemetry: z
++    .object({
++      attempted: z.boolean().optional(),
++      injected: z.boolean().optional(),
++      candidates: z.number().optional(),
++      kept: z.number().optional(),
++      topScore: z.number().optional(),
++      minScore: z.number().optional(),
++      reranked: z.boolean().optional(),
++      injectedChars: z.number().optional(),
++      retrievedPathCount: z.number().optional(),
++      retrievedPaths: z.array(z.string()).optional(),
++    })
++    .optional(),
++};
++
+ const findOpportunitiesOutputSchema = {
+   status: z.string().optional(),
+   ranked: z
+@@ -1729,6 +1764,17 @@ export class GittensoryMcp {
+       async (input) => this.toolResult(await this.findOpportunities(input)),
+     );
+ 
++    server.registerTool(
++      "gittensory_retrieve_issue_context",
++      {
++        description:
++          "Metadata-only, repo-scoped issue-centric RAG retrieval for the miner analyze phase. Composes an embeddable query from issue title/body/labels and returns retrieved file paths plus retrieval scores — never chunk bodies or source text. Requires hosted Vectorize/D1; degrades to empty paths when unavailable.",
++        inputSchema: issueRagShape,
++        outputSchema: issueRagOutputSchema,
++      },
++      async (input) => this.toolResult(await this.retrieveIssueContext(input)),
++    );
++
+     server.registerTool(
+       "gittensory_lint_pr_text",
+       {
+@@ -2555,6 +2601,28 @@ export class GittensoryMcp {
+     };
+   }
+ 
++  private async retrieveIssueContext(input: z.infer<z.ZodObject<typeof issueRagShape>>): Promise<ToolPayload> {
++    const validated = validateIssueRagInput(input);
++    if (!validated.ok) {
++      return {
++        summary: "Invalid issue-context retrieval request.",
++        data: { status: "invalid_request", repoFullName: "", reason: validated.reason, telemetry: { attempted: false, injected: false, retrievedPaths: [] } },
++      };
++    }
++    await this.requireRepoAccess(validated.value.repoFullName);
++    const result = await runIssueRagRetrieval(this.env, validated.value);
++    const pathCount = result.telemetry.retrievedPathCount;
++    return {
++      summary:
++        result.status === "query_too_short"
++          ? "Issue query is below the retrieval floor; no RAG context was fetched."
++          : result.telemetry.injected
++            ? `Gittensory retrieved metadata-only context for ${pathCount} related path${pathCount === 1 ? "" : "s"}.`
++            : "Gittensory found no issue-centric RAG context for this request.",
++      data: result as unknown as Record<string, unknown>,
++    };
++  }
++
+   /** Cross-repo search requires unscoped MCP read (wildcard allowlist) or operator/session authority. */
+   private async requireDiscoveryAccess(): Promise<void> {
+     if (this.identity.kind === "session") {
+diff --git a/src/review/issue-rag-retrieval.ts b/src/review/issue-rag-retrieval.ts
+new file mode 100644
+index 000000000..afc277c45
+--- /dev/null
++++ b/src/review/issue-rag-retrieval.ts
+@@ -0,0 +1,115 @@
++// Issue-centric RAG retrieval wiring (#4293): composes `buildIssueRagQuery` and runs the hosted
++// Vectorize/D1 retrieval backend (`retrieveContextWithMetrics` in `./rag`). Fail-safe — a missing
++// binding, cold index, short query, or any error degrades to empty metadata and NEVER throws.
++// The MCP/API surfaces return metadata only (paths + scores), never retrieved source text.
++
++import { buildIssueRagQuery } from "../../packages/gittensory-engine/src/issue-rag-query";
++import { createReviewAdapters } from "./adapters";
++import { retrieveContextWithMetrics } from "./rag";
++
++const RAG_TOP_K = 12;
++const RAG_MIN_SCORE = 0.4;
++const RAG_RERANKER = "bm25" as const;
++const MAX_ISSUE_RAG_TOP_K = 12;
++
++export type IssueRagTelemetry = {
++  attempted: boolean;
++  injected: boolean;
++  candidates: number;
++  kept: number;
++  topScore: number;
++  minScore: number;
++  reranked: boolean;
++  injectedChars: number;
++  retrievedPathCount: number;
++  retrievedPaths: string[];
++};
++
++export type IssueRagRetrievalResult = {
++  repoFullName: string;
++  telemetry: IssueRagTelemetry;
++};
++
++export function emptyIssueRagTelemetry(): IssueRagTelemetry {
++  return {
++    attempted: false,
++    injected: false,
++    candidates: 0,
++    kept: 0,
++    topScore: 0,
++    minScore: 0,
++    reranked: false,
++    injectedChars: 0,
++    retrievedPathCount: 0,
++    retrievedPaths: [],
++  };
++}
++
++function splitRepo(repoFullName: string): [string, string] {
++  const slash = repoFullName.indexOf("/");
++  return slash === -1 ? ["", repoFullName] : [repoFullName.slice(0, slash), repoFullName.slice(slash + 1)];
++}
++
++export function normalizeIssueRagTopK(topK: number | null | undefined): number {
++  if (!Number.isFinite(topK)) return RAG_TOP_K;
++  return Math.min(MAX_ISSUE_RAG_TOP_K, Math.max(1, Math.trunc(topK!)));
++}
++
++/**
++ * Run issue-centric RAG retrieval for the miner analyze phase. Returns metadata-only telemetry
++ * (retrieved paths + scores) — never the retrieved chunk bodies. Degrades to empty telemetry when
++ * the query is too short, the backend is unavailable, or anything errors.
++ */
++export async function retrieveIssueRagContext(
++  env: Env,
++  args: {
++    repoFullName: string;
++    title: string;
++    body?: string | undefined;
++    labels?: string[] | undefined;
++    topK?: number | undefined;
++    reranker?: "off" | "bm25" | undefined;
++  },
++): Promise<IssueRagRetrievalResult> {
++  const repoFullName = args.repoFullName.trim();
++  try {
++    const { queryText } = buildIssueRagQuery({
++      title: args.title,
++      body: args.body,
++      labels: args.labels,
++    });
++    if (!queryText) {
++      return { repoFullName, telemetry: emptyIssueRagTelemetry() };
++    }
++    const infra = createReviewAdapters(env);
++    if (!infra.vector || !infra.inference) {
++      return { repoFullName, telemetry: emptyIssueRagTelemetry() };
++    }
++    const [project, repo] = splitRepo(repoFullName);
++    const result = await retrieveContextWithMetrics(infra, {
++      project,
++      repo,
++      queryText,
++      topK: normalizeIssueRagTopK(args.topK),
++      minScore: RAG_MIN_SCORE,
++      reranker: args.reranker ?? RAG_RERANKER,
++    });
++    return {
++      repoFullName,
++      telemetry: {
++        attempted: true,
++        injected: result.metrics.paths.length > 0,
++        candidates: result.metrics.candidates,
++        kept: result.metrics.kept,
++        topScore: result.metrics.topScore,
++        minScore: result.metrics.minScore,
++        reranked: result.metrics.reranked,
++        injectedChars: result.metrics.injectedChars,
++        retrievedPathCount: result.metrics.paths.length,
++        retrievedPaths: result.metrics.paths,
++      },
++    };
++  } catch {
++    return { repoFullName, telemetry: emptyIssueRagTelemetry() };
++  }
++}
+diff --git a/src/review/issue-rag-wire.ts b/src/review/issue-rag-wire.ts
+index 0efc20c62..9ca4e0a69 100644
+--- a/src/review/issue-rag-wire.ts
++++ b/src/review/issue-rag-wire.ts
+@@ -1,8 +1,8 @@
+ /**
+  * Issue-centric RAG query composition (#2320), extracted to `@jsonbored/gittensory-engine` (#4254) so the
+  * miner analyze phase can compose the identical retrieval query from an issue's title/body/labels without
+- * importing the review stack. The retrieval backend itself (`retrieveContext` in `./rag`) is Vectorize/D1-bound
+- * and intentionally stays in `src` — this shim only re-exports the pure query builder.
++ * importing the review stack. Retrieval wiring for the miner MCP tool lives in `./issue-rag-retrieval.ts`
++ * and `src/mcp/issue-rag.ts` (#4293); the Vectorize/D1 backend itself stays in `./rag`.
+  *
+  * packages/gittensory-engine/src/issue-rag-query.ts (imported via relative source path, not the published
+  * module, matching the #2278/#2282 extraction shims) is the source of truth.
+diff --git a/test/integration/api.test.ts b/test/integration/api.test.ts
+index 8dfa93f6a..2bfd7bc5d 100644
+--- a/test/integration/api.test.ts
++++ b/test/integration/api.test.ts
+@@ -1266,6 +1266,17 @@ describe("api routes", () => {
+       reason: "targets_or_search_query_required",
+     });
+ 
++    const invalidIssueRag = await app.request(
++      "/v1/issue-rag/retrieve",
++      { method: "POST", headers: apiHeaders(env), body: JSON.stringify({ owner: "acme", repo: "widgets", title: "" }) },
++      env,
++    );
++    expect(invalidIssueRag.status).toBe(400);
++    await expect(invalidIssueRag.json()).resolves.toMatchObject({
++      status: "invalid_request",
++      reason: "title_required",
++    });
++
+     const { token: minerSessionToken } = await createSessionForGitHubUser(env, { login: "ordinary-mcp-user", id: 4243 });
+     const minerSearchForbidden = await app.request(
+       "/v1/opportunities/find",
+@@ -5168,6 +5179,7 @@ describe("api routes", () => {
+     expect(toolNames).toContain("gittensory_explain_repo_decision");
+     expect(toolNames).toContain("gittensory_preflight_pr");
+     expect(toolNames).toContain("gittensory_find_opportunities");
++    expect(toolNames).toContain("gittensory_retrieve_issue_context");
+     expect(toolNames).toContain("gittensory_preflight_local_diff");
+     expect(toolNames).toContain("gittensory_preview_local_pr_score");
+     expect(toolNames).toContain("gittensory_explain_score_breakdown");
+diff --git a/test/unit/auth.test.ts b/test/unit/auth.test.ts
+index 9aab77930..6c3ed1475 100644
+--- a/test/unit/auth.test.ts
++++ b/test/unit/auth.test.ts
+@@ -112,6 +112,7 @@ describe("private-beta auth and rate limiting", () => {
+     expect(routeClassForPath("/v1/app/miner-dashboard/refresh")).toBe("expensive");
+     expect(routeClassForPath("/v1/contributors/jsonbored/open-pr-monitor")).toBe("expensive");
+     expect(routeClassForPath("/v1/opportunities/find")).toBe("expensive");
++    expect(routeClassForPath("/v1/issue-rag/retrieve")).toBe("expensive");
+     expect(routeClassForPath("/v1/installations/999/repair/refresh")).toBe("expensive");
+     expect(routeClassForPath("/v1/internal/jobs/generate-signal-snapshots")).toBe("expensive");
+     expect(routeClassForPath("/v1/internal/jobs/build-contributor-decision-packs")).toBe("expensive");
+diff --git a/test/unit/issue-rag-mcp.test.ts b/test/unit/issue-rag-mcp.test.ts
+new file mode 100644
+index 000000000..9882bbab6
+--- /dev/null
++++ b/test/unit/issue-rag-mcp.test.ts
+@@ -0,0 +1,115 @@
++import { describe, expect, it } from "vitest";
++import { runIssueRagRetrieval, validateIssueRagInput } from "../../src/mcp/issue-rag";
++import { emptyIssueRagTelemetry } from "../../src/review/issue-rag-retrieval";
++import { createTestEnv } from "../helpers/d1";
++
++describe("runIssueRagRetrieval (#4293)", () => {
++  it("returns invalid_request for malformed input", async () => {
++    const env = createTestEnv();
++    await expect(runIssueRagRetrieval(env, { owner: "acme", repo: "demo", title: "" })).resolves.toMatchObject({
++      status: "invalid_request",
++      reason: "title_required",
++    });
++  });
++
++  it("returns query_too_short when the composed query is below the retrieval floor", async () => {
++    const env = createTestEnv();
++    await expect(runIssueRagRetrieval(env, { owner: "acme", repo: "demo", title: "Tiny" })).resolves.toMatchObject({
++      status: "query_too_short",
++      repoFullName: "acme/demo",
++      reason: "issue_query_below_retrieval_floor",
++    });
++  });
++
++  it("rejects oversized repos and invalid labels", () => {
++    expect(validateIssueRagInput({ owner: "acme", repo: "r".repeat(101), title: "Add observability context for self-hosted review planning failures" })).toMatchObject({
++      ok: false,
++      reason: "repo_too_long",
++    });
++    expect(
++      validateIssueRagInput({
++        owner: "acme",
++        repo: "demo",
++        title: "Add observability context for self-hosted review planning failures",
++        labels: ["x".repeat(101)],
++      }),
++    ).toMatchObject({ ok: false, reason: "invalid_labels" });
++  });
++
++  it("covers validation branches for owner/title/body/labels/topK normalization", () => {
++    expect(validateIssueRagInput({ owner: "", repo: "demo", title: "Add observability context for self-hosted review planning failures" })).toMatchObject({
++      ok: false,
++      reason: "owner_and_repo_required",
++    });
++    expect(
++      validateIssueRagInput({
++        owner: "acme",
++        repo: "demo",
++        title: "x".repeat(301),
++      }),
++    ).toMatchObject({ ok: false, reason: "title_too_long" });
++    expect(
++      validateIssueRagInput({
++        owner: "acme",
++        repo: "demo",
++        title: "Add observability context for self-hosted review planning failures",
++        body: "Body text for retrieval.",
++        labels: [" ", "docs"],
++        topK: 13,
++      }),
++    ).toMatchObject({ ok: false, reason: "invalid_top_k" });
++    expect(
++      validateIssueRagInput({
++        owner: "acme",
++        repo: "demo",
++        title: "Add observability context for self-hosted review planning failures",
++        body: "Body text for retrieval.",
++        labels: ["docs"],
++        topK: 4,
++      }),
++    ).toMatchObject({
++      ok: true,
++      value: {
++        repoFullName: "acme/demo",
++        body: "Body text for retrieval.",
++        labels: ["docs"],
++        topK: 4,
++      },
++    });
++    expect(
++      validateIssueRagInput({
++        owner: "acme",
++        repo: "demo",
++        title: "Add observability context for self-hosted review planning failures",
++        labels: [" ", ""],
++      }),
++    ).toMatchObject({
++      ok: true,
++      value: {
++        repoFullName: "acme/demo",
++      },
++    });
++    expect(
++      validateIssueRagInput({
++        owner: 1 as unknown as string,
++        repo: 2 as unknown as string,
++        title: 3 as unknown as string,
++      }),
++    ).toMatchObject({ ok: false, reason: "owner_and_repo_required" });
++  });
++
++  it("returns ok with empty telemetry when retrieval finds no paths", async () => {
++    const env = createTestEnv();
++    await expect(
++      runIssueRagRetrieval(env, {
++        owner: "acme",
++        repo: "demo",
++        title: "Add observability context for self-hosted review planning failures",
++      }),
++    ).resolves.toMatchObject({
++      status: "ok",
++      repoFullName: "acme/demo",
++      telemetry: emptyIssueRagTelemetry(),
++    });
++  });
++});
+diff --git a/test/unit/issue-rag-retrieval.test.ts b/test/unit/issue-rag-retrieval.test.ts
+new file mode 100644
+index 000000000..6fceb0bec
+--- /dev/null
++++ b/test/unit/issue-rag-retrieval.test.ts
+@@ -0,0 +1,171 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import * as ragModule from "../../src/review/rag";
++import { RAG_DIMENSIONS } from "../../src/review/rag";
++import {
++  emptyIssueRagTelemetry,
++  normalizeIssueRagTopK,
++  retrieveIssueRagContext,
++} from "../../src/review/issue-rag-retrieval";
++import { createTestEnv } from "../helpers/d1";
++
++const VEC_1024 = Array.from({ length: RAG_DIMENSIONS }, () => 0.01);
++
++function ragDbStub(opts: { count?: number; chunkRows?: Array<{ id: string; text: string }> } = {}) {
++  const count = opts.count ?? 5;
++  const chunkRows = opts.chunkRows ?? [{ id: "v1", text: "export function helper() { return 1; }" }];
++  const prepared = (sql: string) => ({
++    bind: (..._values: unknown[]) => ({
++      first: vi.fn(async () => (/COUNT\(\*\)/i.test(sql) ? { n: count } : null)),
++      all: vi.fn(async () => ({ results: /SELECT id, text/i.test(sql) ? chunkRows : [] })),
++      run: vi.fn(async () => undefined),
++    }),
++  });
++  return { prepare: vi.fn((sql: string) => prepared(sql)), batch: vi.fn(async () => []) } as unknown as D1Database;
++}
++
++function vectorizeStub(matches = [{ id: "v1", score: 0.92, metadata: { path: "src/helper.ts" } }]) {
++  return {
++    upsert: vi.fn(async () => ({ mutationId: "m1" })),
++    query: vi.fn(async () => ({ matches })),
++    deleteByIds: vi.fn(async () => ({ mutationId: "m2" })),
++  };
++}
++
++function aiStub() {
++  return {
++    run: vi.fn(async (model: string) => (model === "@cf/baai/bge-m3" ? { data: [VEC_1024] } : { response: "{}" })),
++  };
++}
++
++describe("issue-centric RAG retrieval (#4293)", () => {
++  afterEach(() => vi.restoreAllMocks());
++
++  it("normalizes topK to the hosted retrieval bounds", () => {
++    expect(normalizeIssueRagTopK(undefined)).toBe(12);
++    expect(normalizeIssueRagTopK(0)).toBe(1);
++    expect(normalizeIssueRagTopK(4.9)).toBe(4);
++    expect(normalizeIssueRagTopK(99)).toBe(12);
++  });
++
++  it("returns empty telemetry for a query below the retrieval floor", async () => {
++    const env = createTestEnv({ DB: ragDbStub(), VECTORIZE: vectorizeStub() as unknown as Vectorize, AI: aiStub() as unknown as Ai });
++    const out = await retrieveIssueRagContext(env, {
++      repoFullName: "acme/widgets",
++      title: "Tiny",
++    });
++    expect(out.telemetry).toEqual(emptyIssueRagTelemetry());
++  });
++
++  it("returns metadata-only paths when retrieval succeeds", async () => {
++    const env = createTestEnv({ DB: ragDbStub(), VECTORIZE: vectorizeStub() as unknown as Vectorize, AI: aiStub() as unknown as Ai });
++    const out = await retrieveIssueRagContext(env, {
++      repoFullName: "acme/widgets",
++      title: "Improve SQLite backup readiness checks",
++      body: "Operators need restore guidance tied to the existing self-host backup flow.",
++      labels: ["selfhost"],
++    });
++    expect(out.repoFullName).toBe("acme/widgets");
++    expect(out.telemetry.attempted).toBe(true);
++    expect(out.telemetry.injected).toBe(true);
++    expect(out.telemetry.retrievedPaths).toEqual(["src/helper.ts"]);
++    expect(out.telemetry.retrievedPathCount).toBe(1);
++  });
++
++  it("degrades to empty telemetry when Vectorize/AI bindings are missing", async () => {
++    const env = createTestEnv();
++    const out = await retrieveIssueRagContext(env, {
++      repoFullName: "acme/widgets",
++      title: "Improve SQLite backup readiness checks",
++      body: "Operators need restore guidance tied to the existing self-host backup flow.",
++    });
++    expect(out.telemetry).toEqual(emptyIssueRagTelemetry());
++  });
++
++  it("passes review parity knobs into retrieveContextWithMetrics", async () => {
++    const spy = vi.spyOn(ragModule, "retrieveContextWithMetrics").mockResolvedValue({
++      context: "=== RELEVANT EXISTING CODE / DOCS ===",
++      metrics: {
++        candidates: 1,
++        kept: 1,
++        topScore: 0.9,
++        minScore: 0.4,
++        reranked: true,
++        injectedChars: 120,
++        paths: ["src/helper.ts"],
++      },
++    });
++    const env = createTestEnv({ DB: ragDbStub(), VECTORIZE: vectorizeStub() as unknown as Vectorize, AI: aiStub() as unknown as Ai });
++    await retrieveIssueRagContext(env, {
++      repoFullName: "acme/widgets",
++      title: "Improve SQLite backup readiness checks",
++      body: "Operators need restore guidance tied to the existing self-host backup flow.",
++      reranker: "off",
++      topK: 6,
++    });
++    expect(spy.mock.calls[0]?.[1]).toMatchObject({
++      minScore: 0.4,
++      reranker: "off",
++      topK: 6,
++      project: "acme",
++      repo: "widgets",
++    });
++  });
++
++  it("marks injected false when retrieval keeps zero paths", async () => {
++    vi.spyOn(ragModule, "retrieveContextWithMetrics").mockResolvedValue({
++      context: "",
++      metrics: {
++        candidates: 2,
++        kept: 0,
++        topScore: 0.2,
++        minScore: 0.4,
++        reranked: true,
++        injectedChars: 0,
++        paths: [],
++      },
++    });
++    const env = createTestEnv({ DB: ragDbStub(), VECTORIZE: vectorizeStub() as unknown as Vectorize, AI: aiStub() as unknown as Ai });
++    const out = await retrieveIssueRagContext(env, {
++      repoFullName: "acme/widgets",
++      title: "Improve SQLite backup readiness checks",
++      body: "Operators need restore guidance tied to the existing self-host backup flow.",
++    });
++    expect(out.telemetry.attempted).toBe(true);
++    expect(out.telemetry.injected).toBe(false);
++    expect(out.telemetry.retrievedPaths).toEqual([]);
++  });
++
++  it("handles slashless repo names by using an empty project namespace", async () => {
++    const spy = vi.spyOn(ragModule, "retrieveContextWithMetrics").mockResolvedValue({
++      context: "",
++      metrics: {
++        candidates: 0,
++        kept: 0,
++        topScore: 0,
++        minScore: 0.4,
++        reranked: false,
++        injectedChars: 0,
++        paths: [],
++      },
++    });
++    const env = createTestEnv({ DB: ragDbStub(), VECTORIZE: vectorizeStub() as unknown as Vectorize, AI: aiStub() as unknown as Ai });
++    await retrieveIssueRagContext(env, {
++      repoFullName: "widgets",
++      title: "Improve SQLite backup readiness checks",
++      body: "Operators need restore guidance tied to the existing self-host backup flow.",
++    });
++    expect(spy.mock.calls[0]?.[1]).toMatchObject({ project: "", repo: "widgets" });
++  });
++
++  it("fail-safe: retrieval errors degrade to empty telemetry without throwing", async () => {
++    vi.spyOn(ragModule, "retrieveContextWithMetrics").mockRejectedValue(new Error("vectorize down"));
++    const env = createTestEnv({ DB: ragDbStub(), VECTORIZE: vectorizeStub() as unknown as Vectorize, AI: aiStub() as unknown as Ai });
++    await expect(
++      retrieveIssueRagContext(env, {
++        repoFullName: "acme/widgets",
++        title: "Improve SQLite backup readiness checks",
++        body: "Operators need restore guidance tied to the existing self-host backup flow.",
++      }),
++    ).resolves.toMatchObject({ telemetry: emptyIssueRagTelemetry() });
++  });
++});
+diff --git a/test/unit/mcp-cli-issue-rag.test.ts b/test/unit/mcp-cli-issue-rag.test.ts
+new file mode 100644
+index 000000000..950ff8469
+--- /dev/null
++++ b/test/unit/mcp-cli-issue-rag.test.ts
+@@ -0,0 +1,113 @@
++import { Client } from "@modelcontextprotocol/sdk/client/index.js";
++import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { closeFixtureServer, startFixtureServer } from "./support/mcp-cli-harness";
++
++const bin = join(process.cwd(), "packages/gittensory-mcp/bin/gittensory-mcp.js");
++const FORBIDDEN_PUBLIC_TERMS = /wallet\s*[:=]\s*\S+|hotkey\s*[:=]\s*\S+|coldkey\s*[:=]\s*\S+|raw trust score is|your trust score|reward estimate is|estimated reward/i;
++
++let client: Client;
++let transport: StdioClientTransport;
++let configDir: string;
++let apiUrl: string;
++let capturedRequests: Array<{ url: string; method: string; body: string }>;
++
++async function connect() {
++  configDir = mkdtempSync(join(tmpdir(), "gittensory-issue-rag-"));
++  capturedRequests = [];
++  apiUrl = await startFixtureServer({
++    onApiRequest: (request) => {
++      if (request.url && request.url.includes("/v1/issue-rag/retrieve")) {
++        const chunks: Buffer[] = [];
++        request.on("data", (chunk: Buffer) => chunks.push(chunk));
++        request.on("end", () => {
++          capturedRequests.push({
++            url: request.url ?? "",
++            method: request.method ?? "GET",
++            body: Buffer.concat(chunks).toString("utf8"),
++          });
++        });
++      }
++    },
++  });
++  transport = new StdioClientTransport({
++    command: "node",
++    args: [bin, "--stdio"],
++    env: {
++      ...process.env,
++      GITTENSORY_CONFIG_DIR: configDir,
++      GITTENSORY_API_URL: apiUrl,
++      GITTENSORY_TOKEN: "session-token",
++      GITTENSORY_API_TIMEOUT_MS: "5000",
++    },
++  });
++  client = new Client({ name: "issue-rag-test", version: "0.0.1" });
++  await client.connect(transport);
++}
++
++async function disconnect() {
++  await client.close().catch(() => undefined);
++  await closeFixtureServer();
++  if (configDir) rmSync(configDir, { recursive: true, force: true });
++}
++
++describe("gittensory_retrieve_issue_context stdio proxy", () => {
++  beforeEach(connect);
++  afterEach(disconnect);
++
++  it("registers the tool in the stdio server's tool list", async () => {
++    const { tools } = await client.listTools();
++    const names = tools.map((t) => t.name);
++    expect(names).toContain("gittensory_retrieve_issue_context");
++  });
++
++  it("proxies the call to /v1/issue-rag/retrieve via apiPost", async () => {
++    await client.callTool({
++      name: "gittensory_retrieve_issue_context",
++      arguments: {
++        owner: "JSONbored",
++        repo: "gittensory",
++        title: "Improve SQLite backup readiness checks",
++        labels: ["selfhost"],
++        topK: 6,
++      },
++    });
++    expect(capturedRequests.length).toBe(1);
++    const captured = capturedRequests[0]!;
++    expect(captured.url).toContain("/v1/issue-rag/retrieve");
++    expect(captured.method).toBe("POST");
++    const parsedBody = JSON.parse(captured.body) as {
++      owner?: string;
++      repo?: string;
++      title?: string;
++      labels?: string[];
++      topK?: number;
++      body?: string;
++    };
++    expect(parsedBody.owner).toBe("JSONbored");
++    expect(parsedBody.repo).toBe("gittensory");
++    expect(parsedBody.title).toBe("Improve SQLite backup readiness checks");
++    expect(parsedBody.labels).toEqual(["selfhost"]);
++    expect(parsedBody.topK).toBe(6);
++    expect("body" in parsedBody).toBe(false);
++  });
++
++  it("returns metadata-only retrieval telemetry", async () => {
++    const result = await client.callTool({
++      name: "gittensory_retrieve_issue_context",
++      arguments: {
++        owner: "JSONbored",
++        repo: "gittensory",
++        title: "Improve SQLite backup readiness checks",
++      },
++    });
++    expect(result.isError).toBeFalsy();
++    const text = JSON.stringify(result);
++    expect(text).not.toMatch(FORBIDDEN_PUBLIC_TERMS);
++    expect(text).toContain("retrievedPaths");
++    expect(text).not.toMatch(/RELEVANT EXISTING CODE|export function/i);
++  });
++});
+diff --git a/test/unit/mcp-issue-rag.test.ts b/test/unit/mcp-issue-rag.test.ts
+new file mode 100644
+index 000000000..2300a1a5b
+--- /dev/null
++++ b/test/unit/mcp-issue-rag.test.ts
+@@ -0,0 +1,194 @@
++import { Client } from "@modelcontextprotocol/sdk/client/index.js";
++import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { createSessionForGitHubUser, type AuthIdentity } from "../../src/auth/security";
++import { upsertRepositoryFromGitHub } from "../../src/db/repositories";
++import { GittensoryMcp } from "../../src/mcp/server";
++import { validateIssueRagInput } from "../../src/mcp/issue-rag";
++import { createTestEnv } from "../helpers/d1";
++
++async function connect(env: Env, identity?: AuthIdentity) {
++  const server = new GittensoryMcp(env, identity).createServer();
++  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
++  await server.connect(serverTransport);
++  const client = new Client({ name: "gittensory-issue-rag-test", version: "0.1.0" }, { capabilities: {} });
++  await client.connect(clientTransport);
++  return client;
++}
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
++
++describe("validateIssueRagInput (#4293)", () => {
++  it("rejects missing owner/repo/title and oversized fields", () => {
++    expect(validateIssueRagInput({ owner: "", repo: "demo", title: "Add observability context for self-hosted review planning failures" }).ok).toBe(false);
++    expect(validateIssueRagInput({ owner: "acme", repo: "", title: "Add observability context for self-hosted review planning failures" }).ok).toBe(false);
++    expect(validateIssueRagInput({ owner: "acme", repo: "demo", title: "" }).ok).toBe(false);
++    expect(validateIssueRagInput({ owner: "a".repeat(40), repo: "demo", title: "Add observability context for self-hosted review planning failures" })).toMatchObject({ ok: false, reason: "owner_too_long" });
++    expect(validateIssueRagInput({ owner: "acme", repo: "demo", title: "Add observability context for self-hosted review planning failures", topK: 0 })).toMatchObject({ ok: false, reason: "invalid_top_k" });
++  });
++});
++
++describe("MCP gittensory_retrieve_issue_context", () => {
++  it("registers the tool and rejects invalid requests before authorization", async () => {
++    const env = createTestEnv();
++    const client = await connect(env);
++    const { tools } = await client.listTools();
++    expect(tools.map((tool) => tool.name)).toContain("gittensory_retrieve_issue_context");
++
++    const invalid = await client.callTool({
++      name: "gittensory_retrieve_issue_context",
++      arguments: { owner: "acme", repo: "widgets", title: "" },
++    });
++    expect(invalid.isError).toBeFalsy();
++    expect(invalid.structuredContent).toMatchObject({
++      status: "invalid_request",
++      reason: "title_required",
++    });
++  });
++
++  it("returns query_too_short for a one-line issue below the retrieval floor", async () => {
++    const env = createTestEnv();
++    const client = await connect(env);
++    const result = await client.callTool({
++      name: "gittensory_retrieve_issue_context",
++      arguments: { owner: "acme", repo: "widgets", title: "Tiny" },
++    });
++    expect(result.isError).toBeFalsy();
++    expect(result.structuredContent).toMatchObject({
++      status: "query_too_short",
++      repoFullName: "acme/widgets",
++      reason: "issue_query_below_retrieval_floor",
++    });
++    expect(JSON.stringify(result.content)).toContain("below the retrieval floor");
++  });
++
++  it("returns metadata-only retrieval telemetry and never leaks source text", async () => {
++    const env = createTestEnv({ DB: ragDbStub(), VECTORIZE: vectorizeStub() as unknown as Vectorize, AI: aiStub() as unknown as Ai });
++    const client = await connect(env);
++    const result = await client.callTool({
++      name: "gittensory_retrieve_issue_context",
++      arguments: {
++        owner: "acme",
++        repo: "widgets",
++        title: "Improve SQLite backup readiness checks",
++        body: "Operators need restore guidance tied to the existing self-host backup flow.",
++        labels: ["selfhost"],
++      },
++    });
++    expect(result.isError).toBeFalsy();
++    const data = result.structuredContent as {
++      status: string;
++      telemetry: { retrievedPaths: string[]; injected: boolean };
++    };
++    expect(data.status).toBe("ok");
++    expect(data.telemetry.injected).toBe(true);
++    expect(data.telemetry.retrievedPaths).toEqual(["src/helper.ts"]);
++    const text = JSON.stringify(result);
++    expect(text).not.toMatch(/export function helper|RELEVANT EXISTING CODE|wallet|hotkey|reward/i);
++    expect(JSON.stringify(result.content)).toContain("metadata-only context for 1 related path.");
++  });
++
++  it("summarizes empty retrieval when the hosted backend is unavailable", async () => {
++    const env = createTestEnv();
++    const client = await connect(env);
++    const result = await client.callTool({
++      name: "gittensory_retrieve_issue_context",
++      arguments: {
++        owner: "acme",
++        repo: "widgets",
++        title: "Improve SQLite backup readiness checks",
++        body: "Operators need restore guidance tied to the existing self-host backup flow.",
++      },
++    });
++    expect(result.isError).toBeFalsy();
++    expect(result.structuredContent).toMatchObject({
++      status: "ok",
++      telemetry: { injected: false, retrievedPathCount: 0 },
++    });
++    expect(JSON.stringify(result.content)).toContain("found no issue-centric RAG context");
++  });
++
++  it("uses plural path wording when multiple related paths are retrieved", async () => {
++    const env = createTestEnv({
++      DB: ragDbStub({
++        chunkRows: [
++          { id: "v1", text: "export function helper() { return 1; }" },
++          { id: "v2", text: "export function backup() { return 2; }" },
++        ],
++      }),
++      VECTORIZE: vectorizeStub([
++        { id: "v1", score: 0.92, metadata: { path: "src/helper.ts" } },
++        { id: "v2", score: 0.88, metadata: { path: "src/backup.ts" } },
++      ]) as unknown as Vectorize,
++      AI: aiStub() as unknown as Ai,
++    });
++    const client = await connect(env);
++    const result = await client.callTool({
++      name: "gittensory_retrieve_issue_context",
++      arguments: {
++        owner: "acme",
++        repo: "widgets",
++        title: "Improve SQLite backup readiness checks",
++        body: "Operators need restore guidance tied to the existing self-host backup flow.",
++      },
++    });
++    expect(result.isError).toBeFalsy();
++    expect(result.structuredContent).toMatchObject({
++      status: "ok",
++      telemetry: { injected: true, retrievedPathCount: 2 },
++    });
++    expect((result.structuredContent as { telemetry: { retrievedPaths: string[] } }).telemetry.retrievedPaths.sort()).toEqual(
++      ["src/backup.ts", "src/helper.ts"],
++    );
++    expect(JSON.stringify(result.content)).toContain("metadata-only context for 2 related paths.");
++  });
++
++  it("rejects out-of-scope repo access for extension-contributor sessions", async () => {
++    const env = createTestEnv();
++    await upsertRepositoryFromGitHub(env, { name: "private-roadmap", full_name: "victimco/private-roadmap", private: true, owner: { login: "victimco" } });
++    const { session } = await createSessionForGitHubUser(env, { login: "contributor-dev", id: 555 }, { scopes: ["extension:contributor_context"] });
++    const client = await connect(env, { kind: "session", actor: "contributor-dev", session });
++
++    const result = await client.callTool({
++      name: "gittensory_retrieve_issue_context",
++      arguments: {
++        owner: "victimco",
++        repo: "private-roadmap",
++        title: "Improve SQLite backup readiness checks",
++      },
++    });
++    expect(result.isError).toBe(true);
++    expect(JSON.stringify(result.content)).toMatch(/session cannot access this repository/i);
++  });
++});
++
++const VEC_1024 = Array.from({ length: 1024 }, () => 0.01);
++
++function ragDbStub(opts: { count?: number; chunkRows?: Array<{ id: string; text: string }> } = {}) {
++  const count = opts.count ?? 5;
++  const chunkRows = opts.chunkRows ?? [{ id: "v1", text: "export function helper() { return 1; }" }];
++  const prepared = (sql: string) => ({
++    bind: (..._values: unknown[]) => ({
++      first: vi.fn(async () => (/COUNT\(\*\)/i.test(sql) ? { n: count } : null)),
++      all: vi.fn(async () => ({ results: /SELECT id, text/i.test(sql) ? chunkRows : [] })),
++      run: vi.fn(async () => undefined),
++    }),
++  });
++  return { prepare: vi.fn((sql: string) => prepared(sql)), batch: vi.fn(async () => []) } as unknown as D1Database;
++}
++
++function vectorizeStub(matches = [{ id: "v1", score: 0.92, metadata: { path: "src/helper.ts" } }]) {
++  return {
++    upsert: vi.fn(async () => ({ mutationId: "m1" })),
++    query: vi.fn(async () => ({ matches })),
++    deleteByIds: vi.fn(async () => ({ mutationId: "m2" })),
++  };
++}
++
++function aiStub() {
++  return {
++    run: vi.fn(async (model: string) => (model === "@cf/baai/bge-m3" ? { data: [VEC_1024] } : { response: "{}" })),
++  };
++}
+diff --git a/test/unit/mcp-output-schemas.test.ts b/test/unit/mcp-output-schemas.test.ts
+index 1d68bd897..1178f31a2 100644
+--- a/test/unit/mcp-output-schemas.test.ts
++++ b/test/unit/mcp-output-schemas.test.ts
+@@ -27,6 +27,7 @@ const TOOLS_WITH_OUTPUT_SCHEMA = [
+   "gittensory_validate_linked_issue",
+   "gittensory_check_before_start",
+   "gittensory_find_opportunities",
++  "gittensory_retrieve_issue_context",
+   "gittensory_lint_pr_text",
+   "gittensory_validate_config",
+   "gittensory_get_registry_changes",
+diff --git a/test/unit/routes-issue-rag.test.ts b/test/unit/routes-issue-rag.test.ts
+new file mode 100644
+index 000000000..75c53f4b2
+--- /dev/null
++++ b/test/unit/routes-issue-rag.test.ts
+@@ -0,0 +1,137 @@
++import { describe, expect, it } from "vitest";
++import { createApp } from "../../src/api/routes";
++import { createSessionForGitHubUser } from "../../src/auth/security";
++import { upsertInstallation, upsertRepositoryFromGitHub } from "../../src/db/repositories";
++import { createTestEnv } from "../helpers/d1";
++
++const ISSUE_RAG_PATH = "/v1/issue-rag/retrieve";
++const VALID_TITLE = "Add observability context for self-hosted review planning failures";
++
++async function seedRegisteredInstalledRepo(env: Env, installationId: number, owner: string, name: string): Promise<void> {
++  await upsertInstallation(env, {
++    installation: {
++      id: installationId,
++      account: { login: owner, id: installationId, type: "User" },
++      repository_selection: "selected",
++      permissions: { metadata: "read", contents: "read" },
++      events: ["repository"],
++    },
++  });
++  await upsertRepositoryFromGitHub(
++    env,
++    { name, full_name: `${owner}/${name}`, private: false, owner: { login: owner } },
++    installationId,
++  );
++  await env.DB.prepare("UPDATE repositories SET is_registered = 1 WHERE full_name = ?")
++    .bind(`${owner}/${name}`)
++    .run();
++}
++
++describe("issue-rag retrieve route (#4293)", () => {
++  it("returns metadata-only retrieval for API tokens", async () => {
++    const app = createApp();
++    const env = createTestEnv();
++    await seedRegisteredInstalledRepo(env, 301, "repo-owner", "owned-repo");
++
++    const response = await app.request(
++      ISSUE_RAG_PATH,
++      {
++        method: "POST",
++        headers: { authorization: `Bearer ${env.GITTENSORY_API_TOKEN}`, "content-type": "application/json" },
++        body: JSON.stringify({ owner: "repo-owner", repo: "owned-repo", title: VALID_TITLE }),
++      },
++      env,
++    );
++
++    expect(response.status).toBe(200);
++    const body = await response.json();
++    expect(body).toMatchObject({
++      status: "ok",
++      repoFullName: "repo-owner/owned-repo",
++      telemetry: {
++        attempted: expect.any(Boolean),
++        injected: expect.any(Boolean),
++        retrievedPaths: expect.any(Array),
++      },
++    });
++    expect(JSON.stringify(body)).not.toMatch(/RELEVANT EXISTING CODE|export function/i);
++  });
++
++  it("rejects invalid requests and malformed JSON bodies", async () => {
++    const app = createApp();
++    const env = createTestEnv();
++
++    const invalid = await app.request(
++      ISSUE_RAG_PATH,
++      {
++        method: "POST",
++        headers: { authorization: `Bearer ${env.GITTENSORY_API_TOKEN}`, "content-type": "application/json" },
++        body: JSON.stringify({ owner: "repo-owner", repo: "owned-repo", title: "" }),
++      },
++      env,
++    );
++    expect(invalid.status).toBe(400);
++    await expect(invalid.json()).resolves.toMatchObject({ status: "invalid_request", reason: "title_required" });
++
++    const malformed = await app.request(
++      ISSUE_RAG_PATH,
++      {
++        method: "POST",
++        headers: { authorization: `Bearer ${env.GITTENSORY_API_TOKEN}`, "content-type": "application/json" },
++        body: "{not json",
++      },
++      env,
++    );
++    expect(malformed.status).toBe(400);
++    await expect(malformed.json()).resolves.toMatchObject({ status: "invalid_request", reason: "owner_and_repo_required" });
++  });
++
++  it("allows sessions through the path allowlist and scopes repo access", async () => {
++    const app = createApp();
++    const env = createTestEnv({ ADMIN_GITHUB_LOGINS: "" });
++    await seedRegisteredInstalledRepo(env, 301, "repo-owner", "owned-repo");
++    await seedRegisteredInstalledRepo(env, 302, "other-owner", "other-repo");
++
++    const { token: ownerToken } = await createSessionForGitHubUser(env, { login: "repo-owner", id: 301 });
++    const own = await app.request(
++      ISSUE_RAG_PATH,
++      {
++        method: "POST",
++        headers: { cookie: `gittensory_session=${ownerToken}`, "content-type": "application/json" },
++        body: JSON.stringify({ owner: "repo-owner", repo: "owned-repo", title: VALID_TITLE }),
++      },
++      env,
++    );
++    expect(own.status).toBe(200);
++    await expect(own.json()).resolves.toMatchObject({
++      status: "ok",
++      repoFullName: "repo-owner/owned-repo",
++    });
++
++    const { token: minerToken } = await createSessionForGitHubUser(env, { login: "miner-only", id: 900 });
++    const forbidden = await app.request(
++      ISSUE_RAG_PATH,
++      {
++        method: "POST",
++        headers: { cookie: `gittensory_session=${minerToken}`, "content-type": "application/json" },
++        body: JSON.stringify({ owner: "repo-owner", repo: "owned-repo", title: VALID_TITLE }),
++      },
++      env,
++    );
++    expect(forbidden.status).toBe(403);
++    await expect(forbidden.json()).resolves.toMatchObject({ error: "forbidden_repo" });
++
++    const { token: otherOwnerToken } = await createSessionForGitHubUser(env, { login: "other-owner", id: 302 });
++    const crossRepo = await app.request(
++      ISSUE_RAG_PATH,
++      {
++        method: "POST",
++        headers: { cookie: `gittensory_session=${otherOwnerToken}`, "content-type": "application/json" },
++        body: JSON.stringify({ owner: "repo-owner", repo: "owned-repo", title: VALID_TITLE }),
++      },
++      env,
++    );
++    expect(crossRepo.status).toBe(403);
++    await expect(crossRepo.json()).resolves.toMatchObject({ error: "forbidden_repo" });
++  });
++});
+diff --git a/test/unit/support/mcp-cli-harness.ts b/test/unit/support/mcp-cli-harness.ts
+index ff99f37c5..2e2a3b557 100644
+--- a/test/unit/support/mcp-cli-harness.ts
++++ b/test/unit/support/mcp-cli-harness.ts
+@@ -298,6 +298,28 @@ export async function startFixtureServer(
+       response.end(JSON.stringify({ ranked, totalCandidates: candidates.length, appliedLane: lane, appliedMinRankScore: minRank }));
+       return;
+     }
++    if (request.url === "/v1/issue-rag/retrieve" && request.method === "POST") {
++      const body = (await readJsonRequest(request)) as { owner?: string; repo?: string; title?: string };
++      response.end(
++        JSON.stringify({
++          status: "ok",
++          repoFullName: `${body.owner}/${body.repo}`,
++          telemetry: {
++            attempted: true,
++            injected: true,
++            candidates: 1,
++            kept: 1,
++            topScore: 0.9,
++            minScore: 0.4,
++            reranked: true,
++            injectedChars: 120,
++            retrievedPathCount: 1,
++            retrievedPaths: ["src/helper.ts"],
++          },
++        }),
++      );
++      return;
++    }
+     // #784 maintainer controls (agent approval queue + kill-switch).
+     if (request.url === "/v1/repos/owner/repo/agent/pending-actions" && request.method === "GET") {
+       response.end(JSON.stringify({ repoFullName: "owner/repo", pendingActions: [{ id: "pa-1", actionClass: "merge", pullNumber: 7, reason: "clean", status: "pending" }] }));

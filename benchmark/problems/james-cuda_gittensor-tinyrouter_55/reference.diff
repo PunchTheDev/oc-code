@@ -1,0 +1,465 @@
+diff --git a/src/trinity/adapters/swebench.py b/src/trinity/adapters/swebench.py
+index aefc592..7b5d72e 100644
+--- a/src/trinity/adapters/swebench.py
++++ b/src/trinity/adapters/swebench.py
+@@ -307,10 +307,21 @@ def load_swebench_tasks(split: str, max_items: int | None, seed: int = 0) -> lis
+ # Adapter
+ # --------------------------------------------------------------------------- #
+ class SweBenchAdapter(BenchmarkAdapter):
+-    """SWE-bench Verified: repository-issue in, unified-diff patch out."""
++    """SWE-bench Verified: repository-issue in, unified-diff patch out.
++
++    ``repo_provider`` opts into real execution: a context-manager factory
++    ``(reference) -> ContextManager[repo_dir]`` yielding a work-tree checked out at
++    the instance's ``base_commit`` (e.g. :func:`trinity.adapters.swebench_runner.prepare_repo`).
++    When set, :meth:`score_output` grades the patch through the sandboxed runner
++    (#18); when ``None`` (the default) it uses the cheap exact-match placeholder,
++    so the adapter stays offline and network-free out of the box.
++    """
+ 
+     name = BENCHMARK
+ 
++    def __init__(self, *, repo_provider=None):
++        self._repo_provider = repo_provider
++
+     def load_tasks(self, split: str, max_items: int | None, seed: int = 0) -> list[Task]:
+         return load_swebench_tasks(split, max_items, seed=seed)
+ 
+@@ -318,7 +329,13 @@ def build_prompt(self, task: Task) -> str:
+         return task.prompt
+ 
+     def score_output(self, output: str, reference: Any) -> float:
+-        return score_patch(output, reference)
++        if self._repo_provider is None:
++            return score_patch(output, reference)
++        # Execute the patch in a sandboxed, prepared work-tree via the runner.
++        from .swebench_runner import evaluate_patch
++
++        with self._repo_provider(reference) as repo_dir:
++            return evaluate_patch(repo_dir, output, reference).reward
+ 
+     def task_type(self) -> TaskType:
+         return TaskType.PATCH
+diff --git a/src/trinity/adapters/swebench_runner.py b/src/trinity/adapters/swebench_runner.py
+new file mode 100644
+index 0000000..87a6d5f
+--- /dev/null
++++ b/src/trinity/adapters/swebench_runner.py
+@@ -0,0 +1,249 @@
++"""Sandboxed SWE-bench patch evaluator (issue #18).
++
++The SWE-bench adapter (#17) turns a repository issue into a task and lets a model
++emit a unified diff; this module is the *dedicated runner* that actually grades
++that diff by applying it to a checked-out repo and running the task's tests. It
++is the execution counterpart to the adapter's cheap exact-match placeholder.
++
++Grading follows SWE-bench's own rule: a patch **resolves** an instance iff, after
++it is applied, every ``FAIL_TO_PASS`` test passes **and** every ``PASS_TO_PASS``
++test still passes. The result is a single binary reward.
++
++Isolation & safety, mirroring the repo's existing ``reward.run_pass_at_1``
++sandbox: the patch is applied with ``git apply`` inside a caller-provided
++work-tree, tests run in a **subprocess with a wall-clock timeout**, and this
++module never ``exec``s model output in-process. Preparing the work-tree (cloning
++the repo at ``base_commit``) is a network operation kept behind :func:`prepare_repo`
++and injected, so the pure grading mechanism (:func:`evaluate_patch`) is fully
++offline-testable against a throwaway local git repo.
++
++This module is imported only when a patch is actually executed, and it touches no
++other benchmark's scoring path.
++"""
++from __future__ import annotations
++
++import re
++import shutil
++import subprocess
++from contextlib import contextmanager
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Any, Iterator, Sequence
++
++__all__ = [
++    "PatchEvalResult",
++    "extract_patch",
++    "apply_patch",
++    "run_tests",
++    "evaluate_patch",
++    "score_swebench",
++    "prepare_repo",
++]
++
++#: Default per-step wall-clock limits (seconds). Bounded so an adversarial patch
++#: or a hanging test cannot stall the evaluator.
++_APPLY_TIMEOUT = 60
++_TEST_TIMEOUT = 900
++
++_FENCE_RE = re.compile(r"```(?:diff|patch)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
++_DIFF_START_RE = re.compile(r"^(diff --git |--- |\+\+\+ |Index: )", re.MULTILINE)
++
++
++@dataclass
++class PatchEvalResult:
++    """Outcome of grading one candidate patch.
++
++    ``passed`` is the binary reward. ``reason`` is a stable machine-readable tag
++    (``patch_did_not_apply`` / ``tests_failed`` / ``resolved`` / ...), and
++    ``detail`` carries human-readable context (git/pytest stderr) for clean
++    failure reporting without leaking into the reward.
++    """
++
++    passed: bool
++    reason: str
++    applied: bool = False
++    detail: str = ""
++    failures: list[str] = field(default_factory=list)
++
++    @property
++    def reward(self) -> float:
++        return 1.0 if self.passed else 0.0
++
++
++def extract_patch(text: str) -> str:
++    """Pull the unified diff out of a model's (possibly chatty) output.
++
++    Prefers a fenced ```` ```diff ```` block; otherwise takes everything from the
++    first diff header (``diff --git`` / ``---`` / ``Index:``) onward. Returns an
++    empty string if no diff-looking content is present.
++    """
++    if not text:
++        return ""
++    fence = _FENCE_RE.search(text)
++    if fence:
++        candidate = fence.group(1)
++        if _DIFF_START_RE.search(candidate):
++            return candidate.strip("\n") + "\n"
++    m = _DIFF_START_RE.search(text)
++    if m:
++        return text[m.start():].strip("\n") + "\n"
++    return ""
++
++
++def apply_patch(repo_dir: str | Path, patch: str, *, timeout: int = _APPLY_TIMEOUT) -> tuple[bool, str]:
++    """Apply ``patch`` inside ``repo_dir`` with ``git apply``.
++
++    Returns ``(ok, detail)``. ``git apply`` is used (not ``patch``) so malformed
++    or fuzzy diffs are rejected rather than partially applied. ``--whitespace=nowarn``
++    keeps benign whitespace differences from failing an otherwise-valid patch.
++    """
++    try:
++        proc = subprocess.run(
++            ["git", "-C", str(repo_dir), "apply", "--whitespace=nowarn"],
++            input=patch,
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return False, "git apply timed out"
++    except FileNotFoundError:
++        return False, "git not available"
++    return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
++
++
++def run_tests(
++    repo_dir: str | Path,
++    node_ids: Sequence[str],
++    *,
++    timeout: int = _TEST_TIMEOUT,
++) -> tuple[bool, str]:
++    """Run the given pytest node ids in ``repo_dir`` in a subprocess.
++
++    Returns ``(all_passed, detail)``. The tests run in a fresh ``python -m pytest``
++    process (never in-process), with the cache disabled and a wall-clock timeout,
++    so a hanging or crashing test is contained. ``all_passed`` is ``True`` only if
++    pytest exits 0 (every selected test passed).
++    """
++    if not node_ids:
++        return False, "no tests specified"
++    try:
++        proc = subprocess.run(
++            ["python", "-m", "pytest", "-p", "no:cacheprovider", "-q", "--no-header",
++             "--tb=no", *node_ids],
++            cwd=str(repo_dir),
++            capture_output=True,
++            text=True,
++            timeout=timeout,
++        )
++    except subprocess.TimeoutExpired:
++        return False, "tests timed out"
++    except FileNotFoundError:
++        return False, "python/pytest not available"
++    tail = "\n".join((proc.stdout or "").splitlines()[-15:])
++    return proc.returncode == 0, tail
++
++
++def evaluate_patch(
++    repo_dir: str | Path,
++    candidate: str,
++    reference: Any,
++    *,
++    apply_timeout: int = _APPLY_TIMEOUT,
++    test_timeout: int = _TEST_TIMEOUT,
++) -> PatchEvalResult:
++    """Grade ``candidate`` against ``reference`` in a **prepared** ``repo_dir``.
++
++    ``repo_dir`` must already be a checked-out work-tree at the instance's
++    ``base_commit`` (see :func:`prepare_repo`). Steps: extract the diff, ``git
++    apply`` it, then run ``FAIL_TO_PASS`` + ``PASS_TO_PASS`` and require all to
++    pass. Never raises for a bad patch — a failure to apply or a failing test is a
++    clean ``passed=False`` result with a reason.
++    """
++    ref = reference if isinstance(reference, dict) else {}
++    fail_to_pass = list(ref.get("fail_to_pass", []) or [])
++    pass_to_pass = list(ref.get("pass_to_pass", []) or [])
++
++    patch = extract_patch(candidate)
++    if not patch.strip():
++        return PatchEvalResult(False, "no_patch_found", applied=False)
++
++    applied, apply_detail = apply_patch(repo_dir, patch, timeout=apply_timeout)
++    if not applied:
++        return PatchEvalResult(False, "patch_did_not_apply", applied=False, detail=apply_detail)
++
++    nodes = fail_to_pass + pass_to_pass
++    if not nodes:
++        return PatchEvalResult(False, "no_tests_specified", applied=True)
++
++    ok, detail = run_tests(repo_dir, nodes, timeout=test_timeout)
++    if ok:
++        return PatchEvalResult(True, "resolved", applied=True, detail=detail)
++    return PatchEvalResult(False, "tests_failed", applied=True, detail=detail, failures=nodes)
++
++
++def score_swebench(
++    candidate: str,
++    reference: Any,
++    *,
++    repo_dir: str | Path | None = None,
++    apply_timeout: int = _APPLY_TIMEOUT,
++    test_timeout: int = _TEST_TIMEOUT,
++) -> float | None:
++    """Binary reward for a candidate patch, or ``None`` if it cannot be executed.
++
++    When ``repo_dir`` (a prepared work-tree) is supplied, this returns
++    ``1.0``/``0.0`` from :func:`evaluate_patch`. With no work-tree there is nothing
++    to run against, so it returns ``None`` — the caller (the adapter) then falls
++    back to its cheap exact-match placeholder rather than guessing.
++    """
++    if repo_dir is None:
++        return None
++    return evaluate_patch(
++        repo_dir, candidate, reference,
++        apply_timeout=apply_timeout, test_timeout=test_timeout,
++    ).reward
++
++
++@contextmanager
++def prepare_repo(reference: Any, *, workdir: str | Path | None = None) -> Iterator[str]:
++    """Clone the instance's repo at ``base_commit`` into a temp work-tree.
++
++    **Network operation** (``git clone``) — the production seam that turns a
++    reference into the checked-out ``repo_dir`` that :func:`evaluate_patch` grades
++    against. It is deliberately separate from the pure grading mechanism so the
++    latter stays offline-testable; tests inject their own prepared repo instead of
++    calling this. Yields the repo path and cleans up the clone on exit.
++
++    Raises:
++        RuntimeError: If ``reference`` lacks ``repo``/``base_commit``, or the
++            clone/checkout fails.
++    """
++    import tempfile
++
++    ref = reference if isinstance(reference, dict) else {}
++    repo = ref.get("repo")
++    base_commit = ref.get("base_commit")
++    if not repo or not base_commit:
++        raise RuntimeError("reference is missing 'repo' or 'base_commit'")
++
++    root = Path(workdir) if workdir else Path(tempfile.mkdtemp(prefix="swebench-"))
++    dest = root / "repo"
++    url = repo if "://" in str(repo) else f"https://github.com/{repo}.git"
++    try:
++        clone = subprocess.run(
++            ["git", "clone", "--quiet", url, str(dest)],
++            capture_output=True, text=True, timeout=600,
++        )
++        if clone.returncode != 0:
++            raise RuntimeError(f"git clone failed: {clone.stderr.strip()}")
++        checkout = subprocess.run(
++            ["git", "-C", str(dest), "checkout", "--quiet", str(base_commit)],
++            capture_output=True, text=True, timeout=120,
++        )
++        if checkout.returncode != 0:
++            raise RuntimeError(f"git checkout failed: {checkout.stderr.strip()}")
++        yield str(dest)
++    finally:
++        if workdir is None:
++            shutil.rmtree(root, ignore_errors=True)
+diff --git a/tests/test_swebench_runner.py b/tests/test_swebench_runner.py
+new file mode 100644
+index 0000000..d9fc71a
+--- /dev/null
++++ b/tests/test_swebench_runner.py
+@@ -0,0 +1,162 @@
++"""Sandboxed SWE-bench patch evaluator (issue #18).
++
++Exercises the real grading mechanism — ``git apply`` + a subprocess pytest run —
++against a throwaway local git repo built in a tempdir. No network and no
++SWE-bench download: :func:`prepare_repo` (the network seam) is not called; the
++test injects its own prepared work-tree.
++"""
++from __future__ import annotations
++
++import shutil
++import subprocess
++import tempfile
++from contextlib import contextmanager
++from pathlib import Path
++
++from trinity.adapters.swebench import SweBenchAdapter
++from trinity.adapters.swebench_runner import (
++    PatchEvalResult,
++    evaluate_patch,
++    extract_patch,
++    score_swebench,
++)
++
++
++def _run(cmd, cwd):
++    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=True)
++
++
++@contextmanager
++def _repo():
++    """A tiny git repo whose `add` is buggy (a-b); yields (dir, gold, wrong, ref)."""
++    d = tempfile.mkdtemp(prefix="swebench-test-")
++    try:
++        _run(["git", "init", "-q"], d)
++        _run(["git", "config", "user.email", "t@t"], d)
++        _run(["git", "config", "user.name", "t"], d)
++        buggy = "def add(a, b):\n    return a - b\n\n\ndef sub(a, b):\n    return a - b\n"
++        (Path(d) / "calc.py").write_text(buggy)
++        (Path(d) / "test_calc.py").write_text(
++            "from calc import add, sub\n\n"
++            "def test_add():\n    assert add(2, 3) == 5\n\n"
++            "def test_sub():\n    assert sub(10, 4) == 6\n"
++        )
++        _run(["git", "add", "-A"], d)
++        _run(["git", "commit", "-q", "-m", "init"], d)
++        base = _run(["git", "rev-parse", "HEAD"], d).stdout.strip()
++
++        # Gold patch: fix `add` to a + b (derived via git diff so it applies cleanly).
++        (Path(d) / "calc.py").write_text("def add(a, b):\n    return a + b\n\n\ndef sub(a, b):\n    return a - b\n")
++        gold = _run(["git", "diff"], d).stdout
++        _run(["git", "checkout", "--", "calc.py"], d)
++
++        # Wrong patch: applies (adds a comment) but does not fix the bug.
++        (Path(d) / "calc.py").write_text("# helper module\n" + buggy)
++        wrong = _run(["git", "diff"], d).stdout
++        _run(["git", "checkout", "--", "calc.py"], d)
++
++        ref = {
++            "repo": "octo/calc",
++            "base_commit": base,
++            "gold_patch": gold,
++            "fail_to_pass": ["test_calc.py::test_add"],
++            "pass_to_pass": ["test_calc.py::test_sub"],
++        }
++        yield d, gold, wrong, ref
++    finally:
++        shutil.rmtree(d, ignore_errors=True)
++
++
++def _reset(d, base):
++    _run(["git", "-C", d, "reset", "--hard", "-q", base], ".")
++    _run(["git", "-C", d, "clean", "-fdq"], ".")
++
++
++# --------------------------------------------------------------------------- #
++# extract_patch
++# --------------------------------------------------------------------------- #
++def test_extract_patch_from_fence():
++    text = "Here is the fix:\n```diff\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@\n-1\n+2\n```\nDone."
++    out = extract_patch(text)
++    assert out.startswith("diff --git a/x b/x")
++    assert "prose" not in out and "Done." not in out
++
++
++def test_extract_patch_bare_and_none():
++    assert extract_patch("diff --git a/x b/x\n--- a/x\n+++ b/x\n").startswith("diff --git")
++    assert extract_patch("just some prose, no diff here") == ""
++    assert extract_patch("") == ""
++
++
++# --------------------------------------------------------------------------- #
++# evaluate_patch (real git apply + subprocess pytest)
++# --------------------------------------------------------------------------- #
++def test_gold_patch_resolves():
++    with _repo() as (d, gold, _wrong, ref):
++        _reset(d, ref["base_commit"])
++        res = evaluate_patch(d, gold, ref)
++        assert isinstance(res, PatchEvalResult)
++        assert res.passed is True
++        assert res.reason == "resolved"
++        assert res.reward == 1.0
++
++
++def test_wrong_patch_applies_but_fails_tests():
++    with _repo() as (d, _gold, wrong, ref):
++        _reset(d, ref["base_commit"])
++        res = evaluate_patch(d, wrong, ref)
++        assert res.applied is True          # the comment patch applies...
++        assert res.passed is False          # ...but FAIL_TO_PASS still fails
++        assert res.reason == "tests_failed"
++
++
++def test_non_applying_patch_is_clean_failure():
++    with _repo() as (d, _gold, _wrong, ref):
++        _reset(d, ref["base_commit"])
++        bogus = "diff --git a/nope.py b/nope.py\n--- a/nope.py\n+++ b/nope.py\n@@ -1 +1 @@\n-x\n+y\n"
++        res = evaluate_patch(d, bogus, ref)
++        assert res.passed is False
++        assert res.reason == "patch_did_not_apply"
++
++
++def test_no_patch_found():
++    with _repo() as (d, _gold, _wrong, ref):
++        res = evaluate_patch(d, "I could not find a fix.", ref)
++        assert res.passed is False
++        assert res.reason == "no_patch_found"
++
++
++def test_score_swebench_none_without_repo():
++    # No work-tree -> cannot execute -> None (caller falls back to placeholder).
++    assert score_swebench("diff --git ...", {"gold_patch": "x"}) is None
++
++
++def test_score_swebench_binary_with_repo():
++    with _repo() as (d, gold, wrong, ref):
++        _reset(d, ref["base_commit"])
++        assert score_swebench(gold, ref, repo_dir=d) == 1.0
++        _reset(d, ref["base_commit"])
++        assert score_swebench(wrong, ref, repo_dir=d) == 0.0
++
++
++# --------------------------------------------------------------------------- #
++# Adapter integration: repo_provider routes scoring through the runner
++# --------------------------------------------------------------------------- #
++def test_adapter_uses_runner_when_provider_set():
++    with _repo() as (d, gold, wrong, ref):
++        @contextmanager
++        def provider(reference):
++            _reset(d, reference["base_commit"])   # fresh work-tree per grade
++            yield d
++
++        adapter = SweBenchAdapter(repo_provider=provider)
++        assert adapter.score_output(gold, ref) == 1.0
++        assert adapter.score_output(wrong, ref) == 0.0
++
++
++def test_adapter_defaults_to_exact_match_placeholder():
++    # No repo_provider -> unchanged offline behaviour (exact normalized-patch match).
++    adapter = SweBenchAdapter()
++    ref = {"gold_patch": "diff --git a/x b/x\n+fix\n"}
++    assert adapter.score_output("diff --git a/x b/x\n+fix\n", ref) == 1.0
++    assert adapter.score_output("diff --git a/x b/x\n+nope\n", ref) == 0.0

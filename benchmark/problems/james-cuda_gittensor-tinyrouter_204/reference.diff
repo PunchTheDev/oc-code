@@ -1,0 +1,301 @@
+diff --git a/scripts/pr_eval.py b/scripts/pr_eval.py
+index b781d67..ff43502 100644
+--- a/scripts/pr_eval.py
++++ b/scripts/pr_eval.py
+@@ -166,9 +166,18 @@ def _load_submission(submission_dir: Path) -> Optional[Tuple[np.ndarray, np.ndar
+ # ==========================================================================
+ 
+ def _evaluate_cached(policy, items: List[dict], pool_model_names: List[str]) -> float:
+-    """Evaluate a configured policy on cached benchmark items. Returns accuracy [0, 1]."""
++    """Evaluate a configured policy on cached benchmark items. Returns accuracy [0, 1].
++
++    Scoring routes through the benchmark **adapter** (``adapter.score_output``)
++    rather than calling ``reward.score_text`` directly (issue #154), so the
++    maintainer scorer honours the same adapter contract the rest of the repo
++    advertises. For math/mmlu/gpqa/livecodebench the delegating adapter forwards to
++    ``score_text`` -- identical results -- while execution-aware benchmarks such as
++    SWE-bench Verified are graded through their own ``score_output`` (the patch
++    scorer) instead of being mis-dispatched.
++    """
++    from trinity.adapters import get_adapter
+     from trinity.adapters.hidden_item import from_protocol_item
+-    from trinity.orchestration.reward import score_text
+     from trinity.orchestration.session import routing_transcript
+ 
+     if not items:
+@@ -180,7 +189,8 @@ def _evaluate_cached(policy, items: List[dict], pool_model_names: List[str]) ->
+         agent_idx, _role = policy.decide(routing_transcript(canonical["prompt"]), sample=False)
+         model_name = pool_model_names[agent_idx % len(pool_model_names)]
+         cached = canonical["cached_model_answers"].get(model_name, "")
+-        if score_text(canonical["benchmark"] or "math500", cached, canonical["reference"]) > 0.0:
++        adapter = get_adapter(canonical["benchmark"] or "math500")
++        if adapter.score_output(cached, canonical["reference"]) > 0.0:
+             correct += 1
+ 
+     return correct / len(items)
+@@ -194,10 +204,20 @@ async def _evaluate_live(
+     policy, pool, pool_models, items: List[dict],
+     max_turns: int = 5, max_tokens: int = 4096,
+ ) -> Tuple[float, float]:
+-    """Run full multi-turn eval with real API calls. Returns (accuracy, avg_turns)."""
++    """Run full multi-turn eval with real API calls. Returns (accuracy, avg_turns).
++
++    Live trajectories are graded through the benchmark **adapter**
++    (``adapter.score_trajectory``) rather than ``reward.score`` directly (issue
++    #154), so the maintainer live scorer uses the same adapter contract as the
++    main evaluator (``trinity.eval``) and can grade execution-aware benchmarks such
++    as SWE-bench Verified (whose adapter scores the final patch) end-to-end. The
++    adapter's default ``score_trajectory`` picks the committed answer across turns
++    and delegates to ``score_output`` -- the documented evaluator rule -- so
++    non-SWE benchmarks are scored exactly as ``trinity.eval`` scores them.
++    """
+     import httpx
++    from trinity.adapters import get_adapter
+     from trinity.adapters.hidden_item import from_protocol_item
+-    from trinity.orchestration.reward import score
+     from trinity.orchestration.session import run_trajectory
+     from trinity.types import Task
+ 
+@@ -229,7 +249,8 @@ async def _evaluate_live(
+             total_turns += max_turns
+             continue
+         traj = result
+-        if score(traj) > 0.0:
++        adapter = get_adapter(traj.task.benchmark or "math500")
++        if adapter.score_trajectory(traj) > 0.0:
+             correct += 1
+         total_turns += traj.n_turns
+ 
+diff --git a/tests/test_loaders_hf_parsers.py b/tests/test_loaders_hf_parsers.py
+index cf0cf79..dcb1173 100644
+--- a/tests/test_loaders_hf_parsers.py
++++ b/tests/test_loaders_hf_parsers.py
+@@ -173,7 +173,7 @@ def test_livecodebench_parses_via_config_name(monkeypatch):
+     t = tasks[0]
+     assert t.task_id == "lcb-42"
+     assert t.benchmark == "livecodebench"
+-    assert t.answer["tests"] == [{"input": "2 3\n", "output": "5\n"}]
++    assert t.answer["tests"] == [{"input": "2 3\n", "output": "5\n", "testtype": ""}]
+     assert t.answer["fn_name"] == "solve"
+     assert t.answer["starter_code"] == "def solve(): ..."
+     assert t.meta["version"] == "release_v6"  # "test" -> v6
+@@ -210,12 +210,26 @@ def test_livecodebench_missing_question_is_skipped_and_id_falls_back(monkeypatch
+ # --------------------------------------------------------------------------- #
+ def test_parse_lcb_tests_from_json_string():
+     row = {"public_test_cases": json.dumps([{"input": "a", "output": "b"}])}
+-    assert loaders._parse_lcb_tests(row) == [{"input": "a", "output": "b"}]
++    assert loaders._parse_lcb_tests(row) == [{"input": "a", "output": "b", "testtype": ""}]
+ 
+ 
+ def test_parse_lcb_tests_from_list_with_alt_keys():
+     row = {"tests": [{"stdin": "x", "expected_output": "y"}]}
+-    assert loaders._parse_lcb_tests(row) == [{"input": "x", "output": "y"}]
++    assert loaders._parse_lcb_tests(row) == [{"input": "x", "output": "y", "testtype": ""}]
++
++
++def test_parse_lcb_tests_preserves_testtype():
++    # The parser records the testtype (stdin vs functional) so the reward checker
++    # can call the entry point for LeetCode-style problems.
++    row = {"tests": [{"input": "i", "output": "o", "testtype": "functional"}]}
++    assert loaders._parse_lcb_tests(row) == [
++        {"input": "i", "output": "o", "testtype": "functional"}
++    ]
++
++
++def test_parse_lcb_tests_reads_type_alias_for_testtype():
++    row = {"tests": [{"input": "i", "output": "o", "type": "stdin"}]}
++    assert loaders._parse_lcb_tests(row)[0]["testtype"] == "stdin"
+ 
+ 
+ def test_parse_lcb_tests_bad_json_returns_empty():
+diff --git a/tests/test_pr_eval_adapter_scoring.py b/tests/test_pr_eval_adapter_scoring.py
+new file mode 100644
+index 0000000..3e61d81
+--- /dev/null
++++ b/tests/test_pr_eval_adapter_scoring.py
+@@ -0,0 +1,168 @@
++"""pr_eval scores through benchmark adapters, not hardcoded reward dispatch (#154).
++
++`_evaluate_cached` / `_evaluate_live` used to call `reward.score_text` / `reward.score`
++directly, so an execution-aware benchmark like SWE-bench Verified was not scoreable
++through the maintainer scorer -- `score_text("swebench_verified", ...)` raises
++`ValueError: Unknown benchmark`. Routing through `get_adapter(benchmark)` fixes that
++and is behaviour-preserving for math/mmlu/... (their delegating adapters forward to
++the same `score_text` / committed-answer logic).
++
++Offline: fakes only, no network.
++"""
++from __future__ import annotations
++
++import asyncio
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++_REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(_REPO / "src"))
++sys.path.insert(0, str(_REPO / "scripts"))
++
++import pr_eval  # noqa: E402
++from trinity.types import Trajectory, TurnRecord  # noqa: E402
++
++_POOL = ["deepseek-v4-pro", "glm-5p2", "kimi-k2p6"]
++_GOLD = "diff --git a/f b/f\n@@ -1 +1 @@\n-x\n+y\n"
++_PATCH_REF = {
++    "repo": "octo/calc", "base_commit": "c0", "gold_patch": _GOLD,
++    "fail_to_pass": ["t::a"],
++}
++
++
++class _FakePolicy:
++    """Routes every item to pool index 0."""
++
++    def decide(self, prompt, *, sample=False):
++        return (0, None)
++
++
++# --------------------------------------------------------------------------- #
++# cached path
++# --------------------------------------------------------------------------- #
++def test_cached_scores_swebench_through_its_adapter():
++    # The routed model (index 0) returns the gold patch; the SWE-bench adapter
++    # grades it by exact normalized match -> 1.0.
++    item = {
++        "question_text": "resolve the issue",
++        "benchmark": "swebench_verified",
++        "correct_answer": _PATCH_REF,
++        "model_answers": {"deepseek-v4-pro": _GOLD},
++    }
++    acc = pr_eval._evaluate_cached(_FakePolicy(), [item], _POOL)
++    assert acc == 1.0
++
++
++def test_cached_swebench_was_unscoreable_via_the_old_direct_dispatch():
++    # Proof the routing change matters: the old `score_text(benchmark, ...)` path
++    # cannot grade a SWE-bench item at all.
++    from trinity.orchestration.reward import score_text
++
++    with pytest.raises(ValueError, match="Unknown benchmark"):
++        score_text("swebench_verified", _GOLD, _PATCH_REF)
++
++
++def test_cached_math_is_behaviour_preserved():
++    from trinity.orchestration.reward import score_text
++
++    item = {
++        "question_text": "2+2",
++        "benchmark": "math500",
++        "correct_answer": "4",
++        "model_answers": {"deepseek-v4-pro": "\\boxed{4}"},
++    }
++    acc = pr_eval._evaluate_cached(_FakePolicy(), [item], _POOL)
++    assert acc == 1.0
++    # Identical to the old direct dispatch for a delegating adapter.
++    assert score_text("math500", "\\boxed{4}", "4") == 1.0
++
++
++def test_cached_math_wrong_answer_scores_zero():
++    item = {
++        "question_text": "2+2",
++        "benchmark": "math500",
++        "correct_answer": "4",
++        "model_answers": {"deepseek-v4-pro": "\\boxed{5}"},
++    }
++    assert pr_eval._evaluate_cached(_FakePolicy(), [item], _POOL) == 0.0
++
++
++# --------------------------------------------------------------------------- #
++# live path
++# --------------------------------------------------------------------------- #
++def _install_fake_httpx(monkeypatch):
++    class _AsyncClient:
++        async def __aenter__(self):
++            return self
++
++        async def __aexit__(self, *exc):
++            return False
++
++    module = types.ModuleType("httpx")
++    module.AsyncClient = _AsyncClient  # type: ignore[attr-defined]
++    monkeypatch.setitem(sys.modules, "httpx", module)
++
++
++def test_live_scores_swebench_through_its_adapter(monkeypatch):
++    _install_fake_httpx(monkeypatch)
++
++    async def fake_run_trajectory(task, *args, **kwargs):
++        # The model's final answer is the gold patch.
++        return Trajectory(task=task, turns=[], final_answer=_GOLD, terminated_by="done")
++
++    monkeypatch.setattr(
++        "trinity.orchestration.session.run_trajectory", fake_run_trajectory
++    )
++
++    item = {
++        "question_text": "resolve the issue",
++        "benchmark": "swebench_verified",
++        "correct_answer": _PATCH_REF,
++        "model_answers": {},
++    }
++    acc, _turns = asyncio.run(
++        pr_eval._evaluate_live(_FakePolicy(), object(), _POOL, [item])
++    )
++    # SweBenchAdapter.score_trajectory grades the final patch -> 1.0.
++    assert acc == 1.0
++
++
++def test_live_math_is_behaviour_preserved(monkeypatch):
++    _install_fake_httpx(monkeypatch)
++
++    def _math_traj(task):
++        # Final turn is a verbose verifier line with no boxed answer; an earlier
++        # Worker turn boxed the answer. committed-answer scoring (which the adapter
++        # uses, matching reward.score) must still recover it.
++        return Trajectory(
++            task=task,
++            turns=[
++                TurnRecord(turn=1, agent_name="glm-5p2", role=_worker_role(),
++                           raw_output="\\boxed{4}", processed_output="\\boxed{4}"),
++            ],
++            final_answer="Looks good.",
++            terminated_by="done",
++        )
++
++    async def fake_run_trajectory(task, *args, **kwargs):
++        return _math_traj(task)
++
++    monkeypatch.setattr(
++        "trinity.orchestration.session.run_trajectory", fake_run_trajectory
++    )
++
++    item = {"question_text": "2+2", "benchmark": "math500", "correct_answer": "4",
++            "model_answers": {}}
++    acc, _turns = asyncio.run(
++        pr_eval._evaluate_live(_FakePolicy(), object(), _POOL, [item])
++    )
++    assert acc == 1.0  # committed answer recovered, exactly as reward.score would
++
++
++def _worker_role():
++    from trinity.types import Role
++
++    return Role.WORKER
+diff --git a/tests/test_svf_submission.py b/tests/test_svf_submission.py
+index bccc1ca..9752be0 100644
+--- a/tests/test_svf_submission.py
++++ b/tests/test_svf_submission.py
+@@ -58,7 +58,11 @@ def __init__(self):
+         def decide(self, prompt, *, sample=False):
+             self.calls += 1
+             assert sample is False
+-            return (1 if len(prompt) % 2 == 0 else 0, None)
++            # `_evaluate_cached` passes `routing_transcript(query)` (which prepends
++            # "QUERY:\n"), not the bare query, so route on the query CONTENT rather
++            # than the transcript's length: item "abc" -> deepseek (idx 0), the
++            # shorter "ab" item -> glm (idx 1). Both land on their correct answer.
++            return (0 if "abc" in prompt else 1, None)
+ 
+     policy = _FakePolicy()
+     items = [

@@ -1,0 +1,758 @@
+diff --git a/packages/gittensory-miner/lib/worktree-allocator.d.ts b/packages/gittensory-miner/lib/worktree-allocator.d.ts
+new file mode 100644
+index 000000000..acfa3a8b8
+--- /dev/null
++++ b/packages/gittensory-miner/lib/worktree-allocator.d.ts
+@@ -0,0 +1,39 @@
++export type WorktreeAllocation = {
++  slotIndex: number;
++  worktreePath: string;
++  attemptId: string | null;
++  repoFullName: string | null;
++  status: "free" | "active";
++  ownerPid: number | null;
++  allocatedAt: string | null;
++};
++
++export type WorktreeAllocator = {
++  dbPath: string;
++  worktreeBaseDir: string;
++  maxConcurrency: number;
++  processPid: number;
++  acquire(attemptId: string, repoFullName: string): WorktreeAllocation;
++  release(attemptId: string): WorktreeAllocation | null;
++  listSlots(): WorktreeAllocation[];
++  close(): void;
++};
++
++export function resolveWorktreeAllocatorDbPath(env?: Record<string, string | undefined>): string;
++
++export function resolveWorktreeBaseDir(env?: Record<string, string | undefined>): string;
++
++export function isProcessAlive(pid: number): boolean;
++
++export function openWorktreeAllocator(options?: {
++  dbPath?: string;
++  worktreeBaseDir?: string;
++  maxConcurrency?: number;
++  processPid?: number;
++}): WorktreeAllocator;
++
++export function acquireWorktree(attemptId: string, repoFullName: string): WorktreeAllocation;
++
++export function releaseWorktree(attemptId: string): WorktreeAllocation | null;
++
++export function closeDefaultWorktreeAllocator(): void;
+diff --git a/packages/gittensory-miner/lib/worktree-allocator.js b/packages/gittensory-miner/lib/worktree-allocator.js
+new file mode 100644
+index 000000000..1a35427c6
+--- /dev/null
++++ b/packages/gittensory-miner/lib/worktree-allocator.js
+@@ -0,0 +1,262 @@
++import { chmodSync, mkdirSync } from "node:fs";
++import { homedir } from "node:os";
++import { dirname, join } from "node:path";
++import { DatabaseSync } from "node:sqlite";
++
++// Git-worktree-per-attempt allocator (#4297): durable local bookkeeping for which worktree paths are
++// allocated to which fleet attempts. Mirrors the package's existing local-store pattern (run-state.js,
++// claim-ledger.js, portfolio-queue.js) — plain JS + node:sqlite, never phones home.
++
++const defaultDbFileName = "worktree-allocator.sqlite3";
++const defaultWorktreeDirName = "worktrees";
++const defaultMaxConcurrency = 2;
++let defaultWorktreeAllocator = null;
++
++export function resolveWorktreeAllocatorDbPath(env = process.env) {
++  const explicitPath = typeof env.GITTENSORY_MINER_WORKTREE_ALLOCATOR_DB === "string"
++    ? env.GITTENSORY_MINER_WORKTREE_ALLOCATOR_DB.trim()
++    : "";
++  if (explicitPath) return explicitPath;
++
++  const explicitConfigDir = typeof env.GITTENSORY_MINER_CONFIG_DIR === "string"
++    ? env.GITTENSORY_MINER_CONFIG_DIR.trim()
++    : "";
++  if (explicitConfigDir) return join(explicitConfigDir, defaultDbFileName);
++
++  const configHome = typeof env.XDG_CONFIG_HOME === "string" && env.XDG_CONFIG_HOME.trim()
++    ? env.XDG_CONFIG_HOME.trim()
++    : join(homedir(), ".config");
++  return join(configHome, "gittensory-miner", defaultDbFileName);
++}
++
++export function resolveWorktreeBaseDir(env = process.env) {
++  const explicitPath = typeof env.GITTENSORY_MINER_WORKTREE_DIR === "string"
++    ? env.GITTENSORY_MINER_WORKTREE_DIR.trim()
++    : "";
++  if (explicitPath) return explicitPath;
++
++  const explicitConfigDir = typeof env.GITTENSORY_MINER_CONFIG_DIR === "string"
++    ? env.GITTENSORY_MINER_CONFIG_DIR.trim()
++    : "";
++  if (explicitConfigDir) return join(explicitConfigDir, defaultWorktreeDirName);
++
++  const configHome = typeof env.XDG_CONFIG_HOME === "string" && env.XDG_CONFIG_HOME.trim()
++    ? env.XDG_CONFIG_HOME.trim()
++    : join(homedir(), ".config");
++  return join(configHome, "gittensory-miner", defaultWorktreeDirName);
++}
++
++function normalizeDbPath(dbPath) {
++  const path = (dbPath ?? resolveWorktreeAllocatorDbPath()).trim();
++  if (!path) throw new Error("invalid_worktree_allocator_db_path");
++  return path;
++}
++
++function normalizeWorktreeBaseDir(worktreeBaseDir) {
++  const path = (worktreeBaseDir ?? resolveWorktreeBaseDir()).trim();
++  if (!path) throw new Error("invalid_worktree_base_dir");
++  return path;
++}
++
++function normalizeMaxConcurrency(value) {
++  if (value === undefined || value === null) return defaultMaxConcurrency;
++  if (!Number.isInteger(value) || value < 1) throw new Error("invalid_max_concurrency");
++  return value;
++}
++
++function normalizeRepoFullName(repoFullName) {
++  if (typeof repoFullName !== "string") throw new Error("invalid_repo_full_name");
++  const [owner, repo, extra] = repoFullName.trim().split("/");
++  if (!owner || !repo || extra !== undefined) throw new Error("invalid_repo_full_name");
++  return `${owner}/${repo}`;
++}
++
++function normalizeAttemptId(attemptId) {
++  if (typeof attemptId !== "string") throw new Error("invalid_attempt_id");
++  const trimmed = attemptId.trim();
++  if (!trimmed) throw new Error("invalid_attempt_id");
++  return trimmed;
++}
++
++export function isProcessAlive(pid) {
++  if (!Number.isInteger(pid) || pid <= 0) return false;
++  try {
++    process.kill(pid, 0);
++    return true;
++  } catch (error) {
++    // ESRCH = no such process; EPERM (or similar) means the process exists but we lack signal rights.
++    return typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH"
++      ? false
++      : true;
++  }
++}
++
++function rowToAllocation(row) {
++  return {
++    slotIndex: row.slot_index,
++    worktreePath: row.worktree_path,
++    attemptId: row.attempt_id,
++    repoFullName: row.repo_full_name,
++    status: row.status,
++    ownerPid: row.owner_pid,
++    allocatedAt: row.allocated_at,
++  };
++}
++
++function ensureSlotTable(db) {
++  db.exec(`
++    CREATE TABLE IF NOT EXISTS worktree_slots (
++      slot_index INTEGER PRIMARY KEY,
++      worktree_path TEXT NOT NULL UNIQUE,
++      attempt_id TEXT UNIQUE,
++      repo_full_name TEXT,
++      status TEXT NOT NULL CHECK (status IN ('free', 'active')),
++      owner_pid INTEGER,
++      allocated_at TEXT
++    )
++  `);
++}
++
++function ensureSlots(db, worktreeBaseDir, maxConcurrency) {
++  mkdirSync(worktreeBaseDir, { recursive: true, mode: 0o700 });
++  const insert = db.prepare(`
++    INSERT OR IGNORE INTO worktree_slots (slot_index, worktree_path, status)
++    VALUES (?, ?, 'free')
++  `);
++  for (let slotIndex = 0; slotIndex < maxConcurrency; slotIndex += 1) {
++    const worktreePath = join(worktreeBaseDir, `slot-${slotIndex}`);
++    insert.run(slotIndex, worktreePath);
++    mkdirSync(worktreePath, { recursive: true, mode: 0o700 });
++  }
++}
++
++function reclaimOrphanedAllocations(db) {
++  const orphans = db
++    .prepare("SELECT slot_index, owner_pid FROM worktree_slots WHERE status = 'active'")
++    .all();
++  const reclaim = db.prepare(`
++    UPDATE worktree_slots
++    SET status = 'free', attempt_id = NULL, repo_full_name = NULL, owner_pid = NULL, allocated_at = NULL
++    WHERE slot_index = ?
++  `);
++  for (const row of orphans) {
++    if (row.owner_pid !== null && isProcessAlive(row.owner_pid)) continue;
++    reclaim.run(row.slot_index);
++  }
++}
++
++/**
++ * Opens the local worktree allocator store. Reclaims orphaned active slots from dead owner processes on startup.
++ */
++export function openWorktreeAllocator(options = {}) {
++  const resolvedPath = normalizeDbPath(options.dbPath);
++  const worktreeBaseDir = normalizeWorktreeBaseDir(options.worktreeBaseDir);
++  const maxConcurrency = normalizeMaxConcurrency(options.maxConcurrency);
++  const processPid = Number.isInteger(options.processPid) ? options.processPid : process.pid;
++
++  mkdirSync(dirname(resolvedPath), { recursive: true, mode: 0o700 });
++  const db = new DatabaseSync(resolvedPath);
++  chmodSync(resolvedPath, 0o600);
++  db.exec("PRAGMA busy_timeout = 5000");
++  ensureSlotTable(db);
++  ensureSlots(db, worktreeBaseDir, maxConcurrency);
++  reclaimOrphanedAllocations(db);
++
++  const getByAttempt = db.prepare(
++    "SELECT slot_index, worktree_path, attempt_id, repo_full_name, status, owner_pid, allocated_at FROM worktree_slots WHERE attempt_id = ?",
++  );
++  const countActive = db.prepare("SELECT COUNT(*) AS count FROM worktree_slots WHERE status = 'active'");
++  const selectFreeSlot = db.prepare(`
++    SELECT slot_index, worktree_path, attempt_id, repo_full_name, status, owner_pid, allocated_at
++    FROM worktree_slots
++    WHERE status = 'free'
++    ORDER BY slot_index
++    LIMIT 1
++  `);
++  const markActive = db.prepare(`
++    UPDATE worktree_slots
++    SET status = 'active', attempt_id = ?, repo_full_name = ?, owner_pid = ?, allocated_at = ?
++    WHERE slot_index = ?
++  `);
++  const releaseByAttempt = db.prepare(`
++    UPDATE worktree_slots
++    SET status = 'free', attempt_id = NULL, repo_full_name = NULL, owner_pid = NULL, allocated_at = NULL
++    WHERE attempt_id = ? AND status = 'active'
++    RETURNING slot_index, worktree_path, attempt_id, repo_full_name, status, owner_pid, allocated_at
++  `);
++  const listSlots = db.prepare(
++    "SELECT slot_index, worktree_path, attempt_id, repo_full_name, status, owner_pid, allocated_at FROM worktree_slots ORDER BY slot_index",
++  );
++
++  const allocator = {
++    dbPath: resolvedPath,
++    worktreeBaseDir,
++    maxConcurrency,
++    processPid,
++    acquire(attemptId, repoFullName) {
++      const normalizedAttempt = normalizeAttemptId(attemptId);
++      const normalizedRepo = normalizeRepoFullName(repoFullName);
++      const existing = getByAttempt.get(normalizedAttempt);
++      if (existing?.status === "active") return rowToAllocation(existing);
++
++      db.exec("BEGIN IMMEDIATE");
++      try {
++        const raced = getByAttempt.get(normalizedAttempt);
++        if (raced?.status === "active") {
++          db.exec("COMMIT");
++          return rowToAllocation(raced);
++        }
++        const activeCount = countActive.get().count;
++        if (activeCount >= maxConcurrency) throw new Error("worktree_capacity_exceeded");
++        const slot = selectFreeSlot.get();
++        if (!slot) throw new Error("worktree_capacity_exceeded");
++        const allocatedAt = new Date().toISOString();
++        markActive.run(normalizedAttempt, normalizedRepo, processPid, allocatedAt, slot.slot_index);
++        db.exec("COMMIT");
++        return rowToAllocation({
++          ...slot,
++          attempt_id: normalizedAttempt,
++          repo_full_name: normalizedRepo,
++          status: "active",
++          owner_pid: processPid,
++          allocated_at: allocatedAt,
++        });
++      } catch (error) {
++        db.exec("ROLLBACK");
++        throw error;
++      }
++    },
++    release(attemptId) {
++      const normalizedAttempt = normalizeAttemptId(attemptId);
++      const row = releaseByAttempt.get(normalizedAttempt);
++      return row ? rowToAllocation(row) : null;
++    },
++    listSlots() {
++      return listSlots.all().map(rowToAllocation);
++    },
++    close() {
++      db.close();
++    },
++  };
++
++  return allocator;
++}
++
++function getDefaultWorktreeAllocator() {
++  defaultWorktreeAllocator ??= openWorktreeAllocator();
++  return defaultWorktreeAllocator;
++}
++
++export function acquireWorktree(attemptId, repoFullName) {
++  return getDefaultWorktreeAllocator().acquire(attemptId, repoFullName);
++}
++
++export function releaseWorktree(attemptId) {
++  return getDefaultWorktreeAllocator().release(attemptId);
++}
++
++export function closeDefaultWorktreeAllocator() {
++  if (!defaultWorktreeAllocator) return;
++  defaultWorktreeAllocator.close();
++  defaultWorktreeAllocator = null;
++}
+diff --git a/packages/gittensory-miner/package.json b/packages/gittensory-miner/package.json
+index 0772ed6a2..91a297109 100644
+--- a/packages/gittensory-miner/package.json
++++ b/packages/gittensory-miner/package.json
+@@ -32,7 +32,7 @@
+     "expected-engine.version"
+   ],
+   "scripts": {
+-    "build": "node --check bin/gittensory-miner.js && node --check lib/version.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/run-state-cli.js && node --check lib/update-check.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/event-ledger-cli.js && node --check lib/claim-ledger.js && node --check lib/claim-ledger-expiry.js && node --check lib/claim-ledger-cli.js && node --check lib/claim-adjudication.js && node --check lib/portfolio-queue.js && node --check lib/portfolio-queue-cli.js && node --check lib/portfolio-discovery.js && node --check lib/opportunity-ranker.js && node --check lib/plan-store.js && node --check lib/plan-store-cli.js && node --check lib/rejection-templates.js && node --check lib/governor-ledger.js && node --check lib/governor-ledger-cli.js && node --check lib/manage-status.js && node --check lib/manage-poll.js && node --check lib/status.js && node --check lib/laptop-init.js && node --check lib/replay-objective-anchor.js && node --check lib/replay-task-generation.js && node --check lib/calibration-types.js && node --check lib/calibration.js"
++    "build": "node --check bin/gittensory-miner.js && node --check lib/version.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/run-state-cli.js && node --check lib/update-check.js && node --check lib/worktree-allocator.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/event-ledger-cli.js && node --check lib/claim-ledger.js && node --check lib/claim-ledger-expiry.js && node --check lib/claim-ledger-cli.js && node --check lib/claim-adjudication.js && node --check lib/portfolio-queue.js && node --check lib/portfolio-queue-cli.js && node --check lib/portfolio-discovery.js && node --check lib/opportunity-ranker.js && node --check lib/plan-store.js && node --check lib/plan-store-cli.js && node --check lib/rejection-templates.js && node --check lib/governor-ledger.js && node --check lib/governor-ledger-cli.js && node --check lib/manage-status.js && node --check lib/manage-poll.js && node --check lib/status.js && node --check lib/laptop-init.js && node --check lib/replay-objective-anchor.js && node --check lib/replay-task-generation.js && node --check lib/calibration-types.js && node --check lib/calibration.js"
+   },
+   "dependencies": {
+     "@jsonbored/gittensory-engine": ">=0.1.0 <1.0.0"
+diff --git a/test/fixtures/miner-worktree-allocator/acquire-child.mjs b/test/fixtures/miner-worktree-allocator/acquire-child.mjs
+new file mode 100644
+index 000000000..5d4063a19
+--- /dev/null
++++ b/test/fixtures/miner-worktree-allocator/acquire-child.mjs
+@@ -0,0 +1,39 @@
++#!/usr/bin/env node
++// Cross-process helper for worktree-allocator collision tests (#4298).
++// Opens the shared store, waits for a stdin "go" signal, then calls acquire() so
++// multiple Node processes contend on BEGIN IMMEDIATE against the same dbPath.
++import { openWorktreeAllocator } from "../../../packages/gittensory-miner/lib/worktree-allocator.js";
++
++const [dbPath, worktreeBaseDir, maxConcurrencyStr, attemptId, repoFullName] = process.argv.slice(2);
++if (!dbPath || !worktreeBaseDir || !maxConcurrencyStr || !attemptId || !repoFullName) {
++  process.stderr.write("usage: acquire-child.mjs <dbPath> <worktreeBaseDir> <maxConcurrency> <attemptId> <repoFullName>\n");
++  process.exit(2);
++}
++
++const allocator = openWorktreeAllocator({
++  dbPath,
++  worktreeBaseDir,
++  maxConcurrency: Number(maxConcurrencyStr),
++});
++
++let started = false;
++
++function runAcquire() {
++  if (started) return;
++  started = true;
++  try {
++    const allocation = allocator.acquire(attemptId, repoFullName);
++    process.stdout.write(`${JSON.stringify({ ok: true, allocation })}\n`);
++    process.exit(0);
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
++    process.stdout.write(`${JSON.stringify({ ok: false, message })}\n`);
++    process.exit(1);
++  } finally {
++    allocator.close();
++  }
++}
++
++process.stdin.setEncoding("utf8");
++process.stdin.on("data", () => runAcquire());
++process.stdout.write("READY\n");
+diff --git a/test/unit/miner-worktree-allocator-collisions.test.ts b/test/unit/miner-worktree-allocator-collisions.test.ts
+new file mode 100644
+index 000000000..302c44d8e
+--- /dev/null
++++ b/test/unit/miner-worktree-allocator-collisions.test.ts
+@@ -0,0 +1,274 @@
++import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { dirname, join } from "node:path";
++import { DatabaseSync } from "node:sqlite";
++import { fileURLToPath } from "node:url";
++import { afterEach, describe, expect, it } from "vitest";
++import {
++  closeDefaultWorktreeAllocator,
++  openWorktreeAllocator,
++} from "../../packages/gittensory-miner/lib/worktree-allocator.js";
++
++const acquireChildScript = join(
++  dirname(fileURLToPath(import.meta.url)),
++  "../fixtures/miner-worktree-allocator/acquire-child.mjs",
++);
++
++const roots: string[] = [];
++const allocators: Array<{ close(): void }> = [];
++
++type AcquireChildResult = {
++  ok: boolean;
++  allocation?: { worktreePath: string; attemptId: string; status: string };
++  message?: string;
++};
++
++function tempPaths() {
++  const root = mkdtempSync(join(tmpdir(), "gittensory-miner-worktree-collisions-"));
++  roots.push(root);
++  return {
++    root,
++    dbPath: join(root, "worktree-allocator.sqlite3"),
++    worktreeBaseDir: join(root, "worktrees"),
++  };
++}
++
++function openAllocator(
++  paths: ReturnType<typeof tempPaths>,
++  options: { maxConcurrency?: number; processPid?: number } = {},
++) {
++  const allocator = openWorktreeAllocator({
++    dbPath: paths.dbPath,
++    worktreeBaseDir: paths.worktreeBaseDir,
++    maxConcurrency: options.maxConcurrency ?? 4,
++    ...(options.processPid === undefined ? {} : { processPid: options.processPid }),
++  });
++  allocators.push(allocator);
++  return allocator;
++}
++
++function bootstrapSharedStore(paths: ReturnType<typeof tempPaths>, maxConcurrency: number) {
++  const bootstrap = openWorktreeAllocator({
++    dbPath: paths.dbPath,
++    worktreeBaseDir: paths.worktreeBaseDir,
++    maxConcurrency,
++  });
++  bootstrap.close();
++}
++
++function spawnAcquireChild(
++  paths: ReturnType<typeof tempPaths>,
++  attemptId: string,
++  maxConcurrency: number,
++): ChildProcessWithoutNullStreams {
++  return spawn(
++    process.execPath,
++    [
++      acquireChildScript,
++      paths.dbPath,
++      paths.worktreeBaseDir,
++      String(maxConcurrency),
++      attemptId,
++      "acme/widgets",
++    ],
++    { stdio: ["pipe", "pipe", "pipe"] },
++  );
++}
++
++async function waitForReady(child: ChildProcessWithoutNullStreams): Promise<void> {
++  await new Promise<void>((resolve, reject) => {
++    let buffer = "";
++    const onData = (chunk: Buffer | string) => {
++      buffer += chunk.toString();
++      if (buffer.includes("READY\n")) {
++        child.stdout.off("data", onData);
++        resolve();
++      }
++    };
++    child.stdout.on("data", onData);
++    child.once("error", reject);
++    child.once("exit", (code) => {
++      if (code !== 0 && code !== null) reject(new Error(`child exited before READY (${code})`));
++    });
++  });
++}
++
++async function runBarrieredAcquires(
++  paths: ReturnType<typeof tempPaths>,
++  attemptIds: string[],
++  maxConcurrency: number,
++): Promise<AcquireChildResult[]> {
++  const children = attemptIds.map((attemptId) => spawnAcquireChild(paths, attemptId, maxConcurrency));
++  await Promise.all(children.map((child) => waitForReady(child)));
++  for (const child of children) child.stdin.write("go\n");
++  return Promise.all(
++    children.map(
++      (child) =>
++        new Promise<AcquireChildResult>((resolve, reject) => {
++          let stdout = "";
++          child.stdout.on("data", (chunk) => {
++            stdout += chunk.toString();
++          });
++          child.once("error", reject);
++          child.once("exit", () => {
++            const line = stdout
++              .split("\n")
++              .map((entry) => entry.trim())
++              .find((entry) => entry.startsWith("{"));
++            if (!line) {
++              reject(new Error(`child produced no JSON result: ${stdout}`));
++              return;
++            }
++            resolve(JSON.parse(line) as AcquireChildResult);
++          });
++        }),
++    ),
++  );
++}
++
++afterEach(() => {
++  for (const allocator of allocators.splice(0)) allocator.close();
++  closeDefaultWorktreeAllocator();
++  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
++});
++
++describe("gittensory-miner worktree allocator collisions (#4298)", () => {
++  it("returns distinct worktree paths when multiple processes acquire simultaneously", async () => {
++    const paths = tempPaths();
++    const maxConcurrency = 5;
++    bootstrapSharedStore(paths, maxConcurrency);
++    const results = await runBarrieredAcquires(
++      paths,
++      Array.from({ length: maxConcurrency }, (_, index) => `attempt-${index}`),
++      maxConcurrency,
++    );
++    expect(results.every((result) => result.ok)).toBe(true);
++    const worktreePaths = results.map((result) => result.allocation?.worktreePath ?? "");
++    expect(new Set(worktreePaths).size).toBe(maxConcurrency);
++  });
++
++  it("rejects excess simultaneous cross-process acquire calls at the concurrency cap", async () => {
++    const paths = tempPaths();
++    const maxConcurrency = 2;
++    bootstrapSharedStore(paths, maxConcurrency);
++    const results = await runBarrieredAcquires(
++      paths,
++      ["attempt-1", "attempt-2", "attempt-3"],
++      maxConcurrency,
++    );
++    const fulfilled = results.filter((result) => result.ok);
++    const rejected = results.filter((result) => !result.ok);
++    expect(fulfilled).toHaveLength(2);
++    expect(rejected).toHaveLength(1);
++    expect(rejected[0]?.message).toBe("worktree_capacity_exceeded");
++  });
++
++  it("returns the same allocation when two processes race on one attempt id", async () => {
++    const paths = tempPaths();
++    bootstrapSharedStore(paths, 2);
++    const results = await runBarrieredAcquires(paths, ["shared-attempt", "shared-attempt"], 2);
++    expect(results.every((result) => result.ok)).toBe(true);
++    const worktreePaths = results.map((result) => result.allocation?.worktreePath ?? "");
++    expect(worktreePaths[0]).toBe(worktreePaths[1]);
++  });
++
++  it("rejects the acquire-child helper when required args are missing", async () => {
++    const child = spawn(process.execPath, [acquireChildScript], { stdio: ["ignore", "pipe", "pipe"] });
++    const exitCode = await new Promise<number | null>((resolve, reject) => {
++      child.once("error", reject);
++      child.once("exit", resolve);
++    });
++    expect(exitCode).toBe(2);
++  });
++
++  it("reuses a worktree path after release", () => {
++    const paths = tempPaths();
++    const allocator = openAllocator(paths, { maxConcurrency: 1 });
++    const first = allocator.acquire("attempt-a", "acme/widgets");
++    allocator.release("attempt-a");
++    const second = allocator.acquire("attempt-b", "acme/widgets");
++    expect(second.worktreePath).toBe(first.worktreePath);
++    expect(second.status).toBe("active");
++  });
++
++  it("reclaims orphaned active allocations after a simulated crash on reopen", () => {
++    const paths = tempPaths();
++    const crashedPid = 40_001;
++    const restartedPid = 40_002;
++
++    const crashed = openAllocator(paths, { maxConcurrency: 1, processPid: crashedPid });
++    const allocation = crashed.acquire("attempt-dead", "acme/widgets");
++    crashed.close();
++    allocators.pop();
++
++    const restarted = openAllocator(paths, { maxConcurrency: 1, processPid: restartedPid });
++    expect(restarted.listSlots().find((slot) => slot.status === "active")).toBeUndefined();
++
++    const reclaimed = restarted.acquire("attempt-new", "acme/other");
++    expect(reclaimed.worktreePath).toBe(allocation.worktreePath);
++    expect(reclaimed.attemptId).toBe("attempt-new");
++  });
++
++  it("reclaims a manually seeded active row with no live owner", () => {
++    const paths = tempPaths();
++    mkdirSeed(paths, 50_001);
++
++    const restarted = openAllocator(paths, { maxConcurrency: 2, processPid: 50_002 });
++    expect(restarted.acquire("attempt-live", "acme/widgets").status).toBe("active");
++    expect(restarted.listSlots().filter((slot) => slot.status === "active")).toHaveLength(1);
++  });
++
++  it("does not reclaim active slots owned by another live process on reopen", () => {
++    const paths = tempPaths();
++    const ownerPid = process.pid;
++
++    const owner = openAllocator(paths, { maxConcurrency: 1, processPid: ownerPid });
++    const allocation = owner.acquire("attempt-live-owner", "acme/widgets");
++    owner.close();
++    allocators.pop();
++
++    const peer = openAllocator(paths, { maxConcurrency: 1, processPid: 99_999 });
++    const active = peer.listSlots().find((slot) => slot.status === "active");
++    expect(active).toMatchObject({
++      attemptId: "attempt-live-owner",
++      worktreePath: allocation.worktreePath,
++      ownerPid,
++    });
++    expect(() => peer.acquire("attempt-peer", "acme/other")).toThrow("worktree_capacity_exceeded");
++  });
++});
++
++function mkdirSeed(paths: ReturnType<typeof tempPaths>, ownerPid: number) {
++  const bootstrap = openWorktreeAllocator({
++    dbPath: paths.dbPath,
++    worktreeBaseDir: paths.worktreeBaseDir,
++    maxConcurrency: 2,
++    processPid: ownerPid,
++  });
++  bootstrap.close();
++
++  const db = new DatabaseSync(paths.dbPath);
++  try {
++    db.prepare(`
++      UPDATE worktree_slots
++      SET status = 'active',
++          attempt_id = 'orphan-attempt',
++          repo_full_name = 'acme/widgets',
++          owner_pid = ?,
++          allocated_at = '2026-07-08T12:00:00.000Z'
++      WHERE slot_index = 0
++    `).run(ownerPid);
++    db.prepare(`
++      UPDATE worktree_slots
++      SET status = 'active',
++          attempt_id = 'orphan-attempt-2',
++          repo_full_name = 'acme/other',
++          owner_pid = ?,
++          allocated_at = '2026-07-08T12:00:00.000Z'
++      WHERE slot_index = 1
++    `).run(ownerPid);
++  } finally {
++    db.close();
++  }
++}
+diff --git a/test/unit/miner-worktree-allocator.test.ts b/test/unit/miner-worktree-allocator.test.ts
+new file mode 100644
+index 000000000..e49752635
+--- /dev/null
++++ b/test/unit/miner-worktree-allocator.test.ts
+@@ -0,0 +1,101 @@
++import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  closeDefaultWorktreeAllocator,
++  isProcessAlive,
++  openWorktreeAllocator,
++  resolveWorktreeAllocatorDbPath,
++  resolveWorktreeBaseDir,
++} from "../../packages/gittensory-miner/lib/worktree-allocator.js";
++
++const roots: string[] = [];
++const allocators: Array<{ close(): void }> = [];
++
++function tempAllocator(options: { maxConcurrency?: number; processPid?: number } = {}) {
++  const root = mkdtempSync(join(tmpdir(), "gittensory-miner-worktree-allocator-"));
++  roots.push(root);
++  const allocator = openWorktreeAllocator({
++    dbPath: join(root, "worktree-allocator.sqlite3"),
++    worktreeBaseDir: join(root, "worktrees"),
++    maxConcurrency: options.maxConcurrency ?? 2,
++    ...(options.processPid === undefined ? {} : { processPid: options.processPid }),
++  });
++  allocators.push(allocator);
++  return allocator;
++}
++
++afterEach(() => {
++  for (const allocator of allocators.splice(0)) allocator.close();
++  closeDefaultWorktreeAllocator();
++  vi.restoreAllMocks();
++  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
++});
++
++describe("gittensory-miner worktree allocator scaffolding (#4298)", () => {
++  it("resolves DB and worktree base paths from env overrides", () => {
++    expect(
++      resolveWorktreeAllocatorDbPath({ GITTENSORY_MINER_WORKTREE_ALLOCATOR_DB: "/custom/alloc.sqlite3" }),
++    ).toBe("/custom/alloc.sqlite3");
++    expect(resolveWorktreeBaseDir({ GITTENSORY_MINER_WORKTREE_DIR: "/custom/worktrees" })).toBe(
++      "/custom/worktrees",
++    );
++    expect(resolveWorktreeAllocatorDbPath({ GITTENSORY_MINER_CONFIG_DIR: "/cfg" })).toBe(
++      "/cfg/worktree-allocator.sqlite3",
++    );
++    expect(resolveWorktreeBaseDir({ GITTENSORY_MINER_CONFIG_DIR: "/cfg" })).toBe("/cfg/worktrees");
++  });
++
++  it("creates a permissioned SQLite store and allocates distinct worktree paths", () => {
++    const allocator = tempAllocator({ maxConcurrency: 2 });
++    expect(statSync(allocator.dbPath).mode & 0o077).toBe(0);
++    expect(existsSync(join(allocator.worktreeBaseDir, "slot-0"))).toBe(true);
++
++    const first = allocator.acquire("attempt-a", "acme/widgets");
++    const second = allocator.acquire("attempt-b", "acme/other");
++    expect(first.worktreePath).not.toBe(second.worktreePath);
++    expect(first.status).toBe("active");
++    expect(allocator.listSlots().filter((slot) => slot.status === "active")).toHaveLength(2);
++  });
++
++  it("release frees a slot for reuse and rejects invalid input", () => {
++    const allocator = tempAllocator({ maxConcurrency: 1 });
++    const first = allocator.acquire("attempt-a", "acme/widgets");
++    expect(allocator.release("attempt-a")?.worktreePath).toBe(first.worktreePath);
++    const second = allocator.acquire("attempt-b", "acme/widgets");
++    expect(second.worktreePath).toBe(first.worktreePath);
++    expect(() => allocator.acquire("", "acme/widgets")).toThrow("invalid_attempt_id");
++    expect(() => allocator.acquire("attempt-c", "bad")).toThrow("invalid_repo_full_name");
++    expect(allocator.release("missing")).toBeNull();
++  });
++
++  it("isProcessAlive returns false for invalid or dead pids", () => {
++    expect(isProcessAlive(0)).toBe(false);
++    expect(isProcessAlive(9_999_999)).toBe(false);
++    expect(isProcessAlive(process.pid)).toBe(true);
++  });
++
++  it("isProcessAlive treats EPERM from process.kill as alive", () => {
++    const kill = vi.spyOn(process, "kill").mockImplementation(() => {
++      const error = new Error("operation not permitted") as NodeJS.ErrnoException;
++      error.code = "EPERM";
++      throw error;
++    });
++    expect(isProcessAlive(42_424)).toBe(true);
++    kill.mockRestore();
++  });
++
++  it("rejects invalid store configuration", () => {
++    expect(() => openWorktreeAllocator({ maxConcurrency: 0 })).toThrow("invalid_max_concurrency");
++    expect(() => openWorktreeAllocator({ dbPath: "  " })).toThrow("invalid_worktree_allocator_db_path");
++    expect(() => openWorktreeAllocator({ worktreeBaseDir: "  " })).toThrow("invalid_worktree_base_dir");
++  });
++
++  it("returns the same allocation for repeated acquire on one attempt id", () => {
++    const allocator = tempAllocator({ maxConcurrency: 1 });
++    const first = allocator.acquire("attempt-a", "acme/widgets");
++    const second = allocator.acquire("attempt-a", "acme/widgets");
++    expect(second.worktreePath).toBe(first.worktreePath);
++  });
++});

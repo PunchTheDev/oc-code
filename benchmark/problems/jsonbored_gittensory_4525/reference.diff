@@ -1,0 +1,566 @@
+diff --git a/packages/gittensory-miner/lib/deny-hook-synthesis.d.ts b/packages/gittensory-miner/lib/deny-hook-synthesis.d.ts
+new file mode 100644
+index 000000000..b28600dde
+--- /dev/null
++++ b/packages/gittensory-miner/lib/deny-hook-synthesis.d.ts
+@@ -0,0 +1,84 @@
++import type { DenyRule } from "./deny-hooks.js";
++
++export type BlockerHistoryRecord = {
++  repoFullName?: string | null;
++  blockerCodes: string[];
++  changedPaths?: string[];
++  guardrailMatches?: string[];
++  pullNumber?: number | null;
++  recordedAt?: string | null;
++};
++
++export type DenyRuleProposalStatus = "proposed" | "approved" | "rejected";
++
++export type DenyRuleProposalAudit = {
++  kind: string;
++  path?: string;
++  pathPattern?: string;
++  occurrenceCount?: number;
++  blockerCodes?: string[];
++  synthesizedAt: string;
++};
++
++export type DenyRuleProposal = {
++  id: string;
++  status: DenyRuleProposalStatus;
++  rule: DenyRule;
++  audit: DenyRuleProposalAudit;
++};
++
++export type SynthesisConfig = {
++  minPathOccurrences?: number;
++  maxProposals?: number;
++};
++
++export const DEFAULT_SYNTHESIS_CONFIG: Readonly<Required<SynthesisConfig>>;
++
++export function normalizeBlockerHistoryRecord(record: unknown): BlockerHistoryRecord | null;
++
++export function normalizeBlockerHistory(records: unknown): BlockerHistoryRecord[];
++
++export function canonicalizeChangedPath(path: unknown): string | null;
++
++export function changedPathToDenyGlob(path: string): string | null;
++
++export function isCoveredByDefaultDenyRules(pathPattern: string): boolean;
++
++export function aggregateBlockerHistory(records: unknown): {
++  pathCounts: Map<string, number>;
++  pathBlockers: Map<string, Set<string>>;
++  blockerCounts: Map<string, number>;
++  recordCount: number;
++};
++
++export function synthesizeDenyRuleProposals(
++  records: unknown,
++  config?: SynthesisConfig,
++): DenyRuleProposal[];
++
++export function resolveEffectiveDenyRules(options?: {
++  includeDefaults?: boolean;
++  approvedProposals?: DenyRuleProposal[];
++}): DenyRule[];
++
++export function setProposalStatuses(
++  proposals: DenyRuleProposal[],
++  updates: Record<string, DenyRuleProposalStatus> | Map<string, DenyRuleProposalStatus>,
++): DenyRuleProposal[];
++
++export function resolveDenyHookSynthesisDbPath(env?: Record<string, string | undefined>): string;
++
++export type DenyHookSynthesisStore = {
++  dbPath: string;
++  refreshProposals(
++    repoFullName: string,
++    history: unknown,
++    config?: SynthesisConfig,
++  ): DenyRuleProposal[];
++  listProposals(repoFullName: string): DenyRuleProposal[];
++  setProposalStatus(repoFullName: string, proposalId: string, status: DenyRuleProposalStatus): void;
++  resolveEffectiveRules(repoFullName: string, options?: { includeDefaults?: boolean }): DenyRule[];
++  close(): void;
++};
++
++export function initDenyHookSynthesisStore(dbPath?: string): DenyHookSynthesisStore;
+diff --git a/packages/gittensory-miner/lib/deny-hook-synthesis.js b/packages/gittensory-miner/lib/deny-hook-synthesis.js
+new file mode 100644
+index 000000000..4697a4f14
+--- /dev/null
++++ b/packages/gittensory-miner/lib/deny-hook-synthesis.js
+@@ -0,0 +1,349 @@
++// Synthesize PreToolUse deny-hook rule proposals from per-repo blocker/path history (#4522). Pure synthesis
++// plus an optional local SQLite store for refresh + maintainer review before any synthesized rule takes effect.
++// Approved rules merge with {@link DEFAULT_DENY_RULES}; unapproved proposals never block tool calls. Feeds the
++// consumption surface #2343 will wire into evaluateDenyHooks — this issue owns derivation + audit, not live hook
++// interception.
++import { chmodSync, mkdirSync } from "node:fs";
++import { homedir } from "node:os";
++import { dirname, join } from "node:path";
++import { createHash } from "node:crypto";
++import { DatabaseSync } from "node:sqlite";
++import { DEFAULT_DENY_RULES, evaluateDenyHooks } from "./deny-hooks.js";
++
++const defaultDbFileName = "deny-hook-synthesis.sqlite3";
++const PROPOSAL_STATUSES = Object.freeze(["proposed", "approved", "rejected"]);
++const proposalStatusSet = new Set(PROPOSAL_STATUSES);
++
++export const DEFAULT_SYNTHESIS_CONFIG = Object.freeze({
++  minPathOccurrences: 2,
++  maxProposals: 20,
++});
++
++function normalizeRepoFullName(repoFullName) {
++  if (typeof repoFullName !== "string") throw new Error("invalid_repo_full_name");
++  const [owner, repo, extra] = repoFullName.trim().split("/");
++  if (!owner || !repo || extra !== undefined) throw new Error("invalid_repo_full_name");
++  return `${owner}/${repo}`;
++}
++
++function normalizeOptionalStringArray(value) {
++  if (value === undefined || value === null) return [];
++  if (!Array.isArray(value)) return [];
++  return value.filter((entry) => typeof entry === "string" && entry.trim()).map((entry) => entry.trim());
++}
++
++/** Validate one blocker-history row from the review stack (gate block/close audit). */
++export function normalizeBlockerHistoryRecord(record) {
++  if (!record || typeof record !== "object" || Array.isArray(record)) return null;
++  const blockerCodes = normalizeOptionalStringArray(record.blockerCodes);
++  if (blockerCodes.length === 0) return null;
++  const changedPaths = normalizeOptionalStringArray(record.changedPaths);
++  const guardrailMatches = normalizeOptionalStringArray(record.guardrailMatches);
++  const repoFullName = typeof record.repoFullName === "string" && record.repoFullName.trim()
++    ? normalizeRepoFullName(record.repoFullName)
++    : null;
++  return {
++    repoFullName,
++    blockerCodes,
++    changedPaths,
++    guardrailMatches,
++    pullNumber: Number.isInteger(record.pullNumber) && record.pullNumber > 0 ? record.pullNumber : null,
++    recordedAt: typeof record.recordedAt === "string" && record.recordedAt.trim() ? record.recordedAt.trim() : null,
++  };
++}
++
++export function normalizeBlockerHistory(records) {
++  if (!Array.isArray(records)) return [];
++  const normalized = [];
++  for (const record of records) {
++    const entry = normalizeBlockerHistoryRecord(record);
++    if (entry) normalized.push(entry);
++  }
++  return normalized;
++}
++
++/** Canonicalize a changed path the same way guardrail matching does (case/separator insensitive). */
++export function canonicalizeChangedPath(path) {
++  if (typeof path !== "string") return null;
++  const trimmed = path.trim().replace(/\\/g, "/").replace(/^\.\/+/, "").replace(/^\/+/, "");
++  if (!trimmed || trimmed.includes("..")) return null;
++  return trimmed.toLowerCase();
++}
++
++/** Convert a repo-relative changed path into a deny-hook glob matching DEFAULT_DENY_RULES shape. */
++export function changedPathToDenyGlob(path) {
++  const canonical = canonicalizeChangedPath(path);
++  if (!canonical) return null;
++  return `**/${canonical}`;
++}
++
++function ruleSignature(rule) {
++  return JSON.stringify({
++    matcher: rule.matcher,
++    pathPattern: rule.pathPattern ?? null,
++    inputIncludesAll: rule.inputIncludesAll ?? null,
++    reason: rule.reason,
++  });
++}
++
++/** True when a synthesized glob is already enforced by a built-in default deny rule. */
++export function isCoveredByDefaultDenyRules(pathPattern) {
++  if (typeof pathPattern !== "string" || !pathPattern.trim()) return false;
++  const samplePath = pathPattern.replace(/^\*\*\//, "");
++  if (!samplePath) return false;
++  return !evaluateDenyHooks({ name: "Write", input: { file_path: samplePath } }, DEFAULT_DENY_RULES).allowed;
++}
++
++function collectPathsFromRecord(record) {
++  const paths = new Set();
++  for (const path of [...record.changedPaths, ...record.guardrailMatches]) {
++    const canonical = canonicalizeChangedPath(path);
++    if (canonical) paths.add(canonical);
++  }
++  return paths;
++}
++
++/** Aggregate path and blocker-code frequencies from normalized history. Pure. */
++export function aggregateBlockerHistory(records) {
++  const normalized = normalizeBlockerHistory(records);
++  const pathCounts = new Map();
++  const pathBlockers = new Map();
++  const blockerCounts = new Map();
++
++  for (const record of normalized) {
++    for (const code of record.blockerCodes) {
++      blockerCounts.set(code, (blockerCounts.get(code) ?? 0) + 1);
++    }
++    for (const path of collectPathsFromRecord(record)) {
++      pathCounts.set(path, (pathCounts.get(path) ?? 0) + 1);
++      const blockers = pathBlockers.get(path) ?? new Set();
++      for (const code of record.blockerCodes) blockers.add(code);
++      pathBlockers.set(path, blockers);
++    }
++  }
++
++  return {
++    pathCounts,
++    pathBlockers,
++    blockerCounts,
++    recordCount: normalized.length,
++  };
++}
++
++function stableProposalId(kind, key) {
++  const digest = createHash("sha256").update(`${kind}:${key}`).digest("hex").slice(0, 16);
++  return `${kind}:${digest}`;
++}
++
++function buildPathProposal(path, occurrenceCount, blockerCodes) {
++  const pathPattern = changedPathToDenyGlob(path);
++  if (!pathPattern || isCoveredByDefaultDenyRules(pathPattern)) return null;
++  const sortedBlockers = [...blockerCodes].sort();
++  const reason = `Synthesized deny rule: ${occurrenceCount} gate block(s) touched ${path} (${sortedBlockers.join(", ") || "path history"}). Review before enabling.`;
++  const rule = { matcher: "*", pathPattern, reason };
++  return {
++    id: stableProposalId("path", pathPattern),
++    status: "proposed",
++    rule,
++    audit: {
++      kind: "path_history",
++      path,
++      pathPattern,
++      occurrenceCount,
++      blockerCodes: sortedBlockers,
++      synthesizedAt: new Date(0).toISOString(),
++    },
++  };
++}
++
++/**
++ * Derive candidate deny-hook rules from blocker/path history. Returns proposal objects only — nothing is active
++ * until a maintainer approves them (see resolveEffectiveDenyRules).
++ */
++export function synthesizeDenyRuleProposals(records, config = {}) {
++  const minPathOccurrences = Number.isInteger(config.minPathOccurrences)
++    ? Math.max(1, config.minPathOccurrences)
++    : DEFAULT_SYNTHESIS_CONFIG.minPathOccurrences;
++  const maxProposals = Number.isInteger(config.maxProposals)
++    ? Math.max(1, config.maxProposals)
++    : DEFAULT_SYNTHESIS_CONFIG.maxProposals;
++
++  const { pathCounts, pathBlockers, recordCount } = aggregateBlockerHistory(records);
++  if (recordCount === 0) return [];
++
++  const rankedPaths = [...pathCounts.entries()]
++    .filter(([, count]) => count >= minPathOccurrences)
++    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
++
++  const proposals = [];
++  const seenSignatures = new Set(DEFAULT_DENY_RULES.map(ruleSignature));
++  for (const [path, count] of rankedPaths) {
++    const proposal = buildPathProposal(path, count, pathBlockers.get(path) ?? new Set());
++    if (!proposal) continue;
++    const signature = ruleSignature(proposal.rule);
++    if (seenSignatures.has(signature)) continue;
++    seenSignatures.add(signature);
++    proposals.push({
++      ...proposal,
++      audit: { ...proposal.audit, synthesizedAt: new Date().toISOString() },
++    });
++    if (proposals.length >= maxProposals) break;
++  }
++  return proposals;
++}
++
++/** Merge built-in defaults with maintainer-approved synthesized rules (deduped, defaults first). */
++export function resolveEffectiveDenyRules(options = {}) {
++  const includeDefaults = options.includeDefaults !== false;
++  const approvedProposals = Array.isArray(options.approvedProposals) ? options.approvedProposals : [];
++  const merged = includeDefaults ? [...DEFAULT_DENY_RULES] : [];
++  const seen = new Set(merged.map(ruleSignature));
++  for (const proposal of approvedProposals) {
++    if (proposal?.status !== "approved") continue;
++    const rule = proposal.rule;
++    if (!rule || typeof rule !== "object") continue;
++    const signature = ruleSignature(rule);
++    if (seen.has(signature)) continue;
++    seen.add(signature);
++    merged.push(rule);
++  }
++  return merged;
++}
++
++/** Apply maintainer approval/rejection to in-memory proposals. Pure. */
++export function setProposalStatuses(proposals, updates) {
++  if (!Array.isArray(proposals)) throw new Error("invalid_proposals");
++  const updateMap = updates instanceof Map
++    ? updates
++    : new Map(Object.entries(updates ?? {}).filter(([id]) => typeof id === "string"));
++  return proposals.map((proposal) => {
++    const nextStatus = updateMap.get(proposal.id);
++    if (!nextStatus || !proposalStatusSet.has(nextStatus)) return proposal;
++    return { ...proposal, status: nextStatus };
++  });
++}
++
++export function resolveDenyHookSynthesisDbPath(env = process.env) {
++  const explicitPath = typeof env.GITTENSORY_MINER_DENY_HOOK_SYNTHESIS_DB === "string"
++    ? env.GITTENSORY_MINER_DENY_HOOK_SYNTHESIS_DB.trim()
++    : "";
++  if (explicitPath) return explicitPath;
++
++  const explicitConfigDir = typeof env.GITTENSORY_MINER_CONFIG_DIR === "string"
++    ? env.GITTENSORY_MINER_CONFIG_DIR.trim()
++    : "";
++  if (explicitConfigDir) return join(explicitConfigDir, defaultDbFileName);
++
++  const configHome = typeof env.XDG_CONFIG_HOME === "string" && env.XDG_CONFIG_HOME.trim()
++    ? env.XDG_CONFIG_HOME.trim()
++    : join(homedir(), ".config");
++  return join(configHome, "gittensory-miner", defaultDbFileName);
++}
++
++function normalizeDbPath(dbPath) {
++  const path = (dbPath ?? resolveDenyHookSynthesisDbPath()).trim();
++  if (!path) throw new Error("invalid_deny_hook_synthesis_db_path");
++  return path;
++}
++
++function rowToProposal(row) {
++  return {
++    id: row.id,
++    status: row.status,
++    rule: JSON.parse(row.rule_json),
++    audit: JSON.parse(row.audit_json),
++  };
++}
++
++/**
++ * Local SQLite store for synthesized deny-rule proposals. Refresh re-derives proposals from history while
++ * preserving maintainer decisions on ids that still exist.
++ */
++export function initDenyHookSynthesisStore(dbPath = resolveDenyHookSynthesisDbPath()) {
++  const resolvedPath = normalizeDbPath(dbPath);
++  mkdirSync(dirname(resolvedPath), { recursive: true, mode: 0o700 });
++  const db = new DatabaseSync(resolvedPath);
++  chmodSync(resolvedPath, 0o600);
++  db.exec("PRAGMA busy_timeout = 5000");
++  db.exec(`
++    CREATE TABLE IF NOT EXISTS deny_rule_proposals (
++      repo_full_name TEXT NOT NULL,
++      id TEXT NOT NULL,
++      status TEXT NOT NULL CHECK (status IN ('proposed', 'approved', 'rejected')),
++      rule_json TEXT NOT NULL,
++      audit_json TEXT NOT NULL,
++      updated_at TEXT NOT NULL,
++      PRIMARY KEY (repo_full_name, id)
++    )
++  `);
++
++  const upsertStatement = db.prepare(`
++    INSERT INTO deny_rule_proposals (repo_full_name, id, status, rule_json, audit_json, updated_at)
++    VALUES (?, ?, ?, ?, ?, ?)
++    ON CONFLICT(repo_full_name, id) DO UPDATE SET
++      status = excluded.status,
++      rule_json = excluded.rule_json,
++      audit_json = excluded.audit_json,
++      updated_at = excluded.updated_at
++  `);
++  const getStatusStatement = db.prepare(
++    "SELECT status FROM deny_rule_proposals WHERE repo_full_name = ? AND id = ?",
++  );
++  const listStatement = db.prepare(
++    "SELECT repo_full_name, id, status, rule_json, audit_json, updated_at FROM deny_rule_proposals WHERE repo_full_name = ? ORDER BY id ASC",
++  );
++  const setStatusStatement = db.prepare(`
++    UPDATE deny_rule_proposals SET status = ?, updated_at = ? WHERE repo_full_name = ? AND id = ?
++  `);
++
++  return {
++    dbPath: resolvedPath,
++    refreshProposals(repoFullName, history, config = {}) {
++      const repo = normalizeRepoFullName(repoFullName);
++      const synthesized = synthesizeDenyRuleProposals(history, config);
++      const updatedAt = new Date().toISOString();
++      db.exec("BEGIN IMMEDIATE");
++      try {
++        for (const proposal of synthesized) {
++          const existing = getStatusStatement.get(repo, proposal.id);
++          const status = existing?.status && proposalStatusSet.has(existing.status) && existing.status !== "proposed"
++            ? existing.status
++            : "proposed";
++          upsertStatement.run(
++            repo,
++            proposal.id,
++            status,
++            JSON.stringify(proposal.rule),
++            JSON.stringify(proposal.audit),
++            updatedAt,
++          );
++        }
++        db.exec("COMMIT");
++      } catch (error) {
++        db.exec("ROLLBACK");
++        throw error;
++      }
++      return listStatement.all(repo).map(rowToProposal);
++    },
++    listProposals(repoFullName) {
++      const repo = normalizeRepoFullName(repoFullName);
++      return listStatement.all(repo).map(rowToProposal);
++    },
++    setProposalStatus(repoFullName, proposalId, status) {
++      const repo = normalizeRepoFullName(repoFullName);
++      if (typeof proposalId !== "string" || !proposalId.trim()) throw new Error("invalid_proposal_id");
++      if (!proposalStatusSet.has(status)) throw new Error("invalid_proposal_status");
++      setStatusStatement.run(status, new Date().toISOString(), repo, proposalId.trim());
++    },
++    resolveEffectiveRules(repoFullName, options = {}) {
++      const proposals = this.listProposals(repoFullName);
++      return resolveEffectiveDenyRules({
++        includeDefaults: options.includeDefaults,
++        approvedProposals: proposals,
++      });
++    },
++    close() {
++      db.close();
++    },
++  };
++}
+diff --git a/test/unit/miner-deny-hook-synthesis.test.ts b/test/unit/miner-deny-hook-synthesis.test.ts
+new file mode 100644
+index 000000000..8e6db2feb
+--- /dev/null
++++ b/test/unit/miner-deny-hook-synthesis.test.ts
+@@ -0,0 +1,115 @@
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it } from "vitest";
++import {
++  DEFAULT_DENY_RULES,
++  evaluateDenyHooks,
++} from "../../packages/gittensory-miner/lib/deny-hooks.js";
++import {
++  aggregateBlockerHistory,
++  changedPathToDenyGlob,
++  initDenyHookSynthesisStore,
++  normalizeBlockerHistory,
++  resolveEffectiveDenyRules,
++  setProposalStatuses,
++  synthesizeDenyRuleProposals,
++} from "../../packages/gittensory-miner/lib/deny-hook-synthesis.js";
++
++const tempDirs: string[] = [];
++const stores: Array<{ close(): void }> = [];
++
++afterEach(() => {
++  while (stores.length > 0) stores.pop()?.close();
++  while (tempDirs.length > 0) rmSync(tempDirs.pop()!, { recursive: true, force: true });
++});
++
++function tempStore() {
++  const dir = mkdtempSync(join(tmpdir(), "miner-deny-hook-synthesis-"));
++  tempDirs.push(dir);
++  const store = initDenyHookSynthesisStore(join(dir, "deny-hook-synthesis.sqlite3"));
++  stores.push(store);
++  return store;
++}
++
++describe("synthesizeDenyRuleProposals() (#4522)", () => {
++  it("returns no proposals and empty history aggregates cleanly", () => {
++    expect(synthesizeDenyRuleProposals([])).toEqual([]);
++    expect(aggregateBlockerHistory([]).recordCount).toBe(0);
++    expect(normalizeBlockerHistory([null, {}, { blockerCodes: [] }])).toEqual([]);
++  });
++
++  it("derives a path-shaped deny rule from repeated blocker history", () => {
++    const history = [
++      { blockerCodes: ["guardrail_hold"], changedPaths: ["CHANGELOG.md"] },
++      { blockerCodes: ["guardrail_hold"], changedPaths: ["./CHANGELOG.md"] },
++      { blockerCodes: ["guardrail_hold"], guardrailMatches: ["CHANGELOG.md"] },
++    ];
++    const proposals = synthesizeDenyRuleProposals(history, { minPathOccurrences: 2 });
++    expect(proposals).toHaveLength(1);
++    expect(proposals[0]?.rule).toMatchObject({
++      matcher: "*",
++      pathPattern: "**/changelog.md",
++    });
++    expect(proposals[0]?.status).toBe("proposed");
++    expect(proposals[0]?.audit.blockerCodes).toEqual(["guardrail_hold"]);
++    expect(proposals[0]?.audit.occurrenceCount).toBe(3);
++    expect(changedPathToDenyGlob("src/Foo.ts")).toBe("**/src/foo.ts");
++  });
++
++  it("skips paths already covered by DEFAULT_DENY_RULES", () => {
++    const history = [
++      { blockerCodes: ["guardrail_hold"], changedPaths: [".github/workflows/ci.yml"] },
++      { blockerCodes: ["guardrail_hold"], changedPaths: [".github/workflows/ci.yml"] },
++    ];
++    expect(synthesizeDenyRuleProposals(history)).toEqual([]);
++  });
++
++  it("does not emit proposals below the occurrence threshold", () => {
++    const history = [{ blockerCodes: ["guardrail_hold"], changedPaths: ["docs/ONLY.md"] }];
++    expect(synthesizeDenyRuleProposals(history, { minPathOccurrences: 2 })).toEqual([]);
++  });
++});
++
++describe("resolveEffectiveDenyRules() (#4522)", () => {
++  it("falls back to static defaults when history is empty or nothing is approved", () => {
++    expect(resolveEffectiveDenyRules()).toEqual(DEFAULT_DENY_RULES);
++    const proposals = synthesizeDenyRuleProposals([
++      { blockerCodes: ["guardrail_hold"], changedPaths: ["CHANGELOG.md", "CHANGELOG.md"] },
++    ]);
++    expect(resolveEffectiveDenyRules({ approvedProposals: proposals })).toEqual(DEFAULT_DENY_RULES);
++  });
++
++  it("merges approved synthesized rules after defaults and blocks matching tool calls", () => {
++    const proposals = synthesizeDenyRuleProposals([
++      { blockerCodes: ["guardrail_hold"], changedPaths: ["CHANGELOG.md"] },
++      { blockerCodes: ["guardrail_hold"], changedPaths: ["CHANGELOG.md"] },
++    ]);
++    const approved = setProposalStatuses(proposals, { [proposals[0]!.id]: "approved" });
++    const effective = resolveEffectiveDenyRules({ approvedProposals: approved });
++    expect(effective.length).toBe(DEFAULT_DENY_RULES.length + 1);
++    const verdict = evaluateDenyHooks({ name: "Write", input: { file_path: "CHANGELOG.md" } }, effective);
++    expect(verdict.allowed).toBe(false);
++    expect(verdict.blockedBy?.pathPattern).toBe("**/changelog.md");
++  });
++});
++
++describe("initDenyHookSynthesisStore() (#4522)", () => {
++  it("refreshes proposals, preserves approval, and resolves effective rules from the store", () => {
++    const store = tempStore();
++    const history = [
++      { blockerCodes: ["guardrail_hold"], changedPaths: ["CHANGELOG.md"] },
++      { blockerCodes: ["guardrail_hold"], changedPaths: ["CHANGELOG.md"] },
++    ];
++    const refreshed = store.refreshProposals("acme/widgets", history);
++    expect(refreshed).toHaveLength(1);
++    expect(refreshed[0]?.status).toBe("proposed");
++
++    store.setProposalStatus("acme/widgets", refreshed[0]!.id, "approved");
++    const again = store.refreshProposals("acme/widgets", history);
++    expect(again.find((entry) => entry.id === refreshed[0]!.id)?.status).toBe("approved");
++
++    const effective = store.resolveEffectiveRules("acme/widgets");
++    expect(effective.length).toBe(DEFAULT_DENY_RULES.length + 1);
++  });
++});

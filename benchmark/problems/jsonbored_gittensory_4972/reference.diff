@@ -1,0 +1,1387 @@
+diff --git a/.gittensory-miner.yml.example b/.gittensory-miner.yml.example
+index 6ff294af0..e5e666f0f 100644
+--- a/.gittensory-miner.yml.example
++++ b/.gittensory-miner.yml.example
+@@ -60,3 +60,8 @@ issueDiscoveryPolicy: neutral
+ feasibilityGate:
+   enabled: true
+   suppressedReasons: []
++
++# Self-plagiarism throttle (#2345): similarity threshold for the miner's own recent open_pr fingerprints.
++# Float in [0, 1]. Default: 0.85.
++selfPlagiarism:
++  similarityThreshold: 0.85
+diff --git a/packages/gittensory-engine/src/governor/self-plagiarism.ts b/packages/gittensory-engine/src/governor/self-plagiarism.ts
+new file mode 100644
+index 000000000..4a5731613
+--- /dev/null
++++ b/packages/gittensory-engine/src/governor/self-plagiarism.ts
+@@ -0,0 +1,241 @@
++// Self-plagiarism throttle (#2345): pure classifier over a prospective PR's diff fingerprint vs the miner's own
++// recent submission history. Gates nothing on its own — the Governor open_pr chokepoint (#2340) composes this
++// verdict with rate-limit, budget caps, and non-convergence before recording to the governor ledger.
++//
++// ELECTION: reuses {@link isDuplicateClusterWinnerByClaim}'s claim-time / earliest-wins ordering so a
++// near-duplicate cluster has exactly one survivor — sparse or ambiguous timing fails closed (deny), mirroring
++// duplicate-cluster adjudication in src/signals/duplicate-winner.ts.
++//
++// DETECTOR ONLY — no IO, no Date.now(), no randomness. Identical inputs always yield the identical verdict.
++
++import {
++  isDuplicateClusterWinnerByClaim,
++  resolveDuplicateClusterWinnerNumber,
++  type DuplicateClaimMember,
++} from "../duplicate-winner.js";
++import type { GovernorLedgerEventType } from "../governor-ledger.js";
++
++/** Conservative default — only very similar diff fingerprints throttle (not hard-coded at call sites). */
++export const DEFAULT_SELF_PLAGIARISM_SIMILARITY_THRESHOLD = 0.85;
++
++export type SelfPlagiarismConfig = {
++  /** Jaccard similarity in [0, 1] at/above which two fingerprints read as near-duplicates. */
++  similarityThreshold: number;
++};
++
++export const DEFAULT_SELF_PLAGIARISM_CONFIG: Readonly<SelfPlagiarismConfig> = Object.freeze({
++  similarityThreshold: DEFAULT_SELF_PLAGIARISM_SIMILARITY_THRESHOLD,
++});
++
++/** One prior submission from the miner's own history (same actor only — never cross-miner). */
++export type OwnSubmissionRecord = {
++  repoFullName: string;
++  /** Stable diff fingerprint for similarity comparison (caller-normalized token set or hash). */
++  fingerprint: string;
++  /** When the submission was recorded — election ordering signal (ISO-8601). */
++  submittedAt?: string | null | undefined;
++  pullRequestNumber?: number | null | undefined;
++  issueNumber?: number | null | undefined;
++};
++
++export type SelfPlagiarismCandidate = OwnSubmissionRecord;
++
++export type SelfPlagiarismVerdict = {
++  allowed: boolean;
++  /** Aligns with governor-ledger vocabulary: `allowed`, `throttled`, or `denied`. */
++  eventType: GovernorLedgerEventType;
++  reason: string;
++  /** Highest-similarity prior that triggered the throttle, when present. */
++  matchedSubmission?: OwnSubmissionRecord;
++  similarity?: number;
++};
++
++function normalizeThreshold(value: number): number {
++  if (!Number.isFinite(value)) return DEFAULT_SELF_PLAGIARISM_SIMILARITY_THRESHOLD;
++  return Math.min(1, Math.max(0, value));
++}
++
++function normalizeFingerprint(value: string | null | undefined): string | null {
++  if (typeof value !== "string") return null;
++  const trimmed = value.trim().toLowerCase();
++  return trimmed.length > 0 ? trimmed : null;
++}
++
++function tokenSet(fingerprint: string): Set<string> {
++  return new Set(
++    fingerprint
++      .split(/[\s:,]+/)
++      .map((token) => token.trim())
++      .filter(Boolean),
++  );
++}
++
++/** Token-set Jaccard similarity — deterministic and dependency-free for diff fingerprint comparison. */
++export function fingerprintSimilarity(left: string, right: string): number {
++  const setLeft = tokenSet(normalizeFingerprint(left) ?? "");
++  const setRight = tokenSet(normalizeFingerprint(right) ?? "");
++  if (setLeft.size === 0 && setRight.size === 0) return 1;
++  if (setLeft.size === 0 || setRight.size === 0) return 0;
++  let intersection = 0;
++  for (const token of setLeft) {
++    if (setRight.has(token)) intersection += 1;
++  }
++  const union = setLeft.size + setRight.size - intersection;
++  return intersection / union;
++}
++
++function submissionTimeMs(value: string | null | undefined): number | null {
++  if (!value) return null;
++  const parsed = Date.parse(value);
++  return Number.isFinite(parsed) ? parsed : null;
++}
++
++function asClaimMember(record: OwnSubmissionRecord): DuplicateClaimMember {
++  const number =
++    (typeof record.pullRequestNumber === "number" && Number.isFinite(record.pullRequestNumber)
++      ? record.pullRequestNumber
++      : null) ??
++    (typeof record.issueNumber === "number" && Number.isFinite(record.issueNumber) ? record.issueNumber : null) ??
++    0;
++  return { number, linkedIssueClaimedAt: record.submittedAt };
++}
++
++function buildVerdict(
++  allowed: boolean,
++  eventType: GovernorLedgerEventType,
++  reason: string,
++  matchedSubmission?: OwnSubmissionRecord,
++  similarity?: number,
++): SelfPlagiarismVerdict {
++  return {
++    allowed,
++    eventType,
++    reason,
++    ...(matchedSubmission ? { matchedSubmission } : {}),
++    ...(similarity !== undefined ? { similarity } : {}),
++  };
++}
++
++/**
++ * Compare a prospective PR fingerprint against the miner's own recent submissions. Fail closed when the
++ * candidate fingerprint or election timing is missing/ambiguous. When near-duplicates exist, only the
++ * earliest claimant wins — later submissions are throttled.
++ */
++export function selfPlagiarismCheck(
++  candidateFingerprint: SelfPlagiarismCandidate,
++  recentOwnSubmissions: readonly OwnSubmissionRecord[],
++  config: SelfPlagiarismConfig = DEFAULT_SELF_PLAGIARISM_CONFIG,
++): SelfPlagiarismVerdict {
++  const threshold = normalizeThreshold(config.similarityThreshold);
++  const candidatePrint = normalizeFingerprint(candidateFingerprint.fingerprint);
++  if (candidatePrint === null) {
++    return buildVerdict(false, "denied", "missing_candidate_fingerprint");
++  }
++  if (submissionTimeMs(candidateFingerprint.submittedAt) === null) {
++    return buildVerdict(false, "denied", "missing_candidate_submitted_at");
++  }
++
++  let bestMatch: OwnSubmissionRecord | undefined;
++  let bestSimilarity = 0;
++  const nearDuplicates: OwnSubmissionRecord[] = [];
++
++  for (const prior of recentOwnSubmissions) {
++    const priorPrint = normalizeFingerprint(prior.fingerprint);
++    if (priorPrint === null) continue;
++    const similarity = fingerprintSimilarity(candidatePrint, priorPrint);
++    if (similarity >= threshold) {
++      nearDuplicates.push(prior);
++      if (similarity > bestSimilarity) {
++        bestSimilarity = similarity;
++        bestMatch = prior;
++      }
++    }
++  }
++
++  if (nearDuplicates.length === 0) {
++    return buildVerdict(true, "allowed", "distinct_from_recent_own_submissions");
++  }
++
++  for (const prior of nearDuplicates) {
++    if (submissionTimeMs(prior.submittedAt) === null) {
++      return buildVerdict(false, "denied", "missing_prior_submitted_at");
++    }
++  }
++
++  const candidateMember = asClaimMember(candidateFingerprint);
++  const siblingMembers = nearDuplicates.map(asClaimMember);
++  if (isDuplicateClusterWinnerByClaim(candidateMember, siblingMembers)) {
++    return buildVerdict(true, "allowed", "earliest_near_duplicate_claimant");
++  }
++
++  const winner =
++    resolveDuplicateClusterWinnerNumber(candidateMember, siblingMembers) ??
++    bestMatch?.pullRequestNumber ??
++    bestMatch?.issueNumber ??
++    null;
++  const matched =
++    bestMatch ??
++    nearDuplicates.find(
++      (prior) => prior.pullRequestNumber === winner || prior.issueNumber === winner,
++    ) ??
++    nearDuplicates[0]!;
++
++  const matchedPrint = normalizeFingerprint(matched.fingerprint)!;
++  return buildVerdict(
++    false,
++    "throttled",
++    "near_duplicate_self_plagiarism",
++    matched,
++    bestSimilarity > 0 ? bestSimilarity : fingerprintSimilarity(candidatePrint, matchedPrint),
++  );
++}
++
++/** Governor-ledger row shape for an open_pr self-plagiarism decision (#2345 deliverable). */
++export function buildSelfPlagiarismGovernorLedgerEvent(
++  repoFullName: string,
++  verdict: SelfPlagiarismVerdict,
++): {
++  eventType: GovernorLedgerEventType;
++  repoFullName: string;
++  actionClass: string;
++  decision: string;
++  reason: string;
++  payload: Record<string, unknown>;
++} {
++  const matched = verdict.matchedSubmission;
++  return {
++    eventType: verdict.eventType,
++    repoFullName,
++    actionClass: "open_pr",
++    decision: verdict.allowed ? "allow" : verdict.eventType === "throttled" ? "throttle" : "deny",
++    reason: verdict.reason,
++    payload: matched
++      ? {
++          matchedRepoFullName: matched.repoFullName,
++          matchedPullRequestNumber: matched.pullRequestNumber ?? null,
++          matchedIssueNumber: matched.issueNumber ?? null,
++          matchedSubmittedAt: matched.submittedAt ?? null,
++          similarity: verdict.similarity ?? null,
++        }
++      : {},
++  };
++}
++
++/** Normalize a miner-goal-spec selfPlagiarism block (or bare threshold number) into engine config. */
++export function resolveSelfPlagiarismConfig(raw: unknown): SelfPlagiarismConfig {
++  if (raw === undefined || raw === null) return { ...DEFAULT_SELF_PLAGIARISM_CONFIG };
++  if (typeof raw === "number") {
++    return { similarityThreshold: normalizeThreshold(raw) };
++  }
++  if (typeof raw === "object" && !Array.isArray(raw)) {
++    const record = raw as Record<string, unknown>;
++    return {
++      similarityThreshold: normalizeThreshold(
++        typeof record.similarityThreshold === "number"
++          ? record.similarityThreshold
++          : DEFAULT_SELF_PLAGIARISM_SIMILARITY_THRESHOLD,
++      ),
++    };
++  }
++  return { ...DEFAULT_SELF_PLAGIARISM_CONFIG };
++}
+diff --git a/packages/gittensory-engine/src/index.ts b/packages/gittensory-engine/src/index.ts
+index b3e21244c..b6fb4a36f 100644
+--- a/packages/gittensory-engine/src/index.ts
++++ b/packages/gittensory-engine/src/index.ts
+@@ -145,6 +145,7 @@ export {
+ } from "./track-record-summary.js";
+ export * from "./governor/rate-limit.js";
+ export * from "./governor/budget-cap.js";
++export * from "./governor/self-plagiarism.js";
+ export {
+   GOVERNOR_LEDGER_EVENT_TYPES,
+   normalizeGovernorLedgerEvent,
+diff --git a/packages/gittensory-engine/src/miner-goal-spec.ts b/packages/gittensory-engine/src/miner-goal-spec.ts
+index 82b14103e..57d26ea03 100644
+--- a/packages/gittensory-engine/src/miner-goal-spec.ts
++++ b/packages/gittensory-engine/src/miner-goal-spec.ts
+@@ -1,5 +1,10 @@
+ import { parse as parseYaml } from "yaml";
+ 
++import {
++  DEFAULT_SELF_PLAGIARISM_SIMILARITY_THRESHOLD,
++  resolveSelfPlagiarismConfig,
++} from "./governor/self-plagiarism.js";
++
+ // MinerGoalSpec (#2293 / #2301). The type surface for `.gittensory-miner.yml` — the per-repo config a
+ // maintainer/repo-owner drops in to tell an autonomous miner what to look for and how to behave when targeting
+ // their repo. This is the MINER-side analogue of the review-side `.gittensory.yml` focus manifest (see
+@@ -23,6 +28,12 @@ export type FeasibilityGatePolicy = {
+   suppressedReasons: readonly string[];
+ };
+ 
++/** Per-repo self-plagiarism throttle tuning for Governor open_pr (#2345). */
++export type SelfPlagiarismPolicy = {
++  /** Jaccard similarity threshold in [0, 1] for near-duplicate diff fingerprints. Default: 0.85. */
++  similarityThreshold: number;
++};
++
+ /** Per-repo miner configuration parsed from `.gittensory-miner.yml`. See {@link DEFAULT_MINER_GOAL_SPEC}. */
+ export type MinerGoalSpec = {
+   /**
+@@ -67,6 +78,10 @@ export type MinerGoalSpec = {
+    * Default: { enabled: true, suppressedReasons: [] }.
+    */
+   feasibilityGate: FeasibilityGatePolicy;
++  /**
++   * Self-plagiarism throttle consulted before open_pr (#2345). Default: { similarityThreshold: 0.85 }.
++   */
++  selfPlagiarism: SelfPlagiarismPolicy;
+ };
+ 
+ /** The tolerant parser result for `.gittensory-miner.yml`: the normalized spec plus parse warnings and whether the
+@@ -96,6 +111,7 @@ export const DEFAULT_MINER_GOAL_SPEC: Readonly<MinerGoalSpec> = Object.freeze({
+   maxConcurrentClaims: 1,
+   issueDiscoveryPolicy: "neutral",
+   feasibilityGate: Object.freeze({ enabled: true, suppressedReasons: Object.freeze([]) }),
++  selfPlagiarism: Object.freeze({ similarityThreshold: DEFAULT_SELF_PLAGIARISM_SIMILARITY_THRESHOLD }),
+ });
+ 
+ const MAX_MINER_GOAL_SPEC_BYTES = 32_768;
+@@ -113,6 +129,7 @@ function cloneDefaultMinerGoalSpec(): MinerGoalSpec {
+       enabled: DEFAULT_MINER_GOAL_SPEC.feasibilityGate.enabled,
+       suppressedReasons: [...DEFAULT_MINER_GOAL_SPEC.feasibilityGate.suppressedReasons],
+     },
++    selfPlagiarism: { ...DEFAULT_MINER_GOAL_SPEC.selfPlagiarism },
+   };
+ }
+ 
+@@ -190,6 +207,31 @@ function normalizeFeasibilityGatePolicy(
+   };
+ }
+ 
++function normalizeSelfPlagiarismPolicy(
++  value: unknown,
++  field: string,
++  fallback: SelfPlagiarismPolicy,
++  warnings: string[],
++): SelfPlagiarismPolicy {
++  if (value === undefined || value === null) return fallback;
++  if (typeof value !== "object" || Array.isArray(value)) {
++    warnings.push(`MinerGoalSpec field "${field}" must be a mapping; falling back to defaults.`);
++    return fallback;
++  }
++  const resolved = resolveSelfPlagiarismConfig(value);
++  const record = value as Record<string, unknown>;
++  if (
++    record.similarityThreshold !== undefined &&
++    typeof record.similarityThreshold !== "number"
++  ) {
++    warnings.push(
++      `MinerGoalSpec field "${field}.similarityThreshold" must be a number; falling back to ${fallback.similarityThreshold}.`,
++    );
++    return fallback;
++  }
++  return resolved;
++}
++
+ function normalizePositiveInteger(value: unknown, field: string, fallback: number, warnings: string[]): number {
+   if (value === undefined || value === null) return fallback;
+   if (typeof value !== "number" || !Number.isFinite(value)) {
+@@ -224,7 +266,8 @@ function hasConfiguredGoalFields(spec: MinerGoalSpec): boolean {
+     spec.maxConcurrentClaims !== DEFAULT_MINER_GOAL_SPEC.maxConcurrentClaims ||
+     spec.issueDiscoveryPolicy !== DEFAULT_MINER_GOAL_SPEC.issueDiscoveryPolicy ||
+     spec.feasibilityGate.enabled !== DEFAULT_MINER_GOAL_SPEC.feasibilityGate.enabled ||
+-    spec.feasibilityGate.suppressedReasons.length > 0
++    spec.feasibilityGate.suppressedReasons.length > 0 ||
++    spec.selfPlagiarism.similarityThreshold !== DEFAULT_MINER_GOAL_SPEC.selfPlagiarism.similarityThreshold
+   );
+ }
+ 
+@@ -271,6 +314,12 @@ export function parseMinerGoalSpec(raw: unknown): ParsedMinerGoalSpec {
+       DEFAULT_MINER_GOAL_SPEC.feasibilityGate,
+       warnings,
+     ),
++    selfPlagiarism: normalizeSelfPlagiarismPolicy(
++      record.selfPlagiarism,
++      "selfPlagiarism",
++      DEFAULT_MINER_GOAL_SPEC.selfPlagiarism,
++      warnings,
++    ),
+   };
+   if (!hasConfiguredGoalFields(spec)) {
+     warnings.push("MinerGoalSpec contained no recognized non-default goal fields; falling back to safe defaults.");
+diff --git a/packages/gittensory-engine/test/miner-goal-spec-parser.test.ts b/packages/gittensory-engine/test/miner-goal-spec-parser.test.ts
+index f8e230767..68873ac2f 100644
+--- a/packages/gittensory-engine/test/miner-goal-spec-parser.test.ts
++++ b/packages/gittensory-engine/test/miner-goal-spec-parser.test.ts
+@@ -47,6 +47,7 @@ test("parseMinerGoalSpec: valid raw config normalizes every field and keeps non-
+     maxConcurrentClaims: 2,
+     issueDiscoveryPolicy: "encouraged",
+     feasibilityGate: { enabled: false, suppressedReasons: ["duplicate_cluster_high"] },
++    selfPlagiarism: { similarityThreshold: 0.85 },
+   });
+   assert.deepEqual(parsed.warnings, []);
+ });
+@@ -155,6 +156,7 @@ test("parseMinerGoalSpec: malformed fields fall back independently with targeted
+     maxConcurrentClaims: 1,
+     issueDiscoveryPolicy: "neutral",
+     feasibilityGate: { enabled: true, suppressedReasons: [] },
++    selfPlagiarism: { similarityThreshold: 0.85 },
+   });
+   const warningText = parsed.warnings.join(" ");
+   assert.match(warningText, /minerEnabled/i);
+@@ -183,6 +185,7 @@ test("parseMinerGoalSpec: unknown-only or default-only content stays absent with
+     maxConcurrentClaims: 1,
+     issueDiscoveryPolicy: "neutral",
+     feasibilityGate: { enabled: true, suppressedReasons: [] },
++    selfPlagiarism: { similarityThreshold: 0.85 },
+   });
+   assert.equal(explicitDefaults.present, false);
+   assert.deepEqual(explicitDefaults.spec, DEFAULT_MINER_GOAL_SPEC);
+diff --git a/packages/gittensory-engine/test/miner-goal-spec.test.ts b/packages/gittensory-engine/test/miner-goal-spec.test.ts
+index b4b7d5d89..6f305229c 100644
+--- a/packages/gittensory-engine/test/miner-goal-spec.test.ts
++++ b/packages/gittensory-engine/test/miner-goal-spec.test.ts
+@@ -20,6 +20,7 @@ test("DEFAULT_MINER_GOAL_SPEC carries the documented safe defaults", () => {
+     maxConcurrentClaims: 1,
+     issueDiscoveryPolicy: "neutral",
+     feasibilityGate: { enabled: true, suppressedReasons: [] },
++    selfPlagiarism: Object.freeze({ similarityThreshold: 0.85 }),
+   });
+ });
+ 
+@@ -31,6 +32,7 @@ test("DEFAULT_MINER_GOAL_SPEC is deep-frozen so the shared singleton can't be mu
+   assert.ok(Object.isFrozen(DEFAULT_MINER_GOAL_SPEC.blockedLabels));
+   assert.ok(Object.isFrozen(DEFAULT_MINER_GOAL_SPEC.feasibilityGate));
+   assert.ok(Object.isFrozen(DEFAULT_MINER_GOAL_SPEC.feasibilityGate.suppressedReasons));
++  assert.ok(Object.isFrozen(DEFAULT_MINER_GOAL_SPEC.selfPlagiarism));
+ });
+ 
+ test("DEFAULT_MINER_GOAL_SPEC exposes exactly the specified field surface", () => {
+@@ -42,6 +44,7 @@ test("DEFAULT_MINER_GOAL_SPEC exposes exactly the specified field surface", () =
+     "maxConcurrentClaims",
+     "minerEnabled",
+     "preferredLabels",
++    "selfPlagiarism",
+     "wantedPaths",
+   ]);
+ });
+diff --git a/packages/gittensory-engine/test/self-plagiarism.test.ts b/packages/gittensory-engine/test/self-plagiarism.test.ts
+new file mode 100644
+index 000000000..e4057b0b2
+--- /dev/null
++++ b/packages/gittensory-engine/test/self-plagiarism.test.ts
+@@ -0,0 +1,129 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++
++import {
++  buildSelfPlagiarismGovernorLedgerEvent,
++  DEFAULT_SELF_PLAGIARISM_SIMILARITY_THRESHOLD,
++  fingerprintSimilarity,
++  resolveSelfPlagiarismConfig,
++  selfPlagiarismCheck,
++  type OwnSubmissionRecord,
++} from "../dist/index.js";
++
++const CANDIDATE_AT = "2026-07-10T12:00:00.000Z";
++
++function candidate(overrides: Partial<OwnSubmissionRecord> = {}): OwnSubmissionRecord {
++  return {
++    repoFullName: "acme/widgets",
++    fingerprint: "alpha beta gamma",
++    submittedAt: CANDIDATE_AT,
++    pullRequestNumber: 200,
++    ...overrides,
++  };
++}
++
++function prior(overrides: Partial<OwnSubmissionRecord> = {}): OwnSubmissionRecord {
++  return {
++    repoFullName: "acme/other",
++    fingerprint: "totally different tokens",
++    submittedAt: "2026-07-09T12:00:00.000Z",
++    pullRequestNumber: 100,
++    ...overrides,
++  };
++}
++
++test("barrel: the public entrypoint re-exports the self-plagiarism governor API (#2345)", () => {
++  assert.equal(typeof selfPlagiarismCheck, "function");
++  assert.equal(typeof fingerprintSimilarity, "function");
++  assert.equal(typeof buildSelfPlagiarismGovernorLedgerEvent, "function");
++  assert.equal(typeof resolveSelfPlagiarismConfig, "function");
++  assert.equal(DEFAULT_SELF_PLAGIARISM_SIMILARITY_THRESHOLD, 0.85);
++});
++
++test("selfPlagiarismCheck: allows a genuinely distinct PR against recent own submissions", () => {
++  const verdict = selfPlagiarismCheck(candidate(), [prior()]);
++  assert.equal(verdict.allowed, true);
++  assert.equal(verdict.eventType, "allowed");
++  assert.equal(verdict.reason, "distinct_from_recent_own_submissions");
++});
++
++test("selfPlagiarismCheck: throttles a near-duplicate diff across repos when the prior claimed first", () => {
++  const shared = "fix null pointer in handler cleanup path shared";
++  const verdict = selfPlagiarismCheck(
++    candidate({ repoFullName: "acme/repo-b", fingerprint: shared, pullRequestNumber: 201 }),
++    [
++      prior({
++        repoFullName: "acme/repo-a",
++        fingerprint: `${shared} extra`,
++        submittedAt: "2026-07-10T11:00:00.000Z",
++        pullRequestNumber: 55,
++      }),
++    ],
++    { similarityThreshold: 0.85 },
++  );
++  assert.equal(verdict.allowed, false);
++  assert.equal(verdict.eventType, "throttled");
++  assert.equal(verdict.reason, "near_duplicate_self_plagiarism");
++  assert.equal(verdict.matchedSubmission?.repoFullName, "acme/repo-a");
++});
++
++test("selfPlagiarismCheck: fails closed on missing or ambiguous fingerprint data", () => {
++  assert.deepEqual(selfPlagiarismCheck(candidate({ fingerprint: "  " }), [prior()]), {
++    allowed: false,
++    eventType: "denied",
++    reason: "missing_candidate_fingerprint",
++  });
++  assert.deepEqual(selfPlagiarismCheck(candidate({ submittedAt: null }), [prior()]), {
++    allowed: false,
++    eventType: "denied",
++    reason: "missing_candidate_submitted_at",
++  });
++  assert.deepEqual(
++    selfPlagiarismCheck(candidate({ fingerprint: "shared diff fingerprint tokens" }), [
++      prior({ fingerprint: "shared diff fingerprint tokens", submittedAt: null }),
++    ]),
++    { allowed: false, eventType: "denied", reason: "missing_prior_submitted_at" },
++  );
++});
++
++test("selfPlagiarismCheck: allows the earliest near-duplicate claimant", () => {
++  const shared = "shared implementation patch body";
++  const verdict = selfPlagiarismCheck(
++    candidate({ fingerprint: shared, submittedAt: "2026-07-10T10:00:00.000Z", pullRequestNumber: 10 }),
++    [
++      prior({
++        fingerprint: shared,
++        submittedAt: "2026-07-10T11:00:00.000Z",
++        pullRequestNumber: 20,
++      }),
++    ],
++  );
++  assert.equal(verdict.allowed, true);
++  assert.equal(verdict.reason, "earliest_near_duplicate_claimant");
++});
++
++test("resolveSelfPlagiarismConfig: normalizes bare numbers and invalid shapes", () => {
++  assert.equal(resolveSelfPlagiarismConfig(0.9).similarityThreshold, 0.9);
++  assert.equal(resolveSelfPlagiarismConfig(Number.NaN).similarityThreshold, 0.85);
++  assert.equal(resolveSelfPlagiarismConfig(["not", "object"]).similarityThreshold, 0.85);
++});
++
++test("buildSelfPlagiarismGovernorLedgerEvent: records throttled open_pr with the flagged prior referenced", () => {
++  const verdict = selfPlagiarismCheck(
++    candidate({ fingerprint: "same patch tokens" }),
++    [prior({ fingerprint: "same patch tokens", pullRequestNumber: 42, repoFullName: "acme/first" })],
++  );
++  const event = buildSelfPlagiarismGovernorLedgerEvent("acme/second", verdict);
++  assert.equal(event.eventType, "throttled");
++  assert.equal(event.repoFullName, "acme/second");
++  assert.equal(event.actionClass, "open_pr");
++  assert.equal(event.decision, "throttle");
++  assert.equal(event.reason, "near_duplicate_self_plagiarism");
++  assert.equal(event.payload.matchedRepoFullName, "acme/first");
++  assert.equal(event.payload.matchedPullRequestNumber, 42);
++});
++
++test("fingerprintSimilarity: returns Jaccard overlap for token sets", () => {
++  assert.equal(fingerprintSimilarity("abc def", "ABC DEF"), 1);
++  assert.equal(fingerprintSimilarity("aa bb", "bb cc"), 1 / 3);
++});
+diff --git a/packages/gittensory-miner/docs/miner-goal-spec.md b/packages/gittensory-miner/docs/miner-goal-spec.md
+index 037bceb4d..6599ba6df 100644
+--- a/packages/gittensory-miner/docs/miner-goal-spec.md
++++ b/packages/gittensory-miner/docs/miner-goal-spec.md
+@@ -56,3 +56,9 @@ Per-repo tuning for the feasibility gate (`buildFeasibilityVerdict`) a miner con
+ 
+ - `enabled` (boolean, default: `true`) — whether the feasibility gate is consulted at all before a miner starts work.
+ - `suppressedReasons` (string list, default: `[]`) — specific avoid/raise reason codes (e.g. `duplicate_cluster_high`) this repo wants ignored.
++
++### `selfPlagiarism` (object, default: `{ similarityThreshold: 0.85 }`)
++
++Per-repo tuning for the Governor self-plagiarism throttle consulted before `open_pr` (#2345). Compares a prospective PR's diff fingerprint against the miner's own recent submission history.
++
++- `similarityThreshold` (number in `[0, 1]`, default: `0.85`) — Jaccard similarity at/above which two fingerprints read as near-duplicates across repos.
+diff --git a/packages/gittensory-miner/lib/governor-open-pr.d.ts b/packages/gittensory-miner/lib/governor-open-pr.d.ts
+new file mode 100644
+index 000000000..5e0dd9527
+--- /dev/null
++++ b/packages/gittensory-miner/lib/governor-open-pr.d.ts
+@@ -0,0 +1,21 @@
++import type {
++  OwnSubmissionRecord,
++  SelfPlagiarismCandidate,
++  SelfPlagiarismVerdict,
++} from "@jsonbored/gittensory-engine";
++import type { AppendGovernorEventInput, GovernorLedgerEntry } from "./governor-ledger.js";
++
++export type EvaluateOpenPrSelfPlagiarismInput = {
++  candidate: SelfPlagiarismCandidate;
++  recentOwnSubmissions?: readonly OwnSubmissionRecord[];
++  selfPlagiarismConfig?: unknown;
++};
++
++export type EvaluateOpenPrSelfPlagiarismOptions = {
++  append?: (event: AppendGovernorEventInput) => GovernorLedgerEntry;
++};
++
++export function evaluateOpenPrSelfPlagiarism(
++  input: EvaluateOpenPrSelfPlagiarismInput,
++  options?: EvaluateOpenPrSelfPlagiarismOptions,
++): { verdict: SelfPlagiarismVerdict; recorded: GovernorLedgerEntry };
+diff --git a/packages/gittensory-miner/lib/governor-open-pr.js b/packages/gittensory-miner/lib/governor-open-pr.js
+new file mode 100644
+index 000000000..15a20cb0a
+--- /dev/null
++++ b/packages/gittensory-miner/lib/governor-open-pr.js
+@@ -0,0 +1,27 @@
++// Governor open_pr self-plagiarism gate (#2345). Consults the engine's pure selfPlagiarismCheck before an open_pr
++// write is allowed and records throttled/denied outcomes to the append-only governor ledger.
++
++import {
++  buildSelfPlagiarismGovernorLedgerEvent,
++  resolveSelfPlagiarismConfig,
++  selfPlagiarismCheck,
++} from "@jsonbored/gittensory-engine";
++import { appendGovernorEvent } from "./governor-ledger.js";
++
++/**
++ * Run the self-plagiarism throttle for a prospective open_pr and persist the governor decision.
++ *
++ * @param {object} input
++ * @param {import("@jsonbored/gittensory-engine").SelfPlagiarismCandidate} input.candidate
++ * @param {readonly import("@jsonbored/gittensory-engine").OwnSubmissionRecord[]} input.recentOwnSubmissions
++ * @param {unknown} [input.selfPlagiarismConfig] parsed `.gittensory-miner.yml` selfPlagiarism block
++ * @param {{ append?: typeof appendGovernorEvent }} [options]
++ */
++export function evaluateOpenPrSelfPlagiarism(input, options = {}) {
++  const append = options.append ?? appendGovernorEvent;
++  const config = resolveSelfPlagiarismConfig(input.selfPlagiarismConfig);
++  const verdict = selfPlagiarismCheck(input.candidate, input.recentOwnSubmissions ?? [], config);
++  const ledgerEvent = buildSelfPlagiarismGovernorLedgerEvent(input.candidate.repoFullName, verdict);
++  const recorded = append(ledgerEvent);
++  return { verdict, recorded };
++}
+diff --git a/packages/gittensory-miner/package.json b/packages/gittensory-miner/package.json
+index 09bd7bf88..dfd1c4667 100644
+--- a/packages/gittensory-miner/package.json
++++ b/packages/gittensory-miner/package.json
+@@ -32,7 +32,7 @@
+     "expected-engine.version"
+   ],
+   "scripts": {
+-    "build": "node --check bin/gittensory-miner.js && node --check lib/version.js && node --check lib/local-store.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/run-state-cli.js && node --check lib/update-check.js && node --check lib/worktree-allocator.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/event-ledger-cli.js && node --check lib/claim-ledger.js && node --check lib/claim-ledger-expiry.js && node --check lib/claim-ledger-cli.js && node --check lib/claim-adjudication.js && node --check lib/portfolio-queue.js && node --check lib/portfolio-queue-cli.js && node --check lib/portfolio-queue-manager.js && node --check lib/portfolio-discovery.js && node --check lib/opportunity-ranker.js && node --check lib/plan-store.js && node --check lib/plan-store-cli.js && node --check lib/rejection-templates.js && node --check lib/governor-ledger.js && node --check lib/governor-ledger-cli.js && node --check lib/attempt-log.js && node --check lib/manage-status.js && node --check lib/manage-poll.js && node --check lib/status.js && node --check lib/laptop-init.js && node --check lib/replay-objective-anchor.js && node --check lib/replay-task-generation.js && node --check lib/calibration-types.js && node --check lib/calibration.js"
++    "build": "node --check bin/gittensory-miner.js && node --check lib/version.js && node --check lib/local-store.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/run-state-cli.js && node --check lib/update-check.js && node --check lib/worktree-allocator.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/event-ledger-cli.js && node --check lib/claim-ledger.js && node --check lib/claim-ledger-expiry.js && node --check lib/claim-ledger-cli.js && node --check lib/claim-adjudication.js && node --check lib/portfolio-queue.js && node --check lib/portfolio-queue-cli.js && node --check lib/portfolio-queue-manager.js && node --check lib/portfolio-discovery.js && node --check lib/opportunity-ranker.js && node --check lib/plan-store.js && node --check lib/plan-store-cli.js && node --check lib/rejection-templates.js && node --check lib/governor-ledger.js && node --check lib/governor-ledger-cli.js && node --check lib/governor-open-pr.js && node --check lib/attempt-log.js && node --check lib/manage-status.js && node --check lib/manage-poll.js && node --check lib/status.js && node --check lib/laptop-init.js && node --check lib/replay-objective-anchor.js && node --check lib/replay-task-generation.js && node --check lib/calibration-types.js && node --check lib/calibration.js"
+   },
+   "dependencies": {
+     "@jsonbored/gittensory-engine": ">=0.1.0 <1.0.0"
+diff --git a/packages/gittensory-miner/schema/miner-goal-spec.schema.json b/packages/gittensory-miner/schema/miner-goal-spec.schema.json
+index 915b79645..5f8a75f91 100644
+--- a/packages/gittensory-miner/schema/miner-goal-spec.schema.json
++++ b/packages/gittensory-miner/schema/miner-goal-spec.schema.json
+@@ -65,6 +65,21 @@
+           "description": "buildFeasibilityVerdict avoid/raise reason codes this repo wants ignored. Default: []."
+         }
+       }
++    },
++    "selfPlagiarism": {
++      "type": "object",
++      "additionalProperties": true,
++      "default": { "similarityThreshold": 0.85 },
++      "description": "Self-plagiarism throttle consulted before open_pr (#2345). Default: { similarityThreshold: 0.85 }.",
++      "properties": {
++        "similarityThreshold": {
++          "type": "number",
++          "minimum": 0,
++          "maximum": 1,
++          "default": 0.85,
++          "description": "Jaccard similarity threshold for near-duplicate diff fingerprints. Default: 0.85."
++        }
++      }
+     }
+   }
+ }
+diff --git a/test/unit/miner-goal-spec-doc.test.ts b/test/unit/miner-goal-spec-doc.test.ts
+index d48bc6402..01bc846bd 100644
+--- a/test/unit/miner-goal-spec-doc.test.ts
++++ b/test/unit/miner-goal-spec-doc.test.ts
+@@ -18,6 +18,7 @@ const SPEC_FIELDS = [
+   "maxConcurrentClaims",
+   "issueDiscoveryPolicy",
+   "feasibilityGate",
++  "selfPlagiarism",
+ ] as const;
+ 
+ describe("miner goal spec docs (#2300)", () => {
+@@ -55,6 +56,7 @@ describe("miner goal spec docs (#2300)", () => {
+       maxConcurrentClaims: 1,
+       issueDiscoveryPolicy: "neutral",
+       feasibilityGate: { enabled: true, suppressedReasons: [] },
++      selfPlagiarism: { similarityThreshold: 0.85 },
+     });
+     expect(parsed.warnings).toEqual([]);
+   });
+diff --git a/test/unit/miner-goal-spec-parser.test.ts b/test/unit/miner-goal-spec-parser.test.ts
+index 9a5ba1dca..6d1d35d91 100644
+--- a/test/unit/miner-goal-spec-parser.test.ts
++++ b/test/unit/miner-goal-spec-parser.test.ts
+@@ -55,6 +55,7 @@ describe("MinerGoalSpec parser (#2301)", () => {
+         maxConcurrentClaims: 2,
+         issueDiscoveryPolicy: "encouraged",
+         feasibilityGate: { enabled: false, suppressedReasons: ["duplicate_cluster_high"] },
++        selfPlagiarism: { similarityThreshold: 0.85 },
+       },
+       warnings: ['MinerGoalSpec field "blockedPaths" truncated an over-long entry.'],
+     });
+@@ -147,6 +148,7 @@ describe("MinerGoalSpec parser (#2301)", () => {
+         maxConcurrentClaims: 1,
+         issueDiscoveryPolicy: "neutral",
+         feasibilityGate: { enabled: true, suppressedReasons: [] },
++        selfPlagiarism: { similarityThreshold: 0.85 },
+       },
+       warnings: expect.arrayContaining([
+         expect.stringMatching(/minerEnabled/i),
+@@ -199,6 +201,25 @@ describe("MinerGoalSpec parser (#2301)", () => {
+     expect(suppressedOnly.spec.feasibilityGate).toEqual({ enabled: true, suppressedReasons: ["issue_missing"] });
+   });
+ 
++  it("a selfPlagiarism policy alone (all other fields default) marks the spec present", () => {
++    const parsed = parseMinerGoalSpec({ selfPlagiarism: { similarityThreshold: 0.9 } });
++    expect(parsed.present).toBe(true);
++    expect(parsed.spec.selfPlagiarism).toEqual({ similarityThreshold: 0.9 });
++  });
++
++  it("normalizes nested selfPlagiarism sub-fields and rejects a non-mapping value", () => {
++    const malformed = parseMinerGoalSpec({
++      wantedPaths: ["src/**"],
++      selfPlagiarism: { similarityThreshold: "not-a-number" },
++    });
++    expect(malformed.spec.selfPlagiarism).toEqual({ similarityThreshold: 0.85 });
++    expect(malformed.warnings.join(" ")).toMatch(/selfPlagiarism\.similarityThreshold/i);
++
++    const arrayValue = parseMinerGoalSpec({ wantedPaths: ["src/**"], selfPlagiarism: ["not", "a", "mapping"] });
++    expect(arrayValue.spec.selfPlagiarism).toEqual({ similarityThreshold: 0.85 });
++    expect(arrayValue.warnings.join(" ")).toMatch(/selfPlagiarism.*must be a mapping/i);
++  });
++
+   it("rejects claim counts below one after flooring", () => {
+     const parsed = parseMinerGoalSpec({
+       wantedPaths: ["src/**"],
+@@ -227,6 +248,7 @@ describe("MinerGoalSpec parser (#2301)", () => {
+         maxConcurrentClaims: 1,
+         issueDiscoveryPolicy: "neutral",
+         feasibilityGate: { enabled: true, suppressedReasons: [] },
++        selfPlagiarism: { similarityThreshold: 0.85 },
+       }),
+     ).toEqual({
+       present: false,
+diff --git a/test/unit/miner-governor-open-pr.test.ts b/test/unit/miner-governor-open-pr.test.ts
+new file mode 100644
+index 000000000..bc5dac4ef
+--- /dev/null
++++ b/test/unit/miner-governor-open-pr.test.ts
+@@ -0,0 +1,89 @@
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("@jsonbored/gittensory-engine", async () => {
++  return import("../../packages/gittensory-engine/src/index");
++});
++
++import { evaluateOpenPrSelfPlagiarism } from "../../packages/gittensory-miner/lib/governor-open-pr.js";
++import { initGovernorLedger } from "../../packages/gittensory-miner/lib/governor-ledger.js";
++
++const roots: string[] = [];
++const ledgers: Array<{ close(): void }> = [];
++
++afterEach(() => {
++  for (const ledger of ledgers.splice(0)) ledger.close();
++  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
++});
++
++describe("evaluateOpenPrSelfPlagiarism (#2345)", () => {
++  it("records a throttled open_pr denial to the governor ledger with the matched prior submission", () => {
++    const root = mkdtempSync(join(tmpdir(), "gittensory-miner-governor-open-pr-"));
++    roots.push(root);
++    const ledger = initGovernorLedger(join(root, "governor-ledger.sqlite3"));
++    ledgers.push(ledger);
++
++    const shared = "shared diff fingerprint for throttle test";
++    const { verdict, recorded } = evaluateOpenPrSelfPlagiarism(
++      {
++        candidate: {
++          repoFullName: "acme/repo-b",
++          fingerprint: shared,
++          submittedAt: "2026-07-10T12:00:00.000Z",
++          pullRequestNumber: 20,
++        },
++        recentOwnSubmissions: [
++          {
++            repoFullName: "acme/repo-a",
++            fingerprint: shared,
++            submittedAt: "2026-07-10T11:00:00.000Z",
++            pullRequestNumber: 10,
++          },
++        ],
++        selfPlagiarismConfig: { similarityThreshold: 0.85 },
++      },
++      { append: (event) => ledger.appendGovernorEvent(event) },
++    );
++
++    expect(verdict.allowed).toBe(false);
++    expect(recorded.eventType).toBe("throttled");
++    expect(recorded.actionClass).toBe("open_pr");
++    expect(recorded.payload).toMatchObject({
++      matchedRepoFullName: "acme/repo-a",
++      matchedPullRequestNumber: 10,
++    });
++  });
++
++  it("accepts a bare numeric selfPlagiarismConfig threshold", () => {
++    const root = mkdtempSync(join(tmpdir(), "gittensory-miner-governor-open-pr-num-"));
++    roots.push(root);
++    const ledger = initGovernorLedger(join(root, "governor-ledger.sqlite3"));
++    ledgers.push(ledger);
++
++    const shared = "numeric threshold config fingerprint";
++    const { verdict } = evaluateOpenPrSelfPlagiarism(
++      {
++        candidate: {
++          repoFullName: "acme/repo-b",
++          fingerprint: shared,
++          submittedAt: "2026-07-10T12:00:00.000Z",
++          pullRequestNumber: 20,
++        },
++        recentOwnSubmissions: [
++          {
++            repoFullName: "acme/repo-a",
++            fingerprint: shared,
++            submittedAt: "2026-07-10T11:00:00.000Z",
++            pullRequestNumber: 10,
++          },
++        ],
++        selfPlagiarismConfig: 0.85,
++      },
++      { append: (event) => ledger.appendGovernorEvent(event) },
++    );
++
++    expect(verdict.eventType).toBe("throttled");
++  });
++});
+diff --git a/test/unit/miner-opportunity-ranker.test.ts b/test/unit/miner-opportunity-ranker.test.ts
+index 4cb9e8e35..a24e03cc3 100644
+--- a/test/unit/miner-opportunity-ranker.test.ts
++++ b/test/unit/miner-opportunity-ranker.test.ts
+@@ -8,6 +8,7 @@ import {
+   rankCandidateIssues,
+   rankCandidateIssuesWithSummary,
+ } from "../../packages/gittensory-miner/lib/opportunity-ranker.js";
++import { DEFAULT_MINER_GOAL_SPEC } from "../../packages/gittensory-engine/src/miner-goal-spec";
+ 
+ const NOW = Date.parse("2026-07-03T12:00:00.000Z");
+ 
+@@ -135,14 +136,9 @@ describe("rankCandidateIssues (#2302 follow-up)", () => {
+       nowMs: NOW,
+       goalSpecsByRepo: {
+         "other/repo": {
+-          minerEnabled: true,
+-          wantedPaths: [],
+-          blockedPaths: [],
++          ...DEFAULT_MINER_GOAL_SPEC,
+           preferredLabels: ["feature"],
+-          blockedLabels: [],
+           maxConcurrentClaims: 2,
+-          issueDiscoveryPolicy: "neutral",
+-          feasibilityGate: { enabled: true, suppressedReasons: [] },
+         },
+       },
+     });
+@@ -154,14 +150,9 @@ describe("rankCandidateIssues (#2302 follow-up)", () => {
+       nowMs: NOW,
+       goalSpecsByRepo: {
+         "acme/widgets": {
+-          minerEnabled: true,
+-          wantedPaths: [],
+-          blockedPaths: [],
++          ...DEFAULT_MINER_GOAL_SPEC,
+           preferredLabels: ["help wanted"],
+-          blockedLabels: [],
+           maxConcurrentClaims: 2,
+-          issueDiscoveryPolicy: "neutral",
+-          feasibilityGate: { enabled: true, suppressedReasons: [] },
+         },
+       },
+     });
+@@ -212,14 +203,9 @@ describe("rankCandidateIssues (#2302 follow-up)", () => {
+         nowMs: NOW,
+         goalSpecsByRepo: {
+           "acme/widgets": {
+-            minerEnabled: true,
+-            wantedPaths: [],
+-            blockedPaths: [],
++            ...DEFAULT_MINER_GOAL_SPEC,
+             preferredLabels: ["documentation"],
+-            blockedLabels: [],
+             maxConcurrentClaims: 2,
+-            issueDiscoveryPolicy: "neutral",
+-            feasibilityGate: { enabled: true, suppressedReasons: [] },
+           },
+         },
+       },
+diff --git a/test/unit/opportunity-branch-internals.test.ts b/test/unit/opportunity-branch-internals.test.ts
+index d337726d5..f23e5be86 100644
+--- a/test/unit/opportunity-branch-internals.test.ts
++++ b/test/unit/opportunity-branch-internals.test.ts
+@@ -66,14 +66,9 @@ describe("opportunity branch internals", () => {
+         goalSpecsByRepo: {
+           "other/repo": DEFAULT_MINER_GOAL_SPEC,
+           "ACME/Widgets": {
+-            minerEnabled: true,
+-            wantedPaths: [],
+-            blockedPaths: [],
++            ...DEFAULT_MINER_GOAL_SPEC,
+             preferredLabels: ["feature"],
+-            blockedLabels: [],
+-            maxConcurrentClaims: 1,
+             issueDiscoveryPolicy: "encouraged",
+-            feasibilityGate: { enabled: true, suppressedReasons: [] },
+           },
+         },
+       }).preferredLabels,
+diff --git a/test/unit/opportunity-metadata-signals.test.ts b/test/unit/opportunity-metadata-signals.test.ts
+index 4c70f7ebb..99cb7b85d 100644
+--- a/test/unit/opportunity-metadata-signals.test.ts
++++ b/test/unit/opportunity-metadata-signals.test.ts
+@@ -59,14 +59,9 @@ describe("opportunity metadata signals", () => {
+         nowMs: NOW,
+         goalSpecsByRepo: {
+           "ACME/Widgets": {
+-            minerEnabled: true,
+-            wantedPaths: [],
+-            blockedPaths: [],
++            ...DEFAULT_MINER_GOAL_SPEC,
+             preferredLabels: ["feature"],
+-            blockedLabels: [],
+-            maxConcurrentClaims: 1,
+             issueDiscoveryPolicy: "encouraged",
+-            feasibilityGate: { enabled: true, suppressedReasons: [] },
+           },
+         },
+       },
+diff --git a/test/unit/self-plagiarism.test.ts b/test/unit/self-plagiarism.test.ts
+new file mode 100644
+index 000000000..34d8014e1
+--- /dev/null
++++ b/test/unit/self-plagiarism.test.ts
+@@ -0,0 +1,426 @@
++import { describe, expect, it, vi } from "vitest";
++import * as duplicateWinner from "../../packages/gittensory-engine/src/duplicate-winner";
++import {
++  buildSelfPlagiarismGovernorLedgerEvent,
++  DEFAULT_SELF_PLAGIARISM_CONFIG,
++  DEFAULT_SELF_PLAGIARISM_SIMILARITY_THRESHOLD,
++  fingerprintSimilarity,
++  resolveSelfPlagiarismConfig,
++  selfPlagiarismCheck,
++  type OwnSubmissionRecord,
++} from "../../packages/gittensory-engine/src/governor/self-plagiarism";
++
++const CANDIDATE_AT = "2026-07-10T12:00:00.000Z";
++
++function candidate(overrides: Partial<OwnSubmissionRecord> = {}): OwnSubmissionRecord {
++  return {
++    repoFullName: "acme/widgets",
++    fingerprint: "alpha beta gamma",
++    submittedAt: CANDIDATE_AT,
++    pullRequestNumber: 200,
++    ...overrides,
++  };
++}
++
++function prior(overrides: Partial<OwnSubmissionRecord> = {}): OwnSubmissionRecord {
++  return {
++    repoFullName: "acme/other",
++    fingerprint: "totally different tokens",
++    submittedAt: "2026-07-09T12:00:00.000Z",
++    pullRequestNumber: 100,
++    ...overrides,
++  };
++}
++
++describe("fingerprintSimilarity", () => {
++  it("returns 1 for identical normalized fingerprints", () => {
++    expect(fingerprintSimilarity("abc def", "ABC DEF")).toBe(1);
++  });
++
++  it("returns 0 when either fingerprint token set is empty", () => {
++    expect(fingerprintSimilarity("", "abc")).toBe(0);
++    expect(fingerprintSimilarity("abc", "   ")).toBe(0);
++  });
++
++  it("returns 1 when both normalized token sets are empty", () => {
++    expect(fingerprintSimilarity("   ", "  ")).toBe(1);
++  });
++
++  it("returns partial Jaccard overlap for overlapping token sets", () => {
++    expect(fingerprintSimilarity("aa bb", "bb cc")).toBeCloseTo(1 / 3);
++  });
++});
++
++describe("resolveSelfPlagiarismConfig", () => {
++  it("returns defaults for nullish and invalid top-level shapes", () => {
++    expect(resolveSelfPlagiarismConfig(undefined)).toEqual({ ...DEFAULT_SELF_PLAGIARISM_CONFIG });
++    expect(resolveSelfPlagiarismConfig(null)).toEqual({ ...DEFAULT_SELF_PLAGIARISM_CONFIG });
++    expect(resolveSelfPlagiarismConfig(["not", "object"])).toEqual({ ...DEFAULT_SELF_PLAGIARISM_CONFIG });
++    expect(resolveSelfPlagiarismConfig("0.9")).toEqual({ ...DEFAULT_SELF_PLAGIARISM_CONFIG });
++  });
++
++  it("accepts a bare numeric threshold and normalizes it", () => {
++    expect(resolveSelfPlagiarismConfig(0.9).similarityThreshold).toBe(0.9);
++    expect(resolveSelfPlagiarismConfig(Number.NaN).similarityThreshold).toBe(0.85);
++    expect(resolveSelfPlagiarismConfig(2).similarityThreshold).toBe(1);
++    expect(resolveSelfPlagiarismConfig(-1).similarityThreshold).toBe(0);
++  });
++
++  it("reads similarityThreshold from an object or falls back to default when absent", () => {
++    expect(resolveSelfPlagiarismConfig({ similarityThreshold: 0.7 }).similarityThreshold).toBe(0.7);
++    expect(resolveSelfPlagiarismConfig({}).similarityThreshold).toBe(0.85);
++  });
++});
++
++describe("selfPlagiarismCheck (#2345)", () => {
++  it("allows a genuinely distinct PR against recent own submissions", () => {
++    const verdict = selfPlagiarismCheck(candidate(), [prior()]);
++    expect(verdict.allowed).toBe(true);
++    expect(verdict.eventType).toBe("allowed");
++    expect(verdict.reason).toBe("distinct_from_recent_own_submissions");
++  });
++
++  it("throttles a near-duplicate diff across two different target repos when the prior claimed first", () => {
++    const shared = "fix null pointer in handler cleanup path shared";
++    const verdict = selfPlagiarismCheck(
++      candidate({ repoFullName: "acme/repo-b", fingerprint: shared, pullRequestNumber: 201 }),
++      [
++        prior({
++          repoFullName: "acme/repo-a",
++          fingerprint: `${shared} extra`,
++          submittedAt: "2026-07-10T11:00:00.000Z",
++          pullRequestNumber: 55,
++        }),
++      ],
++      { similarityThreshold: 0.85 },
++    );
++    expect(verdict.allowed).toBe(false);
++    expect(verdict.eventType).toBe("throttled");
++    expect(verdict.reason).toBe("near_duplicate_self_plagiarism");
++    expect(verdict.matchedSubmission?.repoFullName).toBe("acme/repo-a");
++    expect(verdict.similarity).toBeGreaterThanOrEqual(0.85);
++  });
++
++  it("denies when the candidate fingerprint is missing (fail closed — does not assume uniqueness)", () => {
++    const verdict = selfPlagiarismCheck(candidate({ fingerprint: "  " }), [prior()]);
++    expect(verdict).toMatchObject({ allowed: false, eventType: "denied", reason: "missing_candidate_fingerprint" });
++  });
++
++  it("denies when the candidate submittedAt is missing even if fingerprints differ", () => {
++    const verdict = selfPlagiarismCheck(candidate({ submittedAt: null }), [prior()]);
++    expect(verdict).toMatchObject({ allowed: false, eventType: "denied", reason: "missing_candidate_submitted_at" });
++  });
++
++  it("denies when a near-duplicate prior lacks submittedAt (ambiguous election timing)", () => {
++    const shared = "shared diff fingerprint tokens";
++    const verdict = selfPlagiarismCheck(candidate({ fingerprint: shared }), [
++      prior({ fingerprint: shared, submittedAt: null }),
++    ]);
++    expect(verdict).toMatchObject({ allowed: false, eventType: "denied", reason: "missing_prior_submitted_at" });
++  });
++
++  it("allows the earliest claimant when it precedes near-duplicate priors in claim-time order", () => {
++    const shared = "shared implementation patch body";
++    const verdict = selfPlagiarismCheck(
++      candidate({ fingerprint: shared, submittedAt: "2026-07-10T10:00:00.000Z", pullRequestNumber: 10 }),
++      [
++        prior({
++          fingerprint: shared,
++          submittedAt: "2026-07-10T11:00:00.000Z",
++          pullRequestNumber: 20,
++        }),
++      ],
++    );
++    expect(verdict.allowed).toBe(true);
++    expect(verdict.reason).toBe("earliest_near_duplicate_claimant");
++  });
++
++  it("uses the conservative built-in default threshold when config is omitted", () => {
++    expect(DEFAULT_SELF_PLAGIARISM_SIMILARITY_THRESHOLD).toBe(0.85);
++    const almost = "aa bb cc dd ee ff gg hh ii jj kk ll mm nn oo pp qq rr ss tt uu vv ww xx yy zz";
++    const verdict = selfPlagiarismCheck(
++      candidate({ fingerprint: almost }),
++      [prior({ fingerprint: `${almost} zz` })],
++    );
++    expect(verdict.eventType).toBe("throttled");
++  });
++
++  it("denies when the candidate fingerprint is non-string", () => {
++    const verdict = selfPlagiarismCheck(
++      candidate({ fingerprint: null as unknown as string }),
++      [prior()],
++    );
++    expect(verdict).toMatchObject({ allowed: false, eventType: "denied", reason: "missing_candidate_fingerprint" });
++  });
++
++  it("denies when the candidate submittedAt is unparsable", () => {
++    const verdict = selfPlagiarismCheck(candidate({ submittedAt: "not-a-date" }), [prior()]);
++    expect(verdict).toMatchObject({ allowed: false, eventType: "denied", reason: "missing_candidate_submitted_at" });
++  });
++
++  it("skips priors with missing fingerprints when comparing", () => {
++    const verdict = selfPlagiarismCheck(candidate(), [prior({ fingerprint: "   " }), prior()]);
++    expect(verdict.allowed).toBe(true);
++    expect(verdict.reason).toBe("distinct_from_recent_own_submissions");
++  });
++
++  it("throttles using issueNumber when pullRequestNumber is absent on the matched prior", () => {
++    const shared = "shared patch content across repos";
++    const verdict = selfPlagiarismCheck(
++      candidate({ fingerprint: shared, submittedAt: "2026-07-10T12:00:00.000Z", pullRequestNumber: 50 }),
++      [
++        prior({
++          fingerprint: shared,
++          submittedAt: "2026-07-10T11:00:00.000Z",
++          pullRequestNumber: undefined,
++          issueNumber: 99,
++        }),
++      ],
++    );
++    expect(verdict.eventType).toBe("throttled");
++    expect(verdict.matchedSubmission?.issueNumber).toBe(99);
++  });
++
++  it("throttles at similarity threshold 0 and reports zero similarity for disjoint fingerprints", () => {
++    const verdict = selfPlagiarismCheck(
++      candidate({ fingerprint: "aaa", submittedAt: CANDIDATE_AT }),
++      [prior({ fingerprint: "bbb", submittedAt: "2026-07-10T11:00:00.000Z" })],
++      { similarityThreshold: 0 },
++    );
++    expect(verdict.eventType).toBe("throttled");
++    expect(verdict.similarity).toBe(0);
++  });
++
++  it("keeps the first highest-similarity prior when scores tie", () => {
++    const shared = "identical shared tokens";
++    const verdict = selfPlagiarismCheck(
++      candidate({ fingerprint: shared, submittedAt: "2026-07-10T12:00:00.000Z" }),
++      [
++        prior({
++          repoFullName: "acme/first",
++          fingerprint: shared,
++          submittedAt: "2026-07-10T11:00:00.000Z",
++          pullRequestNumber: 1,
++        }),
++        prior({
++          repoFullName: "acme/second",
++          fingerprint: shared,
++          submittedAt: "2026-07-10T10:00:00.000Z",
++          pullRequestNumber: 2,
++        }),
++      ],
++    );
++    expect(verdict.eventType).toBe("throttled");
++    expect(verdict.matchedSubmission?.repoFullName).toBe("acme/first");
++  });
++
++  it("uses issueNumber on the candidate when pullRequestNumber is absent", () => {
++    const shared = "shared claim election tokens";
++    const verdict = selfPlagiarismCheck(
++      candidate({
++        fingerprint: shared,
++        submittedAt: "2026-07-10T12:00:00.000Z",
++        pullRequestNumber: undefined,
++        issueNumber: 88,
++      }),
++      [prior({ fingerprint: shared, submittedAt: "2026-07-10T11:00:00.000Z", issueNumber: 77 })],
++    );
++    expect(verdict.eventType).toBe("throttled");
++  });
++
++  it("falls back to bestMatch pullRequestNumber when winner resolution is ambiguous", () => {
++    const resolveSpy = vi.spyOn(duplicateWinner, "resolveDuplicateClusterWinnerNumber").mockReturnValue(null);
++    try {
++      const shared = "shared fallback winner tokens";
++      const verdict = selfPlagiarismCheck(
++        candidate({ fingerprint: shared, submittedAt: "2026-07-10T12:00:00.000Z", pullRequestNumber: 20 }),
++        [prior({ fingerprint: shared, submittedAt: "2026-07-10T11:00:00.000Z", pullRequestNumber: 10 })],
++      );
++      expect(verdict.eventType).toBe("throttled");
++      expect(verdict.matchedSubmission?.pullRequestNumber).toBe(10);
++    } finally {
++      resolveSpy.mockRestore();
++    }
++  });
++
++  it("falls back to bestMatch issueNumber when pullRequestNumber is absent and winner resolution is ambiguous", () => {
++    const resolveSpy = vi.spyOn(duplicateWinner, "resolveDuplicateClusterWinnerNumber").mockReturnValue(null);
++    try {
++      const shared = "shared issue fallback tokens";
++      const verdict = selfPlagiarismCheck(
++        candidate({ fingerprint: shared, submittedAt: "2026-07-10T12:00:00.000Z", pullRequestNumber: 20 }),
++        [
++          prior({
++            fingerprint: shared,
++            submittedAt: "2026-07-10T11:00:00.000Z",
++            pullRequestNumber: undefined,
++            issueNumber: 33,
++          }),
++        ],
++      );
++      expect(verdict.matchedSubmission?.issueNumber).toBe(33);
++    } finally {
++      resolveSpy.mockRestore();
++    }
++  });
++
++  it("falls back to the first near-duplicate when winner resolution and bestMatch are absent", () => {
++    const resolveSpy = vi.spyOn(duplicateWinner, "resolveDuplicateClusterWinnerNumber").mockReturnValue(null);
++    try {
++      const verdict = selfPlagiarismCheck(
++        candidate({ fingerprint: "aaa", submittedAt: "2026-07-10T12:00:00.000Z", pullRequestNumber: 2 }),
++        [
++          prior({
++            fingerprint: "bbb",
++            submittedAt: "2026-07-10T11:00:00.000Z",
++            pullRequestNumber: undefined,
++            issueNumber: undefined,
++          }),
++        ],
++        { similarityThreshold: 0 },
++      );
++      expect(verdict.eventType).toBe("throttled");
++      expect(verdict.matchedSubmission?.repoFullName).toBe("acme/other");
++      expect(verdict.similarity).toBe(0);
++    } finally {
++      resolveSpy.mockRestore();
++    }
++  });
++
++  it("defaults claim member number to zero when neither pull nor issue number is present", () => {
++    const shared = "claim member zero fallback";
++    const verdict = selfPlagiarismCheck(
++      candidate({
++        fingerprint: shared,
++        submittedAt: "2026-07-10T12:00:00.000Z",
++        pullRequestNumber: undefined,
++        issueNumber: undefined,
++      }),
++      [prior({ fingerprint: shared, submittedAt: "2026-07-10T11:00:00.000Z", pullRequestNumber: undefined, issueNumber: undefined })],
++    );
++    expect(verdict.eventType).toBe("throttled");
++  });
++
++  it("uses issueNumber when pullRequestNumber is non-finite", () => {
++    const shared = "non-finite pull number election";
++    const verdict = selfPlagiarismCheck(
++      candidate({
++        fingerprint: shared,
++        submittedAt: CANDIDATE_AT,
++        pullRequestNumber: Number.NaN,
++        issueNumber: 44,
++      }),
++      [
++        prior({
++          fingerprint: shared,
++          submittedAt: "2026-07-10T11:00:00.000Z",
++          pullRequestNumber: Number.NaN,
++          issueNumber: 33,
++        }),
++      ],
++    );
++    expect(verdict.eventType).toBe("throttled");
++  });
++
++  it("defaults claim member number to zero when pull and issue numbers are non-finite", () => {
++    const shared = "both non-finite numbers";
++    const verdict = selfPlagiarismCheck(
++      candidate({
++        fingerprint: shared,
++        submittedAt: CANDIDATE_AT,
++        pullRequestNumber: Number.NaN,
++        issueNumber: Number.NaN,
++      }),
++      [
++        prior({
++          fingerprint: shared,
++          submittedAt: "2026-07-10T11:00:00.000Z",
++          pullRequestNumber: Number.NaN,
++          issueNumber: Number.NaN,
++        }),
++      ],
++    );
++    expect(verdict.eventType).toBe("throttled");
++  });
++});
++
++describe("buildSelfPlagiarismGovernorLedgerEvent", () => {
++  it("records a throttled open_pr denial with the flagged prior submission referenced", () => {
++    const verdict = selfPlagiarismCheck(
++      candidate({ fingerprint: "same patch tokens" }),
++      [prior({ fingerprint: "same patch tokens", pullRequestNumber: 42, repoFullName: "acme/first" })],
++    );
++    const event = buildSelfPlagiarismGovernorLedgerEvent("acme/second", verdict);
++    expect(event).toMatchObject({
++      eventType: "throttled",
++      repoFullName: "acme/second",
++      actionClass: "open_pr",
++      decision: "throttle",
++      reason: "near_duplicate_self_plagiarism",
++      payload: {
++        matchedRepoFullName: "acme/first",
++        matchedPullRequestNumber: 42,
++      },
++    });
++  });
++
++  it("maps allowed and denied verdicts without matched payload fields", () => {
++    expect(
++      buildSelfPlagiarismGovernorLedgerEvent("acme/repo", {
++        allowed: true,
++        eventType: "allowed",
++        reason: "distinct_from_recent_own_submissions",
++      }),
++    ).toMatchObject({ decision: "allow", payload: {} });
++
++    expect(
++      buildSelfPlagiarismGovernorLedgerEvent("acme/repo", {
++        allowed: false,
++        eventType: "denied",
++        reason: "missing_candidate_fingerprint",
++      }),
++    ).toMatchObject({ decision: "deny", payload: {} });
++  });
++
++  it("nulls optional matched fields in the throttled payload", () => {
++    const verdict = selfPlagiarismCheck(
++      candidate({ fingerprint: "same tokens", submittedAt: CANDIDATE_AT }),
++      [
++        prior({
++          fingerprint: "same tokens",
++          submittedAt: "2026-07-10T11:00:00.000Z",
++          pullRequestNumber: undefined,
++          issueNumber: 7,
++        }),
++      ],
++      { similarityThreshold: 0 },
++    );
++    const event = buildSelfPlagiarismGovernorLedgerEvent("acme/target", verdict);
++    expect(event.payload).toMatchObject({
++      matchedPullRequestNumber: null,
++      matchedIssueNumber: 7,
++      matchedSubmittedAt: "2026-07-10T11:00:00.000Z",
++    });
++  });
++
++  it("nulls matchedSubmittedAt and similarity when the verdict omits them", () => {
++    const event = buildSelfPlagiarismGovernorLedgerEvent("acme/target", {
++      allowed: false,
++      eventType: "throttled",
++      reason: "near_duplicate_self_plagiarism",
++      matchedSubmission: {
++        repoFullName: "acme/prior",
++        fingerprint: "fp",
++        submittedAt: undefined,
++        pullRequestNumber: 1,
++      },
++    });
++    expect(event.payload).toEqual({
++      matchedRepoFullName: "acme/prior",
++      matchedPullRequestNumber: 1,
++      matchedIssueNumber: null,
++      matchedSubmittedAt: null,
++      similarity: null,
++    });
++  });
++});

@@ -1,0 +1,246 @@
+diff --git a/packages/gittensory-engine/src/index.ts b/packages/gittensory-engine/src/index.ts
+index 7e870d96b..76adf85c8 100644
+--- a/packages/gittensory-engine/src/index.ts
++++ b/packages/gittensory-engine/src/index.ts
+@@ -192,6 +192,11 @@ export {
+   type CodingAgentDriverResult,
+   type CodingAgentDriverTask,
+ } from "./miner/coding-agent-driver.js";
++export {
++  createCliSubprocessCodingAgentDriver,
++  type CliSubprocessDriverOptions,
++  type CliSubprocessSpawnFn,
++} from "./miner/cli-subprocess-driver.js";
+ export {
+   invokeCodingAgentDriver,
+   type AttemptLogSink,
+diff --git a/packages/gittensory-engine/src/miner/cli-subprocess-driver.ts b/packages/gittensory-engine/src/miner/cli-subprocess-driver.ts
+new file mode 100644
+index 000000000..07660b9cc
+--- /dev/null
++++ b/packages/gittensory-engine/src/miner/cli-subprocess-driver.ts
+@@ -0,0 +1,110 @@
++import type {
++  CodingAgentDriver,
++  CodingAgentDriverResult,
++  CodingAgentDriverTask,
++} from "./coding-agent-driver.js";
++import { SUBPROCESS_CLI_ENV_ALLOWLIST, buildAllowlistedEnv, redactSecrets } from "../subprocess-env.js";
++
++// CLI-subprocess CodingAgentDriver (#4266). Implements the CodingAgentDriver seam (#4262) by running the coding
++// agent (`claude`/`codex`) as a subprocess in the attempt's scoped working directory. The spawn primitive is
++// INJECTED (a generalized version of src/selfhost/ai.ts's SpawnFn, redeclared here so gittensory-engine stays
++// standalone and doesn't import from src/), so the driver is fully testable without a real child process. Two
++// safety primitives are reused from subprocess-env.ts (#4284) rather than re-implemented: the child gets a STRICT
++// allowlisted env (never the full host env — a coding-agent subprocess is prompt-injectable), and any subprocess
++// output surfaced in an error/transcript is run through `redactSecrets` first. Detecting which files changed is a
++// sibling concern (a git diff over the worktree, #4269), so this driver reports `changedFiles: []` and leaves that
++// to the caller.
++
++/** The spawn primitive a CLI driver depends on — the generalized shape of src/selfhost/ai.ts's `SpawnFn`. Injected
++ *  so the driver never hardcodes `child_process`; a fake resolves this in tests. */
++export type CliSubprocessSpawnFn = (
++  cmd: string,
++  args: readonly string[],
++  opts: {
++    cwd: string;
++    env: Record<string, string | undefined>;
++    timeoutMs: number;
++  },
++) => Promise<{ stdout: string; code: number | null; stderr?: string; timedOut?: boolean }>;
++
++export type CliSubprocessDriverOptions = {
++  /** The coding-agent CLI to spawn (e.g. "claude" or "codex"). */
++  command: string;
++  /** Injected spawn — a real `child_process` spawn in prod, a fake in tests. */
++  spawn: CliSubprocessSpawnFn;
++  /** Per-run wall-clock budget handed to the spawn. Default: 120000ms. */
++  timeoutMs?: number;
++  /** Parent env to allowlist from. Default: `{}` (a real caller passes `process.env`; the default stays pure). */
++  parentEnv?: Record<string, string | undefined>;
++  /** Extra env overlaid on the allowlisted parent (e.g. an auth value the CLI reads). */
++  env?: Record<string, string | undefined>;
++  /** Known secret values (e.g. an injected auth token) to strip from any surfaced output, on top of the well-known
++   *  token-shape patterns. */
++  knownSecrets?: readonly string[];
++  /** Build the CLI argv from a task. Default is a generic max-turns / acceptance-criteria / instructions argv that a
++   *  caller overrides to match the real CLI's flags. */
++  buildArgs?: (task: CodingAgentDriverTask) => readonly string[];
++};
++
++const DEFAULT_TIMEOUT_MS = 120_000;
++const MAX_TRANSCRIPT_CHARS = 8000;
++const MAX_ERROR_DETAIL_CHARS = 500;
++
++function defaultBuildArgs(task: CodingAgentDriverTask): string[] {
++  return [
++    "--max-turns",
++    String(task.maxTurns),
++    "--acceptance-criteria",
++    task.acceptanceCriteriaPath,
++    task.instructions,
++  ];
++}
++
++/**
++ * Create a {@link CodingAgentDriver} that runs the coding agent as a CLI subprocess. A non-zero or absent exit
++ * code, or a timeout, yields `ok: false` with a redacted error; exit `0` yields `ok: true`. Any subprocess output
++ * kept as a transcript or folded into an error is redacted first.
++ */
++export function createCliSubprocessCodingAgentDriver(options: CliSubprocessDriverOptions): CodingAgentDriver {
++  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
++  const buildArgs = options.buildArgs ?? defaultBuildArgs;
++  const knownSecrets = options.knownSecrets ?? [];
++  return {
++    async run(task: CodingAgentDriverTask): Promise<CodingAgentDriverResult> {
++      const env = buildAllowlistedEnv(options.parentEnv ?? {}, SUBPROCESS_CLI_ENV_ALLOWLIST, options.env ?? {});
++      const spawned = await options.spawn(options.command, buildArgs(task), {
++        cwd: task.workingDirectory,
++        env,
++        timeoutMs,
++      });
++      const transcript = redactSecrets(spawned.stdout, knownSecrets).slice(0, MAX_TRANSCRIPT_CHARS);
++
++      if (spawned.timedOut) {
++        return {
++          ok: false,
++          changedFiles: [],
++          summary: `${options.command} timed out after ${timeoutMs}ms`,
++          transcript,
++          error: `${options.command}_timeout_${timeoutMs}ms`,
++        };
++      }
++      if (spawned.code !== 0) {
++        const stderr = (spawned.stderr ?? "").trim();
++        const detail = redactSecrets(stderr || `exit ${spawned.code}`, knownSecrets).slice(0, MAX_ERROR_DETAIL_CHARS);
++        return {
++          ok: false,
++          changedFiles: [],
++          summary: `${options.command} exited non-zero`,
++          transcript,
++          error: `${options.command}_exit_${spawned.code}: ${detail}`,
++        };
++      }
++      return {
++        ok: true,
++        changedFiles: [],
++        summary: `${options.command} completed for ${task.attemptId}`,
++        transcript,
++      };
++    },
++  };
++}
+diff --git a/test/unit/cli-subprocess-driver.test.ts b/test/unit/cli-subprocess-driver.test.ts
+new file mode 100644
+index 000000000..ef9c431e0
+--- /dev/null
++++ b/test/unit/cli-subprocess-driver.test.ts
+@@ -0,0 +1,108 @@
++import { describe, expect, it } from "vitest";
++import {
++  createCliSubprocessCodingAgentDriver,
++  type CliSubprocessSpawnFn,
++} from "../../packages/gittensory-engine/src/index";
++import type { CodingAgentDriverTask } from "../../packages/gittensory-engine/src/index";
++
++const TASK: CodingAgentDriverTask = {
++  attemptId: "attempt-1",
++  workingDirectory: "/work/attempt-1",
++  acceptanceCriteriaPath: "/work/attempt-1/acceptance-criteria.json",
++  instructions: "Fix the pagination bug.",
++  maxTurns: 6,
++};
++
++/** A fake spawn that records the call and returns a scripted result. */
++function fakeSpawn(result: Awaited<ReturnType<CliSubprocessSpawnFn>>) {
++  const calls: Array<{ cmd: string; args: readonly string[]; opts: Parameters<CliSubprocessSpawnFn>[2] }> = [];
++  const spawn: CliSubprocessSpawnFn = async (cmd, args, opts) => {
++    calls.push({ cmd, args, opts });
++    return result;
++  };
++  return { spawn, calls };
++}
++
++describe("createCliSubprocessCodingAgentDriver (#4266)", () => {
++  it("returns ok on exit 0 and spawns in the task's working directory with the default argv", async () => {
++    const { spawn, calls } = fakeSpawn({ stdout: "done", code: 0 });
++    const driver = createCliSubprocessCodingAgentDriver({ command: "claude", spawn });
++    const result = await driver.run(TASK);
++    expect(result.ok).toBe(true);
++    expect(result.summary).toBe("claude completed for attempt-1");
++    expect(result.transcript).toBe("done");
++    expect(result.changedFiles).toEqual([]);
++    expect(calls[0]?.cmd).toBe("claude");
++    expect(calls[0]?.opts.cwd).toBe("/work/attempt-1");
++    expect(calls[0]?.opts.timeoutMs).toBe(120_000);
++    expect(calls[0]?.args).toEqual([
++      "--max-turns",
++      "6",
++      "--acceptance-criteria",
++      "/work/attempt-1/acceptance-criteria.json",
++      "Fix the pagination bug.",
++    ]);
++  });
++
++  it("returns a redacted error on a non-zero exit code", async () => {
++    const { spawn } = fakeSpawn({
++      stdout: "",
++      code: 1,
++      stderr: "auth failed for token sk-ant-abcdefghijklmnop12345",
++    });
++    const driver = createCliSubprocessCodingAgentDriver({ command: "codex", spawn });
++    const result = await driver.run(TASK);
++    expect(result.ok).toBe(false);
++    expect(result.summary).toBe("codex exited non-zero");
++    expect(result.error).toContain("codex_exit_1:");
++    expect(result.error).toContain("auth failed");
++    expect(result.error).toContain("[redacted]");
++    expect(result.error).not.toContain("sk-ant-abcdefghijklmnop12345");
++  });
++
++  it("falls back to 'exit <code>' when a failing subprocess wrote no stderr (incl. a null code)", async () => {
++    const { spawn } = fakeSpawn({ stdout: "", code: null });
++    const driver = createCliSubprocessCodingAgentDriver({ command: "claude", spawn });
++    const result = await driver.run(TASK);
++    expect(result.ok).toBe(false);
++    expect(result.error).toBe("claude_exit_null: exit null");
++  });
++
++  it("reports a timeout distinctly from a non-zero exit", async () => {
++    const { spawn } = fakeSpawn({ stdout: "partial", code: null, timedOut: true });
++    const driver = createCliSubprocessCodingAgentDriver({ command: "claude", spawn, timeoutMs: 5000 });
++    const result = await driver.run(TASK);
++    expect(result.ok).toBe(false);
++    expect(result.summary).toBe("claude timed out after 5000ms");
++    expect(result.error).toBe("claude_timeout_5000ms");
++  });
++
++  it("hands the child a strict allowlisted env plus overlaid extras, never the full parent env", async () => {
++    const { spawn, calls } = fakeSpawn({ stdout: "", code: 0 });
++    const driver = createCliSubprocessCodingAgentDriver({
++      command: "claude",
++      spawn,
++      parentEnv: { HOME: "/home/miner", RUNTIME_ONLY_FLAG: "leak-me", PATH: "/usr/bin" },
++      env: { AGENT_SESSION_HANDLE: "provided-by-caller" },
++    });
++    await driver.run(TASK);
++    const env = calls[0]?.opts.env ?? {};
++    expect(env.HOME).toBe("/home/miner");
++    expect(env.PATH).toBe("/usr/bin");
++    expect(env.AGENT_SESSION_HANDLE).toBe("provided-by-caller");
++    expect(env.RUNTIME_ONLY_FLAG).toBeUndefined();
++  });
++
++  it("redacts known secret values and honors a custom argv builder", async () => {
++    const { spawn, calls } = fakeSpawn({ stdout: "used my-injected-longkey to auth", code: 0 });
++    const driver = createCliSubprocessCodingAgentDriver({
++      command: "claude",
++      spawn,
++      knownSecrets: ["my-injected-longkey"],
++      buildArgs: (task) => ["run", task.attemptId],
++    });
++    const result = await driver.run(TASK);
++    expect(result.transcript).toBe("used [redacted] to auth");
++    expect(calls[0]?.args).toEqual(["run", "attempt-1"]);
++  });
++});

@@ -1,0 +1,161 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index e467c7c..07110e6 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -18,6 +18,32 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
+ 
+ ---
+ 
++## 2026-07-10 — Hidden-benchmark cached answers used a bare prompt, not the WORKER turn  #mistake #finding #decision
++
++**Context:** `scripts/build_benchmark.py::_cache_answers` pre-computes each pool
++model's answer per question; those cached answers back the **70%-weighted**
++single-turn score in `pr_eval._evaluate_cached`.
++**Expected:** cached answers reflect how the pool is actually queried in the
++pipeline the router is trained and live-evaluated on.
++**Actual:** caching sent a bare `[{"role":"user","content": question_text}]`
++message — no role contract. But the single-model baseline
++(`trinity.eval._score_single_model`) and the live pipeline
++(`orchestration.session.run_trajectory`) both query via
++`build_messages(Role.WORKER, prompt, [])`, which prepends the WORKER system
++prompt. So the 70% cached component measured model behaviour on a prompt the
++pipeline never uses, and diverged from the 15% live component (which does use the
++WORKER turn).
++**Root cause:** the caching path bypassed `build_messages`, duplicating the
++message construction with a different (role-less) shape.
++**Fix / decision:** cache via `build_messages(Role.WORKER, question_text, [])`, so
++the cached single-turn answers match the baseline and the live path exactly. The
++integrity hash excludes `model_answers` (`benchmark_protocol._HASHED_ITEM_FIELDS`),
++so this changes only the cached answers on a rebuild, not the sealed question set.
++Covered by `tests/test_build_benchmark_cache_prompt.py` (a stub pool asserts the
++WORKER-role message layout and the skip-already-cached behaviour).
++**Follow-up:** none. Rebuilding a benchmark will refresh cached answers under the
++corrected prompt.
++
+ ## 2026-07-09 — Rate-limit gate parsed UTC timestamps as local time  #mistake #finding #decision
+ 
+ **Context:** Auditing the anti-cheat gates in `scripts/pr_eval.py`. Gate 1
+diff --git a/scripts/build_benchmark.py b/scripts/build_benchmark.py
+index d25f7ff..93df5e9 100644
+--- a/scripts/build_benchmark.py
++++ b/scripts/build_benchmark.py
+@@ -78,9 +78,22 @@ def _sample_pool(benchmark: str, counts: Dict[str, int]) -> List[Any]:
+ 
+ 
+ async def _cache_answers(items: List[Dict], pool, pool_models: List[str]) -> None:
+-    """Call each model ONCE per question (temp=0) and cache the answer."""
++    """Call each model ONCE per question (temp=0) and cache the answer.
++
++    The cached answers back the 70%-weighted single-turn score, so they must be
++    produced with the SAME single-turn invocation the router is trained and
++    live-evaluated against: one WORKER-role turn with an empty transcript. This
++    mirrors ``trinity.eval._score_single_model`` and the pipeline's
++    ``session.run_trajectory`` (both go through ``build_messages``). Prompting the
++    model with a bare user message instead would cache answers to a different
++    prompt than the pipeline ever uses — the model gets no role contract — so the
++    cached (70%) and live (15%) components would measure different behaviours.
++    """
+     import httpx
+ 
++    from trinity.roles.prompts import build_messages
++    from trinity.types import Role
++
+     async with httpx.AsyncClient() as client:
+         for item in items:
+             for model_name in pool_models:
+@@ -89,7 +102,7 @@ async def _cache_answers(items: List[Dict], pool, pool_models: List[str]) -> Non
+                 try:
+                     res = await pool.chat(
+                         model_name,
+-                        [{"role": "user", "content": item["question_text"]}],
++                        build_messages(Role.WORKER, item["question_text"], []),
+                         max_tokens=4096, temperature=0.0, top_p=1.0,
+                         client=client,
+                     )
+diff --git a/tests/test_build_benchmark_cache_prompt.py b/tests/test_build_benchmark_cache_prompt.py
+new file mode 100644
+index 0000000..d78e20b
+--- /dev/null
++++ b/tests/test_build_benchmark_cache_prompt.py
+@@ -0,0 +1,81 @@
++"""Offline test: cached benchmark answers use the WORKER single-turn prompt.
++
++The hidden benchmark's cached model answers back the 70%-weighted single-turn
++score, so they must be produced with the same single-turn invocation the router
++is trained and live-evaluated against — one WORKER-role turn with an empty
++transcript (`build_messages(Role.WORKER, question, [])`), exactly as
++`trinity.eval._score_single_model` and `session.run_trajectory` do. Caching with
++a bare user message would query a different prompt than the pipeline ever uses.
++
++No network: a stub pool records the messages it is handed.
++"""
++import asyncio
++import importlib.util
++import sys
++from pathlib import Path
++
++_REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(_REPO / "src"))
++sys.path.insert(0, str(_REPO / "scripts"))
++
++# build_benchmark lives under scripts/ and needs benchmark_protocol importable.
++_SCRIPT = _REPO / "scripts" / "build_benchmark.py"
++_spec = importlib.util.spec_from_file_location("build_benchmark", _SCRIPT)
++build_benchmark = importlib.util.module_from_spec(_spec)
++sys.modules["build_benchmark"] = build_benchmark
++_spec.loader.exec_module(build_benchmark)
++
++from trinity.roles.prompts import WORKER_SYSTEM, build_messages  # noqa: E402
++from trinity.types import Role  # noqa: E402
++
++
++class _StubResult:
++    def __init__(self, text: str) -> None:
++        self.text = text
++
++
++class _RecordingPool:
++    """Records every (model, messages) it is asked to chat with; no network."""
++
++    def __init__(self) -> None:
++        self.calls: list[tuple[str, list[dict]]] = []
++
++    async def chat(self, model, messages, **kwargs):
++        self.calls.append((model, messages))
++        return _StubResult(f"answer-from-{model}")
++
++
++def _run(items, pool, models):
++    asyncio.run(build_benchmark._cache_answers(items, pool, models))
++
++
++def test_cache_uses_worker_role_messages():
++    items = [{"question_id": "q0", "question_text": "What is 2+2?", "model_answers": {}}]
++    pool = _RecordingPool()
++    models = ["m-a", "m-b"]
++
++    _run(items, pool, models)
++
++    # One call per (item, model).
++    assert len(pool.calls) == len(models)
++    for model, messages in pool.calls:
++        # Must be the WORKER single-turn layout, identical to the baseline path.
++        assert messages == build_messages(Role.WORKER, "What is 2+2?", [])
++        assert messages[0]["role"] == "system"
++        assert messages[0]["content"] == WORKER_SYSTEM
++        assert "What is 2+2?" in messages[1]["content"]
++        # Regression guard: never a bare single user message.
++        assert not (len(messages) == 1 and messages[0]["role"] == "user")
++
++    # Answers are cached back per model.
++    assert items[0]["model_answers"] == {"m-a": "answer-from-m-a", "m-b": "answer-from-m-b"}
++
++
++def test_cache_skips_already_cached_models():
++    items = [{"question_id": "q0", "question_text": "Q?", "model_answers": {"m-a": "prior"}}]
++    pool = _RecordingPool()
++    _run(items, pool, ["m-a", "m-b"])
++
++    # m-a already had an answer -> only m-b is queried.
++    assert [m for m, _ in pool.calls] == ["m-b"]
++    assert items[0]["model_answers"]["m-a"] == "prior"

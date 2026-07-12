@@ -1,0 +1,176 @@
+diff --git a/scripts/pr_eval.py b/scripts/pr_eval.py
+index 7daf390..5ad581e 100644
+--- a/scripts/pr_eval.py
++++ b/scripts/pr_eval.py
+@@ -38,6 +38,7 @@
+     EXPECTED_TOTAL_PARAMS,
+     MAX_WEIGHT_MAGNITUDE,
+     MIN_TRAINING_COST_USD,
++    N_HEAD_MODELS,
+     RATE_LIMIT_MAX_SUBMISSIONS,
+     RATE_LIMIT_WINDOW_DAYS,
+ )
+@@ -47,6 +48,7 @@
+     cosine_similarity as _cosine_similarity,
+     parse_utc_timestamp as _parse_utc_timestamp,
+     rate_limit_entries as _rate_limit_entries,
++    routing_invariant_head as _routing_invariant_head,
+     validate_ledger_receipt_cost,
+     validate_receipt as _validate_receipt,
+     validate_weights as _validate_weights,
+@@ -64,6 +66,7 @@
+ _RATE_LIMIT_WINDOW_DAYS = RATE_LIMIT_WINDOW_DAYS
+ _RATE_LIMIT_MAX_SUBMISSIONS = RATE_LIMIT_MAX_SUBMISSIONS
+ _POOL_MODELS = list(DEFAULT_POOL_MODELS)
++_N_HEAD_MODELS = N_HEAD_MODELS
+ 
+ 
+ # ==========================================================================
+diff --git a/src/trinity/submission/constants.py b/src/trinity/submission/constants.py
+index 42d79ef..4af6369 100644
+--- a/src/trinity/submission/constants.py
++++ b/src/trinity/submission/constants.py
+@@ -8,6 +8,11 @@
+ EXPECTED_TOTAL_PARAMS: int = EXPECTED_HEAD_PARAMS + EXPECTED_SVF_PARAMS
+ EXPECTED_HEAD_SHAPE: tuple[int, int] = (6, 1024)
+ 
++# Head rows [0:N_HEAD_MODELS) are agent logits, the rest are role logits. Each
++# group is argmax/softmax'd independently, so routing is invariant to a per-group
++# additive shift of the rows -- the duplicate gate must compare heads accordingly.
++N_HEAD_MODELS: int = 3
++
+ MIN_TRAINING_COST_USD: float = 15.0
+ MAX_WEIGHT_MAGNITUDE: float = 1e6
+ DUPLICATE_HEAD_COSINE_THRESHOLD: float = 0.999
+diff --git a/src/trinity/submission/gates.py b/src/trinity/submission/gates.py
+index c60d55c..74e2512 100644
+--- a/src/trinity/submission/gates.py
++++ b/src/trinity/submission/gates.py
+@@ -22,6 +22,7 @@
+     LEDGER_RECEIPT_COST_TOLERANCE_USD,
+     MAX_WEIGHT_MAGNITUDE,
+     MIN_TRAINING_COST_USD,
++    N_HEAD_MODELS,
+     RATE_LIMIT_MAX_SUBMISSIONS,
+     RATE_LIMIT_WINDOW_DAYS,
+ )
+@@ -157,6 +158,41 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+     return float(np.dot(a_arr, b_arr) / (na * nb))
+ 
+ 
++def routing_invariant_head(head_W: np.ndarray) -> Optional[np.ndarray]:
++    """Return a routing-behaviour view of a head for duplicate comparison.
++
++    ``LinearHead`` routes by argmax/softmax over two INDEPENDENT logit groups of
++    ``z = W·h``: agent rows ``[0:N_HEAD_MODELS)`` and role rows
++    ``[N_HEAD_MODELS:]``. Adding a common vector ``c`` to every row of a group
++    shifts that group's logits by the same scalar ``c·h`` for every input, so
++    both ``argmax`` and ``softmax`` are unchanged — the head routes identically.
++    Raw-weight cosine, however, is NOT invariant to that shift, so a plagiarised
++    head can be given an arbitrary per-group offset to drive the cosine far below
++    the gate threshold while behaving identically (issue #152).
++
++    Mean-centering each group's rows (subtracting the per-column mean across the
++    group) removes exactly that common-vector component, so an exact copy and any
++    of its shifted variants collapse to the same representation (cosine ``1.0``),
++    while genuinely different heads stay distinct.
++
++    Args:
++        head_W: A head weight matrix, expected shape ``(n_a, d_h)`` with
++            ``n_a > N_HEAD_MODELS``.
++
++    Returns:
++        The centered head flattened to 1-D, or ``None`` when ``head_W`` is not a
++        2-D head with more than ``N_HEAD_MODELS`` rows (not comparable).
++    """
++    W = np.asarray(head_W, dtype=np.float64)
++    if W.ndim != 2 or W.shape[0] <= N_HEAD_MODELS:
++        return None
++    centered = W.copy()
++    agent, role = centered[:N_HEAD_MODELS], centered[N_HEAD_MODELS:]
++    agent -= agent.mean(axis=0, keepdims=True)
++    role -= role.mean(axis=0, keepdims=True)
++    return centered.ravel()
++
++
+ def check_duplicate(
+     head_W: np.ndarray,
+     svf_scales: np.ndarray,
+@@ -167,12 +203,12 @@ def check_duplicate(
+     leaderboard: dict[str, Any] | None = None,
+     load_leaderboard: Callable[[], dict[str, Any]] | None = None,
+ ) -> Optional[str]:
+-    head = np.asarray(head_W, dtype=np.float64).ravel()
++    head = routing_invariant_head(head_W)
+     svf = np.asarray(svf_scales, dtype=np.float64).ravel()
+ 
+     def _match(other_hw: np.ndarray, other_sv: np.ndarray) -> Optional[tuple[float, float]]:
+-        other_head = np.asarray(other_hw, dtype=np.float64).ravel()
+-        if other_head.size != head.size:
++        other_head = routing_invariant_head(other_hw)
++        if head is None or other_head is None or other_head.size != head.size:
+             return None
+         h_sim = cosine_similarity(head, other_head)
+         s_sim = cosine_similarity(svf, np.asarray(other_sv, dtype=np.float64).ravel())
+diff --git a/tests/test_pr_eval_duplicate.py b/tests/test_pr_eval_duplicate.py
+index 36ba9d9..5b48db2 100644
+--- a/tests/test_pr_eval_duplicate.py
++++ b/tests/test_pr_eval_duplicate.py
+@@ -96,6 +96,57 @@ def test_mismatched_head_shape_is_skipped(tmp_path):
+     assert err is None
+ 
+ 
++def _shift_head_per_group(head: np.ndarray, seed: int, scale: float = 5.0) -> np.ndarray:
++    """Copy a head, then add a common vector to each logit group's rows.
++
++    LinearHead argmax/softmax over each group is invariant to a per-group additive
++    shift, so this reproduces a rival's routing EXACTLY while changing the raw
++    weights arbitrarily (issue #152).
++    """
++    rng = np.random.default_rng(seed)
++    n_models = pr_eval._N_HEAD_MODELS
++    out = head.copy()
++    out[:n_models] += rng.normal(0, scale, head.shape[1])
++    out[n_models:] += rng.normal(0, scale, head.shape[1])
++    return out
++
++
++def test_routing_preserving_shift_is_caught(tmp_path):
++    """The #152 evasion: copy a head, add a per-group additive shift.
++
++    Raw-weight cosine drops far below 0.999, but the head routes identically on
++    every input, so the shift-invariant gate must still reject it as a duplicate.
++    """
++    head = _rand_head(1)
++    _write_submission(tmp_path, "alice", 1, head, _near_identity_svf(10))
++
++    attack = _shift_head_per_group(head, seed=7)
++    # Sanity: the raw cosine really is below threshold (old gate would pass it).
++    raw = pr_eval._cosine_similarity(head, attack)
++    assert raw < pr_eval._COPY_THRESHOLD, raw
++
++    err = pr_eval._check_duplicate(attack, _near_identity_svf(999, std=0.05),
++                                   tmp_path, "bob", 1)
++    assert err is not None and err.startswith("duplicate_of_alice_gen_1")
++
++
++def test_routing_invariant_head_collapses_the_shift():
++    """The centered representation is identical for a head and its shifted copy."""
++    head = _rand_head(2)
++    attack = _shift_head_per_group(head, seed=3)
++    sim = pr_eval._cosine_similarity(
++        pr_eval._routing_invariant_head(head),
++        pr_eval._routing_invariant_head(attack),
++    )
++    assert sim == pytest.approx(1.0, abs=1e-9)
++    # ...but two genuinely different heads stay distinct after centering.
++    other = pr_eval._cosine_similarity(
++        pr_eval._routing_invariant_head(_rand_head(2)),
++        pr_eval._routing_invariant_head(_rand_head(3)),
++    )
++    assert other < pr_eval._COPY_THRESHOLD
++
++
+ def test_king_copy_is_caught(tmp_path, monkeypatch):
+     """A head copied from the leaderboard king is rejected even with new SVF.
+ 

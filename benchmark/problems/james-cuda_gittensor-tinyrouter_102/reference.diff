@@ -1,0 +1,292 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index c76df69..f5c2eca 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -18,6 +18,30 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
+ 
+ ---
+ 
++## 2026-07-10 — GPQA logical `test` resolved via a deterministic holdout  #finding #decision
++
++**Context:** closing the follow-up left by the MMLU split fix below — "GPQA still has only an
++upstream `train` split; deterministic holdout for logical `test` is separate work" (issue #95).
++**Expected:** `python -m trinity.eval --benchmark gpqa` scores the router on real GPQA-Diamond
++rows that training never saw.
++**Actual:** it scored on **2 toy questions**. `eval.py` asks for split `"test"`; `Idavidrein/gpqa`
++publishes only `train`; `_try_load_hf` swallowed the unknown-split error and `load_split`
++substituted `_toy_tasks("gpqa")`. Training (`split="train"`) loaded the real 198 rows, so train
++and eval were silently running on different data and the R1/R2 verdicts rested on 2 questions.
++**Root cause:** `split_policy._SPLIT_ALIASES` had entries for `mmlu` (#35) and `mmlu_pro` (#50)
++but none for `gpqa`, so the logical split was forwarded verbatim.
++**Fix / decision:** alias both `train` and `test` onto upstream `train`, then partition those rows
++with `split_policy.select_holdout` — a fixed-seed (`HOLDOUT_SEED = 20260710`), 25% holdout keyed on
++upstream row position. `[OUR CHOICE]` a plain `test → train` alias was rejected: it would have
++evaluated on exactly the rows training consumed. The partition is deliberately independent of
++`load_split`'s shuffle `seed`, so the train/test boundary cannot drift when a caller changes
++sampling. 198 rows → 148 train / 50 test, disjoint and covering. The toy fallback skips the
++partition (a 2-item set cannot be divided) and still raises `ToyFallbackWarning`.
++**Follow-up:** `eval.py` treats `ToyFallbackWarning` as non-fatal, so any *other* loader failure
++still reports toy-set numbers as if real. Promoting that warning to an error under `--strict-data`
++would close the class rather than this one instance. GPQA is also a gated HF repo — without auth
++the fallback still fires, now loudly but not fatally.
++
+ ## 2026-07-10 — Every submission receipt claimed `seed: 0`  #mistake #decision
+ 
+ **Context:** closing the loose end from the `SepCMAES` seed fix (#38) — "a 'plausible CMA-ES
+diff --git a/src/trinity/adapters/loaders.py b/src/trinity/adapters/loaders.py
+index 339b9ac..d93c49d 100644
+--- a/src/trinity/adapters/loaders.py
++++ b/src/trinity/adapters/loaders.py
+@@ -24,7 +24,7 @@
+ 
+ from trinity.types import Task
+ 
+-from .split_policy import resolve_split, warn_on_toy_fallback
++from .split_policy import resolve_split, select_holdout, warn_on_toy_fallback
+ 
+ #: Benchmarks with a dedicated raw loader in this module.
+ SUPPORTED_BENCHMARKS: tuple[str, ...] = ("math500", "mmlu", "gpqa", "livecodebench")
+@@ -453,7 +453,12 @@ def load_split(
+     used_toy = not loaded
+     # Narrow on ``loaded`` itself: a separate ``used_toy`` bool cannot tell the
+     # type checker that the loader did not return None.
+-    tasks = list(loaded) if loaded else _toy_tasks(key)
++    #
++    # Single-split benchmarks (GPQA) serve both logical splits from one upstream
++    # split, so carve them apart deterministically. ``select_holdout`` returns a
++    # fresh list and passes through unchanged for every benchmark that publishes
++    # its own test split.
++    tasks = select_holdout(key, logical_split, loaded) if loaded else _toy_tasks(key)
+     warn_on_toy_fallback(key, logical_split, used_toy=used_toy)
+ 
+     rng = random.Random(seed)
+diff --git a/src/trinity/adapters/split_policy.py b/src/trinity/adapters/split_policy.py
+index 3989c40..c9438c1 100644
+--- a/src/trinity/adapters/split_policy.py
++++ b/src/trinity/adapters/split_policy.py
+@@ -1,19 +1,28 @@
+ """Shared split-resolution helpers for benchmark loaders."""
+ from __future__ import annotations
+ 
++import random
+ import warnings
++from typing import Sequence, TypeVar
+ 
+ __all__ = [
++    "HOLDOUT_SEED",
+     "ToyFallbackWarning",
++    "holdout_indices",
+     "resolve_split",
++    "select_holdout",
+     "warn_on_toy_fallback",
+ ]
+ 
++T = TypeVar("T")
++
+ #: Logical split names that do not exist upstream, mapped per benchmark.
+ #: MMLU-Pro publishes only ``validation`` and ``test``; training callers use
+ #: ``train``, which we map to ``validation`` (issue #50).
+ #: MMLU publishes ``auxiliary_train`` for training pool; logical ``train`` maps
+ #: there (issue #35).
++#: GPQA-Diamond publishes only ``train``; both logical splits read it and are then
++#: carved into disjoint subsets by :func:`select_holdout` (issue #95).
+ _SPLIT_ALIASES: dict[str, dict[str, str]] = {
+     "mmlu": {
+         "train": "auxiliary_train",
+@@ -23,8 +32,26 @@
+         "train": "validation",
+         "training": "validation",
+     },
++    "gpqa": {
++        "train": "train",
++        "training": "train",
++        "test": "train",
++    },
++}
++
++#: Seed for the deterministic holdout partition. Fixed: changing it silently
++#: redefines the train/test boundary of every benchmark listed below.
++HOLDOUT_SEED: int = 20260710
++
++#: Fraction of upstream rows reserved for the logical ``test`` split. Only
++#: benchmarks that publish a single upstream split need an entry.
++_HOLDOUT_FRACTION: dict[str, float] = {
++    "gpqa": 0.25,
+ }
+ 
++#: Logical split names served the held-out rows; every other name gets the rest.
++_TEST_SPLITS: frozenset[str] = frozenset({"test", "eval", "validation"})
++
+ 
+ class ToyFallbackWarning(UserWarning):
+     """A loader substituted the offline toy set for real benchmark data."""
+@@ -40,6 +67,53 @@ def resolve_split(benchmark: str, split: str) -> str:
+     return _SPLIT_ALIASES.get(key, {}).get(logical, logical)
+ 
+ 
++def holdout_indices(benchmark: str, n: int) -> frozenset[int]:
++    """Return the row positions reserved for the logical ``test`` split.
++
++    The partition is a pure function of ``benchmark``, ``n``, and
++    :data:`HOLDOUT_SEED`, so repeated calls — and separate processes — agree on
++    which rows are held out. Positions index the upstream row order as loaded.
++
++    Args:
++        benchmark: Benchmark name; case- and whitespace-insensitive.
++        n: Number of upstream rows available.
++
++    Returns:
++        The held-out positions, or an empty set for benchmarks that publish
++        their own ``test`` split (and when ``n`` is too small to divide).
++    """
++    key = (benchmark or "").strip().lower()
++    fraction = _HOLDOUT_FRACTION.get(key)
++    if fraction is None or n < 2:
++        return frozenset()
++    k = max(1, min(n - 1, round(n * fraction)))
++    rng = random.Random(f"{key}:{HOLDOUT_SEED}")
++    return frozenset(rng.sample(range(n), k))
++
++
++def select_holdout(benchmark: str, split: str, items: Sequence[T]) -> list[T]:
++    """Carve ``items`` into the logical ``split`` half of a single-split benchmark.
++
++    Benchmarks with no holdout configured pass ``items`` through unchanged, so
++    this is safe to call for every benchmark.
++
++    Args:
++        benchmark: Benchmark name; case- and whitespace-insensitive.
++        split: Logical split name, e.g. ``"train"`` or ``"test"``.
++        items: Upstream rows in their loaded order.
++
++    Returns:
++        The held-out rows for a test-like ``split``, otherwise the remainder.
++        The two are disjoint and together cover ``items``.
++    """
++    held = holdout_indices(benchmark, len(items))
++    if not held:
++        return list(items)
++    logical = (split or "test").strip().lower()
++    want_holdout = logical in _TEST_SPLITS
++    return [x for i, x in enumerate(items) if (i in held) == want_holdout]
++
++
+ def warn_on_toy_fallback(benchmark: str, split: str, *, used_toy: bool) -> None:
+     """Emit :class:`ToyFallbackWarning` when the toy set stands in for real data."""
+     if not used_toy:
+diff --git a/tests/test_gpqa_holdout_split.py b/tests/test_gpqa_holdout_split.py
+new file mode 100644
+index 0000000..4f31e35
+--- /dev/null
++++ b/tests/test_gpqa_holdout_split.py
+@@ -0,0 +1,110 @@
++"""Tests for GPQA holdout-split resolution (issue #95)."""
++from __future__ import annotations
++
++import sys
++import types
++import warnings
++
++from trinity.adapters.loaders import load_split
++from trinity.adapters.split_policy import (
++    ToyFallbackWarning,
++    holdout_indices,
++    resolve_split,
++    select_holdout,
++)
++from trinity.orchestration.dataset import load_tasks
++
++N_ROWS = 40
++
++
++def _install_fake_gpqa_datasets() -> None:
++    """Simulate Idavidrein/gpqa, which publishes only a ``train`` split."""
++
++    def load_dataset(path, name=None, split=None, **kwargs):
++        if path != "Idavidrein/gpqa" or name != "gpqa_diamond" or split != "train":
++            raise ValueError(f"Unknown split {split!r}.")
++        return [
++            {
++                "Question": f"q-{i}",
++                "Correct Answer": f"right-{i}",
++                "Incorrect Answer 1": f"wrong-{i}-a",
++                "Incorrect Answer 2": f"wrong-{i}-b",
++                "Incorrect Answer 3": f"wrong-{i}-c",
++            }
++            for i in range(N_ROWS)
++        ]
++
++    mod = types.ModuleType("datasets")
++    mod.load_dataset = load_dataset
++    sys.modules["datasets"] = mod
++
++
++def test_resolve_split_maps_both_logical_splits_to_train():
++    assert resolve_split("gpqa", "train") == "train"
++    assert resolve_split("gpqa", "test") == "train"
++
++
++def test_resolve_split_leaves_other_benchmarks_alone():
++    assert resolve_split("math500", "test") == "test"
++    assert resolve_split("mmlu", "train") == "auxiliary_train"
++
++
++def test_test_split_loads_real_rows_not_toy_set():
++    _install_fake_gpqa_datasets()
++    tasks = load_split("gpqa", "test", max_items=None, seed=0)
++    assert tasks
++    assert all(not t.task_id.startswith("gpqa-toy-") for t in tasks)
++    assert tasks[0].meta["source"] == "Idavidrein/gpqa"
++
++
++def test_train_and_test_are_disjoint_and_cover_the_upstream_split():
++    _install_fake_gpqa_datasets()
++    train = {t.task_id for t in load_split("gpqa", "train", max_items=None, seed=0)}
++    test = {t.task_id for t in load_split("gpqa", "test", max_items=None, seed=0)}
++    assert train and test
++    assert train.isdisjoint(test)
++    assert len(train | test) == N_ROWS
++
++
++def test_partition_is_independent_of_the_shuffle_seed():
++    _install_fake_gpqa_datasets()
++    a = {t.task_id for t in load_split("gpqa", "test", max_items=None, seed=0)}
++    b = {t.task_id for t in load_split("gpqa", "test", max_items=None, seed=123)}
++    assert a == b
++
++
++def test_holdout_indices_are_deterministic_and_proportional():
++    first = holdout_indices("gpqa", N_ROWS)
++    assert first == holdout_indices("gpqa", N_ROWS)
++    assert len(first) == round(N_ROWS * 0.25)
++    assert all(0 <= i < N_ROWS for i in first)
++
++
++def test_holdout_never_empties_either_side():
++    for n in (2, 3, 5):
++        held = holdout_indices("gpqa", n)
++        assert 1 <= len(held) <= n - 1
++
++
++def test_benchmarks_without_a_holdout_pass_through():
++    items = list(range(10))
++    assert holdout_indices("math500", 10) == frozenset()
++    assert select_holdout("math500", "test", items) == items
++    assert select_holdout("math500", "train", items) == items
++
++
++def test_load_tasks_shim_uses_same_resolution():
++    _install_fake_gpqa_datasets()
++    tasks = load_tasks("gpqa", "test", max_items=3, seed=0)
++    assert len(tasks) == 3
++    assert tasks[0].benchmark == "gpqa"
++
++
++def test_toy_fallback_still_warns_when_hf_missing(monkeypatch):
++    monkeypatch.setattr("trinity.adapters.loaders._try_load_hf", lambda *a, **k: None)
++    sys.modules.pop("datasets", None)
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always", ToyFallbackWarning)
++        tasks = load_split("gpqa", "test", max_items=None, seed=0)
++    assert len(tasks) == 2
++    assert any(isinstance(w.message, ToyFallbackWarning) for w in caught)

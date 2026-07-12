@@ -1,0 +1,242 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index 3597b05..cb0d1ae 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -18,6 +18,18 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
+ 
+ ---
+ 
++## 2026-07-10 — The hidden-benchmark build accepted toy data, then died pointing elsewhere  #mistake #gotcha #repro
++**Context:** #73 fixed MMLU's `train` split and wired `ToyFallbackWarning` into `load_split`. Checking what the *hidden-benchmark builder* does when that warning fires.
++**Expected:** `build_benchmark.py` refuses to seal a benchmark whose questions came from the 2-item offline toy set.
++**Actual:** it accepts them. `protocol.sample_pool` draws from the `"train"` split, so with `datasets` unavailable (offline box, or the gated `Idavidrein/gpqa`) the pool is the toy set. A warning is emitted — and warnings do not stop anything. The build then dies much later, in `select_splits`:
++```
++_sample_pool('mmlu')  -> 2 tasks  (ToyFallbackWarning emitted)
++select_splits         -> ValueError: pool has 2 tasks but the protocol needs 220 (eval=150, audit=50, live=20)
++```
++That error names neither the toy fallback nor the split that failed to load. Someone reading it would go hunting in `benchmark_protocol.py`, which is entirely innocent.
++**Root cause:** the loaders correctly *report* the substitution, but the only consumer for whom toy data is categorically unacceptable — the sealed, integrity-hashed hidden benchmark — never listened. `select_splits`' size check caught it by accident, one stage too late, because 2 < 220. A benchmark whose toy set happened to exceed the protocol's counts would have been sealed and hashed as real data with nothing but a warning on stderr.
++**Fix / decision:** escalate `ToyFallbackWarning` to an error inside `_sample_pool` (`warnings.simplefilter("error", ToyFallbackWarning)`), and re-raise it as a `RuntimeError` that names the benchmark, quotes the original warning, and states the remedy. The original warning is preserved as `__cause__` rather than swallowed. Chose this over threading an `allow_toy_fallback=False` flag up through `BenchmarkAdapter.load_tasks`: escalating the warning reuses the signal #73 already added, changes no interface, and cannot be forgotten by the next adapter — any loader that warns is covered for free.
++**Follow-up:** `trinity.train` has the same exposure — training on 2 toy questions produces a normal-looking receipt — but it goes through `load_tasks` rather than `_sample_pool`, so it needs its own decision about whether an offline smoke run should stay permitted. Deliberately out of scope here.
+ ## 2026-07-11 — Audit random-routing baseline was non-reproducible (shared rng under asyncio.gather)  #mistake #finding #decision
+ 
+ **Context:** `scripts/audit_eval.py` is the SEALED, run-once "honest, ungameable"
+diff --git a/scripts/build_benchmark.py b/scripts/build_benchmark.py
+index 94dde9d..72d42d3 100644
+--- a/scripts/build_benchmark.py
++++ b/scripts/build_benchmark.py
+@@ -71,10 +71,45 @@ def _encrypt_json(data: dict, password: str) -> str:
+ 
+ 
+ def _sample_pool(benchmark: str, counts: Dict[str, int]) -> List[Any]:
+-    """Sample the deterministic task pool per the frozen protocol (sealed seed)."""
++    """Sample the deterministic task pool per the frozen protocol (sealed seed).
++
++    The loaders substitute a tiny offline toy set whenever HuggingFace is
++    unreachable, a dataset is gated, or a split does not resolve. That fallback
++    exists so smoke tests run with zero network -- it must never reach the hidden
++    benchmark, whose questions are sealed and integrity-hashed. The
++    :class:`~trinity.adapters.split_policy.ToyFallbackWarning` the loaders already
++    emit is therefore escalated to an error here.
++
++    Without this the build limps on and dies later inside
++    :func:`benchmark_protocol.select_splits` with ``pool has 2 tasks but the
++    protocol needs 220`` -- an error naming neither the toy fallback nor the
++    benchmark split that failed to load.
++
++    Args:
++        benchmark: Benchmark name.
++        counts: Per-split question counts from the frozen protocol.
++
++    Returns:
++        The deterministic task pool.
++
++    Raises:
++        RuntimeError: If the pool would be drawn from the offline toy set.
++    """
++    import warnings
++
++    from trinity.adapters.split_policy import ToyFallbackWarning
+     from trinity.orchestration.dataset import load_tasks
+ 
+-    return protocol.sample_pool(load_tasks, benchmark, counts, seed=_BENCHMARK_SEED)
++    with warnings.catch_warnings():
++        warnings.simplefilter("error", ToyFallbackWarning)
++        try:
++            return protocol.sample_pool(load_tasks, benchmark, counts, seed=_BENCHMARK_SEED)
++        except ToyFallbackWarning as exc:
++            raise RuntimeError(
++                f"Refusing to build the hidden benchmark for {benchmark!r} from the "
++                f"offline toy set: {exc} Install `datasets`, check network access, and "
++                f"verify the benchmark's train split exists upstream."
++            ) from exc
+ 
+ 
+ async def _cache_answers(
+diff --git a/tests/test_build_benchmark_toy_guard.py b/tests/test_build_benchmark_toy_guard.py
+new file mode 100644
+index 0000000..ebbd9ba
+--- /dev/null
++++ b/tests/test_build_benchmark_toy_guard.py
+@@ -0,0 +1,161 @@
++"""The hidden benchmark must never be built from the offline toy set.
++
++`benchmark_protocol.sample_pool` draws its pool from the ``"train"`` split. The
++loaders substitute a 2-3 item toy set whenever HuggingFace is unreachable, a
++dataset is gated (``Idavidrein/gpqa``), or a split does not resolve -- emitting a
++``ToyFallbackWarning``. A warning is not enough here: the hidden benchmark's
++questions are sealed and integrity-hashed, so toy data must abort the build.
++
++Before this guard, ``_sample_pool`` returned the toy tasks and the build died much
++later inside ``select_splits`` with ``pool has 2 tasks but the protocol needs 220``
++-- an error naming neither the toy fallback nor the split that failed to load.
++
++Offline: no network. ``datasets`` is faked (or removed) per test.
++"""
++from __future__ import annotations
++
++import importlib.util
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++_REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(_REPO / "src"))
++
++
++def _load(name: str, relpath: str):
++    spec = importlib.util.spec_from_file_location(name, _REPO / relpath)
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++protocol = _load("benchmark_protocol", "scripts/benchmark_protocol.py")
++build_benchmark = _load("build_benchmark", "scripts/build_benchmark.py")
++
++
++def _install_missing_datasets(monkeypatch):
++    """Make ``import datasets`` fail — the offline dev box, or a gated dataset."""
++    monkeypatch.setitem(sys.modules, "datasets", None)
++
++
++def _install_fake_datasets(monkeypatch, n_rows: int = 2000):
++    """A working ``datasets`` serving `cais/mmlu`'s real split set."""
++    real = {("cais/mmlu", "all"): {"test", "validation", "dev", "auxiliary_train"}}
++
++    def load_dataset(path, name=None, split=None, **kw):
++        available = real.get((path, name))
++        if available is None:
++            raise ValueError(f"Dataset {path!r} is not available.")
++        if split not in available:
++            raise ValueError(f"Unknown split {split!r}.")
++        return [
++            {
++                "question": f"real question {i}",
++                "choices": ["alpha", "beta", "gamma", "delta"],
++                "answer": i % 4,
++                "subject": "astronomy",
++            }
++            for i in range(n_rows)
++        ]
++
++    module = types.ModuleType("datasets")
++    module.load_dataset = load_dataset  # type: ignore[attr-defined]
++    monkeypatch.setitem(sys.modules, "datasets", module)
++
++
++# --------------------------------------------------------------------------- #
++# The guard
++# --------------------------------------------------------------------------- #
++def test_toy_fallback_aborts_the_build(monkeypatch):
++    """The regression: previously this returned 2 toy tasks and limped on."""
++    _install_missing_datasets(monkeypatch)
++    counts = protocol.split_counts("mmlu")
++
++    with pytest.raises(RuntimeError, match="Refusing to build the hidden benchmark"):
++        build_benchmark._sample_pool("mmlu", counts)
++
++
++def test_abort_message_names_the_benchmark(monkeypatch):
++    _install_missing_datasets(monkeypatch)
++    counts = protocol.split_counts("gpqa")
++
++    with pytest.raises(RuntimeError, match="'gpqa'"):
++        build_benchmark._sample_pool("gpqa", counts)
++
++
++def test_abort_message_explains_the_remedy(monkeypatch):
++    _install_missing_datasets(monkeypatch)
++    counts = protocol.split_counts("mmlu")
++
++    with pytest.raises(RuntimeError) as excinfo:
++        build_benchmark._sample_pool("mmlu", counts)
++
++    message = str(excinfo.value)
++    assert "toy set" in message
++    assert "datasets" in message
++
++
++def test_abort_chains_the_original_warning(monkeypatch):
++    """The `ToyFallbackWarning` is preserved as `__cause__`, not swallowed."""
++    from trinity.adapters.split_policy import ToyFallbackWarning
++
++    _install_missing_datasets(monkeypatch)
++    counts = protocol.split_counts("mmlu")
++
++    with pytest.raises(RuntimeError) as excinfo:
++        build_benchmark._sample_pool("mmlu", counts)
++
++    assert isinstance(excinfo.value.__cause__, ToyFallbackWarning)
++
++
++def test_no_silent_short_pool(monkeypatch):
++    """It must raise, not return a pool too small for the protocol."""
++    _install_missing_datasets(monkeypatch)
++    counts = protocol.split_counts("mmlu")
++
++    with pytest.raises(RuntimeError):
++        pool = build_benchmark._sample_pool("mmlu", counts)
++        assert len(pool) >= protocol.pool_size(counts), "unreachable: must have raised"
++
++
++# --------------------------------------------------------------------------- #
++# The happy path must be untouched
++# --------------------------------------------------------------------------- #
++def test_real_data_builds_a_full_pool(monkeypatch):
++    _install_fake_datasets(monkeypatch)
++    counts = protocol.split_counts("mmlu")
++
++    pool = build_benchmark._sample_pool("mmlu", counts)
++
++    assert len(pool) == protocol.pool_size(counts)
++    assert not any(str(t.task_id).startswith("mmlu-toy") for t in pool)
++
++
++def test_real_data_carves_the_protocol_splits(monkeypatch):
++    _install_fake_datasets(monkeypatch)
++    counts = protocol.split_counts("mmlu")
++
++    pool = build_benchmark._sample_pool("mmlu", counts)
++    splits = protocol.select_splits(pool, counts)
++
++    assert {k: len(v) for k, v in splits.items()} == dict(counts)
++
++
++def test_the_warning_filter_does_not_leak(monkeypatch):
++    """`catch_warnings` must restore the global filters for other callers."""
++    import warnings
++
++    from trinity.adapters.split_policy import ToyFallbackWarning
++
++    _install_fake_datasets(monkeypatch)
++    build_benchmark._sample_pool("mmlu", protocol.split_counts("mmlu"))
++
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        warnings.warn("still just a warning", ToyFallbackWarning)
++
++    assert len(caught) == 1

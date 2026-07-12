@@ -1,0 +1,258 @@
+diff --git a/scripts/fugu_baseline_eval.py b/scripts/fugu_baseline_eval.py
+index 800bb6e..dafc999 100644
+--- a/scripts/fugu_baseline_eval.py
++++ b/scripts/fugu_baseline_eval.py
+@@ -57,7 +57,9 @@ async def _run(args) -> int:
+     pool = OpenRouterPool(args.models)
+     pool_models = list(pool.models)
+     conductor = PromptedConductor(
+-        pool, args.conductor_model, max_tokens=args.conductor_max_tokens
++        pool, args.conductor_model, max_tokens=args.conductor_max_tokens,
++        # The eval parses with allow_self=(max_depth > 0); keep the prompt in sync.
++        allow_self=(args.max_depth > 0),
+     )
+     tasks = _load_tasks(args)
+     prices = price_table(args.conductor_model, conductor_local=False)
+diff --git a/src/trinity/fugu/conductor.py b/src/trinity/fugu/conductor.py
+index d1dc2fc..392ea5d 100644
+--- a/src/trinity/fugu/conductor.py
++++ b/src/trinity/fugu/conductor.py
+@@ -49,27 +49,42 @@ async def propose(
+     ) -> Proposal: ...
+ 
+ 
+-def _worker_menu(worker_names: list[str]) -> str:
++def _worker_menu(worker_names: list[str], *, allow_self: bool = True) -> str:
+     lines = [f"  {i}: {name}" for i, name in enumerate(worker_names)]
+-    lines.append(f"  {len(worker_names)}: yourself (recursive sub-workflow)")
++    if allow_self:
++        lines.append(f"  {len(worker_names)}: yourself (recursive sub-workflow)")
+     return "\n".join(lines)
+ 
+ 
+ def build_prompt(
+-    task: Task, worker_names: list[str], *, max_steps: int = MAX_STEPS
++    task: Task,
++    worker_names: list[str],
++    *,
++    max_steps: int = MAX_STEPS,
++    allow_self: bool = True,
+ ) -> list[dict]:
+     """Chat messages instructing a model to emit a parseable workflow.
+ 
+     The format described here is exactly what :func:`trinity.fugu.workflow.parse_workflow`
+     accepts, so a well-behaved model's output passes the parse-gate.
++
++    Args:
++        task: The query to route.
++        worker_names: The worker menu, in index order.
++        max_steps: Cap advertised to the model.
++        allow_self: Whether the self index (``len(worker_names)``) may be routed to.
++            ``propose_and_run`` parses with ``allow_self=(max_depth > 0)``, so when
++            recursion is disabled the self index is REJECTED by the parse-gate.
++            Advertising it anyway would instruct the model to emit a workflow that
++            is guaranteed to fail, which is a parse-gate false reject. Pass the same
++            value the parse-gate will use.
+     """
+-    n = len(worker_names)
+     system = (
+         "You are the Conductor: you orchestrate a pool of worker LLMs to solve a "
+         "problem. You do NOT solve it yourself; you design a short workflow and "
+         "assign each step to a worker.\n\n"
+         "Available workers (by index):\n"
+-        f"{_worker_menu(worker_names)}\n\n"
++        f"{_worker_menu(worker_names, allow_self=allow_self)}\n\n"
+         f"Design a workflow of 1 to {max_steps} steps. Output EXACTLY three Python "
+         "lists of equal length and NOTHING else:\n"
+         "  model_id    = [..]   # worker index for each step\n"
+@@ -77,9 +92,13 @@ def build_prompt(
+         "  access_list = [..]   # for each step: [] for none, \"all\", or a list of\n"
+         "                       # earlier step indices whose outputs that step may read\n"
+         "Rules: indices in access_list must be strictly smaller than the step's own "
+-        "index. The LAST step must produce the final answer in the required format. "
+-        f"Worker index {n} means call yourself recursively on a sub-problem."
++        "index. The LAST step must produce the final answer in the required format."
+     )
++    if allow_self:
++        system += (
++            f" Worker index {len(worker_names)} means call yourself recursively "
++            "on a sub-problem."
++        )
+     user = f"Benchmark: {task.benchmark}\nProblem:\n{task.prompt}\n\nEmit the three lists."
+     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+ 
+@@ -89,12 +108,17 @@ class PromptedConductor:
+ 
+     def __init__(self, pool, model: str, *, max_steps: int = MAX_STEPS,
+                  sample_temperature: float = 0.7, greedy_temperature: float = 0.2,
+-                 max_tokens: int = 1600, reasoning: str | None = "none"):
++                 max_tokens: int = 1600, reasoning: str | None = "none",
++                 allow_self: bool = True):
+         self.pool = pool
+         self.model = model
+         self.max_steps = max_steps
+         self.sample_temperature = sample_temperature
+         self.greedy_temperature = greedy_temperature
++        # Must match the parse-gate: propose_and_run uses allow_self=(max_depth > 0).
++        # Advertising the self index when it will be rejected instructs the model to
++        # emit a workflow that cannot pass the gate.
++        self.allow_self = bool(allow_self)
+         # The Conductor emits the three lists DIRECTLY; a reasoning model that
+         # spends its token budget on chain-of-thought gets truncated before the
+         # lists appear (a parse-gate false reject). Default to no reasoning and a
+@@ -107,7 +131,9 @@ async def propose(
+         sample: bool = False, rng=None, client=None,
+     ) -> Proposal:
+         del rng  # temperature controls exploration for the prompted baseline
+-        messages = build_prompt(task, worker_names, max_steps=self.max_steps)
++        messages = build_prompt(
++            task, worker_names, max_steps=self.max_steps, allow_self=self.allow_self
++        )
+         temp = self.sample_temperature if sample else self.greedy_temperature
+         kwargs = dict(temperature=temp, max_tokens=self.max_tokens)
+         if self.reasoning is not None:
+diff --git a/src/trinity/fugu/hf_backend.py b/src/trinity/fugu/hf_backend.py
+index 5e82ab8..34cb7d7 100644
+--- a/src/trinity/fugu/hf_backend.py
++++ b/src/trinity/fugu/hf_backend.py
+@@ -390,7 +390,12 @@ def _sample_nll(self, task: Task, proposal: str):
+         return out.loss.to(torch.float32), int(valid.item())
+ 
+     def _prompt_text(self, task: Task) -> str:
+-        messages = build_prompt(task, self.worker_names)
++        # `constrained_allow_self` is documented "keep in sync with max_depth > 0",
++        # which is the value the parse-gate uses, so the prompt must not advertise
++        # the self index when it is False.
++        messages = build_prompt(
++            task, self.worker_names, allow_self=self.cfg.constrained_allow_self
++        )
+         return (
+             _chat_text(self.tokenizer, messages, add_generation_prompt=True)
+             + self.cfg.proposal_prefix
+diff --git a/tests/test_conductor_prompt_allow_self.py b/tests/test_conductor_prompt_allow_self.py
+new file mode 100644
+index 0000000..c17c603
+--- /dev/null
++++ b/tests/test_conductor_prompt_allow_self.py
+@@ -0,0 +1,121 @@
++"""Offline tests: the Conductor prompt must agree with the parse-gate on the self index.
++
++`propose_and_run` parses with `allow_self=(max_depth > 0)`. If the prompt advertises
++the self index while the gate rejects it, a prompt-obeying model produces a workflow
++that cannot pass — a parse-gate false reject. No network, no GPU.
++"""
++from __future__ import annotations
++
++from trinity.fugu.conductor import PromptedConductor, build_prompt
++from trinity.fugu.workflow import parse_workflow
++from trinity.types import Task
++
++WORKERS = ["m-a", "m-b", "m-c"]
++SELF_INDEX = len(WORKERS)
++TASK = Task(task_id="t", benchmark="math500", prompt="2+2?", answer="4")
++
++
++def _system(**kw) -> str:
++    return build_prompt(TASK, WORKERS, **kw)[0]["content"]
++
++
++# ---------------------------------------------------------------------------
++# The prompt tracks allow_self
++# ---------------------------------------------------------------------------
++def test_self_index_is_advertised_when_recursion_is_allowed():
++    system = _system(allow_self=True)
++    assert f"  {SELF_INDEX}: yourself" in system
++    assert f"Worker index {SELF_INDEX} means call yourself recursively" in system
++
++
++def test_self_index_is_not_advertised_when_recursion_is_disabled():
++    system = _system(allow_self=False)
++    assert "yourself (recursive sub-workflow)" not in system
++    assert "call yourself recursively" not in system
++    # The real workers are still listed, in index order.
++    for i, name in enumerate(WORKERS):
++        assert f"  {i}: {name}" in system
++
++
++def test_allow_self_defaults_to_true_so_existing_callers_are_unchanged():
++    assert _system() == _system(allow_self=True)
++
++
++# ---------------------------------------------------------------------------
++# The regression: prompt and parse-gate must not disagree
++# ---------------------------------------------------------------------------
++def _routes_to_self() -> str:
++    return f"model_id=[{SELF_INDEX}]\nsubtasks=['solve']\naccess_list=[[]]"
++
++
++def test_a_prompt_obeying_model_is_never_rejected_by_the_gate():
++    # For each parse-gate setting, a model that only uses indices the prompt
++    # advertised must pass the gate.
++    for allow_self in (False, True):
++        system = _system(allow_self=allow_self)
++        advertised_self = f"  {SELF_INDEX}: yourself" in system
++        assert advertised_self == allow_self
++
++        if advertised_self:
++            # It was offered, so it must parse.
++            assert parse_workflow(_routes_to_self(), len(WORKERS), allow_self=allow_self)[1]
++
++
++def test_self_route_still_rejected_by_the_gate_when_disallowed():
++    # Unchanged gate behaviour: the fix is to stop advertising it, not to accept it.
++    assert parse_workflow(_routes_to_self(), len(WORKERS), allow_self=False)[1] is False
++    assert parse_workflow(_routes_to_self(), len(WORKERS), allow_self=True)[1] is True
++
++
++def test_a_plain_worker_workflow_parses_under_both_settings():
++    proposal = "model_id=[0,1]\nsubtasks=['solve','answer']\naccess_list=[[],[0]]"
++    assert parse_workflow(proposal, len(WORKERS), allow_self=False)[1] is True
++    assert parse_workflow(proposal, len(WORKERS), allow_self=True)[1] is True
++
++
++# ---------------------------------------------------------------------------
++# PromptedConductor forwards the flag
++# ---------------------------------------------------------------------------
++class _CapturingPool:
++    """Records the messages it is handed; returns a parseable proposal."""
++
++    def __init__(self) -> None:
++        self.messages: list[dict] = []
++
++    async def chat(self, model, messages, **kwargs):
++        self.messages = messages
++
++        class _R:
++            text = "model_id=[0]\nsubtasks=['solve']\naccess_list=[[]]"
++            prompt_tokens = 1
++            completion_tokens = 1
++
++        return _R()
++
++
++def _propose_system(allow_self: bool) -> str:
++    import asyncio
++
++    pool = _CapturingPool()
++    conductor = PromptedConductor(pool, "m-a", allow_self=allow_self)
++    asyncio.run(conductor.propose(TASK, WORKERS))
++    return pool.messages[0]["content"]
++
++
++def test_prompted_conductor_forwards_allow_self_into_the_prompt():
++    assert "yourself (recursive sub-workflow)" in _propose_system(True)
++    assert "yourself (recursive sub-workflow)" not in _propose_system(False)
++
++
++def test_prompted_conductor_defaults_to_allowing_self():
++    import asyncio
++
++    pool = _CapturingPool()
++    asyncio.run(PromptedConductor(pool, "m-a").propose(TASK, WORKERS))
++    assert "yourself (recursive sub-workflow)" in pool.messages[0]["content"]
++
++
++if __name__ == "__main__":
++    import pytest
++
++    raise SystemExit(pytest.main([__file__, "-q"]))

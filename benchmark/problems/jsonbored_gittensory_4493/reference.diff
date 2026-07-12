@@ -1,0 +1,360 @@
+diff --git a/packages/gittensory-miner/lib/portfolio-queue-manager.d.ts b/packages/gittensory-miner/lib/portfolio-queue-manager.d.ts
+new file mode 100644
+index 000000000..68ecee9b9
+--- /dev/null
++++ b/packages/gittensory-miner/lib/portfolio-queue-manager.d.ts
+@@ -0,0 +1,46 @@
++import type { PortfolioCaps } from "@jsonbored/gittensory-engine";
++import type { EnqueueItem, PortfolioQueueStore, QueueEntry } from "./portfolio-queue.js";
++
++export type PortfolioQueueClaimTarget = {
++  repoFullName: string;
++  identifier: string;
++};
++
++export function queueItemId(repoFullName: string, identifier: string): string;
++
++export function parseQueueItemId(id: string): PortfolioQueueClaimTarget;
++
++export function normalizePortfolioCaps(caps?: Partial<PortfolioCaps>): PortfolioCaps;
++
++export function entriesToPortfolioQueue(entries: QueueEntry[]): {
++  buckets: Array<{
++    repoFullName: string;
++    items: Array<{ id: string; repoFullName: string; state: "queued" | "in_progress" }>;
++  }>;
++};
++
++export function selectEligibleBatch(
++  entries: QueueEntry[],
++  caps: PortfolioCaps,
++): PortfolioQueueClaimTarget[];
++
++export type PortfolioQueueManager = {
++  caps: PortfolioCaps;
++  store: PortfolioQueueStore;
++  dbPath: string;
++  enqueue(item: EnqueueItem): QueueEntry;
++  listQueue(repoFullName?: string | null): QueueEntry[];
++  markDone(repoFullName: string, identifier: string): QueueEntry | null;
++  claimNextBatch(): QueueEntry[];
++  close(): void;
++};
++
++export type InitPortfolioQueueManagerOptions = {
++  caps?: Partial<PortfolioCaps>;
++  store?: PortfolioQueueStore;
++  dbPath?: string;
++};
++
++export function initPortfolioQueueManager(options?: InitPortfolioQueueManagerOptions): PortfolioQueueManager;
++
++export function closeDefaultPortfolioQueueManager(): void;
+diff --git a/packages/gittensory-miner/lib/portfolio-queue-manager.js b/packages/gittensory-miner/lib/portfolio-queue-manager.js
+new file mode 100644
+index 000000000..ed7b8ba41
+--- /dev/null
++++ b/packages/gittensory-miner/lib/portfolio-queue-manager.js
+@@ -0,0 +1,102 @@
++// Stateful PortfolioQueueManager (#4285): compose the persisted SQLite portfolio/queue store
++// (portfolio-queue.js, #2292) with the pure engine selector (nextEligibleItems, queue.ts, #2326) so batch
++// claiming respects global/per-repo WIP caps and cross-repo diversification instead of a naive priority-only
++// single-row dequeue. Caps are plain constructor arguments — not wired to .gittensory-miner.yml here.
++import { nextEligibleItems } from "@jsonbored/gittensory-engine";
++import { initPortfolioQueueStore } from "./portfolio-queue.js";
++
++const ITEM_ID_SEPARATOR = "::";
++
++/** Stable composite id for projecting SQLite rows into the engine's PortfolioQueueItem shape. */
++export function queueItemId(repoFullName, identifier) {
++  return `${repoFullName}${ITEM_ID_SEPARATOR}${identifier}`;
++}
++
++/** Reverse {@link queueItemId} after engine selection so claims can target SQLite primary keys. */
++export function parseQueueItemId(id) {
++  if (typeof id !== "string") throw new Error("invalid_queue_item_id");
++  const separatorIndex = id.indexOf(ITEM_ID_SEPARATOR);
++  if (separatorIndex <= 0 || separatorIndex === id.length - ITEM_ID_SEPARATOR.length) {
++    throw new Error("invalid_queue_item_id");
++  }
++  return {
++    repoFullName: id.slice(0, separatorIndex),
++    identifier: id.slice(separatorIndex + ITEM_ID_SEPARATOR.length),
++  };
++}
++
++/** Coerce caps to finite non-negative integers (mirrors the engine's normalizeCaps posture). */
++export function normalizePortfolioCaps(caps = {}) {
++  const globalWipCap = Number.isFinite(caps.globalWipCap) ? Math.max(0, Math.trunc(caps.globalWipCap)) : 0;
++  const perRepoWipCap = Number.isFinite(caps.perRepoWipCap) ? Math.max(0, Math.trunc(caps.perRepoWipCap)) : 0;
++  return { globalWipCap, perRepoWipCap };
++}
++
++/** Project persisted queue rows into the engine's in-memory PortfolioQueue (done rows omitted). Pure. */
++export function entriesToPortfolioQueue(entries) {
++  const activeEntries = Array.isArray(entries) ? entries.filter((entry) => entry?.status !== "done") : [];
++  const bucketsByRepo = new Map();
++  const bucketOrder = [];
++  for (const entry of activeEntries) {
++    const repoFullName = typeof entry.repoFullName === "string" ? entry.repoFullName.trim() : "";
++    const identifier = typeof entry.identifier === "string" ? entry.identifier.trim() : "";
++    if (!repoFullName || !identifier) continue;
++    const repoKey = repoFullName.toLowerCase();
++    if (!bucketsByRepo.has(repoKey)) {
++      bucketsByRepo.set(repoKey, []);
++      bucketOrder.push(repoKey);
++    }
++    bucketsByRepo.get(repoKey).push({
++      id: queueItemId(repoFullName, identifier),
++      repoFullName,
++      state: entry.status === "in_progress" ? "in_progress" : "queued",
++    });
++  }
++  return {
++    buckets: bucketOrder.map((repoFullName) => ({
++      repoFullName,
++      items: bucketsByRepo.get(repoFullName),
++    })),
++  };
++}
++
++/** Select the next eligible batch from active rows using the engine primitive. Pure. */
++export function selectEligibleBatch(entries, caps) {
++  const normalizedCaps = normalizePortfolioCaps(caps);
++  const queue = entriesToPortfolioQueue(entries);
++  return nextEligibleItems(queue, normalizedCaps).map((item) => parseQueueItemId(item.id));
++}
++
++/**
++ * Open a caps-aware portfolio queue manager backed by the local SQLite store. The existing single-row
++ * `dequeueNext()` CLI surface is untouched — this adds `claimNextBatch()` for fleet-style batch claiming.
++ */
++export function initPortfolioQueueManager(options = {}) {
++  const caps = normalizePortfolioCaps(options.caps ?? { globalWipCap: 1, perRepoWipCap: 1 });
++  const store = options.store ?? initPortfolioQueueStore(options.dbPath);
++
++  return {
++    caps,
++    store,
++    dbPath: store.dbPath,
++    enqueue(item) {
++      return store.enqueue(item);
++    },
++    listQueue(repoFullName) {
++      return store.listQueue(repoFullName);
++    },
++    markDone(repoFullName, identifier) {
++      return store.markDone(repoFullName, identifier);
++    },
++    claimNextBatch() {
++      return store.batchClaim((entries) => selectEligibleBatch(entries, caps));
++    },
++    close() {
++      store.close();
++    },
++  };
++}
++
++export function closeDefaultPortfolioQueueManager() {
++  // Reserved for symmetry with other miner stores; managers are opened explicitly today.
++}
+diff --git a/packages/gittensory-miner/lib/portfolio-queue.d.ts b/packages/gittensory-miner/lib/portfolio-queue.d.ts
+index 6fe17dab9..c1560421e 100644
+--- a/packages/gittensory-miner/lib/portfolio-queue.d.ts
++++ b/packages/gittensory-miner/lib/portfolio-queue.d.ts
+@@ -20,6 +20,9 @@ export type PortfolioQueueStore = {
+   dequeueNext(): QueueEntry | null;
+   listQueue(repoFullName?: string | null): QueueEntry[];
+   markDone(repoFullName: string, identifier: string): QueueEntry | null;
++  batchClaim(
++    selectFn: (entries: QueueEntry[]) => Array<{ repoFullName: string; identifier: string }>,
++  ): QueueEntry[];
+   close(): void;
+ };
+ 
+diff --git a/packages/gittensory-miner/lib/portfolio-queue.js b/packages/gittensory-miner/lib/portfolio-queue.js
+index a07adc5d9..b59f4a27d 100644
+--- a/packages/gittensory-miner/lib/portfolio-queue.js
++++ b/packages/gittensory-miner/lib/portfolio-queue.js
+@@ -133,6 +133,14 @@ export function initPortfolioQueueStore(dbPath = resolvePortfolioQueueDbPath())
+   const listRepoStatement = db.prepare(
+     `SELECT * FROM miner_portfolio_queue WHERE repo_full_name = ? ${ORDER}`,
+   );
++  const listActiveStatement = db.prepare(
++    `SELECT * FROM miner_portfolio_queue WHERE status IN ('queued', 'in_progress') ${ORDER}`,
++  );
++  const claimTargetStatement = db.prepare(`
++    UPDATE miner_portfolio_queue SET status = 'in_progress'
++    WHERE repo_full_name = ? AND identifier = ? AND status = 'queued'
++    RETURNING *
++  `);
+ 
+   return {
+     dbPath: resolvedPath,
+@@ -162,6 +170,31 @@ export function initPortfolioQueueStore(dbPath = resolvePortfolioQueueDbPath())
+       const row = getStatement.get(normalizedRepo, normalizedIdentifier);
+       return row ? rowToEntry(row) : null;
+     },
++    /**
++     * Transactional caps-aware batch claim hook used by portfolio-queue-manager.js: re-read active rows under an
++     * exclusive lock, let the caller pick targets, then atomically flip each still-queued row to `in_progress`.
++     */
++    batchClaim(selectFn) {
++      if (typeof selectFn !== "function") throw new Error("invalid_batch_claim_selector");
++      db.exec("BEGIN IMMEDIATE");
++      try {
++        const entries = listActiveStatement.all().map(rowToEntry);
++        const targets = selectFn(entries);
++        if (!Array.isArray(targets)) throw new Error("invalid_batch_claim_selection");
++        const claimed = [];
++        for (const target of targets) {
++          const repoFullName = normalizeRepoFullName(target?.repoFullName);
++          const identifier = normalizeIdentifier(target?.identifier);
++          const row = claimTargetStatement.get(repoFullName, identifier);
++          if (row) claimed.push(rowToEntry(row));
++        }
++        db.exec("COMMIT");
++        return claimed;
++      } catch (error) {
++        db.exec("ROLLBACK");
++        throw error;
++      }
++    },
+     close() {
+       db.close();
+     },
+diff --git a/packages/gittensory-miner/package.json b/packages/gittensory-miner/package.json
+index 91a297109..e6cccab43 100644
+--- a/packages/gittensory-miner/package.json
++++ b/packages/gittensory-miner/package.json
+@@ -32,7 +32,7 @@
+     "expected-engine.version"
+   ],
+   "scripts": {
+-    "build": "node --check bin/gittensory-miner.js && node --check lib/version.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/run-state-cli.js && node --check lib/update-check.js && node --check lib/worktree-allocator.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/event-ledger-cli.js && node --check lib/claim-ledger.js && node --check lib/claim-ledger-expiry.js && node --check lib/claim-ledger-cli.js && node --check lib/claim-adjudication.js && node --check lib/portfolio-queue.js && node --check lib/portfolio-queue-cli.js && node --check lib/portfolio-discovery.js && node --check lib/opportunity-ranker.js && node --check lib/plan-store.js && node --check lib/plan-store-cli.js && node --check lib/rejection-templates.js && node --check lib/governor-ledger.js && node --check lib/governor-ledger-cli.js && node --check lib/manage-status.js && node --check lib/manage-poll.js && node --check lib/status.js && node --check lib/laptop-init.js && node --check lib/replay-objective-anchor.js && node --check lib/replay-task-generation.js && node --check lib/calibration-types.js && node --check lib/calibration.js"
++    "build": "node --check bin/gittensory-miner.js && node --check lib/version.js && node --check lib/cli.js && node --check lib/deny-check.js && node --check lib/run-state-cli.js && node --check lib/update-check.js && node --check lib/worktree-allocator.js && node --check lib/opportunity-fanout.js && node --check lib/ci-poller.js && node --check lib/run-state.js && node --check lib/deny-hooks.js && node --check lib/event-ledger.js && node --check lib/event-ledger-cli.js && node --check lib/claim-ledger.js && node --check lib/claim-ledger-expiry.js && node --check lib/claim-ledger-cli.js && node --check lib/claim-adjudication.js && node --check lib/portfolio-queue.js && node --check lib/portfolio-queue-cli.js && node --check lib/portfolio-queue-manager.js && node --check lib/portfolio-discovery.js && node --check lib/opportunity-ranker.js && node --check lib/plan-store.js && node --check lib/plan-store-cli.js && node --check lib/rejection-templates.js && node --check lib/governor-ledger.js && node --check lib/governor-ledger-cli.js && node --check lib/manage-status.js && node --check lib/manage-poll.js && node --check lib/status.js && node --check lib/laptop-init.js && node --check lib/replay-objective-anchor.js && node --check lib/replay-task-generation.js && node --check lib/calibration-types.js && node --check lib/calibration.js"
+   },
+   "dependencies": {
+     "@jsonbored/gittensory-engine": ">=0.1.0 <1.0.0"
+diff --git a/test/unit/miner-portfolio-queue-manager.test.ts b/test/unit/miner-portfolio-queue-manager.test.ts
+new file mode 100644
+index 000000000..4e1b6471c
+--- /dev/null
++++ b/test/unit/miner-portfolio-queue-manager.test.ts
+@@ -0,0 +1,116 @@
++import { afterEach, describe, expect, it } from "vitest";
++import {
++  entriesToPortfolioQueue,
++  initPortfolioQueueManager,
++  normalizePortfolioCaps,
++  parseQueueItemId,
++  queueItemId,
++  selectEligibleBatch,
++} from "../../packages/gittensory-miner/lib/portfolio-queue-manager.js";
++import { initPortfolioQueueStore, type QueueEntry } from "../../packages/gittensory-miner/lib/portfolio-queue.js";
++
++const stores: Array<{ close(): void }> = [];
++
++afterEach(() => {
++  while (stores.length > 0) stores.pop()?.close();
++});
++
++function memoryManager(caps: { globalWipCap: number; perRepoWipCap: number }) {
++  const store = initPortfolioQueueStore(":memory:");
++  stores.push(store);
++  return initPortfolioQueueManager({ store, caps });
++}
++
++describe("normalizePortfolioCaps() (#4285)", () => {
++  it("coerces caps to finite non-negative integers", () => {
++    expect(normalizePortfolioCaps({ globalWipCap: 2.9, perRepoWipCap: -1 })).toEqual({
++      globalWipCap: 2,
++      perRepoWipCap: 0,
++    });
++    expect(normalizePortfolioCaps()).toEqual({ globalWipCap: 0, perRepoWipCap: 0 });
++  });
++});
++
++describe("entriesToPortfolioQueue() / selectEligibleBatch() (#4285)", () => {
++  it("mirrors the engine diversification scenario through persisted row shapes", () => {
++    const entries: QueueEntry[] = [
++      { repoFullName: "acme/alpha", identifier: "a-running", priority: 0, status: "in_progress", enqueuedAt: "t1" },
++      { repoFullName: "acme/alpha", identifier: "a-queued-1", priority: 0, status: "queued", enqueuedAt: "t2" },
++      { repoFullName: "acme/alpha", identifier: "a-queued-2", priority: 0, status: "queued", enqueuedAt: "t3" },
++      { repoFullName: "acme/beta", identifier: "b-queued-1", priority: 0, status: "queued", enqueuedAt: "t4" },
++      { repoFullName: "acme/gamma", identifier: "c-queued-1", priority: 0, status: "queued", enqueuedAt: "t5" },
++    ];
++
++    expect(
++      selectEligibleBatch(entries, { globalWipCap: 4, perRepoWipCap: 2 }).map((target) => target.identifier),
++    ).toEqual(["b-queued-1", "c-queued-1", "a-queued-1"]);
++    expect(entriesToPortfolioQueue(entries).buckets.map((bucket) => bucket.repoFullName)).toEqual([
++      "acme/alpha",
++      "acme/beta",
++      "acme/gamma",
++    ]);
++    expect(parseQueueItemId(queueItemId("acme/beta", "b-queued-1"))).toEqual({
++      repoFullName: "acme/beta",
++      identifier: "b-queued-1",
++    });
++  });
++
++  it("returns nothing when either cap is zero", () => {
++    const entries: QueueEntry[] = [
++      { repoFullName: "acme/alpha", identifier: "x", priority: 0, status: "queued", enqueuedAt: "t1" },
++    ];
++    expect(selectEligibleBatch(entries, { globalWipCap: 0, perRepoWipCap: 1 })).toEqual([]);
++    expect(selectEligibleBatch(entries, { globalWipCap: 1, perRepoWipCap: 0 })).toEqual([]);
++  });
++});
++
++describe("initPortfolioQueueManager().claimNextBatch() (#4285)", () => {
++  it("returns an empty batch on an empty queue", () => {
++    const manager = memoryManager({ globalWipCap: 2, perRepoWipCap: 2 });
++    expect(manager.claimNextBatch()).toEqual([]);
++  });
++
++  it("respects a saturated per-repo cap", () => {
++    const manager = memoryManager({ globalWipCap: 4, perRepoWipCap: 1 });
++    manager.enqueue({ repoFullName: "acme/alpha", identifier: "running", priority: 1 });
++    manager.enqueue({ repoFullName: "acme/alpha", identifier: "queued-1", priority: 2 });
++    manager.enqueue({ repoFullName: "acme/alpha", identifier: "queued-2", priority: 3 });
++    expect(manager.store.dequeueNext()?.identifier).toBe("queued-2");
++
++    expect(manager.claimNextBatch().map((entry) => entry.identifier)).toEqual([]);
++    expect(manager.listQueue("acme/alpha").map((entry) => [entry.identifier, entry.status])).toEqual([
++      ["queued-2", "in_progress"],
++      ["queued-1", "queued"],
++      ["running", "queued"],
++    ]);
++  });
++
++  it("claims a diversified batch and leaves dequeueNext behavior unchanged for the CLI path", () => {
++    const manager = memoryManager({ globalWipCap: 4, perRepoWipCap: 2 });
++    manager.enqueue({ repoFullName: "acme/alpha", identifier: "a-running", priority: 5 });
++    manager.enqueue({ repoFullName: "acme/alpha", identifier: "a-queued-1", priority: 4 });
++    manager.enqueue({ repoFullName: "acme/alpha", identifier: "a-queued-2", priority: 3 });
++    manager.enqueue({ repoFullName: "acme/beta", identifier: "b-queued-1", priority: 2 });
++    manager.enqueue({ repoFullName: "acme/gamma", identifier: "c-queued-1", priority: 1 });
++    manager.store.dequeueNext(); // single-row CLI path still claims highest priority only
++
++    const claimed = manager.claimNextBatch();
++    expect(claimed.map((entry) => entry.identifier)).toEqual(["b-queued-1", "c-queued-1", "a-queued-1"]);
++    expect(claimed.every((entry) => entry.status === "in_progress")).toBe(true);
++    expect(manager.listQueue().find((entry) => entry.identifier === "a-queued-2")?.status).toBe("queued");
++  });
++
++  it("does not claim rows another writer already took inside the same transaction window", () => {
++    const store = initPortfolioQueueStore(":memory:");
++    stores.push(store);
++    store.enqueue({ repoFullName: "acme/alpha", identifier: "one", priority: 1 });
++    store.enqueue({ repoFullName: "acme/beta", identifier: "two", priority: 1 });
++
++    const claimed = store.batchClaim((entries) => {
++      store.dequeueNext();
++      return selectEligibleBatch(entries, { globalWipCap: 2, perRepoWipCap: 1 });
++    });
++
++    expect(claimed.map((entry) => entry.identifier)).toEqual(["two"]);
++  });
++});

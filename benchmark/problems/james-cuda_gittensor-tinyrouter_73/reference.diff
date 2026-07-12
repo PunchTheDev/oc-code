@@ -1,0 +1,149 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index ee1b2a9..7c7fa57 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -58,6 +58,21 @@ seed=1: identical first population? True
+ **Fix / decision:** stop forwarding the seed to pycma. Pass `np.nan` (pycma's documented "do nothing") and call `np.random.seed(self.seed)` ourselves, since numpy treats `0` as an ordinary seed. This is behavior-preserving: pycma implements an honoured `seed=k` as exactly `np.random.seed(k)`, verified by a test that reconstructs the reference stream directly from `cma.CMAEvolutionStrategy` — so every previously-working seed keeps its byte-identical stream and archived fitness curves stay reproducible. `0` simply joins them. Rejected the tempting one-liner `seed or 1`, which would silently alias seeds 0 and 1 onto one stream (pinned by `test_zero_and_one_are_not_aliased`). Seeds outside `[0, 2**32-1]` now raise instead of reaching numpy.
+ **Follow-up:** the wrapper still seeds the **global** `numpy.random` state — that is unchanged from before (pycma did it too), but it means constructing a `SepCMAES` perturbs unrelated numpy randomness in the process. Isolating it behind a `np.random.Generator` / pycma's `randn` option is worth doing separately. Also relevant to the receipt gate in `pr_eval.py`: a "plausible CMA-ES fitness curve" is only re-derivable now that the default seed is honoured.
+ 
++## 2026-07-10 — MMLU `train` split resolved via shared split_policy  #finding #decision
++
++**Context:** `load_tasks("mmlu", "train")` silently fell back to the 2-item toy set
++because `cais/mmlu` publishes `auxiliary_train`, not `train` (issue #35).
++**Expected:** training and benchmark builds load real MMLU rows for logical `train`.
++**Actual:** `_try_load_hf` swallowed the unknown-split error; `load_split` substituted
++the toy set with no warning.
++**Root cause:** split name forwarded verbatim; no alias table on the built-in loader path
++(MMLU-Pro already fixed this in `split_policy.py` for its adapter).
++**Fix / decision:** extend `split_policy._SPLIT_ALIASES` with `mmlu: train →
++auxiliary_train`, resolve in `loaders.load_split`, and emit `ToyFallbackWarning` when
++the toy set stands in. Keeps one split-resolution module for all benchmarks.
++**Follow-up:** GPQA still has only an upstream `train` split; deterministic holdout for
++logical `test` is separate work.
++
+ ## 2026-07-10 — Hidden-benchmark cached answers used a bare prompt, not the WORKER turn  #mistake #finding #decision
+ 
+ **Context:** `scripts/build_benchmark.py::_cache_answers` pre-computes each pool
+diff --git a/src/trinity/adapters/loaders.py b/src/trinity/adapters/loaders.py
+index 5369ebf..563839b 100644
+--- a/src/trinity/adapters/loaders.py
++++ b/src/trinity/adapters/loaders.py
+@@ -24,6 +24,8 @@
+ 
+ from trinity.types import Task
+ 
++from .split_policy import resolve_split, warn_on_toy_fallback
++
+ #: Benchmarks with a dedicated raw loader in this module.
+ SUPPORTED_BENCHMARKS: tuple[str, ...] = ("math500", "mmlu", "gpqa", "livecodebench")
+ 
+@@ -445,9 +447,13 @@ def load_split(
+             f"Unknown benchmark {benchmark!r}. Supported: {SUPPORTED_BENCHMARKS}"
+         )
+ 
+-    tasks = _HF_LOADERS[key](split)
+-    if not tasks:
++    logical_split = (split or "test").strip().lower()
++    resolved_split = resolve_split(key, logical_split)
++    tasks = _HF_LOADERS[key](resolved_split)
++    used_toy = not tasks
++    if used_toy:
+         tasks = _toy_tasks(key)
++    warn_on_toy_fallback(key, logical_split, used_toy=used_toy)
+ 
+     rng = random.Random(seed)
+     tasks = list(tasks)
+diff --git a/src/trinity/adapters/split_policy.py b/src/trinity/adapters/split_policy.py
+index 9d970d5..3989c40 100644
+--- a/src/trinity/adapters/split_policy.py
++++ b/src/trinity/adapters/split_policy.py
+@@ -12,7 +12,13 @@
+ #: Logical split names that do not exist upstream, mapped per benchmark.
+ #: MMLU-Pro publishes only ``validation`` and ``test``; training callers use
+ #: ``train``, which we map to ``validation`` (issue #50).
++#: MMLU publishes ``auxiliary_train`` for training pool; logical ``train`` maps
++#: there (issue #35).
+ _SPLIT_ALIASES: dict[str, dict[str, str]] = {
++    "mmlu": {
++        "train": "auxiliary_train",
++        "training": "auxiliary_train",
++    },
+     "mmlu_pro": {
+         "train": "validation",
+         "training": "validation",
+diff --git a/tests/test_mmlu_train_split.py b/tests/test_mmlu_train_split.py
+new file mode 100644
+index 0000000..21aaebf
+--- /dev/null
++++ b/tests/test_mmlu_train_split.py
+@@ -0,0 +1,70 @@
++"""Tests for MMLU train-split resolution (issue #35)."""
++from __future__ import annotations
++
++import sys
++import types
++import warnings
++
++from trinity.adapters.loaders import load_split
++from trinity.adapters.split_policy import ToyFallbackWarning, resolve_split
++from trinity.orchestration.dataset import load_tasks
++
++
++def _install_fake_mmlu_datasets() -> None:
++    """Simulate cais/mmlu with the real upstream split set."""
++    real_splits = {"auxiliary_train", "test", "validation", "dev"}
++
++    def load_dataset(path, name=None, split=None, **kwargs):
++        if path != "cais/mmlu" or split not in real_splits:
++            raise ValueError(f"Unknown split {split!r}.")
++        return [
++            {
++                "question": f"q-{split}-{i}",
++                "choices": ["A", "B", "C", "D"],
++                "answer": 0,
++            }
++            for i in range(50)
++        ]
++
++    mod = types.ModuleType("datasets")
++    mod.load_dataset = load_dataset
++    sys.modules["datasets"] = mod
++
++
++def test_resolve_split_maps_train_to_auxiliary_train():
++    assert resolve_split("mmlu", "train") == "auxiliary_train"
++    assert resolve_split("mmlu", "test") == "test"
++
++
++def test_train_loads_auxiliary_train_not_toy_set():
++    _install_fake_mmlu_datasets()
++    tasks = load_split("mmlu", "train", max_items=5, seed=0)
++    assert len(tasks) == 5
++    assert all(not t.task_id.startswith("mmlu-toy-") for t in tasks)
++    assert tasks[0].meta["source"] == "cais/mmlu"
++
++
++def test_train_and_test_load_different_upstream_splits():
++    _install_fake_mmlu_datasets()
++    train_prompts = {t.prompt for t in load_split("mmlu", "train", max_items=None, seed=0)}
++    test_prompts = {t.prompt for t in load_split("mmlu", "test", max_items=None, seed=0)}
++    assert any("auxiliary_train" in p for p in train_prompts)
++    assert any("test" in p for p in test_prompts)
++    assert train_prompts.isdisjoint(test_prompts)
++
++
++def test_load_tasks_shim_uses_same_resolution():
++    _install_fake_mmlu_datasets()
++    tasks = load_tasks("mmlu", "train", max_items=3, seed=0)
++    assert len(tasks) == 3
++    assert tasks[0].benchmark == "mmlu"
++
++
++def test_toy_fallback_emits_warning_when_hf_missing(monkeypatch):
++    monkeypatch.setattr("trinity.adapters.loaders._try_load_hf", lambda *a, **k: None)
++    sys.modules.pop("datasets", None)
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always", ToyFallbackWarning)
++        tasks = load_split("mmlu", "train", max_items=None, seed=0)
++    assert len(tasks) == 2
++    assert any(isinstance(w.message, ToyFallbackWarning) for w in caught)

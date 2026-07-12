@@ -1,0 +1,197 @@
+diff --git a/matmul/cli.py b/matmul/cli.py
+index ea66037..c6a1ecb 100644
+--- a/matmul/cli.py
++++ b/matmul/cli.py
+@@ -49,7 +49,7 @@ def main(argv=None) -> int:
+     )
+     try:
+         info = runner.run(args.n, cfg, fill=args.fill, verify=args.verify, keep=args.keep)
+-    except RuntimeError as e:
++    except (RuntimeError, MemoryError) as e:
+         print(f"error: {e}", file=sys.stderr)
+         return 2
+     if args.quiet:
+diff --git a/matmul/runner.py b/matmul/runner.py
+index 055713f..7b0d163 100644
+--- a/matmul/runner.py
++++ b/matmul/runner.py
+@@ -64,11 +64,14 @@ def run(n: int, cfg: Config, fill: str = "random",
+         print(f"[run] throughput   : {info['gflops']:.1f} GFLOP/s")
+ 
+     if verify:
+-        info["verify"] = _verify(A, B, C, n, cfg)
++        info["verify"] = _verify(A, B, C, n, cfg, backend)
+         if cfg.verbose:
+             v = info["verify"]
+-            print(f"[run] verify       : max_rel_err={v['max_rel_err']:.2e} "
+-                  f"({'OK' if v['ok'] else 'MISMATCH'})")
++            if v.get("skipped"):
++                print(f"[run] verify       : skipped ({v['skipped']})")
++            else:
++                print(f"[run] verify       : max_rel_err={v['max_rel_err']:.2e} "
++                      f"({'OK' if v['ok'] else 'MISMATCH'})")
+ 
+     if on_disk and not keep:
+         for p in (pa, pb, pc):
+@@ -80,8 +83,17 @@ def run(n: int, cfg: Config, fill: str = "random",
+     return info
+ 
+ 
+-def _verify(A, B, C, n: int, cfg: Config) -> dict:
+-    """Compare against a float64 CPU reference. Only sensible for small n."""
++def _verify(A, B, C, n: int, cfg: Config, backend: Backend) -> dict:
++    """Compare against a float64 CPU reference. Only sensible for small n:
++    it materializes A, B, the reference product and C as float64 in host RAM
++    (~4*n*n*8 bytes) and runs an O(n^3) CPU multiply, so it is SKIPPED when that
++    working set would not fit safely -- otherwise --verify on a large / disk-backed
++    run OOMs the host after the GPU multiply already succeeded."""
++    need = 4 * n * n * 8                      # A_f64, B_f64, ref, got
++    host_free = backend.host_available_bytes()
++    if need > 0.5 * host_free:
++        return {"skipped": f"n={n}: float64 CPU reference needs ~{storage.bytes_human(need)}, "
++                f"over 50% of ~{storage.bytes_human(host_free)} host RAM"}
+     ref = np.asarray(A, dtype=np.float64) @ np.asarray(B, dtype=np.float64)
+     got = np.asarray(C, dtype=np.float64)
+     denom = np.linalg.norm(ref) or 1.0
+diff --git a/strategy/cli.py b/strategy/cli.py
+index 4ab952f..c25bc66 100644
+--- a/strategy/cli.py
++++ b/strategy/cli.py
+@@ -67,7 +67,7 @@ def main(argv=None) -> int:
+             return 0
+         info = runner.run(args.n, cfg, fill=args.fill, verify=args.verify,
+                           keep=args.keep, data_rank=args.data_rank)
+-    except RuntimeError as e:
++    except (RuntimeError, MemoryError) as e:
+         print(f"error: {e}", file=sys.stderr)
+         return 2
+     if args.quiet:
+diff --git a/strategy/runner.py b/strategy/runner.py
+index 2814ff7..458bc6b 100644
+--- a/strategy/runner.py
++++ b/strategy/runner.py
+@@ -73,10 +73,14 @@ def run(n: int, cfg: Config, fill: str = "lowrank", verify: bool = False,
+               f"fewer FLOPs than exact")
+ 
+     if verify:
+-        info["verify"] = _verify(A, B, C, cfg)
++        info["verify"] = _verify(A, B, C, n, cfg, backend)
+         if cfg.verbose:
+-            print(f"[strategy] rel. error : {info['verify']['max_rel_err']:.2e} "
+-                  f"(approximate by design)")
++            v = info["verify"]
++            if v.get("skipped"):
++                print(f"[strategy] rel. error : skipped ({v['skipped']})")
++            else:
++                print(f"[strategy] rel. error : {v['max_rel_err']:.2e} "
++                      f"(approximate by design)")
+ 
+     if on_disk and not keep:
+         for p in (pa, pb, pc):
+@@ -139,8 +143,17 @@ def compare(n: int, cfg: Config, fill: str = "lowrank",
+     return out
+ 
+ 
+-def _verify(A, B, C, cfg: Config) -> dict:
+-    """Reconstruction error vs a float64 CPU reference. Small n only."""
++def _verify(A, B, C, n: int, cfg: Config, backend: Backend) -> dict:
++    """Reconstruction error vs a float64 CPU reference. Small n only:
++    it materializes A, B, the reference product and C as float64 in host RAM
++    (~4*n*n*8 bytes) and runs an O(n^3) CPU multiply, so it is SKIPPED when that
++    working set would not fit safely -- otherwise --verify on a large / disk-backed
++    run OOMs the host after the smart multiply already succeeded."""
++    need = 4 * n * n * 8                      # A_f64, B_f64, ref, got
++    host_free = backend.host_available_bytes()
++    if need > 0.5 * host_free:
++        return {"skipped": f"n={n}: float64 CPU reference needs ~{storage.bytes_human(need)}, "
++                f"over 50% of ~{storage.bytes_human(host_free)} host RAM"}
+     ref = np.asarray(A, dtype=np.float64) @ np.asarray(B, dtype=np.float64)
+     got = np.asarray(C, dtype=np.float64)
+     rel_err = float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) or 1.0))
+diff --git a/tests/test_verify_guard.py b/tests/test_verify_guard.py
+new file mode 100644
+index 0000000..fad5081
+--- /dev/null
++++ b/tests/test_verify_guard.py
+@@ -0,0 +1,81 @@
++"""CPU-only tests for the --verify host-RAM guard (issue #136).
++
++`_verify` materializes A, B, the reference product and C as float64 in host RAM
++(~4*n*n*8 bytes) and runs an O(n^3) CPU multiply. It must SKIP (not OOM) when
++that working set would not fit safely. These drive `_verify` directly with a
++stub backend, so no GPU is needed.
++
++Run:  python tests/test_verify_guard.py
++"""
++import os
++import sys
++
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from matmul.config import Config as MatmulConfig
++from matmul.runner import _verify as matmul_verify
++from strategy.config import Config as StrategyConfig
++from strategy.runner import _verify as strategy_verify
++
++
++class _StubBackend:
++    """Minimal stand-in exposing only the host_available_bytes() the guard reads."""
++
++    def __init__(self, host_bytes):
++        self._host_bytes = host_bytes
++
++    def host_available_bytes(self):
++        return self._host_bytes
++
++
++def _small_operands(n=8):
++    rng = np.random.default_rng(0)
++    A = rng.standard_normal((n, n)).astype(np.float32)
++    B = rng.standard_normal((n, n)).astype(np.float32)
++    C = (A @ B).astype(np.float32)
++    return A, B, C
++
++
++def test_matmul_verify_runs_when_ram_is_ample():
++    n = 8
++    A, B, C = _small_operands(n)
++    plenty = 4 * n * n * 8 * 100          # far above the 4*n^2*8 working set
++    res = matmul_verify(A, B, C, n, MatmulConfig(dtype="fp32", verbose=False),
++                        _StubBackend(plenty))
++    assert "skipped" not in res
++    assert res["ok"] is True and res["max_rel_err"] < 1e-4
++
++
++def test_matmul_verify_skips_when_ram_is_tiny():
++    n = 8
++    A, B, C = _small_operands(n)
++    res = matmul_verify(A, B, C, n, MatmulConfig(dtype="fp32", verbose=False),
++                        _StubBackend(1))    # 1 byte of host RAM -> must skip, not crash
++    assert res.get("skipped")
++    assert "ok" not in res
++
++
++def test_strategy_verify_runs_and_skips():
++    n = 8
++    A, B, C = _small_operands(n)
++    cfg = StrategyConfig(dtype="fp32", verbose=False)
++    ok = strategy_verify(A, B, C, n, cfg, _StubBackend(4 * n * n * 8 * 100))
++    assert "skipped" not in ok and ok["max_rel_err"] < 1e-4
++    skipped = strategy_verify(A, B, C, n, cfg, _StubBackend(1))
++    assert skipped.get("skipped")
++
++
++if __name__ == "__main__":
++    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
++    failed = 0
++    for fn in fns:
++        try:
++            fn()
++            print(f"PASS  {fn.__name__}")
++        except AssertionError as e:
++            failed += 1
++            print(f"FAIL  {fn.__name__}: {e}")
++    print(f"\n{len(fns) - failed}/{len(fns)} passed")
++    sys.exit(1 if failed else 0)

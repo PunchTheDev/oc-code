@@ -1,0 +1,415 @@
+diff --git a/configs/trinity.yaml b/configs/trinity.yaml
+index 01ce2fc..2f781dc 100644
+--- a/configs/trinity.yaml
++++ b/configs/trinity.yaml
+@@ -52,6 +52,9 @@ sep_cmaes:
+   init_mean: "head_zero_svf_one"        # W=0 (uniform policy) + SVF scales=1.0
+   bounds: null
+   seed: 0
++  val_fraction: 0.0                     # held-out share for validation-based model selection
++                                        # (issue #172); 0.0 = save es.best() by train fitness
++  patience: 0                           # early-stop after N generations w/o val gain; 0 = off
+   fitness:
+     metric: "accuracy"                  # mean binary reward R(tau) in {0,1} over m_cma instances
+     cost_penalty: 0.0                   # no explicit length/cost penalty (bounded by 4096 x K)
+diff --git a/src/trinity/optim/selection.py b/src/trinity/optim/selection.py
+new file mode 100644
+index 0000000..f259a2f
+--- /dev/null
++++ b/src/trinity/optim/selection.py
+@@ -0,0 +1,72 @@
++"""Validation-based model selection for CMA-ES training (issue #172).
++
++The training loop scores each generation's incumbent on a held-out validation set
++and keeps the one that generalizes best, rather than the candidate with the best
++*training* fitness (which is the most prone to fitting the minibatch noise). This
++module holds the pure, torch-free selection state so it is unit-testable with a
++stubbed fitness sequence (no GPU/API).
++"""
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass
++
++import numpy as np
++
++
++@dataclass
++class ValidationSelector:
++    """Tracks the best-on-validation candidate across CMA-ES generations.
++
++    ``update`` is called once per generation with that generation's incumbent
++    theta and its validation fitness; the selector keeps the theta with the
++    highest validation fitness seen so far (first one wins on ties). ``should_stop``
++    reports whether validation has plateaued for ``patience`` generations, so the
++    caller can early-stop.
++
++    Attributes:
++        best_val_fitness: Highest validation fitness seen (``-inf`` until the
++            first :meth:`update`).
++        best_theta: A copy of the incumbent theta at ``best_val_fitness``, or
++            ``None`` before the first update.
++        best_gen: Generation index that produced ``best_theta`` (``-1`` if none).
++        stale_generations: Generations since the last strict improvement.
++    """
++
++    best_val_fitness: float = -math.inf
++    best_theta: np.ndarray | None = None
++    best_gen: int = -1
++    stale_generations: int = 0
++
++    def update(self, generation: int, theta: np.ndarray, val_fitness: float) -> bool:
++        """Record one generation's incumbent and validation fitness.
++
++        Args:
++            generation: The generation index (0-based).
++            theta: The incumbent parameter vector for this generation.
++            val_fitness: Its fitness on the held-out validation set.
++
++        Returns:
++            ``True`` if this is a new strict best (and thus the newly selected
++            theta), else ``False``.
++        """
++        if self.best_theta is None or val_fitness > self.best_val_fitness:
++            self.best_val_fitness = float(val_fitness)
++            self.best_theta = np.asarray(theta, dtype=float).copy()
++            self.best_gen = int(generation)
++            self.stale_generations = 0
++            return True
++        self.stale_generations += 1
++        return False
++
++    def should_stop(self, patience: int) -> bool:
++        """Whether to early-stop: ``patience > 0`` and that many stale generations.
++
++        Args:
++            patience: Generations without validation improvement before stopping.
++                ``patience <= 0`` disables early stopping.
++
++        Returns:
++            ``True`` if training should stop now.
++        """
++        return patience > 0 and self.stale_generations >= patience
+diff --git a/src/trinity/orchestration/dataset.py b/src/trinity/orchestration/dataset.py
+index 79ca167..f299e4a 100644
+--- a/src/trinity/orchestration/dataset.py
++++ b/src/trinity/orchestration/dataset.py
+@@ -102,3 +102,53 @@ def sample_minibatch(
+         return rng.sample(tasks, m)
+     # Not enough distinct tasks (toy set): sample with replacement.
+     return [rng.choice(tasks) for _ in range(m)]
++
++
++def split_train_val(
++    tasks: list[Task],
++    val_fraction: float,
++    rng: random.Random,
++) -> tuple[list[Task], list[Task]]:
++    """Partition ``tasks`` into disjoint ``(train, validation)`` pools (issue #172).
++
++    ``val_fraction`` in ``[0, 1)`` is the share held out for validation-based model
++    selection. The split is a deterministic shuffle driven by the caller-owned
++    ``rng`` (seed it from ``--seed`` for reproducibility), so the validation pool
++    never overlaps the training pool and is stable across runs.
++
++    ``val_fraction <= 0`` returns ``(list(tasks), [])`` unchanged — the legacy
++    no-holdout behavior. At least one task is always kept for training; when a
++    positive ``val_fraction`` rounds to zero on a small set it holds out a single
++    validation task.
++
++    Parameters
++    ----------
++    tasks:
++        The full training pool from :func:`load_tasks`.
++    val_fraction:
++        Fraction to hold out for validation, in ``[0, 1)``.
++    rng:
++        Caller-owned :class:`random.Random` for a reproducible split.
++
++    Returns
++    -------
++    tuple[list[Task], list[Task]]
++        ``(train_tasks, val_tasks)``, disjoint. ``val_tasks`` is empty when
++        ``val_fraction <= 0`` or fewer than 2 tasks are available.
++
++    Raises
++    ------
++    ValueError
++        If ``val_fraction`` is not in ``[0, 1)``.
++    """
++    if val_fraction <= 0.0:
++        return list(tasks), []
++    if val_fraction >= 1.0:
++        raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
++    n = len(tasks)
++    if n < 2:
++        return list(tasks), []
++    n_val = max(1, min(int(round(n * val_fraction)), n - 1))
++    shuffled = list(tasks)
++    rng.shuffle(shuffled)
++    return shuffled[n_val:], shuffled[:n_val]
+diff --git a/src/trinity/train.py b/src/trinity/train.py
+index 7b64aef..eac9c67 100644
+--- a/src/trinity/train.py
++++ b/src/trinity/train.py
+@@ -23,9 +23,10 @@
+ from .coordinator import params as P
+ from .coordinator.policy import CoordinatorPolicy
+ from .llm.openrouter_client import OpenRouterPool
+-from .optim.fitness import FitnessConfig, evaluate_population
++from .optim.fitness import FitnessConfig, evaluate_candidate, evaluate_population
++from .optim.selection import ValidationSelector
+ from .optim.sep_cmaes import SepCMAES, default_popsize
+-from .orchestration.dataset import load_tasks, sample_minibatch
++from .orchestration.dataset import load_tasks, sample_minibatch, split_train_val
+ 
+ _REPO = Path(__file__).resolve().parents[2]
+ 
+@@ -134,14 +135,31 @@ async def train(args) -> dict:
+     )
+     print(f"[train] θ dimension n = {spec.n_total} (head {spec.n_head} + SVF {spec.n_svf})")
+ 
+-    tasks = load_tasks(args.benchmark, "train", max_items=args.max_items, seed=args.seed)
+-    print(f"[train] loaded {len(tasks)} train tasks")
+-
+     popsize = args.popsize or sc.get("population_size") or default_popsize(spec.n_total)
+     m_cma = args.m_cma or sc.get("m_cma", 16)
+     generations = args.generations or sc.get("generations", 60)
+     sigma0 = sc.get("sigma0", 0.1)
+ 
++    # Validation-based model selection (issue #172). Default off (val_fraction=0.0)
++    # -> save es.best() and run all generations, exactly as before.
++    _val_arg = getattr(args, "val_fraction", None)
++    val_fraction = _val_arg if _val_arg is not None else float(sc.get("val_fraction", 0.0))
++    _pat_arg = getattr(args, "patience", None)
++    patience = _pat_arg if _pat_arg is not None else int(sc.get("patience", 0))
++
++    tasks = load_tasks(args.benchmark, "train", max_items=args.max_items, seed=args.seed)
++    print(f"[train] loaded {len(tasks)} train tasks")
++
++    selector: ValidationSelector | None = None
++    val_tasks: list = []
++    if val_fraction > 0.0:
++        # A distinct RNG stream from the per-generation minibatch RNG so the split
++        # is reproducible from --seed without correlating with task sampling.
++        tasks, val_tasks = split_train_val(tasks, val_fraction, random.Random(args.seed * 100003 + 7))
++        selector = ValidationSelector()
++        print(f"[train] validation holdout: {len(val_tasks)} val / {len(tasks)} train "
++              f"(val_fraction={val_fraction}, patience={patience})")
++
+     x0 = _resolve_x0(args, spec)
+ 
+     es = SepCMAES(
+@@ -193,6 +211,20 @@ def _on_cand(i, fit, elapsed, _g=gen):
+         es.tell(thetas, fits)
+ 
+         best_x, best_f = es.best()
++
++        val_fit: float | None = None
++        if selector is not None:
++            # Score THIS generation's best candidate on the fixed val set with the
++            # eval decision rule (argmax, sample=False) and pure-binary reward
++            # (fitness_cfg=None) so val fitness proxies the hidden-eval accuracy.
++            gen_best_x = thetas[int(np.argmax(fits))]
++            vf, _ = await evaluate_candidate(
++                gen_best_x, spec, policy, pool, pool_models, val_tasks,
++                sample=False, fitness_cfg=None, **run_kwargs,
++            )
++            val_fit = float(vf)
++            selector.update(gen, gen_best_x, val_fit)
++
+         rec = {
+             "generation": gen,
+             "gen_mean_fitness": float(np.mean(fits)),
+@@ -200,16 +232,29 @@ def _on_cand(i, fit, elapsed, _g=gen):
+             "best_fitness": float(best_f),
+             "seconds": round(time.time() - t0, 1),
+         }
++        if val_fit is not None:
++            rec["val_fitness"] = val_fit
+         history.append(rec)
+-        print(f"[gen {gen:3d}] mean={rec['gen_mean_fitness']:.3f} "
+-              f"max={rec['gen_max_fitness']:.3f} best={rec['best_fitness']:.3f} "
+-              f"({rec['seconds']}s)")
+-
+-        np.save(run_dir / "best_theta.npy", best_x)
++        line = (f"[gen {gen:3d}] mean={rec['gen_mean_fitness']:.3f} "
++                f"max={rec['gen_max_fitness']:.3f} best={rec['best_fitness']:.3f}")
++        if val_fit is not None:
++            line += f" val={val_fit:.3f}"
++        print(line + f" ({rec['seconds']}s)")
++
++        # Save the validation-selected theta when a holdout is active, else es.best().
++        save_x = selector.best_theta if (selector is not None and selector.best_theta is not None) else best_x
++        np.save(run_dir / "best_theta.npy", save_x)
+         (run_dir / "history.json").write_text(json.dumps(history, indent=2))
+         gen += 1
+ 
+-    best_x, best_f = es.best()
++        if selector is not None and selector.should_stop(patience):
++            print(f"[train] early stop: no val improvement for {patience} generation(s) "
++                  f"(best val={selector.best_val_fitness:.3f} @ gen {selector.best_gen})")
++            break
++
++    train_best_x, best_f = es.best()
++    best_x = (selector.best_theta if (selector is not None and selector.best_theta is not None)
++              else train_best_x)
+     np.save(run_dir / "best_theta.npy", best_x)
+     summary = build_summary(
+         benchmark=args.benchmark,
+@@ -222,6 +267,12 @@ def _on_cand(i, fit, elapsed, _g=gen):
+         seed=args.seed,
+         run_dir=run_dir,
+     )
++    if selector is not None:
++        # ``best_fitness`` stays the TRAIN best (the fitness-curve max the receipt
++        # gate cross-checks); these record which generation the saved theta came
++        # from and its held-out score.
++        summary["selected_generation"] = selector.best_gen
++        summary["val_fitness"] = float(selector.best_val_fitness)
+     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+     print(f"[train] DONE. best_fitness={best_f:.4f}  -> {run_dir}")
+     return summary
+@@ -239,6 +290,12 @@ def main() -> None:
+     ap.add_argument("--generations", type=int, default=0, help="override config T")
+     ap.add_argument("--popsize", type=int, default=0, help="override λ")
+     ap.add_argument("--m-cma", type=int, default=0, dest="m_cma", help="override replications")
++    ap.add_argument("--val-fraction", type=float, default=None, dest="val_fraction",
++                    help="held-out validation share for model selection (overrides config; "
++                         "0.0 disables, the default)")
++    ap.add_argument("--patience", type=int, default=None,
++                    help="early-stop after this many generations with no val improvement "
++                         "(overrides config; 0 disables)")
+     ap.add_argument("--seed", type=int, default=0)
+     ap.add_argument("--run-name", default="run", dest="run_name")
+     ap.add_argument("--warmstart-theta", default="", dest="warmstart_theta",
+diff --git a/tests/test_train_validation_selection.py b/tests/test_train_validation_selection.py
+new file mode 100644
+index 0000000..ee3c68a
+--- /dev/null
++++ b/tests/test_train_validation_selection.py
+@@ -0,0 +1,124 @@
++"""Offline tests for validation-based model selection (issue #172).
++
++Covers the two pure pieces the training loop composes: the train/val split
++(disjoint, deterministic, legacy-preserving) and the ValidationSelector
++(argmax-val selection + early stopping). No GPU/API: the CMA-ES loop's
++per-generation fitness is stubbed as a plain sequence.
++"""
++from __future__ import annotations
++
++import random
++
++import numpy as np
++
++from trinity.optim.selection import ValidationSelector
++from trinity.orchestration.dataset import split_train_val
++from trinity.types import Task
++
++
++def _tasks(n: int) -> list[Task]:
++    return [Task(task_id=str(i), benchmark="math500", prompt=f"q{i}", answer="1") for i in range(n)]
++
++
++# ---- split_train_val ----
++
++
++def test_val_fraction_zero_is_legacy_no_holdout():
++    tasks = _tasks(10)
++    train, val = split_train_val(tasks, 0.0, random.Random(0))
++    assert val == []
++    assert train == tasks               # same tasks, same order (byte-identical path)
++
++
++def test_split_is_disjoint_and_covers_all_tasks():
++    tasks = _tasks(20)
++    train, val = split_train_val(tasks, 0.25, random.Random(1))
++    assert len(val) == 5 and len(train) == 15
++    train_ids = {t.task_id for t in train}
++    val_ids = {t.task_id for t in val}
++    assert train_ids.isdisjoint(val_ids)
++    assert train_ids | val_ids == {t.task_id for t in tasks}
++
++
++def test_split_is_reproducible_under_a_fixed_seed():
++    tasks = _tasks(20)
++    a_tr, a_val = split_train_val(tasks, 0.3, random.Random(42))
++    b_tr, b_val = split_train_val(tasks, 0.3, random.Random(42))
++    assert [t.task_id for t in a_val] == [t.task_id for t in b_val]
++    assert [t.task_id for t in a_tr] == [t.task_id for t in b_tr]
++    # A different seed generally yields a different holdout.
++    _, c_val = split_train_val(tasks, 0.3, random.Random(43))
++    assert [t.task_id for t in a_val] != [t.task_id for t in c_val]
++
++
++def test_split_keeps_at_least_one_train_and_one_val():
++    # A tiny positive fraction still holds out exactly one task.
++    train, val = split_train_val(_tasks(5), 0.01, random.Random(0))
++    assert len(val) == 1 and len(train) == 4
++    # Fewer than 2 tasks: nothing to hold out.
++    assert split_train_val(_tasks(1), 0.5, random.Random(0)) == (_tasks(1), [])
++
++
++def test_val_fraction_out_of_range_raises():
++    import pytest
++
++    with pytest.raises(ValueError):
++        split_train_val(_tasks(4), 1.0, random.Random(0))
++
++
++# ---- ValidationSelector ----
++
++
++def test_selector_picks_the_argmax_val_generation():
++    sel = ValidationSelector()
++    val_curve = [0.40, 0.55, 0.52, 0.61, 0.58]   # best is gen 3
++    for gen, vf in enumerate(val_curve):
++        sel.update(gen, np.full(3, float(gen)), vf)
++    assert sel.best_gen == 3
++    assert sel.best_val_fitness == 0.61
++    assert np.array_equal(sel.best_theta, np.full(3, 3.0))
++
++
++def test_selector_keeps_first_on_ties_and_copies_theta():
++    sel = ValidationSelector()
++    theta0 = np.zeros(3)
++    sel.update(0, theta0, 0.5)
++    sel.update(1, np.ones(3), 0.5)   # equal, not strictly better -> keep gen 0
++    assert sel.best_gen == 0
++    # Stored theta is a copy, not a live reference to the caller's array.
++    theta0[:] = 9.0
++    assert np.array_equal(sel.best_theta, np.zeros(3))
++
++
++def test_early_stop_after_patience_stale_generations():
++    sel = ValidationSelector()
++    sel.update(0, np.zeros(3), 0.60)   # best
++    assert not sel.should_stop(2)
++    sel.update(1, np.zeros(3), 0.59)   # stale 1
++    assert not sel.should_stop(2)
++    sel.update(2, np.zeros(3), 0.58)   # stale 2 -> stop
++    assert sel.should_stop(2)
++
++
++def test_patience_zero_never_stops():
++    sel = ValidationSelector()
++    sel.update(0, np.zeros(3), 0.6)
++    for gen in range(1, 6):
++        sel.update(gen, np.zeros(3), 0.1)
++    assert not sel.should_stop(0)
++
++
++def test_improvement_resets_the_stale_counter():
++    sel = ValidationSelector()
++    sel.update(0, np.zeros(3), 0.5)
++    sel.update(1, np.zeros(3), 0.4)    # stale 1
++    sel.update(2, np.ones(3), 0.7)     # new best -> reset
++    assert sel.stale_generations == 0
++    assert not sel.should_stop(2)
++    assert sel.best_gen == 2
++
++
++if __name__ == "__main__":
++    import pytest
++
++    raise SystemExit(pytest.main([__file__, "-q"]))

@@ -1,0 +1,321 @@
+diff --git a/src/trinity/adapters/__init__.py b/src/trinity/adapters/__init__.py
+index d3a1525..298996a 100644
+--- a/src/trinity/adapters/__init__.py
++++ b/src/trinity/adapters/__init__.py
+@@ -24,7 +24,8 @@
+     MmluAdapter,
+     register_builtin_adapters,
+ )
+-from .builtin import DelegatingBenchmarkAdapter
++from .builtin import DelegatingBenchmarkAdapter, register_livecodebench_v6_adapter
++from .livecodebench import LiveCodeBenchV6Adapter
+ from .mmlu_pro import MmluProAdapter, register_mmlu_pro_adapter
+ from .registry import (
+     available_adapters,
+@@ -50,6 +51,7 @@
+     "supports_execution",
+     "requires_execution",
+     "DelegatingBenchmarkAdapter",
++    "LiveCodeBenchV6Adapter",
+     "Math500Adapter",
+     "MmluAdapter",
+     "GpqaAdapter",
+@@ -70,5 +72,6 @@
+ # Register the built-in benchmarks on import so `get_adapter("math500")` works
+ # without the caller having to bootstrap the registry.
+ register_builtin_adapters()
++register_livecodebench_v6_adapter()
+ register_swebench_adapter()
+ register_mmlu_pro_adapter()
+diff --git a/src/trinity/adapters/builtin.py b/src/trinity/adapters/builtin.py
+index 58becce..560eec8 100644
+--- a/src/trinity/adapters/builtin.py
++++ b/src/trinity/adapters/builtin.py
+@@ -26,8 +26,13 @@
+ from . import loaders
+ from .base import BenchmarkAdapter, TaskType
+ from .benchmarks import register_builtin_adapters
++from .registry import register_adapter
+ 
+-__all__ = ["DelegatingBenchmarkAdapter", "register_builtin_adapters"]
++__all__ = [
++    "DelegatingBenchmarkAdapter",
++    "register_builtin_adapters",
++    "register_livecodebench_v6_adapter",
++]
+ 
+ 
+ def _task_type_for(benchmark: str) -> TaskType:
+@@ -92,3 +97,12 @@ def serialize_task(self, task: Task) -> dict[str, Any]:
+             "task_type": self._task_type.value,
+             "meta": dict(task.meta),
+         }
++
++
++def register_livecodebench_v6_adapter() -> None:
++    """Register the dedicated LiveCodeBench v6 adapter if it is absent."""
++    from .livecodebench import LiveCodeBenchV6Adapter
++    from .registry import is_registered
++
++    if not is_registered("livecodebench_v6"):
++        register_adapter("livecodebench_v6", LiveCodeBenchV6Adapter())
+diff --git a/src/trinity/adapters/livecodebench.py b/src/trinity/adapters/livecodebench.py
+new file mode 100644
+index 0000000..16b0248
+--- /dev/null
++++ b/src/trinity/adapters/livecodebench.py
+@@ -0,0 +1,130 @@
++"""LiveCodeBench v6 — an explicit, version-pinned code-generation adapter.
++
++The shared pipeline serves LiveCodeBench through the delegating adapter, which
++maps a logical split onto a release *implicitly* (V1 train / V6 eval; see
++:func:`trinity.orchestration.dataset._lcb_version_for_split`). Issue #13 asks for
++the eval release to be a first-class, explicitly-named benchmark so that:
++
++* ``livecodebench_v6`` is selectable directly from the evaluator
++  (``get_adapter("livecodebench_v6")``);
++* the pinned dataset id and release are visible in the adapter's metadata and in
++  every serialised task; and
++* the hidden-benchmark builder always freezes the same release rather than
++  relying on an implicit split string.
++
++Only *version selection* lives here. Prompt rendering and scoring reuse the
++shared, already-de-bugged LiveCodeBench path — the sandboxed pass@1 executor in
++:func:`trinity.orchestration.reward.score_text` — so this adapter never forks the
++scorer or the loader. It pins which release the tasks come from and surfaces that
++release as metadata; the underlying :class:`~trinity.types.Task` keeps the base
++``livecodebench`` benchmark key so existing reward dispatch keeps working
++unchanged. Like ``reward`` and ``dataset``, this module has no torch dependency.
++"""
++from __future__ import annotations
++
++from typing import Any
++
++from trinity.orchestration import reward as _reward
++from trinity.orchestration.dataset import load_tasks as _load_tasks
++from trinity.types import Task
++
++from .base import BenchmarkAdapter, TaskType
++
++__all__ = ["LiveCodeBenchV6Adapter"]
++
++
++class LiveCodeBenchV6Adapter(BenchmarkAdapter):
++    """First-class adapter for the LiveCodeBench **v6** code-generation release.
++
++    ``load_tasks`` and ``score_output`` delegate to the shared LiveCodeBench
++    pipeline (``dataset.load_tasks`` + ``reward.score_text``) under the base
++    ``livecodebench`` key, so test-case parsing and pass@1 scoring stay identical
++    to the de-bugged path. This adapter's job is to (a) freeze the release
++    explicitly and (b) make that release visible as metadata.
++    """
++
++    #: Registry / serialised-item identity (matches the registered name).
++    name = "livecodebench_v6"
++
++    #: Pinned HuggingFace dataset id and release configs.
++    dataset_id = "livecodebench/code_generation_lite"
++    eval_version = "release_v6"
++    train_version = "release_v1"
++
++    #: The base benchmark whose shared loader/scorer this adapter reuses. Tasks
++    #: carry this key (not ``name``) so the existing reward dispatch — which is
++    #: keyed on ``Task.benchmark`` — routes them to the LiveCodeBench code scorer.
++    base_benchmark = "livecodebench"
++
++    def resolve_version(self, split: str) -> str:
++        """Return the release frozen for ``split``, keeping train/eval explicit.
++
++        An explicit training split resolves to ``release_v1``; anything else
++        (test/eval/blank) freezes to the pinned ``release_v6`` eval release, so a
++        caller cannot silently score against a different version.
++
++        Args:
++            split: Logical split string, e.g. ``"train"`` or ``"test"``.
++
++        Returns:
++            The resolved LiveCodeBench release config name.
++        """
++        s = (split or "").strip().lower()
++        if s in {"train", "v1", "release_v1"}:
++            return self.train_version
++        return self.eval_version
++
++    def load_tasks(
++        self,
++        split: str,
++        max_items: int | None,
++        seed: int = 0,
++    ) -> list[Task]:
++        """Load LiveCodeBench tasks for ``split`` pinned to the resolved release.
++
++        Reuses the shared loader (with its offline toy fallback), then stamps the
++        resolved release onto each task's ``meta`` so the frozen item and any
++        downstream hidden-benchmark builder record exactly which release was used.
++        """
++        version = self.resolve_version(split)
++        tasks = _load_tasks(self.base_benchmark, version, max_items, seed=seed)
++        for task in tasks:
++            task.meta.setdefault("dataset_id", self.dataset_id)
++            task.meta["dataset_version"] = version
++            task.meta["adapter"] = self.name
++        return tasks
++
++    def build_prompt(self, task: Task) -> str:
++        """Return the task prompt (the loader already renders the problem text)."""
++        return task.prompt
++
++    def score_output(self, output: str, reference: Any) -> float:
++        """Return binary pass@1 via the shared sandboxed LiveCodeBench scorer."""
++        return _reward.score_text(self.base_benchmark, output, reference)
++
++    def task_type(self) -> TaskType:
++        """Return :attr:`TaskType.CODE` — v6 is a code-generation benchmark."""
++        return TaskType.CODE
++
++    def serialize_task(self, task: Task) -> dict[str, Any]:
++        """Return a JSON-safe frozen item that records the pinned release."""
++        return {
++            "task_id": task.task_id,
++            "benchmark": self.name,
++            "prompt": task.prompt,
++            "reference": task.answer,
++            "task_type": TaskType.CODE.value,
++            "dataset_id": self.dataset_id,
++            "dataset_version": task.meta.get("dataset_version", self.eval_version),
++            "meta": dict(task.meta),
++        }
++
++    def metadata(self) -> dict[str, Any]:
++        """Return the adapter's pinned dataset metadata (release visibility)."""
++        return {
++            "name": self.name,
++            "dataset_id": self.dataset_id,
++            "eval_version": self.eval_version,
++            "train_version": self.train_version,
++            "task_type": TaskType.CODE.value,
++        }
+diff --git a/tests/test_benchmark_registry.py b/tests/test_benchmark_registry.py
+index e0002e3..19356fa 100644
+--- a/tests/test_benchmark_registry.py
++++ b/tests/test_benchmark_registry.py
+@@ -18,6 +18,7 @@
+     is_registered,
+     register_adapter,
+     register_builtin_adapters,
++    register_livecodebench_v6_adapter,
+     register_mmlu_pro_adapter,
+     register_swebench_adapter,
+ )
+@@ -39,7 +40,7 @@ def test_builtins_registered_for_every_supported_benchmark():
+     # The registry exposes at least the supported benchmarks; additional adapters
+     # (e.g. the SWE-bench Verified (#17) and MMLU-Pro (#12) adapters) may also be
+     # registered.
+-    assert set(SUPPORTED_BENCHMARKS) <= set(available_adapters())
++    assert set(SUPPORTED_BENCHMARKS) | {"livecodebench_v6"} <= set(available_adapters())
+ 
+ 
+ def test_lookup_is_case_insensitive():
+@@ -225,7 +226,8 @@ def serialize_task(self, task):
+         # adapters).
+         clear_registry()
+         register_builtin_adapters()
++        register_livecodebench_v6_adapter()
+         register_swebench_adapter()
+         register_mmlu_pro_adapter()
+ 
+-    assert set(SUPPORTED_BENCHMARKS) <= set(available_adapters())
++    assert set(SUPPORTED_BENCHMARKS) | {"livecodebench_v6"} <= set(available_adapters())
+diff --git a/tests/test_livecodebench_v6_adapter.py b/tests/test_livecodebench_v6_adapter.py
+new file mode 100644
+index 0000000..121fdd6
+--- /dev/null
++++ b/tests/test_livecodebench_v6_adapter.py
+@@ -0,0 +1,87 @@
++"""Tests for the first-class LiveCodeBench v6 adapter (issue #13).
++
++All offline: task loading falls back to the built-in LiveCodeBench toy set when
++``datasets``/network are unavailable, and pass@1 scoring runs candidate code in
++the same sandboxed subprocess the reward checker uses — no network required.
++"""
++from __future__ import annotations
++
++import json
++
++from trinity.adapters import TaskType, get_adapter
++from trinity.adapters.livecodebench import LiveCodeBenchV6Adapter
++
++
++def test_v6_adapter_is_registered_and_selectable():
++    adapter = get_adapter("livecodebench_v6")
++    assert isinstance(adapter, LiveCodeBenchV6Adapter)
++    # Case-insensitive lookup, like the other built-ins.
++    assert get_adapter("LiveCodeBench_V6") is adapter
++
++
++def test_task_type_is_code():
++    assert get_adapter("livecodebench_v6").task_type() is TaskType.CODE
++
++
++def test_metadata_pins_release_v6():
++    meta = get_adapter("livecodebench_v6").metadata()
++    assert meta["dataset_id"] == "livecodebench/code_generation_lite"
++    assert meta["eval_version"] == "release_v6"
++    assert meta["train_version"] == "release_v1"
++
++
++def test_resolve_version_keeps_train_and_eval_explicit():
++    adapter = get_adapter("livecodebench_v6")
++    assert adapter.resolve_version("train") == "release_v1"
++    assert adapter.resolve_version("v1") == "release_v1"
++    # Anything that is not an explicit training split freezes to the eval release.
++    for split in ("test", "eval", "v6", "release_v6", ""):
++        assert adapter.resolve_version(split) == "release_v6"
++
++
++def test_load_tasks_stamp_release_and_are_deterministic():
++    adapter = get_adapter("livecodebench_v6")
++    a = adapter.load_tasks("test", max_items=2, seed=7)
++    b = adapter.load_tasks("test", max_items=2, seed=7)
++    assert a  # offline toy fallback is non-empty
++    assert [t.task_id for t in a] == [t.task_id for t in b]
++    for task in a:
++        assert task.meta["dataset_version"] == "release_v6"
++        assert task.meta["dataset_id"] == "livecodebench/code_generation_lite"
++        assert task.meta["adapter"] == "livecodebench_v6"
++
++
++def test_load_tasks_train_split_pins_v1():
++    adapter = get_adapter("livecodebench_v6")
++    tasks = adapter.load_tasks("train", max_items=1, seed=0)
++    assert tasks
++    for task in tasks:
++        assert task.meta["dataset_version"] == "release_v1"
++
++
++def test_score_output_runs_pass_at_1():
++    adapter = get_adapter("livecodebench_v6")
++    spec = {
++        "tests": [
++            {"input": "3\n", "output": "9"},
++            {"input": "5\n", "output": "25"},
++        ],
++        "fn_name": None,
++        "starter_code": None,
++    }
++    good = "n = int(input())\nprint(n * n)\n"
++    bad = "n = int(input())\nprint(n + 1)\n"
++    assert adapter.score_output(good, spec) == 1.0
++    assert adapter.score_output(bad, spec) == 0.0
++
++
++def test_serialize_task_is_json_safe_and_versioned():
++    adapter = get_adapter("livecodebench_v6")
++    task = adapter.load_tasks("test", max_items=1, seed=0)[0]
++    item = adapter.serialize_task(task)
++    assert item["benchmark"] == "livecodebench_v6"
++    assert item["task_type"] == TaskType.CODE.value
++    assert item["dataset_version"] == "release_v6"
++    assert item["reference"] == task.answer
++    # Frozen hidden-benchmark item format must round-trip through JSON.
++    assert json.loads(json.dumps(item))["benchmark"] == "livecodebench_v6"

@@ -1,0 +1,168 @@
+diff --git a/strategy/subspace.py b/strategy/subspace.py
+index 2e31921..b045317 100644
+--- a/strategy/subspace.py
++++ b/strategy/subspace.py
+@@ -18,6 +18,8 @@
+ """
+ from __future__ import annotations
+ 
++import math
++
+ import numpy as np
+ 
+ from .backend import Backend
+@@ -43,6 +45,17 @@ def _row_block(n: int, cols: int, backend: Backend, item_bytes: int,
+     return int(min(n, max(1, budget // per_row)))
+ 
+ 
++def _exact_tile(n: int, backend: Backend, item_bytes: int, frac: float) -> int:
++    """Tile edge for row- and k-blocking in ``multiply_exact``.
++
++    Per (row, k) step the device holds an accumulator (T x n), an A panel
++    (T x T), and a B panel (T x n): T * (2n + T) elements total.
++    """
++    budget_elems = max(1, int(backend.free_compute_bytes() * frac) // item_bytes)
++    t = int((math.sqrt(4 * n * n + 4 * budget_elems) - 2 * n) / 2)
++    return max(1, min(t, n))
++
++
+ # ---------------------------------------------------------------------------
+ # streaming BLAS-3 primitives (row-block streamed; memmap-friendly)
+ # ---------------------------------------------------------------------------
+@@ -182,18 +195,29 @@ def multiply_subspace(A, B, C, backend: Backend, cfg: Config) -> dict:
+ # exact baseline (self-contained; for the normal-vs-smart comparison)
+ # ---------------------------------------------------------------------------
+ def multiply_exact(A, B, C, backend: Backend, cfg: Config) -> dict:
+-    """Full C = A @ B baseline. B is resident on the device; the rows of A are
+-    streamed. Fine for comparison-scale n; for out-of-core exact multiply at
+-    huge n use the sibling `matmul` package."""
++    """Full C = A @ B baseline. Both A and B are streamed in row/k blocks so
++    disk-backed memmaps never fully materialise in host or device RAM.
++    For huge-n exact multiply at maximum throughput use the sibling `matmul`
++    package."""
+     n = A.shape[0]
+     dt = cfg.compute_dtype
+-    Bdev = backend.to_device(np.asarray(B).astype(dt, copy=False))
+-    blk = _row_block(n, n, backend, np.dtype(dt).itemsize, cfg.vram_fraction)
+-    for r0 in range(0, n, blk):
+-        r1 = min(n, r0 + blk)
+-        Ar = backend.to_device(np.asarray(A[r0:r1, :]).astype(dt, copy=False))
+-        Cr = backend.matmul(Ar, Bdev)
+-        C[r0:r1, :] = backend.to_host(Cr).astype(cfg.np_dtype, copy=False)
++    item = np.dtype(dt).itemsize
++    T = _exact_tile(n, backend, item, cfg.vram_fraction)
++    xp = backend.xp
++    for r0 in range(0, n, T):
++        r1 = min(n, r0 + T)
++        ti = r1 - r0
++        acc = xp.zeros((ti, n), dtype=dt)
++        for k0 in range(0, n, T):
++            k1 = min(n, k0 + T)
++            Ar = backend.to_device(
++                np.asarray(A[r0:r1, k0:k1]).astype(dt, copy=False)
++            )
++            Bk = backend.to_device(
++                np.asarray(B[k0:k1, :]).astype(dt, copy=False)
++            )
++            acc = acc + backend.matmul(Ar, Bk)
++        C[r0:r1, :] = backend.to_host(acc).astype(cfg.np_dtype, copy=False)
+     if isinstance(C, np.memmap):
+         C.flush()
+     return {
+diff --git a/strategy/tests/test_subspace.py b/strategy/tests/test_subspace.py
+index 8ae0ac4..93d07af 100644
+--- a/strategy/tests/test_subspace.py
++++ b/strategy/tests/test_subspace.py
+@@ -137,6 +137,31 @@ def test_exact_baseline_matches_numpy():
+     assert _rel(C, A @ B) < 1e-12
+ 
+ 
++def test_exact_baseline_memmap_matches_numpy():
++    """Disk-backed inputs must stream both operands, not upload full B to GPU."""
++    import shutil
++    import tempfile
++
++    from strategy import storage
++
++    workdir = tempfile.mkdtemp(prefix="cco_exact_memmap_")
++    try:
++        n = 64
++        cfg = Config(dtype="fp64", verbose=False, workdir=workdir)
++        pa = os.path.join(workdir, "A.dat")
++        pb = os.path.join(workdir, "B.dat")
++        pc = os.path.join(workdir, "C.dat")
++        A = storage.generate(n, np.float64, True, pa, 0, "iota")
++        B = storage.generate(n, np.float64, True, pb, 1, "iota")
++        C = storage.allocate(n, np.float64, True, pc)
++        info = subspace.multiply_exact(A, B, C, BK, cfg)
++        assert info["mode"] == "exact(streamed)"
++        ref = A.astype(np.float64) @ B.astype(np.float64)
++        assert _rel(C, ref) < 1e-12
++    finally:
++        shutil.rmtree(workdir, ignore_errors=True)
++
++
+ # -- exactness / accuracy properties --------------------------------------
+ def test_exact_when_m_equals_n():
+     # M = N => Q spans R^N => P = I => exact. rsvd's four sketches concatenated
+diff --git a/tests/test_exact_tile.py b/tests/test_exact_tile.py
+new file mode 100644
+index 0000000..156547b
+--- /dev/null
++++ b/tests/test_exact_tile.py
+@@ -0,0 +1,55 @@
++"""CPU-only tests for multiply_exact tile sizing.
++
++Run:  python tests/test_exact_tile.py
++"""
++import math
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from strategy.subspace import _exact_tile
++
++
++class _FakeBackend:
++    def __init__(self, free_bytes: int):
++        self._free = free_bytes
++
++    def free_compute_bytes(self) -> int:
++        return self._free
++
++
++def test_exact_tile_within_budget():
++    n = 8192
++    item = 4
++    frac = 0.6
++    free = 512 * 1024**2
++    backend = _FakeBackend(free)
++    t = _exact_tile(n, backend, item, frac)
++    budget_elems = int(free * frac) // item
++    assert t * (2 * n + t) <= budget_elems
++
++
++def test_exact_tile_at_least_one():
++    backend = _FakeBackend(1024)
++    assert _exact_tile(100000, backend, 4, 0.3) >= 1
++
++
++def test_exact_tile_never_exceeds_n():
++    backend = _FakeBackend(1024**4)
++    n = 256
++    assert _exact_tile(n, backend, 4, 0.5) <= n
++
++
++if __name__ == "__main__":
++    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
++    failed = 0
++    for fn in fns:
++        try:
++            fn()
++            print(f"PASS  {fn.__name__}")
++        except AssertionError as e:
++            failed += 1
++            print(f"FAIL  {fn.__name__}: {e}")
++    print(f"\n{len(fns) - failed}/{len(fns)} passed")
++    sys.exit(1 if failed else 0)

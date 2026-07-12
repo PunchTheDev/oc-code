@@ -1,0 +1,1096 @@
+diff --git a/cache/src/cache/autopilot.py b/cache/src/cache/autopilot.py
+index e727016..a3f82ac 100644
+--- a/cache/src/cache/autopilot.py
++++ b/cache/src/cache/autopilot.py
+@@ -45,6 +45,7 @@ async def query_llm(
+         prompt: str,
+         model: str = "deepseek-coder:6.7b",
+         force_live: bool = False,
++        tags: list[str] | None = None,
+     ) -> dict:
+         """
+         Query LLM with autopilot caching.
+@@ -53,6 +54,8 @@ async def query_llm(
+             prompt: LLM prompt
+             model: Model name
+             force_live: Force live LLM call, bypass cache
++            tags: Invalidation categories recorded on the cached response (see
++                :class:`~cache.llm_cache.CacheTag`).
+ 
+         Returns:
+             dict with response and metadata
+@@ -87,7 +90,7 @@ async def query_llm(
+ 
+         # Cache the response
+         if self._enabled:
+-            await self.llm_cache.set(prompt, response, model)
++            await self.llm_cache.set(prompt, response, model, tags=tags)
+ 
+         return {
+             "response": response,
+diff --git a/cache/src/cache/invalidator.py b/cache/src/cache/invalidator.py
+index 9667882..c2afdbc 100644
+--- a/cache/src/cache/invalidator.py
++++ b/cache/src/cache/invalidator.py
+@@ -10,11 +10,14 @@
+ 
+ import asyncio
+ import logging
++from collections.abc import Iterable
+ from typing import Any
+ 
+ from activelearning import current_timestamp
+ from activelearning.nats_client import EventBus
+ 
++from cache.llm_cache import CacheTag
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -71,67 +74,88 @@ async def stop(self) -> None:
+     async def _on_code_deployed(self, data: dict) -> None:
+         """Invalidate cache when code is deployed."""
+         logger.info(f"Code deployed: invalidating related cache entries ({data})")
+-        await self._invalidate_by_tag("code_generation")
++        await self._invalidate_by_tag(CacheTag.CODE_GENERATION)
+ 
+     async def _on_override_applied(self, data: dict) -> None:
+         """Invalidate cache when override is applied."""
+         parameter = data.get("parameter", "")
+         logger.info(f"Override applied to {parameter}: invalidating cache")
+-        await self._invalidate_by_tag("configuration")
++        await self._invalidate_by_tag(CacheTag.CONFIGURATION)
+ 
+     async def _on_task_saved(self, data: dict) -> None:
+         """Invalidate cache when new task is saved."""
+         task_id = data.get("task_id", "")
+         logger.info(f"Task saved: {task_id}")
+-        await self._invalidate_by_tag("task_query")
++        await self._invalidate_by_tag(CacheTag.TASK_QUERY)
+ 
+-    async def _invalidate_by_tag(self, tag: str) -> None:
+-        """
+-        Invalidate cache entries by tag.
++    async def _invalidate_by_tag(self, tag: str) -> int:
++        """Evict every entry carrying ``tag``; returns how many were removed.
+ 
+-        TODO: Implement tag-based indexing in cache
++        ``json_each`` gives exact membership (so ``task_query`` won't match
++        ``task_query_extended``) and skips NULL (untagged) rows.
+         """
+-        logger.info(f"Invalidating cache entries tagged: {tag}")
+-        # For now, this is a no-op
+-        # In a full implementation, we'd query Qdrant for entries with this tag
++        try:
++            cursor = await self.db.execute(
++                """
++                SELECT DISTINCT c.prompt_hash
++                FROM llm_cache c, json_each(c.tags) t
++                WHERE t.value = ?
++                """,
++                (tag,),
++            )
++            rows = await cursor.fetchall()
++            deleted = await self._delete_hashes(row[0] for row in rows)
++        except Exception as e:
++            logger.error(f"Error invalidating cache by tag '{tag}': {e}", exc_info=True)
++            return 0
++
++        logger.info(f"Invalidated {deleted} cache entries tagged '{tag}'")
++        return deleted
++
++    async def _delete_hashes(self, prompt_hashes: Iterable[str]) -> int:
++        """Evict each hash via :meth:`LLMCache.invalidate`; returns the count.
++        Shared by every invalidation path so they evict identically."""
++        deleted = 0
++        for prompt_hash in prompt_hashes:
++            if await self.llm_cache.invalidate(prompt_hash):
++                deleted += 1
++        return deleted
+ 
+     async def _periodic_cleanup(self) -> None:
+-        """Periodic cleanup of old cache entries."""
++        """Run age-based eviction once an hour for the life of the service."""
+         while self._running:
+             try:
+                 await asyncio.sleep(3600)  # Run every hour
+-
+-                logger.info("Running periodic cache cleanup...")
+-
+-                now = current_timestamp()
+-                max_age_ms = self.max_age_days * 24 * 60 * 60 * 1000
+-                unused_age_ms = self.unused_age_days * 24 * 60 * 60 * 1000
+-
+-                # Find old entries
+-                cursor = await self.db.execute(
+-                    """
+-                    SELECT prompt_hash, cached_at, last_hit_at
+-                    FROM llm_cache
+-                    WHERE
+-                        (cached_at < ?) OR
+-                        (last_hit_at IS NOT NULL AND last_hit_at < ?)
+-                    """,
+-                    (now - max_age_ms, now - unused_age_ms),
+-                )
+-
+-                rows = await cursor.fetchall()
+-
+-                deleted_count = 0
+-                for row in rows:
+-                    prompt_hash = row[0]
+-                    success = await self.llm_cache.invalidate(prompt_hash)
+-                    if success:
+-                        deleted_count += 1
+-
+-                if deleted_count > 0:
+-                    logger.info(f"Deleted {deleted_count} old cache entries")
+-
++                await self._evict_expired()
+             except asyncio.CancelledError:
+                 break
+             except Exception as e:
+                 logger.error(f"Error in periodic cleanup: {e}", exc_info=True)
++
++    async def _evict_expired(self) -> int:
++        """Evict entries past ``max_age_days`` or unused for ``unused_age_days``.
++
++        Returns the number of entries evicted.
++        """
++        logger.info("Running periodic cache cleanup...")
++
++        now = current_timestamp()
++        max_age_ms = self.max_age_days * 24 * 60 * 60 * 1000
++        unused_age_ms = self.unused_age_days * 24 * 60 * 60 * 1000
++
++        cursor = await self.db.execute(
++            """
++            SELECT prompt_hash
++            FROM llm_cache
++            WHERE
++                (cached_at < ?) OR
++                (COALESCE(last_hit_at, cached_at) < ?)
++            """,
++            (now - max_age_ms, now - unused_age_ms),
++        )
++        rows = await cursor.fetchall()
++
++        deleted_count = await self._delete_hashes(row[0] for row in rows)
++        if deleted_count > 0:
++            logger.info(f"Deleted {deleted_count} old cache entries")
++        return deleted_count
+diff --git a/cache/src/cache/llm_cache.py b/cache/src/cache/llm_cache.py
+index 694b9b1..73c9196 100644
+--- a/cache/src/cache/llm_cache.py
++++ b/cache/src/cache/llm_cache.py
+@@ -5,6 +5,7 @@
+ """
+ 
+ import hashlib
++import json
+ import logging
+ from typing import Any
+ 
+@@ -19,6 +20,32 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++class CacheTag:
++    """Invalidation categories a producer attaches to a cached response, so the
++    invalidator can drop a whole category when its triggering event fires.
++
++    Shared here so producers and the invalidator never drift on the strings.
++    """
++
++    CODE_GENERATION = "code_generation"  # dropped on `code.deployed`
++    CONFIGURATION = "configuration"  # dropped on `override.applied.*`
++    TASK_QUERY = "task_query"  # dropped on `task.saved`
++
++
++def _normalize_tags(tags: Any) -> list[str] | None:
++    """Coerce a list or bare string into a clean list of non-empty tags, or None.
++
++    Tags arrive over the untyped JSON boundary, so a bare string is wrapped
++    rather than split into characters by ``list()``.
++    """
++    if not tags:
++        return None
++    if isinstance(tags, str):
++        tags = [tags]
++    cleaned = [str(tag) for tag in tags if tag]
++    return cleaned or None
++
++
+ class LLMCache:
+     """
+     LLM response cache with semantic similarity matching.
+@@ -57,6 +84,21 @@ def __init__(
+     async def setup(self) -> None:
+         """Ensure the cache collection exists before serving requests."""
+         await self._qdrant.ensure_collection(self.collection_name)
++        await self._verify_json_support()
++
++    async def _verify_json_support(self) -> None:
++        """Fail fast if SQLite lacks json_each (JSON1, SQLite 3.38+).
++
++        Tag invalidation matches entries with json_each; without it that query
++        would error and be swallowed, evicting nothing. Surface it at startup.
++        """
++        try:
++            await self.db.execute("SELECT 1 FROM json_each('[]')")
++        except Exception as e:
++            raise RuntimeError(
++                "SQLite build lacks JSON support (json_each); cache tag "
++                "invalidation requires SQLite 3.38+ with JSON1 enabled"
++            ) from e
+ 
+     async def close(self) -> None:
+         """Release the Qdrant connection."""
+@@ -124,6 +166,7 @@ async def set(
+         prompt: str,
+         response: str,
+         model: str = "deepseek-coder:6.7b",
++        tags: list[str] | None = None,
+     ) -> bool:
+         """
+         Cache an LLM response.
+@@ -132,6 +175,7 @@ async def set(
+             prompt: The LLM prompt
+             response: The LLM response
+             model: Model name
++            tags: Invalidation categories for this response (see :class:`CacheTag`).
+ 
+         Returns:
+             bool indicating success
+@@ -143,52 +187,68 @@ async def set(
+             # Get prompt embedding
+             embedding = await self._embeddings.embed_text(prompt)
+ 
+-            # Create cache entry
++            # Untagged entries store None so they never match a tag query.
+             cache_entry = {
+                 "id": prompt_hash,
+                 "prompt": prompt,
+                 "response": response,
+                 "model": model,
++                "tags": _normalize_tags(tags),
+                 "cached_at": current_timestamp(),
+                 "hit_count": 0,
+                 "last_hit_at": None,
+             }
+ 
+-            # Store in Qdrant, then mirror into SQLite
++            # Store in Qdrant, then mirror into SQLite. If the mirror fails, roll
++            # the vector back so the two stores cannot diverge (a Qdrant-only
++            # entry would be served but never found by invalidation).
+             await self._qdrant.upsert(
+                 self.collection_name,
+                 [QdrantPoint(id=prompt_hash, vector=embedding, payload=cache_entry)],
+             )
+             logger.debug(f"Cached response: {prompt[:50]}...")
+-            await self._store_in_db(cache_entry)
++            try:
++                await self._store_in_db(cache_entry)
++            except Exception:
++                await self._rollback_qdrant(prompt_hash)
++                raise
+             return True
+ 
+         except Exception as e:
+             logger.error(f"Cache store error: {e}", exc_info=True)
+             return False
+ 
+-    async def _store_in_db(self, cache_entry: dict) -> None:
+-        """Store cache entry in SQLite."""
++    async def _rollback_qdrant(self, prompt_hash: str) -> None:
++        """Best-effort removal of a vector whose SQLite mirror write failed."""
+         try:
+-            await self.db.execute(
+-                """
+-                INSERT OR REPLACE INTO llm_cache
+-                (prompt_hash, prompt, response, model, cached_at, hit_count, last_hit_at)
+-                VALUES (?, ?, ?, ?, ?, ?, ?)
+-                """,
+-                (
+-                    cache_entry["id"],
+-                    cache_entry["prompt"],
+-                    cache_entry["response"],
+-                    cache_entry["model"],
+-                    cache_entry["cached_at"],
+-                    cache_entry["hit_count"],
+-                    cache_entry["last_hit_at"],
+-                ),
+-            )
+-            await self.db.commit()
++            await self._qdrant.delete(self.collection_name, [prompt_hash])
+         except Exception as e:
+-            logger.error(f"Error storing in DB: {e}")
++            logger.error(f"Error rolling back cache entry {prompt_hash}: {e}")
++
++    async def _store_in_db(self, cache_entry: dict) -> None:
++        """Mirror a cache entry into SQLite, the index used for invalidation.
++
++        Raises on failure so the caller can keep the stores consistent.
++        """
++        tags = cache_entry["tags"]
++        await self.db.execute(
++            """
++            INSERT OR REPLACE INTO llm_cache
++            (prompt_hash, prompt, response, model, tags, cached_at, hit_count, last_hit_at)
++            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
++            """,
++            (
++                cache_entry["id"],
++                cache_entry["prompt"],
++                cache_entry["response"],
++                cache_entry["model"],
++                json.dumps(tags) if tags else None,
++                cache_entry["cached_at"],
++                cache_entry["hit_count"],
++                cache_entry["last_hit_at"],
++            ),
++        )
++        await self.db.commit()
+ 
+     async def _update_hit_stats(self, cache_id: str) -> None:
+         """Update cache hit statistics."""
+diff --git a/cache/src/cache/service.py b/cache/src/cache/service.py
+index 2cf9d08..8a6d708 100644
+--- a/cache/src/cache/service.py
++++ b/cache/src/cache/service.py
+@@ -79,11 +79,13 @@ async def _handle_cache_query(self, data: dict, msg) -> None:
+         prompt = data.get("prompt", "")
+         model = data.get("model", "deepseek-coder:6.7b")
+         force_live = data.get("force_live", False)
++        tags = data.get("tags")
+ 
+         result = await self._autopilot.query_llm(
+             prompt=prompt,
+             model=model,
+             force_live=force_live,
++            tags=tags,
+         )
+ 
+         if msg.reply:
+diff --git a/cache/tests/test_autopilot.py b/cache/tests/test_autopilot.py
+new file mode 100644
+index 0000000..16da507
+--- /dev/null
++++ b/cache/tests/test_autopilot.py
+@@ -0,0 +1,41 @@
++"""Tests for AutopilotController's producer-side tag threading.
++
++Uses asyncio.run (no pytest-asyncio) to run under the bare-pytest governance lane.
++"""
++
++import asyncio
++from unittest.mock import AsyncMock, MagicMock
++
++from cache.autopilot import AutopilotController
++
++
++def _controller(cached=None):
++    llm_cache = MagicMock()
++    llm_cache.get = AsyncMock(return_value=cached)
++    llm_cache.set = AsyncMock()
++    bus = MagicMock()
++    bus.publish = AsyncMock()
++    return AutopilotController(event_bus=bus, llm_cache=llm_cache), llm_cache
++
++
++def test_query_llm_caches_miss_with_tags():
++    """A cache miss falls back to live and stores the response under its tags."""
++    ctrl, llm_cache = _controller(cached=None)
++    ctrl.enable()
++
++    result = asyncio.run(ctrl.query_llm("p", tags=["task_query"]))
++
++    assert result["source"] == "live"
++    llm_cache.set.assert_awaited_once()
++    assert llm_cache.set.call_args.kwargs["tags"] == ["task_query"]
++
++
++def test_query_llm_disabled_returns_live_without_caching():
++    """While disabled, autopilot neither reads nor writes the cache."""
++    ctrl, llm_cache = _controller()
++
++    result = asyncio.run(ctrl.query_llm("p", tags=["task_query"]))
++
++    assert result["source"] == "live"
++    llm_cache.get.assert_not_called()
++    llm_cache.set.assert_not_called()
+diff --git a/cache/tests/test_invalidator.py b/cache/tests/test_invalidator.py
+new file mode 100644
+index 0000000..0e3e367
+--- /dev/null
++++ b/cache/tests/test_invalidator.py
+@@ -0,0 +1,292 @@
++"""End-to-end tests for CacheInvalidator's tag- and age-based eviction.
++
++These run against a real in-memory SQLite database (the production schema, via
++the SDK's ``Database``) and a real ``LLMCache`` with a mocked Qdrant store and
++embedding service. That exercises the actual ``json_each`` tag query *and* the
++schema/code alignment that makes the SQLite mirror writable — the silent
++mismatch that previously made both the SQLite store and every invalidation path
++a no-op. Uses ``asyncio.run`` (no pytest-asyncio) so it runs under the
++bare-pytest governance CI lane.
++"""
++
++import asyncio
++import json
++from unittest.mock import AsyncMock, MagicMock, patch
++
++from activelearning import Database
++
++from cache.invalidator import CacheInvalidator
++from cache.llm_cache import CacheTag, LLMCache
++
++
++def _run(body):
++    """Run an async test ``body(inv, cache, db, store)`` against a fresh
++    invalidator + LLMCache backed by one real in-memory database, closing the
++    connection afterwards so aiosqlite's worker thread shuts down cleanly."""
++
++    async def runner():
++        db = Database(":memory:")
++        await db.initialize()
++
++        store = MagicMock()
++        store.upsert = AsyncMock()
++        store.delete = AsyncMock()
++        store.ensure_collection = AsyncMock()
++        store.close = AsyncMock()
++
++        embeddings = MagicMock()
++        embeddings.embed_text = AsyncMock(return_value=[0.1, 0.2])
++
++        cache = LLMCache(
++            qdrant_url="https://qdrant",
++            db=db,
++            store=store,
++            embedding_service=embeddings,
++        )
++        invalidator = CacheInvalidator(event_bus=MagicMock(), llm_cache=cache, db=db)
++        try:
++            await body(invalidator, cache, db, store)
++        finally:
++            await db.close()
++
++    asyncio.run(runner())
++
++
++async def _responses(db):
++    """Responses still present in the cache, sorted — entries are identified by
++    their (test-controlled) response text rather than opaque prompt hashes."""
++    rows = await db.fetchall("SELECT response FROM llm_cache")
++    return sorted(row[0] for row in rows)
++
++
++# ── tag invalidation ─────────────────────────────────────────────────────────
++
++
++def test_event_handlers_evict_only_their_tag():
++    async def body(inv, cache, db, _store):
++        await cache.set("p1", "CODE", tags=[CacheTag.CODE_GENERATION])
++        await cache.set("p2", "CFG", tags=[CacheTag.CONFIGURATION])
++        await cache.set("p3", "TASK", tags=[CacheTag.TASK_QUERY])
++        await cache.set("p4", "PLAIN")  # untagged
++        assert await _responses(db) == ["CFG", "CODE", "PLAIN", "TASK"]
++
++        await inv._on_code_deployed({"path": "x"})
++        assert await _responses(db) == ["CFG", "PLAIN", "TASK"]
++
++        await inv._on_override_applied({"parameter": "thr"})
++        assert await _responses(db) == ["PLAIN", "TASK"]
++
++        await inv._on_task_saved({"task_id": "t"})
++        assert await _responses(db) == ["PLAIN"]  # only the untagged entry left
++
++    _run(body)
++
++
++def test_invalidate_by_tag_forwards_to_qdrant_and_counts():
++    async def body(inv, cache, db, store):
++        await cache.set("p1", "CODE", tags=[CacheTag.CODE_GENERATION])
++        await cache.set("p2", "PLAIN")
++
++        evicted = await inv._invalidate_by_tag(CacheTag.CODE_GENERATION)
++
++        assert evicted == 1
++        assert await _responses(db) == ["PLAIN"]
++        store.delete.assert_awaited_once()  # also removed from the vector store
++
++    _run(body)
++
++
++def test_tag_match_is_exact_not_substring():
++    """``task_query`` must not match ``task_query_extended`` (no LIKE)."""
++
++    async def body(inv, cache, db, _store):
++        await cache.set("p1", "EXTENDED", tags=["task_query_extended"])
++        await cache.set("p2", "TASK", tags=[CacheTag.TASK_QUERY])
++
++        evicted = await inv._invalidate_by_tag(CacheTag.TASK_QUERY)
++
++        assert evicted == 1
++        assert await _responses(db) == ["EXTENDED"]
++
++    _run(body)
++
++
++def test_entry_with_multiple_tags_evicted_by_any_of_them():
++    async def body(inv, cache, db, _store):
++        await cache.set("p1", "MULTI", tags=[CacheTag.CODE_GENERATION, CacheTag.CONFIGURATION])
++
++        evicted = await inv._invalidate_by_tag(CacheTag.CONFIGURATION)
++
++        assert evicted == 1
++        assert await _responses(db) == []
++
++    _run(body)
++
++
++def test_invalidate_by_tag_with_no_matches_is_noop():
++    async def body(inv, cache, db, store):
++        await cache.set("p1", "PLAIN")  # untagged
++        await cache.set("p2", "CFG", tags=[CacheTag.CONFIGURATION])
++
++        evicted = await inv._invalidate_by_tag(CacheTag.CODE_GENERATION)
++
++        assert evicted == 0
++        assert await _responses(db) == ["CFG", "PLAIN"]
++        store.delete.assert_not_called()
++
++    _run(body)
++
++
++# ── persistence + age-based eviction (regressions for the silent mismatch) ────
++
++
++def test_set_persists_row_to_sqlite():
++    """Regression: the mirror INSERT used columns the schema lacked, so it
++    failed silently and nothing was ever stored — leaving invalidation no rows
++    to act on."""
++
++    async def body(_inv, cache, db, _store):
++        await cache.set("hello world", "hi there", "model-x", tags=[CacheTag.TASK_QUERY])
++
++        row = await db.fetchone(
++            "SELECT prompt, response, model, tags, cached_at, hit_count FROM llm_cache"
++        )
++        assert row is not None
++        assert row[0] == "hello world"
++        assert row[1] == "hi there"
++        assert row[2] == "model-x"
++        assert row[3] == json.dumps([CacheTag.TASK_QUERY])
++        assert row[4] > 0  # cached_at populated
++        assert row[5] == 0  # hit_count default
++
++    _run(body)
++
++
++def test_delete_hashes_counts_only_successful_invalidations():
++    async def run():
++        cache = MagicMock()
++        cache.invalidate = AsyncMock(side_effect=[True, False, True])
++        inv = CacheInvalidator(event_bus=MagicMock(), llm_cache=cache, db=MagicMock())
++
++        assert await inv._delete_hashes(["a", "b", "c"]) == 2
++
++    asyncio.run(run())
++
++
++def test_evict_expired_with_nothing_to_evict():
++    async def body(inv, cache, db, _store):
++        await cache.set("fresh", "FRESH")  # within the age window
++
++        assert await inv._evict_expired() == 0
++        assert await _responses(db) == ["FRESH"]
++
++    _run(body)
++
++
++def test_evict_expired_drops_old_entries_and_keeps_fresh():
++    """Regression: the cleanup query referenced ``cached_at`` which the old
++    schema spelled ``created_at``, so age-based eviction always errored out."""
++
++    async def body(inv, cache, db, _store):
++        await cache.set("fresh", "FRESH", tags=[CacheTag.TASK_QUERY])
++        await cache.set("stale", "STALE")
++        # Backdate the stale entry well past max_age_days.
++        await db.execute(
++            "UPDATE llm_cache SET cached_at = 1, last_hit_at = NULL WHERE response = ?",
++            ("STALE",),
++        )
++        await db.commit()
++
++        evicted = await inv._evict_expired()
++
++        assert evicted == 1
++        assert await _responses(db) == ["FRESH"]
++
++    _run(body)
++
++
++def test_evict_expired_drops_never_hit_entry_past_unused_age():
++    """A never-hit entry idle past unused_age_days is evicted even while it is
++    younger than max_age_days (its cached_at stands in for last_hit_at)."""
++
++    async def body(inv, cache, db, _store):
++        await cache.set("idle", "IDLE")  # never hit
++        four_days_ms = 4 * 24 * 60 * 60 * 1000  # > unused_age (3d), < max_age (7d)
++        await db.execute(
++            "UPDATE llm_cache SET cached_at = cached_at - ?, last_hit_at = NULL WHERE response = ?",
++            (four_days_ms, "IDLE"),
++        )
++        await db.commit()
++
++        assert await inv._evict_expired() == 1
++        assert await _responses(db) == []
++
++    _run(body)
++
++
++# ── error handling (a failing query must not crash the caller) ────────────────
++
++
++def _failing_invalidator():
++    """An invalidator whose every DB query raises, with a cache that records
++    whether any eviction was attempted."""
++    db = MagicMock()
++    db.execute = AsyncMock(side_effect=RuntimeError("db down"))
++    cache = MagicMock()
++    cache.invalidate = AsyncMock(return_value=True)
++    inv = CacheInvalidator(event_bus=MagicMock(), llm_cache=cache, db=db)
++    return inv, cache
++
++
++def test_invalidate_by_tag_swallows_db_error():
++    inv, cache = _failing_invalidator()
++
++    assert asyncio.run(inv._invalidate_by_tag(CacheTag.CONFIGURATION)) == 0
++    cache.invalidate.assert_not_called()
++
++
++# ── periodic loop ─────────────────────────────────────────────────────────────
++
++
++def test_periodic_cleanup_evicts_then_exits_on_cancel():
++    """One pass evicts, the next sleep is cancelled (clean shutdown)."""
++
++    async def body(inv, cache, db, _store):
++        await cache.set("stale", "STALE")
++        await db.execute(
++            "UPDATE llm_cache SET cached_at = 1, last_hit_at = NULL WHERE response = ?",
++            ("STALE",),
++        )
++        await db.commit()
++        inv._running = True
++
++        calls = {"n": 0}
++
++        async def fake_sleep(_seconds):
++            calls["n"] += 1
++            if calls["n"] >= 2:
++                raise asyncio.CancelledError()
++
++        with patch("asyncio.sleep", fake_sleep):
++            await inv._periodic_cleanup()
++
++        assert await _responses(db) == []  # evicted on the first pass
++
++    _run(body)
++
++
++def test_periodic_cleanup_keeps_running_after_an_error():
++    """A failed pass is logged and swallowed; the loop exits once stopped."""
++
++    async def body(inv, _cache, _db, _store):
++        inv._running = True
++
++        async def boom():
++            inv._running = False  # let the loop exit after this pass
++            raise RuntimeError("boom")
++
++        inv._evict_expired = boom
++        with patch("asyncio.sleep", AsyncMock()):
++            await inv._periodic_cleanup()  # returns without raising
++
++    _run(body)
+diff --git a/cache/tests/test_llm_cache.py b/cache/tests/test_llm_cache.py
+index 145b6bf..4e1da19 100644
+--- a/cache/tests/test_llm_cache.py
++++ b/cache/tests/test_llm_cache.py
+@@ -7,13 +7,17 @@
+ 
+ import asyncio
+ import importlib.util
++import json
+ import os
+ import sys
+ from unittest.mock import AsyncMock, MagicMock
+ 
+ from activelearning import QdrantHit, QdrantPoint
+ 
+-_LC_PATH = os.path.join(os.path.dirname(__file__), "..", "src", "cache", "llm_cache.py")
++# abspath so coverage attributes this to the same file as the packaged import.
++_LC_PATH = os.path.abspath(
++    os.path.join(os.path.dirname(__file__), "..", "src", "cache", "llm_cache.py")
++)
+ _spec = importlib.util.spec_from_file_location("cache_llm_cache", _LC_PATH)
+ lc = importlib.util.module_from_spec(_spec)
+ sys.modules["cache_llm_cache"] = lc
+@@ -41,7 +45,7 @@ def _make(*, search_result=None, embed=(0.1, 0.2), embed_error=None, hit_thresho
+     db.commit = AsyncMock()
+ 
+     cache = LLMCache(
+-        qdrant_url="http://qdrant",
++        qdrant_url="https://qdrant",
+         db=db,
+         hit_threshold=hit_threshold,
+         store=store,
+@@ -128,6 +132,75 @@ def test_set_embedding_failure_returns_false_without_upsert():
+     db.execute.assert_not_called()
+ 
+ 
++def test_set_rolls_back_qdrant_when_mirror_write_fails():
++    """A failed SQLite mirror write fails the call and removes the vector, so the
++    two stores stay consistent."""
++    cache, store, _, db = _make()
++    db.execute = AsyncMock(side_effect=RuntimeError("disk full"))
++
++    ok = asyncio.run(cache.set("p", "r", tags=["code_generation"]))
++
++    assert ok is False
++    store.upsert.assert_awaited_once()
++    store.delete.assert_awaited_once()
++    collection, ids = store.delete.call_args.args
++    assert collection == "llm_cache"
++    assert len(ids) == 1
++
++
++def test_set_rollback_failure_still_reports_failure():
++    """If the rollback delete also fails, set() still reports failure."""
++    cache, store, _, db = _make()
++    db.execute = AsyncMock(side_effect=RuntimeError("disk full"))
++    store.delete = AsyncMock(side_effect=RuntimeError("qdrant down"))
++
++    assert asyncio.run(cache.set("p", "r")) is False
++
++
++def test_set_records_tags_in_both_stores():
++    """Tags ride along into the Qdrant payload (a list) and the SQLite row (JSON)
++    so entries can later be evicted by tag."""
++    cache, store, _, db = _make()
++
++    ok = asyncio.run(cache.set("p", "r", "m", tags=["code_generation"]))
++
++    assert ok is True
++    _, points = store.upsert.call_args.args
++    assert points[0].payload["tags"] == ["code_generation"]
++    # INSERT column order: prompt_hash, prompt, response, model, tags, ...
++    insert_params = db.execute.call_args.args[1]
++    assert insert_params[4] == json.dumps(["code_generation"])
++
++
++def test_set_without_tags_stores_null():
++    """Untagged entries persist NULL so they never match a tag query."""
++    cache, store, _, db = _make()
++
++    asyncio.run(cache.set("p", "r"))
++
++    assert store.upsert.call_args.args[1][0].payload["tags"] is None
++    assert db.execute.call_args.args[1][4] is None
++
++
++def test_set_coerces_bare_string_tag_to_list():
++    """A single string tag from the JSON boundary is wrapped, not split into
++    characters."""
++    cache, store, _, db = _make()
++
++    asyncio.run(cache.set("p", "r", tags="code_generation"))
++
++    assert store.upsert.call_args.args[1][0].payload["tags"] == ["code_generation"]
++    assert db.execute.call_args.args[1][4] == json.dumps(["code_generation"])
++
++
++def test_normalize_tags():
++    assert lc._normalize_tags(None) is None
++    assert lc._normalize_tags([]) is None
++    assert lc._normalize_tags("x") == ["x"]
++    assert lc._normalize_tags(["a", "", None, "b"]) == ["a", "b"]  # falsy dropped
++    assert lc._normalize_tags(["", None]) is None  # nothing left → None
++
++
+ # ── invalidate ──────────────────────────────────────────────────────────────
+ 
+ 
+@@ -149,3 +222,18 @@ def test_setup_ensures_collection():
+     cache, store, _, _ = _make()
+     asyncio.run(cache.setup())
+     store.ensure_collection.assert_awaited_once_with("llm_cache")
++
++
++def test_setup_raises_when_json1_unavailable():
++    """Tag invalidation needs json_each; an unsupported SQLite build fails loudly
++    at startup instead of silently evicting nothing."""
++    cache, _, _, db = _make()
++    db.execute = AsyncMock(side_effect=Exception("no such function: json_each"))
++
++    raised = ""
++    try:
++        asyncio.run(cache.setup())
++    except RuntimeError as e:
++        raised = str(e)
++
++    assert "JSON" in raised
+diff --git a/cache/tests/test_service.py b/cache/tests/test_service.py
+new file mode 100644
+index 0000000..340eecc
+--- /dev/null
++++ b/cache/tests/test_service.py
+@@ -0,0 +1,45 @@
++"""Tests for CacheService request handlers (producer-side tag threading).
++
++Uses asyncio.run (no pytest-asyncio) to run under the bare-pytest governance lane.
++"""
++
++import asyncio
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++from cache.service import CacheService
++
++
++def test_handle_cache_query_forwards_tags():
++    """`cache.query` passes the request's tags through to the autopilot."""
++    # The handler only touches `_autopilot`, so a stand-in self avoids building
++    # the full service (NATS/DB).
++    autopilot = MagicMock()
++    autopilot.query_llm = AsyncMock(return_value={"response": "x"})
++    service = SimpleNamespace(_autopilot=autopilot)
++
++    msg = MagicMock()
++    msg.reply = "inbox"
++    msg.respond = AsyncMock()
++
++    asyncio.run(
++        CacheService._handle_cache_query(service, {"prompt": "p", "tags": ["configuration"]}, msg)
++    )
++
++    assert autopilot.query_llm.call_args.kwargs["tags"] == ["configuration"]
++    msg.respond.assert_awaited_once()
++
++
++def test_handle_cache_query_without_reply_skips_response():
++    """A fire-and-forget query (no reply subject) produces no response."""
++    autopilot = MagicMock()
++    autopilot.query_llm = AsyncMock(return_value={"response": "x"})
++    service = SimpleNamespace(_autopilot=autopilot)
++
++    msg = MagicMock()
++    msg.reply = None
++    msg.respond = AsyncMock()
++
++    asyncio.run(CacheService._handle_cache_query(service, {"prompt": "p"}, msg))
++
++    msg.respond.assert_not_called()
+diff --git a/sdk/src/activelearning/database.py b/sdk/src/activelearning/database.py
+index 3fbf598..1bb4d0b 100644
+--- a/sdk/src/activelearning/database.py
++++ b/sdk/src/activelearning/database.py
+@@ -56,6 +56,19 @@ def _load_schema() -> str:
+ 
+ SCHEMA_SQL = _load_schema()
+ 
++# Ordered migrations applied before the (declarative) schema is reapplied. Entry
++# i upgrades a database from user_version i to i+1. Because the schema is all
++# CREATE ... IF NOT EXISTS, a migration only needs to drop or alter objects whose
++# shape changed; executescript then recreates them. This keeps the table DDL in
++# schema.sql as the single source of truth.
++_MIGRATIONS: list[tuple[str, ...]] = [
++    # v1: llm_cache changed shape (added model/tags/cached_at, dropped legacy
++    # columns). It is a disposable index over the Qdrant cache, so drop the old
++    # table and let the schema recreate it with the current columns.
++    ("DROP TABLE IF EXISTS llm_cache",),
++]
++SCHEMA_VERSION = len(_MIGRATIONS)
++
+ 
+ class Database:
+     """
+@@ -89,12 +102,34 @@ async def initialize(self) -> None:
+         await self._connection.execute("PRAGMA journal_mode=WAL")
+         await self._connection.execute("PRAGMA synchronous=NORMAL")
+ 
+-        # Create schema
++        # Bring an older database up to date, then (re)create the schema
++        await self._migrate()
+         await self._connection.executescript(SCHEMA_SQL)
++        await self._connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+         await self._connection.commit()
+ 
+         logger.info(f"Database initialized at {self.db_path}")
+ 
++    async def _migrate(self) -> None:
++        """Run pending migrations so existing databases adopt schema changes.
++
++        Tracks progress with PRAGMA user_version; a fresh database starts at 0
++        and the pending statements are no-ops on it.
++        """
++        cursor = await self._connection.execute("PRAGMA user_version")
++        row = await cursor.fetchone()
++        version = row[0] if row else 0
++
++        if version > SCHEMA_VERSION:
++            raise RuntimeError(
++                f"Database schema version {version} is newer than this build "
++                f"supports ({SCHEMA_VERSION}); upgrade the application"
++            )
++
++        for statements in _MIGRATIONS[version:]:
++            for statement in statements:
++                await self._connection.execute(statement)
++
+     async def close(self) -> None:
+         """Close the database connection."""
+         if self._connection:
+diff --git a/sdk/src/activelearning/schema.sql b/sdk/src/activelearning/schema.sql
+index 5b17d9d..95cc1d0 100644
+--- a/sdk/src/activelearning/schema.sql
++++ b/sdk/src/activelearning/schema.sql
+@@ -102,28 +102,29 @@ CREATE INDEX IF NOT EXISTS idx_kernel_decisions_timestamp
+ -- LLM CACHE TABLES
+ -- =============================================================================
+ 
++-- Response vectors live in Qdrant; this table is the index the invalidator uses
++-- to evict by age, by tag, or wholesale. `tags` is a JSON array matched with
++-- json_each(); prompt_hash is the SHA-256 of the prompt and the Qdrant point id.
+ CREATE TABLE IF NOT EXISTS llm_cache (
+-    id TEXT PRIMARY KEY,
+-    prompt_hash TEXT NOT NULL UNIQUE,
++    prompt_hash TEXT PRIMARY KEY,
+     prompt TEXT NOT NULL,
+     response TEXT NOT NULL,
+-    embedding_ref TEXT,  -- Reference to Qdrant vector ID
+-    confidence REAL DEFAULT 1.0,
+-    hit_count INTEGER DEFAULT 0,
+-    last_hit_at INTEGER,
+-    created_at INTEGER NOT NULL,
+-    expires_at INTEGER
++    model TEXT NOT NULL,
++    tags TEXT,  -- JSON array of invalidation tags, or NULL when untagged
++    cached_at INTEGER NOT NULL,
++    hit_count INTEGER NOT NULL DEFAULT 0,
++    last_hit_at INTEGER
+ );
+ 
+-CREATE INDEX IF NOT EXISTS idx_llm_cache_prompt_hash
+-    ON llm_cache(prompt_hash);
+-
+ CREATE INDEX IF NOT EXISTS idx_llm_cache_hit_count
+     ON llm_cache(hit_count DESC);
+ 
+ CREATE INDEX IF NOT EXISTS idx_llm_cache_last_hit
+     ON llm_cache(last_hit_at DESC);
+ 
++CREATE INDEX IF NOT EXISTS idx_llm_cache_cached_at
++    ON llm_cache(cached_at);
++
+ -- =============================================================================
+ -- OVERRIDE TABLES
+ -- =============================================================================
+diff --git a/sdk/tests/test_robustness.py b/sdk/tests/test_robustness.py
+index ddbcf67..1e27334 100644
+--- a/sdk/tests/test_robustness.py
++++ b/sdk/tests/test_robustness.py
+@@ -5,9 +5,10 @@
+ import sys
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
++import aiosqlite
+ import pytest
+ 
+-from activelearning.database import Database, default_sqlite_path
++from activelearning.database import SCHEMA_VERSION, Database, default_sqlite_path
+ from activelearning.embeddings import EmbeddingService
+ from activelearning.nats_client import EventBus
+ 
+@@ -43,6 +44,78 @@ async def test_initialize_creates_parent_dir(self, tmp_path, monkeypatch):
+         finally:
+             await db.close()
+ 
++    @pytest.mark.asyncio
++    async def test_migrates_legacy_llm_cache_table(self, tmp_path, monkeypatch):
++        """An old llm_cache table is rebuilt with the current columns, while
++        unrelated data is left untouched."""
++        db_file = tmp_path / "legacy.db"
++        monkeypatch.setenv("SQLITE_PATH", str(db_file))
++
++        async with aiosqlite.connect(str(db_file)) as conn:
++            await conn.execute(
++                "CREATE TABLE llm_cache (id TEXT PRIMARY KEY, prompt_hash TEXT, "
++                "embedding_ref TEXT, confidence REAL, created_at INTEGER)"
++            )
++            await conn.execute("CREATE TABLE keepme (x INTEGER)")
++            await conn.execute("INSERT INTO keepme VALUES (1)")
++            await conn.execute("PRAGMA user_version = 0")
++            await conn.commit()
++
++        db = Database()
++        await db.initialize()
++        try:
++            cursor = await db.execute("PRAGMA table_info(llm_cache)")
++            columns = {row[1] for row in await cursor.fetchall()}
++            assert {"model", "tags", "cached_at"} <= columns
++            assert "embedding_ref" not in columns
++
++            cursor = await db.execute("PRAGMA user_version")
++            assert (await cursor.fetchone())[0] == SCHEMA_VERSION
++
++            cursor = await db.execute("SELECT x FROM keepme")
++            assert (await cursor.fetchone())[0] == 1  # unrelated data preserved
++        finally:
++            await db.close()
++
++    @pytest.mark.asyncio
++    async def test_initialize_rejects_newer_schema_version(self, tmp_path, monkeypatch):
++        """A database written by a newer build is refused rather than downgraded."""
++        db_file = tmp_path / "future.db"
++        monkeypatch.setenv("SQLITE_PATH", str(db_file))
++        async with aiosqlite.connect(str(db_file)) as conn:
++            await conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
++            await conn.commit()
++
++        db = Database()
++        try:
++            with pytest.raises(RuntimeError, match="newer"):
++                await db.initialize()
++        finally:
++            await db.close()
++
++    @pytest.mark.asyncio
++    async def test_reinitialize_preserves_cache_rows(self, tmp_path, monkeypatch):
++        """Once migrated, re-initialization does not re-drop the cache table."""
++        db_file = tmp_path / "stable.db"
++        monkeypatch.setenv("SQLITE_PATH", str(db_file))
++
++        db = Database()
++        await db.initialize()
++        await db.execute(
++            "INSERT INTO llm_cache (prompt_hash, prompt, response, model, cached_at) "
++            "VALUES ('h', 'p', 'r', 'm', 1)"
++        )
++        await db.commit()
++        await db.close()
++
++        db2 = Database()
++        await db2.initialize()
++        try:
++            cursor = await db2.execute("SELECT prompt FROM llm_cache WHERE prompt_hash = 'h'")
++            assert (await cursor.fetchone())[0] == "p"  # survived the second init
++        finally:
++            await db2.close()
++
+ 
+ class TestEmbeddingServiceSession:
+     @pytest.mark.asyncio

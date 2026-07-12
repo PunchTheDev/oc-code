@@ -1,0 +1,382 @@
+diff --git a/apps/ui/src/lib/metagraphed/queries.block-chain-events.test.ts b/apps/ui/src/lib/metagraphed/queries.block-chain-events.test.ts
+new file mode 100644
+index 000000000..fe9cfa051
+--- /dev/null
++++ b/apps/ui/src/lib/metagraphed/queries.block-chain-events.test.ts
+@@ -0,0 +1,118 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { ApiResult } from "./client";
++import { apiFetch } from "./client";
++import { blockChainEventsQuery } from "./queries";
++
++vi.mock("./client", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("./client")>();
++  return { ...actual, apiFetch: vi.fn() };
++});
++
++const mockedApiFetch = vi.mocked(apiFetch);
++
++function resolveWith(data: unknown): void {
++  mockedApiFetch.mockResolvedValue({
++    data,
++    meta: {} as ApiResult<unknown>["meta"],
++    url: "/api/v1/blocks/5000000/chain-events",
++  });
++}
++
++async function runQuery(ref: string) {
++  const opts = blockChainEventsQuery(ref);
++  if (!opts.queryFn) throw new Error("expected a queryFn");
++  return opts.queryFn({
++    signal: new AbortController().signal,
++    queryKey: opts.queryKey,
++    meta: undefined,
++  } as unknown as Parameters<NonNullable<typeof opts.queryFn>>[0]);
++}
++
++describe("blockChainEventsQuery", () => {
++  beforeEach(() => {
++    mockedApiFetch.mockReset();
++  });
++
++  it("fetches the per-block chain-events route with no query params", async () => {
++    resolveWith({ block_number: 5000000, count: 0, events: [] });
++    await runQuery("5000000");
++    expect(mockedApiFetch).toHaveBeenCalledWith("/api/v1/blocks/5000000/chain-events", {
++      signal: expect.any(AbortSignal),
++    });
++  });
++
++  it("normalizes a well-formed decoded event, converting epoch-ms observed_at to ISO", async () => {
++    resolveWith({
++      block_number: 5000000,
++      count: 1,
++      events: [
++        {
++          block_number: 5000000,
++          event_index: 1,
++          pallet: "SubtensorModule",
++          method: "NeuronRegistered",
++          args: { netuid: 43, uid: 12 },
++          phase: "ApplyExtrinsic",
++          extrinsic_index: 2,
++          observed_at: 1735689600000,
++        },
++      ],
++    });
++    const res = await runQuery("5000000");
++    expect(res.data.block_number).toBe(5000000);
++    expect(res.data.count).toBe(1);
++    expect(res.data.events).toHaveLength(1);
++    expect(res.data.events[0]).toMatchObject({
++      pallet: "SubtensorModule",
++      method: "NeuronRegistered",
++      args: { netuid: 43, uid: 12 },
++      phase: "ApplyExtrinsic",
++      extrinsic_index: 2,
++      observed_at: new Date(1735689600000).toISOString(),
++    });
++  });
++
++  it("coerces the Postgres tier's string-serialized bigints and backfills the per-row block_number", async () => {
++    // Real production shape: the per-block route's rows omit block_number
++    // (redundant — every row is the same block) and serialize event_index /
++    // observed_at as JSON strings (bigint columns), unlike the D1-backed
++    // events/extrinsics routes which return plain numbers and ISO strings.
++    resolveWith({
++      block_number: 8559857,
++      count: 1,
++      events: [
++        {
++          event_index: "323",
++          pallet: "System",
++          method: "ExtrinsicSuccess",
++          args: { class: "Normal" },
++          phase: "ApplyExtrinsic",
++          extrinsic_index: 17,
++          observed_at: "1783313892001",
++        },
++      ],
++    });
++    const res = await runQuery("8559857");
++    expect(res.data.events[0]).toMatchObject({
++      block_number: 8559857,
++      event_index: 323,
++      observed_at: new Date(1783313892001).toISOString(),
++    });
++  });
++
++  it("degrades a cold / junk store to a schema-stable empty page", async () => {
++    for (const raw of [{}, null, "x", { events: "nope" }]) {
++      resolveWith(raw);
++      const res = await runQuery("5000000");
++      expect(res.data.count).toBe(0);
++      expect(res.data.events).toEqual([]);
++    }
++  });
++
++  it("drops malformed event rows", async () => {
++    resolveWith({ events: [null, "x", 42, { pallet: "Balances", method: "Transfer" }] });
++    const res = await runQuery("5000000");
++    expect(res.data.events).toHaveLength(1);
++    expect(res.data.events[0]?.pallet).toBe("Balances");
++  });
++});
+diff --git a/apps/ui/src/lib/metagraphed/queries.ts b/apps/ui/src/lib/metagraphed/queries.ts
+index a62d92eed..947b3e15c 100644
+--- a/apps/ui/src/lib/metagraphed/queries.ts
++++ b/apps/ui/src/lib/metagraphed/queries.ts
+@@ -60,6 +60,8 @@ import type {
+   CompareSubnet,
+   BlockEvent,
+   BlockEvents,
++  BlockChainEvents,
++  ChainEvent,
+   Coverage,
+   BlockExtrinsics,
+   CurationLevel,
+@@ -1535,6 +1537,44 @@ function normalizeBlockEvents(raw: unknown): BlockEvents {
+   } satisfies BlockEvents;
+ }
+ 
++// The Postgres-backed all-events tier (unlike the first-party D1 blocks/events/
++// extrinsics tiers) serializes bigint columns (block_number, event_index,
++// observed_at) as JSON strings rather than numbers, and the per-block route
++// omits the (redundant, same for every row) block_number on each event —
++// hence coerceFiniteNumber (not firstFiniteNumber) and the fallback below.
++function normalizeChainEvent(raw: unknown, fallbackBlockNumber: number | null): ChainEvent | null {
++  if (!isRecord(raw)) return null;
++  const observedAtMs = coerceFiniteNumber(raw.observed_at);
++  return {
++    ...(raw as object),
++    block_number: coerceFiniteNumber(raw.block_number) ?? fallbackBlockNumber,
++    event_index: coerceFiniteNumber(raw.event_index) ?? null,
++    pallet: firstString(raw.pallet) ?? null,
++    method: firstString(raw.method) ?? null,
++    args: raw.args === undefined ? null : sanitizeExtrinsicValue(raw.args),
++    phase: firstString(raw.phase) ?? null,
++    extrinsic_index: coerceFiniteNumber(raw.extrinsic_index) ?? null,
++    observed_at: observedAtMs != null ? (epochMsToIso(observedAtMs) ?? null) : null,
++  } satisfies ChainEvent;
++}
++
++function normalizeBlockChainEvents(raw: unknown): BlockChainEvents {
++  const d = isRecord(raw) ? raw : {};
++  const blockNumber = coerceFiniteNumber(d.block_number) ?? null;
++  const rows = Array.isArray(d.events)
++    ? d.events.flatMap((x) => {
++        const normalized = normalizeChainEvent(x, blockNumber);
++        return normalized ? [normalized] : [];
++      })
++    : [];
++  return {
++    ...(d as object),
++    block_number: blockNumber,
++    count: coerceFiniteNumber(d.count) ?? rows.length,
++    events: rows,
++  } satisfies BlockChainEvents;
++}
++
+ /** Recent blocks feed — newest first, offset-paginated (limit ≤ 100). */
+ export const blocksQuery = (params?: QueryParams) =>
+   queryOptions({
+@@ -1592,6 +1632,28 @@ export const blockEventsQuery = (ref: string, params?: QueryParams) =>
+     staleTime: STALE_SHORT,
+   });
+ 
++/**
++ * Single block by numeric block_number or 0x block_hash, with every raw
++ * pallet-level chain event from the Postgres-backed all-events tier — a
++ * broader, decoded-args view than {@link blockEventsQuery}'s curated,
++ * account-attributed stream. Takes no query params (the route accepts none).
++ */
++export const blockChainEventsQuery = (ref: string) =>
++  queryOptions({
++    queryKey: k("block-chain-events", ref),
++    queryFn: async ({ signal }) => {
++      const res = await apiFetch<unknown>(
++        `/api/v1/blocks/${blockRefPathSegment(ref)}/chain-events`,
++        { signal },
++      );
++      return {
++        ...res,
++        data: normalizeBlockChainEvents(res.data),
++      } as ApiResult<BlockChainEvents>;
++    },
++    staleTime: STALE_SHORT,
++  });
++
+ function normalizeExtrinsicCallArgs(raw: unknown): Extrinsic["call_args"] {
+   if (Array.isArray(raw)) {
+     return raw
+diff --git a/apps/ui/src/lib/metagraphed/types.ts b/apps/ui/src/lib/metagraphed/types.ts
+index b14b87cdd..536e142ac 100644
+--- a/apps/ui/src/lib/metagraphed/types.ts
++++ b/apps/ui/src/lib/metagraphed/types.ts
+@@ -814,6 +814,31 @@ export interface BlockEvents {
+   [key: string]: unknown;
+ }
+ 
++/**
++ * One raw pallet-level chain event from /api/v1/blocks/{ref}/chain-events —
++ * every decoded event in the block (not filtered to account-attributed rows
++ * like {@link BlockEvent}), with the runtime pallet.method id and full args.
++ */
++export interface ChainEvent {
++  block_number: number | null;
++  event_index: number | null;
++  pallet: string | null;
++  method: string | null;
++  args?: unknown;
++  phase?: string | null;
++  extrinsic_index?: number | null;
++  observed_at?: string | null; // iso
++  [key: string]: unknown;
++}
++
++/** Decoded chain-events payload from /api/v1/blocks/{ref}/chain-events. */
++export interface BlockChainEvents {
++  block_number: number | null;
++  count: number;
++  events: ChainEvent[];
++  [key: string]: unknown;
++}
++
+ export interface ExtrinsicCallArg {
+   name?: string | null;
+   value?: unknown;
+diff --git a/apps/ui/src/routes/blocks.$ref.tsx b/apps/ui/src/routes/blocks.$ref.tsx
+index 3aec56e8e..d20abf299 100644
+--- a/apps/ui/src/routes/blocks.$ref.tsx
++++ b/apps/ui/src/routes/blocks.$ref.tsx
+@@ -12,7 +12,12 @@ import { SectionAnchor } from "@/components/metagraphed/section-anchor";
+ import { EndpointSnippet } from "@/components/metagraphed/endpoint-snippet";
+ import { StatTile } from "@/components/metagraphed/charts/stat-tile";
+ import { QueryErrorBoundary } from "@/components/metagraphed/error-boundary";
+-import { blockEventsQuery, blockExtrinsicsQuery, blockQuery } from "@/lib/metagraphed/queries";
++import {
++  blockChainEventsQuery,
++  blockEventsQuery,
++  blockExtrinsicsQuery,
++  blockQuery,
++} from "@/lib/metagraphed/queries";
+ import { formatNumber } from "@/lib/metagraphed/format";
+ import { blockRefPathSegment, isValidBlockRef, shortHash } from "@/lib/metagraphed/blocks";
+ import { extrinsicCall } from "@/lib/metagraphed/extrinsics";
+@@ -88,9 +93,11 @@ function ValidBlockDetail({ refValue }: { refValue: string }) {
+   const block = useSuspenseQuery(blockQuery(refValue)).data.data;
+   const extrinsicsQuery = useQuery(blockExtrinsicsQuery(refValue, { limit: 100 }));
+   const eventsQuery = useQuery(blockEventsQuery(refValue, { limit: 100 }));
++  const chainEventsQuery = useQuery(blockChainEventsQuery(refValue));
+ 
+   const extrinsics = extrinsicsQuery.data?.data.extrinsics ?? [];
+   const events = eventsQuery.data?.data.events ?? [];
++  const chainEvents = chainEventsQuery.data?.data.events ?? [];
+ 
+   if (!block) {
+     return (
+@@ -375,6 +382,69 @@ function ValidBlockDetail({ refValue }: { refValue: string }) {
+         )}
+       </SectionAnchor>
+ 
++      <SectionAnchor
++        id="chain-events"
++        title="Chain events"
++        subtitle="Every raw pallet-level event in this block, decoded from the chain — broader than the curated events above, but without account/amount attribution."
++        tone="accent"
++      >
++        {chainEventsQuery.isPending ? (
++          <Skeleton className="h-44" />
++        ) : chainEventsQuery.error ? (
++          <div className="p-4">
++            <ErrorState
++              error={chainEventsQuery.error}
++              context="block chain events"
++              onRetry={() => {
++                void chainEventsQuery.refetch();
++              }}
++            />
++          </div>
++        ) : chainEvents.length === 0 ? (
++          <EmptyState
++            title="No chain events"
++            description="This block has no decoded pallet events indexed yet, or the all-events backfill hasn't reached it."
++          />
++        ) : (
++          <div className="overflow-x-auto rounded border border-border bg-card">
++            <table className="w-full text-left text-sm">
++              <thead className="bg-surface/40">
++                <tr>
++                  <th className="px-4 py-2.5">Pallet.method</th>
++                  <th className="px-4 py-2.5">Phase</th>
++                  <th className="px-4 py-2.5 text-right">Extrinsic</th>
++                  <th className="px-4 py-2.5">Args</th>
++                </tr>
++              </thead>
++              <tbody className="divide-y divide-border">
++                {chainEvents.map((event) => (
++                  <tr
++                    key={`${event.block_number}-${event.event_index}`}
++                    className="hover:bg-surface/40"
++                  >
++                    <td className="px-4 py-2.5 font-mono text-[11px] text-ink-strong">
++                      {extrinsicCall(event.pallet, event.method)}
++                    </td>
++                    <td className="px-4 py-2.5 font-mono text-[11px] text-ink-muted">
++                      {event.phase ?? "—"}
++                    </td>
++                    <td className="px-4 py-2.5 text-right font-mono text-[11px] tabular-nums text-ink">
++                      {event.extrinsic_index != null ? formatNumber(event.extrinsic_index) : "—"}
++                    </td>
++                    <td
++                      className="max-w-xs truncate px-4 py-2.5 font-mono text-[11px] text-ink-muted"
++                      title={formatChainEventArgs(event.args)}
++                    >
++                      {formatChainEventArgs(event.args)}
++                    </td>
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++          </div>
++        )}
++      </SectionAnchor>
++
+       <div className="mt-6">
+         <Link
+           to="/blocks"
+@@ -394,6 +464,10 @@ function ValidBlockDetail({ refValue }: { refValue: string }) {
+             { label: "block", path: `/api/v1/blocks/${sourceRef}` },
+             { label: "extrinsics", path: `/api/v1/blocks/${sourceRef}/extrinsics` },
+             { label: "events", path: `/api/v1/blocks/${sourceRef}/events` },
++            {
++              label: "chain events",
++              path: `/api/v1/blocks/${sourceRef}/chain-events`,
++            },
+             { label: "artifact", path: `/metagraph/blocks/${sourceRef}.json` },
+           ]}
+         />
+@@ -404,6 +478,7 @@ function ValidBlockDetail({ refValue }: { refValue: string }) {
+           `/api/v1/blocks/${sourceRef}`,
+           `/api/v1/blocks/${sourceRef}/extrinsics`,
+           `/api/v1/blocks/${sourceRef}/events`,
++          `/api/v1/blocks/${sourceRef}/chain-events`,
+         ]}
+         artifacts={[`/metagraph/blocks/${sourceRef}.json`]}
+       />
+@@ -411,6 +486,15 @@ function ValidBlockDetail({ refValue }: { refValue: string }) {
+   );
+ }
+ 
++function formatChainEventArgs(args: unknown): string {
++  if (args == null) return "—";
++  try {
++    return JSON.stringify(args) ?? "—";
++  } catch {
++    return "[Unserializable value]";
++  }
++}
++
+ function FieldRow({ label, children }: { label: string; children: ReactNode }) {
+   return (
+     <div className="flex flex-col gap-1 px-4 py-3 sm:flex-row sm:items-center sm:gap-4">

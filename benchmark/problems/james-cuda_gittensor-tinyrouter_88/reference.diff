@@ -1,0 +1,772 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index f96b69d..f362c47 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -18,6 +18,29 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
+ 
+ ---
+ 
++## 2026-07-10 — Cost-ledger verifier hashed a different JSON string than the writer  #mistake #decision
++**Context:** checking the token-cost ledger path used by training, `cost_report.py`,
++and submission packing.
++**Expected:** a ledger written by `OpenRouterPool._ledger_append` verifies in
++`scripts/cost_report.py --ledger`, and the submission packer prices the same
++entries from the same parsed rows.
++**Actual:** legitimate ledgers failed verification. The writer hashed a fixed,
++compact payload string (`{"m":"...","p":...,"c":...}` in that key order), while
++the verifier rebuilt the payload with `json.dumps(..., sort_keys=True)`, which
++changes the byte string and therefore the hash. `pack_submission.py` then read
++the same file through a separate ad-hoc path, so the write, verify, and summarize
++steps were not sharing one canonical implementation.
++**Root cause:** the hash-chain format existed only implicitly inside the writer.
++Verifiers reimplemented it differently, and nothing enforced one shared payload
++encoding.
++**Fix / decision:** add `trinity.llm.cost_ledger` as the single source of truth
++for payload formatting, chained hashing, line parsing, ledger verification, and
++append helpers. Route `openrouter_client`, `cost_report.py`, and
++`pack_submission.py` through it, and cover the regression with
++`tests/test_cost_ledger.py`.
++**Follow-up:** the append helper writes text-only handles; keeping the test hook
++typed as `TextIO` avoids implying binary support the implementation does not have.
++
+ ## 2026-07-10 — Rate-limit gate counted wins, not attempts  #mistake #finding #decision
+ 
+ **Context:** follow-up from the UTC timestamp fix on Gate 1 (`_check_rate_limit`).
+diff --git a/scripts/cost_report.py b/scripts/cost_report.py
+index 5795f0e..27615c3 100644
+--- a/scripts/cost_report.py
++++ b/scripts/cost_report.py
+@@ -19,10 +19,10 @@
+ from __future__ import annotations
+ 
+ import argparse
+-import hashlib
+-import json
+ import sys
+ 
++from trinity.llm.cost_ledger import read_ledger_entries, verify_ledger_chain
++
+ # ---- OpenRouter prices ($ per 1M tokens), (input, output). ----
+ PRICES = {
+     "qwen3.5-35b-a3b": (0.14, 1.00),
+@@ -37,47 +37,6 @@ def cost(prompt_tok: int, completion_tok: int, in_rate: float, out_rate: float)
+     return prompt_tok / 1e6 * in_rate + completion_tok / 1e6 * out_rate
+ 
+ 
+-def verify_ledger_chain(path: str) -> tuple[bool, int, str]:
+-    """Verify the hash-chain integrity of a cost ledger.
+-
+-    Each entry's ``h`` field must equal
+-    ``sha256(prev_h + {"m":...,"p":...,"c":...})``.
+-    The first entry's previous hash is the empty string.
+-
+-    Returns:
+-        (valid, num_entries, error_message).
+-        If the chain is valid, ``error_message`` is empty.
+-    """
+-    prev_hash = ""
+-    entries = 0
+-    with open(path) as f:
+-        for lineno, line in enumerate(f, 1):
+-            line = line.strip()
+-            if not line:
+-                continue
+-            try:
+-                r = json.loads(line)
+-            except json.JSONDecodeError:
+-                return False, entries, f"line {lineno}: invalid JSON"
+-            expected_h = r.pop("h", None)
+-            payload = json.dumps(r, sort_keys=True)
+-            computed_h = hashlib.sha256((prev_hash + payload).encode()).hexdigest()
+-
+-            if expected_h is None:
+-                return False, entries, (
+-                    f"line {lineno}: missing hash field 'h' "
+-                    f"(ledger entries must be written by OpenRouterPool with hash-chain enabled)"
+-                )
+-            if computed_h != expected_h:
+-                return False, entries, (
+-                    f"line {lineno}: hash mismatch — expected {computed_h[:16]}..., "
+-                    f"got {expected_h[:16]}... (chain broken or entry tampered)"
+-                )
+-            prev_hash = computed_h
+-            entries += 1
+-    return True, entries, ""
+-
+-
+ def report_ledger(path: str) -> None:
+     # Verify hash-chain integrity first.
+     valid, num_entries, err = verify_ledger_chain(path)
+@@ -90,20 +49,11 @@ def report_ledger(path: str) -> None:
+     print(f"[ OK ] Ledger hash-chain verified ({num_entries} entries, all hashes intact)\n")
+ 
+     per = {}  # model -> [prompt, completion, calls]
+-    with open(path) as f:
+-        for line in f:
+-            line = line.strip()
+-            if not line:
+-                continue
+-            try:
+-                r = json.loads(line)
+-            except json.JSONDecodeError:
+-                continue
+-            m = r.get("m", "?")
+-            acc = per.setdefault(m, [0, 0, 0])
+-            acc[0] += r.get("p", 0)
+-            acc[1] += r.get("c", 0)
+-            acc[2] += 1
++    for entry in read_ledger_entries(path):
++        acc = per.setdefault(entry.model, [0, 0, 0])
++        acc[0] += entry.prompt_tokens
++        acc[1] += entry.completion_tokens
++        acc[2] += 1
+     total = 0.0
+     print(f"{'model':18s} {'calls':>8s} {'prompt_tok':>12s} {'compl_tok':>12s} {'$':>9s}")
+     print("-" * 64)
+diff --git a/scripts/pack_submission.py b/scripts/pack_submission.py
+index de4fa74..d237f35 100644
+--- a/scripts/pack_submission.py
++++ b/scripts/pack_submission.py
+@@ -38,28 +38,17 @@ def _estimate_cost() -> float:
+     if not ledger_path:
+         return 0.0
+     try:
+-        import hashlib
++        from trinity.llm.cost_ledger import read_ledger_entries, verify_ledger_chain
++
++        valid, _, _ = verify_ledger_chain(ledger_path)
++        if not valid:
++            return 0.0
++
+         total = 0.0
+         pricing = {"qwen3.5-35b-a3b": 0.90, "minimax-m3": 0.90, "deepseek-v4-flash": 0.90}
+-        prev_hash = ""
+-        with open(ledger_path) as f:
+-            for line in f:
+-                line = line.strip()
+-                if not line:
+-                    continue
+-                rec = json.loads(line)
+-                # Verify hash chain (skip if hash field missing — pre-chain entries)
+-                expected_h = rec.pop("h", None)
+-                payload = json.dumps(rec, sort_keys=True)
+-                if expected_h is not None:
+-                    computed_h = hashlib.sha256((prev_hash + payload).encode()).hexdigest()
+-                    if computed_h == expected_h:
+-                        prev_hash = computed_h
+-                m = rec.get("m", "")
+-                price = pricing.get(m, 0.90)
+-                pt = rec.get("p", 0)
+-                ct = rec.get("c", 0)
+-                total += price * (pt + ct) / 1_000_000
++        for entry in read_ledger_entries(ledger_path):
++            price = pricing.get(entry.model, 0.90)
++            total += price * entry.total_tokens / 1_000_000
+         return round(total, 4)
+     except Exception:
+         return 0.0
+diff --git a/src/trinity/llm/cost_ledger.py b/src/trinity/llm/cost_ledger.py
+new file mode 100644
+index 0000000..ce4ab19
+--- /dev/null
++++ b/src/trinity/llm/cost_ledger.py
+@@ -0,0 +1,288 @@
++"""Canonical cost-ledger hash chain for OpenRouter token accounting.
++
++The training/eval stack appends one JSONL line per LLM call when
++``TRINITY_COST_LEDGER`` is set. Each line carries a tamper-evident hash
++``h = sha256(prev_h + payload)`` where ``payload`` is a **fixed-format**
++compact JSON object::
++
++    {"m":"<model>","p":<prompt_tok>,"c":<completion_tok>}
++
++Every writer and verifier must hash the same ``payload`` string. Using
++``json.dumps(..., sort_keys=True)`` in the verifier while the writer emits
++compact key order makes every legitimate ledger fail verification.
++
++This module is the single source of truth for payload formatting, hashing,
++chain verification, and safe line parsing. It is importable from both
++``src/trinity`` and ``scripts/`` without torch/GPU dependencies.
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass
++from pathlib import Path
++from typing import TextIO
++
++__all__ = [
++    "LedgerEntry",
++    "ledger_payload",
++    "ledger_entry_hash",
++    "format_ledger_line",
++    "parse_ledger_line",
++    "verify_ledger_chain",
++    "verify_ledger_chain_text",
++    "read_ledger_entries",
++    "append_ledger_entry",
++    "summarize_token_usage",
++]
++
++
++@dataclass(frozen=True)
++class LedgerEntry:
++    """One decoded cost-ledger record (hash field excluded)."""
++
++    model: str
++    prompt_tokens: int
++    completion_tokens: int
++    line_number: int = 0
++
++    @property
++    def total_tokens(self) -> int:
++        return self.prompt_tokens + self.completion_tokens
++
++
++def ledger_payload(model: str, prompt_tokens: int, completion_tokens: int) -> str:
++    """Return the canonical pre-hash payload for one ledger entry.
++
++    Args:
++        model: Short model slug (e.g. ``qwen3.5-35b-a3b``).
++        prompt_tokens: Prompt token count from the API response.
++        completion_tokens: Completion token count from the API response.
++
++    Returns:
++        Compact JSON string with keys ``m``, ``p``, ``c`` in fixed order.
++    """
++    short = model.rsplit("/", 1)[-1]
++    pt = int(prompt_tokens)
++    ct = int(completion_tokens)
++    return f'{{"m":"{short}","p":{pt},"c":{ct}}}'
++
++
++def ledger_entry_hash(
++    prev_hash: str,
++    model: str,
++    prompt_tokens: int,
++    completion_tokens: int,
++) -> str:
++    """Compute the chained SHA-256 digest for one ledger entry.
++
++    Args:
++        prev_hash: Hash from the previous line (empty string for the first).
++        model: Short model slug.
++        prompt_tokens: Prompt token count.
++        completion_tokens: Completion token count.
++
++    Returns:
++        Hex digest linking this entry to ``prev_hash``.
++    """
++    payload = ledger_payload(model, prompt_tokens, completion_tokens)
++    return hashlib.sha256((prev_hash + payload).encode()).hexdigest()
++
++
++def format_ledger_line(
++    model: str,
++    prompt_tokens: int,
++    completion_tokens: int,
++    *,
++    prev_hash: str = "",
++) -> str:
++    """Serialize one ledger JSONL line including its hash field.
++
++    Args:
++        model: Short model slug.
++        prompt_tokens: Prompt token count.
++        completion_tokens: Completion token count.
++        prev_hash: Previous line hash (empty for genesis entry).
++
++    Returns:
++        A single JSON object string suitable for appending to the ledger file.
++    """
++    short = model.rsplit("/", 1)[-1]
++    pt = int(prompt_tokens)
++    ct = int(completion_tokens)
++    digest = ledger_entry_hash(prev_hash, short, pt, ct)
++    return f'{{"m":"{short}","p":{pt},"c":{ct},"h":"{digest}"}}'
++
++
++def parse_ledger_line(line: str, *, line_number: int = 0) -> tuple[LedgerEntry, str | None]:
++    """Parse one ledger JSONL line.
++
++    Args:
++        line: Raw line text (may include trailing newline).
++        line_number: 1-based line index for error messages.
++
++    Returns:
++        ``(entry, hash_or_none)`` where ``hash_or_none`` is the ``h`` field if
++        present.
++
++    Raises:
++        ValueError: On invalid JSON or missing required fields.
++    """
++    text = line.strip()
++    if not text:
++        raise ValueError(f"line {line_number}: empty line")
++    try:
++        record = json.loads(text)
++    except json.JSONDecodeError as exc:
++        raise ValueError(f"line {line_number}: invalid JSON") from exc
++    if not isinstance(record, dict):
++        raise ValueError(f"line {line_number}: expected JSON object")
++    expected_h = record.pop("h", None)
++    model = record.pop("m", None)
++    if not isinstance(model, str) or not model:
++        raise ValueError(f"line {line_number}: missing model field 'm'")
++    try:
++        pt = int(record.pop("p"))
++        ct = int(record.pop("c"))
++    except (KeyError, TypeError, ValueError) as exc:
++        raise ValueError(f"line {line_number}: invalid token fields") from exc
++    if record:
++        raise ValueError(f"line {line_number}: unexpected fields {sorted(record)}")
++    return LedgerEntry(model=model, prompt_tokens=pt, completion_tokens=ct, line_number=line_number), expected_h
++
++
++def verify_ledger_chain_text(text: str) -> tuple[bool, int, str]:
++    """Verify a hash chain from in-memory ledger text.
++
++    Args:
++        text: Full ledger file contents (JSONL).
++
++    Returns:
++        ``(valid, num_entries, error_message)``. ``error_message`` is empty when
++        valid.
++    """
++    prev_hash = ""
++    entries = 0
++    for lineno, raw in enumerate(text.splitlines(), 1):
++        if not raw.strip():
++            continue
++        try:
++            entry, expected_h = parse_ledger_line(raw, line_number=lineno)
++        except ValueError as exc:
++            return False, entries, str(exc)
++        if expected_h is None:
++            return False, entries, (
++                f"line {lineno}: missing hash field 'h' "
++                "(ledger entries must be written with hash-chain enabled)"
++            )
++        computed_h = ledger_entry_hash(
++            prev_hash, entry.model, entry.prompt_tokens, entry.completion_tokens
++        )
++        if computed_h != expected_h:
++            return False, entries, (
++                f"line {lineno}: hash mismatch — expected {computed_h[:16]}..., "
++                f"got {expected_h[:16]}... (chain broken or entry tampered)"
++            )
++        prev_hash = computed_h
++        entries += 1
++    return True, entries, ""
++
++
++def verify_ledger_chain(path: str | Path) -> tuple[bool, int, str]:
++    """Verify the hash-chain integrity of a cost ledger file.
++
++    Args:
++        path: Path to ``cost_ledger.jsonl``.
++
++    Returns:
++        ``(valid, num_entries, error_message)``.
++    """
++    with open(path, encoding="utf-8") as fh:
++        return verify_ledger_chain_text(fh.read())
++
++
++def read_ledger_entries(path: str | Path) -> list[LedgerEntry]:
++    """Read all entries from a ledger without verifying the hash chain.
++
++    Skips blank lines. Does not validate hashes — use
++    :func:`verify_ledger_chain` first when integrity matters.
++
++    Args:
++        path: Path to ``cost_ledger.jsonl``.
++
++    Returns:
++        Parsed entries in file order.
++    """
++    out: list[LedgerEntry] = []
++    with open(path, encoding="utf-8") as fh:
++        for lineno, raw in enumerate(fh, 1):
++            if not raw.strip():
++                continue
++            entry, _ = parse_ledger_line(raw, line_number=lineno)
++            out.append(entry)
++    return out
++
++
++def append_ledger_entry(
++    path: str | Path,
++    model: str,
++    prompt_tokens: int,
++    completion_tokens: int,
++    *,
++    file_handle: TextIO | None = None,
++) -> str:
++    """Append one hash-chained entry to a ledger file.
++
++  Best-effort helper mirroring :func:`openrouter_client._ledger_append` but
++  usable from tests and scripts. When ``file_handle`` is provided, writes to
++  that handle instead of opening ``path`` (for in-memory testing).
++
++    Args:
++        path: Ledger file path (read for previous hash unless handle given).
++        model: Model slug written to the ``m`` field.
++        prompt_tokens: Prompt token count.
++        completion_tokens: Completion token count.
++        file_handle: Optional open append handle.
++
++    Returns:
++        The new entry hash ``h``.
++    """
++    prev_hash = ""
++    p = Path(path)
++    if p.exists():
++        try:
++            text = p.read_text(encoding="utf-8")
++            valid, _, _ = verify_ledger_chain_text(text)
++            if valid and text.strip():
++                last_line = [ln for ln in text.splitlines() if ln.strip()][-1]
++                _, prev_hash_val = parse_ledger_line(last_line)
++                prev_hash = prev_hash_val or ""
++        except (OSError, ValueError):
++            prev_hash = ""
++
++    line = format_ledger_line(model, prompt_tokens, completion_tokens, prev_hash=prev_hash)
++    digest = json.loads(line)["h"]
++    if file_handle is not None:
++        file_handle.write(line + "\n")
++    else:
++        with open(p, "a", encoding="utf-8") as fh:
++            fh.write(line + "\n")
++    return digest
++
++
++def summarize_token_usage(entries: list[LedgerEntry]) -> dict[str, tuple[int, int, int]]:
++    """Aggregate prompt/completion/call counts per model slug.
++
++    Args:
++        entries: Parsed ledger rows.
++
++    Returns:
++        ``model -> (prompt_tokens, completion_tokens, num_calls)``.
++    """
++    per: dict[str, list[int]] = {}
++    for entry in entries:
++        acc = per.setdefault(entry.model, [0, 0, 0])
++        acc[0] += entry.prompt_tokens
++        acc[1] += entry.completion_tokens
++        acc[2] += 1
++    return {m: (v[0], v[1], v[2]) for m, v in per.items()}
+diff --git a/src/trinity/llm/openrouter_client.py b/src/trinity/llm/openrouter_client.py
+index df704ad..cccd171 100644
+--- a/src/trinity/llm/openrouter_client.py
++++ b/src/trinity/llm/openrouter_client.py
+@@ -83,37 +83,13 @@ def _ledger_append(model: str, prompt_tokens: int, completion_tokens: int) -> No
+     one short line per call (atomic enough for concurrent training processes).
+     Best-effort: never let cost bookkeeping break an inference call.
+     """
+-    import hashlib
+-
+     path = os.environ.get("TRINITY_COST_LEDGER")
+     if not path:
+         return
+     try:
+-        short = model.rsplit("/", 1)[-1]
+-        pt = int(prompt_tokens)
+-        ct = int(completion_tokens)
+-
+-        prev_hash = ""
+-        try:
+-            with open(path, "r") as fh:
+-                last = None
+-                for line in fh:
+-                    line = line.strip()
+-                    if line:
+-                        last = line
+-                if last is not None:
+-                    import json as _json
+-
+-                    prev = _json.loads(last)
+-                    prev_hash = prev.get("h", "")
+-        except (OSError, ValueError):
+-            prev_hash = ""
+-
+-        payload = f'{{"m":"{short}","p":{pt},"c":{ct}}}'
+-        h = hashlib.sha256((prev_hash + payload).encode()).hexdigest()
+-
+-        with open(path, "a") as f:
+-            f.write(f'{{"m":"{short}","p":{pt},"c":{ct},"h":"{h}"}}\n')
++        from trinity.llm.cost_ledger import append_ledger_entry
++
++        append_ledger_entry(path, model, prompt_tokens, completion_tokens)
+     except Exception:
+         pass
+ 
+diff --git a/tests/test_cost_ledger.py b/tests/test_cost_ledger.py
+new file mode 100644
+index 0000000..43a9474
+--- /dev/null
++++ b/tests/test_cost_ledger.py
+@@ -0,0 +1,260 @@
++"""Offline tests for the canonical cost-ledger hash chain.
++
++Covers payload formatting, chained hashing, verification, tamper detection,
++multi-entry chains, blank-line tolerance, and integration with
++``scripts/cost_report.verify_ledger_chain``.
++"""
++from __future__ import annotations
++
++import hashlib
++import importlib.util
++import json
++import sys
++from io import StringIO
++from pathlib import Path
++
++import pytest
++
++from trinity.llm import cost_ledger as CL
++from trinity.llm.openrouter_client import _ledger_append
++
++_REPO = Path(__file__).resolve().parents[1]
++_COST_REPORT = _REPO / "scripts" / "cost_report.py"
++_spec = importlib.util.spec_from_file_location("cost_report", _COST_REPORT)
++cost_report = importlib.util.module_from_spec(_spec)
++sys.modules["cost_report"] = cost_report
++_spec.loader.exec_module(cost_report)
++
++
++# ---------------------------------------------------------------------------
++# Payload + hash primitives
++# ---------------------------------------------------------------------------
++
++
++def test_ledger_payload_uses_compact_fixed_key_order():
++    assert CL.ledger_payload("qwen/qwen3.5-35b-a3b", 100, 50) == (
++        '{"m":"qwen3.5-35b-a3b","p":100,"c":50}'
++    )
++
++
++def test_ledger_payload_strips_provider_prefix_from_model_slug():
++    assert CL.ledger_payload("deepseek/deepseek-v4-flash", 1, 2) == (
++        '{"m":"deepseek-v4-flash","p":1,"c":2}'
++    )
++
++
++def test_ledger_entry_hash_matches_manual_sha256():
++    prev = ""
++    payload = CL.ledger_payload("minimax-m3", 10, 20)
++    expected = hashlib.sha256((prev + payload).encode()).hexdigest()
++    assert CL.ledger_entry_hash(prev, "minimax-m3", 10, 20) == expected
++
++
++def test_ledger_entry_hash_links_to_previous_digest():
++    first = CL.ledger_entry_hash("", "qwen3.5-35b-a3b", 5, 5)
++    second = CL.ledger_entry_hash(first, "minimax-m3", 1, 1)
++    payload = CL.ledger_payload("minimax-m3", 1, 1)
++    assert second == hashlib.sha256((first + payload).encode()).hexdigest()
++
++
++def test_format_ledger_line_round_trips_through_parse():
++    line = CL.format_ledger_line("qwen3.5-35b-a3b", 42, 7)
++    entry, digest = CL.parse_ledger_line(line)
++    assert entry.model == "qwen3.5-35b-a3b"
++    assert entry.prompt_tokens == 42
++    assert entry.completion_tokens == 7
++    assert digest == json.loads(line)["h"]
++
++
++# ---------------------------------------------------------------------------
++# Chain verification
++# ---------------------------------------------------------------------------
++
++
++def _write_chain(tmp_path: Path, models: list[tuple[str, int, int]]) -> Path:
++    path = tmp_path / "ledger.jsonl"
++    prev = ""
++    lines: list[str] = []
++    for model, p, c in models:
++        line = CL.format_ledger_line(model, p, c, prev_hash=prev)
++        prev = json.loads(line)["h"]
++        lines.append(line)
++    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    return path
++
++
++def test_verify_ledger_chain_accepts_valid_single_entry(tmp_path):
++    path = _write_chain(tmp_path, [("qwen3.5-35b-a3b", 100, 50)])
++    valid, count, err = CL.verify_ledger_chain(path)
++    assert valid is True
++    assert count == 1
++    assert err == ""
++
++
++def test_verify_ledger_chain_accepts_valid_multi_entry_chain(tmp_path):
++    path = _write_chain(
++        tmp_path,
++        [
++            ("qwen3.5-35b-a3b", 10, 5),
++            ("minimax-m3", 20, 15),
++            ("deepseek-v4-flash", 1, 1),
++        ],
++    )
++    valid, count, err = CL.verify_ledger_chain(path)
++    assert valid is True
++    assert count == 3
++    assert err == ""
++
++
++def test_verify_ledger_chain_skips_blank_lines(tmp_path):
++    path = _write_chain(tmp_path, [("qwen3.5-35b-a3b", 1, 1)])
++    text = path.read_text(encoding="utf-8")
++    path.write_text("\n\n" + text + "\n\n", encoding="utf-8")
++    valid, count, err = CL.verify_ledger_chain(path)
++    assert valid is True
++    assert count == 1
++    assert err == ""
++
++
++def test_verify_ledger_chain_rejects_tampered_token_count(tmp_path):
++    path = _write_chain(tmp_path, [("qwen3.5-35b-a3b", 100, 50)])
++    text = path.read_text(encoding="utf-8").replace('"p":100', '"p":999')
++    path.write_text(text, encoding="utf-8")
++    valid, count, err = CL.verify_ledger_chain(path)
++    assert valid is False
++    assert count == 0
++    assert "hash mismatch" in err
++
++
++def test_verify_ledger_chain_rejects_missing_hash_field(tmp_path):
++    path = tmp_path / "bad.jsonl"
++    path.write_text('{"m":"qwen3.5-35b-a3b","p":1,"c":1}\n', encoding="utf-8")
++    valid, count, err = CL.verify_ledger_chain(path)
++    assert valid is False
++    assert "missing hash" in err
++
++
++def test_verify_ledger_chain_rejects_invalid_json(tmp_path):
++    path = tmp_path / "bad.jsonl"
++    path.write_text("not-json\n", encoding="utf-8")
++    valid, count, err = CL.verify_ledger_chain(path)
++    assert valid is False
++    assert "invalid JSON" in err
++
++
++def test_verify_ledger_chain_rejects_broken_link_in_multi_entry_chain(tmp_path):
++    path = _write_chain(
++        tmp_path,
++        [("qwen3.5-35b-a3b", 1, 1), ("minimax-m3", 2, 2)],
++    )
++    lines = path.read_text(encoding="utf-8").splitlines()
++    second = json.loads(lines[1])
++    second["h"] = "0" * 64
++    lines[1] = json.dumps(second, sort_keys=True)
++    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    valid, _, err = CL.verify_ledger_chain(path)
++    assert valid is False
++    assert "hash mismatch" in err
++
++
++# ---------------------------------------------------------------------------
++# Append + read helpers
++# ---------------------------------------------------------------------------
++
++
++def test_append_ledger_entry_builds_chain_on_disk(tmp_path):
++    path = tmp_path / "ledger.jsonl"
++    h1 = CL.append_ledger_entry(path, "qwen3.5-35b-a3b", 10, 5)
++    h2 = CL.append_ledger_entry(path, "minimax-m3", 3, 7)
++    assert h1 != h2
++    valid, count, err = CL.verify_ledger_chain(path)
++    assert valid is True
++    assert count == 2
++    assert err == ""
++
++
++def test_read_ledger_entries_preserves_order(tmp_path):
++    path = _write_chain(
++        tmp_path,
++        [("qwen3.5-35b-a3b", 1, 2), ("minimax-m3", 3, 4)],
++    )
++    entries = CL.read_ledger_entries(path)
++    assert [e.model for e in entries] == ["qwen3.5-35b-a3b", "minimax-m3"]
++    assert entries[1].total_tokens == 7
++
++
++def test_summarize_token_usage_aggregates_per_model():
++    entries = [
++        CL.LedgerEntry("qwen3.5-35b-a3b", 10, 5),
++        CL.LedgerEntry("qwen3.5-35b-a3b", 20, 15),
++        CL.LedgerEntry("minimax-m3", 1, 1),
++    ]
++    summary = CL.summarize_token_usage(entries)
++    assert summary["qwen3.5-35b-a3b"] == (30, 20, 2)
++    assert summary["minimax-m3"] == (1, 1, 1)
++
++
++# ---------------------------------------------------------------------------
++# OpenRouter writer integration
++# ---------------------------------------------------------------------------
++
++
++def test_openrouter_ledger_append_writes_verifiable_chain(tmp_path, monkeypatch):
++    path = tmp_path / "ledger.jsonl"
++    monkeypatch.setenv("TRINITY_COST_LEDGER", str(path))
++    _ledger_append("qwen/qwen3.5-35b-a3b", 100, 25)
++    _ledger_append("minimax/minimax-m3", 50, 50)
++    valid, count, err = CL.verify_ledger_chain(path)
++    assert valid is True
++    assert count == 2
++    assert err == ""
++
++
++def test_openrouter_ledger_append_noop_without_env(monkeypatch, tmp_path):
++    monkeypatch.delenv("TRINITY_COST_LEDGER", raising=False)
++    path = tmp_path / "ledger.jsonl"
++    _ledger_append("qwen3.5-35b-a3b", 1, 1)
++    assert not path.exists()
++
++
++# ---------------------------------------------------------------------------
++# cost_report.py re-export path
++# ---------------------------------------------------------------------------
++
++
++def test_cost_report_verify_delegates_to_canonical_module(tmp_path):
++    path = _write_chain(tmp_path, [("qwen3.5-35b-a3b", 5, 5)])
++    valid, count, err = cost_report.verify_ledger_chain(str(path))
++    assert valid is True
++    assert count == 1
++    assert err == ""
++
++
++def test_cost_report_verify_rejects_sort_keys_payload_mismatch(tmp_path):
++    """Regression: old verifier used json.dumps(sort_keys=True)."""
++    payload = json.dumps({"m": "qwen3.5-35b-a3b", "p": 10, "c": 5}, sort_keys=True)
++    wrong_h = hashlib.sha256(payload.encode()).hexdigest()
++    line = json.dumps(
++        {"m": "qwen3.5-35b-a3b", "p": 10, "c": 5, "h": wrong_h},
++        sort_keys=True,
++    )
++    path = tmp_path / "legacy.jsonl"
++    path.write_text(line + "\n", encoding="utf-8")
++    valid, _, err = cost_report.verify_ledger_chain(str(path))
++    assert valid is False
++    assert "hash mismatch" in err
++
++
++def test_parse_ledger_line_rejects_unexpected_extra_fields():
++    line = '{"m":"qwen3.5-35b-a3b","p":1,"c":1,"extra":true,"h":"abc"}'
++    with pytest.raises(ValueError, match="unexpected fields"):
++        CL.parse_ledger_line(line, line_number=3)
++
++
++def test_verify_ledger_chain_text_accepts_in_memory_buffer():
++    line = CL.format_ledger_line("deepseek-v4-flash", 9, 9)
++    buf = StringIO(line + "\n")
++    valid, count, err = CL.verify_ledger_chain_text(buf.getvalue())
++    assert valid is True
++    assert count == 1
++    assert err == ""

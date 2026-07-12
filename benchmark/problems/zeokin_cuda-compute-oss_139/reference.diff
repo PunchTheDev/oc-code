@@ -1,0 +1,220 @@
+diff --git a/strategy/subspace.py b/strategy/subspace.py
+index 2e31921..b8858f4 100644
+--- a/strategy/subspace.py
++++ b/strategy/subspace.py
+@@ -33,13 +33,24 @@
+ 
+ 
+ def _row_block(n: int, cols: int, backend: Backend, item_bytes: int,
+-               frac: float = _DEFAULT_ROW_BLOCK_FRACTION) -> int:
++               frac: float = _DEFAULT_ROW_BLOCK_FRACTION,
++               out_cols: int = 0, fixed_bytes: int = 0) -> int:
+     """Choose how many rows of an (n x cols) stream to stage on the device.
+ 
+     ``frac`` is the fraction of free device memory one row-block may use
+-    (``Config.vram_fraction`` when driven by the strategy)."""
+-    budget = int(backend.free_compute_bytes() * frac)
+-    per_row = max(1, cols * item_bytes)
++    (``Config.vram_fraction`` when driven by the strategy).
++
++    A block costs more than the rows it stages: each iteration also allocates the
++    GEMM output, which cannot alias its operands and is live alongside the staged
++    block. ``out_cols`` is the number of output columns produced *per staged row*
++    (so the real per-row cost is ``(cols + out_cols) * item_bytes``);
++    ``fixed_bytes`` is any per-iteration allocation whose size does not scale with
++    the block (e.g. ``stream_gemm_left_t``'s full ``(n, m)`` product), and is taken
++    off the budget up front. Counting only ``cols`` under-budgets the block by up
++    to 2x at ``M = N`` (see #138, and #95 for the same fix in ``matmul/gemm.py``).
++    """
++    budget = int(backend.free_compute_bytes() * frac) - int(fixed_bytes)
++    per_row = max(1, (cols + out_cols) * item_bytes)
+     return int(min(n, max(1, budget // per_row)))
+ 
+ 
+@@ -52,7 +63,9 @@ def stream_gemm_right(X, Q, backend: Backend, dtype,
+     xp = backend.xp
+     n, m = X.shape[0], Q.shape[1]
+     out = xp.empty((n, m), dtype=dtype)
+-    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize, frac)
++    # each block also allocates matmul(Xr, Q) -> (blk, m): m output cols per row.
++    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize, frac,
++                     out_cols=m)
+     for r0 in range(0, n, blk):
+         r1 = min(n, r0 + blk)
+         Xr = backend.to_device(np.asarray(X[r0:r1, :]).astype(dtype, copy=False))
+@@ -67,7 +80,11 @@ def stream_gemm_left_t(X, Q, backend: Backend, dtype,
+     xp = backend.xp
+     n, m = X.shape[0], Q.shape[1]
+     acc = xp.zeros((n, m), dtype=dtype)
+-    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize, frac)
++    # matmul(Xr.T, Q[rb]) is (n, m) regardless of the block size, so it is a
++    # fixed per-iteration cost rather than a per-row one.
++    item = np.dtype(dtype).itemsize
++    blk = _row_block(n, X.shape[1], backend, item, frac,
++                     fixed_bytes=n * m * item)
+     for r0 in range(0, n, blk):
+         r1 = min(n, r0 + blk)
+         Xr = backend.to_device(np.asarray(X[r0:r1, :]).astype(dtype, copy=False))
+@@ -82,7 +99,11 @@ def compress(X, Q, backend: Backend, dtype,
+     xp = backend.xp
+     n, m = X.shape[0], Q.shape[1]
+     acc = xp.zeros((m, m), dtype=dtype)
+-    blk = _row_block(n, X.shape[1], backend, np.dtype(dtype).itemsize, frac)
++    # per block: matmul(Xr, Q) -> (blk, m) (m cols per row), then the (m, m)
++    # product folded into acc -- a fixed per-iteration temporary.
++    item = np.dtype(dtype).itemsize
++    blk = _row_block(n, X.shape[1], backend, item, frac,
++                     out_cols=m, fixed_bytes=m * m * item)
+     for r0 in range(0, n, blk):
+         r1 = min(n, r0 + blk)
+         Xr = backend.to_device(np.asarray(X[r0:r1, :]).astype(dtype, copy=False))
+@@ -101,9 +122,12 @@ def reconstruct(Ctil, Q, C_out, backend: Backend, out_dtype,
+     the row-block by 2x and risk OOM on large-N / tight-``vram_fraction`` runs.
+     ``compute_dtype=None`` falls back to ``out_dtype`` (they match unless bumped).
+     """
+-    n = Q.shape[0]
++    n, m = Q.shape
+     item_dtype = compute_dtype if compute_dtype is not None else out_dtype
+-    blk = _row_block(n, n, backend, np.dtype(item_dtype).itemsize, frac)
++    # per row: the (rb, n) product plus the (rb, m) intermediate Q[rb] @ Ctil,
++    # which is still live while the outer matmul against QT runs.
++    blk = _row_block(n, n, backend, np.dtype(item_dtype).itemsize, frac,
++                     out_cols=m)
+     QT = Q.T
+     for r0 in range(0, n, blk):
+         r1 = min(n, r0 + blk)
+diff --git a/tests/test_reconstruct_row_block.py b/tests/test_reconstruct_row_block.py
+index 41725b9..6dcb4d7 100644
+--- a/tests/test_reconstruct_row_block.py
++++ b/tests/test_reconstruct_row_block.py
+@@ -39,9 +39,10 @@ def _capture_row_block_item_bytes(run):
+     captured = []
+     real = subspace._row_block
+ 
+-    def spy(n, cols, backend, item_bytes, frac=subspace._DEFAULT_ROW_BLOCK_FRACTION):
++    def spy(n, cols, backend, item_bytes, frac=subspace._DEFAULT_ROW_BLOCK_FRACTION,
++            **kw):
+         captured.append(item_bytes)
+-        return real(n, cols, backend, item_bytes, frac)
++        return real(n, cols, backend, item_bytes, frac, **kw)
+ 
+     subspace._row_block = spy
+     try:
+diff --git a/tests/test_row_block_budget.py b/tests/test_row_block_budget.py
+new file mode 100644
+index 0000000..a7044e9
+--- /dev/null
++++ b/tests/test_row_block_budget.py
+@@ -0,0 +1,112 @@
++"""CPU-only tests for subspace._row_block's device budget (issue #138).
++
++A streamed row-block costs more than the rows it stages: each iteration also
++allocates the GEMM output, which cannot alias its operands and is live at the
++same time. `_row_block` must budget those too, or the block overshoots
++`vram_fraction x free` -- up to 2x at M = N -- and can OOM. This mirrors the
++accounting `matmul/gemm.py` adopted in #95. Pure arithmetic; no GPU needed.
++
++Run:  python tests/test_row_block_budget.py
++"""
++import os
++import sys
++
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++from strategy import subspace
++
++
++class _FakeBackend:
++    def __init__(self, free_bytes: int):
++        self._free = free_bytes
++
++    def free_compute_bytes(self) -> int:
++        return self._free
++
++
++FREE = 64 * 1024**2
++FRAC = 0.3
++ITEM = 4  # fp32
++
++
++def _budget(free=FREE, frac=FRAC):
++    return int(free * frac)
++
++
++def test_out_cols_shrinks_the_block():
++    """Counting the output columns must never pick a larger block."""
++    n, m = 4096, 4096
++    bk = _FakeBackend(FREE)
++    without = subspace._row_block(n, n, bk, ITEM, FRAC)
++    with_out = subspace._row_block(n, n, bk, ITEM, FRAC, out_cols=m)
++    assert with_out < without
++
++
++def test_block_stays_within_budget_at_m_equals_n():
++    """M = N is the exactness path; staged rows + GEMM output must both fit."""
++    n, m = 4096, 4096
++    blk = subspace._row_block(n, n, _FakeBackend(FREE), ITEM, FRAC, out_cols=m)
++    actual = blk * (n + m) * ITEM          # staged (blk,n) + output (blk,m)
++    assert actual <= _budget()
++
++
++def test_block_stays_within_budget_at_default_m():
++    n, m = 4096, 4096 // 8
++    blk = subspace._row_block(n, n, _FakeBackend(FREE), ITEM, FRAC, out_cols=m)
++    actual = blk * (n + m) * ITEM
++    assert actual <= _budget()
++
++
++def test_old_model_would_have_overshot():
++    """Regression witness: the pre-fix block (input rows only) exceeded budget
++    once the (blk, m) GEMM output is counted -- 2x at M = N."""
++    n, m = 4096, 4096
++    old_blk = subspace._row_block(n, n, _FakeBackend(FREE), ITEM, FRAC)  # no out_cols
++    old_actual = old_blk * (n + m) * ITEM
++    assert old_actual > _budget()
++    assert old_actual / _budget() > 1.9      # ~2x at M = N
++
++
++def test_fixed_bytes_is_taken_off_the_budget():
++    """stream_gemm_left_t's (n, m) product does not scale with the block, so it
++    is charged up front rather than per row."""
++    n, m = 1024, 256
++    bk = _FakeBackend(FREE)
++    fixed = n * m * ITEM
++    blk = subspace._row_block(n, n, bk, ITEM, FRAC, fixed_bytes=fixed)
++    assert blk * n * ITEM + fixed <= _budget()
++    # and it must be no larger than the unconstrained block
++    assert blk <= subspace._row_block(n, n, bk, ITEM, FRAC)
++
++
++def test_block_never_drops_below_one():
++    """Even when the fixed cost swallows the whole budget, stream at least one
++    row rather than returning 0 (which would make the loop spin forever)."""
++    n, m = 4096, 4096
++    blk = subspace._row_block(n, n, _FakeBackend(1024), ITEM, FRAC,
++                              out_cols=m, fixed_bytes=10**9)
++    assert blk >= 1
++
++
++def test_defaults_preserve_previous_behavior():
++    """out_cols=0, fixed_bytes=0 reproduces the original formula exactly."""
++    n, cols = 512, 512
++    bk = _FakeBackend(FREE)
++    expected = min(n, max(1, _budget() // (cols * ITEM)))
++    assert subspace._row_block(n, cols, bk, ITEM, FRAC) == expected
++
++
++if __name__ == "__main__":
++    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
++    failed = 0
++    for fn in fns:
++        try:
++            fn()
++            print(f"PASS  {fn.__name__}")
++        except AssertionError as e:
++            failed += 1
++            print(f"FAIL  {fn.__name__}: {e}")
++    print(f"\n{len(fns) - failed}/{len(fns)} passed")
++    sys.exit(1 if failed else 0)
