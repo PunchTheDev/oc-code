@@ -1,0 +1,421 @@
+diff --git a/crates/engine/src/parser/oracle_static/shared.rs b/crates/engine/src/parser/oracle_static/shared.rs
+index 437e8da2e6..4348839021 100644
+--- a/crates/engine/src/parser/oracle_static/shared.rs
++++ b/crates/engine/src/parser/oracle_static/shared.rs
+@@ -4,6 +4,9 @@
+ use super::prelude::*;
+ #[allow(unused_imports)]
+ use super::support::*;
++use nom::character::complete::anychar;
++use nom::combinator::not;
++use nom::multi::many1;
+ 
+ /// CR 702.11e + CR 609.4 + CR 702.21a: Parse the "[subject] can be the targets
+ /// of spells and abilities[ you control] as though they didn't have hexproof[.
+@@ -2928,6 +2931,91 @@ pub(crate) fn parse_qualified_creatures_you_control_suffix<'a>(
+     Some((filter, predicate_text))
+ }
+ 
++/// CR 611.3a: Split an Oxford-comma / "and" / "or" / "and/or" subject list into
++/// its item text slices — "Skeletons, Vampires, and Zombies" →
++/// `["Skeletons", "Vampires", "Zombies"]`; "Plants and Treefolk" →
++/// `["Plants", "Treefolk"]`; a single subject → one item.
++///
++/// Uses `separated_list1(separator, item)` — the same idiom as
++/// [`parse_subtype_or_list_prefix_with_word_parser`] — where each item is the
++/// maximal run of characters that does not begin a list separator. Unlike a
++/// word-boundary scan (which only ever tries a match at the start of a word and
++/// so can never match a separator that begins with a comma or a leading space),
++/// this consumes a separator wherever it actually starts, so a shared-suffix
++/// Oxford list splits into *every* item rather than collapsing to one.
++///
++/// A bare comma is only a list separator inside a *coordinated* enumeration:
++/// English writes a genuine subject union as "A, B, and C" / "A and B" /
++/// "A or B" — always with a coordinating conjunction before the final item. A
++/// bare-comma sequence with no coordinator is instead a stack of pre-nominal
++/// adjectives modifying one shared head noun ("Noncreature, non-Equipment
++/// artifacts" — Dan Lewis: artifacts that are noncreature AND non-Equipment),
++/// which is a *single* subject, not a union. A pure `", "` split cannot tell the
++/// two apart — both "Noncreature" and "non-Equipment artifacts" anchor as valid
++/// standalone subjects — so this gates bare-comma splitting on the presence of a
++/// coordinator ([`list_has_coordinator`]). Without one, the whole descriptor is
++/// returned as a single item and the caller defers to the single-subject path.
++///
++/// Bare " or " is also excluded from the separator grammar (it would split an
++/// intra-subject qualifier like "with power 3 or greater"); only the
++/// comma-anchored ", or " is a separator. As a final backstop, the caller
++/// re-parses every item as a controller-anchored subject and rejects the whole
++/// compound (`None`) unless each one anchors, so an over-split can never emit a
++/// wrong `Or`.
++fn split_subject_list(text: &str) -> Vec<&str> {
++    // Not a coordinated enumeration → one subject (do not split bare commas).
++    if !list_has_coordinator(text) {
++        return vec![text.trim()];
++    }
++
++    // One list item: one or more characters, none of which begins a separator.
++    fn subject_list_item(input: &str) -> OracleResult<'_, &str> {
++        recognize(many1(preceded(not(subject_list_separator), anychar))).parse(input)
++    }
++
++    match separated_list1(subject_list_separator, subject_list_item).parse(text) {
++        // Require the split to consume the whole list (a trailing/dangling
++        // separator leaves `rest` non-empty) — otherwise treat it as one item.
++        Ok((rest, items)) if rest.trim().is_empty() => items.into_iter().map(str::trim).collect(),
++        _ => vec![text.trim()],
++    }
++}
++
++/// True when `text` carries a coordinating conjunction ("and" / "or" / "and/or")
++/// at a word boundary — the syntactic marker of a genuine enumeration. Matched
++/// without the leading space because [`nom_primitives::scan_at_word_boundaries`]
++/// lands on each word start; the trailing space keeps "or"/"and" from matching
++/// inside a word ("Warriors", "Orcs"). Oracle text writes these coordinators
++/// lowercase mid-subject, so the original-case `text` matches directly.
++fn list_has_coordinator(text: &str) -> bool {
++    nom_primitives::scan_at_word_boundaries(text, |i: &str| {
++        alt((
++            tag::<_, _, OracleError<'_>>("and/or "),
++            tag("and "),
++            tag("or "),
++        ))
++        .parse(i)
++    })
++    .is_some()
++}
++
++/// One subject-list connector token. Ordered longest/most-specific first so that
++/// at a comma position ", and " wins over ", " (no dangling comma on the item).
++fn subject_list_separator(input: &str) -> OracleResult<'_, ()> {
++    value(
++        (),
++        alt((
++            tag::<_, _, OracleError<'_>>(", and/or "),
++            tag(", and "),
++            tag(", or "),
++            tag(" and/or "),
++            tag(" and "),
++            tag(", "),
++        )),
++    )
++    .parse(input)
++}
++
+ fn parse_shared_controller_compound_subject_filter(subject: &TextPair<'_>) -> Option<TargetFilter> {
+     let (descriptor, suffix) = parse_subject_suffix(subject, " you control")
+         .map(|descriptor| (descriptor, " you control"))
+@@ -2936,53 +3024,55 @@ fn parse_shared_controller_compound_subject_filter(subject: &TextPair<'_>) -> Op
+                 .map(|descriptor| (descriptor, " your opponents control"))
+         })?;
+ 
+-    let (left_lower, _, right_lower) = nom_primitives::scan_preceded(descriptor.lower, |input| {
+-        value((), tag::<_, _, OracleError<'_>>("and ")).parse(input)
+-    })?;
+-    let right_start = descriptor.lower.len() - right_lower.len();
+-    let left_original = descriptor.original[..left_lower.len()].trim();
+-    let right_original = descriptor.original[right_start..].trim();
+-    if left_original.is_empty() || right_original.is_empty() {
++    // A leading distribution word ("Other <list>", "Each other <list>", "Each
++    // <list>") applies across EVERY list item, so strip it here and re-attach
++    // "other " to each item's subject. A mid-list "other" (Grimlock: "…, and
++    // other Transformers creatures") stays on its own item and is handled by
++    // `parse_continuous_subject_filter` when that item is parsed.
++    let descriptor_original = descriptor.original.trim();
++    let descriptor_lower_owned = descriptor_original.to_lowercase();
++    let descriptor_tp = TextPair::new(descriptor_original, &descriptor_lower_owned);
++    let (list_text, distribute_other) =
++        if let Some(rest) = nom_tag_tp(&descriptor_tp, "each other ") {
++            (rest.original.trim(), true)
++        } else if let Some(rest) = nom_tag_tp(&descriptor_tp, "other ") {
++            (rest.original.trim(), true)
++        } else if let Some(rest) = nom_tag_tp(&descriptor_tp, "each ") {
++            (rest.original.trim(), false)
++        } else {
++            (descriptor_original, false)
++        };
++    if list_text.is_empty() {
+         return None;
+     }
+ 
+-    let left_lower_owned = left_original.to_lowercase();
+-    let left_tp = TextPair::new(left_original, &left_lower_owned);
+-    let (left_core, distribute_other) = if let Some(rest) = nom_tag_tp(&left_tp, "each other ") {
+-        (rest.original.trim(), true)
+-    } else if let Some(rest) = nom_tag_tp(&left_tp, "other ") {
+-        (rest.original.trim(), true)
+-    } else if let Some(rest) = nom_tag_tp(&left_tp, "each ") {
+-        (rest.original.trim(), false)
+-    } else {
+-        (left_original, false)
+-    };
+-    if left_core.is_empty() {
+-        return None;
+-    }
+-
+-    let left_subject = if distribute_other {
+-        format!("other {left_core}{suffix}")
+-    } else {
+-        format!("{left_core}{suffix}")
+-    };
+-    let right_subject = if distribute_other {
+-        format!("other {right_original}{suffix}")
+-    } else {
+-        format!("{right_original}{suffix}")
+-    };
+-
+-    let left_filter = parse_continuous_subject_filter(&left_subject)?;
+-    let right_filter = parse_continuous_subject_filter(&right_subject)?;
+-    if !filter_has_source_or_controller_anchor(&left_filter)
+-        || !filter_has_source_or_controller_anchor(&right_filter)
+-    {
++    // Split the full Oxford-comma / and / or subject list into its items. A
++    // single item is not a compound subject — defer to the single-subject path.
++    let items = split_subject_list(list_text);
++    if items.len() < 2 {
+         return None;
+     }
+ 
+     let mut filters = Vec::new();
+-    push_or_filter_branch(&mut filters, left_filter);
+-    push_or_filter_branch(&mut filters, right_filter);
++    for item in items {
++        if item.is_empty() {
++            return None;
++        }
++        let item_subject = if distribute_other {
++            format!("other {item}{suffix}")
++        } else {
++            format!("{item}{suffix}")
++        };
++        let item_filter = parse_continuous_subject_filter(&item_subject)?;
++        // Fail-safe: an intra-subject mis-split (e.g. a qualifier containing
++        // "and") yields an item that isn't a controller-anchored subject, so we
++        // bail to `None` and let the caller's other handlers try — never emit a
++        // wrong Or.
++        if !filter_has_source_or_controller_anchor(&item_filter) {
++            return None;
++        }
++        push_or_filter_branch(&mut filters, item_filter);
++    }
+     Some(TargetFilter::Or { filters })
+ }
+ 
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 0d4948dd9f..7521086cb9 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -7311,6 +7311,131 @@ fn static_self_and_group_subject_delegates_group_filter() {
+     ));
+ }
+ 
++/// CR 611.3a: an Oxford-comma subtype list in a "you control" anthem subject
++/// must keep EVERY listed subtype. Before the N-way split fix the compound-
++/// subject parser split only on the last " and ", so "Skeletons, Vampires, and
++/// Zombies" kept only [Skeleton, Zombie] (the trailing ", Vampires" on the left
++/// half was swallowed) — silently buffing the wrong board. Class: Death-Priest
++/// of Myrkul, Blex, Raphael, Valley Questcaller, Grimlock, etc.
++#[test]
++fn compound_subject_oxford_subtype_list_keeps_all_conjuncts() {
++    fn subtypes(f: &TargetFilter) -> Vec<String> {
++        let TargetFilter::Or { filters } = f else {
++            return vec![];
++        };
++        filters
++            .iter()
++            .flat_map(|c| match c {
++                TargetFilter::Typed(tf) => tf
++                    .type_filters
++                    .iter()
++                    .filter_map(|t| match t {
++                        TypeFilter::Subtype(s) => Some(s.clone()),
++                        _ => None,
++                    })
++                    .collect::<Vec<_>>(),
++                _ => vec![],
++            })
++            .collect()
++    }
++
++    // 3-item Oxford list (Death-Priest of Myrkul).
++    let def = parse_static_line("Skeletons, Vampires, and Zombies you control get +1/+1.")
++        .expect("anthem should parse");
++    let subs = subtypes(def.affected.as_ref().expect("affected filter"));
++    for want in ["Skeleton", "Vampire", "Zombie"] {
++        assert!(
++            subs.iter().any(|s| s == want),
++            "dropped subtype {want} (got {subs:?})"
++        );
++    }
++
++    // 5-item Oxford list with a leading "Other " distributor (Blex, Vexing Pest).
++    let def =
++        parse_static_line("Other Pests, Bats, Insects, Snakes, and Spiders you control get +1/+1.")
++            .expect("anthem should parse");
++    let aff = def.affected.as_ref().expect("affected filter");
++    let subs = subtypes(aff);
++    for want in ["Pest", "Bat", "Insect", "Snake", "Spider"] {
++        assert!(
++            subs.iter().any(|s| s == want),
++            "dropped subtype {want} (got {subs:?})"
++        );
++    }
++    // "Other" distributes across every conjunct (each excludes the source).
++    let TargetFilter::Or { filters } = aff else {
++        panic!("expected an Or of subtype filters, got {aff:?}");
++    };
++    for c in filters {
++        if let TargetFilter::Typed(tf) = c {
++            assert!(
++                tf.properties
++                    .iter()
++                    .any(|p| matches!(p, FilterProp::Another)),
++                "each 'other' conjunct must carry Another: {tf:?}"
++            );
++        }
++    }
++}
++
++/// Regression: a plain two-item compound (no Oxford comma) still yields exactly
++/// two `Or` conjuncts (Gisa "Skeletons and Zombies", Fountain Watch "Artifacts
++/// and enchantments").
++#[test]
++fn compound_subject_two_item_still_ors_both() {
++    let def = parse_static_line("Skeletons and Zombies you control get +1/+1.")
++        .expect("anthem should parse");
++    let TargetFilter::Or { filters } = def.affected.as_ref().expect("affected filter") else {
++        panic!("expected Or, got {:?}", def.affected);
++    };
++    assert_eq!(
++        filters.len(),
++        2,
++        "two-item compound must yield exactly 2 conjuncts, got {filters:?}"
++    );
++}
++
++/// CR 611.3a: a static's continuous effect applies to exactly what its text
++/// names, so a leading comma in the subject must not be over-read as a list
++/// separator. Dan Lewis's "Noncreature, non-Equipment artifacts you control" is
++/// ONE conjunctive type description (artifacts that are noncreature AND
++/// non-Equipment), not a union — the comma stacks pre-nominal adjectives onto
++/// the shared head noun "artifacts". Because that phrase has no coordinating
++/// conjunction, the compound-subject splitter must leave it whole rather than
++/// emit `Or[noncreature, non-Equipment artifacts]` (whose first branch would
++/// wrongly admit non-artifact noncreatures). Guards the comma-grammar fix.
++#[test]
++fn compound_subject_comma_adjectives_without_coordinator_stay_one_subject() {
++    let filter =
++        parse_continuous_subject_filter("Noncreature, non-Equipment artifacts you control")
++            .expect("Dan Lewis subject should parse");
++    // A single conjunctive subject, never a union.
++    let TargetFilter::Typed(tf) = &filter else {
++        panic!("expected a single Typed subject, got {filter:?}");
++    };
++    assert_eq!(tf.controller, Some(ControllerRef::You));
++    // All three conjuncts survive on the one branch: artifact ∧ ¬creature ∧ ¬Equipment.
++    assert!(
++        tf.type_filters.contains(&TypeFilter::Artifact),
++        "must keep the Artifact head type, got {:?}",
++        tf.type_filters
++    );
++    assert!(
++        tf.type_filters
++            .contains(&TypeFilter::Non(Box::new(TypeFilter::Creature))),
++        "must keep the noncreature restriction, got {:?}",
++        tf.type_filters
++    );
++    assert!(
++        tf.type_filters
++            .contains(&TypeFilter::Non(Box::new(TypeFilter::Subtype(
++                "Equipment".into()
++            )))),
++        "must keep the non-Equipment restriction, got {:?}",
++        tf.type_filters
++    );
++}
++
+ #[test]
+ fn static_as_long_as_unrecognized_condition() {
+     // Conditions the parser cannot yet decompose fall through to Unrecognized.
+diff --git a/crates/engine/tests/integration/death_priest_myrkul_oxford_anthem.rs b/crates/engine/tests/integration/death_priest_myrkul_oxford_anthem.rs
+new file mode 100644
+index 0000000000..f370264409
+--- /dev/null
++++ b/crates/engine/tests/integration/death_priest_myrkul_oxford_anthem.rs
+@@ -0,0 +1,65 @@
++//! Regression coverage for Death-Priest of Myrkul's Oxford-comma subtype anthem.
++//!
++//! Drives the real Oracle parse → static synthesis → layer pipeline. The middle
++//! Vampire item is the revert-failing case: the former two-way split silently
++//! omitted it, while Skeleton and Zombie still received the pump.
++
++use engine::game::layers::evaluate_layers;
++use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
++use engine::types::identifiers::ObjectId;
++use engine::types::phase::Phase;
++
++const DEATH_PRIEST_STATIC: &str = "Skeletons, Vampires, and Zombies you control get +1/+1.";
++
++fn effective_pt(runner: &mut GameRunner, id: ObjectId) -> (i32, i32) {
++    runner.state_mut().layers_dirty.mark_full();
++    evaluate_layers(runner.state_mut());
++    let object = &runner.state().objects[&id];
++    (
++        object.power.expect("creature has power"),
++        object.toughness.expect("creature has toughness"),
++    )
++}
++
++#[test]
++fn death_priest_oxford_anthem_pumps_every_listed_subtype_you_control() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    let _death_priest = scenario
++        .add_creature_from_oracle(P0, "Death-Priest of Myrkul", 2, 2, DEATH_PRIEST_STATIC)
++        .with_subtypes(vec!["Human", "Cleric"])
++        .id();
++    let skeleton = scenario
++        .add_creature(P0, "Skeleton", 1, 1)
++        .with_subtypes(vec!["Skeleton"])
++        .id();
++    let vampire = scenario
++        .add_creature(P0, "Vampire", 1, 1)
++        .with_subtypes(vec!["Vampire"])
++        .id();
++    let zombie = scenario
++        .add_creature(P0, "Zombie", 1, 1)
++        .with_subtypes(vec!["Zombie"])
++        .id();
++    let unrelated = scenario
++        .add_creature(P0, "Elf", 1, 1)
++        .with_subtypes(vec!["Elf"])
++        .id();
++    let opponent_vampire = scenario
++        .add_creature(P1, "Opponent Vampire", 1, 1)
++        .with_subtypes(vec!["Vampire"])
++        .id();
++
++    let mut runner = scenario.build();
++
++    assert_eq!(effective_pt(&mut runner, skeleton), (2, 2));
++    assert_eq!(
++        effective_pt(&mut runner, vampire),
++        (2, 2),
++        "the middle Oxford-list item must receive the anthem"
++    );
++    assert_eq!(effective_pt(&mut runner, zombie), (2, 2));
++    assert_eq!(effective_pt(&mut runner, unrelated), (1, 1));
++    assert_eq!(effective_pt(&mut runner, opponent_vampire), (1, 1));
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index ce46bf6e71..37ea7ea188 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -87,6 +87,7 @@ mod dalkovan_encampment_attack_trigger;
+ mod daretti_emblem_simultaneous_death;
+ mod dark_confidant_upkeep;
+ mod dark_depths_thespian_stage;
++mod death_priest_myrkul_oxford_anthem;
+ mod destroy_redirect_to_battlefield_delivery_tail;
+ mod devour_co_entry_regression;
+ mod devour_intellect_treasure_rider;

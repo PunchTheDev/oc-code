@@ -1,0 +1,245 @@
+# LoopOver miner deployment
+
+> Also published on the docs website: [AMS deployment guide](https://loopover.ai/docs/ams-deployment)
+> (same content, rendered with search and the rest of the maintainer docs nav). This file remains
+> the canonical source and ships inside the published `@loopover/miner` package.
+
+Two form factors for running `@loopover/miner`: **laptop mode** (single machine, zero Docker) and **fleet mode** (containerized workers with a shared data volume). Both are 100% client-side for core operation — the miner never uploads source and never requires a hosted LoopOver callback to boot. Credentials (GitHub tokens, etc.) stay on the operator's machine or in their own secret store; nothing is baked into images.
+
+|                  | Laptop mode                                                                                    | Fleet mode                                                                        |
+| ---------------- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| **Best for**     | One contributor machine, local experimentation                                                 | Many parallel miner attempts on a host or small cluster                           |
+| **Dependencies** | Node.js `>=22.13.0` only                                                                       | Docker (or compatible runtime) + Node image or custom image                       |
+| **State**        | SQLite files under `~/.config/loopover-miner/` (override with `LOOPOVER_MINER_CONFIG_DIR`) | Same SQLite layout on a mounted `/data` (or `LOOPOVER_MINER_CONFIG_DIR`) volume |
+| **Setup**        | `npm install -g @loopover/miner` or workspace build                                | `docker build` + `docker run` with env + volume (see below)                       |
+| **Footprint**    | One Node process, local disk for ledgers/queues                                                | One container per worker; scale horizontally by adding containers                 |
+
+## Coding-agent provider configuration
+
+For provider selection and the CLI-specific model/timeout overrides, see
+[`README.md`](README.md) and the interface-level contract in
+[`docs/coding-agent-driver.md`](docs/coding-agent-driver.md).
+
+## Laptop mode walkthrough
+
+1. Install Node.js 22.13+ and the package:
+
+   ```sh
+   npm install -g @loopover/miner@latest
+   # or from a checkout:
+   npm install && npm --workspace @loopover/miner run build
+   ```
+
+2. Inspect what is installed and where local state will live. `status` and `doctor` stay offline; `init --verify-token` is optional and makes one authenticated GitHub call up front:
+
+   ```sh
+   loopover-miner status
+   loopover-miner doctor
+   loopover-miner init --verify-token   # optional: validate GITHUB_TOKEN once before attempts
+   loopover-miner init --interactive    # optional: guided prompt for GITHUB_TOKEN + provider, writes a starter .env, then reruns doctor
+   ```
+
+   `init --interactive` offers "Authorize with GitHub" (device flow -- visit a URL, enter a short code, no
+   token to copy or paste) as its first option once `LOOPOVER_MINER_AMS_OAUTH_CLIENT_ID` is configured for the
+   centrally-held `loopover-ams` GitHub App; the original pasted-PAT prompt stays available as option 2, and is
+   what the wizard falls back to automatically on any device-flow failure. Unconfigured, the wizard is
+   byte-identical to the pasted-token-only prompt. Either way, the resulting `GITHUB_TOKEN` acts as your own
+   GitHub account -- there is no separate bot identity; see [`README.md`](README.md) for the credential model.
+
+3. Expected layout after first use (default paths):
+
+   ```text
+   ~/.config/loopover-miner/
+     laptop-state.sqlite3          # laptop-mode setup state, created by `init`
+     portfolio-queue.sqlite3       # prioritized work backlog across tracked repos (#2292)
+     claim-ledger.sqlite3          # soft issue claims (#2314)
+     plan-store.sqlite3            # persisted MCP plan DAGs (#2318)
+     run-state.sqlite3             # per-repo run state (idle/discovering/planning/preparing)
+     event-ledger.sqlite3          # append-only miner-loop event audit trail (#2290)
+     governor-ledger.sqlite3       # append-only governor allow/deny/throttle decisions (#2328)
+     governor-state.sqlite3        # governor cross-attempt counters/state (#5134)
+     attempt-log.sqlite3           # per-attempt coding-agent driver event trace (#4294)
+     worktree-allocator.sqlite3    # git-worktree-per-attempt allocation bookkeeping (#4297)
+     prediction-ledger.sqlite3     # predicted-gate verdicts, for later self-improve scoring (#4263)
+     replay-snapshot.sqlite3       # frozen historical-replay target snapshots (#3010)
+     policy-doc-cache.sqlite3      # ETag cache for discovery's policy-doc fetches (#4842)
+     policy-verdict-cache.sqlite3  # cache of resolved AI-usage-policy verdicts (#4843)
+     deny-hook-synthesis.sqlite3   # synthesized PreToolUse deny-hook proposals (#4522)
+     orb-export.sqlite3            # opt-in anonymized Orb telemetry export state (#4277)
+   ```
+
+   Not every file appears immediately: `laptop-state` is written by `init`, and each of the others is created
+   the first time its subsystem actually runs (an attempt, a discovery pass, a replay, an Orb export, …), so a
+   fresh install that has only run `status`/`doctor` will show a subset. All sixteen default into this one
+   directory. Override the directory for every store at once with `LOOPOVER_MINER_CONFIG_DIR` or
+   `XDG_CONFIG_HOME` (same resolution chain as `@loopover/mcp`); every store except `laptop-state.sqlite3`
+   (directory only) also honors its own `LOOPOVER_MINER_<NAME>_DB` path override — e.g.
+   `LOOPOVER_MINER_PORTFOLIO_QUEUE_DB` — to relocate an individual file. `doctor`'s `store-integrity:*` checks
+   report the persistent stores, so it is the quickest way to confirm what exists and is readable on disk.
+
+4. Optional per-repo miner goals: copy [`.loopover-miner.yml.example`](../../.loopover-miner.yml.example) to a target repo as `.loopover-miner.yml`. See [`docs/miner-goal-spec.md`](docs/miner-goal-spec.md).
+
+## Fleet mode walkthrough
+
+Build the fleet image from the **monorepo root** (the Dockerfile needs the full workspace on disk before `npm ci` — see comments in [`Dockerfile`](Dockerfile)):
+
+```sh
+docker build -f packages/loopover-miner/Dockerfile -t loopover-miner:latest .
+```
+
+Run a disposable worker with persistent SQLite state on a mounted volume. Inject secrets at runtime (never bake them into the image):
+
+```sh
+docker run --rm -it \
+  -e LOOPOVER_MINER_CONFIG_DIR=/data/miner \
+  -e GITHUB_TOKEN \
+  -v miner-data:/data/miner \
+  loopover-miner:latest \
+  doctor
+```
+
+The image entrypoint is `loopover-miner`; pass subcommands after the image name (`status`, `doctor`, `claim`, …).
+
+- **`/data/miner` volume** — holds all SQLite state (`claim-ledger.sqlite3`, `plan-store.sqlite3`, etc.) so containers are disposable. Defaults to `LOOPOVER_MINER_CONFIG_DIR=/data/miner` in the image.
+- **`GITHUB_TOKEN`** — supplied by the operator at run time; the image contains no credentials.
+- **Scale** — launch additional containers with the same volume (or partitioned config dirs) for parallel attempts.
+
+**Secret-file alternative (`GITHUB_TOKEN_FILE`).** A plain `-e GITHUB_TOKEN` value is visible in plaintext
+via `docker inspect`/`docker compose config` and any full-env dump of the running container. For Docker
+Swarm/Kubernetes-managed secrets (mounted as a file, e.g. at `/run/secrets/github_token`), set
+`GITHUB_TOKEN_FILE` to that mount path instead — the miner reads and trims the file's contents at startup and
+uses it exactly as if `GITHUB_TOKEN` had been set directly:
+
+```sh
+docker run --rm -it \
+  -e LOOPOVER_MINER_CONFIG_DIR=/data/miner \
+  -e GITHUB_TOKEN_FILE=/run/secrets/github_token \
+  -v miner-data:/data/miner \
+  -v /path/to/your/secret:/run/secrets/github_token:ro \
+  loopover-miner:latest \
+  doctor
+```
+
+If both `GITHUB_TOKEN` and `GITHUB_TOKEN_FILE` are set, the plain `GITHUB_TOKEN` value always wins (same
+precedence rule as ORB's own `src/selfhost/load-file-secrets.ts`). A missing or unreadable `GITHUB_TOKEN_FILE`
+fails the container fast with a clear error naming the file path, rather than silently proceeding with no
+credential. The same `<NAME>_FILE` convention works for any credential the miner reads from a plain env var —
+not only `GITHUB_TOKEN`.
+
+The repo-root [`docker-compose.yml`](../../docker-compose.yml) documents the **self-hosted review stack** (the `loopover` API/orb), not the miner CLI. Miners are clients of that stack (or of github.com directly) and do not require it to run locally.
+
+### Docker Compose (fleet mode)
+
+Instead of a hand-assembled `docker run`, [`docker-compose.miner.yml`](docker-compose.miner.yml) defines a long-lived `miner` service (built from this package's Dockerfile, `restart: unless-stopped`, state on a named `miner-data` volume). Credentials come from an env file, never inlined:
+
+```sh
+cp .loopover-miner.env.example .loopover-miner.env   # fill in GITHUB_TOKEN (+ optional provider keys)
+docker compose -f docker-compose.miner.yml up -d --build
+```
+
+**Scaling to N parallel workers.** `docker compose -f docker-compose.miner.yml up -d --scale miner=N` gives every replica the **same** `miner-data` volume — and the miner's SQLite ledgers are **not** safe for concurrent access, so N replicas on one volume will contend/corrupt. To run N **isolated** workers, give each its own state: run N separate compose projects (`docker compose -p miner-1 …`, `-p miner-2 …` — `-p` namespaces the volume) or point each at a distinct `LOOPOVER_MINER_CONFIG_DIR` on its own mount. For built-in isolated horizontal scaling, use the Kubernetes StatefulSet in [`k8s/`](../../k8s/) (per-pod volumes).
+
+### Network-egress firewall (Docker Compose / `docker run`)
+
+The container enforces deny-by-default network egress for the coding-agent execution environment (#7648, #7857): outbound traffic is blocked except to a curated allowlist (OS package registries, GitHub — the target repo's own git remote) plus whatever an operator declares in [`.loopover-ams.yml`](../../.loopover-ams.yml.example)'s `networkAllowlist` (ecosystem registries like npm/PyPI, or specific extra hostnames). This applies to the **whole container**, not just the coding-agent subprocess — no per-process network isolation exists yet, so the miner's own necessary calls (the Orb broker, Sentry, the discovery-index plane, Neon) are allowed automatically whenever their corresponding feature is actually configured.
+
+This changes what the container needs at `docker run`/Compose time:
+
+- `docker-compose.miner.yml` already grants the required `NET_ADMIN`/`NET_RAW` capabilities — nothing to change if you use it as-is.
+- Running with a bare `docker run` instead: add `--cap-add=NET_ADMIN --cap-add=NET_RAW`.
+- The image now starts as **root** (not `node`) so its entrypoint can configure the firewall, then drops to the unprivileged `node` user before running anything else — the actual miner process runs exactly as before.
+
+If the firewall setup itself fails (a misconfigured environment, `dnsmasq`/`iptables` erroring), the container **fails to start** rather than silently running with no restriction — that's deliberate (a coding-agent sandbox with no network policy at all is worse than not running). If you hit a real snag, `LOOPOVER_MINER_DISABLE_EGRESS_FIREWALL=1` is the documented escape hatch to get unblocked, then use `.loopover-ams.yml`'s `networkAllowlist` to fix it properly and remove the override.
+
+Only covers Docker/Compose today. Kubernetes (`k8s/miner-deployment.yaml`) and systemd (bare-host) need their own privilege-setup mechanism (a k8s `initContainer`, a systemd `ExecStartPre=+`) — tracked separately in [#8282](https://github.com/JSONbored/loopover/issues/8282), not yet enforced on those paths.
+
+### Running fleet mode alongside ORB's `ams-observability` profile
+
+Fleet mode keeps miner state in a named `miner-data` volume, but ORB's `ams-reporting-exporter` (root [`docker-compose.yml`](../../docker-compose.yml), `--profile ams-observability`) reads the miner's ledgers from a **host** directory (default `~/.config/loopover-miner`). A named volume's host path is a Docker-managed internal detail, so the two never line up on their own — the exporter reads an empty directory and the Grafana AMS datasources stay **silently empty**.
+
+To bridge them, relocate the fleet miner's state onto a host directory with the opt-in override, then run both profiles together:
+
+```sh
+cp packages/loopover-miner/docker-compose.miner.override.yml.example \
+   packages/loopover-miner/docker-compose.miner.override.yml   # gitignored; edit the host path only if you want a non-default location
+
+docker compose -f docker-compose.yml \
+  -f packages/loopover-miner/docker-compose.miner.yml \
+  -f packages/loopover-miner/docker-compose.miner.override.yml \
+  --profile ams-observability up -d
+```
+
+The override bind-mounts `/data/miner` to `${LOOPOVER_MINER_CONFIG_DIR:-~/.config/loopover-miner}` — the **same** variable and default the exporter already uses — so both read one location with no `docker volume inspect` archaeology. Leave both unset for the default, or set `LOOPOVER_MINER_CONFIG_DIR` once and both the fleet miner and the exporter follow it. This override is opt-in and additive: without it, `docker-compose.miner.yml`'s named-volume default is unchanged.
+
+## Bare-host (systemd, no Docker)
+
+To run the miner continuously on a plain Linux host without Docker, supervise `loopover-miner loop` — the autonomous discover → attempt → manage daemon (#5135) — with systemd. [`systemd/loopover-miner.service.example`](../../systemd/loopover-miner.service.example) is a ready-to-adapt persistent unit; its header carries the full install steps:
+
+```sh
+npm install -g @loopover/miner
+loopover-miner init --verify-token   # optional: validate GITHUB_TOKEN before discovery/attempt runs
+sudo cp systemd/loopover-miner.service.example /etc/systemd/system/loopover-miner.service
+sudo $EDITOR /etc/systemd/system/loopover-miner.service   # set User / WorkingDirectory / ExecStart / secrets
+sudo systemctl daemon-reload
+sudo systemctl enable --now loopover-miner.service
+```
+
+Because `loop` is a **long-running daemon that schedules its own cycles**, it is a persistent `Type=simple` service (with `Restart=on-failure`) — **not** a oneshot unit driven by a `.timer`, unlike the periodic `loopover-docker-prune@.*.example` hygiene job in [`systemd/`](../../systemd/). Keep `GITHUB_TOKEN` (and any coding-agent credentials) in a root-owned `0600` `EnvironmentFile`, never in the unit file. Follow the loop with `journalctl -u loopover-miner -f`; `systemctl stop` sends SIGTERM, which the loop handles cleanly at its next kill-switch check.
+
+Want the dashboard too? [`systemd/loopover-miner-ui.service.example`](../../systemd/loopover-miner-ui.service.example) is a companion unit that serves `apps/loopover-miner-ui` persistently over the same local state — see that app's [README](../../apps/loopover-miner-ui/README.md#running-as-a-persistent-service).
+
+## Invariants
+
+- Core miner bookkeeping (claims, plans, queues, ledgers) works offline after install.
+- `loopover-miner status` and `loopover-miner doctor` make **no network calls**.
+- Discovery/ranking primitives that touch GitHub only run when explicitly invoked and only perform documented GETs unless a future command says otherwise.
+- Operators own secret injection; images and packages ship without embedded tokens.
+- AMS works against **any** GitHub repository — it does not require ORB installed, gittensor registration, or a `.loopover.yml` file on the target repo to function. Verified end to end (`init`, `doctor`, `discover <owner/repo>`) against real public repositories with no `.loopover.yml` and no gittensor registration, using only a plain `GITHUB_TOKEN`.
+
+See [`docs/operations-runbook.md`](docs/operations-runbook.md) for operational scenarios: ledger corruption, two miners on one state dir, and post-upgrade schema migration ([#4875](https://github.com/JSONbored/loopover/issues/4875)).
+
+See [`docs/sizing.md`](docs/sizing.md) for measured CPU/RAM/disk numbers for laptop mode vs. fleet mode at
+different worker counts, with the exact commands used to reproduce them.
+
+## Environment variable reference
+
+All optional. The per-store `LOOPOVER_MINER_<NAME>_DB` path overrides (e.g. `LOOPOVER_MINER_PORTFOLIO_QUEUE_DB`)
+and `LOOPOVER_MINER_CONFIG_DIR` are covered above under the fleet/state notes; the rest are:
+
+| Variable | Read by | Purpose |
+| --- | --- | --- |
+| `LOOPOVER_MINER_AMS_POLICY_PATH` | `dist/lib/ams-policy.js` | Path to the operator's `.loopover-ams.yml` policy spec. |
+| `LOOPOVER_MINER_AMS_COLLECTOR_URL`, `LOOPOVER_MINER_AMS_COLLECTOR_TOKEN` | `dist/lib/orb-export.js` | Endpoint + bearer for pushing fleet state to an AMS/Orb collector. |
+| `LOOPOVER_MINER_CHAT_ACTIONS` | `dist/lib/chat-action-dispatch.js` | Truthy string enables the chat-action-dispatch flag (off by default). |
+| `LOOPOVER_MINER_LEDGER_RETENTION_DAYS`, `LOOPOVER_MINER_LEDGER_RETENTION_MAX_ROWS` | `dist/lib/store-maintenance.js` | Opt-in ledger retention window / row cap. |
+| `LOOPOVER_MINER_LOG_LEVEL` | `dist/lib/logger.js` | Log verbosity override. |
+| `LOOPOVER_MINER_NEON_API_KEY`, `LOOPOVER_MINER_NEON_PROJECT_ID`, `LOOPOVER_MINER_NEON_PARENT_BRANCH_ID` | `dist/lib/attempt-db-fork-config.js` | Neon branch-per-attempt disposable DB fork ([#7858](https://github.com/JSONbored/loopover/issues/7858)). All three required together — any one missing disables the feature entirely (no branch is ever created). |
+| `LOOPOVER_MINER_NO_UPDATE_CHECK` | `dist/lib/update-check.js` | Truthy string disables the background update check. |
+| `LOOPOVER_MINER_REPO_CLONE_DIR` | `dist/lib/repo-clone.js` | Base directory for cloned target repos. |
+| `LOOPOVER_MINER_WORKTREE_DIR` | `dist/lib/worktree-allocator.js` | Base directory for per-attempt git worktrees. |
+| `LOOPOVER_MINER_SENTRY_DSN`, `LOOPOVER_MINER_SENTRY_ENVIRONMENT` | `dist/lib/sentry.js` | Optional Sentry error reporting (DSN + environment tag). |
+| `LOOPOVER_MINER_POSTHOG_API_KEY`, `LOOPOVER_MINER_POSTHOG_HOST` | `dist/lib/posthog.js` | Optional PostHog error + AI-generation reporting ([#8292](https://github.com/JSONbored/loopover/issues/8292), epic [#8286](https://github.com/JSONbored/loopover/issues/8286)) — runs alongside Sentry during the parallel-run window; API key + optional ingestion host override (defaults to PostHog's US-cloud host). |
+| `LOOPOVER_MINER_VERSION` | `dist/lib/version.js` | Overrides the reported release id (e.g. for a custom build). |
+
+## Optional hosted discovery plane (opt-in)
+
+The Phase 6 **hosted discovery-index** is **off by default** — unlike Orb fleet export (`ORB_AIR_GAP` is the only opt-out). Operators who want cross-fleet metadata queries or soft-claim coordination must opt in explicitly, via `dist/lib/discovery-index-client.js` ([#7168](https://github.com/JSONbored/loopover/issues/7168), wired against the hosted server from [#7164](https://github.com/JSONbored/loopover/issues/7164)/[#7166](https://github.com/JSONbored/loopover/issues/7166)):
+
+| Variable | Read by | Purpose |
+| --- | --- | --- |
+| `LOOPOVER_MINER_DISCOVERY_PLANE` | `dist/lib/discovery-index-client.js` | Master opt-in (truthy string, off by default). No hosted discovery-index traffic or telemetry unless set. |
+| `LOOPOVER_MINER_DISCOVERY_INDEX_URL` | `dist/lib/discovery-index-client.js` | Base URL of the hosted discovery-index service. Required for the plane to do anything once enabled. |
+| `LOOPOVER_MINER_DISCOVERY_SHARED_SECRET` | `dist/lib/discovery-index-client.js` | Optional bearer secret for the hosted endpoint, if it requires one. |
+| `LOOPOVER_MINER_DISCOVERY_TELEMETRY` | `dist/lib/discovery-index-client.js` | Second, independent opt-in for anonymized operational telemetry — can stay off while the plane itself is queried/claimed against. |
+
+See [`docs/discovery-plane-operator-guide.md`](docs/discovery-plane-operator-guide.md) for the full invariant list (metadata-only, no compensation signals, credentials stay local).
+
+## Optional hosted control plane — tenant admin (opt-in)
+
+The `loopover-miner tenant` command group (create/list/destroy) provisions hosted tenant instances against the ORB+AMS hosting control-plane's provisioning API ([#7275](https://github.com/JSONbored/loopover/issues/7275)). It is **off by default** and completely inert unless opted in; unlike the discovery plane, these are deliberate **admin actions that fail loud** (a disabled/unconfigured/unreachable/error condition exits non-zero rather than degrading silently), via `dist/lib/tenant-client.js`:
+
+| Variable | Read by | Purpose |
+| --- | --- | --- |
+| `LOOPOVER_MINER_CONTROL_PLANE` | `dist/lib/tenant-client.js` | Master opt-in (truthy string, off by default). No tenant admin traffic is possible unless set. |
+| `LOOPOVER_MINER_CONTROL_PLANE_URL` | `dist/lib/tenant-client.js` | Base URL of the hosted control-plane provisioning API. Required once the plane is enabled. |
+| `LOOPOVER_MINER_CONTROL_PLANE_ADMIN_TOKEN` | `dist/lib/tenant-client.js` | Bearer admin credential for the provisioning API — distinct from any tenant's own per-instance secrets. Required once the plane is enabled. |

@@ -1,0 +1,396 @@
+"""Entrypoint: evaluate a trained coordinator + baselines on a benchmark.
+
+Reports the relative invariants from SPEC §1.3:
+  - TRINITY (trained coordinator, argmax) vs
+  - each single model alone (one direct Worker turn) [R1, R2] vs
+  - random routing (random agent+role each turn) [R4].
+
+Usage:
+    source ~/.config/trinity/secrets.env
+    CUDA_VISIBLE_DEVICES=5 python -m trinity.eval --benchmark math500 \
+        --theta experiments/math500/run/best_theta.npy
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import random
+from pathlib import Path
+from statistics import mean
+from typing import Any, Mapping
+
+import numpy as np
+import yaml
+
+from .adapters import get_adapter
+from .coordinator.policy import CoordinatorPolicy
+from .llm.openrouter_client import OpenRouterPool
+from .orchestration.session import run_trajectory
+from .types import ROLE_ORDER, Role
+
+_REPO = Path(__file__).resolve().parents[2]
+
+# Locked reproducibility seed — committed, never changed.
+# Using a custom seed prints a warning: cherry-picking seeds to find a lucky
+# eval split undermines result trustworthiness.
+REPRODUCIBILITY_SEED: int = 42
+
+
+class RandomPolicy:
+    """Random (agent, role) each turn — the R4 routing baseline (no GPU).
+
+    Draws from the caller-supplied ``rng`` when one is given, so each trajectory
+    can own a deterministically-seeded stream. Falling back to a single shared
+    ``self.rng`` across trajectories running under ``asyncio.gather`` would make
+    the draws depend on network completion order rather than on the seed.
+    """
+
+    def __init__(self, n_models: int, seed: int = 0) -> None:
+        self.n_models = n_models
+        self.rng = random.Random(seed)
+
+    def decide(
+        self,
+        transcript_text: str,
+        *,
+        sample: bool = False,
+        rng: random.Random | None = None,
+    ) -> tuple[int, Role]:
+        """Pick the next (agent index, role) uniformly at random.
+
+        Args:
+            transcript_text: Unused — the baseline ignores the transcript.
+            sample: Unused — the baseline is always stochastic.
+            rng: Per-trajectory RNG. Falls back to the instance RNG when ``None``.
+
+        Returns:
+            A ``(agent_idx, role)`` pair.
+        """
+        r = self.rng if rng is None else rng
+        return r.randrange(self.n_models), r.choice(ROLE_ORDER)
+
+
+def task_rng(seed: int, task_id: str) -> random.Random:
+    """Build a per-task RNG whose stream depends only on ``seed`` and ``task_id``.
+
+    Keeps the random-routing baseline invariant to ``asyncio`` scheduling: a task's
+    draws never depend on when other concurrent tasks' HTTP calls happen to return.
+    Seeding from a string is stable across processes (``random.Random`` hashes str
+    seeds with SHA-512, so it does not depend on ``PYTHONHASHSEED``).
+
+    Args:
+        seed: The run's base seed.
+        task_id: The benchmark item's stable identifier.
+
+    Returns:
+        A freshly seeded :class:`random.Random`.
+    """
+    return random.Random(f"{seed}:{task_id}")
+
+
+def single_model_budget(max_tokens: int, max_turns: int) -> int:
+    """Token budget for one single-model baseline turn, matched to TRINITY's total.
+
+    SPEC §1.3.4 requires the R1/R2 baselines to be **budget-matched**: *"run each
+    single model at max_tokens = 20,480 (5x) so the single-vs-TRINITY comparison is
+    fair, matching the paper's 5x protocol."*
+
+    TRINITY may spend ``max_tokens`` on each of up to ``max_turns`` turns, so a
+    single model answering in one turn is given that same total. Deriving the
+    multiplier from ``max_turns`` (rather than hard-coding 5) keeps the comparison
+    matched if ``--max-turns`` is changed.
+
+    Args:
+        max_tokens: Per-turn token cap (``--max-tokens``).
+        max_turns: Maximum TRINITY turns (``--max-turns``).
+
+    Returns:
+        The single-model baseline's ``max_tokens``. At the defaults: ``5 * 4096 =
+        20,480``.
+
+    Raises:
+        ValueError: If either argument is not positive.
+    """
+    if max_tokens < 1:
+        raise ValueError(f"max_tokens must be >= 1, got {max_tokens}")
+    if max_turns < 1:
+        raise ValueError(f"max_turns must be >= 1, got {max_turns}")
+    return int(max_tokens) * int(max_turns)
+
+
+def _reduce_scores(scores: list, *, label: str) -> float:
+    """Average per-task scores, counting a failed trajectory as ``0.0``.
+
+    ``asyncio.gather(..., return_exceptions=True)`` returns a :class:`BaseException`
+    in place of any task whose trajectory exhausted its retries (e.g. a persistent
+    ``httpx.ReadTimeout``). Such a task degrades to a score of ``0.0`` instead of
+    aborting the whole evaluation — the same pessimistic convention training already
+    uses (:mod:`trinity.optim.fitness`). The failed task stays in the denominator: it
+    produced no answer, so it is not correct, and dropping it would inflate the mean
+    by survivorship.
+
+    Args:
+        scores: Per-task scores, each either a ``float`` or the :class:`BaseException`
+            raised while producing it.
+        label: Scorer name, shown in the degraded-run warning.
+
+    Returns:
+        The mean task score.
+
+    Raises:
+        RuntimeError: If *every* task failed. A dead API must not be reportable as a
+            measurement of ``0.0`` accuracy, so the caller aborts rather than writing
+            a meaningless results file.
+    """
+    n_failed = sum(isinstance(s, BaseException) for s in scores)
+    if scores and n_failed == len(scores):
+        raise RuntimeError(
+            f"{label}: all {len(scores)} trajectories failed (last error: "
+            f"{type(scores[-1]).__name__}: {scores[-1]}); refusing to report 0.0."
+        )
+    if n_failed:
+        print(f"  [warn] {label}: {n_failed}/{len(scores)} trajectories failed "
+              "(counted as 0.0); the reported score is degraded.", flush=True)
+    return float(mean(0.0 if isinstance(s, BaseException) else s for s in scores))
+
+
+def _binary_scores(scores: list) -> list[int]:
+    """Per-task 0/1 correctness (failed trajectory -> 0), aligned to input order.
+
+    Feeds the optional ``per_item`` block so ``trinity.analysis.significance`` can put
+    paired bootstrap CIs / McNemar on the R1/R2/R4 verdicts. Uses the same
+    failed-trajectory -> 0 convention as :func:`_reduce_scores`.
+    """
+    return [0 if isinstance(s, BaseException) else int(float(s) >= 0.5) for s in scores]
+
+
+async def _score_policy(
+    tasks, policy, pool, pool_models, *, adapter, sample, rng_seed: int | None = None,
+    label: str = "routing", per_task_out: list | None = None, **run_kwargs,
+) -> float:
+    import httpx
+
+    async with httpx.AsyncClient() as cli:
+        # return_exceptions=True so one trajectory that exhausts retries (e.g. a
+        # persistent timeout) degrades to 0.0 instead of discarding the whole eval —
+        # and every baseline already computed before it. Matches training
+        # (trinity.optim.fitness), which tolerates the same error.
+        trajs = await asyncio.gather(
+            *[
+                run_trajectory(
+                    t, policy, pool, pool_models, adapter=adapter, sample=sample, client=cli,
+                    rng=None if rng_seed is None else task_rng(rng_seed, t.task_id),
+                    **run_kwargs,
+                )
+                for t in tasks
+            ],
+            return_exceptions=True,
+        )
+    # Score through the adapter (not reward.score directly) so the routed path
+    # honours the same benchmark contract as the single-model baseline. A failed
+    # trajectory is kept as its exception and scored 0.0 by _reduce_scores.
+    scores = [t if isinstance(t, BaseException) else adapter.score_trajectory(t) for t in trajs]
+    if per_task_out is not None:
+        per_task_out.extend(_binary_scores(scores))
+    return _reduce_scores(scores, label=label)
+
+
+async def _score_single_model(tasks, pool, model, adapter, *, max_tokens, reasoning,
+                              per_task_out: list | None = None) -> float:
+    """Baseline: ask one model directly (one Worker-style turn), score its answer."""
+    import httpx
+
+    from .roles.prompts import build_messages
+
+    async with httpx.AsyncClient() as cli:
+        async def one(task):
+            msgs = build_messages(Role.WORKER, adapter.build_prompt(task), [])
+            res = await pool.chat(model, msgs, max_tokens=max_tokens, temperature=0.0,
+                                  reasoning=reasoning, client=cli)
+            return adapter.score_output(res.text, task.answer)
+
+        # return_exceptions=True: a single retry-exhausted task degrades to 0.0 rather
+        # than aborting the baseline (and discarding the other baselines this run
+        # already computed).
+        scores = await asyncio.gather(*[one(t) for t in tasks], return_exceptions=True)
+    if per_task_out is not None:
+        per_task_out.extend(_binary_scores(scores))
+    return _reduce_scores(scores, label=f"single::{model}")
+
+
+def resolve_session_run_kwargs(args, session: Mapping[str, Any]) -> dict[str, Any]:
+    """Build ``run_trajectory`` kwargs for eval from CLI args + the ``session:`` block.
+
+    Mirrors ``trinity.train`` so the coordinator is EVALUATED under the same
+    protocol it was TRAINED under: an explicit ``--max-turns`` overrides the
+    config, which overrides the default ``K=5``; ``verifier_requires_prior_worker``
+    comes from the config (default ``True``). Without this, a ``session:`` block
+    that changed the turn budget or the verifier gate at train time is silently
+    ignored at eval — the reported R1/R2/R4 then describe an off-distribution
+    policy, and the budget-matched single-model baselines (``max_turns`` x
+    ``max_tokens``) are sized against the wrong ``K``.
+
+    Args:
+        args: Parsed CLI args (uses ``max_turns``, ``max_tokens``, ``reasoning``).
+            ``max_turns`` of ``0``/``None`` means "not given" and defers to config.
+        session: The parsed ``session:`` mapping from the config (``{}`` if absent).
+
+    Returns:
+        Keyword args for :func:`trinity.orchestration.session.run_trajectory`,
+        including the resolved ``max_turns`` and ``verifier_requires_prior_worker``.
+    """
+    max_turns = args.max_turns or session.get("max_turns", 5)
+    return dict(
+        max_turns=max_turns,
+        max_tokens=args.max_tokens,
+        reasoning=args.reasoning,
+        verifier_requires_prior_worker=session.get("verifier_requires_prior_worker", True),
+    )
+
+
+async def evaluate(args) -> dict:
+    pool = OpenRouterPool(args.models)
+    pool_models = list(pool.models)
+    n_models = len(pool_models)
+
+    # Resolve the benchmark to an adapter ONCE; the rest of the evaluator drives
+    # the adapter interface and never branches on the benchmark name (#9).
+    adapter = get_adapter(args.benchmark)
+    tasks = adapter.load_tasks("test", max_items=args.max_items, seed=args.seed)
+    print(f"[eval] benchmark={args.benchmark}  {len(tasks)} test tasks  pool={pool_models}")
+
+    # Read the SAME `session:` block train.py uses so eval runs the trained
+    # protocol (turn budget K, verifier gate), not just CLI defaults. Loaded once
+    # and reused for the `coordinator:` block below.
+    full_cfg = yaml.safe_load(Path(args.config).read_text())
+    run_kwargs = resolve_session_run_kwargs(args, full_cfg.get("session", {}))
+    eval_max_turns = run_kwargs["max_turns"]
+
+    # SPEC §1.3.4: the single-model baselines must be BUDGET-MATCHED to TRINITY, or
+    # R1/R2 ("TRINITY beats the best single model") is decided by token budget
+    # rather than by routing. TRINITY may spend `max_tokens` on each of `max_turns`
+    # turns, so a single model gets that same total in its one turn -- 5 x 4096 =
+    # 20,480 at the defaults, which is the paper's 5x protocol.
+    single_max_tokens = single_model_budget(args.max_tokens, eval_max_turns)
+    print(f"[eval] budget-matched baselines: single-model max_tokens="
+          f"{single_max_tokens} ({eval_max_turns}x {args.max_tokens})")
+
+    results: dict[str, float] = {}
+    # Per-question 0/1 correctness for each system, so trinity.analysis.significance can
+    # put paired bootstrap CIs / McNemar on R1/R2/R4 (SPEC §6.4; RESULTS.md "inside the
+    # noise"). Purely additive: a new `per_item` output key; verdicts stay as-is. Single
+    # models / random routing capture one representative pass (the mean over reps/seeds
+    # stays the reported score); TRINITY is deterministic (argmax).
+    per_item: dict[str, list] = {"task_ids": [t.task_id for t in tasks]}
+
+    # --- single-model baselines (R1/R2) ---
+    for m in pool_models:
+        first_rep: list[int] = []
+        reps = [await _score_single_model(tasks, pool, m, adapter,
+                                          max_tokens=single_max_tokens,
+                                          reasoning=args.reasoning,
+                                          per_task_out=(first_rep if i == 0 else None))
+                for i in range(max(1, args.single_reps))]
+        s = float(mean(reps))
+        results[f"single::{m}"] = s
+        per_item[f"single::{m}"] = first_rep
+        if len(reps) > 1:
+            sd = (sum((x - s) ** 2 for x in reps) / len(reps)) ** 0.5
+            results[f"single_std::{m}"] = sd
+            print(f"  single  {m:20s} = {s:.4f} ± {sd:.4f}  (reps={reps})")
+        else:
+            print(f"  single  {m:20s} = {s:.4f}")
+
+    # --- TRINITY trained coordinator (argmax) ---
+    cfg = full_cfg["coordinator"]
+    print("[eval] building coordinator on GPU...")
+    policy, spec = CoordinatorPolicy.build(
+        model_name=cfg["encoder_model"], device=cfg.get("device", "cuda:0"),
+        dtype=cfg.get("dtype", "bfloat16"), target_layer=cfg["svf"]["target_layer"],
+        svf_matrices=cfg["svf"].get("matrices"), n_models=n_models,
+        l2_normalize=cfg["hidden_state"].get("l2_normalize", True),
+    )
+    theta = np.load(args.theta)
+    policy.configure(theta, spec)
+    tri_vec: list[int] = []
+    s_trinity = await _score_policy(tasks, policy, pool, pool_models, adapter=adapter,
+                                    sample=False, label="TRINITY", per_task_out=tri_vec,
+                                    **run_kwargs)
+    results["TRINITY"] = s_trinity
+    per_item["TRINITY"] = tri_vec
+    print(f"  TRINITY (trained)        = {s_trinity:.4f}")
+
+    # --- random routing (R4) — multi-seed baseline to remove run-to-run noise ---
+    # The paper reports random routing as a single draw per run, but with
+    # small eval sets (~120 q's) the variance is large (0.733–0.792 in
+    # practice).  Reporting the mean over 100 seeds gives an honest baseline.
+    rand_seeds = max(1, args.rand_seeds)
+    rand_scores: list[float] = []
+    rand_vec: list[int] = []
+    for s in range(rand_seeds):
+        seed_s = args.seed * 10000 + s
+        rand = RandomPolicy(n_models, seed=seed_s)
+        s_r = await _score_policy(tasks, rand, pool, pool_models, adapter=adapter,
+                                  sample=False, rng_seed=seed_s, label="random routing",
+                                  per_task_out=(rand_vec if s == 0 else None),
+                                  **run_kwargs)
+        rand_scores.append(s_r)
+    per_item["random_routing"] = rand_vec
+    s_rand = float(mean(rand_scores))
+    results["random_routing"] = s_rand
+    if rand_seeds > 1:
+        rand_std = (sum((x - s_rand) ** 2 for x in rand_scores) / rand_seeds) ** 0.5
+        results["random_routing_std"] = rand_std
+        print(f"  random routing           = {s_rand:.4f} ± {rand_std:.4f}  (n={rand_seeds} seeds)")
+    else:
+        print(f"  random routing           = {s_rand:.4f}")
+
+    best_single = max(results[k] for k in results if k.startswith("single::"))
+    invariants = {
+        "R1/R2 TRINITY > best single model": s_trinity > best_single,
+        "R4 TRINITY > random routing": s_trinity > s_rand,
+        "best_single": best_single,
+    }
+    out = {"benchmark": args.benchmark, "results": results, "invariants": invariants,
+           "per_item": per_item}
+    print("[eval] invariants:", json.dumps(invariants, indent=2))
+
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(json.dumps(out, indent=2))
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Evaluate TRINITY + baselines")
+    ap.add_argument("--benchmark", required=True)
+    ap.add_argument("--theta", required=True, help="path to trained best_theta.npy")
+    ap.add_argument("--config", default=str(_REPO / "configs" / "trinity.yaml"))
+    ap.add_argument("--models", default=str(_REPO / "configs" / "models.yaml"))
+    ap.add_argument("--max-items", type=int, default=100, dest="max_items")
+    ap.add_argument("--single-reps", type=int, default=1, dest="single_reps",
+                    help="average each single-model baseline over K runs (cuts nondeterminism noise)")
+    ap.add_argument("--max-turns", type=int, default=0, dest="max_turns",
+                    help="override K; 0 (default) defers to config session.max_turns (else 5)")
+    ap.add_argument("--max-tokens", type=int, default=4096, dest="max_tokens")
+    ap.add_argument("--reasoning", default="minimal")
+    ap.add_argument("--seed", type=int, default=REPRODUCIBILITY_SEED,
+                    help=f"random seed (default: {REPRODUCIBILITY_SEED} — locked for reproducibility; "
+                         "overriding prints a warning)")
+    ap.add_argument("--rand-seeds", type=int, default=100, dest="rand_seeds",
+                    help="number of random seeds for the random-routing baseline (default: 100)")
+    ap.add_argument("--out", default="")
+    args = ap.parse_args()
+    if args.seed != REPRODUCIBILITY_SEED:
+        print(
+            f"[eval] ⚠ seed={args.seed} differs from locked REPRODUCIBILITY_SEED="
+            f"{REPRODUCIBILITY_SEED}. Non-default seeds weaken reproducibility "
+            f"and should be justified in any reported results.",
+            flush=True,
+        )
+    asyncio.run(evaluate(args))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,193 @@
+diff --git a/control-plane/src/container-driver.ts b/control-plane/src/container-driver.ts
+index 66716ba2c..035ea3ddd 100644
+--- a/control-plane/src/container-driver.ts
++++ b/control-plane/src/container-driver.ts
+@@ -40,6 +40,11 @@ export type ContainerDriverConfig = {
+    *  `product` string `TenantProvisioningRequest` carries; an unconfigured product is a real
+    *  misconfiguration, not a silent no-op (see `bindingFor`). */
+   bindings: Record<Product, ContainerNamespaceLike>;
++  /** #7876: the central PostHog project key (#7875) the hosted fleet reports errors to. When set, it rides
++   *  into EVERY tenant container as {@link CENTRAL_POSTHOG_KEY_ENV_VAR}, so the self-host image's own error
++   *  tracking (once its Phase-1 init lands) points at the loopover-owned project instead of nothing. A
++   *  control-plane secret, never hardcoded; absent ⇒ no key is injected and tenants behave exactly as before. */
++  centralPosthogKey?: string;
+ };
+ 
+ export type ContainerDriver = {
+@@ -75,6 +80,12 @@ export const PINNED_VERSION_ENV_VAR = "LOOPOVER_PINNED_VERSION";
+  *  actually has custodied -- this driver never sees or needs to know what that is. */
+ export const TENANT_SECRET_ENV_VAR = "LOOPOVER_TENANT_SECRET_TOKEN";
+ 
++/** The env var a tenant's container reads the central PostHog project key from (#7876). Product-agnostic for
++ *  the same reason as {@link PINNED_VERSION_ENV_VAR}/{@link TENANT_SECRET_ENV_VAR}: both the ORB and AMS tenant
++ *  images read the identical name. Unlike those two (per-tenant values), this is a single fleet-wide key from
++ *  {@link ContainerDriverConfig.centralPosthogKey}, so every tenant that starts gets the same value. */
++export const CENTRAL_POSTHOG_KEY_ENV_VAR = "LOOPOVER_CENTRAL_POSTHOG_KEY";
++
+ /** Idempotent: an already-provisioned tenant's container is left running as-is, never restarted -- a repeat
+  *  create must not interrupt a container mid-work. This is also the ONLY point in a tenant's lifecycle where
+  *  `envVars` actually reach the container (confirmed against the real `@cloudflare/containers` SDK: a `start()`
+@@ -90,6 +101,7 @@ export async function createTenantContainer(config: ContainerDriverConfig, reque
+   const envVars: Record<string, string> = {};
+   if (request.tenant.pinnedVersion) envVars[PINNED_VERSION_ENV_VAR] = request.tenant.pinnedVersion;
+   if (request.bootstrapSecret) envVars[TENANT_SECRET_ENV_VAR] = request.bootstrapSecret;
++  if (config.centralPosthogKey) envVars[CENTRAL_POSTHOG_KEY_ENV_VAR] = config.centralPosthogKey;
+   if (Object.keys(envVars).length > 0) {
+     await stub.start({ envVars });
+   } else {
+diff --git a/control-plane/src/driver-factory.ts b/control-plane/src/driver-factory.ts
+index d8922254e..735e84bc3 100644
+--- a/control-plane/src/driver-factory.ts
++++ b/control-plane/src/driver-factory.ts
+@@ -75,7 +75,13 @@ export function createTenantProvisioningDriver(
+   }
+ 
+   if (containerBindings && Object.keys(containerBindings).length > 0) {
+-    driver = withRealContainerDriver(driver, createContainerDriver({ bindings: containerBindings }));
++    // #7876: when the central PostHog key is configured, thread it into the container driver so every tenant
++    // container it starts reports errors to the loopover-owned project; unset ⇒ omitted, tenants unchanged.
++    const centralPosthogKey = nonBlank(env.CENTRAL_POSTHOG_KEY);
++    driver = withRealContainerDriver(
++      driver,
++      createContainerDriver({ bindings: containerBindings, ...(centralPosthogKey ? { centralPosthogKey } : {}) }),
++    );
+   }
+ 
+   const mainAppBaseUrl = nonBlank(env.MAIN_APP_BASE_URL);
+diff --git a/control-plane/src/env.d.ts b/control-plane/src/env.d.ts
+index 6fdbce9bc..187840a5a 100644
+--- a/control-plane/src/env.d.ts
++++ b/control-plane/src/env.d.ts
+@@ -24,6 +24,11 @@ declare global {
+      *  (a plain var, see wrangler.jsonc); createTenantProvisioningDriver falls back to the fake otherwise.
+      *  Genuinely sensitive: whoever holds it can call every internal admin route in the main app. */
+     INTERNAL_JOB_TOKEN?: string;
++    /** The central PostHog project key (#7876) the hosted fleet reports errors to, provisioned by #7875.
++     *  When set, driver-factory.ts threads it into every tenant container (CENTRAL_POSTHOG_KEY_ENV_VAR) so the
++     *  self-host image points its own error tracking at the loopover-owned project. Genuinely sensitive:
++     *  whoever holds it can write events into the fleet's analytics project. */
++    CENTRAL_POSTHOG_KEY?: string;
+   }
+ }
+ 
+diff --git a/control-plane/src/index.ts b/control-plane/src/index.ts
+index 45851d853..81e17b686 100644
+--- a/control-plane/src/index.ts
++++ b/control-plane/src/index.ts
+@@ -60,6 +60,7 @@ export {
+   type SecretDriverConfig,
+ } from "./secret-driver.js";
+ export {
++  CENTRAL_POSTHOG_KEY_ENV_VAR,
+   createContainerDriver,
+   createTenantContainer,
+   destroyTenantContainer,
+diff --git a/control-plane/src/worker.ts b/control-plane/src/worker.ts
+index b1df38412..4ac5313b9 100644
+--- a/control-plane/src/worker.ts
++++ b/control-plane/src/worker.ts
+@@ -56,7 +56,9 @@ export default {
+     const driver = createTenantProvisioningDriver(
+       // #8066: MAIN_APP_BASE_URL/INTERNAL_JOB_TOKEN select the real secret driver (against the main app's
+       // token broker) once both are configured, same opt-in-per-piece shape as NEON_API_KEY/NEON_PROJECT_ID.
+-      { NEON_API_KEY: env.NEON_API_KEY, NEON_PROJECT_ID: env.NEON_PROJECT_ID, MAIN_APP_BASE_URL: env.MAIN_APP_BASE_URL, INTERNAL_JOB_TOKEN: env.INTERNAL_JOB_TOKEN },
++      // #7876: CENTRAL_POSTHOG_KEY threads into every tenant container so the hosted fleet reports to the
++      // loopover-owned PostHog project (#7875); unset ⇒ omitted, tenants byte-identical to before.
++      { NEON_API_KEY: env.NEON_API_KEY, NEON_PROJECT_ID: env.NEON_PROJECT_ID, MAIN_APP_BASE_URL: env.MAIN_APP_BASE_URL, INTERNAL_JOB_TOKEN: env.INTERNAL_JOB_TOKEN, CENTRAL_POSTHOG_KEY: env.CENTRAL_POSTHOG_KEY },
+       { orb: env.ORB_TENANT_CONTAINER, ams: env.AMS_TENANT_CONTAINER },
+     );
+     const app = createTenantHttpApp({
+diff --git a/control-plane/test/container-driver.test.ts b/control-plane/test/container-driver.test.ts
+index 8b460f7ca..8a257ec66 100644
+--- a/control-plane/test/container-driver.test.ts
++++ b/control-plane/test/container-driver.test.ts
+@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
+ import { test } from "node:test";
+ 
+ import {
++  CENTRAL_POSTHOG_KEY_ENV_VAR,
+   createContainerDriver,
+   createTenantContainer,
+   destroyTenantContainer,
+@@ -224,3 +225,27 @@ test("a repeat create of an already-provisioned tenant with a bootstrap secret n
+ 
+   assert.deepEqual(stub.startOptions, []);
+ });
++
++// #7876: the central PostHog key is a control-plane CONFIG value (fleet-wide, not per-tenant), so it rides into
++// EVERY tenant container as CENTRAL_POSTHOG_KEY_ENV_VAR, merged with any per-tenant env vars, letting the
++// self-host image report errors to the loopover-owned project. Absent ⇒ never injected (existing tests above).
++test("a configured central PostHog key rides into a tenant's container as CENTRAL_POSTHOG_KEY_ENV_VAR", async () => {
++  const stub = optionCapturingStub();
++
++  await createTenantContainer({ ...configFor(stub), centralPosthogKey: "phc_central123" }, { tenant: { name: "acme" }, product: "orb" });
++
++  assert.deepEqual(stub.startOptions, [{ envVars: { [CENTRAL_POSTHOG_KEY_ENV_VAR]: "phc_central123" } }]);
++});
++
++test("the central PostHog key merges with per-tenant pinned-version and bootstrap-secret env vars into one start call", async () => {
++  const stub = optionCapturingStub();
++
++  await createTenantContainer(
++    { ...configFor(stub), centralPosthogKey: "phc_central123" },
++    { tenant: { name: "acme", pinnedVersion: "v1.4.2" }, product: "orb", bootstrapSecret: "orbsec_xyz" },
++  );
++
++  assert.deepEqual(stub.startOptions, [
++    { envVars: { [PINNED_VERSION_ENV_VAR]: "v1.4.2", [TENANT_SECRET_ENV_VAR]: "orbsec_xyz", [CENTRAL_POSTHOG_KEY_ENV_VAR]: "phc_central123" } },
++  ]);
++});
+diff --git a/control-plane/test/driver-factory.test.ts b/control-plane/test/driver-factory.test.ts
+index a75942ee2..9822b0297 100644
+--- a/control-plane/test/driver-factory.test.ts
++++ b/control-plane/test/driver-factory.test.ts
+@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
+ import { afterEach, beforeEach, test } from "node:test";
+ 
+ import {
++  CENTRAL_POSTHOG_KEY_ENV_VAR,
+   createFakeTenantProvisioningDriver,
+   createTenantProvisioningDriver,
+   withRealContainerDriver,
+@@ -172,6 +173,41 @@ test("createTenantProvisioningDriver: selects the real container driver when con
+   assert.equal(await driver.containerExists(REQUEST), true);
+ });
+ 
++// #7876: env.CENTRAL_POSTHOG_KEY (the injected control-plane secret) threads through the real container driver
++// so every tenant container it starts carries the key; a blank/unset value is omitted (nonBlank), unchanged.
++function startCapturingNamespace(startOptions: Array<Record<string, unknown> | undefined>): ContainerNamespaceLike {
++  const stub: ContainerStubLike = {
++    async start(options) {
++      startOptions.push(options);
++    },
++    async stop() {},
++    async isProvisioned() {
++      return false;
++    },
++    async markProvisioned() {},
++    async markDeprovisioned() {},
++  };
++  return { getByName: () => stub };
++}
++
++test("createTenantProvisioningDriver: threads env.CENTRAL_POSTHOG_KEY into every tenant container (#7876)", async () => {
++  const startOptions: Array<Record<string, unknown> | undefined> = [];
++  const driver = createTenantProvisioningDriver({ CENTRAL_POSTHOG_KEY: "phc_from_env" }, { orb: startCapturingNamespace(startOptions) });
++
++  await driver.createContainer(REQUEST);
++
++  assert.deepEqual(startOptions, [{ envVars: { [CENTRAL_POSTHOG_KEY_ENV_VAR]: "phc_from_env" } }]);
++});
++
++test("createTenantProvisioningDriver: a blank CENTRAL_POSTHOG_KEY is omitted, leaving the tenant start byte-identical (#7876)", async () => {
++  const startOptions: Array<Record<string, unknown> | undefined> = [];
++  const driver = createTenantProvisioningDriver({ CENTRAL_POSTHOG_KEY: "   " }, { orb: startCapturingNamespace(startOptions) });
++
++  await driver.createContainer(REQUEST);
++
++  assert.deepEqual(startOptions, [undefined]);
++});
++
+ test("createTenantProvisioningDriver: composes both the real database driver AND the real container driver together", async () => {
+   globalThis.fetch = (async () => new Response(JSON.stringify({ branches: [] }), { status: 200 })) as unknown as typeof fetch;
+ 

@@ -1,0 +1,169 @@
+diff --git a/sdk/src/activelearning/nats_client.py b/sdk/src/activelearning/nats_client.py
+index 72ea420..6c98cba 100644
+--- a/sdk/src/activelearning/nats_client.py
++++ b/sdk/src/activelearning/nats_client.py
+@@ -35,6 +35,7 @@
+     TRANSITION_RECONNECTED,
+     log_connection_event,
+ )
++from activelearning.core import current_timestamp
+ from activelearning.messages import (
+     KernelDecisionMessage,
+     MessageValidationError,
+@@ -642,6 +643,22 @@ async def _js_handler(msg: Msg) -> None:
+                     )
+                     await msg.ack()  # remove from stream; retrying won't fix a bad sig
+                     return
++                # Expiry is itself a signed field (activelearning.signing.
++                # SIGNED_FIELDS), so a valid signature alone isn't enough — a
++                # captured, still-validly-signed old decision must not be
++                # replayable past its TTL. Reject at accept time, same as a
++                # bad signature: ignore and keep waiting for the real thing.
++                expires_at = data.get("expires_at")
++                if expires_at is not None and current_timestamp() > expires_at:
++                    logger.error(
++                        "Rejected decision on %s: expired at %s (now %s) — "
++                        "possible replay of a stale decision.",
++                        subject,
++                        expires_at,
++                        current_timestamp(),
++                    )
++                    await msg.ack()  # remove from stream; it will never become valid
++                    return
+                 result = data
+                 decision_received.set()
+                 await msg.ack()
+diff --git a/sdk/src/activelearning/signing.py b/sdk/src/activelearning/signing.py
+index 04bf132..7d6e01e 100644
+--- a/sdk/src/activelearning/signing.py
++++ b/sdk/src/activelearning/signing.py
+@@ -19,6 +19,21 @@
+   and verification passes (legacy/dev mode) — but a one-time warning is logged
+   so operators know the gate is unauthenticated.
+ - ``hmac.compare_digest`` is used for constant-time comparison.
++
++Replay resistance (issue #190)
++-------------------------------
++A valid signature alone only proves a decision was issued by the Kernel at
++*some* point — it does not prove it is still current. Because ``expires_at``
++is one of the signed fields, an attacker cannot extend a captured decision's
++lifetime without invalidating its signature, but nothing stopped a captured,
++still-validly-signed old decision (e.g. a stale ``ALLOW``) from being
++*replayed* as-is. ``EventBus.wait_for_decision`` (``nats_client.py``) closes
++this by checking ``expires_at`` against the current time immediately after
++signature verification and before accepting the decision — an expired
++decision is rejected exactly like a forged one (logged and ignored; the
++waiter keeps waiting and ultimately times out, i.e. fails closed). A
++decision with no ``expires_at`` set never expires, matching
++``KernelDecision.is_expired()``'s semantics in ``core.py``.
+ - **Key rotation (issue #206):** ``ENGRAM_DECISION_KEY_SECONDARY`` is an
+   optional, verify-only second key — never used for signing — that lets a
+   verifier accept decisions signed with either the current or a rotating-out
+diff --git a/sdk/tests/test_base_service_migration.py b/sdk/tests/test_base_service_migration.py
+index 9a05853..e1f205b 100644
+--- a/sdk/tests/test_base_service_migration.py
++++ b/sdk/tests/test_base_service_migration.py
+@@ -24,6 +24,7 @@
+ import pytest
+ 
+ from activelearning.base_service import BaseService
++from activelearning.core import current_timestamp
+ from activelearning.messages import ObservationMessage
+ from activelearning.nats_client import EventBus, serialize_message
+ from activelearning.signing import sign_decision
+@@ -416,8 +417,11 @@ async def _publish_signed():
+             "type": "ALLOW",
+             "reason": "approved",
+             "risk_score": 0.1,
+-            "issued_at": 1000000,
+-            "expires_at": 9999999,
++            "issued_at": current_timestamp(),
++            # Must be a real future timestamp, not a small placeholder: issue
++            # #190 made wait_for_decision() reject expired decisions, and a
++            # fixed value like 9999999ms (1970-01-01) is long since past.
++            "expires_at": current_timestamp() + 60_000,
+         }
+         signed = sign_decision(payload, key=key)
+         probe = EventBus(nats_url=nats_url, name="signed-probe")
+diff --git a/sdk/tests/test_nats_client.py b/sdk/tests/test_nats_client.py
+index 70ecfe5..8c18943 100644
+--- a/sdk/tests/test_nats_client.py
++++ b/sdk/tests/test_nats_client.py
+@@ -5,7 +5,7 @@
+ 
+ import pytest
+ 
+-from activelearning.core import generate_trace_id
++from activelearning.core import current_timestamp, generate_trace_id
+ from activelearning.nats_client import EventBus
+ from activelearning.signing import DECISION_KEY_ENV, DECISION_KEY_SECONDARY_ENV, sign_decision
+ from activelearning.subjects import Subjects, code_decision_subject, decision_subject
+@@ -208,6 +208,68 @@ async def test_wait_for_decision_retires_old_key_after_rotation_completes(
+         await event_bus.wait_for_decision(trace_id, timeout=0.5)
+ 
+ 
++@pytest.mark.asyncio
++async def test_wait_for_decision_rejects_expired_signed_decision(
++    event_bus: EventBus,
++    monkeypatch,
++):
++    """Issue #190: a validly-signed but expired decision must not be
++    replayable. expires_at is itself a signed field (activelearning.
++    signing.SIGNED_FIELDS), so a captured old ALLOW can't be re-timestamped
++    without invalidating its signature — but nothing checked it at accept
++    time until now."""
++    key = "test-decision-secret-expired"
++    monkeypatch.setenv(DECISION_KEY_ENV, key)
++    trace_id = generate_trace_id()
++
++    expired_allow = sign_decision(
++        {
++            "trace_id": trace_id,
++            "type": "ALLOW",
++            "reason": "stale — captured and replayed",
++            "risk_score": 0.0,
++            "expires_at": current_timestamp() - 1000,
++        },
++        key,
++    )
++    await event_bus.publish(decision_subject(trace_id), expired_allow)
++
++    with pytest.raises(asyncio.TimeoutError):
++        await event_bus.wait_for_decision(trace_id, timeout=0.5)
++
++
++@pytest.mark.asyncio
++async def test_wait_for_decision_accepts_signed_decision_before_expiry(
++    event_bus: EventBus,
++    monkeypatch,
++):
++    """Companion to the expired-decision test: a signed decision with a
++    future expires_at must still be accepted normally."""
++    key = "test-decision-secret-not-expired"
++    monkeypatch.setenv(DECISION_KEY_ENV, key)
++    trace_id = generate_trace_id()
++
++    async def publish_signed():
++        await asyncio.sleep(0.1)
++        decision = sign_decision(
++            {
++                "trace_id": trace_id,
++                "type": "ALLOW",
++                "reason": "fresh",
++                "risk_score": 0.0,
++                "expires_at": current_timestamp() + 60_000,
++            },
++            key,
++        )
++        await event_bus.publish(decision_subject(trace_id), decision)
++
++    publish_task = asyncio.create_task(publish_signed())
++    result = await event_bus.wait_for_decision(trace_id, timeout=2.0)
++    await publish_task
++    assert result["trace_id"] == trace_id
++    assert result["type"] == "ALLOW"
++
++
+ @pytest.mark.asyncio
+ async def test_wait_for_decision_code_subject(
+     event_bus: EventBus,

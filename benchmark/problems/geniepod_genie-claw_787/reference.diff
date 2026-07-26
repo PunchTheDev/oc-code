@@ -1,0 +1,450 @@
+diff --git a/crates/dashboard/dashboard.js b/crates/dashboard/dashboard.js
+index 38911b59..8ef9b21c 100644
+--- a/crates/dashboard/dashboard.js
++++ b/crates/dashboard/dashboard.js
+@@ -201,6 +201,8 @@ async function pollRuntimeContract() {
+   setText('contract-model', data.model_family || '--');
+   setText('contract-tools', data.tool_count ?? '--');
+   setText('contract-prompt', data.prompt_hash || '--');
++  const activeChannels = data.hydration?.channels?.active;
++  setText('contract-channels', Array.isArray(activeChannels) && activeChannels.length ? activeChannels.join(', ') : '--');
+   const validation = data.validation || {};
+   const status = validation.status || 'unknown';
+   const driftText = validation.drift ? ' · DRIFT' : '';
+diff --git a/crates/dashboard/index.html b/crates/dashboard/index.html
+index 582a84f6..0ba05ca3 100644
+--- a/crates/dashboard/index.html
++++ b/crates/dashboard/index.html
+@@ -183,6 +183,10 @@ <h2>Runtime Contract</h2>
+       <span class="label">Prompt</span>
+       <span><span class="value" id="contract-prompt" style="font-size:.9rem">--</span></span>
+     </div>
++    <div class="stat">
++      <span class="label">Channels</span>
++      <span><span class="value" id="contract-channels">--</span></span>
++    </div>
+     <div class="small" id="contract-detail">Runtime fingerprint not loaded yet.</div>
+   </div>
+ 
+diff --git a/crates/genie-core/src/channel/mod.rs b/crates/genie-core/src/channel/mod.rs
+index 48340923..3fc1299c 100644
+--- a/crates/genie-core/src/channel/mod.rs
++++ b/crates/genie-core/src/channel/mod.rs
+@@ -247,6 +247,41 @@ impl ChannelRegistry {
+     }
+ }
+ 
++/// Registration-only marker for a transport that is live in this process but
++/// not yet itself driven through `Channel`/`serve_channel` (#785).
++///
++/// `main.rs` registers one of these per transport it actually starts (voice,
++/// HTTP, Telegram) purely so `ChannelRegistry::kinds()` can report which
++/// channel(s) are active — e.g. via the runtime contract's hydration snapshot
++/// — even before every transport's own `recv`/`send` loop is ported (#700,
++/// #701). `recv`/`send` are unreachable: the real transport loop runs
++/// elsewhere (`voice_loop::run`, `ChatServer::serve`, `telegram::run`), and
++/// `ChannelRegistry` itself never drives a registered channel — see its own
++/// doc comment. As each transport's real port lands, replace its
++/// `ActiveChannelMarker` registration with the live `Channel` object.
++pub struct ActiveChannelMarker(pub ChannelKind);
++
++#[async_trait]
++impl Channel for ActiveChannelMarker {
++    fn kind(&self) -> ChannelKind {
++        self.0
++    }
++
++    async fn recv(&mut self) -> Option<IncomingTurn> {
++        unreachable!(
++            "ActiveChannelMarker is registration-only; the real {} transport loop runs elsewhere",
++            self.0.as_str()
++        )
++    }
++
++    async fn send(&mut self, _response: OutgoingResponse) -> Result<()> {
++        unreachable!(
++            "ActiveChannelMarker is registration-only; the real {} transport loop runs elsewhere",
++            self.0.as_str()
++        )
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -391,4 +426,29 @@ mod tests {
+             ]
+         );
+     }
++
++    #[test]
++    fn active_channel_marker_reports_its_kind() {
++        let marker = ActiveChannelMarker(ChannelKind::Http);
++        assert_eq!(marker.kind(), ChannelKind::Http);
++    }
++
++    #[test]
++    fn active_channel_marker_registers_into_channel_registry() {
++        let mut registry = ChannelRegistry::new();
++        registry.register(Box::new(ActiveChannelMarker(ChannelKind::Http)));
++        registry.register(Box::new(ActiveChannelMarker(ChannelKind::Telegram)));
++
++        assert_eq!(
++            registry.kinds(),
++            vec![ChannelKind::Http, ChannelKind::Telegram]
++        );
++    }
++
++    #[tokio::test]
++    #[should_panic(expected = "registration-only")]
++    async fn active_channel_marker_recv_is_unreachable() {
++        let mut marker = ActiveChannelMarker(ChannelKind::Voice);
++        let _ = marker.recv().await;
++    }
+ }
+diff --git a/crates/genie-core/src/main.rs b/crates/genie-core/src/main.rs
+index 8ee26bb3..92d3f649 100644
+--- a/crates/genie-core/src/main.rs
++++ b/crates/genie-core/src/main.rs
+@@ -194,6 +194,74 @@ async fn main() -> Result<()> {
+     // Check if stdin is a terminal (REPL mode) or pipe/systemd (server-only).
+     let interactive = atty_check();
+ 
++    // Check for voice mode: --voice flag or GENIEPOD_VOICE=1 or config voice_enabled.
++    // Decided here (ahead of the boot-contract snapshot below) so the runtime
++    // contract's hydration can report which channel(s) this process is
++    // actually starting (#785), not just at the point the mode is entered.
++    let voice_requested = std::env::args().any(|a| a == "--voice")
++        || std::env::var("GENIEPOD_VOICE").unwrap_or_default() == "1"
++        || config.core.voice_enabled;
++    let wakeword_available =
++        !config.core.wakeword_script.as_os_str().is_empty() && config.core.wakeword_script.exists();
++    let startup_decision =
++        runtime_mode::decide_startup_mode(voice_requested, interactive, wakeword_available);
++
++    // Whether the running binary actually has the voice subsystem compiled in.
++    // When voice was requested but the binary is chat-only (issue #41 feature
++    // gate), emit one warning and fall through to the chat path so an existing
++    // voice-tagged `geniepod.toml` still deploys cleanly on a chat-only build.
++    #[cfg(feature = "voice")]
++    let voice_mode = {
++        if startup_decision.blocked_push_to_talk() {
++            tracing::warn!(
++                "push-to-talk voice mode requested without an interactive terminal and no wakeword script is available; \
++                 running HTTP API only"
++            );
++        }
++        startup_decision.enters_voice()
++    };
++    #[cfg(not(feature = "voice"))]
++    let voice_mode = {
++        if voice_requested {
++            tracing::warn!(
++                "voice mode requested (--voice / GENIEPOD_VOICE=1 / core.voice_enabled) but \
++                 this genie-core build was compiled without the 'voice' feature; falling back \
++                 to chat-only mode. Rebuild with default features (or --features voice) to \
++                 enable the voice loop."
++            );
++        }
++        let _ = startup_decision;
++        false
++    };
++
++    // Which transport(s) this process is (at least intends to) start, tracked
++    // through `ChannelRegistry` (#785) purely for runtime introspection —
++    // `ChannelRegistry` itself never drives these; each transport still runs
++    // its own loop below. Telegram's entry here reflects config intent
++    // (`config.telegram.enabled`); the daemon branch below refines this to
++    // the real outcome once bot-token presence is known, since that can
++    // still fall back to HTTP-only.
++    let mut channel_registry = channel::ChannelRegistry::new();
++    if voice_mode {
++        channel_registry.register(Box::new(channel::ActiveChannelMarker(
++            channel::ChannelKind::Voice,
++        )));
++    } else {
++        channel_registry.register(Box::new(channel::ActiveChannelMarker(
++            channel::ChannelKind::Http,
++        )));
++        if config.telegram.enabled {
++            channel_registry.register(Box::new(channel::ActiveChannelMarker(
++                channel::ChannelKind::Telegram,
++            )));
++        }
++    }
++    let boot_active_channels: Vec<&'static str> = channel_registry
++        .kinds()
++        .iter()
++        .map(|k| k.as_str())
++        .collect();
++
+     // Open conversation store.
+     let conv_path = config.data_dir.join("conversations.db");
+     let conversations = conversation::ConversationStore::open(&conv_path)?;
+@@ -214,6 +282,7 @@ async fn main() -> Result<()> {
+         config.core.max_history_turns,
+         model_family,
+         &connectivity_health,
++        &boot_active_channels,
+     );
+     let contract_hash = boot_contract.contract_hash.clone();
+     let contract_validation = genie_core::runtime_contract::validate_runtime_contract(
+@@ -252,43 +321,6 @@ async fn main() -> Result<()> {
+         ),
+     }
+ 
+-    // Check for voice mode: --voice flag or GENIEPOD_VOICE=1 or config voice_enabled.
+-    let voice_requested = std::env::args().any(|a| a == "--voice")
+-        || std::env::var("GENIEPOD_VOICE").unwrap_or_default() == "1"
+-        || config.core.voice_enabled;
+-    let wakeword_available =
+-        !config.core.wakeword_script.as_os_str().is_empty() && config.core.wakeword_script.exists();
+-    let startup_decision =
+-        runtime_mode::decide_startup_mode(voice_requested, interactive, wakeword_available);
+-
+-    // Whether the running binary actually has the voice subsystem compiled in.
+-    // When voice was requested but the binary is chat-only (issue #41 feature
+-    // gate), emit one warning and fall through to the chat path so an existing
+-    // voice-tagged `geniepod.toml` still deploys cleanly on a chat-only build.
+-    #[cfg(feature = "voice")]
+-    let voice_mode = {
+-        if startup_decision.blocked_push_to_talk() {
+-            tracing::warn!(
+-                "push-to-talk voice mode requested without an interactive terminal and no wakeword script is available; \
+-                 running HTTP API only"
+-            );
+-        }
+-        startup_decision.enters_voice()
+-    };
+-    #[cfg(not(feature = "voice"))]
+-    let voice_mode = {
+-        if voice_requested {
+-            tracing::warn!(
+-                "voice mode requested (--voice / GENIEPOD_VOICE=1 / core.voice_enabled) but \
+-                 this genie-core build was compiled without the 'voice' feature; falling back \
+-                 to chat-only mode. Rebuild with default features (or --features voice) to \
+-                 enable the voice loop."
+-            );
+-        }
+-        let _ = startup_decision;
+-        false
+-    };
+-
+     if voice_mode {
+         #[cfg(feature = "voice")]
+         {
+@@ -454,6 +486,12 @@ async fn main() -> Result<()> {
+                     "starting Telegram adapter"
+                 );
+ 
++                // Telegram is confirmed live past this point (feature compiled
++                // in, bot token present) — refine the runtime contract's
++                // reported channels from the boot-time "declared" guess
++                // (#785) to the real outcome.
++                let chat_server = chat_server.with_active_channels(vec!["http", "telegram"]);
++
+                 tokio::try_join!(
+                     chat_server.serve(&bind_host, port),
+                     genie_core::telegram::run(telegram_cfg)
+diff --git a/crates/genie-core/src/server.rs b/crates/genie-core/src/server.rs
+index d5cb2601..f88141e6 100644
+--- a/crates/genie-core/src/server.rs
++++ b/crates/genie-core/src/server.rs
+@@ -120,6 +120,12 @@ pub struct ChatServer {
+     /// Storage lifecycle config — pruning intervals, retention limits, and the
+     /// disk-size threshold that surfaces as `degraded` in `/api/health`.
+     storage_config: StorageConfig,
++    /// Which transport(s) `main.rs` actually started alongside this HTTP
++    /// server (always includes `"http"`; `"telegram"` when that adapter is
++    /// really running) — surfaced in the runtime contract's hydration
++    /// snapshot (#785). Defaults to `["http"]`; override with
++    /// [`Self::with_active_channels`].
++    active_channels: Vec<&'static str>,
+ }
+ 
+ pub struct ChatTurnResult {
+@@ -167,6 +173,7 @@ impl ChatServer {
+             agent_config: AgentConfig::default(),
+             optional_ai_provider: OptionalAiProviderConfig::default(),
+             storage_config: StorageConfig::default(),
++            active_channels: vec!["http"],
+         })
+     }
+ 
+@@ -216,6 +223,15 @@ impl ChatServer {
+         self
+     }
+ 
++    /// Override which transport(s) are reported as active in the runtime
++    /// contract's hydration snapshot (#785). Defaults to `["http"]`; pass
++    /// `["http", "telegram"]` when `main.rs` has actually started the
++    /// Telegram adapter alongside this server.
++    pub fn with_active_channels(mut self, channels: Vec<&'static str>) -> Self {
++        self.active_channels = channels;
++        self
++    }
++
+     /// Serve HTTP requests on the current-thread runtime.
+     ///
+     /// Requests are accepted concurrently on one OS thread so health/dashboard
+@@ -817,6 +833,7 @@ async fn handle_request(
+                 max_history,
+                 model_family,
+                 expected_runtime_contract_hash,
++                &ctx.active_channels,
+             )
+             .await
+         }
+@@ -837,6 +854,7 @@ async fn handle_request(
+                 chat_gate,
+                 &ctx.boot_harness,
+                 ctx.storage_config.warn_threshold_mb,
++                &ctx.active_channels,
+             )
+             .await
+         }
+@@ -1852,6 +1870,7 @@ async fn handle_health(
+     chat_gate: &ChatTurnGate,
+     boot_harness: &crate::agent_harness::LimitedContextHarnessReport,
+     warn_threshold_mb: u64,
++    active_channels: &[&str],
+ ) -> (u16, &'static str, String) {
+     let llm_ok = llm.health().await;
+     let connectivity_health = connectivity.health().await;
+@@ -1880,6 +1899,7 @@ async fn handle_health(
+         max_history,
+         model_family,
+         &connectivity_health,
++        active_channels,
+     );
+     let runtime_contract =
+         runtime_contract_summary_json(&runtime_contract, expected_runtime_contract_hash);
+@@ -2005,6 +2025,7 @@ async fn handle_runtime_contract(
+     max_history: usize,
+     model_family: ModelFamily,
+     expected_runtime_contract_hash: &str,
++    active_channels: &[&str],
+ ) -> (u16, &'static str, String) {
+     let connectivity_health = connectivity.health().await;
+     let (mem_count, mem_promoted_count) = with_shared_memory(memory, |memory| {
+@@ -2024,6 +2045,7 @@ async fn handle_runtime_contract(
+         max_history,
+         model_family,
+         &connectivity_health,
++        active_channels,
+     );
+     let body = runtime_contract_json(&contract, expected_runtime_contract_hash);
+     let body = serde_json::to_string(&body).unwrap_or_else(|e| {
+@@ -2042,6 +2064,7 @@ pub fn build_runtime_contract_snapshot(
+     max_history: usize,
+     model_family: ModelFamily,
+     connectivity_health: &ConnectivityHealth,
++    active_channels: &[&str],
+ ) -> crate::runtime_contract::RuntimeContract {
+     let tool_defs = tools.tool_defs();
+     let hydration = serde_json::json!({
+@@ -2061,6 +2084,15 @@ pub fn build_runtime_contract_snapshot(
+             "transport": connectivity_health.transport.clone(),
+             "device": connectivity_health.device.clone(),
+         },
++        // Which transport(s) are live in this process (#785) — sourced from
++        // ChannelRegistry via ActiveChannelMarker. Folded into hydration (and
++        // so into hydration_hash / contract_hash) rather than a separate
++        // top-level field: a restart that silently changes operating mode
++        // (e.g. voice -> daemon, or drops the Telegram adapter) is exactly
++        // the kind of deployment drift this contract exists to catch.
++        "channels": {
++            "active": active_channels,
++        },
+     });
+ 
+     crate::runtime_contract::build_runtime_contract(
+@@ -2827,13 +2859,13 @@ async fn write_status_response(writer: &mut OwnedWriteHalf, status: u16) -> Resu
+ #[cfg(test)]
+ mod tests {
+     use super::{
+-        ConnectivityState, StreamMode, detect_stream_mode, handle_actuation_actions, handle_chat,
+-        handle_health, handle_runtime_contract, handle_web_search, handle_web_search_status,
+-        is_client_disconnect_error, overall_health_status, resolve_chat_conv_id,
+-        should_summarize_tool_result,
++        ConnectivityState, StreamMode, build_runtime_contract_snapshot, detect_stream_mode,
++        handle_actuation_actions, handle_chat, handle_health, handle_runtime_contract,
++        handle_web_search, handle_web_search_status, is_client_disconnect_error,
++        overall_health_status, resolve_chat_conv_id, should_summarize_tool_result,
+     };
+     use crate::channel::{ChannelKind, IncomingTurn};
+-    use crate::connectivity::NullConnectivityController;
++    use crate::connectivity::{ConnectivityController, NullConnectivityController};
+     use crate::conversation::ConversationStore;
+     use crate::memory::{Memory, SharedMemory};
+     use crate::prompt::ModelFamily;
+@@ -3148,6 +3180,7 @@ mod tests {
+             &gate,
+             &boot_harness,
+             0,
++            &["http"],
+         )
+         .await;
+ 
+@@ -3243,6 +3276,7 @@ mod tests {
+             12,
+             ModelFamily::Phi,
+             "expected-hash",
++            &["http"],
+         )
+         .await;
+ 
+@@ -3264,10 +3298,53 @@ mod tests {
+         );
+         assert_eq!(parsed["hydration"]["conversations"]["count"], 1);
+         assert_eq!(parsed["hydration"]["connectivity"]["state"], "disabled");
++        assert_eq!(
++            parsed["hydration"]["channels"]["active"],
++            serde_json::json!(["http"])
++        );
+         assert_eq!(parsed["validation"]["status"], "drift");
+         assert_eq!(parsed["validation"]["drift"], true);
+     }
+ 
++    #[tokio::test]
++    async fn runtime_contract_hash_changes_when_active_channels_differ() {
++        // #785: active_channels is folded into hydration (and so into
++        // contract_hash) rather than kept as an unhashed sibling field, so a
++        // restart that silently changes operating mode is a catchable
++        // contract drift, not a silent no-op.
++        let tools = ToolDispatcher::new(None);
++        let connectivity_health =
++            NullConnectivityController::from_config(&ConnectivityConfig::default())
++                .health()
++                .await;
++
++        let http_only = build_runtime_contract_snapshot(
++            &tools,
++            0,
++            0,
++            0,
++            "system prompt",
++            12,
++            ModelFamily::Phi,
++            &connectivity_health,
++            &["http"],
++        );
++        let http_and_telegram = build_runtime_contract_snapshot(
++            &tools,
++            0,
++            0,
++            0,
++            "system prompt",
++            12,
++            ModelFamily::Phi,
++            &connectivity_health,
++            &["http", "telegram"],
++        );
++
++        assert_ne!(http_only.contract_hash, http_and_telegram.contract_hash);
++        assert_ne!(http_only.hydration_hash, http_and_telegram.hydration_hash);
++    }
++
+     #[test]
+     fn web_search_status_endpoint_reports_provider() {
+         let tools = ToolDispatcher::new(None);

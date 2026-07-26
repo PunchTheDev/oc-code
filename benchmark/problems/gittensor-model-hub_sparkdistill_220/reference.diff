@@ -1,0 +1,174 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 002d3bb..3df1096 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -26,6 +26,16 @@ All notable changes to SparkDistill are documented here. The format follows
+   `apply_verified_report_to_frontiers` (and backfills the Hopper frontier from
+   `2026-07-15-magicrails-hopper-v2`).
+ 
++- **Malformed training-track proof bundles no longer crash the gate**: `verify_submission`
++  parses `manifest.json` / `eval_scores.json` through a new `load_bundle_json` helper and
++  requires `eval_scores.scores` to be an object, returning `eval:REJECT`
++  (`reason: malformed_bundle`) instead of raising; `training_track_gate` uses the same
++  helper for its pre-verify `manifest.json` read. The bundle is downloaded from the
++  submitter's Hugging Face repo, so a non-object/malformed artifact previously raised
++  `TypeError` / `KeyError` / `AttributeError` / `JSONDecodeError` out of the ungated
++  `verify_submission` call and failed `training_track.yml` with a traceback — violating
++  that helper's documented contract that unreadable bundles return a clean `error`.
++
+ ## [0.1.3] — 2026-07-21
+ 
+ Training-track CI fail-closes forged attestation JSON; dataset/registry gates no longer
+diff --git a/eval/training_track_gate.py b/eval/training_track_gate.py
+index 1a67746..a332617 100644
+--- a/eval/training_track_gate.py
++++ b/eval/training_track_gate.py
+@@ -394,7 +394,7 @@ def _download_and_verify_bundle(
+     from huggingface_hub import snapshot_download
+ 
+     from eval.frontiers import load_frontier_scores
+-    from eval.verify import resolve_bundle_gpu_architecture, verify_submission
++    from eval.verify import load_bundle_json, resolve_bundle_gpu_architecture, verify_submission
+ 
+     attestation = None
+     attestation_path = find_attestation_path(changed_paths)
+@@ -414,7 +414,9 @@ def _download_and_verify_bundle(
+     if not (bundle_dir / "manifest.json").exists() or not (bundle_dir / "eval_scores.json").exists():
+         return None, None, None, bundle_dir  # already flagged by verify_remote_proof_bundle
+ 
+-    manifest = json.loads((bundle_dir / "manifest.json").read_text(encoding="utf-8"))
++    manifest, manifest_error = load_bundle_json(bundle_dir, "manifest.json")
++    if manifest is None:
++        return None, None, f"proof bundle {manifest_error}", bundle_dir
+     frontier = load_frontier_scores(resolve_bundle_gpu_architecture(manifest))
+ 
+     report = verify_submission(bundle_dir, frontier, attestation=attestation)
+diff --git a/eval/verify.py b/eval/verify.py
+index 7029544..df78a92 100644
+--- a/eval/verify.py
++++ b/eval/verify.py
+@@ -372,6 +372,25 @@ def check_checkpoint_manifest(manifest: dict, checkpoint_path: Path | None) -> b
+     return checkpoint_manifest(checkpoint_path) == expected
+ 
+ 
++def load_bundle_json(bundle_dir: Path, name: str) -> tuple[dict | None, str | None]:
++    """Parse a proof-bundle artifact into a JSON object.
++
++    The bundle is downloaded from the submitter's Hugging Face repo, so a
++    malformed or non-object artifact must come back as a readable error string
++    the training-track gate can report — not as a ``JSONDecodeError`` /
++    ``AttributeError`` escaping into CI as a traceback.
++
++    Returns ``(payload, error)``; exactly one is ever non-None.
++    """
++    try:
++        payload = json.loads((bundle_dir / name).read_text(encoding="utf-8"))
++    except json.JSONDecodeError as exc:
++        return None, f"{name} is not valid JSON: {exc}"
++    if not isinstance(payload, dict):
++        return None, f"{name} must be a JSON object, got {type(payload).__name__}"
++    return payload, None
++
++
+ def verify_submission(
+     bundle_dir: Path,
+     frontier: dict[str, float] | None,
+@@ -389,8 +408,27 @@ def verify_submission(
+     instead of tier scoring the submission is labeled `eval:BASELINE` — its
+     scores then seed `runs/frontier.json` for the next submission to beat.
+     """
+-    manifest = json.loads((bundle_dir / "manifest.json").read_text())
+-    claimed = json.loads((bundle_dir / "eval_scores.json").read_text())["scores"]
++    manifest, manifest_error = load_bundle_json(bundle_dir, "manifest.json")
++    scores_payload, scores_error = load_bundle_json(bundle_dir, "eval_scores.json")
++    bundle_error = manifest_error or scores_error
++    if manifest is None or scores_payload is None or bundle_error is not None:
++        return {
++            "verified": False,
++            "reason": "malformed_bundle",
++            "issues": [bundle_error or "proof bundle could not be read"],
++            "label": "eval:REJECT",
++            "run_id": (manifest or {}).get("run_id"),
++        }
++
++    claimed = scores_payload.get("scores")
++    if not isinstance(claimed, dict):
++        return {
++            "verified": False,
++            "reason": "malformed_bundle",
++            "issues": ["eval_scores.json must contain a 'scores' object"],
++            "label": "eval:REJECT",
++            "run_id": manifest.get("run_id"),
++        }
+     gpu_architecture = resolve_bundle_gpu_architecture(manifest)
+ 
+     if attestation is not None and not attestation.get("passed"):
+diff --git a/tests/test_verify.py b/tests/test_verify.py
+index 7ed05a2..7063a0e 100644
+--- a/tests/test_verify.py
++++ b/tests/test_verify.py
+@@ -388,3 +388,64 @@ def test_verify_submission_hopper_tiers_on_triton(tmp_path, monkeypatch):
+     assert report["gpu_architecture"] == "hopper"
+     assert report["best_benchmark"] == "triton"
+     assert report["label"] == "eval:XL"
++
++
++def _malformed_bundle(tmp_path, *, manifest: str, scores: str):
++    bundle = tmp_path / "bundle"
++    bundle.mkdir(parents=True)
++    (bundle / "manifest.json").write_text(manifest, encoding="utf-8")
++    (bundle / "eval_scores.json").write_text(scores, encoding="utf-8")
++    return bundle
++
++
++def test_load_bundle_json_rejects_malformed_and_non_object(tmp_path):
++    from eval.verify import load_bundle_json
++
++    bundle = tmp_path / "b"
++    bundle.mkdir()
++    (bundle / "a.json").write_text("{not json")
++    (bundle / "b.json").write_text("[]")
++    (bundle / "c.json").write_text('{"ok": 1}')
++
++    payload, error = load_bundle_json(bundle, "a.json")
++    assert payload is None and "is not valid JSON" in error
++
++    payload, error = load_bundle_json(bundle, "b.json")
++    assert payload is None and "must be a JSON object, got list" in error
++
++    payload, error = load_bundle_json(bundle, "c.json")
++    assert payload == {"ok": 1} and error is None
++
++
++def test_malformed_proof_bundle_rejects_instead_of_raising(tmp_path):
++    """A miner's published bundle is untrusted input, and the training-track gate
++    calls verify_submission with no try/except — so a bad artifact must come back
++    as eval:REJECT, not TypeError/KeyError/AttributeError/JSONDecodeError.
++    """
++    import json
++
++    from eval.verify import verify_submission
++
++    cases = [
++        ('{"run_id": "r"}', "[]", "eval_scores.json must be a JSON object"),
++        ('{"run_id": "r"}', json.dumps({"oops": 1}), "must contain a 'scores' object"),
++        ('{"run_id": "r"}', "{bad", "eval_scores.json is not valid JSON"),
++        ("[]", json.dumps({"scores": {"gsm8k": 0.5}}), "manifest.json must be a JSON object"),
++        ("{bad", json.dumps({"scores": {"gsm8k": 0.5}}), "manifest.json is not valid JSON"),
++    ]
++    for index, (manifest, scores, expected) in enumerate(cases):
++        bundle = _malformed_bundle(tmp_path / f"case{index}", manifest=manifest, scores=scores)
++        report = verify_submission(bundle, frontier=None)
++        assert report["verified"] is False
++        assert report["reason"] == "malformed_bundle"
++        assert report["label"] == "eval:REJECT"
++        assert any(expected in issue for issue in report["issues"]), (expected, report["issues"])
++
++
++def test_malformed_bundle_reports_run_id_when_manifest_is_readable(tmp_path):
++    import json
++
++    from eval.verify import verify_submission
++
++    bundle = _malformed_bundle(tmp_path, manifest=json.dumps({"run_id": "r-42"}), scores="[]")
++    assert verify_submission(bundle, frontier=None)["run_id"] == "r-42"

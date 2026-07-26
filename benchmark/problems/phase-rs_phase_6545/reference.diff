@@ -1,0 +1,1424 @@
+diff --git a/client/src-tauri/Cargo.lock b/client/src-tauri/Cargo.lock
+index 0e9d0e5f13..ce777b5dac 100644
+--- a/client/src-tauri/Cargo.lock
++++ b/client/src-tauri/Cargo.lock
+@@ -2616,7 +2616,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+ 
+ [[package]]
+ name = "phase-tauri"
+-version = "0.35.1"
++version = "0.35.2"
+ dependencies = [
+  "futures-util",
+  "minisign-verify",
+diff --git a/crates/engine/src/game/effects/change_zone.rs b/crates/engine/src/game/effects/change_zone.rs
+index 7b464bdf65..ee2f55903c 100644
+--- a/crates/engine/src/game/effects/change_zone.rs
++++ b/crates/engine/src/game/effects/change_zone.rs
+@@ -1390,6 +1390,82 @@ pub(crate) fn process_one_zone_move_with_terminal(
+     result
+ }
+ 
++/// CR 401.4: Group object ids by owner in APNAP order for per-owner library
++/// arrangement prompts.
++fn group_object_ids_by_owner_apnap(
++    state: &GameState,
++    object_ids: &[ObjectId],
++) -> Vec<(PlayerId, Vec<ObjectId>)> {
++    use std::collections::HashMap;
++    let mut by_owner: HashMap<PlayerId, Vec<ObjectId>> = HashMap::new();
++    for &id in object_ids {
++        let owner = state.objects[&id].owner;
++        by_owner.entry(owner).or_default().push(id);
++    }
++    crate::game::players::apnap_order(state)
++        .into_iter()
++        .filter_map(|pid| by_owner.remove(&pid).map(|cards| (pid, cards)))
++        .collect()
++}
++
++fn mass_library_order_effect_zone_choice(
++    owner: PlayerId,
++    cards: Vec<ObjectId>,
++    source_id: ObjectId,
++    library_position: crate::types::ability::LibraryPosition,
++    track_exiled_by_source: bool,
++    duration: Option<crate::types::ability::Duration>,
++) -> WaitingFor {
++    let choice_count = cards.len();
++    WaitingFor::EffectZoneChoice {
++        player: owner,
++        cards,
++        count: choice_count,
++        min_count: choice_count,
++        up_to: false,
++        source_id,
++        effect_kind: EffectKind::PutAtLibraryPosition,
++        zone: Zone::Library,
++        destination: None,
++        enter_tapped: EtbTapState::Unspecified,
++        enter_transformed: false,
++        enters_under_player: None,
++        enters_attacking: false,
++        owner_library: false,
++        track_exiled_by_source,
++        face_down_profile: None,
++        enter_with_counters: vec![],
++        conditional_enter_with_counters: vec![],
++        count_param: 0,
++        library_position: Some(library_position),
++        is_cost_payment: false,
++        enters_modified_if: None,
++        duration,
++    }
++}
++
++/// CR 401.4: After one owner batch of a mass library-order prompt completes,
++/// surface the next owner's `EffectZoneChoice` if any remain.
++pub(crate) fn resume_next_mass_library_order_choice(state: &mut GameState) -> Option<PlayerId> {
++    let mut pending = state.pending_mass_library_order_choice.take()?;
++    let (owner, cards) = pending.remaining_batches.first()?.clone();
++    pending.remaining_batches.remove(0);
++    if pending.remaining_batches.is_empty() {
++        state.pending_mass_library_order_choice = None;
++    } else {
++        state.pending_mass_library_order_choice = Some(pending.clone());
++    }
++    state.waiting_for = mass_library_order_effect_zone_choice(
++        owner,
++        cards,
++        pending.source_id,
++        pending.library_position,
++        pending.track_exiled_by_source,
++        pending.duration,
++    );
++    Some(owner)
++}
++
+ /// Move all objects matching the filter from `Origin` zone to `Destination` zone.
+ pub fn resolve_all(
+     state: &mut GameState,
+@@ -1666,6 +1742,47 @@ pub fn resolve_all(
+         state.push_devour_change_zone_snapshot(state.battlefield.iter().copied().collect());
+     }
+ 
++    // CR 401.4: When multiple objects are placed at the same library position
++    // simultaneously and `random_order` is false, the owner arranges their
++    // relative order ("in any order" restates this default). Route through the
++    // shared `EffectZoneChoice` + `PutAtLibraryPosition` production path instead
++    // of silently picking an engine-default batch order.
++    if dest_zone == Zone::Library
++        && effect_library_position.is_some()
++        && !random_order
++        && matching.len() > 1
++    {
++        let owner_batches = group_object_ids_by_owner_apnap(state, &matching);
++        let (first_owner, first_cards) = owner_batches
++            .first()
++            .expect("matching.len() > 1 guarantees at least one owner batch")
++            .clone();
++        let remaining_batches: Vec<_> = owner_batches.into_iter().skip(1).collect();
++        if !remaining_batches.is_empty() {
++            state.pending_mass_library_order_choice =
++                Some(crate::types::game_state::PendingMassLibraryOrderChoice {
++                    source_id: ability.source_id,
++                    library_position: effect_library_position
++                        .clone()
++                        .expect("library-order branch requires an explicit library position"),
++                    track_exiled_by_source,
++                    duration: ability.duration.clone(),
++                    remaining_batches,
++                });
++        }
++        state.waiting_for = mass_library_order_effect_zone_choice(
++            first_owner,
++            first_cards,
++            ability.source_id,
++            effect_library_position
++                .clone()
++                .expect("library-order branch requires an explicit library position"),
++            track_exiled_by_source,
++            ability.duration.clone(),
++        );
++        return Ok(());
++    }
++
+     // CR 401.4: When placing objects on the bottom of a library "in a random
+     // order", randomize the processing order so the final bottom-to-top sequence
+     // is non-deterministic without shuffling the rest of the library. Top
+@@ -5555,6 +5672,162 @@ mod tests {
+         );
+     }
+ 
++    /// CR 401.4: Mass library-bottom placement must prompt each card's owner to
++    /// arrange order, not the spell's `filter_controller` when those differ.
++    #[test]
++    fn change_zone_all_library_bottom_order_prompts_card_owner_not_controller() {
++        let mut state = GameState::new_two_player(42);
++        let card_a = create_object(
++            &mut state,
++            CardId(701),
++            PlayerId(1),
++            "Opponent Revealed A".to_string(),
++            Zone::Library,
++        );
++        let card_b = create_object(
++            &mut state,
++            CardId(702),
++            PlayerId(1),
++            "Opponent Revealed B".to_string(),
++            Zone::Library,
++        );
++        let card_c = create_object(
++            &mut state,
++            CardId(703),
++            PlayerId(1),
++            "Opponent Revealed C".to_string(),
++            Zone::Library,
++        );
++        state.players[1].library = im::vector![card_a, card_b, card_c];
++        state.last_revealed_ids = vec![card_a, card_b, card_c];
++
++        let ability = ResolvedAbility::new(
++            Effect::ChangeZoneAll {
++                origin: Some(Zone::Library),
++                destination: Zone::Library,
++                target: TargetFilter::LastRevealed,
++                enters_under: None,
++                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
++                enter_with_counters: vec![],
++                face_down_profile: None,
++                library_position: Some(LibraryPosition::Bottom),
++                random_order: false,
++            },
++            vec![],
++            ObjectId(900),
++            PlayerId(0),
++        );
++
++        let mut events = Vec::new();
++        resolve_all(&mut state, &ability, &mut events).unwrap();
++
++        match &state.waiting_for {
++            WaitingFor::EffectZoneChoice {
++                player,
++                cards,
++                effect_kind,
++                ..
++            } => {
++                assert_eq!(
++                    *player,
++                    PlayerId(1),
++                    "opponent-owned cards must be ordered by their owner, not the caster"
++                );
++                assert_eq!(cards.len(), 3);
++                assert_eq!(*effect_kind, EffectKind::PutAtLibraryPosition);
++            }
++            other => panic!("expected EffectZoneChoice, got {other:?}"),
++        }
++    }
++
++    /// CR 401.4: When one mass move covers multiple owners' cards, each owner
++    /// receives an independent library-order prompt in APNAP order.
++    #[test]
++    fn change_zone_all_library_bottom_order_prompts_each_owner_sequentially() {
++        let mut state = GameState::new_two_player(42);
++        let p0_card = create_object(
++            &mut state,
++            CardId(711),
++            PlayerId(0),
++            "Self Revealed".to_string(),
++            Zone::Library,
++        );
++        let p1_a = create_object(
++            &mut state,
++            CardId(712),
++            PlayerId(1),
++            "Opponent Revealed A".to_string(),
++            Zone::Library,
++        );
++        let p1_b = create_object(
++            &mut state,
++            CardId(713),
++            PlayerId(1),
++            "Opponent Revealed B".to_string(),
++            Zone::Library,
++        );
++        state.players[0].library = im::vector![p0_card];
++        state.players[1].library = im::vector![p1_a, p1_b];
++        state.last_revealed_ids = vec![p0_card, p1_a, p1_b];
++        state.active_player = PlayerId(1);
++
++        let ability = ResolvedAbility::new(
++            Effect::ChangeZoneAll {
++                origin: Some(Zone::Library),
++                destination: Zone::Library,
++                target: TargetFilter::LastRevealed,
++                enters_under: None,
++                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
++                enter_with_counters: vec![],
++                face_down_profile: None,
++                library_position: Some(LibraryPosition::Bottom),
++                random_order: false,
++            },
++            vec![],
++            ObjectId(901),
++            PlayerId(0),
++        );
++
++        let mut events = Vec::new();
++        resolve_all(&mut state, &ability, &mut events).unwrap();
++
++        match &state.waiting_for {
++            WaitingFor::EffectZoneChoice { player, cards, .. } => {
++                assert_eq!(
++                    *player,
++                    PlayerId(1),
++                    "APNAP: active player's batch first even when active player is not seat 0"
++                );
++                let mut sorted = cards.clone();
++                sorted.sort_by_key(|id| id.0);
++                let mut expect = vec![p1_a, p1_b];
++                expect.sort_by_key(|id| id.0);
++                assert_eq!(sorted, expect);
++            }
++            other => panic!("expected first-owner EffectZoneChoice, got {other:?}"),
++        }
++        assert!(
++            state.pending_mass_library_order_choice.is_some(),
++            "non-active owner batch must remain queued"
++        );
++
++        apply_as_current(
++            &mut state,
++            GameAction::SelectCards {
++                cards: vec![p1_a, p1_b],
++            },
++        )
++        .unwrap();
++
++        match &state.waiting_for {
++            WaitingFor::EffectZoneChoice { player, cards, .. } => {
++                assert_eq!(*player, PlayerId(0), "second owner receives their batch");
++                assert_eq!(cards, &vec![p0_card]);
++            }
++            other => panic!("expected second-owner EffectZoneChoice, got {other:?}"),
++        }
++    }
++
+     /// Build an Exhume-shaped ability: `Effect::ChangeZone` Graveyard →
+     /// Battlefield with a `Typed{Creature}` target carrying the post-fix
+     /// owner constraint `Owned{ScopedPlayer}` + `InZone Graveyard`, and
+diff --git a/crates/engine/src/game/effects/choose_from_zone.rs b/crates/engine/src/game/effects/choose_from_zone.rs
+index 263ede166f..fd3e662459 100644
+--- a/crates/engine/src/game/effects/choose_from_zone.rs
++++ b/crates/engine/src/game/effects/choose_from_zone.rs
+@@ -513,7 +513,13 @@ pub(crate) fn complete_per_category_exile(
+     events: &mut Vec<GameEvent>,
+ ) {
+     if !chosen.is_empty() {
+-        super::publish_tracked_set(state, chosen);
++        super::publish_tracked_set_with_causes(
++            state,
++            chosen
++                .iter()
++                .map(|&id| (id, Some(crate::types::ability::ThisWayCause::Exiled)))
++                .collect(),
++        );
+     }
+     let _ = prompt_next_category_member(state, &ability, &pool, remaining_member_filters, events);
+ }
+@@ -556,6 +562,12 @@ fn resolve_category_pool(state: &GameState, ability: &ResolvedAbility) -> Vec<Ob
+             crate::game::targeting::latest_tracked_set_id(state)
+                 .and_then(|id| state.tracked_object_sets.get(&id).cloned())
+         })
++        // CR 701.20b + CR 608.2c: Reveal-only Dig / RevealTop may leave the
++        // revealed pile only in `last_revealed_ids` when no TrackedSet consumer
++        // forced publication (Portent of Calamity: Dig → ForEachCategory →
++        // LastRevealed rest-move). Prefer the live reveal window over an empty
++        // ability-target fallback.
++        .or_else(|| (!state.last_revealed_ids.is_empty()).then(|| state.last_revealed_ids.clone()))
+         .unwrap_or_else(|| {
+             ability
+                 .targets
+diff --git a/crates/engine/src/game/effects/dig.rs b/crates/engine/src/game/effects/dig.rs
+index 89d3942c76..62b25ed036 100644
+--- a/crates/engine/src/game/effects/dig.rs
++++ b/crates/engine/src/game/effects/dig.rs
+@@ -141,21 +141,38 @@ pub fn resolve(
+         .collect::<Vec<_>>();
+     let raw_keep_count = raw_keep_num.min(cards.len());
+ 
+-    // CR 701.20e: Pure-peek pattern (keep_count = 0): "look at the top card" with no
+-    // player selection — the sub_ability condition decides whether to take it. Set
+-    // last_revealed_ids so RevealedHasCardType can evaluate, then return without
+-    // creating a DigChoice interaction.
+-    if raw_keep_count == 0 && !is_reveal {
++    // CR 701.20e / CR 701.20a: Pure-peek pattern (keep_count = 0): "look at" /
++    // "reveal the top N" with no player selection on this step — a following
++    // ForEachCategory / LastRevealed move decides disposition (Portent of
++    // Calamity). Set last_revealed_ids (and emit CardsRevealed for public
++    // reveals) then return without creating a DigChoice interaction.
++    if raw_keep_count == 0 {
+         state.last_revealed_ids = cards.clone();
+-        // CR 701.20e: "look at" privately reveals the cards to the looking
+-        // player. The looker is the ability controller (e.g. Delver of Secrets'
+-        // "look at the top card of your library"). Record the looker-scoped peek
+-        // window so `filter_state_for_viewer` keeps these cards visible to the
+-        // looker — and only the looker — through any subsequent "you may reveal
+-        // that card" optional decision, instead of leaving the looking player to
+-        // choose blind.
+-        state.private_look_ids = cards.clone();
+-        state.private_look_player = Some(ability.controller);
++        if is_reveal {
++            // CR 701.20a: public reveal — show to all players.
++            for &card_id in &cards {
++                state.revealed_cards.insert(card_id);
++            }
++            let card_names: Vec<String> = cards
++                .iter()
++                .filter_map(|id| state.objects.get(id).map(|o| o.name.clone()))
++                .collect();
++            events.push(GameEvent::CardsRevealed {
++                player: ability.controller,
++                card_ids: cards.clone(),
++                card_names,
++            });
++        } else {
++            // CR 701.20e: "look at" privately reveals the cards to the looking
++            // player. The looker is the ability controller (e.g. Delver of Secrets'
++            // "look at the top card of your library"). Record the looker-scoped peek
++            // window so `filter_state_for_viewer` keeps these cards visible to the
++            // looker — and only the looker — through any subsequent "you may reveal
++            // that card" optional decision, instead of leaving the looking player to
++            // choose blind.
++            state.private_look_ids = cards.clone();
++            state.private_look_player = Some(ability.controller);
++        }
+         events.push(GameEvent::EffectResolved {
+             kind: EffectKind::from(&ability.effect),
+             source_id: ability.source_id,
+diff --git a/crates/engine/src/game/effects/mod.rs b/crates/engine/src/game/effects/mod.rs
+index 414d1df19a..1eb98cb8e1 100644
+--- a/crates/engine/src/game/effects/mod.rs
++++ b/crates/engine/src/game/effects/mod.rs
+@@ -4742,8 +4742,17 @@ fn affected_objects_from_events(
+         // CR 701.20b + CR 608.2c: Reveal instructions do not move cards, so they
+         // emit `CardsRevealed` rather than `ZoneChanged`. Publish the revealed
+         // card ids for downstream "from among the revealed cards"
+-        // `ChooseFromZone` continuations (Atraxa, Grand Unifier class).
+-        Effect::RevealTop { .. } | Effect::RevealHand { .. } | Effect::Clash => events
++        // `ChooseFromZone` / `ForEachCategory` continuations (Atraxa, Portent of
++        // Calamity). Reveal-only Digs with `keep_count: 0` take the same path —
++        // they never emit ZoneChanged either.
++        Effect::RevealTop { .. }
++        | Effect::RevealHand { .. }
++        | Effect::Clash
++        | Effect::Dig {
++            reveal: true,
++            keep_count: Some(0),
++            ..
++        } => events
+             .iter()
+             .filter_map(|event| match event {
+                 GameEvent::CardsRevealed { card_ids, .. } => Some(card_ids.as_slice()),
+diff --git a/crates/engine/src/game/engine_resolution_choices.rs b/crates/engine/src/game/engine_resolution_choices.rs
+index 8bdf2c66df..6dde5e8c74 100644
+--- a/crates/engine/src/game/engine_resolution_choices.rs
++++ b/crates/engine/src/game/engine_resolution_choices.rs
+@@ -4970,6 +4970,14 @@ pub(super) fn handle_resolution_choice(
+                             &library_position,
+                             events,
+                         );
++                        if let Some(next_owner) =
++                            effects::change_zone::resume_next_mass_library_order_choice(state)
++                        {
++                            state.priority_player = next_owner;
++                            return Ok(ResolutionChoiceOutcome::WaitingFor(
++                                state.waiting_for.clone(),
++                            ));
++                        }
+                     } else {
+                         // The selected EffectZoneChoice is now consumed. Clear it
+                         // before the pipeline may park a CR 616.1 prompt; otherwise
+@@ -6824,6 +6832,10 @@ fn finish_effect_zone_put_at_library_position(
+         &library_position,
+         events,
+     );
++    if let Some(next_owner) = effects::change_zone::resume_next_mass_library_order_choice(state) {
++        state.priority_player = next_owner;
++        return;
++    }
+     if state.active_ability_continuation().is_some() {
+         let tracked = if matches!(library_position, LibraryPosition::Bottom) {
+             state
+diff --git a/crates/engine/src/game/scenario.rs b/crates/engine/src/game/scenario.rs
+index 0cd300b29a..97f5ccfae3 100644
+--- a/crates/engine/src/game/scenario.rs
++++ b/crates/engine/src/game/scenario.rs
+@@ -15,7 +15,7 @@ use crate::game::game_object::GameObject;
+ use crate::game::printed_cards::apply_card_face_to_object;
+ use crate::game::zones::create_object;
+ use crate::types::ability::{
+-    AbilityDefinition, AbilityKind, AdditionalCost, Effect, PtValue, QuantityExpr,
++    AbilityDefinition, AbilityKind, AdditionalCost, Effect, EffectKind, PtValue, QuantityExpr,
+     ReplacementDefinition, ResolvedAbility, StaticDefinition, TargetFilter, TargetRef,
+     TriggerDefinition,
+ };
+@@ -1497,6 +1497,36 @@ impl GameRunner {
+                 super::triggers::drain_order_triggers_with_identity(&mut self.state);
+                 continue;
+             }
++            // CR 401.4: mass library-bottom placement parks `EffectZoneChoice` even
++            // when the stack is empty (Teferi's Puzzle Box draw-step trigger). Tests
++            // that drive phase advancement without an explicit `.effect_zone()` policy
++            // submit the engine-listed card order so resolution can finish.
++            if let WaitingFor::EffectZoneChoice {
++                cards,
++                count,
++                min_count,
++                up_to,
++                effect_kind,
++                ..
++            } = &self.state.waiting_for
++            {
++                if *effect_kind != EffectKind::PutAtLibraryPosition {
++                    break;
++                }
++                if *up_to || cards.len() < *min_count {
++                    break;
++                }
++                let chosen: Vec<_> = cards.iter().take(*count).copied().collect();
++                if chosen.len() != *count {
++                    break;
++                }
++                if apply_as_current(&mut self.state, GameAction::SelectCards { cards: chosen })
++                    .is_err()
++                {
++                    break;
++                }
++                continue;
++            }
+             if self.state.stack.is_empty() {
+                 break;
+             }
+diff --git a/crates/engine/src/parser/oracle_effect/assembly.rs b/crates/engine/src/parser/oracle_effect/assembly.rs
+index 904f2a96ea..d91a0b3816 100644
+--- a/crates/engine/src/parser/oracle_effect/assembly.rs
++++ b/crates/engine/src/parser/oracle_effect/assembly.rs
+@@ -2302,6 +2302,11 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
+     // continuation patched it. An unpatched Dig { reveal: true, keep_count: None, filter: Any }
+     // is a simple "reveal the top N" with no player selection — it must resolve synchronously
+     // (via RevealTop) so that sub_ability chains like RevealedHasCardType evaluate inline.
++    //
++    // CR 107.3 + CR 701.20a: Dynamic counts (Portent of Calamity's "top X cards") cannot
++    // round-trip through `RevealTop { count: u32 }` without collapsing to 1. Keep those
++    // Digs as reveal-only peeks (`keep_count: 0`) so X resolves at runtime; a later
++    // ForEachCategory / LastRevealed rest-move consumes the revealed pool.
+     for def in &mut defs {
+         if let Effect::Dig {
+             count,
+@@ -2317,14 +2322,27 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
+             if destination == &Some(Zone::Library) && rest_destination == &Some(Zone::Library) {
+                 continue;
+             }
+-            let count_val = match count {
+-                QuantityExpr::Fixed { value } => *value as u32,
+-                _ => 1,
+-            };
+-            *def.effect = Effect::RevealTop {
+-                player: player.clone(),
+-                count: count_val,
+-            };
++            match count {
++                QuantityExpr::Fixed { value } => {
++                    *def.effect = Effect::RevealTop {
++                        player: player.clone(),
++                        count: *value as u32,
++                    };
++                }
++                _ => {
++                    if let Effect::Dig {
++                        keep_count,
++                        destination,
++                        rest_destination,
++                        ..
++                    } = &mut *def.effect
++                    {
++                        *keep_count = Some(0);
++                        *destination = None;
++                        *rest_destination = None;
++                    }
++                }
++            }
+         }
+     }
+ 
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index ab8ea00b1b..abcaaaf21c 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -2359,10 +2359,13 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
+             enter_tapped,
+             enter_with_counters,
+         } => {
+-            let origin = if matches!(target, TargetFilter::ExiledBySource) {
+-                Some(Zone::Exile)
+-            } else {
+-                origin
++            let origin = match &target {
++                TargetFilter::ExiledBySource => Some(Zone::Exile),
++                TargetFilter::TrackedSetFiltered {
++                    caused_by: Some(crate::types::ability::ThisWayCause::Exiled),
++                    ..
++                } => Some(Zone::Exile),
++                _ => origin,
+             };
+             Effect::ChangeZoneAll {
+                 origin,
+@@ -6524,17 +6527,31 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
+             choice_count: _,
+             enter_with_counters,
+         } => {
+-            // CR 610.3: Mass filters (ExiledBySource, TrackedSet) act on all matching
+-            // objects without individual targeting — use ChangeZoneAll.
++            // CR 610.3: Mass filters (ExiledBySource, TrackedSet,
++            // TrackedSetFiltered) act on all matching objects without individual
++            // targeting — use ChangeZoneAll. Bounded "up to N" picks from the
++            // tracked set ("put up to one land discarded this way") remain
++            // `ChangeZone` so the player selects a subset at resolution.
+             // ExiledBySource always originates from Exile regardless of inferred zone.
+             // CR 122.1: ChangeZoneAll has no counter-stamping channel — those
+             // patterns are single-target only in current Oracle text, so the
+             // mass-filter branch deliberately drops `enter_with_counters`.
+             if matches!(
+                 target,
+-                TargetFilter::ExiledBySource | TargetFilter::TrackedSet { .. }
++                TargetFilter::ExiledBySource
++                    | TargetFilter::TrackedSet { .. }
++                    | TargetFilter::TrackedSetFiltered { .. }
+             ) && enter_with_counters.is_empty()
++                && !up_to
+             {
++                let origin = match target {
++                    TargetFilter::TrackedSetFiltered {
++                        caused_by: Some(crate::types::ability::ThisWayCause::Exiled),
++                        ..
++                    } => origin.or(Some(Zone::Exile)),
++                    TargetFilter::TrackedSetFiltered { .. } => origin,
++                    _ => origin.or(Some(Zone::Exile)),
++                };
+                 Effect::ChangeZoneAll {
+                     // CR 608.2c + CR 400.7: A tracked-set / impulse mass move
+                     // defaults to scanning Exile (cascade, impulse-draw, and the
+@@ -6543,7 +6560,7 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
+                     // (Breach the Multiverse's graveyard choose stamps
+                     // `origin: Some(Graveyard)` in `parse_put_ast`), honor it so
+                     // the chosen cards are read out of the right zone.
+-                    origin: origin.or(Some(Zone::Exile)),
++                    origin,
+                     destination,
+                     target,
+                     // CR 110.2a: Preserve the parsed entering-controller override
+diff --git a/crates/engine/src/parser/oracle_effect/sequence.rs b/crates/engine/src/parser/oracle_effect/sequence.rs
+index 465c44a762..9ed248baca 100644
+--- a/crates/engine/src/parser/oracle_effect/sequence.rs
++++ b/crates/engine/src/parser/oracle_effect/sequence.rs
+@@ -3975,6 +3975,42 @@ pub(super) fn apply_clause_continuation(
+             destination,
+             reorder_all,
+         } => {
++            // CR 608.2c + CR 701.20b (Portent of Calamity): After a per-category
++            // exile from among revealed cards, "put the rest into <zone>" moves
++            // the revealed cards still in the library — `LastRevealed` ∩ origin
++            // Library — NOT Dig.rest_destination (a keep_count-0 reveal Dig
++            // returns before applying rest) and NOT the chain tracked set of
++            // cards just exiled (which would dump the player's picks into the
++            // graveyard). Prefer this over Dig patching when both antecedents
++            // exist in the clause list. The exiled-card tail ("put the rest of
++            // the exiled cards …") is a distinct remainder set and must stay on
++            // the imperative `ExiledBySource` path.
++            let for_each_bound = defs.iter().rposition(|def| {
++                matches!(
++                    &*def.effect,
++                    Effect::ForEachCategory {
++                        action: ForEachCategoryAction::ExileFromPool { .. },
++                        ..
++                    }
++                )
++            });
++            if for_each_bound.is_some() && destination != Zone::Hand {
++                defs.push(AbilityDefinition::new(
++                    kind,
++                    Effect::ChangeZoneAll {
++                        origin: Some(Zone::Library),
++                        destination,
++                        target: TargetFilter::LastRevealed,
++                        enters_under: None,
++                        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
++                        enter_with_counters: vec![],
++                        face_down_profile: None,
++                        library_position: None,
++                        random_order: false,
++                    },
++                ));
++                return;
++            }
+             // Absorbed into preceding Dig or RevealUntil — sets rest_destination
+             // for unchosen/non-matching cards. CR 608.2c: When the preceding def is
+             // a conditional "instead" alternative (new def with `else_ability =
+@@ -3995,10 +4031,37 @@ pub(super) fn apply_clause_continuation(
+                 None,
+                 super::assembly::OnMiss::Ignore,
+             );
+-            let Some(bound_index) = bound else {
+-                return;
+-            };
+-            patch_rest_destination_recursively(&mut defs[bound_index], destination, reorder_all);
++            if let Some(bound_index) = bound {
++                // CR 701.20a + CR 608.2c: Dynamic-count reveal-only Digs
++                // (`keep_count: 0`) return before `Dig.rest_destination` is
++                // applied at runtime. Emit an explicit `LastRevealed` sibling
++                // for the revealed-library remainder instead of patching an
++                // unused field (Sunbird's Invocation / Enshrined Memories class).
++                if !reorder_all && dig_needs_last_revealed_rest_sibling(&defs[bound_index].effect) {
++                    let library_position =
++                        (destination == Zone::Library).then_some(LibraryPosition::Bottom);
++                    defs.push(AbilityDefinition::new(
++                        kind,
++                        Effect::ChangeZoneAll {
++                            origin: Some(Zone::Library),
++                            destination,
++                            target: TargetFilter::LastRevealed,
++                            enters_under: None,
++                            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
++                            enter_with_counters: vec![],
++                            face_down_profile: None,
++                            library_position,
++                            random_order: false,
++                        },
++                    ));
++                    return;
++                }
++                patch_rest_destination_recursively(
++                    &mut defs[bound_index],
++                    destination,
++                    reorder_all,
++                );
++            }
+         }
+         ContinuationAst::DigFromAmong {
+             quantity,
+@@ -4925,6 +4988,38 @@ fn apply_search_destination_to_ability_chain(
+     }
+ }
+ 
++/// CR 608.2c + CR 701.20b: True for "put the rest …" clauses that move the
++/// revealed-library remainder after a per-category exile. False for the distinct
++/// exiled-card tail ("put the rest of the exiled cards …"), which must bind to
++/// `ExiledBySource` instead of `LastRevealed` / chain `TrackedSet`.
++fn put_rest_targets_revealed_remainder(lower: &str) -> bool {
++    nom_primitives::scan_contains(lower, "put the rest")
++        && !nom_primitives::scan_contains(lower, "of the exiled cards")
++        && !nom_primitives::scan_contains(lower, "of those exiled cards")
++}
++
++/// CR 701.20a + CR 608.2c: True when a trailing PutRest must become an explicit
++/// `LastRevealed` sibling rather than patching `Dig.rest_destination`. Matches
++/// reveal-only Digs already at `keep_count: 0` and dynamic-count reveal Digs
++/// that assembly demotes to `keep_count: 0` after continuations are applied.
++fn dig_needs_last_revealed_rest_sibling(effect: &Effect) -> bool {
++    match effect {
++        Effect::Dig {
++            keep_count: Some(0),
++            reveal: true,
++            ..
++        } => true,
++        Effect::Dig {
++            keep_count: None,
++            reveal: true,
++            filter: TargetFilter::Any,
++            count,
++            ..
++        } => !matches!(count, QuantityExpr::Fixed { .. }),
++        _ => false,
++    }
++}
++
+ /// Recursively patch `rest_destination` on Dig/RevealUntil effects reachable from
+ /// `def` via `else_ability`. CR 608.2c: When a preceding def is a conditional
+ /// "instead" wrapper (new_def with `else_ability = base_def`), a trailing
+@@ -6615,6 +6710,32 @@ pub(super) fn parse_followup_continuation_ast(
+                 reorder_all: false,
+             })
+         }
++        // CR 608.2c + CR 701.20b (Portent of Calamity / Sanar class): "Put the
++        // rest into your graveyard" after a per-category exile from among the
++        // revealed cards. The rest are the revealed cards still in the library
++        // (not the cards just exiled into the chain tracked set).
++        Effect::ForEachCategory {
++            action: ForEachCategoryAction::ExileFromPool { .. },
++            ..
++        } if put_rest_targets_revealed_remainder(&lower) =>
++        {
++            let destination = if nom_primitives::scan_contains(&lower, "into your graveyard")
++                || nom_primitives::scan_contains(&lower, "into their graveyard")
++            {
++                Zone::Graveyard
++            } else if nom_primitives::scan_contains(&lower, "into your hand")
++                || nom_primitives::scan_contains(&lower, "into their hand")
++            {
++                Zone::Hand
++            } else {
++                // "on the bottom", "on top of", and other library rest piles.
++                Zone::Library
++            };
++            Some(ContinuationAst::PutRest {
++                destination,
++                reorder_all: false,
++            })
++        }
+         // CR 701.20a + CR 608.2c: A reveal-until rest-pile clause may be
+         // separated from the RevealUntil by a transparent intervening effect
+         // ("~ deals damage equal to that card's mana value. Put that card into
+diff --git a/crates/engine/src/parser/oracle_target.rs b/crates/engine/src/parser/oracle_target.rs
+index ae5af8ddcc..68d08aa176 100644
+--- a/crates/engine/src/parser/oracle_target.rs
++++ b/crates/engine/src/parser/oracle_target.rs
+@@ -13,7 +13,7 @@ use crate::types::ability::{
+     Comparator, ControllerRef, CountScope, DamageKindFilter, FilterProp, ObjectProperty,
+     ObjectScope, ParitySource, PlayerFilter, PtStat, PtValueScope, QuantityExpr, QuantityRef,
+     SeatDirection, SharedQuality, SharedQualityRelation, TargetFilter, TargetSelectionMode,
+-    TypeFilter, TypedFilter,
++    ThisWayCause, TypeFilter, TypedFilter,
+ };
+ use crate::types::card_type::Supertype;
+ use crate::types::counter::{CounterMatch, CounterType};
+@@ -1026,6 +1026,24 @@ pub fn parse_target_with_syntax<'a>(
+         return (filter, rest, syntax);
+     }
+ 
++    // CR 608.2c + CR 607.2a (Portent of Calamity): "the rest of the exiled cards"
++    // names the cards still linked to this resolution's exile step — not the bare
++    // "the rest" tracked-set anaphor, which can absorb unrelated chain members
++    // after an intervening revealed-library cleanup publishes to the chain set.
++    if let Ok((rest, _)) =
++        tag::<_, _, OracleError<'_>>("the rest of the exiled cards").parse(lower.as_str())
++    {
++        return (
++            TargetFilter::TrackedSetFiltered {
++                id: TrackedSetId(0),
++                filter: Box::new(TargetFilter::Any),
++                caused_by: Some(ThisWayCause::Exiled),
++            },
++            &text[lower.len() - rest.len()..],
++            syntax,
++        );
++    }
++
+     // CR 603.7: Anaphoric tracked-set pronouns
+     static TRACKED_SET_PHRASES: &[&str] = &[
+         "the chosen cards",
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index b0483203a3..3f53126b8c 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -3582,6 +3582,22 @@ pub struct PendingPerPlayerZoneChoice {
+     pub accumulated: bool,
+ }
+ 
++/// CR 401.4 + CR 608.2c: Per-owner library-order prompts for one
++/// `ChangeZoneAll` instruction that places multiple owners' cards at the same
++/// library position with `random_order: false`. The first owner's batch is
++/// surfaced immediately as `WaitingFor::EffectZoneChoice`; remaining owner
++/// batches drain after each batch completes.
++#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
++pub struct PendingMassLibraryOrderChoice {
++    pub source_id: ObjectId,
++    pub library_position: crate::types::ability::LibraryPosition,
++    pub track_exiled_by_source: bool,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub duration: Option<crate::types::ability::Duration>,
++    /// Remaining (owner, cards) batches in APNAP order after the current prompt.
++    pub remaining_batches: Vec<(PlayerId, Vec<ObjectId>)>,
++}
++
+ /// CR 101.4: If players make choices for one instruction, they choose in
+ /// APNAP order before the simultaneous action happens.
+ /// CR 701.21a: To sacrifice a permanent, its controller moves it from the
+@@ -12242,6 +12258,10 @@ pub struct GameState {
+     /// `EffectZoneChoice`.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub pending_player_scope_sacrifice_choice: Option<PendingPlayerScopeSacrificeChoice>,
++    /// CR 401.4: Remaining per-owner library-order batches for a mass
++    /// `ChangeZoneAll` instruction paused on `EffectZoneChoice`.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub pending_mass_library_order_choice: Option<PendingMassLibraryOrderChoice>,
+     /// CR 101.4 + CR 701.23i: Pending private selections for a simultaneous
+     /// scoped self-library search. Kept separate from the generic continuation
+     /// so the action phase cannot begin before every player has chosen.
+@@ -16207,6 +16227,7 @@ impl GameState {
+             merged_card_component_route: None,
+             resolution_coin_flip: None,
+             pending_player_scope_sacrifice_choice: None,
++            pending_mass_library_order_choice: None,
+             pending_scoped_library_search: None,
+             pending_library_search_delivery: None,
+             pending_search_found_batch: None,
+@@ -17540,6 +17561,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
+         //     Priority`, effects/mod.rs:759) or a constant direct-assigned count across a real
+         //     copy-token loop, so COMPARING never suppresses a legitimate loop's detection.
+         pending_player_scope_sacrifice_choice: _,
++        pending_mass_library_order_choice: _,
+         pending_scoped_library_search: _,
+         pending_library_search_delivery: _,
+         pending_search_found_batch: _,
+@@ -17739,6 +17761,8 @@ impl PartialEq for GameState {
+             && self.resolution_coin_flip == other.resolution_coin_flip
+             && self.pending_player_scope_sacrifice_choice
+                 == other.pending_player_scope_sacrifice_choice
++            && self.pending_mass_library_order_choice
++                == other.pending_mass_library_order_choice
+             && self.pending_scoped_library_search == other.pending_scoped_library_search
+             && self.pending_library_search_delivery == other.pending_library_search_delivery
+             && self.pending_search_found_batch == other.pending_search_found_batch
+diff --git a/crates/engine/tests/fixtures/cr733/authority_matrix.json.gz b/crates/engine/tests/fixtures/cr733/authority_matrix.json.gz
+index 6ca1045bfb..fa28dbd56a 100644
+Binary files a/crates/engine/tests/fixtures/cr733/authority_matrix.json.gz and b/crates/engine/tests/fixtures/cr733/authority_matrix.json.gz differ
+diff --git a/crates/engine/tests/integration/issue_6498_portent_of_calamity.rs b/crates/engine/tests/integration/issue_6498_portent_of_calamity.rs
+new file mode 100644
+index 0000000000..beb308c11e
+--- /dev/null
++++ b/crates/engine/tests/integration/issue_6498_portent_of_calamity.rs
+@@ -0,0 +1,519 @@
++//! Issue #6498 — Portent of Calamity: revealed cards cannot be selected;
++//! they just go to the graveyard.
++//!
++//! Oracle: `Reveal the top X cards of your library. For each card type, you
++//! may exile a card of that type from among them. Put the rest into your
++//! graveyard. You may cast a spell from among the exiled cards without paying
++//! its mana cost if you exiled four or more cards this way. Then put the rest
++//! of the exiled cards into your hand.`
++//!
++//! Discord report: after revealing, the player could not keep selected cards —
++//! picks dumped to the graveyard. Root cause: "Put the rest into your
++//! graveyard" was modeled as `ChangeZoneAll { Exile → Graveyard, TrackedSet }`,
++//! so the per-type exile picks (the tracked set) were immediately moved to the
++//! graveyard. Also, Dig→RevealTop demotion collapsed X to 1.
++//!
++//! DISCRIMINATING: with X=5, exile one of each of four types plus a duplicate
++//! creature; the unselected revealed creature goes to the graveyard; after
++//! declining the free cast, the four exiled picks reach hand via
++//! `TrackedSetFiltered { caused_by: Exiled }`, not chain `TrackedSet`.
++
++use engine::game::effects::change_zone::resolve_all;
++use engine::game::engine::apply_as_current;
++use engine::game::scenario::{GameRunner, GameScenario, P1};
++use engine::game::zones::create_object;
++use engine::parser::oracle_effect::parse_effect_chain;
++use engine::types::ability::{
++    AbilityKind, Effect, EffectKind, ForEachCategoryAction, LibraryPosition, QuantityExpr,
++    QuantityRef, ResolvedAbility, TargetFilter,
++};
++use engine::types::actions::GameAction;
++use engine::types::card_type::CoreType;
++use engine::types::game_state::{GameState, WaitingFor};
++use engine::types::identifiers::{CardId, ObjectId};
++use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
++use engine::types::phase::Phase;
++use engine::types::player::PlayerId;
++use engine::types::zones::{EtbTapState, Zone};
++
++const P0: PlayerId = PlayerId(0);
++
++const PORTENT: &str = "Reveal the top X cards of your library. For each card type, you may exile a card of that type from among them. Put the rest into your graveyard. You may cast a spell from among the exiled cards without paying its mana cost if you exiled four or more cards this way. Then put the rest of the exiled cards into your hand.";
++
++fn add_mana(runner: &mut GameRunner, amount_blue: u32, amount_colorless: u32) {
++    let dummy = ObjectId(0);
++    let pool = &mut runner.state_mut().players[0].mana_pool;
++    for _ in 0..amount_blue {
++        pool.add(ManaUnit::new(ManaType::Blue, dummy, false, vec![]));
++    }
++    for _ in 0..amount_colorless {
++        pool.add(ManaUnit::new(ManaType::Colorless, dummy, false, vec![]));
++    }
++}
++
++#[test]
++fn portent_parses_dynamic_reveal_and_last_revealed_rest_to_graveyard() {
++    let def = parse_effect_chain(PORTENT, AbilityKind::Spell);
++    // Head: Dig reveal with Variable X (not RevealTop count 1).
++    match &*def.effect {
++        Effect::Dig {
++            reveal: true,
++            keep_count: Some(0),
++            count:
++                QuantityExpr::Ref {
++                    qty: QuantityRef::Variable { name },
++                },
++            ..
++        } => assert_eq!(name, "X"),
++        Effect::RevealTop { count: 1, .. } => {
++            panic!("X must not collapse to RevealTop {{ count: 1 }}")
++        }
++        other => panic!("expected reveal Dig with X, got {other:?}"),
++    }
++
++    let mut node = &def;
++    let mut saw_for_each = false;
++    let mut saw_rest_to_gy = false;
++    let mut saw_final_hand_cleanup = false;
++    loop {
++        match &*node.effect {
++            Effect::ForEachCategory {
++                action: ForEachCategoryAction::ExileFromPool { .. },
++                ..
++            } => saw_for_each = true,
++            Effect::ChangeZoneAll {
++                origin: Some(Zone::Library),
++                destination: Zone::Graveyard,
++                target: TargetFilter::LastRevealed,
++                ..
++            } => saw_rest_to_gy = true,
++            Effect::ChangeZoneAll {
++                origin: Some(Zone::Exile),
++                destination: Zone::Hand,
++                target: TargetFilter::TrackedSetFiltered {
++                    caused_by: Some(engine::types::ability::ThisWayCause::Exiled),
++                    ..
++                },
++                ..
++            } => saw_final_hand_cleanup = true,
++            Effect::ChangeZoneAll {
++                origin: Some(Zone::Exile),
++                destination: Zone::Graveyard,
++                target: TargetFilter::TrackedSet { .. },
++                ..
++            } => panic!(
++                "put-the-rest must NOT dump the exile tracked set into the graveyard (Discord #6498)"
++            ),
++            _ => {}
++        }
++        match node.sub_ability.as_deref() {
++            Some(next) => node = next,
++            None => break,
++        }
++    }
++    assert!(saw_for_each, "must parse ForEachCategory exile");
++    assert!(
++        saw_rest_to_gy,
++        "must emit ChangeZoneAll Library+LastRevealed→Graveyard for put-the-rest"
++    );
++    assert!(
++        saw_final_hand_cleanup,
++        "final tail must bind to action-stamped TrackedSetFiltered(Exiled), not chain TrackedSet"
++    );
++
++    let mut node = &def;
++    let cast = loop {
++        if matches!(&*node.effect, Effect::CastFromZone { .. }) {
++            break node;
++        }
++        node = node
++            .sub_ability
++            .as_ref()
++            .expect("Portent chain must reach CastFromZone");
++    };
++    let hand_cleanup = |node: &engine::types::ability::AbilityDefinition| {
++        matches!(
++            &*node.effect,
++            Effect::ChangeZoneAll {
++                origin: Some(Zone::Exile),
++                destination: Zone::Hand,
++                target: TargetFilter::TrackedSetFiltered {
++                    caused_by: Some(engine::types::ability::ThisWayCause::Exiled),
++                    ..
++                },
++                ..
++            }
++        )
++    };
++    assert!(
++        cast.sub_ability.as_deref().is_some_and(hand_cleanup)
++            || cast.else_ability.as_deref().is_some_and(hand_cleanup),
++        "CastFromZone must chain into the exiled-card hand cleanup; sub={:?}, else={:?}",
++        cast.sub_ability.as_ref().map(|s| &*s.effect),
++        cast.else_ability.as_ref().map(|s| &*s.effect),
++    );
++    assert!(
++        cast.sub_ability
++            .as_deref()
++            .is_some_and(hand_cleanup),
++        "hand cleanup must be the accept/decline sub_ability (SequentialSibling), not only else_ability"
++    );
++    assert_eq!(
++        cast.sub_ability.as_ref().unwrap().sub_link,
++        engine::types::ability::SubAbilityLink::SequentialSibling,
++        "Portent hand cleanup must resolve on optional cast decline"
++    );
++}
++
++#[test]
++fn dynamic_reveal_put_rest_emits_last_revealed_sibling() {
++    // Shared grammar class from the parse-diff (Sunbird's Invocation tail,
++    // Enshrined Memories-style separate rest clause, etc.): dynamic-count
++    // reveal-only Dig + trailing "put the rest …".
++    const DYNAMIC_REVEAL_REST: &str = "Reveal the top X cards of your library. Put the rest on the bottom of your library in any order.";
++    let def = parse_effect_chain(DYNAMIC_REVEAL_REST, AbilityKind::Spell);
++    match &*def.effect {
++        Effect::Dig {
++            reveal: true,
++            keep_count: Some(0),
++            count:
++                QuantityExpr::Ref {
++                    qty: QuantityRef::Variable { name },
++                },
++            ..
++        } => assert_eq!(name, "X"),
++        other => panic!("expected dynamic reveal Dig with X, got {other:?}"),
++    }
++
++    let mut node = &def;
++    let mut saw_last_revealed_rest = false;
++    loop {
++        if matches!(
++            &*node.effect,
++            Effect::ChangeZoneAll {
++                origin: Some(Zone::Library),
++                destination: Zone::Library,
++                target: TargetFilter::LastRevealed,
++                ..
++            }
++        ) {
++            saw_last_revealed_rest = true;
++        }
++        match node.sub_ability.as_deref() {
++            Some(next) => node = next,
++            None => break,
++        }
++    }
++    assert!(
++        saw_last_revealed_rest,
++        "dynamic reveal Dig with put-the-rest must emit explicit LastRevealed sibling \
++         instead of relying on unused Dig.rest_destination"
++    );
++}
++
++#[test]
++fn dynamic_reveal_put_rest_moves_revealed_cards_to_library_bottom() {
++    // CR 701.20a + CR 608.2c + CR 401.4: dynamic reveal-only Dig with a trailing
++    // put-the-rest clause must move the revealed library remainder to the bottom,
++    // leaving cards below the reveal window untouched (Enshrined Memories class).
++    const DYNAMIC_REVEAL_REST: &str = "Reveal the top X cards of your library. Put the rest on the bottom of your library in any order.";
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Library top-to-bottom: [rev3, rev2, rev1, deep]. X=3 reveals the top three.
++    let deep = scenario
++        .add_spell_to_library_top(P0, "Deep Card", true)
++        .id();
++    let rev1 = scenario
++        .add_spell_to_library_top(P0, "Revealed 1", true)
++        .id();
++    let rev2 = scenario
++        .add_spell_to_library_top(P0, "Revealed 2", true)
++        .id();
++    let rev3 = scenario
++        .add_spell_to_library_top(P0, "Revealed 3", true)
++        .id();
++
++    let spell = {
++        let mut b = scenario.add_spell_to_hand_from_oracle(
++            P0,
++            "Dynamic Reveal Probe",
++            false,
++            DYNAMIC_REVEAL_REST,
++        );
++        b.with_mana_cost(ManaCost::Cost {
++            shards: vec![ManaCostShard::X],
++            generic: 0,
++        });
++        b.id()
++    };
++
++    let mut runner = scenario.build();
++    add_mana(&mut runner, 0, 3);
++
++    // CR 401.4: submit a non-default bottom order through the production
++    // `EffectZoneChoice` path — not an engine-default batch order.
++    let outcome = runner
++        .cast(spell)
++        .x(3)
++        .effect_zone(&[rev3, rev1, rev2])
++        .resolve();
++    assert!(
++        matches!(outcome.final_waiting_for(), WaitingFor::Priority { .. }),
++        "dynamic reveal rest cleanup must finish after the library-order choice"
++    );
++
++    let library = &runner.state().players[0].library;
++    assert_eq!(
++        library.len(),
++        4,
++        "spell must not remove the unrevealed fourth card from the library"
++    );
++    assert_eq!(
++        library[0], deep,
++        "the card below the X-card reveal window must remain on top"
++    );
++    let bottom_tail: Vec<ObjectId> = library.iter().skip(1).copied().collect();
++    assert_eq!(
++        bottom_tail,
++        vec![rev3, rev1, rev2],
++        "revealed remainder must land on the bottom in the player's submitted order"
++    );
++    for id in [rev1, rev2, rev3] {
++        assert_eq!(
++            runner.state().objects[&id].zone,
++            Zone::Library,
++            "revealed cards must stay in the library, not be stranded elsewhere"
++        );
++    }
++}
++
++#[test]
++fn opponent_library_bottom_order_prompts_owner_and_applies_submitted_order() {
++    // CR 401.4: mass library-bottom placement on opponent-owned revealed cards
++    // must prompt the opponent (not the spell controller) and honor their order.
++    let mut state = GameState::new_two_player(42);
++    let deep = create_object(
++        &mut state,
++        CardId(801),
++        P1,
++        "Deep Card".to_string(),
++        Zone::Library,
++    );
++    let rev3 = create_object(
++        &mut state,
++        CardId(802),
++        P1,
++        "Revealed 3".to_string(),
++        Zone::Library,
++    );
++    let rev1 = create_object(
++        &mut state,
++        CardId(803),
++        P1,
++        "Revealed 1".to_string(),
++        Zone::Library,
++    );
++    let rev2 = create_object(
++        &mut state,
++        CardId(804),
++        P1,
++        "Revealed 2".to_string(),
++        Zone::Library,
++    );
++    state.players[P1.0 as usize].library = im::vector![rev3, rev2, rev1, deep];
++    state.last_revealed_ids = vec![rev3, rev2, rev1];
++
++    let ability = ResolvedAbility::new(
++        Effect::ChangeZoneAll {
++            origin: Some(Zone::Library),
++            destination: Zone::Library,
++            target: TargetFilter::LastRevealed,
++            enters_under: None,
++            enter_tapped: EtbTapState::Unspecified,
++            enter_with_counters: vec![],
++            face_down_profile: None,
++            library_position: Some(LibraryPosition::Bottom),
++            random_order: false,
++        },
++        vec![],
++        ObjectId(900),
++        P0,
++    );
++
++    let mut events = Vec::new();
++    resolve_all(&mut state, &ability, &mut events).unwrap();
++
++    match &state.waiting_for {
++        WaitingFor::EffectZoneChoice {
++            player,
++            cards,
++            effect_kind,
++            ..
++        } => {
++            assert_eq!(
++                *player, P1,
++                "opponent-owned cards must be ordered by their owner, not the caster"
++            );
++            assert_eq!(cards.len(), 3);
++            assert_eq!(*effect_kind, EffectKind::PutAtLibraryPosition);
++        }
++        other => panic!("expected library-order prompt for opponent-owned cards, got {other:?}"),
++    }
++
++    apply_as_current(
++        &mut state,
++        GameAction::SelectCards {
++            cards: vec![rev3, rev1, rev2],
++        },
++    )
++    .unwrap();
++
++    assert!(
++        matches!(state.waiting_for, WaitingFor::Priority { .. }),
++        "library-order cleanup must finish after the owner submits order"
++    );
++    let library = &state.players[P1.0 as usize].library;
++    assert_eq!(library[0], deep, "unrevealed card stays on top");
++    assert_eq!(
++        library.iter().skip(1).copied().collect::<Vec<_>>(),
++        vec![rev3, rev1, rev2],
++        "bottom tail must match the opponent's submitted order"
++    );
++}
++
++#[test]
++fn portent_full_resolution_exiles_picks_to_hand_and_unselected_reveal_to_graveyard() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    let spell = {
++        let mut b =
++            scenario.add_spell_to_hand_from_oracle(P0, "Portent of Calamity", false, PORTENT);
++        b.with_mana_cost(ManaCost::Cost {
++            shards: vec![ManaCostShard::X, ManaCostShard::Blue],
++            generic: 0,
++        });
++        b.id()
++    };
++
++    // Five revealed cards: four distinct types plus a duplicate creature.
++    let creature_a = scenario
++        .add_spell_to_library_top(P0, "Creature A", true)
++        .id();
++    let creature_b = scenario
++        .add_spell_to_library_top(P0, "Creature B", true)
++        .id();
++    let artifact = scenario.add_spell_to_library_top(P0, "Artifact", true).id();
++    let enchantment = scenario
++        .add_spell_to_library_top(P0, "Enchantment", true)
++        .id();
++    let sorcery = scenario.add_spell_to_library_top(P0, "Sorcery", true).id();
++
++    let mut runner = scenario.build();
++    runner
++        .state_mut()
++        .objects
++        .get_mut(&creature_a)
++        .unwrap()
++        .card_types
++        .core_types = vec![CoreType::Creature];
++    runner
++        .state_mut()
++        .objects
++        .get_mut(&creature_b)
++        .unwrap()
++        .card_types
++        .core_types = vec![CoreType::Creature];
++    runner
++        .state_mut()
++        .objects
++        .get_mut(&artifact)
++        .unwrap()
++        .card_types
++        .core_types = vec![CoreType::Artifact];
++    runner
++        .state_mut()
++        .objects
++        .get_mut(&enchantment)
++        .unwrap()
++        .card_types
++        .core_types = vec![CoreType::Enchantment];
++    runner
++        .state_mut()
++        .objects
++        .get_mut(&sorcery)
++        .unwrap()
++        .card_types
++        .core_types = vec![CoreType::Sorcery];
++
++    // X=5 + {U}
++    add_mana(&mut runner, 1, 5);
++
++    let _outcome = runner.cast(spell).x(5).resolve();
++
++    let mut exiled = Vec::new();
++    while let WaitingFor::ChooseFromZoneChoice { cards, .. } = &runner.state().waiting_for {
++        let pick = if cards.contains(&creature_a) && cards.contains(&creature_b) {
++            creature_a
++        } else {
++            cards[0]
++        };
++        exiled.push(pick);
++        runner
++            .act(GameAction::SelectCards { cards: vec![pick] })
++            .expect("per-type exile selection");
++    }
++
++    assert_eq!(
++        exiled.len(),
++        4,
++        "must exile exactly one card per distinct revealed type"
++    );
++    for id in &exiled {
++        assert_eq!(
++            runner.state().objects[id].zone,
++            Zone::Exile,
++            "exiled picks must remain in Exile through the revealed rest cleanup"
++        );
++    }
++
++    let unselected_creature = if exiled.contains(&creature_a) {
++        creature_b
++    } else {
++        creature_a
++    };
++    assert_eq!(
++        runner.state().objects[&unselected_creature].zone,
++        Zone::Graveyard,
++        "the revealed-but-unselected duplicate creature must go to the graveyard"
++    );
++
++    // Decline the optional free cast, then drive the final hand cleanup.
++    while !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
++        match &runner.state().waiting_for {
++            WaitingFor::OptionalEffectChoice { .. } => {
++                runner
++                    .act(GameAction::DecideOptionalEffect { accept: false })
++                    .expect("decline optional free cast");
++            }
++            WaitingFor::CastOffer { .. } => {
++                runner
++                    .act(GameAction::PassPriority)
++                    .expect("decline cast offer");
++            }
++            other => panic!("unexpected prompt before final cleanup: {other:?}"),
++        }
++    }
++
++    for id in &exiled {
++        assert_eq!(
++            runner.state().objects[id].zone,
++            Zone::Hand,
++            "remaining exiled cards must reach hand via TrackedSetFiltered(Exiled) tail"
++        );
++        assert!(
++            !runner.state().players[0].graveyard.contains(id),
++            "exiled pick must not be stranded in the graveyard"
++        );
++    }
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 621d6f14a3..65203ffc5c 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -579,6 +579,7 @@ mod issue_6092_ability_block_reason;
+ mod issue_6102_ragavan_exile_cast;
+ mod issue_6157_gold_token_auto_mana_payment;
+ mod issue_629_fractured_sanity_cycling;
++mod issue_6498_portent_of_calamity;
+ mod issue_6500_loreseekers_stone_hand_cost;
+ mod issue_654_stridehangar_automaton;
+ mod issue_680_shalai_and_hallar_forgotten_ancient;

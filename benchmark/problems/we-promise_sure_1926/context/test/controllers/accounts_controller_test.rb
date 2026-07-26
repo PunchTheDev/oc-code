@@ -1,0 +1,480 @@
+require "test_helper"
+
+class AccountsControllerTest < ActionDispatch::IntegrationTest
+  include ActionView::RecordIdentifier
+
+  setup do
+    sign_in @user = users(:family_admin)
+    @account = accounts(:depository)
+  end
+
+  test "should get index" do
+    get accounts_url
+    assert_response :success
+    assert_select "p.ml-auto.privacy-sensitive"
+  end
+
+  test "should get show" do
+    get account_url(@account)
+    assert_response :success
+  end
+
+  test "show lazily loads statement tab data unless statements tab is active" do
+    AccountStatement::Coverage.expects(:for_year).never
+    AccountStatement.expects(:reconciliation_statuses_for).never
+
+    get account_url(@account)
+
+    assert_response :success
+    assert_select "select[name='statement_year']", count: 0
+    statements_path = account_path(@account, tab: "statements")
+    assert_select "turbo-frame[src='#{statements_path}']"
+  end
+
+  test "statements tab links escape turbo frame for full-page navigation" do
+    # Upload a statement to ensure table rows render
+    statement = AccountStatement.create_from_upload!(
+      family: @account.family,
+      file: uploaded_file(
+        filename: "test.pdf",
+        content_type: "application/pdf",
+        content: "%PDF-1.4 test content"
+      ),
+      account: @account
+    )
+
+
+    get account_url(@account, tab: "statements")
+
+    assert_response :success
+
+    # Inbox link escapes frame
+    assert_select "a[href='#{account_statements_path}'][data-turbo-frame='_top']"
+
+    # Statement filename link escapes frame
+    assert_select "a[data-turbo-frame='_top']", text: statement.filename
+
+    # Eye/view icon escapes frame and opens in new tab
+    assert_select "a[target='_blank'][data-turbo-frame='_top'][aria-label='#{I18n.t("account_statements.table.view")}']"
+
+    # Edit icon escapes frame
+    assert_select "a[href='#{account_statement_path(statement)}'][data-turbo-frame='_top'][aria-label='#{I18n.t("account_statements.table.edit")}']"
+
+    # Unlink button escapes frame
+    assert_select "form[action='#{unlink_account_statement_path(statement)}'][data-turbo-frame='_top'] button"
+  end
+
+  test "statements tab shows coverage and upload for statement managers with account write access" do
+    get account_url(@account, tab: "statements")
+
+    assert_response :success
+    assert_select "input[type=file][accept='.pdf,.csv,.xlsx']"
+    assert_select "select[name='statement_year']"
+    assert_select "p", text: I18n.l(Date.current.prev_month.beginning_of_month, format: "%b %Y")
+  end
+
+  test "statements tab lazy frame returns matching frame content" do
+    frame_id = dom_id(@account, :statements_tab)
+
+    get account_url(@account, tab: "statements"), headers: { "Turbo-Frame" => frame_id }
+
+    assert_response :success
+    assert_select "turbo-frame##{frame_id}", count: 1
+    assert_select "select[name='statement_year']"
+    assert_select "turbo-frame##{dom_id(@account, :container)}", count: 0
+  end
+
+  test "statements tab filters historical coverage by year" do
+    account = Account.create!(
+      family: @user.family,
+      owner: @user,
+      name: "Historical Checking",
+      balance: 0,
+      currency: "USD",
+      accountable: Depository.new
+    )
+    statement = AccountStatement.create_from_upload!(
+      family: @user.family,
+      account: account,
+      file: uploaded_file(filename: "historical.csv", content_type: "text/csv")
+    )
+    statement.update!(period_start_on: Date.new(2024, 2, 1), period_end_on: Date.new(2024, 2, 29))
+
+    travel_to Date.new(2026, 5, 6) do
+      get account_url(account, tab: "statements")
+
+      assert_response :success
+      assert_select "select[name='statement_year'] option[selected='selected']", text: "2026"
+      assert_select "p", text: "May 2026"
+      assert_select "p", text: "Not expected"
+
+      get account_url(account, tab: "statements", statement_year: 2024)
+
+      assert_response :success
+      assert_select "select[name='statement_year'] option[selected='selected']", text: "2024"
+      assert_select "p", text: "Jan 2024"
+      assert_select "p", text: "Feb 2024"
+      assert_select "p", text: "Covered"
+      assert_select "p", text: "Missing"
+      assert_select "p", text: "Not expected"
+    end
+  end
+
+  test "statements tab hides upload for read only account access" do
+    sign_in users(:family_member)
+
+    get account_url(accounts(:credit_card), tab: "statements")
+
+    assert_response :success
+    assert_select "input[type=file]", count: 0
+  end
+
+  test "account activity marks trade amounts as privacy-sensitive" do
+    trade_entry = entries(:trade)
+    expected_amount = ApplicationController.helpers.format_money(-trade_entry.amount_money)
+
+    get account_url(accounts(:investment))
+
+    assert_response :success
+    assert_select "turbo-frame##{dom_id(trade_entry)} p.privacy-sensitive", text: expected_amount, count: 1
+  end
+
+  test "activity pagination keeps activity tab when loaded from holdings tab" do
+    investment = accounts(:investment)
+
+    11.times do |i|
+      Entry.create!(
+        account: investment,
+        name: "Test investment activity #{i}",
+        date: Date.current - i.days,
+        amount: 10 + i,
+        currency: investment.currency,
+        entryable: Transaction.new
+      )
+    end
+
+    get account_url(investment, tab: "holdings")
+
+    assert_response :success
+    assert_select "a[href*='page=2'][href*='tab=activity']"
+    assert_select "a[href*='page=2'][href*='tab=holdings']", count: 0
+  end
+
+  test "account activity constrains long category labels before the amount on wide screens" do
+    category = categories(:food_and_drink)
+    category.update!(name: "Super Long Category Name That Should Stop Before The Amount On Wide Screens Too")
+
+    entry = @account.entries.create!(
+      name: "Wide category verification",
+      date: Date.current,
+      amount: 187.65,
+      currency: @account.currency,
+      entryable: Transaction.new(category: category)
+    )
+
+    get account_url(@account, tab: "activity")
+
+    assert_response :success
+    assert_select "##{dom_id(entry.entryable, "category_menu_desktop")}"
+    assert_select "##{dom_id(entry.entryable, "category_menu_desktop")}.min-w-0"
+    assert_select "##{dom_id(entry.entryable, "category_menu_desktop")}.overflow-hidden"
+    assert_select "##{dom_id(entry.entryable, "category_menu_desktop")} button.block"
+    assert_select "##{dom_id(entry.entryable, "category_menu_desktop")} button.w-full"
+    assert_select "##{dom_id(entry.entryable, "category_menu_desktop")} button.overflow-hidden"
+    assert_select "##{dom_id(entry.entryable, "category_menu_desktop")} [data-testid='category-name']"
+    assert_select "div.hidden.md\\:flex.min-w-0"
+  end
+
+  test "should sync account" do
+    post sync_account_url(@account)
+    assert_redirected_to account_url(@account)
+  end
+
+  test "should get sparkline" do
+    get sparkline_account_url(@account)
+    assert_response :success
+  end
+
+  test "destroys account" do
+    delete account_url(@account)
+    assert_redirected_to accounts_path
+    assert_enqueued_with job: DestroyJob
+    assert_equal "Depository account scheduled for deletion", flash[:notice]
+  end
+
+  test "syncing linked account triggers sync for all provider items" do
+    plaid_account = plaid_accounts(:one)
+    plaid_item = plaid_account.plaid_item
+    AccountProvider.create!(account: @account, provider: plaid_account)
+
+    # Reload to ensure the account has the provider association loaded
+    @account.reload
+
+    # Mock at the class level since controller loads account from DB
+    Account.any_instance.expects(:syncing?).returns(false)
+    PlaidItem.any_instance.expects(:syncing?).returns(false)
+    PlaidItem.any_instance.expects(:sync_later).once
+
+    post sync_account_url(@account)
+    assert_redirected_to account_url(@account)
+  end
+
+  test "syncing unlinked account calls account sync_later" do
+    Account.any_instance.expects(:syncing?).returns(false)
+    Account.any_instance.expects(:sync_later).once
+
+    post sync_account_url(@account)
+    assert_redirected_to account_url(@account)
+  end
+
+  test "confirms unlink for linked account" do
+    plaid_account = plaid_accounts(:one)
+    AccountProvider.create!(account: @account, provider: plaid_account)
+
+    get confirm_unlink_account_url(@account)
+    assert_response :success
+  end
+
+  test "redirects when confirming unlink for unlinked account" do
+    get confirm_unlink_account_url(@account)
+    assert_redirected_to account_url(@account)
+    assert_equal "Account is not linked to a provider", flash[:alert]
+  end
+
+  test "unlinks linked account successfully with new system" do
+    plaid_account = plaid_accounts(:one)
+    AccountProvider.create!(account: @account, provider: plaid_account)
+    @account.reload
+
+    assert @account.linked?
+
+    delete unlink_account_url(@account)
+    @account.reload
+
+    assert_not @account.linked?
+    assert_redirected_to accounts_path
+    assert_equal "Account unlinked successfully. It is now a manual account.", flash[:notice]
+  end
+
+  test "unlinks linked account successfully with legacy system" do
+    plaid_account = plaid_accounts(:one)
+    @account.update!(plaid_account_id: plaid_account.id)
+    @account.reload
+
+    assert @account.linked?
+
+    delete unlink_account_url(@account)
+    @account.reload
+
+    assert_not @account.linked?
+    assert_nil @account.plaid_account_id
+    assert_redirected_to accounts_path
+    assert_equal "Account unlinked successfully. It is now a manual account.", flash[:notice]
+  end
+
+  test "redirects when unlinking unlinked account" do
+    delete unlink_account_url(@account)
+    assert_redirected_to account_url(@account)
+    assert_equal "Account is not linked to a provider", flash[:alert]
+  end
+
+  test "unlinked account can be deleted" do
+    plaid_account = plaid_accounts(:one)
+    AccountProvider.create!(account: @account, provider: plaid_account)
+    @account.reload
+
+    # Cannot delete while linked
+    delete account_url(@account)
+    assert_redirected_to account_url(@account)
+    assert_equal "Cannot delete a linked account. Please unlink it first.", flash[:alert]
+
+    # Unlink the account
+    delete unlink_account_url(@account)
+    @account.reload
+
+    # Now can delete
+    delete account_url(@account)
+    assert_redirected_to accounts_path
+    assert_enqueued_with job: DestroyJob
+    assert_equal "Depository account scheduled for deletion", flash[:notice]
+  end
+
+  test "disabling an account keeps it visible on index" do
+    @account.disable!
+
+    get accounts_path
+
+    assert_response :success
+    assert_includes @response.body, @account.name
+  end
+
+  test "toggle_active disables and re-enables an account" do
+    patch toggle_active_account_url(@account)
+    assert_redirected_to accounts_path
+    @account.reload
+    assert @account.disabled?
+
+    patch toggle_active_account_url(@account)
+    assert_redirected_to accounts_path
+    @account.reload
+    assert @account.active?
+  end
+
+  test "toggle_exclude_from_reports toggles the flag on an account" do
+    assert_not @account.exclude_from_reports?
+
+    patch toggle_exclude_from_reports_account_url(@account)
+    assert_redirected_to accounts_path
+    @account.reload
+    assert @account.exclude_from_reports?
+
+    patch toggle_exclude_from_reports_account_url(@account)
+    assert_redirected_to accounts_path
+    @account.reload
+    assert_not @account.exclude_from_reports?
+  end
+
+  test "toggle_exclude_from_reports requires write permission" do
+    sign_in users(:family_member)
+
+    patch toggle_exclude_from_reports_account_url(accounts(:credit_card))
+    assert_redirected_to account_url(accounts(:credit_card))
+  end
+
+  test "select_provider shows available providers" do
+    get select_provider_account_url(@account)
+    assert_response :success
+  end
+
+  test "set_default sets user default account" do
+    patch set_default_account_url(@account)
+    assert_redirected_to accounts_path
+    @user.reload
+    assert_equal @account.id, @user.default_account_id
+  end
+
+  test "set_default rejects ineligible account type" do
+    investment = accounts(:investment)
+
+    patch set_default_account_url(investment)
+    assert_redirected_to accounts_path
+    assert_equal I18n.t("accounts.set_default.depository_only"), flash[:alert]
+
+    @user.reload
+    assert_not_equal investment.id, @user.default_account_id
+  end
+
+  test "remove_default clears user default account" do
+    @user.update!(default_account: @account)
+
+    patch remove_default_account_url(@account)
+    assert_redirected_to accounts_path
+
+    @user.reload
+    assert_nil @user.default_account_id
+  end
+
+  test "select_provider redirects for already linked account" do
+    plaid_account = plaid_accounts(:one)
+    AccountProvider.create!(account: @account, provider: plaid_account)
+
+    get select_provider_account_url(@account)
+    assert_redirected_to account_url(@account)
+    assert_equal "Account is already linked to a provider", flash[:alert]
+  end
+
+  test "unlink preserves SnaptradeAccount record" do
+    snaptrade_account = snaptrade_accounts(:fidelity_401k)
+    investment = accounts(:investment)
+    AccountProvider.create!(account: investment, provider: snaptrade_account)
+    investment.reload
+
+    assert investment.linked?
+
+    delete unlink_account_url(investment)
+    investment.reload
+
+    assert_not investment.linked?
+    assert_redirected_to accounts_path
+    # SnaptradeAccount should still exist (not destroyed)
+    assert SnaptradeAccount.exists?(snaptrade_account.id), "SnaptradeAccount should be preserved after unlink"
+    # But AccountProvider should be gone
+    assert_not AccountProvider.exists?(provider_type: "SnaptradeAccount", provider_id: snaptrade_account.id)
+  end
+
+  test "unlink does not enqueue SnapTrade cleanup job" do
+    snaptrade_account = snaptrade_accounts(:fidelity_401k)
+    investment = accounts(:investment)
+    AccountProvider.create!(account: investment, provider: snaptrade_account)
+    investment.reload
+
+    assert_no_enqueued_jobs(only: SnaptradeConnectionCleanupJob) do
+      delete unlink_account_url(investment)
+    end
+  end
+
+  test "unlink detaches holdings from SnapTrade provider" do
+    snaptrade_account = snaptrade_accounts(:fidelity_401k)
+    investment = accounts(:investment)
+    ap = AccountProvider.create!(account: investment, provider: snaptrade_account)
+
+    # Assign a holding to this provider
+    holding = holdings(:one)
+    holding.update!(account_provider: ap)
+
+    delete unlink_account_url(investment)
+    holding.reload
+
+    assert_nil holding.account_provider_id, "Holding should be detached from provider after unlink"
+  end
+end
+
+class AccountsControllerSimplefinCtaTest < ActionDispatch::IntegrationTest
+  fixtures :users, :families
+
+  setup do
+    sign_in users(:family_admin)
+    @family = families(:dylan_family)
+  end
+
+  test "when unlinked SFAs exist and manuals exist, shows setup button only" do
+    item = SimplefinItem.create!(family: @family, name: "Conn", access_url: "https://example.com/access")
+    # Unlinked SFA (no account and no provider link)
+    item.simplefin_accounts.create!(name: "A", account_id: "sf_a", currency: "USD", current_balance: 1, account_type: "depository")
+    # One manual account available
+    Account.create!(family: @family, name: "Manual A", currency: "USD", balance: 0, accountable_type: "Depository", accountable: Depository.create!(subtype: "checking"))
+
+    get accounts_path
+    assert_response :success
+    # Expect setup link present
+    assert_includes @response.body, setup_accounts_simplefin_item_path(item)
+    # Relink modal (SimpleFin-specific) should not be present anymore
+    refute_includes @response.body, "Link existing accounts"
+  end
+
+  test "when SFAs exist and none unlinked and manuals exist, no relink modal is shown (unified flow)" do
+    item = SimplefinItem.create!(family: @family, name: "Conn2", access_url: "https://example.com/access")
+    # Create a manual linked to SFA so unlinked count == 0
+    sfa = item.simplefin_accounts.create!(name: "B", account_id: "sf_b", currency: "USD", current_balance: 1, account_type: "depository")
+    linked = Account.create!(family: @family, name: "Linked", currency: "USD", balance: 0, accountable_type: "Depository", accountable: Depository.create!(subtype: "savings"))
+    # Legacy association sufficient to count as linked
+    sfa.update!(account: linked)
+
+    # Also create another manual account to make manuals_exist true
+    Account.create!(family: @family, name: "Manual B", currency: "USD", balance: 0, accountable_type: "Depository", accountable: Depository.create!(subtype: "checking"))
+
+    get accounts_path
+    assert_response :success
+    # The SimpleFin-specific relink modal is removed in favor of unified provider flow
+    refute_includes @response.body, "Link existing accounts"
+  end
+
+  test "when no SFAs exist, shows neither CTA" do
+    item = SimplefinItem.create!(family: @family, name: "Conn3", access_url: "https://example.com/access")
+
+    get accounts_path
+    assert_response :success
+    refute_includes @response.body, setup_accounts_simplefin_item_path(item)
+    refute_includes @response.body, "Link existing accounts"
+  end
+end

@@ -1,0 +1,119 @@
+diff --git a/docs/JOURNAL.md b/docs/JOURNAL.md
+index ec70b80..06a74ce 100644
+--- a/docs/JOURNAL.md
++++ b/docs/JOURNAL.md
+@@ -18,6 +18,28 @@ protocol. **Newest entries at the top.** Tag each entry with one or more of:
+ 
+ ---
+ 
++## 2026-07-12 — train-cost estimate dropped a duplicated worker's calls  #mistake #gotcha #repro
++
++**Context:** reading the new `trinity.train_cost.estimate_cmaes_cost` (projects sep-CMA-ES run spend,
++#179-era cost tooling).
++**Expected:** `total_usd` prices all `worker_calls` at the pool's blended per-call cost — the
++docstring's contract.
++**Actual:** `per_call`/`per_model_usd` are keyed by model name (a dict, so duplicate names collapse
++to one entry), but `calls_per_model = worker_calls / len(names)` still divides by the SLOT count. A
++pool that lists a model more than once (reachable via `train_cost_report.py --workers a a b`) drops
++the repeated slots' calls from the total. Reproduced: `['cheap','cheap','pricey']` reports $93.00
++where the documented blend is $96.00; `['a','a']` reports exactly half. Feeds `below_receipt_floor`,
++so an under-count can wrongly clear the $15 receipt floor.
++**Root cause:** collapsing calls by name while dividing by slot count double-loses the duplicated
++model's share.
++**Fix / decision:** split `worker_calls` across the pool slots (`worker_calls/len(names)` each) and
++fold each slot into its model (`calls_by_model[name] += share`), so a repeated model keeps both
++slots' weight. Identical output for a distinct pool; only the duplicated-name case changes, to match
++the documented blend. Added `tests/test_train_cost_duplicate_worker.py` (pure): dup keeps all calls
++priced, `['a','a']` prices both slots, total == worker_calls × slot-blend, distinct pool unchanged.
++Fixes #270.
++**Follow-up:** none.
++
+ ## 2026-07-12 — Radical canonicalization changed a font-wrapper regression expectation  #mistake #repro
+ 
+ **Context:** running the full CI suite after combining the font-wrapper and sqrt-normalization
+diff --git a/src/trinity/train_cost.py b/src/trinity/train_cost.py
+index afcab93..336c7ba 100644
+--- a/src/trinity/train_cost.py
++++ b/src/trinity/train_cost.py
+@@ -113,8 +113,17 @@ def estimate_cmaes_cost(
+         per_call[name] = (avg_prompt_tokens / 1e6 * pin
+                           + avg_completion_tokens / 1e6 * pout)
+ 
+-    calls_per_model = worker_calls / len(names)
+-    per_model_usd = {name: round(calls_per_model * c, 4) for name, c in per_call.items()}
++    # Split the calls across the pool SLOTS (worker_calls / len(names) each), then
++    # fold each slot into its model. Keying only by unique name and dividing by
++    # len(names) would drop the calls of any model the pool lists more than once,
++    # so the priced total no longer covers all worker_calls (an under-count that
++    # can wrongly clear the receipt floor). Summing per-slot shares keeps a
++    # repeated model's full weight in the blend.
++    share = worker_calls / len(names)
++    calls_by_model: dict[str, float] = {}
++    for name in names:
++        calls_by_model[name] = calls_by_model.get(name, 0.0) + share
++    per_model_usd = {name: round(calls_by_model[name] * per_call[name], 4) for name in per_call}
+     total = round(sum(per_model_usd.values()), 2)
+ 
+     return TrainCostEstimate(
+diff --git a/tests/test_train_cost_duplicate_worker.py b/tests/test_train_cost_duplicate_worker.py
+new file mode 100644
+index 0000000..e7cc714
+--- /dev/null
++++ b/tests/test_train_cost_duplicate_worker.py
+@@ -0,0 +1,56 @@
++"""Regression: a pool that lists a model more than once must not drop its calls (issue #270).
++
++`estimate_cmaes_cost` keyed `per_model_usd` by model name (collapsing duplicates)
++while dividing the calls by the slot count, so a repeated worker's share of the
++`worker_calls` was silently un-priced and `total_usd` under-counted the run.
++Pure Python — no network, no GPU, no torch.
++"""
++from __future__ import annotations
++
++from trinity.train_cost import estimate_cmaes_cost
++
++PRICES = {"cheap": (0.1, 0.2), "pricey": (3.0, 6.0)}
++
++
++def _est(worker_names, **kw):
++    return estimate_cmaes_cost(
++        population_size=10, m_cma=1, generations=1,
++        worker_names=worker_names, prices=PRICES,
++        avg_turns=3, avg_prompt_tokens=1_000_000, avg_completion_tokens=1_000_000,
++        **kw,
++    )
++
++
++def test_duplicate_worker_keeps_all_calls_priced():
++    # 3 slots, 30 worker calls -> 10 per slot. per-call: cheap=0.3, pricey=9.0.
++    # cheap listed twice -> 20 calls * 0.3 = 6.0 ; pricey 10 * 9.0 = 90.0 ; total 96.0.
++    e = _est(["cheap", "cheap", "pricey"])
++    assert e.worker_calls == 30
++    assert e.per_model_usd["cheap"] == 6.0
++    assert e.per_model_usd["pricey"] == 90.0
++    assert e.total_usd == 96.0
++
++
++def test_two_of_same_worker_prices_both_slots():
++    # ['a', 'a'] must price BOTH slots, not one (previously reported half).
++    e = _est(["cheap", "cheap"])
++    # 30 calls / 2 slots = 15 each -> cheap gets all 30 * 0.3 = 9.0.
++    assert e.total_usd == 9.0
++    assert e.per_model_usd["cheap"] == 9.0
++
++
++def test_total_equals_slot_blended_price_times_calls():
++    # total_usd must equal worker_calls * (mean per-call cost over the SLOTS).
++    names = ["cheap", "cheap", "pricey"]
++    e = _est(names)
++    per_call = {"cheap": 0.3, "pricey": 9.0}
++    slot_blend = sum(per_call[n] for n in names) / len(names)
++    assert abs(e.total_usd - round(e.worker_calls * slot_blend, 2)) < 1e-6
++
++
++def test_distinct_pool_is_unchanged():
++    # Regression guard: a distinct pool must price exactly as before.
++    e = _est(["cheap", "pricey"])
++    # 30 / 2 = 15 each -> cheap 15*0.3=4.5, pricey 15*9.0=135.0, total 139.5.
++    assert e.per_model_usd == {"cheap": 4.5, "pricey": 135.0}
++    assert e.total_usd == 139.5

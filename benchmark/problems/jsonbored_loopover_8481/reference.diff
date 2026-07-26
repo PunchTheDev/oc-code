@@ -1,0 +1,125 @@
+diff --git a/src/github/repo-doc-pr.ts b/src/github/repo-doc-pr.ts
+index f9381f6ab..ba9b5b2e2 100644
+--- a/src/github/repo-doc-pr.ts
++++ b/src/github/repo-doc-pr.ts
+@@ -25,6 +25,7 @@
+ // module's own design intent), so a skill-only content change can still open a PR even when AGENTS.md itself
+ // is unchanged, and a skill-file conflict (manual-review-required without the overwrite opt-in) only excludes
+ // the skill from this run rather than blocking the AGENTS.md refresh it rode in with.
++import { errorMessage } from "../utils/json";
+ import { githubErrorStatus, withInstallationTokenRetry } from "./app";
+ import { githubRateLimitAdmissionKeyForInstallation, makeInstallationOctokit } from "./client";
+ import { LOOPOVER_SITE_URL } from "./footer";
+@@ -59,6 +60,13 @@ function splitRepo(repoFullName: string): { owner: string; repo: string } {
+ type DocTreeEntry = { path: string; mode: "100644" | "120000"; type: "blob"; content: string };
+ type Octokit = ReturnType<typeof makeInstallationOctokit>;
+ 
++/** #8310: GitHub answers a create-ref for an existing branch with 422 "Reference already exists". Matched on
++ *  BOTH the status and the message so an unrelated 422 (e.g. a bad sha) still fails loudly instead of being
++ *  silently force-updated. */
++function isRefAlreadyExistsError(error: unknown): boolean {
++  return githubErrorStatus(error) === 422 && /reference already exists/i.test(errorMessage(error));
++}
++
+ // GitHub's Contents API base64-encodes the file's raw bytes (with line-wrapped whitespace); decoding through
+ // atob + TextDecoder (rather than a naive charCodeAt reassembly) is what makes this correct for non-ASCII
+ // manual content a maintainer added outside the generated markers.
+@@ -224,7 +232,18 @@ export async function openRepoDocPullRequest(env: Env, repoFullName: string, mod
+       const commit = await octokit.request("POST /repos/{owner}/{repo}/git/commits", { owner, repo, message: PR_TITLE, tree: treeSha, parents: [baseCommitSha] });
+       const commitSha = (commit.data as { sha: string }).sha;
+ 
+-      await octokit.request("POST /repos/{owner}/{repo}/git/refs", { owner, repo, ref: `refs/heads/${REPO_DOC_BRANCH_NAME}`, sha: commitSha });
++      // #8310: the ref can already exist with NO open PR on it -- a maintainer closed the previous repo-doc PR
++      // without deleting its branch (GitHub never forces that, and an API/bot close deletes nothing). The
++      // open-only PR lookup above then finds nothing, so we reach here and POST /git/refs 422s "Reference
++      // already exists", failing the whole refresh forever. This branch is exclusively owned by this feature
++      // (see the header comment), never shared with contributor work, so force-updating it to the freshly
++      // built commit is safe. Any OTHER failure still propagates to the outer catch's fail-safe.
++      try {
++        await octokit.request("POST /repos/{owner}/{repo}/git/refs", { owner, repo, ref: `refs/heads/${REPO_DOC_BRANCH_NAME}`, sha: commitSha });
++      } catch (refError) {
++        if (!isRefAlreadyExistsError(refError)) throw refError;
++        await octokit.request("PATCH /repos/{owner}/{repo}/git/refs/{ref}", { owner, repo, ref: `heads/${REPO_DOC_BRANCH_NAME}`, sha: commitSha, force: true });
++      }
+ 
+       const pr = await octokit.request("POST /repos/{owner}/{repo}/pulls", {
+         owner,
+diff --git a/test/unit/repo-doc-pr.test.ts b/test/unit/repo-doc-pr.test.ts
+index d844f9cd2..607ebb613 100644
+--- a/test/unit/repo-doc-pr.test.ts
++++ b/test/unit/repo-doc-pr.test.ts
+@@ -212,6 +212,74 @@ describe("openRepoDocPullRequest (#3000)", () => {
+     expect(prCall?.body.body as string).toContain("LoopOver opened this pull request");
+   });
+ 
++  // #8310: a maintainer closing the repo-doc PR WITHOUT deleting its branch left the ref behind. The open-only
++  // PR lookup then finds nothing, create-ref 422s "Reference already exists", and every later refresh failed
++  // permanently. The branch is owned solely by this feature, so force-updating it is safe.
++  it("force-updates the existing branch ref and still opens a fresh PR when the branch survived a closed PR", async () => {
++    const env = envWithKey();
++    await seedInstalledRepo(env, { defaultBranch: "main" });
++    await seedProfileData(env);
++    await seedRepoDocGenerationConfig(env, REPO);
++    const calls: Array<{ method: string; url: string; body: Record<string, unknown> }> = [];
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = input.toString();
++      if (TOKEN_URL.test(url)) return Response.json({ token: "t" });
++      const method = init?.method ?? "GET";
++      calls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : {} });
++      if (url.includes("/pulls?") && method === "GET") return Response.json([]); // the closed PR is not returned
++      if (url.includes("/contents/AGENTS.md") && method === "GET") return new Response("not found", { status: 404 });
++      if (url.includes("/contents/CLAUDE.md") && method === "GET") return new Response("not found", { status: 404 });
++      if (url.endsWith("/branches/main")) return Response.json({ commit: { sha: "base-commit-sha", commit: { tree: { sha: "base-tree-sha" } } } });
++      if (url.endsWith("/git/trees") && method === "POST") return Response.json({ sha: "new-tree-sha" });
++      if (url.endsWith("/git/commits") && method === "POST") return Response.json({ sha: "new-commit-sha" });
++      if (url.endsWith("/git/refs") && method === "POST") {
++        return Response.json({ message: "Reference already exists" }, { status: 422 });
++      }
++      if (method === "PATCH" && url.includes("/git/refs/")) return Response.json({ ref: "refs/heads/loopover/repo-docs" });
++      if (url.endsWith("/repos/owner/widgets/pulls") && method === "POST") return Response.json({ number: 43, html_url: "https://github.com/owner/widgets/pull/43" });
++      return new Response("unexpected", { status: 500 });
++    });
++
++    const result = await openRepoDocPullRequest(env, REPO, "live");
++
++    // A brand-new PR is opened (reused: false) -- a CLOSED PR is never silently revived.
++    expect(result).toMatchObject({ opened: true, reused: false, pullNumber: 43 });
++    const patchCall = calls.find((c) => c.method === "PATCH" && c.url.includes("/git/refs/"));
++    expect(patchCall, "expected a force ref-update after the create 422'd").toBeTruthy();
++    expect(patchCall?.body).toMatchObject({ sha: "new-commit-sha", force: true });
++  });
++
++  // #8310 (other arm): only "Reference already exists" is recovered. Any other create-ref failure must still
++  // degrade through the existing fail-safe rather than being force-pushed over.
++  it("does NOT force-update the ref for an unrelated create-ref failure, degrading to opened:false", async () => {
++    const env = envWithKey();
++    await seedInstalledRepo(env, { defaultBranch: "main" });
++    await seedProfileData(env);
++    await seedRepoDocGenerationConfig(env, REPO);
++    const calls: Array<{ method: string; url: string; body: Record<string, unknown> }> = [];
++    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = input.toString();
++      if (TOKEN_URL.test(url)) return Response.json({ token: "t" });
++      const method = init?.method ?? "GET";
++      calls.push({ method, url, body: init?.body ? JSON.parse(String(init.body)) : {} });
++      if (url.includes("/pulls?") && method === "GET") return Response.json([]);
++      if (url.includes("/contents/AGENTS.md") && method === "GET") return new Response("not found", { status: 404 });
++      if (url.includes("/contents/CLAUDE.md") && method === "GET") return new Response("not found", { status: 404 });
++      if (url.endsWith("/branches/main")) return Response.json({ commit: { sha: "base-commit-sha", commit: { tree: { sha: "base-tree-sha" } } } });
++      if (url.endsWith("/git/trees") && method === "POST") return Response.json({ sha: "new-tree-sha" });
++      if (url.endsWith("/git/commits") && method === "POST") return Response.json({ sha: "new-commit-sha" });
++      if (url.endsWith("/git/refs") && method === "POST") {
++        return Response.json({ message: "Invalid request. sha is not a valid commit" }, { status: 422 });
++      }
++      return new Response("unexpected", { status: 500 });
++    });
++
++    const result = await openRepoDocPullRequest(env, REPO, "live");
++
++    expect(result.opened).toBe(false);
++    expect(calls.some((c) => c.method === "PATCH")).toBe(false);
++  });
++
+   // #4613: a self-hoster's PUBLIC_SITE_ORIGIN reaches the generated AGENTS.md's attribution link instead
+   // of LOOPOVER_SITE_URL. NOTE: createTestEnv() defaults PUBLIC_SITE_ORIGIN to a truthy value (matching
+   // LOOPOVER_SITE_URL's own string), so envWithKey() alone does NOT exercise the `??` fallback's nullish

@@ -1,0 +1,149 @@
+diff --git a/apps/web/plugins/indexnow-scheduled.ts b/apps/web/plugins/indexnow-scheduled.ts
+index f4544f082b..603b9213da 100644
+--- a/apps/web/plugins/indexnow-scheduled.ts
++++ b/apps/web/plugins/indexnow-scheduled.ts
+@@ -2,6 +2,10 @@ import { definePlugin } from "nitro";
+ 
+ import { getEnvString, runWithCloudflareRuntime } from "@/lib/cloudflare-env.server";
+ import { getDirectoryEntries } from "@/lib/content.server";
++import {
++  INDEXNOW_CHANGE_WINDOW_MS,
++  isWithinIndexNowChangeWindow,
++} from "@/lib/indexnow-change-window-lib";
+ import { siteConfig } from "@/lib/site";
+ 
+ // Daily 05:00 UTC. Must match the string in wrangler.jsonc triggers.crons
+@@ -13,9 +17,11 @@ const DAILY_CRON = "0 5 * * *";
+ // ignores it and uses sitemap lastmod instead). We submit ONLY the URLs that
+ // changed recently, never the whole sitemap: resubmitting unchanged URLs gives
+ // no benefit and reads as spam. The key file is served from the site root.
++//
++// Window is ~26h (see INDEXNOW_CHANGE_WINDOW_MS): wider than the 24h cadence for
++// slight cron skew, but under 48h so a normal daily pair does not double-submit.
+ const INDEXNOW_ENDPOINT = "https://api.indexnow.org/indexnow";
+ const INDEXNOW_KEY = "48486ebc7ddc47af875118345161ae70";
+-const WINDOW_MS = 48 * 60 * 60 * 1000; // entries added/updated in the last 48h
+ const MAX_URLS = 1000; // IndexNow per-request cap
+ 
+ type CloudflareScheduledPayload = {
+@@ -61,7 +67,6 @@ export default definePlugin((nitroApp) => {
+           }
+ 
+           const now = Date.now();
+-          const cutoff = now - WINDOW_MS;
+           const entries = await getDirectoryEntries();
+ 
+           const seen = new Set<string>();
+@@ -69,7 +74,7 @@ export default definePlugin((nitroApp) => {
+           for (const entry of entries) {
+             const stampSource = entry.contentUpdatedAt ?? entry.dateAdded ?? "";
+             const stamp = Date.parse(stampSource);
+-            if (!Number.isFinite(stamp) || stamp < cutoff || stamp > now) continue;
++            if (!isWithinIndexNowChangeWindow(stamp, now, INDEXNOW_CHANGE_WINDOW_MS)) continue;
+ 
+             // IndexNow rejects a batch if any URL's host differs from the
+             // submitted `host`, so only trust canonicalUrl when it's HTTPS AND
+@@ -86,7 +91,7 @@ export default definePlugin((nitroApp) => {
+           }
+ 
+           if (!urls.length) {
+-            console.log("[indexnow] skipped: no URLs changed in the last 48h");
++            console.log("[indexnow] skipped: no URLs changed in the change window");
+             return;
+           }
+ 
+diff --git a/apps/web/src/lib/indexnow-change-window-lib.ts b/apps/web/src/lib/indexnow-change-window-lib.ts
+new file mode 100644
+index 0000000000..85ce8367d7
+--- /dev/null
++++ b/apps/web/src/lib/indexnow-change-window-lib.ts
+@@ -0,0 +1,30 @@
++/**
++ * Pure IndexNow change-window helpers for the daily scheduled submit job.
++ *
++ * The cron runs once per day (~24h). A 48h sliding window therefore marks
++ * almost every newly-changed URL eligible on *two* consecutive runs, which
++ * contradicts the job's anti-spam "submit only recent changes" design.
++ * Keep the window just wider than one cadence so a slightly-late daily run
++ * still catches updates, without guaranteeing a double submit under normal
++ * operation. A fully missed day can drop an update — use a persisted
++ * watermark if that tradeoff becomes unacceptable.
++ */
++
++export const INDEXNOW_DAILY_CADENCE_MS = 24 * 60 * 60 * 1000;
++
++/** Slightly wider than the daily cadence; must stay well under 2× cadence. */
++export const INDEXNOW_CHANGE_WINDOW_MS = 26 * 60 * 60 * 1000;
++
++/** True when `stampMs` falls inside the inclusive lookback window ending at `nowMs`. */
++export function isWithinIndexNowChangeWindow(
++  stampMs: number,
++  nowMs: number,
++  windowMs: number = INDEXNOW_CHANGE_WINDOW_MS,
++): boolean {
++  if (!Number.isFinite(stampMs) || !Number.isFinite(nowMs) || !Number.isFinite(windowMs)) {
++    return false;
++  }
++  if (windowMs < 0) return false;
++  const cutoff = nowMs - windowMs;
++  return stampMs >= cutoff && stampMs <= nowMs;
++}
+diff --git a/tests/indexnow-change-window-lib.test.ts b/tests/indexnow-change-window-lib.test.ts
+new file mode 100644
+index 0000000000..8f173d690c
+--- /dev/null
++++ b/tests/indexnow-change-window-lib.test.ts
+@@ -0,0 +1,53 @@
++import { describe, expect, it } from "vitest";
++
++import {
++  INDEXNOW_CHANGE_WINDOW_MS,
++  INDEXNOW_DAILY_CADENCE_MS,
++  isWithinIndexNowChangeWindow,
++} from "../apps/web/src/lib/indexnow-change-window-lib";
++
++describe("indexnow-change-window-lib", () => {
++  it("keeps the window between one and two daily cadences", () => {
++    expect(INDEXNOW_CHANGE_WINDOW_MS).toBeGreaterThan(
++      INDEXNOW_DAILY_CADENCE_MS,
++    );
++    expect(INDEXNOW_CHANGE_WINDOW_MS).toBeLessThan(
++      2 * INDEXNOW_DAILY_CADENCE_MS,
++    );
++  });
++
++  it("does not double-submit a T+ε change across consecutive daily runs", () => {
++    const t0 = Date.parse("2026-06-01T05:00:00.000Z");
++    const stamp = t0 + 60_000; // updated shortly after the previous run
++    const runPlus24h = t0 + INDEXNOW_DAILY_CADENCE_MS;
++    const runPlus48h = t0 + 2 * INDEXNOW_DAILY_CADENCE_MS;
++
++    // Before: a 48h window marks the URL eligible on both daily runs.
++    expect(
++      isWithinIndexNowChangeWindow(stamp, runPlus24h, 48 * 60 * 60 * 1000),
++    ).toBe(true);
++    expect(
++      isWithinIndexNowChangeWindow(stamp, runPlus48h, 48 * 60 * 60 * 1000),
++    ).toBe(true);
++
++    // After: the 26h window submits once on the next daily run, not again.
++    expect(isWithinIndexNowChangeWindow(stamp, runPlus24h)).toBe(true);
++    expect(isWithinIndexNowChangeWindow(stamp, runPlus48h)).toBe(false);
++  });
++
++  it("rejects future stamps and non-finite values", () => {
++    const now = Date.parse("2026-06-02T05:00:00.000Z");
++    expect(isWithinIndexNowChangeWindow(now + 1, now)).toBe(false);
++    expect(isWithinIndexNowChangeWindow(Number.NaN, now)).toBe(false);
++  });
++
++  it("includes the cutoff boundary and excludes ages just beyond the window", () => {
++    const now = Date.parse("2026-06-02T05:00:00.000Z");
++    expect(
++      isWithinIndexNowChangeWindow(now - INDEXNOW_CHANGE_WINDOW_MS, now),
++    ).toBe(true);
++    expect(
++      isWithinIndexNowChangeWindow(now - INDEXNOW_CHANGE_WINDOW_MS - 1, now),
++    ).toBe(false);
++  });
++});

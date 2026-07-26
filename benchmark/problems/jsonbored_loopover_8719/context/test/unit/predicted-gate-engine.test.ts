@@ -1,0 +1,2143 @@
+import { describe, expect, it } from "vitest";
+
+import { evaluateGateCheck, buildPullRequestAdvisory, gateAdvisoryInternals } from "../../packages/loopover-engine/src/advisory/gate-advisory";
+import { buildFocusManifestGuidance, isFocusManifestPublicSafe, matchesManifestPath } from "../../packages/loopover-engine/src/focus-manifest/guidance";
+import { sanitizePublicComment } from "../../packages/loopover-engine/src/github/sanitize-public-comment";
+import {
+  CLA_CHECK_UNRESOLVED_CODE,
+  CLA_CONSENT_MISSING_CODE,
+  evaluateClaCheck,
+  type ClaCheckConfig,
+} from "../../packages/loopover-engine/src/review/cla-check";
+import { evaluatePreMergeChecks, PRE_MERGE_CHECK_ADVISORY_CODE, PRE_MERGE_CHECK_BLOCKING_CODE, PRE_MERGE_CHECK_UNRESOLVED_CODE } from "../../packages/loopover-engine/src/review/pre-merge-checks";
+import { REVIEW_THREAD_BLOCKER_CODE } from "../../packages/loopover-engine/src/review/review-thread-findings";
+import { diffFilePriority } from "../../packages/loopover-engine/src/review/diff-file-priority";
+import {
+  clearLabelPatternRegExpCacheForTest,
+  LABEL_PATTERN_REGEXP_CACHE_MAX_ENTRIES,
+  labelMatchesPattern,
+  labelPatternRegExpCacheKeysForTest,
+} from "../../packages/loopover-engine/src/scoring/label-match";
+import {
+  changedPathsHittingGuardrail,
+  globToRegExp,
+  guardrailPathMatches,
+  isGuardrailHit,
+  matchesAny,
+} from "../../packages/loopover-engine/src/signals/change-guardrail";
+import { isDuplicateClusterWinnerByClaim, resolveDuplicateClusterWinnerNumber } from "../../packages/loopover-engine/src/signals/duplicate-winner";
+import {
+  buildCollisionReport,
+  buildLaneAdvice,
+  buildPreflightResult,
+  buildPublicReadinessScore,
+  buildQueueHealth,
+  classifyBountyLifecycle,
+  itemSharesPlannedLinkedIssue,
+  predictedGateEngineInternals,
+  termOverlap,
+  unionScopedOverlapClusters,
+} from "../../packages/loopover-engine/src/signals/predicted-gate-engine";
+import type {
+  CollisionItem,
+  FocusManifest,
+  FocusManifestGuidance,
+  IssueQualityReport,
+  PreMergeCheck,
+  PullRequestRecord,
+  RegistryRepoConfig,
+  RepositoryRecord,
+} from "../../packages/loopover-engine/src/types/predicted-gate-types";
+
+const REPO: RepositoryRecord = {
+  fullName: "acme/widgets",
+  owner: "acme",
+  name: "widgets",
+  isInstalled: true,
+  isRegistered: true,
+  isPrivate: false,
+  registryConfig: {
+    repo: "acme/widgets",
+    emissionShare: 1,
+    issueDiscoveryShare: 0,
+    labelMultipliers: { "type:*": 1.2, bug: 1.1 },
+    maintainerCut: 0,
+    raw: {},
+  },
+};
+
+const PR: PullRequestRecord = {
+  repoFullName: "acme/widgets",
+  number: 9,
+  title: "Fix upload retries",
+  state: "open",
+  authorLogin: "miner1",
+  labels: ["type:bug-fix", "bug"],
+  linkedIssues: [7],
+};
+
+const claConfig = (over: Partial<ClaCheckConfig> = {}): ClaCheckConfig => ({
+  consentPhrase: null,
+  checkRunName: null,
+  ...over,
+});
+
+const preMergeCheck = (over: Partial<PreMergeCheck> = {}): PreMergeCheck => ({
+  name: "Check",
+  whenPaths: [],
+  titleContains: null,
+  descriptionContains: null,
+  requireLabel: null,
+  enforce: false,
+  ...over,
+});
+
+describe("predicted-gate engine module coverage (#2283)", () => {
+  it("mirrors scoring label matcher semantics through the engine copy", () => {
+    expect(labelMatchesPattern("type:bug-fix", "type:*")).toBe(true);
+    expect(labelMatchesPattern("kind:chore", "type:*")).toBe(false);
+    expect(labelMatchesPattern("Priority:1", "priority:?")).toBe(true);
+    expect(labelMatchesPattern("priority:10", "priority:?")).toBe(false);
+    expect(labelMatchesPattern("kind/bug", "kind/[bc]ug")).toBe(true);
+    expect(labelMatchesPattern("kind/dug", "kind/[!bc]ug")).toBe(true);
+    expect(labelMatchesPattern("^ug", "[^x]ug")).toBe(true);
+    expect(labelMatchesPattern("bug", "[^x]ug")).toBe(false);
+    expect(labelMatchesPattern("x", "[z-a]")).toBe(false);
+    expect(labelMatchesPattern("[bug", "[bug")).toBe(true);
+    expect(labelMatchesPattern("m", "[a-z-9]")).toBe(true);
+    expect(labelMatchesPattern("5", "[!a-z-9]")).toBe(true);
+    expect(labelMatchesPattern("type-bug-fix", "type-*-*")).toBe(true);
+    expect(labelMatchesPattern("a-b-c-final", "*-*-*-final")).toBe(false);
+    expect(labelMatchesPattern("x", "[!]")).toBe(false);
+    expect(labelMatchesPattern("a.b", "a.b")).toBe(true);
+  });
+
+  it("bounds the memoized label pattern cache and evicts least-recently-used entries", () => {
+    clearLabelPatternRegExpCacheForTest();
+    for (let i = 0; i < LABEL_PATTERN_REGEXP_CACHE_MAX_ENTRIES; i += 1) {
+      expect(labelMatchesPattern(`kind:${i}`, `kind:${i}`)).toBe(true);
+    }
+    expect(labelPatternRegExpCacheKeysForTest()).toHaveLength(LABEL_PATTERN_REGEXP_CACHE_MAX_ENTRIES);
+    expect(labelMatchesPattern("kind:0", "kind:0")).toBe(true);
+    expect(labelMatchesPattern("kind:overflow", "kind:overflow")).toBe(true);
+    expect(labelPatternRegExpCacheKeysForTest()).toContain("kind:0");
+    expect(labelPatternRegExpCacheKeysForTest()).not.toContain("kind:1");
+    clearLabelPatternRegExpCacheForTest();
+  });
+
+  it("exercises duplicate-winner election helpers", () => {
+    // #dup-winner anti-backdating: createdAt is deliberately NOT an ordering signal (a contributor can edit an
+    // old placeholder PR to add a linked issue later), so a pair with only createdAt and no linkedIssueClaimedAt
+    // has no comparable claim time and fails closed, regardless of which createdAt is earlier.
+    expect(isDuplicateClusterWinnerByClaim({ number: 1, createdAt: "2026-01-01T00:00:00.000Z" }, [{ number: 2, createdAt: "2026-01-02T00:00:00.000Z" }])).toBe(false);
+    expect(
+      isDuplicateClusterWinnerByClaim(
+        { number: 2, linkedIssueClaimedAt: "2026-01-02T00:00:00.000Z" },
+        [{ number: 1, linkedIssueClaimedAt: "2026-01-01T00:00:00.000Z" }],
+      ),
+    ).toBe(false);
+    expect(
+      isDuplicateClusterWinnerByClaim(
+        { number: 3, linkedIssueClaimedAt: "2026-01-01T00:00:00.000Z" },
+        [{ number: 2, linkedIssueClaimedAt: "2026-01-01T00:00:00.000Z" }],
+      ),
+    ).toBe(false);
+    expect(
+      isDuplicateClusterWinnerByClaim(
+        { number: 1, createdAt: "2026-01-01T00:00:00.000Z" },
+        [{ number: 2, createdAt: "2026-01-01T00:00:00.000Z" }],
+      ),
+    ).toBe(false);
+    // Same fail-closed reasoning: resolveDuplicateClusterWinnerNumber mirrors isDuplicateClusterWinnerByClaim,
+    // so a createdAt-only pair with no linkedIssueClaimedAt is not a determinable election either.
+    expect(resolveDuplicateClusterWinnerNumber({ number: 2, createdAt: "2026-01-02T00:00:00.000Z" }, [{ number: 1, createdAt: "2026-01-01T00:00:00.000Z" }])).toBeNull();
+    expect(resolveDuplicateClusterWinnerNumber({ number: 1, createdAt: null }, [{ number: 2, createdAt: null }])).toBeNull();
+  });
+
+  it("exercises diff-file priority tiers and guardrail glob helpers", () => {
+    expect(diffFilePriority("src/app.ts")).toBe(0);
+    expect(diffFilePriority("src/app.test.ts")).toBe(1);
+    expect(diffFilePriority("README.md")).toBe(2);
+    expect(diffFilePriority("package-lock.json")).toBe(4);
+    expect(diffFilePriority("dist/bundle.js")).toBe(4);
+    expect(globToRegExp("src/**/model.ts").test("src/a/deep/model.ts")).toBe(true);
+    expect(globToRegExp("public/**/*.json").test("public/release/config.json")).toBe(true);
+    expect(matchesAny("completely/unrelated.md", ["*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*/*"])).toBe(true);
+    expect(changedPathsHittingGuardrail(["src/a.ts"], [])).toEqual([]);
+    expect(isGuardrailHit(["docs/readme.md"], ["scripts/**"])).toBe(false);
+    expect(matchesManifestPath("", "src/**")).toBe(false);
+    expect(matchesManifestPath("src/a.ts", "")).toBe(false);
+    expect(matchesManifestPath("src/nested/a.ts", "src/")).toBe(true);
+    expect(isFocusManifestPublicSafe("wallet hotkey farming")).toBe(false);
+    expect(isFocusManifestPublicSafe("Keep changes focused.")).toBe(true);
+  });
+
+  it("exercises guardrail path matching", () => {
+    expect(isGuardrailHit([".github/workflows/ci.yml"], [".github/workflows/*"])).toBe(true);
+    expect(guardrailPathMatches([".github/workflows/ci.yml"], [".github/workflows/*"])).toEqual([
+      { path: ".github/workflows/ci.yml", glob: ".github/workflows/*" },
+    ]);
+  });
+
+  it("exercises sanitizePublicComment redaction paths", () => {
+    expect(sanitizePublicComment("score estimate 12.5 -> 41.2")).toContain("private context");
+    expect(sanitizePublicComment("reviewability internals")).toContain("private context");
+    expect(sanitizePublicComment("@loopover reviewability score")).toContain("reviewability");
+    expect(sanitizePublicComment("likely_duplicate overlap")).toContain("possible overlap");
+    expect(sanitizePublicComment("open pr count 12 exceeds threshold 10")).toContain("private context");
+  });
+
+  // Regression: this sanitizer's phrase list had no entry for bare "cohort" or standalone
+  // miner-originated/human-originated/raw-trust (only compound phrases like "raw trust score"), unlike the
+  // canonical PUBLIC_UNSAFE_TERMS boundary (src/signals/redaction.ts) which treats all of these as unsafe.
+  // A bare "score" is intentionally NOT redacted by this shared function (see the comment above its
+  // cohort/originated replace call in sanitize-public-comment.ts): it is also reused by
+  // src/services/score-breakdown.ts's own contributor-facing "explain my score" copy, which legitimately says
+  // "score" throughout by design.
+  it("redacts bare cohort and standalone miner-originated/human-originated/raw-trust mentions", () => {
+    expect(
+      sanitizePublicComment("This diff looks miner-originated and the resulting cohort standing would only shift modestly."),
+    ).not.toMatch(/miner-originated|cohort/i);
+    expect(sanitizePublicComment("This PR affects the cohort.")).toContain("private context");
+    expect(sanitizePublicComment("This change is human originated.")).toContain("private context");
+    expect(sanitizePublicComment("Raw trust is unaffected by this PR.")).toContain("private context");
+  });
+
+  it("exercises focus-manifest guidance branches", () => {
+    const manifest: FocusManifest = {
+      present: true,
+      source: "repo_file",
+      wantedPaths: ["src/"],
+      preferredLabels: ["bug"],
+      linkedIssuePolicy: "required",
+      testExpectations: ["npm test"],
+      issueDiscoveryPolicy: "discouraged",
+      maintainerNotes: [],
+      publicNotes: ["Keep changes focused."],
+      gate: { present: true } as FocusManifest["gate"],
+      settings: {},
+      review: { present: true, preMergeChecks: [] },
+      warnings: [],
+    };
+    const offFocus = buildFocusManifestGuidance({ manifest, changedPaths: ["docs/readme.md"], labels: [], linkedIssueCount: 0, testFileCount: 0 });
+    expect(offFocus.findings.some((f) => f.code === "manifest_off_focus")).toBe(true);
+    expect(offFocus.findings.some((f) => f.code === "manifest_linked_issue_required")).toBe(true);
+    expect(offFocus.findings.some((f) => f.code === "manifest_issue_discovery_discouraged")).toBe(true);
+    const aligned = buildFocusManifestGuidance({ manifest, changedPaths: ["src/a.ts"], labels: ["bug"], linkedIssueCount: 1, testFileCount: 1 });
+    expect(aligned.findings.some((f) => f.code === "manifest_preferred_path")).toBe(true);
+  });
+
+  it("exercises pre-merge unresolved path-gated checks", () => {
+    const findings = evaluatePreMergeChecks(
+      [{ name: "migrations", whenPaths: ["migrations/**"], titleContains: null, descriptionContains: null, requireLabel: null, enforce: true }],
+      { title: "x", body: "y", labels: [], changedPaths: [], filesResolved: false },
+    );
+    expect(findings[0]?.code).toBe(PRE_MERGE_CHECK_UNRESOLVED_CODE);
+  });
+
+  it("exercises preflight bounty and issue-quality branches", () => {
+    const issueQuality: IssueQualityReport = {
+      repoFullName: "acme/widgets",
+      generatedAt: "2026-01-01T00:00:00.000Z",
+      lane: { lane: "direct_pr", repoFullName: "acme/widgets", summary: "ok", contributorGuidance: "ok", maintainerGuidance: "ok" },
+      issues: [{ number: 7, title: "Issue", status: "do_not_use", score: 0, reasons: [], warnings: ["already solved"] }],
+      summary: "hold",
+    };
+    const preflight = buildPreflightResult(
+      { repoFullName: "acme/widgets", title: "Fix", body: "Closes #7", linkedIssues: [7], changedFiles: ["src/a.ts"] },
+      REPO,
+      [],
+      [],
+      [{ id: "b1", repoFullName: "acme/widgets", issueNumber: 7, status: "completed", payload: {} }],
+      issueQuality,
+    );
+    expect(preflight.findings.some((f) => f.code === "issue_quality_do_not_use")).toBe(true);
+    expect(preflight.findings.some((f) => f.code === "linked_issue_bounty_historical")).toBe(true);
+  });
+
+  it("exercises advisory label context and dry-run displayConclusion", () => {
+    const advisory = buildPullRequestAdvisory(REPO, PR);
+    expect(advisory.findings.some((f) => f.code === "label_context_found")).toBe(true);
+    const dry = evaluateGateCheck(advisory, { dryRun: true, duplicatePrGateMode: "advisory", linkedIssueGateMode: "advisory", aiReviewGateMode: "advisory" });
+    expect(dry.displayConclusion).toBeDefined();
+  });
+
+  it("exercises advisory edge cases and gate failures", () => {
+    const missingRepo = buildPullRequestAdvisory(null, PR);
+    expect(missingRepo.findings.some((f) => f.code === "repo_not_registered")).toBe(true);
+    const missingPr = buildPullRequestAdvisory(REPO, null);
+    expect(missingPr.findings.some((f) => f.code === "pr_not_cached")).toBe(true);
+    const blocked = evaluateGateCheck(
+      {
+        id: "a",
+        targetType: "pull_request",
+        targetKey: "k",
+        repoFullName: REPO.fullName,
+        conclusion: "neutral",
+        severity: "warning",
+        title: "t",
+        summary: "s",
+        findings: [{ code: "duplicate_pr_risk", severity: "warning", title: "dup", detail: "dup" }],
+        generatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      { duplicatePrGateMode: "block" },
+    );
+    expect(blocked.conclusion).toBe("failure");
+  });
+
+  it("exercises the inactive lane advice branch", () => {
+    const inactive = buildPreflightResult(
+      { repoFullName: "acme/widgets", title: "Fix", body: "Closes #7", linkedIssues: [7] },
+      { ...REPO, registryConfig: { ...REPO.registryConfig!, emissionShare: 0 } },
+      [],
+      [],
+    );
+    expect(inactive.lane.lane).toBe("inactive");
+  });
+
+  // #6771: the local extractor's own comment claims it matches the canonical src/db/repositories.ts extractor,
+  // which stops at MAX_LINKED_ISSUE_NUMBERS = 50 — but it collected every match uncapped. A body can easily fit
+  // 50+ short closing refs inside the 20k-char truncation this runs on, so the miner's local prediction could
+  // diverge from the maintainer-side gate it exists to mirror.
+  it("REGRESSION (#6771): caps extracted linked issues at the canonical 50, across all three reference forms", () => {
+    // 66 DISTINCT closing references: 30 bare `#N`, 18 qualified `owner/repo#N`, 18 full-URL — all same-repo.
+    const bare = Array.from({ length: 30 }, (_, i) => `Closes #${i + 1}`);
+    const qualified = Array.from({ length: 18 }, (_, i) => `Fixes acme/widgets#${i + 101}`);
+    const urls = Array.from({ length: 18 }, (_, i) => `Resolves https://github.com/acme/widgets/issues/${i + 201}`);
+    const body = [...bare, ...qualified, ...urls].join("\n");
+
+    const preflight = buildPreflightResult(
+      { repoFullName: "acme/widgets", title: "Many links", body, linkedIssues: [] },
+      REPO,
+      [],
+      [],
+    );
+
+    // The body genuinely carries more than the cap, and the extractor's contribution is bounded at 50.
+    expect(bare.length + qualified.length + urls.length).toBeGreaterThan(50);
+    expect(preflight.linkedIssues).toHaveLength(50);
+    // Still real, deduped, positive issue numbers — the cap truncates, it doesn't corrupt.
+    expect(new Set(preflight.linkedIssues).size).toBe(50);
+    expect(preflight.linkedIssues.every((n) => Number.isInteger(n) && n > 0)).toBe(true);
+  });
+
+  it("never leaks public-unsafe wantedPaths/preferredLabels into contributor-facing guidance (#6770)", () => {
+    // wantedPaths and preferredLabels are freeform maintainer-authored text that is never public-safety-checked
+    // at parse time, so buildFocusManifestGuidance must filter them before interpolating them into a finding.
+    const manifest: FocusManifest = {
+      present: true,
+      source: "repo_file",
+      wantedPaths: ["src/reward-payouts/**", "/home/maintainer/secret/**"],
+      preferredLabels: ["trust-score", "hotkey-rotation"],
+      linkedIssuePolicy: "optional",
+      testExpectations: [],
+      issueDiscoveryPolicy: "neutral",
+      maintainerNotes: [],
+      publicNotes: [],
+      gate: { present: true } as FocusManifest["gate"],
+      settings: {},
+      review: { present: true, preMergeChecks: [] },
+      warnings: [],
+    };
+    const forbidden = ["reward-payouts", "/home/maintainer", "trust-score", "hotkey-rotation"];
+    const surfaceOf = (guidance: FocusManifestGuidance): string =>
+      JSON.stringify([guidance.findings, guidance.publicNextSteps, guidance.summary]);
+
+    // Every manifest entry is unsafe here, so each filtered list is empty -> the zero-safe fallback arms fire.
+    const offFocus = buildFocusManifestGuidance({ manifest, changedPaths: ["docs/readme.md"], labels: [], linkedIssueCount: 1, testFileCount: 1 });
+    expect(offFocus.findings.some((f) => f.code === "manifest_off_focus")).toBe(true);
+    expect(offFocus.findings.find((f) => f.code === "manifest_off_focus")?.detail).toBe(
+      "No changed path matches the maintainer-wanted patterns.",
+    );
+    expect(offFocus.findings.find((f) => f.code === "manifest_missing_preferred_label")?.detail).toBe(
+      "No maintainer-preferred label applied.",
+    );
+    expect(offFocus.publicNextSteps).toContain("Consider applying a maintainer-preferred label so triage stays aligned.");
+    for (const term of forbidden) expect(surfaceOf(offFocus)).not.toContain(term);
+
+    // A matched-but-unsafe wanted path must not reach manifest_preferred_path's detail either.
+    const matchedUnsafe = buildFocusManifestGuidance({ manifest, changedPaths: ["src/reward-payouts/a.ts"], labels: [], linkedIssueCount: 1, testFileCount: 1 });
+    expect(matchedUnsafe.matchedWantedPaths.length).toBeGreaterThan(0);
+    expect(matchedUnsafe.findings.find((f) => f.code === "manifest_preferred_path")?.detail).toBe(
+      "Changed paths match the maintainer-wanted patterns.",
+    );
+    for (const term of forbidden) expect(surfaceOf(matchedUnsafe)).not.toContain(term);
+
+    // Safe entries survive: the filter must drop only the unsafe ones, not the whole list.
+    const mixed: FocusManifest = { ...manifest, wantedPaths: ["src/api/**", "src/reward-payouts/**"], preferredLabels: ["bug", "trust-score"] };
+    const mixedOffFocus = buildFocusManifestGuidance({ manifest: mixed, changedPaths: ["docs/readme.md"], labels: [], linkedIssueCount: 1, testFileCount: 1 });
+    expect(mixedOffFocus.findings.find((f) => f.code === "manifest_off_focus")?.detail).toBe(
+      "No changed path matches the maintainer-wanted patterns (src/api/**).",
+    );
+    expect(mixedOffFocus.findings.find((f) => f.code === "manifest_missing_preferred_label")?.detail).toBe(
+      "Maintainer prefers labels: bug.",
+    );
+    expect(mixedOffFocus.publicNextSteps).toContain("Consider a maintainer-preferred label (bug).");
+    for (const term of forbidden) expect(surfaceOf(mixedOffFocus)).not.toContain(term);
+
+    const mixedMatched = buildFocusManifestGuidance({ manifest: mixed, changedPaths: ["src/api/a.ts", "src/reward-payouts/b.ts"], labels: [], linkedIssueCount: 1, testFileCount: 1 });
+    expect(mixedMatched.findings.find((f) => f.code === "manifest_preferred_path")?.detail).toBe(
+      "Changed paths match maintainer-wanted patterns: src/api/**.",
+    );
+    for (const term of forbidden) expect(surfaceOf(mixedMatched)).not.toContain(term);
+  });
+
+  it("exercises manifest globstar path matching", () => {
+    const manifest: FocusManifest = {
+      present: true,
+      source: "repo_file",
+      wantedPaths: ["**/safe.ts"],
+      preferredLabels: [],
+      linkedIssuePolicy: "optional",
+      testExpectations: [],
+      issueDiscoveryPolicy: "neutral",
+      maintainerNotes: [],
+      publicNotes: [],
+      gate: { present: true } as FocusManifest["gate"],
+      settings: {},
+      review: { present: true, preMergeChecks: [] },
+      warnings: [],
+    };
+    const guidance = buildFocusManifestGuidance({ manifest, changedPaths: ["safe.ts", "nested/safe.ts"], linkedIssueCount: 1, testFileCount: 1 });
+    expect(guidance.matchedWantedPaths.length).toBeGreaterThan(0);
+  });
+
+  it("exercises lane, collision, queue, and preflight edge branches", () => {
+    const issueDiscoveryRepo: RepositoryRecord = {
+      ...REPO,
+      registryConfig: { ...REPO.registryConfig!, issueDiscoveryShare: 1, emissionShare: 1 },
+    };
+    const splitRepo: RepositoryRecord = {
+      ...REPO,
+      registryConfig: { ...REPO.registryConfig!, issueDiscoveryShare: 0.5, emissionShare: 1 },
+    };
+    const discoveryPreflight = buildPreflightResult({ repoFullName: REPO.fullName, title: "Report issue", body: "", linkedIssues: [] }, issueDiscoveryRepo, [], []);
+    expect(discoveryPreflight.lane.lane).toBe("issue_discovery");
+    const splitPreflight = buildPreflightResult({ repoFullName: REPO.fullName, title: "Fix", body: "Closes #7", linkedIssues: [7] }, splitRepo, [], []);
+    expect(splitPreflight.lane.lane).toBe("split");
+
+    const collisions = buildCollisionReport(
+      REPO.fullName,
+      [],
+      [
+        { ...PR, number: 1, authorLogin: "alice", title: "retry upload client", changedFiles: ["src/upload.ts"] },
+        { ...PR, number: 2, authorLogin: "alice", title: "retry upload service", changedFiles: ["src/upload.ts"] },
+        { ...PR, number: 3, authorLogin: "bob", title: "totally different", changedFiles: ["src/upload.ts"] },
+        { ...PR, number: 4, authorLogin: "carol", title: "totally different too", changedFiles: ["src/upload.ts"] },
+      ],
+    );
+    expect(collisions.clusters.length).toBeGreaterThan(0);
+
+    const queue = buildPreflightResult(
+      { repoFullName: REPO.fullName, title: "Big change", body: "", linkedIssues: [7, 8], changedFiles: Array.from({ length: 12 }, (_, i) => `src/f${i}.ts`) },
+      REPO,
+      [],
+      [
+        { ...PR, number: 11, linkedIssues: [], updatedAt: "2020-01-01T00:00:00.000Z", isDraft: true },
+        { ...PR, number: 12, linkedIssues: [], updatedAt: "2020-01-01T00:00:00.000Z" },
+      ],
+      [{ id: "b2", repoFullName: REPO.fullName, issueNumber: 7, status: "stale bounty", payload: {} }],
+      {
+        repoFullName: REPO.fullName,
+        generatedAt: "2026-01-01T00:00:00.000Z",
+        lane: splitPreflight.lane,
+        issues: [
+          { number: 7, title: "Issue", status: "needs_proof", score: 0, reasons: [], warnings: ["needs proof"] },
+          { number: 8, title: "Issue2", status: "hold", score: 0, reasons: [], warnings: ["hold"] },
+        ],
+        summary: "x",
+      },
+    );
+    expect(queue.findings.some((f) => f.code === "missing_test_evidence")).toBe(true);
+    expect(queue.findings.some((f) => f.code === "linked_issue_bounty_unverified")).toBe(true);
+    expect(queue.findings.some((f) => f.code === "issue_quality_needs_proof")).toBe(true);
+    expect(queue.findings.some((f) => f.code === "issue_quality_hold")).toBe(true);
+
+    const collisionsForQueue = buildCollisionReport(REPO.fullName, [], [{ ...PR, number: 11, linkedIssues: [], updatedAt: "2020-01-01T00:00:00.000Z", isDraft: true }]);
+    const queueHealth = buildQueueHealth(REPO, [], [{ ...PR, number: 11, linkedIssues: [], updatedAt: "2020-01-01T00:00:00.000Z", isDraft: true }], collisionsForQueue);
+    expect(queueHealth.findings.some((f) => f.code === "unlinked_prs")).toBe(true);
+    expect(queueHealth.findings.some((f) => f.code === "inactive_draft_prs")).toBe(true);
+  });
+
+  it("REGRESSION (#linked-issue-sparse-first-upsert): does not flag missing_linked_issue when bodyObservedAt is explicitly null, but still flags it once observed", () => {
+    const unobserved = buildPullRequestAdvisory(REPO, { ...PR, linkedIssues: [], bodyObservedAt: null }, { requireLinkedIssue: true });
+    expect(unobserved.findings.some((f) => f.code === "missing_linked_issue")).toBe(false);
+
+    const observed = buildPullRequestAdvisory(REPO, { ...PR, linkedIssues: [], bodyObservedAt: "2026-07-14T00:00:00.000Z" }, { requireLinkedIssue: true });
+    expect(observed.findings.some((f) => f.code === "missing_linked_issue")).toBe(true);
+  });
+
+  it("REGRESSION (#7252): a Kotlin-script-only change counts as code so it trips missing_test_evidence like the canonical matcher", () => {
+    // build.gradle.kts is hand-authored source; the predicted-gate engine's old local isCodeFile copy
+    // lacked the `kts` extension the canonical test-evidence matcher has, so a .kts-only PR skipped the
+    // missing-test-evidence preflight. Single-sourcing on isCodeFile widens the predicted gate to match.
+    const ktsOnly = buildPreflightResult(
+      { repoFullName: REPO.fullName, title: "Bump Gradle plugin", body: "Closes #7", linkedIssues: [7], changedFiles: ["build.gradle.kts"] },
+      REPO,
+      [],
+      [],
+    );
+    expect(ktsOnly.findings.some((f) => f.code === "missing_test_evidence")).toBe(true);
+  });
+
+  it("REGRESSION (#6628): predicted preflight honors a clear no-issue rationale like the live gate", () => {
+    const docsOnly = buildPreflightResult(
+      { repoFullName: REPO.fullName, title: "docs-only: fix typo", body: "", linkedIssues: [] },
+      REPO,
+      [],
+      [],
+    );
+    expect(docsOnly.lane.lane).not.toBe("issue_discovery");
+    expect(docsOnly.findings.some((finding) => finding.code === "missing_linked_issue")).toBe(false);
+
+    const unexplained = buildPreflightResult(
+      { repoFullName: REPO.fullName, title: "Fix upload behavior", body: "", linkedIssues: [] },
+      REPO,
+      [],
+      [],
+    );
+    expect(unexplained.findings.some((finding) => finding.code === "missing_linked_issue")).toBe(true);
+  });
+
+  it("exercises gate holds, readiness score branches, and linked-issue advisory paths", () => {
+    const advisory = buildPullRequestAdvisory(REPO, PR, { requireLinkedIssue: true, confirmedNoOpenLinkedIssue: true, linkedIssueAuthorLogins: ["miner1"] });
+    expect(advisory.findings.some((f) => f.code === "missing_linked_issue")).toBe(true);
+    expect(advisory.findings.some((f) => f.code === "self_authored_linked_issue")).toBe(true);
+    const guardrailHold = evaluateGateCheck(
+      { id: "a", targetType: "pull_request", targetKey: "k", repoFullName: REPO.fullName, conclusion: "success", severity: "info", title: "t", summary: "s", findings: [], generatedAt: "2026-01-01T00:00:00.000Z" },
+      { guardrailHit: true, guardrailMatches: [{ path: "src/a.ts", glob: "src/*" }], sizeGateMode: "advisory", changedFileCount: 20, changedLineCount: 2000 },
+    );
+    expect(guardrailHold.conclusion).toBe("neutral");
+    const preflight = buildPreflightResult({ repoFullName: REPO.fullName, title: "No issue docs only", body: "docs-only change", linkedIssues: [] }, REPO, [], []);
+    const readiness = buildPublicReadinessScore({
+      pr: { ...PR, isDraft: true, body: "docs-only change", linkedIssues: [] },
+      preflight,
+      queueHealth: buildQueueHealth(REPO, [], [], buildCollisionReport(REPO.fullName, [], [])),
+      scopedOverlapCount: 2,
+      linkedDuplicatePrs: [42],
+    });
+    expect(readiness.total).toBeGreaterThan(0);
+    const slopBlocked = evaluateGateCheck(
+      {
+        id: "a",
+        targetType: "pull_request",
+        targetKey: "k",
+        repoFullName: REPO.fullName,
+        conclusion: "neutral",
+        severity: "warning",
+        title: "t",
+        summary: "s",
+        findings: [{ code: "slop_risk_above_threshold", severity: "warning", title: "slop", detail: "slop" }],
+        generatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      { slopGateMode: "block", slopRisk: 90, slopGateMinScore: 60 },
+    );
+    expect(slopBlocked.blockers.some((b) => b.code === "slop_risk_above_threshold")).toBe(true);
+  });
+
+  it("exercises remaining advisory, duplicate-winner, and manifest branches", () => {
+    const discoveryOnlyRepo: RepositoryRecord = {
+      ...REPO,
+      registryConfig: { ...REPO.registryConfig!, issueDiscoveryShare: 1, maintainerCut: 1 },
+    };
+    const directOnlyRepo: RepositoryRecord = {
+      ...REPO,
+      registryConfig: { ...REPO.registryConfig!, issueDiscoveryShare: 0, maintainerCut: 0 },
+    };
+    expect(buildPullRequestAdvisory(discoveryOnlyRepo, PR).findings.some((f) => f.code === "direct_pr_pool_disabled")).toBe(true);
+    expect(buildPullRequestAdvisory(directOnlyRepo, PR).findings.some((f) => f.code === "issue_discovery_disabled")).toBe(true);
+    expect(buildPullRequestAdvisory(directOnlyRepo, PR).findings.some((f) => f.code === "maintainer_cut_enabled")).toBe(false);
+    expect(buildPullRequestAdvisory(discoveryOnlyRepo, PR).findings.some((f) => f.code === "maintainer_cut_enabled")).toBe(true);
+
+    const busy = buildPullRequestAdvisory(
+      REPO,
+      PR,
+      { otherOpenPullRequests: Array.from({ length: 10 }, (_, i) => ({ ...PR, number: i + 20 })) },
+    );
+    expect(busy.findings.some((f) => f.code === "busy_pr_queue")).toBe(true);
+    expect(buildPullRequestAdvisory(REPO, { ...PR, authorAssociation: "OWNER" }).findings.some((f) => f.code === "maintainer_authored_pr")).toBe(true);
+
+    const aiBlocked = evaluateGateCheck(
+      {
+        id: "a",
+        targetType: "pull_request",
+        targetKey: "k",
+        repoFullName: REPO.fullName,
+        conclusion: "neutral",
+        severity: "warning",
+        title: "t",
+        summary: "s",
+        findings: [{ code: "ai_consensus_defect", severity: "warning", title: "ai", detail: "ai" }],
+        generatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      { aiReviewGateMode: "block", aiReviewCloseConfidence: 0.5 },
+    );
+    expect(aiBlocked.conclusion).toBe("failure");
+
+    const aiHold = evaluateGateCheck(
+      {
+        id: "a",
+        targetType: "pull_request",
+        targetKey: "k",
+        repoFullName: REPO.fullName,
+        conclusion: "success",
+        severity: "info",
+        title: "t",
+        summary: "s",
+        findings: [{ code: "ai_review_inconclusive", severity: "warning", title: "ai", detail: "ai" }],
+        generatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {},
+    );
+    expect(aiHold.conclusion).toBe("neutral");
+
+    expect(
+      isDuplicateClusterWinnerByClaim(
+        { number: 1, linkedIssueClaimedAt: "2026-01-01T00:00:00.000Z" },
+        [{ number: 2, linkedIssueClaimedAt: "2026-01-02T00:00:00.000Z" }],
+      ),
+    ).toBe(true);
+    expect(
+      isDuplicateClusterWinnerByClaim(
+        { number: 2, createdAt: "2026-01-02T00:00:00.000Z" },
+        [{ number: 1, createdAt: "2026-01-02T00:00:00.000Z" }],
+      ),
+    ).toBe(false);
+
+    const preferredMissing = buildFocusManifestGuidance({
+      manifest: {
+        present: true,
+        source: "repo_file",
+        wantedPaths: [],
+        preferredLabels: ["bug"],
+        linkedIssuePolicy: "preferred",
+        testExpectations: [],
+        issueDiscoveryPolicy: "neutral",
+        maintainerNotes: [],
+        publicNotes: [],
+        gate: { present: true } as FocusManifest["gate"],
+        settings: {},
+        review: { present: true, preMergeChecks: [] },
+        warnings: [],
+      },
+      changedPaths: ["src/a.ts"],
+      labels: [],
+      linkedIssueCount: 0,
+      passedValidationCount: 1,
+    });
+    expect(preferredMissing.findings.some((f) => f.code === "manifest_linked_issue_preferred")).toBe(true);
+    expect(preferredMissing.findings.some((f) => f.code === "manifest_missing_preferred_label")).toBe(true);
+  });
+
+  it("exercises collision, bounty, readiness, and queue branches", () => {
+    const selfAuthoredSkip = buildCollisionReport(REPO.fullName, [], [
+      { ...PR, number: 1, linkedIssues: [], labels: [], authorLogin: "alice", title: "foo bar", changedFiles: ["src/services/upload/retry.ts"] },
+      { ...PR, number: 2, linkedIssues: [], labels: [], authorLogin: "alice", title: "baz qux", changedFiles: ["src/services/upload/retry.ts"] },
+    ]);
+    expect(selfAuthoredSkip.clusters).toHaveLength(0);
+
+    const lockfileOnly = buildCollisionReport(REPO.fullName, [], [
+      { ...PR, number: 3, linkedIssues: [], labels: [], authorLogin: "bob", title: "foo bar", changedFiles: ["package-lock.json"] },
+      { ...PR, number: 4, linkedIssues: [], labels: [], authorLogin: "carol", title: "baz qux", changedFiles: ["package-lock.json"] },
+    ]);
+    expect(lockfileOnly.clusters).toHaveLength(0);
+
+    const mergedCollisions = buildCollisionReport(
+      REPO.fullName,
+      [],
+      [],
+      [{ repoFullName: REPO.fullName, number: 99, title: "Merged fix", authorLogin: "miner1", labels: [], linkedIssues: [7], changedFiles: ["src/a.ts"] }],
+    );
+    expect(mergedCollisions.summary.itemsReviewed).toBeGreaterThan(0);
+
+    expect(classifyBountyLifecycle({ id: "b1", repoFullName: REPO.fullName, issueNumber: 7, status: "open", updatedAt: "2020-01-01T00:00:00.000Z", discoveredAt: "2020-01-01T00:00:00.000Z", payload: {} }, { repoFullName: REPO.fullName, number: 7, title: "Issue", state: "open", labels: [], linkedPrs: [] })).toBe("stale");
+    expect(classifyBountyLifecycle({ id: "b3", repoFullName: REPO.fullName, issueNumber: 9, status: "open", updatedAt: new Date().toISOString(), discoveredAt: new Date().toISOString(), payload: {} }, { repoFullName: REPO.fullName, number: 9, title: "Issue", state: "open", labels: [], linkedPrs: [] })).toBe("active");
+    expect(classifyBountyLifecycle({ id: "b2", repoFullName: REPO.fullName, issueNumber: 8, status: "active funded", updatedAt: "2026-01-01T00:00:00.000Z", discoveredAt: "2026-01-01T00:00:00.000Z", payload: {} }, { repoFullName: REPO.fullName, number: 8, title: "Issue", state: "closed", labels: [], linkedPrs: [] })).toBe("ambiguous");
+
+    const mergedSelfAuthored = buildCollisionReport(
+      REPO.fullName,
+      [],
+      [{ ...PR, number: 5, linkedIssues: [], labels: [], authorLogin: "alice", title: "foo bar", changedFiles: ["src/services/upload/retry.ts"] }],
+      [{ repoFullName: REPO.fullName, number: 50, title: "baz qux", authorLogin: "alice", labels: [], linkedIssues: [], changedFiles: ["src/services/upload/retry.ts"] }],
+    );
+    expect(mergedSelfAuthored.clusters).toHaveLength(0);
+
+    const linkedBodyPreflight = buildPreflightResult(
+      { repoFullName: REPO.fullName, title: "Fix", body: "Closes acme/widgets#77", linkedIssues: [] },
+      REPO,
+      [],
+      [],
+    );
+    expect(linkedBodyPreflight.linkedIssues).toContain(77);
+
+    const holdPreflight = buildPreflightResult(
+      { repoFullName: REPO.fullName, title: "Fix", body: "", linkedIssues: [7] },
+      { ...REPO, registryConfig: { ...REPO.registryConfig!, emissionShare: 0 } },
+      [],
+      [],
+      [],
+      null,
+      false,
+    );
+    const readyPreflight = buildPreflightResult(
+      { repoFullName: REPO.fullName, title: "Fix", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"], tests: ["src/a.test.ts"] },
+      REPO,
+      [],
+      [],
+    );
+    const missingTestPreflight = buildPreflightResult(
+      { repoFullName: REPO.fullName, title: "Fix", body: "tested locally", linkedIssues: [7], changedFiles: ["src/a.ts"], tests: [] },
+      REPO,
+      [],
+      [],
+    );
+    const collisionReport = buildCollisionReport(REPO.fullName, [], [
+      { ...PR, number: 11, title: "overlap upload retry client", changedFiles: ["src/upload.ts"] },
+      { ...PR, number: 12, title: "overlap upload retry service", changedFiles: ["src/upload.ts"] },
+    ]);
+    expect(collisionReport.summary.clusterCount).toBeGreaterThan(0);
+    const queueHealth = buildQueueHealth(
+      REPO,
+      [],
+      Array.from({ length: 14 }, (_, i) => ({ ...PR, number: i + 20, linkedIssues: [7], updatedAt: i === 0 ? "2020-01-01T00:00:00.000Z" : "2026-06-01T00:00:00.000Z" })),
+      collisionReport,
+    );
+    expect(queueHealth.findings.some((f) => f.code === "stale_prs")).toBe(true);
+    expect(queueHealth.findings.some((f) => f.code === "collision_clusters")).toBe(true);
+
+    expect(buildPublicReadinessScore({ pr: { ...PR, labels: ["size:large"], isDraft: true }, preflight: holdPreflight, queueHealth }).total).toBeGreaterThan(0);
+    expect(buildPublicReadinessScore({ pr: { ...PR, body: "tested locally" }, preflight: missingTestPreflight, queueHealth }).components.find((c) => c.key === "validation")?.score).toBe(12);
+    expect(buildPublicReadinessScore({ pr: { ...PR, body: "npm test passed" }, preflight: readyPreflight, queueHealth }).components.find((c) => c.key === "validation")?.score).toBe(25);
+    expect(buildPublicReadinessScore({ pr: PR, preflight: readyPreflight, queueHealth }).components.find((c) => c.key === "validation")?.score).toBe(20);
+
+    const union = unionScopedOverlapClusters(collisionReport, PR, collisionReport.clusters);
+    expect(union.length).toBeGreaterThanOrEqual(0);
+
+    const malformed = buildFocusManifestGuidance({
+      manifest: {
+        present: false,
+        source: "repo_file",
+        wantedPaths: [],
+        preferredLabels: [],
+        linkedIssuePolicy: "optional",
+        testExpectations: ["run npm test"],
+        issueDiscoveryPolicy: "neutral",
+        maintainerNotes: [],
+        publicNotes: [],
+        gate: { present: false } as FocusManifest["gate"],
+        settings: {},
+        review: { present: false, preMergeChecks: [] },
+        warnings: ["invalid yaml"],
+      },
+      changedPaths: ["src/a.ts"],
+      linkedIssueCount: 0,
+      testFileCount: 0,
+      passedValidationCount: 0,
+    });
+    expect(malformed.findings.some((f) => f.code === "manifest_malformed")).toBe(true);
+
+    const middleGlob = buildFocusManifestGuidance({
+      manifest: {
+        present: true,
+        source: "repo_file",
+        wantedPaths: ["src/*util*core.ts"],
+        preferredLabels: [],
+        linkedIssuePolicy: "optional",
+        testExpectations: [],
+        issueDiscoveryPolicy: "neutral",
+        maintainerNotes: [],
+        publicNotes: [],
+        gate: { present: true } as FocusManifest["gate"],
+        settings: {},
+        review: { present: true, preMergeChecks: [] },
+        warnings: [],
+      },
+      changedPaths: ["src/foo/util/bar/core.ts"],
+      linkedIssueCount: 1,
+      testFileCount: 1,
+    });
+    expect(middleGlob.matchedWantedPaths.length).toBeGreaterThan(0);
+
+    expect(buildPullRequestAdvisory(REPO, { ...PR, state: "closed" }).findings.some((f) => f.code === "pr_not_open")).toBe(true);
+    const sizeHold = evaluateGateCheck(
+      { id: "a", targetType: "pull_request", targetKey: "k", repoFullName: REPO.fullName, conclusion: "success", severity: "info", title: "t", summary: "s", findings: [], generatedAt: "2026-01-01T00:00:00.000Z" },
+      { sizeGateMode: "advisory", changedFileCount: 20, changedLineCount: 2000 },
+    );
+    expect(sizeHold.conclusion).toBe("neutral");
+    expect(sizeHold.warnings.some((w) => w.code === "oversized_pr")).toBe(true);
+  });
+
+  it("mirrors engine cla-check and pre-merge-check branches", () => {
+    expect(evaluateClaCheck(claConfig(), { body: "no consent" })).toEqual([]);
+    expect(evaluateClaCheck(claConfig({ consentPhrase: "agree to the CLA" }), { body: "I agree to the CLA." })).toEqual([]);
+    expect(evaluateClaCheck(claConfig({ consentPhrase: "agree to the CLA" }), { body: "missing" })[0]?.code).toBe(CLA_CONSENT_MISSING_CODE);
+    expect(evaluateClaCheck(claConfig({ checkRunName: "CLA Assistant Lite" }), { checkRunConclusion: "success" })).toEqual([]);
+    expect(evaluateClaCheck(claConfig({ checkRunName: "CLA Assistant Lite" }), { checkRunConclusion: undefined })[0]?.code).toBe(CLA_CHECK_UNRESOLVED_CODE);
+    expect(evaluateClaCheck(claConfig({ consentPhrase: "agree", checkRunName: "CLA Assistant Lite" }), { body: "no", checkRunConclusion: "failure" })[0]?.code).toBe(
+      CLA_CONSENT_MISSING_CODE,
+    );
+
+    expect(evaluatePreMergeChecks([], { title: "t", body: "b", labels: [], changedPaths: [] })).toEqual([]);
+    expect(
+      evaluatePreMergeChecks([preMergeCheck({ name: "All", titleContains: "FEAT", descriptionContains: "Migration", requireLabel: "Ship" })], {
+        title: "feat: add",
+        body: "includes a migration",
+        labels: ["ship"],
+        changedPaths: [],
+      }),
+    ).toEqual([]);
+    const advisoryFail = evaluatePreMergeChecks([preMergeCheck({ name: "Needs all", titleContains: "feat", descriptionContains: "why", requireLabel: "ready" })], {
+      title: "chore: x",
+      body: "no rationale",
+      labels: [],
+      changedPaths: [],
+    });
+    expect(advisoryFail[0]?.code).toBe(PRE_MERGE_CHECK_ADVISORY_CODE);
+    const blockingFail = evaluatePreMergeChecks([preMergeCheck({ name: "Required", requireLabel: "approved", enforce: true })], {
+      title: "t",
+      body: "b",
+      labels: ["other"],
+      changedPaths: [],
+    });
+    expect(blockingFail[0]?.code).toBe(PRE_MERGE_CHECK_BLOCKING_CODE);
+    const pathGated = evaluatePreMergeChecks(
+      [preMergeCheck({ name: "Migrations documented", whenPaths: ["migrations/**"], descriptionContains: "migration", enforce: true })],
+      { title: "t", body: "no note", labels: [], changedPaths: ["migrations/0099_x.sql"] },
+    );
+    expect(pathGated[0]?.code).toBe(PRE_MERGE_CHECK_BLOCKING_CODE);
+    const unresolved = evaluatePreMergeChecks(
+      [
+        preMergeCheck({ name: "Migrations documented", whenPaths: ["migrations/**"], descriptionContains: "migration", enforce: true }),
+        preMergeCheck({ name: "advisory path check", whenPaths: ["migrations/**"], descriptionContains: "migration", enforce: false }),
+        preMergeCheck({ name: "JIRA in title", titleContains: "JIRA-", enforce: true }),
+      ],
+      { title: "no ref", body: "", labels: [], changedPaths: [], filesResolved: false },
+    );
+    expect(unresolved.find((f) => f.title.includes("Migrations documented"))?.code).toBe(PRE_MERGE_CHECK_UNRESOLVED_CODE);
+    expect(unresolved.find((f) => f.title.includes("JIRA in title"))?.code).toBe(PRE_MERGE_CHECK_BLOCKING_CODE);
+    expect(evaluatePreMergeChecks([preMergeCheck({ name: "T", titleContains: "feat" })], { changedPaths: [] })).toHaveLength(1);
+  });
+
+  it("exercises collision, duplicate-winner, and gate-evaluation edge branches", () => {
+    const sharedIssueCollision = buildCollisionReport(
+      REPO.fullName,
+      [{ repoFullName: REPO.fullName, number: 7, title: "Issue", state: "open", labels: [], linkedPrs: [], authorLogin: "other" }],
+      [
+        { ...PR, number: 1, linkedIssues: [7] },
+        { ...PR, number: 2, linkedIssues: [7] },
+      ],
+    );
+    expect(sharedIssueCollision.clusters.length).toBeGreaterThan(0);
+
+    const pathOverlap = buildCollisionReport(REPO.fullName, [], [
+      { ...PR, number: 1, authorLogin: "alice", title: "alpha widget refactor", changedFiles: ["src/core/upload.ts"] },
+      { ...PR, number: 2, authorLogin: "bob", title: "beta service cleanup", changedFiles: ["src/core/upload.ts"] },
+    ]);
+    expect(pathOverlap.clusters.length).toBeGreaterThan(0);
+
+    expect(
+      isDuplicateClusterWinnerByClaim({ number: 1, linkedIssueClaimedAt: "invalid" }, [{ number: 2, linkedIssueClaimedAt: "2026-01-02T00:00:00.000Z" }]),
+    ).toBe(false);
+    expect(resolveDuplicateClusterWinnerNumber({ number: 1, createdAt: null }, [{ number: 2, createdAt: null }])).toBeNull();
+
+    const unregistered = buildPullRequestAdvisory({ ...REPO, isRegistered: false, registryConfig: null }, PR);
+    expect(unregistered.findings.some((f) => f.code === "repo_unregistered")).toBe(true);
+    const missingConfig = buildPullRequestAdvisory({ ...REPO, registryConfig: null }, PR);
+    expect(missingConfig.findings.some((f) => f.code === "repo_config_missing")).toBe(true);
+
+    const duplicateWinner = buildPullRequestAdvisory(
+      REPO,
+      { ...PR, number: 20, linkedIssues: [7], linkedIssueClaimedAt: "2026-01-01T00:00:00.000Z" },
+      {
+        otherOpenPullRequests: [{ ...PR, number: 21, linkedIssues: [7], linkedIssueClaimedAt: "2026-01-02T00:00:00.000Z" }],
+        duplicateWinnerEnabled: true,
+      },
+    );
+    expect(duplicateWinner.findings.some((f) => f.code === "duplicate_pr_risk")).toBe(false);
+
+    const held = evaluateGateCheck(
+      {
+        id: "a",
+        targetType: "pull_request",
+        targetKey: "k",
+        repoFullName: REPO.fullName,
+        conclusion: "neutral",
+        severity: "warning",
+        title: "t",
+        summary: "s",
+        findings: [{ code: "repo_not_registered", severity: "warning", title: "hold", detail: "hold" }],
+        generatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {},
+    );
+    expect(held.conclusion).toBe("neutral");
+
+    const claHeld = evaluateGateCheck(
+      {
+        id: "a",
+        targetType: "pull_request",
+        targetKey: "k",
+        repoFullName: REPO.fullName,
+        conclusion: "neutral",
+        severity: "warning",
+        title: "t",
+        summary: "s",
+        findings: [{ code: CLA_CHECK_UNRESOLVED_CODE, severity: "warning", title: "cla", detail: "cla" }],
+        generatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      { claGateMode: "block" },
+    );
+    expect(claHeld.conclusion).toBe("neutral");
+
+    const manifestBlocked = evaluateGateCheck(
+      {
+        id: "a",
+        targetType: "pull_request",
+        targetKey: "k",
+        repoFullName: REPO.fullName,
+        conclusion: "neutral",
+        severity: "warning",
+        title: "t",
+        summary: "s",
+        findings: [{ code: "manifest_missing_tests", severity: "warning", title: "tests", detail: "tests", action: "add tests" }],
+        generatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      { manifestPolicyGateMode: "block" },
+    );
+    expect(manifestBlocked.conclusion).toBe("failure");
+
+    const mergeReady = evaluateGateCheck(
+      {
+        id: "a",
+        targetType: "pull_request",
+        targetKey: "k",
+        repoFullName: REPO.fullName,
+        conclusion: "neutral",
+        severity: "warning",
+        title: "t",
+        summary: "s",
+        findings: [{ code: "missing_linked_issue", severity: "warning", title: "issue", detail: "issue" }],
+        generatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      { mergeReadinessGateMode: "block" },
+    );
+    expect(mergeReady.conclusion).toBe("failure");
+
+    const guardrailOnly = evaluateGateCheck(
+      {
+        id: "a",
+        targetType: "pull_request",
+        targetKey: "k",
+        repoFullName: REPO.fullName,
+        conclusion: "success",
+        severity: "info",
+        title: "t",
+        summary: "s",
+        findings: [],
+        generatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      { guardrailHit: true, sizeGateMode: "off" },
+    );
+    expect(guardrailOnly.conclusion).toBe("neutral");
+    expect(guardrailOnly.warnings.some((w) => w.code === "guardrail_hold")).toBe(true);
+
+    const criticalBlocker = evaluateGateCheck(
+      {
+        id: "a",
+        targetType: "pull_request",
+        targetKey: "k",
+        repoFullName: REPO.fullName,
+        conclusion: "neutral",
+        severity: "warning",
+        title: "t",
+        summary: "s",
+        findings: [{ code: "pre_merge_check_required", severity: "critical", title: "required", detail: "required", action: "fix it" }],
+        generatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {},
+    );
+    expect(criticalBlocker.conclusion).toBe("failure");
+    expect(criticalBlocker.summary).toContain("fix it");
+
+    const missingTests = buildFocusManifestGuidance({
+      manifest: {
+        present: true,
+        source: "repo_file",
+        wantedPaths: [],
+        preferredLabels: [],
+        linkedIssuePolicy: "optional",
+        testExpectations: ["paste your wallet hotkey here"],
+        issueDiscoveryPolicy: "neutral",
+        maintainerNotes: [],
+        publicNotes: [],
+        gate: { present: true } as FocusManifest["gate"],
+        settings: {},
+        review: { present: true, preMergeChecks: [] },
+        warnings: [],
+      },
+      changedPaths: ["src/a.ts"],
+      linkedIssueCount: 1,
+      testFileCount: 0,
+      passedValidationCount: 0,
+    });
+    expect(missingTests.findings.some((f) => f.code === "manifest_missing_tests")).toBe(true);
+    expect(missingTests.findings.find((f) => f.code === "manifest_missing_tests")?.detail).not.toContain("wallet");
+
+    // REGRESSION (#manifest-missing-tests-docs-only-false-positive): a docs/content-only change has nothing a
+    // test could cover, so it must not trip manifest_missing_tests just because no test file or validation
+    // evidence exists.
+    const docsOnlyNoFalsePositive = buildFocusManifestGuidance({
+      manifest: {
+        present: true,
+        source: "repo_file",
+        wantedPaths: [],
+        preferredLabels: [],
+        linkedIssuePolicy: "optional",
+        testExpectations: ["paste your wallet hotkey here"],
+        issueDiscoveryPolicy: "neutral",
+        maintainerNotes: [],
+        publicNotes: [],
+        gate: { present: true } as FocusManifest["gate"],
+        settings: {},
+        review: { present: true, preMergeChecks: [] },
+        warnings: [],
+      },
+      changedPaths: ["content/registry/new-entry.mdx"],
+      linkedIssueCount: 1,
+      testFileCount: 0,
+      passedValidationCount: 0,
+    });
+    expect(docsOnlyNoFalsePositive.findings.some((f) => f.code === "manifest_missing_tests")).toBe(false);
+  });
+
+  it("covers remaining codecov patch branch arms in ported engine modules", () => {
+    const splitRepo: RepositoryRecord = {
+      ...REPO,
+      registryConfig: { ...REPO.registryConfig!, issueDiscoveryShare: 0.5 },
+    };
+    expect(buildPullRequestAdvisory(splitRepo, PR).findings.some((f) => f.code === "issue_discovery_disabled")).toBe(false);
+    expect(buildPullRequestAdvisory(splitRepo, PR).findings.some((f) => f.code === "direct_pr_pool_disabled")).toBe(false);
+    expect(buildPullRequestAdvisory(null, null).findings.some((f) => f.code === "repo_not_registered")).toBe(true);
+
+    expect(evaluateClaCheck(claConfig({ checkRunName: "CLA Bot" }), { checkRunConclusion: "failure" })[0]?.detail).toContain("CLA Bot");
+    expect(evaluateClaCheck(claConfig({ consentPhrase: "agree" }), { body: "nope" })[0]?.detail).toContain("agree");
+
+    expect(isDuplicateClusterWinnerByClaim({ number: 1 }, [])).toBe(true);
+    expect(resolveDuplicateClusterWinnerNumber({ number: 1, linkedIssueClaimedAt: "2026-01-01T00:00:00.000Z" }, [])).toBe(1);
+    expect(
+      isDuplicateClusterWinnerByClaim(
+        { number: 1, createdAt: "2026-01-01T00:00:00.000Z" },
+        [{ number: 2, linkedIssueClaimedAt: "2026-01-02T00:00:00.000Z" }],
+      ),
+    ).toBe(false);
+
+    const pathological = "src/*-*-*-final.ts";
+    expect(globToRegExp(pathological).test("src/a-b-c-final.ts")).toBe(false);
+    expect(guardrailPathMatches(["", "src/a.ts"], ["src/**"])).toEqual([{ path: "src/a.ts", glob: "src/**" }]);
+    expect(guardrailPathMatches(["scripts/x.ts"], [pathological])).toEqual([{ path: "scripts/x.ts", glob: pathological }]);
+
+    expect(sanitizePublicComment("public reviewability score without prefix")).toContain("private context");
+
+    const prItem: CollisionItem = { type: "pull_request", number: 42, title: "Unrelated", linkedIssues: [9] };
+    expect(itemSharesPlannedLinkedIssue(prItem, [9])).toBe(true);
+    expect(itemSharesPlannedLinkedIssue({ type: "pull_request", number: 9, title: "No links" }, [9])).toBe(false);
+    expect(termOverlap({ terms: new Set(), size: 0 }, { terms: new Set(["alpha"]), size: 1 }).score).toBe(0);
+
+    const sharedIssueMedium = buildCollisionReport(
+      REPO.fullName,
+      [],
+      [{ ...PR, number: 1, linkedIssues: [7] }],
+      [{ repoFullName: REPO.fullName, number: 88, title: "Merged overlap", authorLogin: "bob", labels: [], linkedIssues: [7], changedFiles: ["src/a.ts"] }],
+    );
+    expect(sharedIssueMedium.clusters.some((c) => c.risk === "medium")).toBe(true);
+
+    const pathCollision = buildCollisionReport(REPO.fullName, [], [
+      { ...PR, number: 10, authorLogin: "alice", title: "upload retry client handler", labels: [], linkedIssues: [], changedFiles: ["src/core/upload.ts"] },
+      { ...PR, number: 11, authorLogin: "carol", title: "upload retry service layer", labels: [], linkedIssues: [], changedFiles: ["src/core/upload.ts"] },
+    ]);
+    expect(pathCollision.clusters.length).toBeGreaterThan(0);
+
+    const mediumOnlyCollisions = buildCollisionReport(
+      REPO.fullName,
+      [],
+      [{ ...PR, number: 1, linkedIssues: [7] }],
+      [{ repoFullName: REPO.fullName, number: 88, title: "Merged overlap", authorLogin: "bob", labels: [], linkedIssues: [7], changedFiles: ["src/a.ts"] }],
+    );
+    expect(mediumOnlyCollisions.summary.highRiskCount).toBe(0);
+    expect(mediumOnlyCollisions.summary.clusterCount).toBeGreaterThan(0);
+
+    const queueInfoCollision = buildQueueHealth(
+      null,
+      [],
+      [{ ...PR, number: 14, linkedIssues: [], updatedAt: "2020-01-01T00:00:00.000Z", isDraft: true }],
+      mediumOnlyCollisions,
+      { openPullRequests: 20, likelyReviewablePullRequests: 5 },
+    );
+    expect(queueInfoCollision.repoFullName).toBe(REPO.fullName);
+    expect(queueInfoCollision.findings.find((f) => f.code === "collision_clusters")?.severity).toBe("info");
+    expect(queueInfoCollision.findings.some((f) => f.code === "inactive_draft_prs")).toBe(true);
+
+    const issueQuality: IssueQualityReport = {
+      repoFullName: REPO.fullName,
+      generatedAt: "2026-01-01T00:00:00.000Z",
+      lane: { lane: "direct_pr", repoFullName: REPO.fullName, summary: "direct", contributorGuidance: "direct", maintainerGuidance: "direct" },
+      summary: "quality",
+      issues: [
+        { number: 7, title: "Issue 7", status: "needs_proof", score: 40, reasons: [], warnings: ["needs more detail"] },
+        { number: 8, title: "Issue 8", status: "do_not_use", score: 10, reasons: [], warnings: ["duplicate prone"] },
+      ],
+    };
+    const bountyPreflight = buildPreflightResult(
+      { repoFullName: REPO.fullName, title: "Fix", body: `Closes ${REPO.fullName}#77`, changedFiles: ["src/a.ts"], linkedIssues: [7, 8] },
+      REPO,
+      [{ repoFullName: REPO.fullName, number: 7, title: "Issue", state: "open", labels: [], linkedPrs: [] }],
+      [],
+      [
+        { id: "b1", repoFullName: REPO.fullName, issueNumber: 7, status: "closed", updatedAt: "2020-01-01T00:00:00.000Z", discoveredAt: "2020-01-01T00:00:00.000Z", payload: {} },
+        { id: "b2", repoFullName: REPO.fullName, issueNumber: 8, status: "open", updatedAt: "2020-01-01T00:00:00.000Z", discoveredAt: "2020-01-01T00:00:00.000Z", payload: {} },
+      ],
+      issueQuality,
+    );
+    expect(bountyPreflight.linkedIssues).toContain(77);
+    expect(bountyPreflight.findings.map((f) => f.code)).toEqual(
+      expect.arrayContaining(["linked_issue_bounty_historical", "linked_issue_bounty_unverified", "issue_quality_do_not_use", "issue_quality_needs_proof", "missing_test_evidence"]),
+    );
+
+    const mediumBurdenPreflight = buildPreflightResult(
+      {
+        repoFullName: REPO.fullName,
+        title: "Add pagination export endpoint",
+        body: "",
+        changedFiles: Array.from({ length: 12 }, (_, i) => `src/file-${i}.ts`),
+        linkedIssues: [7],
+      },
+      REPO,
+      [{ repoFullName: REPO.fullName, number: 7, title: "Token refresh race", state: "open", labels: [], linkedPrs: [] }],
+      [{ ...PR, number: 50, linkedIssues: [7] }],
+    );
+    expect(mediumBurdenPreflight.reviewBurden).toBe("high");
+    expect(mediumBurdenPreflight.findings.some((f) => f.code === "possible_duplicate_work")).toBe(true);
+
+    const globOverflowPattern = "**/".repeat(8) + "safe.ts";
+    expect(matchesManifestPath("deep/nested/safe.ts", globOverflowPattern)).toBe(true);
+
+    const middleMiss = buildFocusManifestGuidance({
+      manifest: {
+        present: true,
+        source: "repo_file",
+        wantedPaths: ["src/foo/missing/bar/core.ts"],
+        preferredLabels: [],
+        linkedIssuePolicy: "optional",
+        testExpectations: [],
+        issueDiscoveryPolicy: "neutral",
+        maintainerNotes: [],
+        publicNotes: [],
+        gate: { present: true } as FocusManifest["gate"],
+        settings: {},
+        review: { present: true, preMergeChecks: [] },
+        warnings: [],
+      },
+      changedPaths: ["src/foo/wrong/bar/core.ts"],
+      linkedIssueCount: 1,
+      testFileCount: 1,
+    });
+    expect(middleMiss.matchedWantedPaths).toHaveLength(0);
+
+    const defaultLabelsGuidance = buildFocusManifestGuidance({
+      manifest: {
+        present: true,
+        source: "repo_file",
+        wantedPaths: ["src/**"],
+        preferredLabels: ["bug"],
+        linkedIssuePolicy: "optional",
+        testExpectations: [],
+        issueDiscoveryPolicy: "neutral",
+        maintainerNotes: [],
+        publicNotes: [],
+        gate: { present: true } as FocusManifest["gate"],
+        settings: {},
+        review: { present: true, preMergeChecks: [] },
+        warnings: [],
+      },
+      changedPaths: ["", "src/a.ts"],
+      linkedIssueCount: 1,
+      testFileCount: 1,
+    });
+    expect(defaultLabelsGuidance.preferredLabelHits).toEqual([]);
+
+    const advisoryBase = {
+      id: "a",
+      targetType: "pull_request" as const,
+      targetKey: "k",
+      repoFullName: REPO.fullName,
+      conclusion: "neutral" as const,
+      severity: "warning" as const,
+      title: "t",
+      summary: "s",
+      generatedAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    expect(
+      evaluateGateCheck(
+        { ...advisoryBase, findings: [{ code: "repo_not_seen", severity: "warning", title: "hold", detail: "hold" }] },
+        {},
+      ).conclusion,
+    ).toBe("neutral");
+
+    const dryRun = evaluateGateCheck(
+      { ...advisoryBase, conclusion: "success", severity: "info", findings: [] },
+      { dryRun: true, aiReviewGateMode: "advisory" },
+    );
+    expect(dryRun.displayConclusion).toBeDefined();
+
+    const multiBlocker = evaluateGateCheck(
+      {
+        ...advisoryBase,
+        findings: [
+          { code: "missing_linked_issue", severity: "warning", title: "issue", detail: "issue", action: "link one" },
+          { code: "duplicate_pr_risk", severity: "warning", title: "dup", detail: "dup" },
+        ],
+      },
+      { linkedIssueGateMode: "block", duplicatePrGateMode: "block" },
+    );
+    expect(multiBlocker.conclusion).toBe("failure");
+    expect(multiBlocker.title).toContain("2 blockers");
+
+    const policyBlockers = evaluateGateCheck(
+      {
+        ...advisoryBase,
+        findings: [
+          { code: REVIEW_THREAD_BLOCKER_CODE, severity: "warning", title: "thread", detail: "thread" },
+          { code: "secret_leak", severity: "critical", title: "secret", detail: "secret", action: "rotate" },
+          { code: "self_authored_linked_issue", severity: "warning", title: "self", detail: "self" },
+          { code: "lockfile_tamper_risk", severity: "warning", title: "lock", detail: "lock" },
+          { code: CLA_CONSENT_MISSING_CODE, severity: "warning", title: "cla", detail: "cla" },
+          { code: "ai_review_split", severity: "warning", title: "split", detail: "split" },
+        ],
+      },
+      {
+        selfAuthoredLinkedIssueGateMode: "block",
+        lockfileIntegrityGateMode: "block",
+        claGateMode: "block",
+        aiReviewGateMode: "block",
+      },
+    );
+    expect(policyBlockers.blockers.map((b) => b.code)).toEqual(
+      expect.arrayContaining([REVIEW_THREAD_BLOCKER_CODE, "secret_leak", "self_authored_linked_issue", "lockfile_tamper_risk", CLA_CONSENT_MISSING_CODE, "ai_review_split"]),
+    );
+
+    const advisoryDuplicate = evaluateGateCheck(
+      { ...advisoryBase, findings: [{ code: "duplicate_pr_risk", severity: "warning", title: "dup", detail: "dup" }] },
+      { duplicatePrGateMode: "advisory" },
+    );
+    expect(advisoryDuplicate.conclusion).toBe("success");
+
+    const qualityWarn = evaluateGateCheck(
+      { ...advisoryBase, conclusion: "success", severity: "info", findings: [] },
+      { qualityGateMode: "advisory", readinessScore: 40, qualityGateMinScore: 70 },
+    );
+    expect(qualityWarn.warnings.some((w) => w.code === "readiness_score_below_threshold")).toBe(true);
+
+    const slopBelow = evaluateGateCheck(
+      { ...advisoryBase, conclusion: "success", severity: "info", findings: [] },
+      { slopGateMode: "block", slopRisk: 10, slopGateMinScore: 60 },
+    );
+    expect(slopBelow.conclusion).toBe("success");
+
+    expect(gateAdvisoryInternals.highestSeverity([{ code: "x", severity: "critical", title: "c", detail: "c" }])).toBe("critical");
+    expect(
+      gateAdvisoryInternals.conclusionForSeverity("critical", [{ code: "x", severity: "critical", title: "c", detail: "c" }]),
+    ).toBe("action_required");
+    expect(gateAdvisoryInternals.buildSizeHoldFinding({ sizeGateMode: "advisory", changedFileCount: 1, changedLineCount: 1 })).toBeNull();
+    expect(gateAdvisoryInternals.promoteAdvisoryToBlock({ aiReviewGateMode: "advisory" }).aiReviewGateMode).toBe("block");
+
+    const dryRunAi = evaluateGateCheck(
+      {
+        ...advisoryBase,
+        conclusion: "success",
+        severity: "info",
+        findings: [{ code: "ai_consensus_defect", severity: "warning", title: "ai", detail: "ai" }],
+      },
+      { dryRun: true, aiReviewGateMode: "advisory" },
+    );
+    expect(dryRunAi.displayConclusion).toBe("failure");
+
+    const sampledQueue = buildQueueHealth(REPO, [], [{ ...PR, number: 1, linkedIssues: [7], updatedAt: "2026-06-01T00:00:00.000Z" }], buildCollisionReport(REPO.fullName, [], []), {
+      openPullRequests: 25,
+    });
+    expect(sampledQueue.signals.likelyReviewablePullRequestsSource).toBe("sampled_cache");
+    expect(
+      buildPublicReadinessScore({
+        pr: PR,
+        preflight: buildPreflightResult({ repoFullName: REPO.fullName, title: "Fix", body: "", linkedIssues: [7] }, REPO, [], []),
+        queueHealth: sampledQueue,
+      }).components.find((c) => c.key === "queue_pressure")?.evidence,
+    ).toContain("sampled");
+
+    const selfAuthoredSkip = buildCollisionReport(REPO.fullName, [], [
+      { ...PR, number: 1, linkedIssues: [], labels: [], authorLogin: "alice", title: "alpha upload retry", changedFiles: ["src/core/upload.ts"] },
+      { ...PR, number: 2, linkedIssues: [], labels: [], authorLogin: "alice", title: "beta service layer", changedFiles: ["src/core/upload.ts"] },
+    ]);
+    expect(selfAuthoredSkip.clusters).toHaveLength(0);
+
+    const existingCluster = buildCollisionReport(REPO.fullName, [], [
+      { ...PR, number: 1, linkedIssues: [7] },
+      { ...PR, number: 2, linkedIssues: [7] },
+      { ...PR, number: 3, linkedIssues: [7] },
+    ]);
+    expect(existingCluster.clusters.length).toBeGreaterThan(0);
+
+    expect(
+      isDuplicateClusterWinnerByClaim({ number: 1, linkedIssueClaimedAt: "2026-01-01T00:00:00.000Z" }, [{ number: 2, linkedIssueClaimedAt: undefined }]),
+    ).toBe(false);
+
+    expect(evaluateClaCheck({ consentPhrase: "agree", checkRunName: null }, { body: "nope" })[0]?.code).toBe(CLA_CONSENT_MISSING_CODE);
+    expect(guardrailPathMatches(["src/a.ts"], ["src/a.ts"])).toEqual([{ path: "src/a.ts", glob: "src/a.ts" }]);
+
+    const noLinkedCountGuidance = buildFocusManifestGuidance({
+      manifest: {
+        present: true,
+        source: "repo_file",
+        wantedPaths: ["src/**"],
+        preferredLabels: [],
+        linkedIssuePolicy: "optional",
+        testExpectations: [],
+        issueDiscoveryPolicy: "neutral",
+        maintainerNotes: [],
+        publicNotes: [],
+        gate: { present: true } as FocusManifest["gate"],
+        settings: {},
+        review: { present: true, preMergeChecks: [] },
+        warnings: [],
+      },
+      changedPaths: ["src/a.ts"],
+      testFileCount: 1,
+    });
+    expect(noLinkedCountGuidance.findings).toBeDefined();
+
+    expect(classifyBountyLifecycle({ id: "b", repoFullName: REPO.fullName, issueNumber: 1, status: "  ", updatedAt: "2026-01-01T00:00:00.000Z", discoveredAt: "2026-01-01T00:00:00.000Z", payload: {} }, null)).toBe("unknown");
+
+    const overlapPreflight = buildPreflightResult(
+      {
+        repoFullName: REPO.fullName,
+        title: "Resolve login redirect loop OAuth callback handler",
+        body: "",
+        changedFiles: ["src/auth.ts"],
+        linkedIssues: [],
+      },
+      REPO,
+      [{ repoFullName: REPO.fullName, number: 51, title: "Login redirect loop OAuth cleanup", state: "open", labels: [], linkedPrs: [] }],
+      [{ ...PR, number: 52, title: "Login redirect loop OAuth middleware", linkedIssues: [], changedFiles: ["src/auth.ts"] }],
+    );
+    expect(overlapPreflight.findings.some((f) => f.code === "possible_duplicate_work")).toBe(true);
+
+    const holdQualityPreflight = buildPreflightResult(
+      { repoFullName: REPO.fullName, title: "Fix", body: "", linkedIssues: [9], changedFiles: ["src/a.ts"], tests: [] },
+      REPO,
+      [],
+      [],
+      [],
+      {
+        repoFullName: REPO.fullName,
+        generatedAt: "2026-01-01T00:00:00.000Z",
+        lane: { lane: "direct_pr", repoFullName: REPO.fullName, summary: "direct", contributorGuidance: "direct", maintainerGuidance: "direct" },
+        summary: "quality",
+        issues: [{ number: 9, title: "Hold", status: "hold", score: 50, reasons: [], warnings: ["on hold"] }],
+      },
+    );
+    expect(holdQualityPreflight.findings.some((f) => f.code === "issue_quality_hold")).toBe(true);
+
+    const inactiveDraftQueue = buildQueueHealth(
+      REPO,
+      [],
+      [{ ...PR, number: 99, isDraft: true, updatedAt: "2000-01-01T00:00:00.000Z", linkedIssues: [] }],
+      buildCollisionReport(REPO.fullName, [], []),
+    );
+    expect(inactiveDraftQueue.findings.some((f) => f.code === "inactive_draft_prs")).toBe(true);
+
+    const nonBlockers = evaluateGateCheck(
+      {
+        ...advisoryBase,
+        findings: [
+          { code: "missing_linked_issue", severity: "warning", title: "issue", detail: "issue" },
+          { code: "ai_consensus_defect", severity: "warning", title: "ai", detail: "ai" },
+          { code: "manifest_missing_tests", severity: "warning", title: "tests", detail: "tests" },
+          { code: "self_authored_linked_issue", severity: "warning", title: "self", detail: "self" },
+          { code: "lockfile_tamper_risk", severity: "warning", title: "lock", detail: "lock" },
+          { code: CLA_CONSENT_MISSING_CODE, severity: "warning", title: "cla", detail: "cla" },
+        ],
+      },
+      {
+        linkedIssueGateMode: "advisory",
+        aiReviewGateMode: "advisory",
+        manifestPolicyGateMode: "off",
+        selfAuthoredLinkedIssueGateMode: "advisory",
+        lockfileIntegrityGateMode: "off",
+        claGateMode: "off",
+        qualityGateMode: "advisory",
+        readinessScore: 30,
+        qualityGateMinScore: 70,
+      },
+    );
+    expect(nonBlockers.conclusion).toBe("success");
+    expect(nonBlockers.warnings.some((w) => w.code === "readiness_score_below_threshold")).toBe(true);
+
+    const sizeHoldLines = evaluateGateCheck(
+      { ...advisoryBase, conclusion: "success", severity: "info", findings: [] },
+      { sizeGateMode: "advisory", changedFileCount: 12, changedLineCount: 50 },
+    );
+    expect(sizeHoldLines.warnings.some((w) => w.code === "oversized_pr")).toBe(true);
+
+    const policy = { linkedIssueGateMode: "advisory" as const, duplicatePrGateMode: "advisory" as const, aiReviewGateMode: "advisory" as const, manifestPolicyGateMode: "off" as const, selfAuthoredLinkedIssueGateMode: "advisory" as const, lockfileIntegrityGateMode: "off" as const, claGateMode: "off" as const };
+    const blockPolicy = { linkedIssueGateMode: "block" as const, duplicatePrGateMode: "block" as const, aiReviewGateMode: "block" as const, manifestPolicyGateMode: "block" as const, selfAuthoredLinkedIssueGateMode: "block" as const, lockfileIntegrityGateMode: "block" as const, claGateMode: "block" as const };
+    const finding = (code: string) => ({ code, severity: "warning" as const, title: code, detail: code });
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("missing_linked_issue"), policy)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("missing_linked_issue"), blockPolicy)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("duplicate_pr_risk"), policy)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("duplicate_pr_risk"), blockPolicy)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("ai_consensus_defect"), policy)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("ai_consensus_defect"), blockPolicy)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("manifest_missing_tests"), policy)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("manifest_missing_tests"), blockPolicy)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("self_authored_linked_issue"), policy)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("self_authored_linked_issue"), blockPolicy)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("lockfile_tamper_risk"), policy)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("lockfile_tamper_risk"), blockPolicy)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding(CLA_CONSENT_MISSING_CODE), policy)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding(CLA_CONSENT_MISSING_CODE), blockPolicy)).toBe(true);
+    expect(gateAdvisoryInternals.buildSlopGateBlocker({ slopGateMode: "block", slopRisk: null })).toBeNull();
+    expect(gateAdvisoryInternals.buildSlopGateBlocker({ slopGateMode: "block", slopRisk: 80, slopGateMinScore: 60 })?.code).toBe("slop_risk_above_threshold");
+    expect(gateAdvisoryInternals.buildSizeHoldFinding({ sizeGateMode: "advisory", changedFileCount: 5, changedLineCount: 2000 })?.code).toBe("oversized_pr");
+    expect(gateAdvisoryInternals.promoteAdvisoryToBlock({ aiReviewGateMode: "block" }).aiReviewGateMode).toBe("block");
+
+    expect(evaluateClaCheck({ consentPhrase: "agree", checkRunName: null }, { body: "nope" })[0]?.code).toBe(CLA_CONSENT_MISSING_CODE);
+    expect(matchesAny("src/a.ts", ["src/a.ts"])).toBe(true);
+
+    expect(predictedGateEngineInternals.sharesMeaningfulFile(["src/a.ts"], ["src/a.ts"])).toBe(true);
+    expect(predictedGateEngineInternals.sharesMeaningfulFile(undefined, ["src/a.ts"])).toBe(false);
+    expect(predictedGateEngineInternals.truncateText("short", 10)).toBe("short");
+    expect(predictedGateEngineInternals.truncateText("x".repeat(20), 10)).toHaveLength(10);
+    expect(predictedGateEngineInternals.extractLinkedIssueNumbers(`closes ${REPO.fullName}#42`, REPO.fullName)).toContain(42);
+    // #6630: a backtick-wrapped reference (e.g. the unfilled PR-template boilerplate `Closes #123`) is NOT a real
+    // linked-issue directive, matching the canonical src/db/repositories.ts extractor; the same reference outside a
+    // code span still counts.
+    expect(predictedGateEngineInternals.extractLinkedIssueNumbers("See the template: `Closes #123` for the format.", REPO.fullName)).toEqual([]);
+    expect(predictedGateEngineInternals.extractLinkedIssueNumbers("Closes #123", REPO.fullName)).toEqual([123]);
+    expect(predictedGateEngineInternals.extractLinkedIssueNumbers(`ref \`closes ${REPO.fullName}#77\``, REPO.fullName)).toEqual([]);
+    expect(predictedGateEngineInternals.extractLinkedIssueNumbers(`ref \`closes https://github.com/${REPO.fullName}/issues/88\``, REPO.fullName)).toEqual([]);
+
+    const failureWithQuality = evaluateGateCheck(
+      { ...advisoryBase, findings: [{ code: "missing_linked_issue", severity: "warning", title: "issue", detail: "issue", action: "link it" }] },
+      { linkedIssueGateMode: "block", qualityGateMode: "advisory", readinessScore: 10, qualityGateMinScore: 50 },
+    );
+    expect(failureWithQuality.conclusion).toBe("failure");
+    expect(failureWithQuality.warnings.some((w) => w.code === "readiness_score_below_threshold")).toBe(true);
+
+    const readinessHold = buildPublicReadinessScore({
+      pr: { ...PR, labels: ["size:large"], isDraft: true, body: "tested locally" },
+      preflight: buildPreflightResult(
+        { repoFullName: REPO.fullName, title: "Fix", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"], tests: [] },
+        { ...REPO, registryConfig: { ...REPO.registryConfig!, emissionShare: 0 } },
+        [],
+        [],
+        [],
+        null,
+        false,
+      ),
+      queueHealth: buildQueueHealth(REPO, [], [{ ...PR, number: 30, linkedIssues: [7], updatedAt: "2026-06-01T00:00:00.000Z" }], buildCollisionReport(REPO.fullName, [], []), { openPullRequests: 30 }),
+    });
+    expect(readinessHold.components.find((c) => c.key === "change_scope")?.score).toBe(20);
+    expect(readinessHold.components.find((c) => c.key === "validation")?.score).toBe(5);
+  });
+});
+
+const BRANCH_REPO = repo("acme/widgets");
+
+describe("predicted-gate engine branch coverage (#2283)", () => {
+  it("exercises gate-advisory gateMode and blocker policy branches", () => {
+    expect(gateAdvisoryInternals.gateMode("off")).toBe("off");
+    expect(gateAdvisoryInternals.gateMode("block")).toBe("block");
+    expect(gateAdvisoryInternals.gateMode("advisory")).toBe("advisory");
+    expect(gateAdvisoryInternals.gateMode(undefined)).toBe("advisory");
+    expect(gateAdvisoryInternals.gatePolicyBlocks("advisory", "advisory")).toBe(false);
+    expect(gateAdvisoryInternals.gatePolicyBlocks("block", "advisory")).toBe(true);
+    expect(gateAdvisoryInternals.gatePolicyBlocks(undefined, "off")).toBe(false);
+    expect(gateAdvisoryInternals.buildSizeHoldFinding({})).toBeNull();
+    expect(gateAdvisoryInternals.buildSizeHoldFinding({ sizeGateMode: "off", changedFileCount: 99, changedLineCount: 99_999 })).toBeNull();
+    expect(gateAdvisoryInternals.buildSizeHoldFinding({ sizeGateMode: "block", changedLineCount: 5000 })?.code).toBe("oversized_pr");
+    expect(gateAdvisoryInternals.buildSizeHoldFinding({ sizeGateMode: "block", changedFileCount: 12 })?.code).toBe("oversized_pr");
+    expect(gateAdvisoryInternals.buildSizeHoldFinding({ sizeGateMode: "advisory", changedFileCount: 2, changedLineCount: 2 })).toBeNull();
+    expect(gateAdvisoryInternals.buildSizeHoldFinding({ sizeGateMode: "advisory", changedFileCount: 2, changedLineCount: 5000 })?.code).toBe("oversized_pr");
+
+    const finding = (code: string) => ({ code, severity: "warning" as const, title: code, detail: code });
+    const advisory = {
+      linkedIssueGateMode: "advisory" as const,
+      duplicatePrGateMode: "advisory" as const,
+      aiReviewGateMode: "advisory" as const,
+      manifestPolicyGateMode: "advisory" as const,
+      selfAuthoredLinkedIssueGateMode: "advisory" as const,
+      lockfileIntegrityGateMode: "off" as const,
+      claGateMode: "off" as const,
+    };
+    const block = {
+      linkedIssueGateMode: "block" as const,
+      duplicatePrGateMode: "block" as const,
+      aiReviewGateMode: "block" as const,
+      manifestPolicyGateMode: "block" as const,
+      selfAuthoredLinkedIssueGateMode: "block" as const,
+      lockfileIntegrityGateMode: "block" as const,
+      claGateMode: "block" as const,
+    };
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("missing_linked_issue"), advisory)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("missing_linked_issue"), block)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("duplicate_pr_risk"), advisory)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("duplicate_pr_risk"), block)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("ai_consensus_defect"), advisory)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("ai_consensus_defect"), block)).toBe(true);
+    // Backtest-regression gate (#8105): absent (defaults to advisory), explicit advisory, and block.
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("backtest_regression"), advisory)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("backtest_regression"), { ...advisory, backtestRegressionGateMode: "advisory" as const })).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("backtest_regression"), { ...block, backtestRegressionGateMode: "block" as const })).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("ai_review_split"), advisory)).toBe(false);
+    // #4603: aiReviewLowConfidenceDisposition branches — the default ("hold_for_review", exercised by the
+    // bare `block` policy above with no confidence set) and "one_shot" both ignore confidence entirely and
+    // still block; only "advisory_only" demotes a SUB-floor finding to a non-blocker, and only below the
+    // configured floor -- at/above it, "advisory_only" still blocks like every other disposition.
+    expect(
+      gateAdvisoryInternals.isConfiguredGateBlocker(
+        { ...finding("ai_consensus_defect"), confidence: 0.2 },
+        { ...block, aiReviewLowConfidenceDisposition: "one_shot" },
+      ),
+    ).toBe(true);
+    expect(
+      gateAdvisoryInternals.isConfiguredGateBlocker(
+        { ...finding("ai_consensus_defect"), confidence: 0.2 },
+        { ...block, aiReviewLowConfidenceDisposition: "advisory_only", aiReviewCloseConfidence: 0.93 },
+      ),
+    ).toBe(false);
+    expect(
+      gateAdvisoryInternals.isConfiguredGateBlocker(
+        { ...finding("ai_review_split"), confidence: 0.99 },
+        { ...block, aiReviewLowConfidenceDisposition: "advisory_only", aiReviewCloseConfidence: 0.93 },
+      ),
+    ).toBe(true);
+    // A finding with no confidence reported at all defaults to fully-confident (?? 1), so it still blocks
+    // even under advisory_only regardless of the configured floor.
+    expect(
+      gateAdvisoryInternals.isConfiguredGateBlocker(finding("ai_consensus_defect"), {
+        ...block,
+        aiReviewLowConfidenceDisposition: "advisory_only",
+      }),
+    ).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("manifest_linked_issue_required"), advisory)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("manifest_linked_issue_required"), block)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("manifest_missing_tests"), advisory)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("manifest_missing_tests"), block)).toBe(true);
+    expect(gateAdvisoryInternals.gatePolicyBlocks("off", "block")).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("self_authored_linked_issue"), advisory)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("self_authored_linked_issue"), block)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("lockfile_tamper_risk"), advisory)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("lockfile_tamper_risk"), block)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding(CLA_CONSENT_MISSING_CODE), advisory)).toBe(false);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding(CLA_CONSENT_MISSING_CODE), block)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding(REVIEW_THREAD_BLOCKER_CODE), advisory)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("secret_leak"), advisory)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("pre_merge_check_required"), advisory)).toBe(true);
+    expect(gateAdvisoryInternals.isConfiguredGateBlocker(finding("unknown_code"), advisory)).toBe(false);
+    expect(gateAdvisoryInternals.buildSlopGateBlocker({ slopGateMode: "block", slopRisk: 90, slopGateMinScore: 60 })?.code).toBe("slop_risk_above_threshold");
+    expect(gateAdvisoryInternals.buildSlopGateBlocker({ slopGateMode: "block", slopRisk: 40, slopGateMinScore: 60 })).toBeNull();
+    expect(gateAdvisoryInternals.buildSlopGateBlocker({ slopGateMode: "block", slopRisk: 80 })).not.toBeNull();
+    expect(gateAdvisoryInternals.buildQualityGateWarning({ qualityGateMode: "off", readinessScore: 1, qualityGateMinScore: 99 })).toBeNull();
+  });
+
+  it("exercises cla-check and guardrail branch arms", () => {
+    expect(evaluateClaCheck({ consentPhrase: null, checkRunName: "CLA Bot" }, { checkRunConclusion: "failure" })[0]?.code).toBe(CLA_CONSENT_MISSING_CODE);
+    expect(evaluateClaCheck({ consentPhrase: "I agree to the CLA", checkRunName: null }, { body: "no consent here" })[0]?.code).toBe(CLA_CONSENT_MISSING_CODE);
+    expect(evaluateClaCheck({ consentPhrase: "I agree to the CLA", checkRunName: null }, { body: undefined })[0]?.code).toBe(CLA_CONSENT_MISSING_CODE);
+    expect(evaluateClaCheck({ consentPhrase: "I agree", checkRunName: "CLA Bot" }, { body: "nope", checkRunConclusion: undefined })[0]?.code).toBe(
+      CLA_CHECK_UNRESOLVED_CODE,
+    );
+    // #5838: a blank/whitespace-only consentPhrase normalizes to null (unset), so it never auto-satisfies consent.
+    expect(evaluateClaCheck({ consentPhrase: "", checkRunName: null }, { body: "no consent here" })).toEqual([]);
+    expect(evaluateClaCheck({ consentPhrase: "   ", checkRunName: null }, { body: "no consent here" })).toEqual([]);
+    expect(evaluateClaCheck({ consentPhrase: "", checkRunName: "CLA Bot" }, { body: "nope", checkRunConclusion: undefined })[0]?.code).toBe(
+      CLA_CHECK_UNRESOLVED_CODE,
+    );
+    expect(guardrailPathMatches(["src/a.ts"], ["src/a.ts"])).toEqual([{ path: "src/a.ts", glob: "src/a.ts" }]);
+    expect(guardrailPathMatches(["other.ts"], ["src/a.ts"])).toEqual([]);
+    const pathological = "src/*-*-*-final.ts";
+    expect(guardrailPathMatches(["scripts/x.ts"], [pathological])).toEqual([{ path: "scripts/x.ts", glob: pathological }]);
+  });
+
+  it("exercises classifyBountyLifecycle and preflight branch arms", () => {
+    const issue = { repoFullName: BRANCH_REPO.fullName, number: 1, title: "Issue", state: "open" as const, labels: [], linkedPrs: [] };
+    expect(classifyBountyLifecycle({ id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 1, status: "cancelled", updatedAt: "2026-01-01T00:00:00.000Z", discoveredAt: "2026-01-01T00:00:00.000Z", payload: {} }, issue)).toBe("cancelled");
+    expect(classifyBountyLifecycle({ id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 1, status: "completed", updatedAt: "2026-01-01T00:00:00.000Z", discoveredAt: "2026-01-01T00:00:00.000Z", payload: {} }, issue)).toBe("completed");
+    expect(classifyBountyLifecycle(
+      { id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 1, status: "active funded", discoveredAt: new Date().toISOString(), payload: {} },
+      issue,
+    )).toBe("active");
+    expect(classifyBountyLifecycle(
+      { id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 1, status: "active funded", updatedAt: "2020-01-01T00:00:00.000Z", discoveredAt: "2020-01-01T00:00:00.000Z", payload: {} },
+      issue,
+    )).toBe("stale");
+
+    const ambiguousOnlyBountyPreflight = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [9], changedFiles: ["src/a.ts"], tests: ["src/a.test.ts"] },
+      BRANCH_REPO,
+      [{ repoFullName: BRANCH_REPO.fullName, number: 9, title: "Issue", state: "open", labels: [], linkedPrs: [] }],
+      [],
+      [{ id: "b3", repoFullName: BRANCH_REPO.fullName, issueNumber: 9, status: "mystery bounty", updatedAt: new Date().toISOString(), discoveredAt: new Date().toISOString(), payload: {} }],
+    );
+    expect(ambiguousOnlyBountyPreflight.findings.some((f) => f.code === "linked_issue_bounty_unverified")).toBe(true);
+
+    const activeBountyPreflight = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [11], changedFiles: ["src/a.ts"], tests: ["src/a.test.ts"] },
+      BRANCH_REPO,
+      [{ repoFullName: BRANCH_REPO.fullName, number: 11, title: "Issue", state: "open", labels: [], linkedPrs: [] }],
+      [],
+      [{ id: "b4", repoFullName: BRANCH_REPO.fullName, issueNumber: 11, status: "active funded", updatedAt: new Date().toISOString(), discoveredAt: new Date().toISOString(), payload: {} }],
+    );
+    expect(activeBountyPreflight.findings.map((f) => f.code)).not.toContain("linked_issue_bounty_unverified");
+
+    const ambiguousBountyPreflight = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"], tests: ["src/a.test.ts"] },
+      BRANCH_REPO,
+      [{ repoFullName: BRANCH_REPO.fullName, number: 7, title: "Issue", state: "closed", labels: [], linkedPrs: [] }],
+      [],
+      [{ id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 7, status: "active funded", updatedAt: new Date().toISOString(), discoveredAt: new Date().toISOString(), payload: {} }],
+    );
+    expect(ambiguousBountyPreflight.findings.some((f) => f.code === "linked_issue_bounty_unverified")).toBe(true);
+    expect(classifyBountyLifecycle({ id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 1, status: "active funded", updatedAt: new Date().toISOString(), discoveredAt: new Date().toISOString(), payload: {} }, { ...issue, state: "closed" })).toBe("ambiguous");
+    expect(
+      classifyBountyLifecycle(
+        { id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 1, status: "active funded", updatedAt: "2020-01-01T00:00:00.000Z", discoveredAt: "2020-01-01T00:00:00.000Z", payload: {} },
+        issue,
+      ),
+    ).toBe("stale");
+
+    const mediumBurden = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", changedFiles: ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"], linkedIssues: [7] },
+      BRANCH_REPO,
+      [],
+      [],
+    );
+    expect(mediumBurden.reviewBurden).toBe("medium");
+
+    const ready = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", changedFiles: ["src/a.ts"], linkedIssues: [7], tests: ["src/a.test.ts"] },
+      BRANCH_REPO,
+      [{ repoFullName: BRANCH_REPO.fullName, number: 7, title: "Issue", state: "open", labels: [], linkedPrs: [] }],
+      [],
+    );
+    expect(ready.status).toBe("ready");
+
+    const staleBountyPreflight = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"], tests: ["src/a.test.ts"] },
+      BRANCH_REPO,
+      [{ repoFullName: BRANCH_REPO.fullName, number: 7, title: "Issue", state: "open", labels: [], linkedPrs: [] }],
+      [],
+      [{ id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 7, status: "active funded", updatedAt: "2020-01-01T00:00:00.000Z", discoveredAt: "2020-01-01T00:00:00.000Z", payload: {} }],
+    );
+    expect(staleBountyPreflight.findings.some((f) => f.code === "linked_issue_bounty_unverified")).toBe(true);
+
+    const issueQualityNoWarnings: IssueQualityReport = {
+      repoFullName: BRANCH_REPO.fullName,
+      generatedAt: "2026-01-01T00:00:00.000Z",
+      lane: { lane: "direct_pr", repoFullName: BRANCH_REPO.fullName, summary: "s", contributorGuidance: "s", maintainerGuidance: "s" },
+      summary: "s",
+      issues: [{ number: 8, title: "Issue", status: "needs_proof", score: 40, reasons: [], warnings: [] }],
+    };
+    expect(
+      buildPreflightResult(
+        { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [8], changedFiles: ["src/a.ts"], tests: ["src/a.test.ts"] },
+        BRANCH_REPO,
+        [],
+        [],
+        [],
+        issueQualityNoWarnings,
+      ).findings.some((f) => f.code === "issue_quality_needs_proof"),
+    ).toBe(true);
+
+    const issueQualityReady: IssueQualityReport = {
+      repoFullName: BRANCH_REPO.fullName,
+      generatedAt: "2026-01-01T00:00:00.000Z",
+      lane: { lane: "direct_pr", repoFullName: BRANCH_REPO.fullName, summary: "s", contributorGuidance: "s", maintainerGuidance: "s" },
+      summary: "s",
+      issues: [{ number: 7, title: "Issue", status: "ready", score: 100, reasons: [], warnings: [] }],
+    };
+    expect(
+      buildPreflightResult(
+        { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"], tests: ["src/a.test.ts"] },
+        BRANCH_REPO,
+        [],
+        [],
+        [],
+        issueQualityReady,
+      ).findings.map((f) => f.code),
+    ).not.toContain("issue_quality_do_not_use");
+
+    const linkedIssueCollision = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Unrelated title", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"], tests: ["src/a.test.ts"] },
+      BRANCH_REPO,
+      [],
+      [
+        { ...pr(BRANCH_REPO.fullName, 20, "Other work"), linkedIssues: [7] },
+        { ...pr(BRANCH_REPO.fullName, 21, "More work"), linkedIssues: [7] },
+      ],
+    );
+    expect(linkedIssueCollision.collisions.length).toBeGreaterThan(0);
+
+    const titleOverlapCollision = buildPreflightResult(
+      {
+        repoFullName: BRANCH_REPO.fullName,
+        title: "Resolve login redirect loop OAuth callback handler",
+        body: "",
+        linkedIssues: [],
+        changedFiles: ["src/auth.ts"],
+        tests: ["src/auth.test.ts"],
+      },
+      BRANCH_REPO,
+      [{ repoFullName: BRANCH_REPO.fullName, number: 51, title: "Login redirect loop OAuth cleanup", state: "open", labels: [], linkedPrs: [] }],
+      [{ ...pr(BRANCH_REPO.fullName, 52, "Login redirect loop OAuth middleware"), changedFiles: ["src/auth.ts"] }],
+    );
+    expect(titleOverlapCollision.collisions.length).toBeGreaterThan(0);
+  });
+
+  it("exercises collision pairwise branch arms", () => {
+    expect(
+      buildCollisionReport(BRANCH_REPO.fullName, [], [
+        { ...pr(BRANCH_REPO.fullName, 1, "alpha upload retry client"), authorLogin: "alice", changedFiles: ["package-lock.json"] },
+        { ...pr(BRANCH_REPO.fullName, 2, "beta upload retry service"), authorLogin: "bob", changedFiles: ["package-lock.json"] },
+      ]).clusters,
+    ).toHaveLength(0);
+
+    const highOverlap = buildCollisionReport(BRANCH_REPO.fullName, [], [
+      { ...pr(BRANCH_REPO.fullName, 3, "upload retry client handler service"), authorLogin: "alice", changedFiles: ["src/core/upload.ts"] },
+      { ...pr(BRANCH_REPO.fullName, 4, "upload retry service handler client"), authorLogin: "bob", changedFiles: ["src/core/upload.ts"] },
+    ]);
+    expect(highOverlap.clusters.some((c) => c.risk === "high")).toBe(true);
+
+    const sharedIssuePair = buildCollisionReport(
+      BRANCH_REPO.fullName,
+      [{ repoFullName: BRANCH_REPO.fullName, number: 7, title: "Issue", state: "open", labels: [], linkedPrs: [], authorLogin: "r" }],
+      [
+        { ...pr(BRANCH_REPO.fullName, 5, "A"), linkedIssues: [7] },
+        { ...pr(BRANCH_REPO.fullName, 6, "B"), linkedIssues: [7] },
+      ],
+    );
+    expect(sharedIssuePair.clusters.length).toBeGreaterThan(0);
+
+    const pairwiseSharedIssue = buildCollisionReport(BRANCH_REPO.fullName, [], [
+      { ...pr(BRANCH_REPO.fullName, 8, "First"), linkedIssues: [42] },
+      { ...pr(BRANCH_REPO.fullName, 9, "Second"), linkedIssues: [42] },
+    ]);
+    expect(pairwiseSharedIssue.clusters.some((c) => c.reason.includes("same linked issue"))).toBe(true);
+
+    const recentMergedSharedIssue = buildCollisionReport(
+      BRANCH_REPO.fullName,
+      [],
+      [{ ...pr(BRANCH_REPO.fullName, 10, "Open overlap"), linkedIssues: [55], changedFiles: ["src/auth.ts"] }],
+      [{ repoFullName: BRANCH_REPO.fullName, number: 88, title: "Merged overlap", authorLogin: "bob", labels: [], linkedIssues: [55], changedFiles: ["src/auth.ts"] }],
+    );
+    expect(recentMergedSharedIssue.clusters.some((c) => c.risk === "medium")).toBe(true);
+
+    const recentMergedNoLinks = buildCollisionReport(
+      BRANCH_REPO.fullName,
+      [],
+      [{ ...pr(BRANCH_REPO.fullName, 13, "upload retry client handler"), authorLogin: "alice", changedFiles: ["src/core/upload.ts"] }],
+      [{ repoFullName: BRANCH_REPO.fullName, number: 90, title: "upload retry service handler", authorLogin: "bob", labels: [], linkedIssues: [], changedFiles: ["src/core/upload.ts"] }],
+    );
+    expect(recentMergedNoLinks.clusters.length).toBeGreaterThan(0);
+
+    const selfAuthoredPathOverlap = buildCollisionReport(BRANCH_REPO.fullName, [], [
+      { ...pr(BRANCH_REPO.fullName, 14, "qwerty alpha"), authorLogin: "alice", changedFiles: ["src/services/upload/retry.ts"] },
+      { ...pr(BRANCH_REPO.fullName, 15, "asdf beta"), authorLogin: "alice", changedFiles: ["src/services/upload/retry.ts"] },
+    ]);
+    const differentLinkedIssues = buildCollisionReport(BRANCH_REPO.fullName, [], [
+      { ...pr(BRANCH_REPO.fullName, 16, "upload retry client handler"), authorLogin: "alice", linkedIssues: [1], changedFiles: ["src/core/upload.ts"] },
+      { ...pr(BRANCH_REPO.fullName, 17, "upload retry service handler"), authorLogin: "bob", linkedIssues: [2], changedFiles: ["src/core/upload.ts"] },
+    ]);
+    expect(differentLinkedIssues.clusters.length).toBeGreaterThan(0);
+  });
+
+  it("exercises readiness and queue-pressure component branches", () => {
+    const internals = predictedGateEngineInternals;
+    expect(internals.reviewLoadComponentScore("low")).toBe(20);
+    expect(internals.reviewLoadComponentScore("medium")).toBe(14);
+    expect(internals.reviewLoadComponentScore("high")).toBe(8);
+    expect(internals.changeScopeEvidence({ ...pr(BRANCH_REPO.fullName, 1, "Fix"), labels: ["size:L"], isDraft: true, linkedIssues: [7] }, "high")).toContain("size label");
+    expect(internals.changeScopeEvidence({ ...pr(BRANCH_REPO.fullName, 2, "Fix"), labels: [], linkedIssues: [] }, "low")).toContain("no linked issue");
+
+    const holdPreflight = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"], tests: [] },
+      { ...BRANCH_REPO, registryConfig: { ...BRANCH_REPO.registryConfig!, emissionShare: 0 } },
+      [],
+      [],
+      [],
+      null,
+      false,
+    );
+    expect(internals.validationComponent({ ...pr(BRANCH_REPO.fullName, 3, "Fix"), body: "npm test passed" }, holdPreflight).score).toBe(5);
+    expect(internals.validationComponent({ ...pr(BRANCH_REPO.fullName, 4, "Fix"), body: "npm test passed" }, { ...holdPreflight, status: "needs_work", findings: [{ code: "missing_test_evidence", severity: "warning", title: "t", detail: "d" }] }).score).toBe(12);
+    expect(
+      internals.validationComponent({ ...pr(BRANCH_REPO.fullName, 31, "Fix"), body: "no validation note" }, {
+        ...holdPreflight,
+        status: "needs_work",
+        findings: [{ code: "missing_test_evidence", severity: "warning", title: "t", detail: "d" }],
+      }).score,
+    ).toBe(10);
+
+    const emptyQueue = internals.queuePressureComponent({
+      repoFullName: BRANCH_REPO.fullName,
+      generatedAt: "2026-01-01T00:00:00.000Z",
+      burdenScore: 0,
+      level: "low",
+      summary: "s",
+      signals: { openIssues: 0, openPullRequests: 0, unlinkedPullRequests: 0, stalePullRequests: 0, draftPullRequests: 0, maintainerAuthoredPullRequests: 0, collisionClusters: 0, slopFlaggedPullRequests: 0, duplicateFlaggedPullRequests: 0, ageBuckets: { under7Days: 0, days7To30: 0, over30Days: 0 }, likelyReviewablePullRequests: 0, cachedOpenPullRequests: 0, likelyReviewablePullRequestsSource: "cache" },
+      findings: [],
+    });
+    expect(emptyQueue.evidence).toContain("0 likely reviewable");
+
+    const sampledQueue = buildQueueHealth(BRANCH_REPO, [], [{ ...pr(BRANCH_REPO.fullName, 8, "Open"), linkedIssues: [7] }], buildCollisionReport(BRANCH_REPO.fullName, [], []), { openPullRequests: 40 });
+    expect(internals.queuePressureComponent(sampledQueue).evidence).toContain("sampled");
+
+    expect(
+      internals.queuePressureComponent({
+        repoFullName: BRANCH_REPO.fullName,
+        generatedAt: "2026-01-01T00:00:00.000Z",
+        burdenScore: 0,
+        level: "low",
+        summary: "s",
+        signals: {
+          openIssues: 0,
+          openPullRequests: 12,
+          unlinkedPullRequests: 0,
+          stalePullRequests: 0,
+          draftPullRequests: 0,
+          maintainerAuthoredPullRequests: 0,
+          collisionClusters: 0,
+          slopFlaggedPullRequests: 0,
+          duplicateFlaggedPullRequests: 0,
+          ageBuckets: { under7Days: 2, days7To30: 1, over30Days: 0 },
+          likelyReviewablePullRequests: 2,
+          likelyReviewablePullRequestsSource: undefined,
+        },
+        findings: [],
+      }).evidence,
+    ).toContain("sampled");
+
+    expect(
+      internals.queuePressureComponent({
+        repoFullName: BRANCH_REPO.fullName,
+        generatedAt: "2026-01-01T00:00:00.000Z",
+        burdenScore: 0,
+        level: "low",
+        summary: "s",
+        signals: {
+          openIssues: 0,
+          openPullRequests: 5,
+          unlinkedPullRequests: 0,
+          stalePullRequests: 0,
+          draftPullRequests: 0,
+          maintainerAuthoredPullRequests: 0,
+          collisionClusters: 0,
+          slopFlaggedPullRequests: 0,
+          duplicateFlaggedPullRequests: 0,
+          ageBuckets: { under7Days: 0, days7To30: 0, over30Days: 0 },
+          likelyReviewablePullRequests: 0,
+          likelyReviewablePullRequestsSource: "sampled_cache",
+        },
+        findings: [],
+      }).evidence,
+    ).toContain("unavailable");
+
+    expect(internals.queuePressureOpenPullRequestScore(0)).toBe(10);
+    expect(internals.queuePressureOpenPullRequestScore(6)).toBe(8);
+    expect(internals.queuePressureOpenPullRequestScore(10)).toBe(5);
+    expect(internals.queuePressureOpenPullRequestScore(20)).toBe(3);
+
+    expect(internals.extractLinkedIssueNumbers("closes other/repo#9", BRANCH_REPO.fullName)).not.toContain(9);
+    expect(internals.extractLinkedIssueNumbers(`closes ${BRANCH_REPO.fullName}#9`, BRANCH_REPO.fullName)).toContain(9);
+
+    // REGRESSION (#linked-issue-url-form): the full GitHub issue URL closing form, which GitHub's own linker
+    // also recognizes, must not silently extract zero linked issues.
+    expect(internals.extractLinkedIssueNumbers(`closes https://github.com/${BRANCH_REPO.fullName}/issues/11`, BRANCH_REPO.fullName)).toContain(11);
+    expect(internals.extractLinkedIssueNumbers(`closes https://github.com/other/repo/issues/11`, BRANCH_REPO.fullName)).not.toContain(11);
+
+    const issueQuality: IssueQualityReport = {
+      repoFullName: BRANCH_REPO.fullName,
+      generatedAt: "2026-01-01T00:00:00.000Z",
+      lane: { lane: "direct_pr", repoFullName: BRANCH_REPO.fullName, summary: "s", contributorGuidance: "s", maintainerGuidance: "s" },
+      summary: "s",
+      issues: [{ number: 7, title: "Issue", status: "ready", score: 100, reasons: [], warnings: [] }],
+    };
+    const overlapPreflight = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Resolve login redirect loop OAuth callback handler", body: "", changedFiles: ["src/auth.ts"], linkedIssues: [] },
+      BRANCH_REPO,
+      [{ repoFullName: BRANCH_REPO.fullName, number: 51, title: "Login redirect loop OAuth cleanup", state: "open", labels: [], linkedPrs: [] }],
+      [{ ...pr(BRANCH_REPO.fullName, 52, "Login redirect loop OAuth middleware"), changedFiles: ["src/auth.ts"] }],
+    );
+    const readiness = buildPublicReadinessScore({
+      pr: { ...pr(BRANCH_REPO.fullName, 9, "Fix"), body: "Validation: npm test", labels: ["size:large"], isDraft: true, linkedIssues: [7] },
+      preflight: { ...overlapPreflight, status: "ready", reviewBurden: "medium", findings: [] },
+      queueHealth: buildQueueHealth(BRANCH_REPO, [], [{ ...pr(BRANCH_REPO.fullName, 10, "Stale"), linkedIssues: [], updatedAt: "2000-01-01T00:00:00.000Z" }], buildCollisionReport(BRANCH_REPO.fullName, [], []), { openPullRequests: 15, likelyReviewablePullRequests: 3 }),
+    });
+    expect(readiness.total).toBeGreaterThan(0);
+    expect(buildPreflightResult({ repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"], tests: ["src/a.test.ts"] }, BRANCH_REPO, [], [], [], issueQuality).findings.map((f) => f.code)).not.toContain("issue_quality_do_not_use");
+
+    const staleDraftOnlyCreatedAt = buildQueueHealth(
+      BRANCH_REPO,
+      [],
+      [{ ...pr(BRANCH_REPO.fullName, 77, "Draft only createdAt"), isDraft: true, updatedAt: undefined, createdAt: "2000-01-01T00:00:00.000Z" }],
+      buildCollisionReport(BRANCH_REPO.fullName, [], []),
+    );
+    expect(staleDraftOnlyCreatedAt.findings.some((f) => f.code === "inactive_draft_prs")).toBe(true);
+
+    const lowBurdenQueue = buildQueueHealth(BRANCH_REPO, [], [], buildCollisionReport(BRANCH_REPO.fullName, [], []));
+    expect(lowBurdenQueue.level).toBe("low");
+    const mediumQueue = buildQueueHealth(
+      BRANCH_REPO,
+      [],
+      [1, 2, 3].map((number) => pr(BRANCH_REPO.fullName, number, `Unlinked ${number}`, { linkedIssues: [] })),
+      buildCollisionReport(BRANCH_REPO.fullName, [], []),
+    );
+    expect(mediumQueue.level).toBe("medium");
+    const highQueue = buildQueueHealth(
+      BRANCH_REPO,
+      [],
+      [1, 2, 3, 4].map((number) => pr(BRANCH_REPO.fullName, number, `Unlinked ${number}`, { linkedIssues: [] })),
+      buildCollisionReport(BRANCH_REPO.fullName, [], []),
+    );
+    expect(highQueue.level).toBe("high");
+    const criticalStale = [44, 45, 46, 47].map((number) =>
+      pr(BRANCH_REPO.fullName, number, `Stale ${number}`, { linkedIssues: [], updatedAt: "2000-01-01T00:00:00.000Z" }),
+    );
+    expect(buildQueueHealth(BRANCH_REPO, [], criticalStale, buildCollisionReport(BRANCH_REPO.fullName, [], criticalStale)).level).toBe("critical");
+
+    const bodyLinkedIssues = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: `closes ${BRANCH_REPO.fullName}#12 and fixes #8`, changedFiles: ["src/a.ts"] },
+      BRANCH_REPO,
+      [],
+      [],
+    );
+    expect(bodyLinkedIssues.linkedIssues).toEqual([8, 12]);
+    const mergedLinkedIssues = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "closes #5", linkedIssues: [3], changedFiles: ["src/a.ts"] },
+      BRANCH_REPO,
+      [],
+      [],
+    );
+    expect(mergedLinkedIssues.linkedIssues).toEqual([3, 5]);
+  });
+
+  it("exercises codecov-critical helper and gate-evaluation branches", () => {
+    const finding = (code: string) => ({ code, severity: "warning" as const, title: code, detail: code });
+    const advisoryBase = {
+      id: "a",
+      targetType: "pull_request" as const,
+      targetKey: "k",
+      repoFullName: BRANCH_REPO.fullName,
+      conclusion: "success" as const,
+      severity: "info" as const,
+      title: "t",
+      summary: "s",
+      generatedAt: "2026-01-01T00:00:00.000Z",
+      findings: [] as Array<{ code: string; severity: "warning" | "critical"; title: string; detail: string; action?: string }>,
+    };
+    const policyBlockers = evaluateGateCheck(
+      {
+        ...advisoryBase,
+        findings: [
+          finding(REVIEW_THREAD_BLOCKER_CODE),
+          { code: "secret_leak", severity: "critical", title: "secret", detail: "secret", action: "rotate" },
+          finding("ai_review_split"),
+        ],
+      },
+      { aiReviewGateMode: "block" },
+    );
+    expect(policyBlockers.blockers.map((b) => b.code)).toEqual(
+      expect.arrayContaining([REVIEW_THREAD_BLOCKER_CODE, "secret_leak", "ai_review_split"]),
+    );
+
+    expect(termOverlap({ terms: new Set(), size: 0 }, { terms: new Set(["alpha"]), size: 1 }).score).toBe(0);
+    expect(termOverlap({ terms: new Set(["alpha"]), size: 1 }, { terms: new Set(), size: 0 }).score).toBe(0);
+    expect(predictedGateEngineInternals.truncateText("short", 10)).toBe("short");
+    expect(predictedGateEngineInternals.truncateText("x".repeat(20), 10)).toHaveLength(10);
+    expect(predictedGateEngineInternals.sharesMeaningfulFile([], ["src/a.ts"])).toBe(false);
+    expect(predictedGateEngineInternals.sharesMeaningfulFile(["src/a.ts"], [])).toBe(false);
+
+    const issue = { repoFullName: BRANCH_REPO.fullName, number: 1, title: "Issue", state: "open" as const, labels: [], linkedPrs: [] };
+    expect(classifyBountyLifecycle({ id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 1, status: "  ", discoveredAt: "2026-01-01T00:00:00.000Z", payload: {} }, issue)).toBe("unknown");
+    expect(classifyBountyLifecycle({ id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 1, status: "archived bounty", discoveredAt: "2026-01-01T00:00:00.000Z", payload: {} }, issue)).toBe("historical");
+    expect(classifyBountyLifecycle({ id: "b", repoFullName: BRANCH_REPO.fullName, issueNumber: 1, status: "mystery", discoveredAt: "2026-01-01T00:00:00.000Z", payload: {} }, issue)).toBe("ambiguous");
+
+    const selfAuthored = buildPullRequestAdvisory(
+      BRANCH_REPO,
+      {
+        ...pr(BRANCH_REPO.fullName, 1, "Fix"),
+        authorLogin: "alice",
+        linkedIssues: [7],
+      },
+      { linkedIssueAuthorLogins: ["alice"] },
+    );
+    expect(selfAuthored.findings.some((f) => f.code === "self_authored_linked_issue")).toBe(true);
+
+    const readiness = buildPublicReadinessScore({
+      pr: { ...pr(BRANCH_REPO.fullName, 2, "Fix"), body: "No issue because docs-only typo", linkedIssues: [] },
+      preflight: buildPreflightResult({ repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "No issue because docs-only typo", linkedIssues: [], changedFiles: ["README.md"] }, BRANCH_REPO, [], []),
+      queueHealth: buildQueueHealth(BRANCH_REPO, [], [], buildCollisionReport(BRANCH_REPO.fullName, [], [])),
+    });
+    expect(readiness.components.find((c) => c.key === "traceability")?.evidence).toContain("no-issue rationale");
+
+    const withIdentifiers = gateAdvisoryInternals.advisory(
+      "pull_request",
+      "acme/widgets#1",
+      BRANCH_REPO.fullName,
+      [],
+      "summary",
+      1,
+      7,
+      "sha123",
+    );
+    expect(withIdentifiers.pullNumber).toBe(1);
+    expect(withIdentifiers.issueNumber).toBe(7);
+    expect(withIdentifiers.headSha).toBe("sha123");
+
+    const overflowGuardrail = gateAdvisoryInternals.buildGuardrailHoldFinding(
+      Array.from({ length: 6 }, (_, index) => ({ path: `src/file-${index}.ts`, glob: "src/**" })),
+    );
+    expect(overflowGuardrail.detail).toContain("and 1 more");
+
+    const issueDiscoveryLane = buildLaneAdvice(
+      { ...BRANCH_REPO, registryConfig: { ...BRANCH_REPO.registryConfig!, emissionShare: 1, issueDiscoveryShare: 1 } },
+      BRANCH_REPO.fullName,
+    );
+    expect(issueDiscoveryLane.lane).toBe("issue_discovery");
+
+    const openReady = buildPublicReadinessScore({
+      pr: { ...pr(BRANCH_REPO.fullName, 3, "Fix"), state: "open", isDraft: false, linkedIssues: [7] },
+      preflight: buildPreflightResult({ repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"] }, BRANCH_REPO, [], []),
+      queueHealth: buildQueueHealth(BRANCH_REPO, [], [], buildCollisionReport(BRANCH_REPO.fullName, [], [])),
+    });
+    expect(openReady.components.find((c) => c.key === "pr_state")?.score).toBe(10);
+
+    const openDraft = buildPublicReadinessScore({
+      pr: { ...pr(BRANCH_REPO.fullName, 4, "Fix"), state: "open", isDraft: true, linkedIssues: [7, 8] },
+      preflight: buildPreflightResult({ repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [7, 8], changedFiles: ["src/a.ts"] }, BRANCH_REPO, [], []),
+      queueHealth: buildQueueHealth(BRANCH_REPO, [], [], buildCollisionReport(BRANCH_REPO.fullName, [], [])),
+    });
+    expect(openDraft.components.find((c) => c.key === "pr_state")?.score).toBe(6);
+    expect(openDraft.components.find((c) => c.key === "change_scope")?.evidence).toContain("2 linked issues");
+
+    const closedPr = buildPublicReadinessScore({
+      pr: { ...pr(BRANCH_REPO.fullName, 5, "Fix"), state: "closed", isDraft: false, linkedIssues: [7] },
+      preflight: buildPreflightResult({ repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"] }, BRANCH_REPO, [], []),
+      queueHealth: buildQueueHealth(BRANCH_REPO, [], [], buildCollisionReport(BRANCH_REPO.fullName, [], [])),
+    });
+    expect(closedPr.components.find((c) => c.key === "pr_state")?.score).toBe(3);
+    expect(closedPr.components.find((c) => c.key === "change_scope")?.evidence).toContain("1 linked issue");
+  });
+
+  it("covers lane_not_recommended maintainer branches and scoped overlap pluralization", () => {
+    const inactiveRepo = { ...BRANCH_REPO, registryConfig: { ...BRANCH_REPO.registryConfig!, emissionShare: 0 } };
+    const maintainerLane = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "Closes #7", linkedIssues: [7], authorAssociation: "OWNER" },
+      inactiveRepo,
+      [],
+      [],
+    );
+    const contributorLane = buildPreflightResult(
+      { repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "Closes #7", linkedIssues: [7], authorAssociation: "CONTRIBUTOR" },
+      inactiveRepo,
+      [],
+      [],
+    );
+    expect(maintainerLane.findings.find((finding) => finding.code === "lane_not_recommended")).toMatchObject({
+      severity: "info",
+      title: "Repo lane unavailable for contributor scoring",
+      detail: expect.stringContaining("Maintainer-authored work is treated as repo stewardship"),
+      action: "No action.",
+    });
+    expect(contributorLane.findings.find((finding) => finding.code === "lane_not_recommended")).toMatchObject({
+      severity: "warning",
+      title: "Repo lane is not ready for a confident recommendation",
+      action: "Refresh registry data or choose a registered active repo.",
+    });
+
+    const missingRepo = { ...BRANCH_REPO, isRegistered: false, registryConfig: null };
+    const ownerUnknownLane = buildPreflightResult(
+      { repoFullName: missingRepo.fullName, title: "Fix", body: "Closes #7", linkedIssues: [7], authorAssociation: "OWNER" },
+      missingRepo,
+      [],
+      [],
+      [],
+      null,
+      true,
+    );
+    const outsideUnknownLane = buildPreflightResult(
+      { repoFullName: missingRepo.fullName, title: "Fix", body: "Closes #7", linkedIssues: [7], authorAssociation: "CONTRIBUTOR" },
+      missingRepo,
+      [],
+      [],
+      [],
+      null,
+      true,
+    );
+    expect(ownerUnknownLane.findings.find((finding) => finding.code === "lane_not_recommended")?.severity).toBe("info");
+    expect(outsideUnknownLane.findings.find((finding) => finding.code === "lane_not_recommended")?.severity).toBe("warning");
+
+    const preflight = buildPreflightResult({ repoFullName: BRANCH_REPO.fullName, title: "Fix", body: "", linkedIssues: [7], changedFiles: ["src/a.ts"] }, BRANCH_REPO, [], []);
+    const singularOverlap = buildPublicReadinessScore({
+      pr: { ...pr(BRANCH_REPO.fullName, 6, "Fix"), linkedIssues: [7] },
+      preflight,
+      queueHealth: buildQueueHealth(BRANCH_REPO, [], [], buildCollisionReport(BRANCH_REPO.fullName, [], [])),
+      scopedOverlapCount: 1,
+      linkedDuplicatePrs: [],
+    });
+    const pluralOverlap = buildPublicReadinessScore({
+      pr: { ...pr(BRANCH_REPO.fullName, 7, "Fix"), linkedIssues: [7] },
+      preflight,
+      queueHealth: buildQueueHealth(BRANCH_REPO, [], [], buildCollisionReport(BRANCH_REPO.fullName, [], [])),
+      scopedOverlapCount: 2,
+      linkedDuplicatePrs: [],
+    });
+    expect(singularOverlap.components.find((component) => component.key === "related_work")?.evidence).toBe("1 scoped overlap found.");
+    expect(pluralOverlap.components.find((component) => component.key === "related_work")?.evidence).toBe("2 scoped overlaps found.");
+  });
+});
+
+function repo(fullName: string, overrides: Partial<RegistryRepoConfig> = {}): RepositoryRecord {
+  const [owner, name] = fullName.split("/") as [string, string];
+  return {
+    fullName,
+    owner,
+    name,
+    isInstalled: true,
+    isRegistered: true,
+    isPrivate: false,
+    registryConfig: {
+      repo: fullName,
+      emissionShare: 1,
+      issueDiscoveryShare: 0,
+      labelMultipliers: {},
+      maintainerCut: 0,
+      raw: {},
+      ...overrides,
+    },
+  };
+}
+
+function pr(repoFullName: string, number: number, title: string, overrides: Partial<PullRequestRecord> = {}): PullRequestRecord {
+  return {
+    repoFullName,
+    number,
+    title,
+    state: "open",
+    authorLogin: "dev",
+    labels: [],
+    linkedIssues: [],
+    updatedAt: new Date().toISOString(),
+    ...overrides,
+  };
+}

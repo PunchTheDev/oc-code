@@ -1,0 +1,203 @@
+diff --git a/neuromorphic/src/neuromorphic/service.py b/neuromorphic/src/neuromorphic/service.py
+index 1c120e7..04fef26 100644
+--- a/neuromorphic/src/neuromorphic/service.py
++++ b/neuromorphic/src/neuromorphic/service.py
+@@ -12,7 +12,7 @@
+ 
+ from activelearning import BaseService
+ from activelearning.core import generate_trace_id
+-from activelearning.signing import verify_decision
++from activelearning.signing import accept_kernel_decision
+ from activelearning.subjects import Subjects
+ 
+ from neuromorphic.auditory_stm import AuditorySTM, AuditorySTMConfig
+@@ -1410,9 +1410,9 @@ async def _handle_kernel_decision(self, data: dict[str, Any]) -> None:
+         if fut.done():
+             self.logger.debug(f"Decision for already-completed trace {trace_id} — ignoring")
+             return
+-        if not verify_decision(data):
++        if not accept_kernel_decision(data):
+             self.logger.error(
+-                "Rejected unverified decision for %s — ignoring (possible forgery)",
++                "Rejected decision for %s — ignoring (forgery or expired replay)",
+                 trace_id,
+             )
+             return
+diff --git a/neuromorphic/tests/test_decision_verification.py b/neuromorphic/tests/test_decision_verification.py
+index 144f03f..7d87728 100644
+--- a/neuromorphic/tests/test_decision_verification.py
++++ b/neuromorphic/tests/test_decision_verification.py
+@@ -24,8 +24,8 @@
+ 
+ from activelearning.signing import (  # noqa: E402
+     DECISION_KEY_ENV,
++    accept_kernel_decision,
+     sign_decision,
+-    verify_decision,
+ )
+ 
+ 
+@@ -45,9 +45,9 @@ async def _handle_kernel_decision(svc: _DecisionGateStub, data: dict[str, Any])
+         return
+     if fut.done():
+         return
+-    if not verify_decision(data):
++    if not accept_kernel_decision(data):
+         svc.logger.error(
+-            "Rejected unverified decision for %s — ignoring (possible forgery)",
++            "Rejected decision for %s — ignoring (forgery or expired replay)",
+             trace_id,
+         )
+         return
+@@ -95,3 +95,28 @@ async def test_handle_kernel_decision_accepts_signed_decision(monkeypatch):
+ 
+     assert fut.done()
+     assert fut.result()["type"] == "ALLOW"
++
++
++@pytest.mark.asyncio
++async def test_handle_kernel_decision_rejects_expired_signed_decision(monkeypatch):
++    key = "neuro-test-key-expired"
++    monkeypatch.setenv(DECISION_KEY_ENV, key)
++    from activelearning.core import current_timestamp
++
++    svc = _DecisionGateStub()
++    fut = asyncio.get_running_loop().create_future()
++    svc._pending_decisions["t-expired"] = fut
++
++    stale = sign_decision(
++        {
++            "trace_id": "t-expired",
++            "type": "ALLOW",
++            "reason": "stale replay",
++            "risk_score": 0.0,
++            "expires_at": current_timestamp() - 1000,
++        },
++        key,
++    )
++    await _handle_kernel_decision(svc, stale)
++
++    assert not fut.done()
+diff --git a/planner/src/planner/service.py b/planner/src/planner/service.py
+index 3e8ea6c..5f74ac0 100644
+--- a/planner/src/planner/service.py
++++ b/planner/src/planner/service.py
+@@ -11,7 +11,7 @@
+ 
+ from activelearning import BaseService, generate_trace_id
+ from activelearning.nats_client import serialize_message
+-from activelearning.signing import verify_decision
++from activelearning.signing import accept_kernel_decision
+ from nats.aio.msg import Msg
+ 
+ from planner.scheduler import PendingAction, Scheduler, SchedulerMode
+@@ -172,11 +172,11 @@ async def _handle_decision(self, data: dict) -> None:
+ 
+             self.logger.debug(f"Received decision for {trace_id}: {data.get('type')}")
+ 
+-            # Resolve pending decision future (fail-closed: reject forgeries).
++            # Resolve pending decision future (fail-closed: reject forgeries/replays).
+             if trace_id in self._pending_decisions:
+-                if not verify_decision(data):
++                if not accept_kernel_decision(data):
+                     self.logger.error(
+-                        "Rejected unverified decision for %s — ignoring (possible forgery)",
++                        "Rejected decision for %s — ignoring (forgery or expired replay)",
+                         trace_id,
+                     )
+                     return
+diff --git a/planner/tests/test_decision_verification.py b/planner/tests/test_decision_verification.py
+index 42f77f7..bf7069b 100644
+--- a/planner/tests/test_decision_verification.py
++++ b/planner/tests/test_decision_verification.py
+@@ -61,3 +61,30 @@ async def _exercise() -> None:
+         assert fut.result().type == "ALLOW"
+ 
+     asyncio.run(_exercise())
++
++
++def test_handle_decision_rejects_expired_signed_decision(monkeypatch):
++    key = "planner-test-key-expired"
++    monkeypatch.setenv(DECISION_KEY_ENV, key)
++
++    async def _exercise() -> None:
++        from activelearning.core import current_timestamp
++
++        svc = _make_planner()
++        fut = asyncio.get_running_loop().create_future()
++        svc._pending_decisions["t-expired"] = fut
++        stale = sign_decision(
++            {
++                "trace_id": "t-expired",
++                "type": "ALLOW",
++                "reason": "stale replay",
++                "risk_score": 0.0,
++                "expires_at": current_timestamp() - 1000,
++            },
++            key,
++        )
++        await svc._handle_decision(stale)
++        assert "t-expired" in svc._pending_decisions
++        assert not fut.done()
++
++    asyncio.run(_exercise())
+diff --git a/sdk/src/activelearning/signing.py b/sdk/src/activelearning/signing.py
+index 7d6e01e..8ad7cf2 100644
+--- a/sdk/src/activelearning/signing.py
++++ b/sdk/src/activelearning/signing.py
+@@ -155,6 +155,25 @@ def verify_decision(payload: dict[str, Any], key: str | None = None) -> bool:
+     return False
+ 
+ 
++def accept_kernel_decision(payload: dict[str, Any], *, now: int | None = None) -> bool:
++    """Return ``True`` only for an authentic, non-expired Kernel decision.
++
++    Combines :func:`verify_decision` with the temporal check documented in
++    issue #190: a captured, still-validly-signed stale ``ALLOW`` must not be
++    replayed past its ``expires_at``. Decisions with no ``expires_at`` never
++    expire (matching ``KernelDecision.is_expired()``).
++    """
++    if not verify_decision(payload):
++        return False
++    expires_at = payload.get("expires_at")
++    if expires_at is None:
++        return True
++    from activelearning.core import current_timestamp
++
++    reference = current_timestamp() if now is None else now
++    return reference <= expires_at
++
++
+ # ── Operator-action signing (SAFE_HALT resume and similar privileged commands) ─
+ #
+ # Operator actions (``safety.resume``) require a separate key so that
+diff --git a/sdk/tests/test_signing.py b/sdk/tests/test_signing.py
+index 65b6aaf..d050194 100644
+--- a/sdk/tests/test_signing.py
++++ b/sdk/tests/test_signing.py
+@@ -6,6 +6,7 @@
+     DECISION_KEY_ENV,
+     DECISION_KEY_SECONDARY_ENV,
+     SIGNATURE_FIELD,
++    accept_kernel_decision,
+     sign_decision,
+     signing_enabled,
+     verify_decision,
+@@ -80,6 +81,17 @@ def test_env_key_enforced(monkeypatch):
+     assert verify_decision(_decision()) is False  # forged/unsigned rejected
+ 
+ 
++def test_accept_kernel_decision_rejects_expired_signed():
++    signed = sign_decision(_decision(), KEY)
++    signed["expires_at"] = 1
++    assert accept_kernel_decision(signed, now=10_000) is False
++
++
++def test_accept_kernel_decision_accepts_before_expiry():
++    signed = sign_decision(_decision(), KEY)
++    assert accept_kernel_decision(signed, now=signed["expires_at"] - 1) is True
++
++
+ # ── key rotation (issue #206) ─────────────────────────────────────────────
+ #
+ # ENGRAM_DECISION_KEY_SECONDARY is a verify-only key: sign_decision never

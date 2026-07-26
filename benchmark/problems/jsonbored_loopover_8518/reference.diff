@@ -1,0 +1,210 @@
+diff --git a/packages/loopover-miner/lib/contribution-profile-extract.ts b/packages/loopover-miner/lib/contribution-profile-extract.ts
+index 4a2976fbd..17ea710ef 100644
+--- a/packages/loopover-miner/lib/contribution-profile-extract.ts
++++ b/packages/loopover-miner/lib/contribution-profile-extract.ts
+@@ -254,10 +254,37 @@ async function fetchContributing(
+   return null;
+ }
+ 
+-/** Extract the PR-body linked-issue requirement from CONTRIBUTING.md. A very small file is a signpost, not the
+- *  rules, so it yields `absent` rather than a false negative dressed as a real one. */
++/** #8316: the agent-facing equivalent of {@link fetchContributing}, probing `AGENTS.md` then `CLAUDE.md` at the
++ *  repo ROOT only — unlike CONTRIBUTING.md, neither follows the `.github/` convention in real repos. Same
++ *  getJson/decodeContents path, same first-hit-wins semantics. */
++async function fetchAgentDocs(
++  base: string,
++  target: { owner: string; repo: string },
++  headers: Record<string, string>,
++  fetchImpl: typeof fetch,
++  sleepFn: ((ms: number) => Promise<unknown>) | undefined,
++): Promise<string | null> {
++  for (const path of ["AGENTS.md", "CLAUDE.md"]) {
++    const payload = await getJson(
++      `${base}/repos/${target.owner}/${target.repo}/contents/${path}`,
++      headers,
++      fetchImpl,
++      sleepFn,
++    );
++    const text = decodeContents(payload);
++    if (text !== null) return text;
++  }
++  return null;
++}
++
++/** Extract the PR-body linked-issue requirement from a contribution doc. A very small file is a signpost, not
++ *  the rules, so it yields `absent` rather than a false negative dressed as a real one. #8316: `source`/`detail`
++ *  are parameterized so an agent-doc-derived result runs through this SAME sizing/keyword logic and differs only
++ *  in provenance — the schema's `agent_docs` source, unused since #6795, finally gets emitted. */
+ function extractPrBody(
+   contributing: string | null,
++  source: ContributionSignalProvenance["source"] = "contributing_md",
++  detail = "CONTRIBUTING.md",
+ ): ContributionSignalRule<ContributionPrBodyRequirements> {
+   if (contributing === null)
+     return { value: null, confidence: "absent", provenance: [] };
+@@ -272,7 +299,7 @@ function extractPrBody(
+   return {
+     value: { requiresLinkedIssue },
+     confidence: "explicit",
+-    provenance: [{ source: "contributing_md", detail: "CONTRIBUTING.md" }],
++    provenance: [{ source, detail }],
+   };
+ }
+ 
+@@ -321,7 +348,19 @@ export async function extractContributionProfile(
+     "explicit",
+   );
+   const exclusionLabels = classifyLabels(labels, EXCLUSION_TERMS, "inferred");
+-  const prBody = extractPrBody(contributing);
++  // #8316: CONTRIBUTING.md stays authoritative. Only a fully `absent` result (no CONTRIBUTING.md anywhere)
++  // lets agent docs have a turn, so every repo that already publishes one is bit-for-bit unaffected — and the
++  // agent doc is never even FETCHED in that case, costing no extra API call on the common path. A present but
++  // signpost-sized CONTRIBUTING.md yields `unknown`, not `absent`, and deliberately does NOT fall through:
++  // that repo HAS stated where its rules live, so second-guessing it would be the false negative this
++  // heuristic exists to avoid.
++  let prBody = extractPrBody(contributing);
++  if (prBody.confidence === "absent") {
++    const agentDocs = await fetchAgentDocs(base, target, headers, fetchImpl, sleepFn);
++    // Detail names both candidates because fetchAgentDocs' mandated `Promise<string | null>` shape (mirroring
++    // fetchContributing) doesn't report WHICH of the two matched.
++    prBody = extractPrBody(agentDocs, "agent_docs", "AGENTS.md or CLAUDE.md");
++  }
+ 
+   return {
+     repoFullName: `${target.owner}/${target.repo}`,
+diff --git a/test/unit/contribution-profile-extract.test.ts b/test/unit/contribution-profile-extract.test.ts
+index 8ffaafc3e..515bb2d4a 100644
+--- a/test/unit/contribution-profile-extract.test.ts
++++ b/test/unit/contribution-profile-extract.test.ts
+@@ -16,6 +16,9 @@ function stubFetch(
+     labels?: Label[] | number;
+     contributing?: string | null;
+     contributingGithubDir?: string | null;
++    /** #8316: AGENTS.md / CLAUDE.md at the repo root. Omitted ⇒ 404, so every pre-existing case is unchanged. */
++    agentsMd?: string | null;
++    claudeMd?: string | null;
+   } = {},
+ ) {
+   const emptyHeaders = { get: (_name: string) => null };
+@@ -75,6 +78,28 @@ function stubFetch(
+           }),
+         } as unknown as Response;
+       }
++      for (const [path, body] of [
++        ["/contents/AGENTS.md", opts.agentsMd],
++        ["/contents/CLAUDE.md", opts.claudeMd],
++      ] as const) {
++        if (!u.includes(path)) continue;
++        if (body == null)
++          return {
++            ok: false,
++            status: 404,
++            headers: emptyHeaders,
++            json: async () => ({}),
++          } as unknown as Response;
++        return {
++          ok: true,
++          status: 200,
++          headers: emptyHeaders,
++          json: async () => ({
++            encoding: "base64",
++            content: Buffer.from(String(body)).toString("base64"),
++          }),
++        } as unknown as Response;
++      }
+       return {
+         ok: false,
+         status: 404,
+@@ -612,8 +637,11 @@ describe("extractContributionProfile (#6796)", () => {
+       generatedAt: AT,
+       sleepFn: async () => {},
+     });
+-    // Both the root and `.github/` probes are each retried to exhaustion (3 attempts × 2 paths).
+-    expect(docCalls).toBe(6);
++    // Both the root and `.github/` probes are each retried to exhaustion (3 attempts × 2 paths), and #8316
++    // adds the same exhaustion for AGENTS.md + CLAUDE.md: an unreachable CONTRIBUTING.md yields `absent`,
++    // which is exactly the precedence condition that lets the agent-doc source have its turn. 4 paths × 3.
++    expect(docCalls).toBe(12);
++    // The fail-open contract itself is unchanged — an outage still degrades to `absent`, never throws.
+     expect(profile.prBody.confidence).toBe("absent");
+   });
+ 
+@@ -764,3 +792,78 @@ describe("extractContributionProfile (#6796)", () => {
+     expect(profile.completeness).toBe("absent");
+   });
+ });
++
++describe("agent-docs fallback (#8316)", () => {
++  const agentDoc = (body: string) => bigContributing(body);
++
++  it("keeps CONTRIBUTING.md authoritative and never fetches an agent doc when it yields a real rule", async () => {
++    const fetchImpl = stubFetch({
++      contributing: bigContributing("Please link an issue in the PR description."),
++      agentsMd: agentDoc("This AGENTS.md must be ignored."),
++    });
++    const profile = await extractContributionProfile("acme/widgets", {
++      fetchImpl: asFetch(fetchImpl),
++      generatedAt: AT,
++    });
++    expect(profile.prBody.confidence).toBe("explicit");
++    expect(profile.prBody.provenance).toEqual([{ source: "contributing_md", detail: "CONTRIBUTING.md" }]);
++    // The common path costs no extra API call: the agent doc is not even probed.
++    const probed = (fetchImpl as unknown as { mock: { calls: [string][] } }).mock.calls.map((c) => String(c[0]));
++    expect(probed.some((u) => u.includes("AGENTS.md"))).toBe(false);
++    expect(probed.some((u) => u.includes("CLAUDE.md"))).toBe(false);
++  });
++
++  it("falls back to AGENTS.md when there is no CONTRIBUTING.md, tagging agent_docs provenance", async () => {
++    const fetchImpl = stubFetch({
++      agentsMd: agentDoc("Every PR must reference a linked issue."),
++    });
++    const profile = await extractContributionProfile("acme/widgets", {
++      fetchImpl: asFetch(fetchImpl),
++      generatedAt: AT,
++    });
++    expect(profile.prBody.confidence).toBe("explicit");
++    expect(profile.prBody.value).toEqual({ requiresLinkedIssue: true });
++    expect(profile.prBody.provenance).toEqual([{ source: "agent_docs", detail: "AGENTS.md or CLAUDE.md" }]);
++  });
++
++  it("probes CLAUDE.md when AGENTS.md is missing (second path in the first-hit-wins loop)", async () => {
++    const fetchImpl = stubFetch({
++      claudeMd: agentDoc("Open a linked issue before submitting."),
++    });
++    const profile = await extractContributionProfile("acme/widgets", {
++      fetchImpl: asFetch(fetchImpl),
++      generatedAt: AT,
++    });
++    expect(profile.prBody.confidence).toBe("explicit");
++    expect(profile.prBody.value).toEqual({ requiresLinkedIssue: true });
++    expect(profile.prBody.provenance).toEqual([{ source: "agent_docs", detail: "AGENTS.md or CLAUDE.md" }]);
++  });
++
++  it("stays absent when neither CONTRIBUTING.md nor any agent doc exists", async () => {
++    const profile = await extractContributionProfile("acme/widgets", {
++      fetchImpl: asFetch(stubFetch({})),
++      generatedAt: AT,
++    });
++    expect(profile.prBody.confidence).toBe("absent");
++    expect(profile.prBody.value).toBeNull();
++    expect(profile.prBody.provenance).toEqual([]);
++  });
++
++  it("treats a signpost-sized agent doc as unknown, reusing extractPrBody's existing size floor", async () => {
++    const profile = await extractContributionProfile("acme/widgets", {
++      fetchImpl: asFetch(stubFetch({ agentsMd: "See our wiki." })),
++      generatedAt: AT,
++    });
++    expect(profile.prBody.confidence).toBe("unknown");
++    expect(profile.prBody.value).toBeNull();
++  });
++
++  it("records no linked-issue requirement when a real agent doc simply doesn't mention one", async () => {
++    const profile = await extractContributionProfile("acme/widgets", {
++      fetchImpl: asFetch(stubFetch({ agentsMd: agentDoc("Run the formatter before committing.") })),
++      generatedAt: AT,
++    });
++    expect(profile.prBody.confidence).toBe("explicit");
++    expect(profile.prBody.value).toEqual({ requiresLinkedIssue: false });
++  });
++});

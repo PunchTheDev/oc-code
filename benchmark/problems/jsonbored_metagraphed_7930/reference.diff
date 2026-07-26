@@ -1,0 +1,807 @@
+diff --git a/src/mcp-server.mjs b/src/mcp-server.mjs
+index 700b14e454..1e13e9e0f2 100644
+--- a/src/mcp-server.mjs
++++ b/src/mcp-server.mjs
+@@ -145,6 +145,12 @@ import {
+   LIST_SUBNET_EVIDENCE_OUTPUT_SCHEMA,
+   loadSubnetEvidenceList,
+ } from "./subnet-evidence-mcp.ts";
++import {
++  LIST_SUBNET_CANDIDATES_INSTRUCTIONS,
++  LIST_SUBNET_CANDIDATES_MCP_TOOL,
++  LIST_SUBNET_CANDIDATES_OUTPUT_SCHEMA,
++  loadSubnetCandidatesList,
++} from "./subnet-candidates-mcp.ts";
+ import {
+   LIST_EVIDENCE_INSTRUCTIONS,
+   LIST_EVIDENCE_MCP_TOOL,
+@@ -1013,7 +1019,9 @@ export const MCP_INSTRUCTIONS =
+   LIST_PROVIDER_ENDPOINTS_INSTRUCTIONS +
+   "get_subnet_endpoints one subnet\u0027s endpoint resources, " +
+   LIST_SUBNET_ENDPOINTS_INSTRUCTIONS +
+-  "get_subnet_candidates its pending candidate surfaces, get_subnet_evidence " +
++  "get_subnet_candidates its pending candidate surfaces, " +
++  LIST_SUBNET_CANDIDATES_INSTRUCTIONS +
++  "get_subnet_evidence " +
+   "its provenance evidence claims, " +
+   LIST_SUBNET_EVIDENCE_INSTRUCTIONS +
+   "get_subnet_surfaces its curated public " +
+@@ -9777,6 +9785,12 @@ export const MCP_TOOLS = [
+       return loadArtifactData(ctx, `/metagraph/candidates/${netuid}.json`);
+     },
+   },
++  {
++    ...LIST_SUBNET_CANDIDATES_MCP_TOOL,
++    async handler(args, ctx) {
++      return loadSubnetCandidatesList(ctx, args);
++    },
++  },
+   {
+     name: "get_subnet_evidence",
+     title: "Get one subnet's evidence ledger",
+@@ -15289,6 +15303,7 @@ const TOOL_OUTPUT_SCHEMAS = {
+       schema_version: { type: ["string", "integer", "null"] },
+     },
+   },
++  list_subnet_candidates: LIST_SUBNET_CANDIDATES_OUTPUT_SCHEMA,
+   get_subnet_endpoints: {
+     type: "object",
+     additionalProperties: true,
+diff --git a/src/subnet-candidates-mcp.ts b/src/subnet-candidates-mcp.ts
+new file mode 100644
+index 0000000000..ebeb1fdbf1
+--- /dev/null
++++ b/src/subnet-candidates-mcp.ts
+@@ -0,0 +1,306 @@
++// Per-subnet candidate surfaces list loader for MCP parity on
++// GET /api/v1/subnets/{netuid}/candidates. Applies the same list-query
++// transforms as the REST route over the baked
++// /metagraph/candidates/{netuid}.json artifact.
++
++import { applyQueryFilters, type Row } from "../workers/list-query.ts";
++import type { StorageReadResult } from "../workers/storage.ts";
++import { API_QUERY_COLLECTIONS, QUERY_ENUMS } from "./contracts.ts";
++
++const CANDIDATE_SORT_FIELDS = API_QUERY_COLLECTIONS.candidates.sort_fields;
++const SURFACE_KINDS = QUERY_ENUMS.surfaceKind;
++const CANDIDATE_STATES = QUERY_ENUMS.candidateState;
++const CONFIDENCE_LEVELS = ["low", "medium", "high"];
++// netuid is the path param (excluded from the REST list query); the remaining
++// candidates filters are all query-string filters, applied over the artifact.
++const SUBNET_CANDIDATES_QUERY_FILTER_NAMES = [
++  "kind",
++  "provider",
++  "state",
++  "id",
++  "confidence",
++];
++
++export function subnetCandidatesArtifactPath(netuid: unknown): string {
++  return `/metagraph/candidates/${netuid}.json`;
++}
++
++export interface SubnetCandidatesMcpError extends Error {
++  toolError: true;
++  code: string;
++}
++
++export function subnetCandidatesMcpError(
++  code: string,
++  message: string,
++): SubnetCandidatesMcpError {
++  const error = new Error(message) as SubnetCandidatesMcpError;
++  error.toolError = true;
++  error.code = code;
++  return error;
++}
++
++function requireNetuid(
++  args: Record<string, unknown> | null | undefined,
++): number {
++  const netuid = args?.netuid;
++  if (typeof netuid !== "number" || !Number.isInteger(netuid) || netuid < 0) {
++    throw subnetCandidatesMcpError(
++      "invalid_params",
++      "netuid must be a non-negative integer.",
++    );
++  }
++  return netuid;
++}
++
++function optionalString(
++  args: Record<string, unknown> | null | undefined,
++  key: string,
++): string | null {
++  const value = args?.[key];
++  if (value === undefined || value === null || value === "") return null;
++  if (typeof value !== "string" || value.trim() === "") {
++    throw subnetCandidatesMcpError(
++      "invalid_params",
++      `Argument \`${key}\` must be a non-empty string when provided.`,
++    );
++  }
++  return value.trim();
++}
++
++function optionalEnum(
++  args: Record<string, unknown> | null | undefined,
++  key: string,
++  allowed: string[],
++): string | null {
++  const value = args?.[key];
++  if (value === undefined || value === null || value === "") return null;
++  if (typeof value !== "string" || !allowed.includes(value)) {
++    throw subnetCandidatesMcpError(
++      "invalid_params",
++      `Argument \`${key}\` must be one of: ${allowed.join(", ")}.`,
++    );
++  }
++  return value;
++}
++
++function clampLimit(value: unknown, fallback: number, max: number): number {
++  if (typeof value !== "number") return fallback;
++  if (!Number.isFinite(value) || value < 1) return fallback;
++  return Math.min(max, Math.floor(value));
++}
++
++export function subnetCandidatesQueryUrl(
++  args: Record<string, unknown> | null | undefined,
++): URL {
++  const url = new URL("https://mcp.internal/subnets/candidates");
++  requireNetuid(args);
++  const kind = optionalEnum(args, "kind", SURFACE_KINDS);
++  if (kind) url.searchParams.set("kind", kind);
++  const provider = optionalString(args, "provider");
++  if (provider) url.searchParams.set("provider", provider);
++  const state = optionalEnum(args, "state", CANDIDATE_STATES);
++  if (state) url.searchParams.set("state", state);
++  const id = optionalString(args, "id");
++  if (id) url.searchParams.set("id", id);
++  const confidence = optionalEnum(args, "confidence", CONFIDENCE_LEVELS);
++  if (confidence) url.searchParams.set("confidence", confidence);
++  const sort = optionalEnum(args, "sort", CANDIDATE_SORT_FIELDS);
++  if (sort) url.searchParams.set("sort", sort);
++  const order = optionalEnum(args, "order", ["asc", "desc"]);
++  if (order) url.searchParams.set("order", order);
++  const fields = optionalString(args, "fields");
++  if (fields) url.searchParams.set("fields", fields);
++  if (args?.limit !== undefined) {
++    url.searchParams.set("limit", String(clampLimit(args.limit, 50, 100)));
++  }
++  if (args?.cursor !== undefined) {
++    const cursor = args.cursor;
++    if (typeof cursor !== "number" || !Number.isInteger(cursor) || cursor < 0) {
++      throw subnetCandidatesMcpError(
++        "invalid_params",
++        "cursor must be a non-negative integer.",
++      );
++    }
++    url.searchParams.set("cursor", String(cursor));
++  }
++  return url;
++}
++
++export interface SubnetCandidatesListResult {
++  generated_at: unknown;
++  netuid: unknown;
++  candidates: Row[];
++  total: unknown;
++  returned: unknown;
++  limit: unknown;
++  cursor: unknown;
++  next_cursor: unknown;
++  sort: unknown;
++  order: unknown;
++}
++
++export async function loadSubnetCandidatesList(
++  ctx: {
++    env: Env;
++    readArtifact: (env: Env, path: string) => Promise<StorageReadResult>;
++  },
++  args: Record<string, unknown> | null | undefined,
++  {
++    readArtifact,
++  }: {
++    readArtifact?: (env: Env, path: string) => Promise<StorageReadResult>;
++  } = {},
++): Promise<SubnetCandidatesListResult> {
++  const netuid = requireNetuid(args);
++  const queryUrl = subnetCandidatesQueryUrl(args);
++  const artifactPath = subnetCandidatesArtifactPath(netuid);
++  const read = readArtifact ?? ctx.readArtifact;
++  const result = await read(ctx.env, artifactPath);
++  if (!result?.ok) {
++    const code =
++      (result as { code?: string } | undefined)?.code || "artifact_unavailable";
++    if (code === "artifact_not_found") {
++      throw subnetCandidatesMcpError(
++        "not_found",
++        `No candidate snapshot exists for netuid ${netuid}.`,
++      );
++    }
++    throw subnetCandidatesMcpError(
++      code,
++      `Could not load ${artifactPath} (${code}).`,
++    );
++  }
++  const blob = result.data;
++  if (!blob || typeof blob !== "object") {
++    throw subnetCandidatesMcpError(
++      "not_found",
++      `No candidate snapshot exists for netuid ${netuid}.`,
++    );
++  }
++  const transformed = applyQueryFilters(
++    blob as Record<string, unknown>,
++    queryUrl,
++    "candidates",
++    SUBNET_CANDIDATES_QUERY_FILTER_NAMES,
++  );
++  if (transformed.error) {
++    throw subnetCandidatesMcpError("invalid_params", transformed.error.message);
++  }
++  const data = transformed.data as Record<string, unknown>;
++  const meta = transformed.meta as Record<string, unknown>;
++  const page = (meta.pagination as Record<string, unknown>) || {};
++  const rows = Array.isArray(data.candidates) ? (data.candidates as Row[]) : [];
++  const rowLen = rows.length;
++  return {
++    generated_at: data.generated_at ?? null,
++    netuid: data.netuid ?? netuid,
++    candidates: rows,
++    total: page.total ?? rowLen,
++    returned: page.returned ?? rowLen,
++    limit: page.limit ?? rowLen,
++    cursor: page.cursor ?? 0,
++    next_cursor: page.next_cursor ?? null,
++    sort: page.sort ?? null,
++    order: page.order ?? null,
++  };
++}
++
++export const LIST_SUBNET_CANDIDATES_INSTRUCTIONS =
++  "list_subnet_candidates one subnet's pending candidate surfaces with REST " +
++  "list-query filters (kind, provider, state, id, confidence, and pagination; " +
++  "mirrors GET /api/v1/subnets/{netuid}/candidates), ";
++
++export const LIST_SUBNET_CANDIDATES_MCP_TOOL = {
++  name: "list_subnet_candidates",
++  title: "List one subnet's candidate surfaces",
++  description:
++    "Fetch pending candidate surfaces for one subnet by netuid: each proposed " +
++    "surface with its kind, provider, review state, and confidence. Filter by " +
++    "kind, provider, state, id, or confidence; sort with sort + order; and page " +
++    "with limit (1-100) / cursor. Distinct from get_subnet_candidates (raw " +
++    "artifact dump) and list_candidates (network-wide catalog). Mirrors " +
++    "GET /api/v1/subnets/{netuid}/candidates.",
++  inputSchema: {
++    type: "object",
++    properties: {
++      netuid: {
++        type: "integer",
++        description: "Subnet netuid.",
++        minimum: 0,
++      },
++      kind: {
++        type: "string",
++        enum: SURFACE_KINDS,
++        description: "Filter by surface kind, e.g. 'subnet-api'.",
++      },
++      provider: {
++        type: "string",
++        description: "Filter by provider slug.",
++      },
++      state: {
++        type: "string",
++        enum: CANDIDATE_STATES,
++        description: "Filter by candidate review state.",
++      },
++      id: {
++        type: "string",
++        description: "Exact-match filter on candidate id.",
++      },
++      confidence: {
++        type: "string",
++        enum: CONFIDENCE_LEVELS,
++        description: "Filter by confidence level.",
++      },
++      sort: {
++        type: "string",
++        enum: CANDIDATE_SORT_FIELDS,
++        description: "Field to sort by before paging.",
++      },
++      order: {
++        type: "string",
++        enum: ["asc", "desc"],
++        description: "Sort direction for sort (default asc).",
++      },
++      fields: {
++        type: "string",
++        description:
++          "Comma-separated projection of candidate row fields to return.",
++      },
++      limit: {
++        type: "integer",
++        description: "Max rows to return (1-100). Enables pagination.",
++        minimum: 1,
++        maximum: 100,
++      },
++      cursor: {
++        type: "integer",
++        description: "Pagination cursor from a prior response's next_cursor.",
++        minimum: 0,
++      },
++    },
++    required: ["netuid"],
++    additionalProperties: false,
++  },
++};
++
++const NULLABLE_STRING = { type: ["string", "null"] };
++const NULLABLE_INT = { type: ["integer", "null"] };
++
++export const LIST_SUBNET_CANDIDATES_OUTPUT_SCHEMA = {
++  type: "object",
++  additionalProperties: true,
++  required: ["candidates"],
++  properties: {
++    generated_at: NULLABLE_STRING,
++    netuid: NULLABLE_INT,
++    candidates: { type: "array", items: { type: "object" } },
++    total: { type: "integer" },
++    returned: { type: "integer" },
++    limit: { type: "integer" },
++    cursor: { type: "integer" },
++    next_cursor: NULLABLE_INT,
++    sort: NULLABLE_STRING,
++    order: NULLABLE_STRING,
++  },
++};
+diff --git a/tests/subnet-candidates-mcp.test.ts b/tests/subnet-candidates-mcp.test.ts
+new file mode 100644
+index 0000000000..2e596c2a7f
+--- /dev/null
++++ b/tests/subnet-candidates-mcp.test.ts
+@@ -0,0 +1,440 @@
++import assert from "node:assert/strict";
++import { describe, test, vi } from "vitest";
++import { Ajv2020 } from "ajv/dist/2020.js";
++import * as listQuery from "../workers/list-query.ts";
++import {
++  LIST_SUBNET_CANDIDATES_INSTRUCTIONS,
++  LIST_SUBNET_CANDIDATES_MCP_TOOL,
++  LIST_SUBNET_CANDIDATES_OUTPUT_SCHEMA,
++  loadSubnetCandidatesList,
++  subnetCandidatesArtifactPath,
++  subnetCandidatesMcpError,
++  subnetCandidatesQueryUrl,
++} from "../src/subnet-candidates-mcp.ts";
++import type { Row } from "./row-type.ts";
++
++type LoadCtx = Parameters<typeof loadSubnetCandidatesList>[0];
++type LoadDeps = Parameters<typeof loadSubnetCandidatesList>[2];
++
++import { MCP_INSTRUCTIONS, MCP_TOOLS } from "../src/mcp-server.mjs";
++
++const NETUID = 7;
++const ARTIFACT = subnetCandidatesArtifactPath(NETUID);
++
++const SAMPLE_BLOB = {
++  generated_at: "2026-07-01T00:00:00.000Z",
++  netuid: NETUID,
++  candidates: [
++    {
++      id: "allways-api",
++      netuid: NETUID,
++      kind: "subnet-api",
++      provider: "allways",
++      state: "maintainer-review",
++      confidence: "high",
++    },
++    {
++      id: "allways-openapi",
++      netuid: NETUID,
++      kind: "openapi",
++      provider: "allways",
++      state: "schema-valid",
++      confidence: "low",
++    },
++    {
++      id: "beta-api",
++      netuid: NETUID,
++      kind: "subnet-api",
++      provider: "beta",
++      state: "schema-valid",
++      confidence: "low",
++    },
++  ],
++};
++
++function readArtifact(_env: unknown, path: string) {
++  if (path === ARTIFACT) {
++    return Promise.resolve({ ok: true, data: SAMPLE_BLOB });
++  }
++  return Promise.resolve({ ok: false, code: "artifact_not_found" });
++}
++
++describe("subnet-candidates-mcp", () => {
++  test("subnetCandidatesMcpError is shaped for MCP toolError handling", () => {
++    const err = subnetCandidatesMcpError("invalid_params", "bad kind");
++    assert.equal(err.code, "invalid_params");
++    assert.equal(err.toolError, true);
++  });
++
++  test("subnetCandidatesQueryUrl validates filters and cursor", () => {
++    const url = subnetCandidatesQueryUrl({
++      netuid: NETUID,
++      kind: "subnet-api",
++      provider: "allways",
++      state: "maintainer-review",
++      id: "allways-api",
++      confidence: "high",
++      sort: "confidence",
++      order: "desc",
++      fields: "id,kind",
++      limit: 10,
++      cursor: 5,
++    });
++    assert.equal(url.searchParams.get("kind"), "subnet-api");
++    assert.equal(url.searchParams.get("provider"), "allways");
++    assert.equal(url.searchParams.get("state"), "maintainer-review");
++    assert.equal(url.searchParams.get("id"), "allways-api");
++    assert.equal(url.searchParams.get("confidence"), "high");
++    assert.equal(url.searchParams.get("sort"), "confidence");
++    assert.equal(url.searchParams.get("order"), "desc");
++    assert.equal(url.searchParams.get("limit"), "10");
++    assert.equal(url.searchParams.get("cursor"), "5");
++  });
++
++  test("subnetCandidatesQueryUrl rejects missing netuid", () => {
++    assert.throws(
++      () => subnetCandidatesQueryUrl({}),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetCandidatesQueryUrl rejects invalid kind", () => {
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, kind: "bogus" }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetCandidatesQueryUrl rejects invalid state", () => {
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, state: "bogus" }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetCandidatesQueryUrl rejects invalid confidence", () => {
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, confidence: "extreme" }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetCandidatesQueryUrl rejects empty provider and invalid sort", () => {
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, provider: "   " }),
++      (err: Row) => err.code === "invalid_params",
++    );
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, sort: "not_a_column" }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetCandidatesQueryUrl rejects non-string id and invalid order", () => {
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, id: 42 }),
++      (err: Row) => err.code === "invalid_params",
++    );
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, order: "sideways" }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetCandidatesQueryUrl rejects empty fields and non-string fields", () => {
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, fields: "   " }),
++      (err: Row) => err.code === "invalid_params",
++    );
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, fields: 42 }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetCandidatesQueryUrl clamps a non-numeric limit to the default", () => {
++    const url = subnetCandidatesQueryUrl({ netuid: NETUID, limit: "lots" });
++    assert.equal(url.searchParams.get("limit"), "50");
++  });
++
++  test("subnetCandidatesQueryUrl clamps a sub-minimum numeric limit to the default", () => {
++    const url = subnetCandidatesQueryUrl({ netuid: NETUID, limit: 0 });
++    assert.equal(url.searchParams.get("limit"), "50");
++  });
++
++  test("subnetCandidatesQueryUrl rejects a fractional netuid", () => {
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: 1.5 }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetCandidatesQueryUrl rejects a fractional cursor", () => {
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, cursor: 1.5 }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetCandidatesQueryUrl rejects negative cursor", () => {
++    assert.throws(
++      () => subnetCandidatesQueryUrl({ netuid: NETUID, cursor: -1 }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetCandidatesQueryUrl clamps limit above the MCP maximum", () => {
++    const url = subnetCandidatesQueryUrl({ netuid: NETUID, limit: 500 });
++    assert.equal(url.searchParams.get("limit"), "100");
++  });
++
++  // The deliverable the issue names: at least two filters combined plus
++  // pagination, over the REST-parity list query.
++  test("loadSubnetCandidatesList combines two filters (kind + state)", async () => {
++    const out = await loadSubnetCandidatesList(
++      { env: {}, readArtifact } as unknown as LoadCtx,
++      { netuid: NETUID, kind: "subnet-api", state: "schema-valid" },
++    );
++    assert.equal(out.returned, 1);
++    assert.equal(out.candidates[0].id, "beta-api");
++    assert.equal(out.candidates[0].kind, "subnet-api");
++    assert.equal(out.candidates[0].state, "schema-valid");
++    assert.equal(out.netuid, NETUID);
++  });
++
++  test("loadSubnetCandidatesList filters by confidence then sorts and pages", async () => {
++    const out = await loadSubnetCandidatesList(
++      { env: {}, readArtifact } as unknown as LoadCtx,
++      {
++        netuid: NETUID,
++        confidence: "low",
++        sort: "id",
++        order: "asc",
++        limit: 1,
++      },
++    );
++    assert.equal(out.returned, 1);
++    assert.equal(out.total, 2);
++    assert.equal(out.candidates[0].id, "allways-openapi");
++    assert.equal(out.next_cursor, 1);
++  });
++
++  test("loadSubnetCandidatesList follows the next_cursor to the second page", async () => {
++    const out = await loadSubnetCandidatesList(
++      { env: {}, readArtifact } as unknown as LoadCtx,
++      {
++        netuid: NETUID,
++        confidence: "low",
++        sort: "id",
++        order: "asc",
++        limit: 1,
++        cursor: 1,
++      },
++    );
++    assert.equal(out.returned, 1);
++    assert.equal(out.candidates[0].id, "beta-api");
++    assert.equal(out.next_cursor, null);
++  });
++
++  test("loadSubnetCandidatesList uses an injected readArtifact dep", async () => {
++    const out = await loadSubnetCandidatesList(
++      {
++        env: {},
++        readArtifact: async () => ({ ok: false }),
++      } as unknown as LoadCtx,
++      { netuid: 0 },
++      {
++        readArtifact: async () => ({
++          ok: true,
++          data: {
++            candidates: [{ netuid: 0, kind: "docs" }],
++          },
++        }),
++      } as unknown as LoadDeps,
++    );
++    assert.equal(out.candidates[0].netuid, 0);
++  });
++
++  test("loadSubnetCandidatesList maps artifact_not_found to not_found", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetCandidatesList(
++          {
++            env: {},
++            readArtifact: async () => ({
++              ok: false,
++              code: "artifact_not_found",
++            }),
++          } as unknown as LoadCtx,
++          { netuid: NETUID },
++        ),
++      (err: Row) => err.code === "not_found",
++    );
++  });
++
++  test("loadSubnetCandidatesList surfaces other artifact failures", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetCandidatesList(
++          {
++            env: {},
++            readArtifact: async () => ({
++              ok: false,
++              code: "artifact_timeout",
++            }),
++          } as unknown as LoadCtx,
++          { netuid: NETUID },
++        ),
++      (err: Row) =>
++        err.code === "artifact_timeout" &&
++        /candidates\/7\.json/.test(err.message),
++    );
++  });
++
++  test("loadSubnetCandidatesList rejects invalid list-query params from REST parity", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetCandidatesList(
++          { env: {}, readArtifact } as unknown as LoadCtx,
++          { netuid: NETUID, fields: "not_a_column" },
++        ),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("loadSubnetCandidatesList projects row fields when requested", async () => {
++    const out = await loadSubnetCandidatesList(
++      { env: {}, readArtifact } as unknown as LoadCtx,
++      { netuid: NETUID, fields: "id,kind", limit: 1 },
++    );
++    assert.deepEqual(out.candidates[0], {
++      id: "allways-api",
++      kind: "subnet-api",
++    });
++  });
++
++  test("loadSubnetCandidatesList omits nullable artifact metadata when absent", async () => {
++    const out = await loadSubnetCandidatesList(
++      {
++        env: {},
++        readArtifact: async () => ({
++          ok: true,
++          data: { candidates: [{ netuid: 0, kind: "docs" }] },
++        }),
++      } as unknown as LoadCtx,
++      { netuid: 0 },
++    );
++    assert.equal(out.generated_at, null);
++  });
++
++  test("loadSubnetCandidatesList treats a non-array candidates key as empty", async () => {
++    const out = await loadSubnetCandidatesList(
++      {
++        env: {},
++        readArtifact: async () => ({
++          ok: true,
++          data: { candidates: null },
++        }),
++      } as unknown as LoadCtx,
++      { netuid: NETUID },
++    );
++    assert.deepEqual(out.candidates, []);
++    assert.equal(out.total, 0);
++  });
++
++  test("loadSubnetCandidatesList falls back when pagination meta is absent", async () => {
++    const spy = vi.spyOn(listQuery, "applyQueryFilters").mockReturnValue({
++      data: { candidates: [{ netuid: 9 }, { netuid: 9 }] },
++      meta: {},
++    });
++    try {
++      const out = await loadSubnetCandidatesList(
++        { env: {}, readArtifact } as unknown as LoadCtx,
++        { netuid: NETUID },
++      );
++      assert.equal(out.total, 2);
++      assert.equal(out.returned, 2);
++      assert.equal(out.limit, 2);
++      assert.equal(out.cursor, 0);
++      assert.equal(out.next_cursor, null);
++      assert.equal(out.sort, null);
++      assert.equal(out.order, null);
++    } finally {
++      spy.mockRestore();
++    }
++  });
++
++  test("loadSubnetCandidatesList rejects a malformed artifact payload", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetCandidatesList(
++          {
++            env: {},
++            readArtifact: async () => ({ ok: true, data: null }),
++          } as unknown as LoadCtx,
++          { netuid: NETUID },
++        ),
++      (err: Row) => err.code === "not_found",
++    );
++  });
++
++  test("loadSubnetCandidatesList defaults code when the read result is bare", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetCandidatesList(
++          {
++            env: {},
++            readArtifact: async () => ({ ok: false }),
++          } as unknown as LoadCtx,
++          { netuid: NETUID },
++        ),
++      (err: Row) => err.code === "artifact_unavailable",
++    );
++  });
++
++  test("loadSubnetCandidatesList rejects missing netuid", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetCandidatesList(
++          { env: {}, readArtifact } as unknown as LoadCtx,
++          {},
++        ),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("MCP tool metadata and outputSchema compile", () => {
++    assert.equal(
++      LIST_SUBNET_CANDIDATES_MCP_TOOL.name,
++      "list_subnet_candidates",
++    );
++    assert.match(LIST_SUBNET_CANDIDATES_INSTRUCTIONS, /list_subnet_candidates/);
++    assert.ok(
++      new Ajv2020({ strict: false }).compile(
++        LIST_SUBNET_CANDIDATES_OUTPUT_SCHEMA,
++      ),
++    );
++  });
++
++  test("MCP server exports wire list_subnet_candidates", () => {
++    assert.match(MCP_INSTRUCTIONS, /list_subnet_candidates/);
++    const tool = MCP_TOOLS.find(
++      (t: Row) => t.name === "list_subnet_candidates",
++    );
++    assert.ok(tool);
++    assert.equal(tool.title, "List one subnet's candidate surfaces");
++  });
++
++  test("the registered tool handler delegates to loadSubnetCandidatesList", async () => {
++    const tool = MCP_TOOLS.find(
++      (t: Row) => t.name === "list_subnet_candidates",
++    );
++    assert.ok(tool);
++    const out = await tool.handler(
++      { netuid: NETUID, kind: "subnet-api", state: "schema-valid" },
++      { env: {}, readArtifact } as unknown as LoadCtx,
++    );
++    assert.equal(out.returned, 1);
++    assert.equal(out.candidates[0].id, "beta-api");
++  });
++});

@@ -1,0 +1,334 @@
+diff --git a/apps/web/src/lib/source-repo-signals-fetch-lib.ts b/apps/web/src/lib/source-repo-signals-fetch-lib.ts
+index ba94e53c2..4e727c030 100644
+--- a/apps/web/src/lib/source-repo-signals-fetch-lib.ts
++++ b/apps/web/src/lib/source-repo-signals-fetch-lib.ts
+@@ -57,7 +57,11 @@ async function fetchShieldsStars(repo: { owner: string; repo: string }, fetcher:
+   }
+ }
+ 
+-export async function fetchGitHubSourceSignal(repoKey: string, fetcher: Fetcher = fetch) {
++export async function fetchGitHubSourceSignal(
++  repoKey: string,
++  fetcher: Fetcher = fetch,
++  options: { githubToken?: string | null } = {},
++) {
+   const parsed = parseGitHubRepoKey(repoKey);
+   if (!parsed) throw new Error(`invalid_repo:${repoKey}`);
+   const { owner, repo } = parsed;
+@@ -67,6 +71,10 @@ export async function fetchGitHubSourceSignal(repoKey: string, fetcher: Fetcher
+     "user-agent": "heyclau.de-source-signals",
+     "x-github-api-version": GITHUB_API_VERSION,
+   };
++  const token = String(options.githubToken || "").trim();
++  if (token) {
++    headers.authorization = `Bearer ${token}`;
++  }
+   const response = await fetcher(buildGitHubRepoApiUrl(owner, repo), {
+     headers,
+     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+diff --git a/apps/web/src/lib/source-repo-signals-lib.ts b/apps/web/src/lib/source-repo-signals-lib.ts
+index d65d0bab3..0e1e0e527 100644
+--- a/apps/web/src/lib/source-repo-signals-lib.ts
++++ b/apps/web/src/lib/source-repo-signals-lib.ts
+@@ -4,6 +4,8 @@ export const GITHUB_API_VERSION = "2022-11-28";
+ export const REQUEST_TIMEOUT_MS = 5000;
+ export const DEFAULT_REFRESH_LIMIT = 25;
+ export const REFRESH_STALE_MS = 24 * 60 * 60 * 1000;
++/** Error rows reuse `fetchedAt` as last-attempt time; wait this long before retrying. */
++export const ERROR_REFRESH_BACKOFF_MS = 7 * 24 * 60 * 60 * 1000;
+ 
+ type EntryWithRepoStats = {
+   repoUrl?: string | null;
+@@ -140,7 +142,28 @@ export function refreshLimit(value: unknown) {
+ 
+ export function shouldRefreshSourceRepoSignal(signal: SourceRepoSignal | undefined, nowMs: number) {
+   if (!signal) return true;
+-  if (signal.status === "error") return true;
+   const fetchedMs = Date.parse(signal.fetchedAt);
+-  return !Number.isFinite(fetchedMs) || nowMs - fetchedMs > REFRESH_STALE_MS;
++  if (!Number.isFinite(fetchedMs)) return true;
++  const ageMs = nowMs - fetchedMs;
++  if (signal.status === "error") {
++    // Permanently-broken / rate-limited repos must not consume every run's budget.
++    return ageMs > ERROR_REFRESH_BACKOFF_MS;
++  }
++  return ageMs > REFRESH_STALE_MS;
++}
++
++/**
++ * Prefer missing, then stale-ok, then error-backoff-due repos so broken repos
++ * cannot starve healthy refreshes within the per-run limit.
++ */
++export function compareSourceRepoRefreshPriority(
++  a: SourceRepoSignal | undefined,
++  b: SourceRepoSignal | undefined,
++) {
++  const rank = (signal: SourceRepoSignal | undefined) => {
++    if (!signal) return 0;
++    if (signal.status !== "error") return 1;
++    return 2;
++  };
++  return rank(a) - rank(b);
+ }
+diff --git a/apps/web/src/lib/source-repo-signals.server.ts b/apps/web/src/lib/source-repo-signals.server.ts
+index 839ffb090..e9d379ed1 100644
+--- a/apps/web/src/lib/source-repo-signals.server.ts
++++ b/apps/web/src/lib/source-repo-signals.server.ts
+@@ -4,6 +4,7 @@ import { getSiteDb, type D1DatabaseLike } from "@/lib/db";
+ import {
+   applySourceRepoSignal,
+   collectSourceRepos,
++  compareSourceRepoRefreshPriority,
+   normalizeSourceRepoSignalRow,
+   parseGitHubRepoUrl,
+   refreshLimit,
+@@ -172,17 +173,22 @@ export async function refreshSourceRepoSignalsForEntries(
+   const fetchedAt = now.toISOString();
+   const work = repos
+     .filter((repo) => shouldRefreshSourceRepoSignal(existing.get(repo), now.getTime()))
++    .sort(
++      (a, b) =>
++        compareSourceRepoRefreshPriority(existing.get(a), existing.get(b)) || a.localeCompare(b),
++    )
+     .slice(0, refreshLimit(options.limit ?? getEnvString("SOURCE_REPO_SIGNAL_REFRESH_LIMIT")));
+ 
+   let refreshed = 0;
+   let failed = 0;
+   const fetcher = options.fetcher ?? fetch;
++  const githubToken = getEnvString("GITHUB_TOKEN");
+ 
+   for (const batch of chunk(work, 4)) {
+     await Promise.all(
+       batch.map(async (repo) => {
+         try {
+-          const signal = await fetchGitHubSourceSignal(repo, fetcher);
++          const signal = await fetchGitHubSourceSignal(repo, fetcher, { githubToken });
+           await upsertSourceRepoSignalSuccess(db, repo, signal, fetchedAt);
+           refreshed += 1;
+         } catch (error) {
+diff --git a/tests/source-repo-signals-fetch-lib.test.ts b/tests/source-repo-signals-fetch-lib.test.ts
+index ed1cf0134..b99e4751b 100644
+--- a/tests/source-repo-signals-fetch-lib.test.ts
++++ b/tests/source-repo-signals-fetch-lib.test.ts
+@@ -1971,6 +1971,42 @@ describe("source-repo-signals-fetch-lib fetchGitHubSourceSignal", () => {
+     );
+     expect(signal.stars).toBe(99);
+   });
++  it("sends Authorization when githubToken is provided", async () => {
++    let auth: string | null = null;
++    await fetchGitHubSourceSignal(
++      "demo/repo",
++      async (_url, init) => {
++        const headers = new Headers(init?.headers);
++        auth = headers.get("authorization");
++        return new Response(
++          JSON.stringify({
++            stargazers_count: 1,
++            forks_count: 0,
++            updated_at: "2026-01-01",
++          }),
++          { status: 200 },
++        );
++      },
++      { githubToken: "ghp_test_token" },
++    );
++    expect(auth).toBe("Bearer ghp_test_token");
++  });
++  it("omits Authorization when githubToken is absent", async () => {
++    let auth: string | null = "sentinel";
++    await fetchGitHubSourceSignal("demo/repo", async (_url, init) => {
++      const headers = new Headers(init?.headers);
++      auth = headers.get("authorization");
++      return new Response(
++        JSON.stringify({
++          stargazers_count: 1,
++          forks_count: 0,
++          updated_at: "2026-01-01",
++        }),
++        { status: 200 },
++      );
++    });
++    expect(auth).toBeNull();
++  });
+   it("falls back to shields on API failure", async () => {
+     let calls = 0;
+     const fetcher = async (url: string | URL | Request) => {
+diff --git a/tests/source-repo-signals-lib.test.ts b/tests/source-repo-signals-lib.test.ts
+index 0bd1be21b..f7c6353cf 100644
+--- a/tests/source-repo-signals-lib.test.ts
++++ b/tests/source-repo-signals-lib.test.ts
+@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
+ import {
+   applySourceRepoSignal,
+   collectSourceRepos,
++  compareSourceRepoRefreshPriority,
+   DEFAULT_REFRESH_LIMIT,
+   GITHUB_API_VERSION,
+   normalizeSourceRepoSignalRow,
+@@ -4672,7 +4673,7 @@ describe("source-repo-signals-lib shouldRefreshSourceRepoSignal", () => {
+   it("returns true when signal missing", () => {
+     expect(shouldRefreshSourceRepoSignal(undefined, now)).toBe(true);
+   });
+-  it("returns true for error status", () => {
++  it("returns false for recent error status within backoff window", () => {
+     const signal: SourceRepoSignal = {
+       repo: "a/b",
+       stars: null,
+@@ -4682,8 +4683,46 @@ describe("source-repo-signals-lib shouldRefreshSourceRepoSignal", () => {
+       status: "error",
+       lastError: "boom",
+     };
++    expect(shouldRefreshSourceRepoSignal(signal, now)).toBe(false);
++  });
++  it("returns true for error status after backoff window", () => {
++    const signal: SourceRepoSignal = {
++      repo: "a/b",
++      stars: null,
++      forks: null,
++      repoUpdatedAt: null,
++      fetchedAt: "2026-06-01T00:00:00.000Z",
++      status: "error",
++      lastError: "boom",
++    };
+     expect(shouldRefreshSourceRepoSignal(signal, now)).toBe(true);
+   });
++  it("prefers missing and ok signals over error in refresh priority", () => {
++    const errorSignal: SourceRepoSignal = {
++      repo: "z/broken",
++      stars: null,
++      forks: null,
++      repoUpdatedAt: null,
++      fetchedAt: "2026-06-01T00:00:00.000Z",
++      status: "error",
++      lastError: "boom",
++    };
++    const okSignal: SourceRepoSignal = {
++      repo: "a/ok",
++      stars: 1,
++      forks: null,
++      repoUpdatedAt: null,
++      fetchedAt: "2026-06-01T00:00:00.000Z",
++      status: "ok",
++      lastError: null,
++    };
++    expect(
++      compareSourceRepoRefreshPriority(undefined, errorSignal),
++    ).toBeLessThan(0);
++    expect(
++      compareSourceRepoRefreshPriority(okSignal, errorSignal),
++    ).toBeLessThan(0);
++  });
+   it("returns false for fresh ok signal", () => {
+     const signal: SourceRepoSignal = {
+       repo: "a/b",
+diff --git a/tests/source-repo-signals.test.ts b/tests/source-repo-signals.test.ts
+index 8008b23f1..995a34eb8 100644
+--- a/tests/source-repo-signals.test.ts
++++ b/tests/source-repo-signals.test.ts
+@@ -250,7 +250,7 @@ describe("source repo signals", () => {
+     });
+   });
+ 
+-  it("does not send configured GitHub tokens for content-controlled repo lookups", async () => {
++  it("does not auto-bind process.env GITHUB_TOKEN in the fetch helper", async () => {
+     const previousToken = process.env.GITHUB_TOKEN;
+     process.env.GITHUB_TOKEN = "secret-token";
+     const seenHeaders: HeadersInit[] = [];
+@@ -282,6 +282,97 @@ describe("source repo signals", () => {
+     );
+   });
+ 
++  it("sends GITHUB_TOKEN from the refresh job when configured", async () => {
++    const previousToken = process.env.GITHUB_TOKEN;
++    process.env.GITHUB_TOKEN = "job-token";
++    const seenAuth: Array<string | null> = [];
++    const db = new FakeD1();
++
++    try {
++      await refreshSourceRepoSignalsForEntries(
++        [{ repoUrl: "https://github.com/example/tool" }],
++        {
++          db,
++          now: new Date("2026-06-02T12:00:00Z"),
++          fetcher: async (_url, init) => {
++            seenAuth.push(new Headers(init?.headers).get("authorization"));
++            return new Response(
++              JSON.stringify({
++                stargazers_count: 10,
++                forks_count: 2,
++                updated_at: "2026-06-02T11:00:00Z",
++              }),
++              { status: 200 },
++            );
++          },
++        },
++      );
++    } finally {
++      if (previousToken === undefined) {
++        delete process.env.GITHUB_TOKEN;
++      } else {
++        process.env.GITHUB_TOKEN = previousToken;
++      }
++    }
++
++    expect(seenAuth).toEqual(["Bearer job-token"]);
++  });
++
++  it("skips error rows still inside the backoff window so stale-ok repos can refresh", async () => {
++    const db = new FakeD1();
++    db.rows.set("aaa/broken", {
++      repo: "aaa/broken",
++      stars: null,
++      forks: null,
++      repo_updated_at: null,
++      fetched_at: "2026-06-02T00:00:00Z",
++      status: "error",
++      last_error: "github_api_404",
++    });
++    db.rows.set("zzz/stale", {
++      repo: "zzz/stale",
++      stars: 1,
++      forks: 0,
++      repo_updated_at: "2026-05-01T00:00:00Z",
++      fetched_at: "2026-06-01T00:00:00Z",
++      status: "ok",
++      last_error: null,
++    });
++
++    const fetched: string[] = [];
++    const result = await refreshSourceRepoSignalsForEntries(
++      [
++        { repoUrl: "https://github.com/aaa/broken" },
++        { repoUrl: "https://github.com/zzz/stale" },
++      ],
++      {
++        db,
++        now: new Date("2026-06-03T12:00:00Z"),
++        limit: 1,
++        fetcher: async (url) => {
++          const href = String(url);
++          if (href.includes("api.github.com")) {
++            const match = href.match(/repos\/([^/]+\/[^/]+)/);
++            if (match) fetched.push(match[1].toLowerCase());
++            return new Response(
++              JSON.stringify({
++                stargazers_count: 9,
++                forks_count: 1,
++                updated_at: "2026-06-03T00:00:00Z",
++              }),
++              { status: 200 },
++            );
++          }
++          return new Response("nope", { status: 404 });
++        },
++      },
++    );
++
++    expect(result).toMatchObject({ refreshed: 1, failed: 0 });
++    expect(fetched).toEqual(["zzz/stale"]);
++    expect(db.rows.get("aaa/broken")).toMatchObject({ status: "error" });
++  });
++
+   it("rejects private GitHub repository payloads before caching", async () => {
+     const db = new FakeD1();
+     const result = await refreshSourceRepoSignalsForEntries(

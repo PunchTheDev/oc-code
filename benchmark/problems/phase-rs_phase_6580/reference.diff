@@ -1,0 +1,1361 @@
+diff --git a/crates/engine/src/analysis/ability_graph.rs b/crates/engine/src/analysis/ability_graph.rs
+index 3eea0c026b..3a54d378ed 100644
+--- a/crates/engine/src/analysis/ability_graph.rs
++++ b/crates/engine/src/analysis/ability_graph.rs
+@@ -1889,6 +1889,11 @@ fn build_nodes(faces: &[&CardFace]) -> Vec<AbilityNode> {
+                             nodes.push(build_node(&face.name, def, trigger_axis(trigger)));
+                         }
+                     }
++                    ContinuousModification::GrantReplacement { replacement } => {
++                        if let Some(def) = &replacement.execute {
++                            nodes.push(build_node(&face.name, def, None));
++                        }
++                    }
+                     _ => {}
+                 }
+             }
+diff --git a/crates/engine/src/database/unearth.rs b/crates/engine/src/database/unearth.rs
+index e4690fa556..662d727ba2 100644
+--- a/crates/engine/src/database/unearth.rs
++++ b/crates/engine/src/database/unearth.rs
+@@ -38,13 +38,12 @@
+ 
+ use crate::types::ability::{
+     AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, DelayedTriggerCondition,
+-    Duration, Effect, ReplacementDefinition, RestrictionExpiry, StaticDefinition, TargetFilter,
++    Duration, Effect, RestrictionExpiry, StaticDefinition, TargetFilter,
+ };
+ use crate::types::card::CardFace;
+ use crate::types::keywords::Keyword;
+ use crate::types::mana::ManaCost;
+ use crate::types::phase::Phase;
+-use crate::types::replacements::ReplacementEvent;
+ use crate::types::zones::Zone;
+ 
+ /// CR 702.84a: Synthesize the graveyard-activated reanimation ability for every
+@@ -162,13 +161,13 @@ fn delayed_exile_step() -> AbilityDefinition {
+ /// reseeds, kept non-copiable (CR 707.2), and pruned on the host's battlefield
+ /// exit (CR 400.7) — see the variant doc in `types/ability.rs`.
+ fn leaves_battlefield_exile_step() -> AbilityDefinition {
+-    let replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+-        .valid_card(TargetFilter::SelfRef)
+-        .expiry(RestrictionExpiry::UntilHostLeavesPlay)
+-        .execute(AbilityDefinition::new(
+-            AbilityKind::Spell,
+-            exile_self_from_battlefield_effect(),
+-        ));
++    // Shares the single unstamped `leave_battlefield_exile_replacement` authority
++    // (#6538 / #6566); this site keeps its own `target: SelfRef` wrapper +
++    // description and composes the #6538 host-lifetime stamp itself. The stamp is
++    // applied per-consumer, not baked into the constructor, because the granted
++    // path (#6566) must NOT carry it — see the constructor doc.
++    let replacement = crate::parser::oracle_effect::leave_battlefield_exile_replacement()
++        .expiry(RestrictionExpiry::UntilHostLeavesPlay);
+ 
+     AbilityDefinition::new(
+         AbilityKind::Spell,
+diff --git a/crates/engine/src/game/ability_rw.rs b/crates/engine/src/game/ability_rw.rs
+index e6127d76fe..42a2a8d52d 100644
+--- a/crates/engine/src/game/ability_rw.rs
++++ b/crates/engine/src/game/ability_rw.rs
+@@ -104,9 +104,9 @@ use crate::types::ability::FilterProp;
+ use crate::types::ability::{
+     AbilityCondition, AbilityDefinition, ContinuousModification, ControllerRef, Duration, Effect,
+     GuessSubject, ModalChoice, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerScope,
+-    QuantityExpr, QuantityRef, RepeatContinuation, ResolvedAbility, StaticCondition,
+-    StaticDefinition, TargetFilter, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
+-    ZoneRef,
++    QuantityExpr, QuantityRef, RepeatContinuation, ReplacementDefinition, ResolvedAbility,
++    StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerDefinition,
++    TypeFilter, TypedFilter, ZoneRef,
+ };
+ use crate::types::game_state::TargetSelectionConstraint;
+ use crate::types::zones::Zone;
+@@ -2695,6 +2695,12 @@ fn legacy_continuous_modification(m: &ContinuousModification) -> bool {
+             legacy_static_definition(definition)
+         }
+         ContinuousModification::GrantTrigger { trigger } => legacy_trigger_definition(trigger),
++        // A granted object-hosted replacement can nest a frozen tag in its
++        // execute body or its `valid_card` scope filter — distinct traversal from
++        // GrantTrigger (a ReplacementDefinition, not a TriggerDefinition).
++        ContinuousModification::GrantReplacement { replacement } => {
++            legacy_replacement_definition(replacement)
++        }
+         ContinuousModification::GrantAllActivatedAbilitiesOf { source, .. }
+         | ContinuousModification::GrantAllTriggeredAbilitiesOf { source } => {
+             legacy_target_filter(source)
+@@ -2758,6 +2764,14 @@ fn legacy_continuous_modification(m: &ContinuousModification) -> bool {
+     }
+ }
+ 
++/// A granted object-hosted `ReplacementDefinition` can carry a frozen tag in its
++/// `execute` redirect body or its `valid_card` scope filter. Mirrors
++/// `legacy_trigger_definition` for the replacement-granting layer-6 case.
++fn legacy_replacement_definition(rd: &ReplacementDefinition) -> bool {
++    rd.execute.as_deref().is_some_and(legacy_definition)
++        || rd.valid_card.as_ref().is_some_and(legacy_target_filter)
++}
++
+ /// A granted / emblem `TriggerDefinition` can carry a frozen tag in its firing
+ /// filters (`valid_card`/`valid_source`), its intervening-if condition, or its
+ /// execute body.
+diff --git a/crates/engine/src/game/ability_scan.rs b/crates/engine/src/game/ability_scan.rs
+index e7b79a6f74..4582b662ba 100644
+--- a/crates/engine/src/game/ability_scan.rs
++++ b/crates/engine/src/game/ability_scan.rs
+@@ -5003,6 +5003,10 @@ fn scan_continuous_modification(m: &ContinuousModification, mode: ScanMode) -> A
+         // walker is a follow-up.
+         ContinuousModification::CopyValues { .. }
+         | ContinuousModification::GrantTrigger { .. }
++        // A granted object-hosted replacement's `ReplacementDefinition` execute
++        // is outside the scanner's traversal closure — fail-closed CONSERVATIVE,
++        // same class as GrantTrigger / GrantStaticAbility.
++        | ContinuousModification::GrantReplacement { .. }
+         | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
+         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
+         | ContinuousModification::AddStaticMode { .. }
+diff --git a/crates/engine/src/game/coverage.rs b/crates/engine/src/game/coverage.rs
+index 7ff4b55ebd..e05fc7f60c 100644
+--- a/crates/engine/src/game/coverage.rs
++++ b/crates/engine/src/game/coverage.rs
+@@ -4194,6 +4194,7 @@ fn fmt_modification(m: &crate::types::ability::ContinuousModification) -> String
+             format!("grant all triggered abilities of {}", fmt_target(source))
+         }
+         ContinuousModification::GrantTrigger { .. } => "grant trigger".into(),
++        ContinuousModification::GrantReplacement { .. } => "grant replacement".into(),
+         ContinuousModification::RemoveAllAbilities => "remove all abilities".into(),
+         ContinuousModification::AddType { core_type } => {
+             format!("add type {}", fmt_core_type(core_type))
+@@ -4340,6 +4341,7 @@ fn static_details(stat: &StaticDefinition) -> Vec<(String, String)> {
+                 m,
+                 ContinuousModification::GrantTrigger { .. }
+                     | ContinuousModification::GrantAbility { .. }
++                    | ContinuousModification::GrantReplacement { .. }
+             )
+         })
+         .map(fmt_modification)
+@@ -4529,6 +4531,11 @@ pub fn build_parse_details(
+                 ContinuousModification::GrantAbility { definition } => {
+                     children.push(build_ability_item(definition));
+                 }
++                ContinuousModification::GrantReplacement { replacement } => {
++                    if let Some(execute) = &replacement.execute {
++                        children.push(build_ability_item(execute));
++                    }
++                }
+                 _ => {}
+             }
+         }
+@@ -5902,6 +5909,10 @@ fn static_has_unimplemented_parts(def: &StaticDefinition) -> bool {
+                 ContinuousModification::GrantTrigger { trigger } => {
+                     trigger_has_unimplemented_parts(trigger)
+                 }
++                ContinuousModification::GrantReplacement { replacement } => replacement
++                    .execute
++                    .as_deref()
++                    .is_some_and(ability_definition_has_unimplemented_parts),
+                 _ => false,
+             })
+ }
+@@ -5996,6 +6007,11 @@ fn check_statics(
+                 ContinuousModification::GrantTrigger { trigger } => {
+                     check_trigger(trigger, trigger_registry, missing);
+                 }
++                ContinuousModification::GrantReplacement { replacement } => {
++                    if let Some(execute) = &replacement.execute {
++                        collect_ability_missing_parts(execute, missing);
++                    }
++                }
+                 _ => {}
+             }
+         }
+@@ -6915,6 +6931,10 @@ fn is_static_supported(
+                 ContinuousModification::GrantTrigger { trigger } => {
+                     is_trigger_supported(trigger, trigger_registry)
+                 }
++                ContinuousModification::GrantReplacement { replacement } => replacement
++                    .execute
++                    .as_deref()
++                    .is_none_or(is_ability_supported),
+                 _ => true,
+             })
+ }
+diff --git a/crates/engine/src/game/effects/effect.rs b/crates/engine/src/game/effects/effect.rs
+index f9fb4fbf27..ede66e385c 100644
+--- a/crates/engine/src/game/effects/effect.rs
++++ b/crates/engine/src/game/effects/effect.rs
+@@ -62,6 +62,21 @@ pub fn resolve(
+             .or(duration.clone())
+             .unwrap_or(Duration::UntilEndOfTurn);
+ 
++        // CR 611.2a: The `UntilEndOfTurn` above is only a fallback for a
++        // stated-duration-less grant. A grant that states NO duration and grants
++        // ONLY an object-hosted replacement (the "it gains 'If ~ would leave the
++        // battlefield, exile it instead'" reanimation rider — Geth, Thane of
++        // Contracts; Llanowar Greenwidow; Realmbreaker; Spirit-Sister's Call)
++        // must last as long as the affected object exists, so promote that def to
++        // Duration::Permanent. It then survives its granting source leaving
++        // (`prune_host_left_effects` only prunes UntilHostLeavesPlay) and is
++        // cleaned up when the reanimated object itself leaves
++        // (`prune_affected_object_left_effects`). A STATED duration arrives on the
++        // wrapper (Elemental Expressionist's "Until end of turn" lives on the
++        // GenericEffect application, so `duration` is `Some` and the fallback is
++        // not taken) and is left EOT-confined, lapsing at cleanup (CR 514.2).
++        let duration_from_fallback = ability.duration.is_none() && duration.is_none();
++
+         for static_def in static_abilities {
+             // CR 611.2d: A continuous effect's variable (X) is determined once,
+             // on resolution. Snapshot resolution-context quantity refs (e.g.
+@@ -94,6 +109,21 @@ pub fn resolve(
+                 }
+             }
+             let static_def = &static_def;
++            // CR 611.2a: promote a fallback-duration replacement-only grant to
++            // Permanent (see `duration_from_fallback` above); every other def
++            // keeps the resolved `dur`. Mixed defs (a replacement grant alongside
++            // any other modification) are NOT promoted.
++            let def_dur = if duration_from_fallback
++                && !static_def.modifications.is_empty()
++                && static_def
++                    .modifications
++                    .iter()
++                    .all(|m| matches!(m, ContinuousModification::GrantReplacement { .. }))
++            {
++                Duration::Permanent
++            } else {
++                dur.clone()
++            };
+             // CR 603.4 + CR 608.2h + CR 611.2d: An in-effect "if <condition>"
+             // carried by a `StaticDefinition` (Odric, Lunarch Marshal:
+             // "creatures you control gain first strike ... if a creature you
+@@ -112,9 +142,9 @@ pub fn resolve(
+                 }
+                 let mut snapshotted = static_def.clone();
+                 snapshotted.condition = None;
+-                register_transient_effect(state, ability, &snapshotted, target.as_ref(), &dur);
++                register_transient_effect(state, ability, &snapshotted, target.as_ref(), &def_dur);
+             } else {
+-                register_transient_effect(state, ability, static_def, target.as_ref(), &dur);
++                register_transient_effect(state, ability, static_def, target.as_ref(), &def_dur);
+             }
+         }
+     }
+diff --git a/crates/engine/src/game/layers.rs b/crates/engine/src/game/layers.rs
+index e307bc7787..c75b845445 100644
+--- a/crates/engine/src/game/layers.rs
++++ b/crates/engine/src/game/layers.rs
+@@ -6659,6 +6659,24 @@ fn apply_continuous_effect_filtered(
+                     obj.static_definitions.push(*definition.clone());
+                 }
+             }
++            // CR 614.1a + CR 614.6 + CR 613.1f: Grant an object-hosted replacement
++            // to the recipient. Mirror of `GrantStaticAbility` — push the cloned
++            // `ReplacementDefinition` onto `obj.replacement_definitions` so the
++            // granted replacement fires as a genuine replacement effect (its
++            // `valid_card: SelfRef` binds to this recipient object). Re-derived
++            // each layer pass (`obj.replacement_definitions` was reset to base at
++            // the start of the pass); structural-equality dedup keeps repeated
++            // grants (multiple sources, or a single static parsed twice)
++            // idempotent, matching the GrantTrigger / GrantStaticAbility invariant.
++            ContinuousModification::GrantReplacement { replacement } => {
++                if !obj
++                    .replacement_definitions
++                    .iter_all()
++                    .any(|rd| rd == replacement.as_ref())
++                {
++                    obj.replacement_definitions.push(*replacement.clone());
++                }
++            }
+             ContinuousModification::AddStaticMode { mode } => {
+                 // CR 509.1b + CR 105.4 + CR 609.6 (issue #327): When the
+                 // granted static mode carries an `IsChosenColor` filter prop,
+diff --git a/crates/engine/src/game/printed_cards.rs b/crates/engine/src/game/printed_cards.rs
+index d23bfcd28f..5a18f88c6f 100644
+--- a/crates/engine/src/game/printed_cards.rs
++++ b/crates/engine/src/game/printed_cards.rs
+@@ -855,6 +855,9 @@ fn walk_continuous_mod(modification: &ContinuousModification, out: &mut Vec<Stri
+     match modification {
+         ContinuousModification::GrantAbility { definition } => walk_ability_def(definition, out),
+         ContinuousModification::GrantTrigger { trigger } => walk_trigger(trigger, out),
++        ContinuousModification::GrantReplacement { replacement } => {
++            walk_replacement(replacement, out)
++        }
+         ContinuousModification::GrantStaticAbility { definition } => walk_static(definition, out),
+         ContinuousModification::CopyValues { values, .. } => walk_copiable_values(values, out),
+         // Remaining modifications carry no nested ability/effect carriers.
+diff --git a/crates/engine/src/game/quantity.rs b/crates/engine/src/game/quantity.rs
+index 2daf8b6fd7..2710a0d88b 100644
+--- a/crates/engine/src/game/quantity.rs
++++ b/crates/engine/src/game/quantity.rs
+@@ -749,6 +749,9 @@ pub(crate) fn continuous_modification_dynamic_quantity(
+         | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
+         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
+         | ContinuousModification::GrantTrigger { .. }
++        // A granted object-hosted replacement carries no `QuantityExpr`
++        // magnitude — its `execute` (ChangeZone→Exile) has no dynamic value.
++        | ContinuousModification::GrantReplacement { .. }
+         | ContinuousModification::RemoveAllAbilities
+         | ContinuousModification::AddType { .. }
+         | ContinuousModification::RemoveType { .. }
+diff --git a/crates/engine/src/parser/oracle_effect/lower.rs b/crates/engine/src/parser/oracle_effect/lower.rs
+index b7e2581a49..67eab90ba4 100644
+--- a/crates/engine/src/parser/oracle_effect/lower.rs
++++ b/crates/engine/src/parser/oracle_effect/lower.rs
+@@ -9055,6 +9055,8 @@ fn apply_where_x_continuous_modification(
+         | ContinuousModification::AddColor { .. }
+         | ContinuousModification::AddStaticMode { .. }
+         | ContinuousModification::GrantStaticAbility { .. }
++        // Granted object-hosted replacement: no where-X / anaphoric magnitude.
++        | ContinuousModification::GrantReplacement { .. }
+         | ContinuousModification::SwitchPowerToughness
+         | ContinuousModification::AssignDamageFromToughness
+         | ContinuousModification::AssignDamageAsThoughUnblocked
+@@ -9154,6 +9156,8 @@ fn rebind_target_anaphor_continuous_modification(modification: &mut ContinuousMo
+         | ContinuousModification::AddColor { .. }
+         | ContinuousModification::AddStaticMode { .. }
+         | ContinuousModification::GrantStaticAbility { .. }
++        // Granted object-hosted replacement: no where-X / anaphoric magnitude.
++        | ContinuousModification::GrantReplacement { .. }
+         | ContinuousModification::SwitchPowerToughness
+         | ContinuousModification::AssignDamageFromToughness
+         | ContinuousModification::AssignDamageAsThoughUnblocked
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 61285f2c58..5274dc5fc0 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -1790,6 +1790,12 @@ fn parse_leave_battlefield_rider_ref(input: &str) -> OracleResult<'_, ()> {
+     value(
+         (),
+         alt((
++            // CR 201.5 + CR 201.5b: `normalize_card_name_refs` (oracle_util.rs)
++            // rewrites every "this creature/permanent/land" self-reference to `~`
++            // card-wide before parsing, so a quoted rider reaching the parser reads
++            // "if ~ would leave the battlefield, ...". Match `~` first; it never
++            // prefix-collides with the "it"/"the …"/"that …"/"this …" arms below.
++            tag("~"),
+             tag("it"),
+             tag("the card"),
+             tag("the creature"),
+@@ -1807,11 +1813,77 @@ fn parse_leave_battlefield_rider_ref(input: &str) -> OracleResult<'_, ()> {
+     .parse(input)
+ }
+ 
++/// CR 614.1a + CR 614.6: The object-hosted "exile this permanent instead of
++/// letting it leave the battlefield" replacement. A `Moved` replacement whose
++/// `valid_card: SelfRef` binds it to its own host object and whose `execute`
++/// redirects any battlefield-exit to exile. Shared single authority for the
++/// #6538 targeted-rider front door (`try_parse_leave_battlefield_exile_replacement`,
++/// wrapping `target: Any`), unearth's synthesis (`database/unearth.rs`), and the
++/// #6566 reanimation-rider grant path. Callers add their own
++/// `AddTargetReplacement` / `GrantReplacement` wrapper.
++///
++/// **The returned definition is deliberately UNSTAMPED (`expiry: None`); the
++/// lifetime is the caller's decision.** The two *standalone* consumers (#6538's
++/// front door and unearth) compose `.expiry(RestrictionExpiry::UntilHostLeavesPlay)`
++/// themselves, because there the rider is a runtime effect bound to the object it
++/// was installed on. The *granted* consumer (`classify_quoted_inner` →
++/// `ContinuousModification::GrantReplacement`) must NOT: a granted replacement's
++/// lifetime is governed by the granting continuous effect's duration and is
++/// re-derived every layer pass (CR 613.1f), with the grant itself ending per
++/// CR 611.2a. A host-lifetime stamp there would be read by #6538's machinery
++/// (`is_runtime_host_lifetime_replacement` → base-install + non-copiable +
++/// host-exit prune), so the granted rider would be base-installed and outlive the
++/// continuous effect that granted it — Elemental Expressionist's until-end-of-turn
++/// grant would never lapse.
++///
++/// Production visibility is `pub(crate)`; the `test-support` feature widens it to
++/// `pub` so integration tests (compiled with that feature) assemble the exact
++/// production replacement shape instead of a hand-copied duplicate. Both arms
++/// delegate to the single `_impl` body — mirrors the `game::zones` module
++/// visibility gate in `game/mod.rs`.
++#[cfg(any(test, feature = "test-support"))]
++pub fn leave_battlefield_exile_replacement() -> ReplacementDefinition {
++    leave_battlefield_exile_replacement_impl()
++}
++
++#[cfg(not(any(test, feature = "test-support")))]
++pub(crate) fn leave_battlefield_exile_replacement() -> ReplacementDefinition {
++    leave_battlefield_exile_replacement_impl()
++}
++
++fn leave_battlefield_exile_replacement_impl() -> ReplacementDefinition {
++    ReplacementDefinition::new(ReplacementEvent::Moved)
++        .valid_card(TargetFilter::SelfRef)
++        .execute(AbilityDefinition::new(
++            AbilityKind::Spell,
++            Effect::ChangeZone {
++                origin: Some(Zone::Battlefield),
++                destination: Zone::Exile,
++                target: TargetFilter::SelfRef,
++                owner_library: false,
++                enter_transformed: false,
++                enters_under: None,
++                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
++                enters_attacking: false,
++                up_to: false,
++                enter_with_counters: vec![],
++                conditional_enter_with_counters: vec![],
++                face_down_profile: None,
++                enters_modified_if: None,
++            },
++        ))
++}
++
+ /// CR 614.1a + CR 614.6: Detect "If it would leave the battlefield, exile it
+ /// instead of putting it anywhere else." riders attached to a previously
+ /// selected object. The carried `ReplacementDefinition` is installed on the
+ /// parent target, where `valid_card: SelfRef` binds to that host object.
+-fn try_parse_leave_battlefield_exile_replacement(lower: &str) -> Option<Effect> {
++///
++/// This is the STANDALONE (printed-rider) front door, so it stamps the #6538
++/// host-lifetime expiry on the shared unstamped definition. Callers that grant
++/// the rider as a continuous effect must use `leave_battlefield_exile_replacement`
++/// directly and treat this function purely as a detector — see its doc.
++pub(crate) fn try_parse_leave_battlefield_exile_replacement(lower: &str) -> Option<Effect> {
+     let (rest, _) = nom::combinator::opt(tag::<_, _, OracleError<'_>>("if "))
+         .parse(lower)
+         .ok()?;
+@@ -1830,37 +1902,17 @@ fn try_parse_leave_battlefield_exile_replacement(lower: &str) -> Option<Effect>
+         .ok()?;
+     parse_optional_period_and_end(rest)?;
+ 
+-    let replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+-        .valid_card(TargetFilter::SelfRef)
+-        // CR 400.7: The rider is bound to the lifetime of the object it is
+-        // installed on; stamp the expiry here so the lifetime is self-contained
++    Some(Effect::AddTargetReplacement {
++        // CR 400.7: The standalone rider is bound to the lifetime of the object it
++        // is installed on; stamp the expiry here so the lifetime is self-contained
+         // (not dependent on the ability frame's duration threading) and so
+         // `expiry_from_duration`'s `is_none` guard never retags it — mirrors the
+         // die-exile stamp precedent at `try_parse_die_exile_rider` /
+         // `parse_token_creation_replacement_effect`. Base-installed to survive
+         // CR 613.1 layer reseeds, non-copiable (CR 707.2), pruned on host exit.
+-        .expiry(RestrictionExpiry::UntilHostLeavesPlay)
+-        .execute(AbilityDefinition::new(
+-            AbilityKind::Spell,
+-            Effect::ChangeZone {
+-                origin: Some(Zone::Battlefield),
+-                destination: Zone::Exile,
+-                target: TargetFilter::SelfRef,
+-                owner_library: false,
+-                enter_transformed: false,
+-                enters_under: None,
+-                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+-                enters_attacking: false,
+-                up_to: false,
+-                enter_with_counters: vec![],
+-                conditional_enter_with_counters: vec![],
+-                face_down_profile: None,
+-                enters_modified_if: None,
+-            },
+-        ));
+-
+-    Some(Effect::AddTargetReplacement {
+-        replacement: Box::new(replacement),
++        replacement: Box::new(
++            leave_battlefield_exile_replacement().expiry(RestrictionExpiry::UntilHostLeavesPlay),
++        ),
+         target: TargetFilter::Any,
+     })
+ }
+diff --git a/crates/engine/src/parser/oracle_effect/tests.rs b/crates/engine/src/parser/oracle_effect/tests.rs
+index 0935dc56e7..e8ea253481 100644
+--- a/crates/engine/src/parser/oracle_effect/tests.rs
++++ b/crates/engine/src/parser/oracle_effect/tests.rs
+@@ -48832,3 +48832,129 @@ fn unless_extraction_offsets_survive_unicode_case_fold() {
+          the boundary, and the mask must not eat the quote)"
+     );
+ }
++
++// ===========================================================================
++// Issue #6566 — granted "If ~ would leave the battlefield, exile it instead"
++// rider. `parse_leave_battlefield_rider_ref` must accept the `~` self-reference
++// that `normalize_card_name_refs` produces, and the shared F4 constructor must
++// reproduce the exact #6538 ReplacementDefinition shape (no regression).
++// ===========================================================================
++
++/// #6566 (1): CR 201.5 + CR 614.1a — after `normalize_card_name_refs`, a
++/// "this creature/permanent/land would leave the battlefield" rider reaches the
++/// parser as `~`. Without the `~` arm added to `parse_leave_battlefield_rider_ref`
++/// this returns `None` and the granted rider is silently dropped. Reverting the
++/// `tag("~")` arm flips this assertion (RED: `expect` panics on `None`).
++#[test]
++fn leave_battlefield_rider_accepts_tilde_selfref_6566() {
++    let effect = try_parse_leave_battlefield_exile_replacement(
++        "if ~ would leave the battlefield, exile it instead of putting it anywhere else",
++    )
++    .expect("~-normalized leave-battlefield rider must parse (6566)");
++    let Effect::AddTargetReplacement {
++        replacement,
++        target,
++    } = effect
++    else {
++        panic!("expected AddTargetReplacement");
++    };
++    assert_eq!(target, TargetFilter::Any);
++    assert_eq!(replacement.event, ReplacementEvent::Moved);
++    assert_eq!(replacement.valid_card, Some(TargetFilter::SelfRef));
++    let exec = replacement.execute.expect("execute present");
++    let Effect::ChangeZone {
++        destination,
++        target,
++        ..
++    } = &*exec.effect
++    else {
++        panic!("expected ChangeZone execute");
++    };
++    assert_eq!(*destination, Zone::Exile);
++    assert_eq!(*target, TargetFilter::SelfRef);
++}
++
++/// #6566 (2) + #6538 regression: the pre-existing "it" front door still parses.
++#[test]
++fn leave_battlefield_rider_still_accepts_it_6538() {
++    let effect = try_parse_leave_battlefield_exile_replacement(
++        "if it would leave the battlefield, exile it instead of putting it anywhere else",
++    );
++    assert!(matches!(effect, Some(Effect::AddTargetReplacement { .. })));
++}
++
++/// #6566 (8): standalone #6538 riders that use "it" / "that creature" as their
++/// self-reference (Whip of Erebos / Kheru Lich Lord "it"; From the Catacombs
++/// "that creature") must parse identically to base — the added `~` arm never
++/// shadows the existing arms.
++#[test]
++fn leave_battlefield_rider_standalone_refs_unchanged_6566() {
++    for r in ["it", "that creature", "the creature", "this permanent"] {
++        let text = format!(
++            "if {r} would leave the battlefield, exile it instead of putting it anywhere else"
++        );
++        assert!(
++            matches!(
++                try_parse_leave_battlefield_exile_replacement(&text),
++                Some(Effect::AddTargetReplacement { .. })
++            ),
++            "standalone self-ref {r:?} must still parse",
++        );
++    }
++}
++
++/// #6566 F4 + #6538 byte identity: the STANDALONE front door must emit exactly
++/// the `ReplacementDefinition` merged main's #6538 builds — Moved / valid_card
++/// SelfRef / `expiry: Some(UntilHostLeavesPlay)` (CR 400.7) / execute ChangeZone
++/// Battlefield→Exile with all 13 `ChangeZone` fields at their #6538 defaults —
++/// wrapped in `{target: Any}`. Byte-identical == no #6538 regression.
++///
++/// The shared constructor itself is deliberately UNSTAMPED; the host-lifetime
++/// expiry is composed per-consumer (this front door + `database/unearth.rs`,
++/// which wraps the same constructor in `{target: SelfRef}` + description). The
++/// granted path must not compose it — pinned by
++/// `granted_replacement_is_not_host_lifetime_stamped` in `oracle_static::tests`.
++#[test]
++fn leave_battlefield_exile_replacement_matches_6538_shape() {
++    let base = ReplacementDefinition::new(ReplacementEvent::Moved)
++        .valid_card(TargetFilter::SelfRef)
++        .execute(AbilityDefinition::new(
++            AbilityKind::Spell,
++            Effect::ChangeZone {
++                origin: Some(Zone::Battlefield),
++                destination: Zone::Exile,
++                target: TargetFilter::SelfRef,
++                owner_library: false,
++                enter_transformed: false,
++                enters_under: None,
++                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
++                enters_attacking: false,
++                up_to: false,
++                enter_with_counters: vec![],
++                conditional_enter_with_counters: vec![],
++                face_down_profile: None,
++                enters_modified_if: None,
++            },
++        ));
++    // The shared constructor is the unstamped base: lifetime is the caller's call.
++    assert_eq!(leave_battlefield_exile_replacement(), base);
++    assert_eq!(
++        leave_battlefield_exile_replacement().expiry,
++        None,
++        "the shared constructor must stay unstamped so the granted path can reuse it"
++    );
++
++    // CR 400.7: the standalone (#6538) front door composes the host-lifetime stamp.
++    let expected = base.expiry(crate::types::ability::RestrictionExpiry::UntilHostLeavesPlay);
++    let targeted = try_parse_leave_battlefield_exile_replacement(
++        "if it would leave the battlefield, exile it instead of putting it anywhere else",
++    )
++    .expect("targeted front door");
++    assert_eq!(
++        targeted,
++        Effect::AddTargetReplacement {
++            replacement: Box::new(expected),
++            target: TargetFilter::Any,
++        }
++    );
++}
+diff --git a/crates/engine/src/parser/oracle_static/keyword_grant.rs b/crates/engine/src/parser/oracle_static/keyword_grant.rs
+index 62b68f4447..1a4035c88f 100644
+--- a/crates/engine/src/parser/oracle_static/keyword_grant.rs
++++ b/crates/engine/src/parser/oracle_static/keyword_grant.rs
+@@ -1926,6 +1926,31 @@ pub(crate) fn classify_quoted_inner(ability_text: &str) -> Vec<ContinuousModific
+         return static_modifications;
+     }
+ 
++    // CR 614.1a + CR 614.6 + CR 201.5b: Object-hosted replacement rider — "If ~
++    // would leave the battlefield, exile it instead of putting it anywhere else."
++    // (`~` because `normalize_card_name_refs` rewrote the "this creature/permanent/
++    // land" self-reference card-wide). The parser IS the detector: route through
++    // the shared `try_parse_leave_battlefield_exile_replacement` combinator and,
++    // on a hit, grant the replacement to the recipient via `GrantReplacement` so
++    // the `~` binds to the object that gains the ability (the reanimated
++    // permanent), not the granting source.
++    //
++    // CR 611.2a + CR 613.1f: the granted definition is built from the UNSTAMPED
++    // `leave_battlefield_exile_replacement` constructor, never from the detector's
++    // `AddTargetReplacement` payload — that standalone payload carries
++    // `RestrictionExpiry::UntilHostLeavesPlay` (#6538). A granted replacement's
++    // lifetime is governed by the granting continuous effect's duration and is
++    // re-derived every layer pass, so it must not carry a host-lifetime stamp:
++    // #6538's `is_runtime_host_lifetime_replacement` keys base-install /
++    // non-copiable / host-exit-prune off exactly that stamp, and a base-installed
++    // granted rider would survive the granting effect lapsing (Elemental
++    // Expressionist's "until end of turn" grant would become permanent).
++    if super::oracle_effect::try_parse_leave_battlefield_exile_replacement(&lower).is_some() {
++        return vec![ContinuousModification::GrantReplacement {
++            replacement: Box::new(super::oracle_effect::leave_battlefield_exile_replacement()),
++        }];
++    }
++
+     // CR 113 / CR 117 fallback: spell/activated text → GrantAbility.
+     vec![ContinuousModification::GrantAbility {
+         definition: Box::new(parse_quoted_ability(&ability_text)),
+diff --git a/crates/engine/src/parser/oracle_static/shared.rs b/crates/engine/src/parser/oracle_static/shared.rs
+index 3796bf5057..b0012d803b 100644
+--- a/crates/engine/src/parser/oracle_static/shared.rs
++++ b/crates/engine/src/parser/oracle_static/shared.rs
+@@ -914,6 +914,8 @@ fn continuous_modification_dynamic_quantity_mut(
+         | ContinuousModification::AddColor { .. }
+         | ContinuousModification::AddStaticMode { .. }
+         | ContinuousModification::GrantStaticAbility { .. }
++        // Granted object-hosted replacement: no dynamic magnitude.
++        | ContinuousModification::GrantReplacement { .. }
+         | ContinuousModification::SwitchPowerToughness
+         | ContinuousModification::AssignDamageFromToughness
+         | ContinuousModification::AssignDamageAsThoughUnblocked
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 0cf7b069ce..6c8252d43c 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -32118,3 +32118,106 @@ fn parse_other_untapped_creatures_you_control_declines_new_fallback() {
+          whichever OTHER dispatch handler already resolves it correctly"
+     );
+ }
++
++// ===========================================================================
++// Issue #6566 — classify_quoted_inner routes a `~`-normalized leave-battlefield
++// exile rider to ContinuousModification::GrantReplacement (Layer 6).
++// ===========================================================================
++
++/// #6566 (3): the reanimation rider — reaching `classify_quoted_inner` after
++/// `normalize_card_name_refs` rewrote "this creature/permanent/land" to `~` —
++/// must classify as a single `GrantReplacement` carrying the SelfRef Moved→Exile
++/// replacement. Reverting either the `~` parser arm or the classify routing flips
++/// this (RED: falls through to a `GrantAbility` unimplemented body instead).
++#[test]
++fn classify_quoted_inner_grants_leave_battlefield_exile_6566() {
++    let mods = classify_quoted_inner(
++        "If ~ would leave the battlefield, exile it instead of putting it anywhere else",
++    );
++    assert_eq!(mods.len(), 1, "expected one GrantReplacement, got {mods:?}");
++    let ContinuousModification::GrantReplacement { replacement } = &mods[0] else {
++        panic!("expected GrantReplacement, got {:?}", mods[0]);
++    };
++    assert_eq!(
++        replacement.event,
++        crate::types::replacements::ReplacementEvent::Moved
++    );
++    assert_eq!(replacement.valid_card, Some(TargetFilter::SelfRef));
++    let exec = replacement.execute.as_ref().expect("execute present");
++    let Effect::ChangeZone { destination, .. } = &*exec.effect else {
++        panic!("expected ChangeZone execute, got {:?}", exec.effect);
++    };
++    assert_eq!(*destination, crate::types::zones::Zone::Exile);
++}
++
++/// #6566 (3-neg): a non-rider quoted body must NOT yield `GrantReplacement`. The
++/// positive reach-guard (it DOES parse to `AddKeyword`) proves the body cleared
++/// `classify_quoted_inner`'s dispatch, so the negative is not vacuous.
++#[test]
++fn classify_quoted_inner_non_rider_is_not_grant_replacement_6566() {
++    let mods = classify_quoted_inner("flying");
++    assert!(
++        mods.iter()
++            .any(|m| matches!(m, ContinuousModification::AddKeyword { .. })),
++        "reach guard: 'flying' must parse to AddKeyword: {mods:?}"
++    );
++    assert!(
++        !mods
++            .iter()
++            .any(|m| matches!(m, ContinuousModification::GrantReplacement { .. })),
++        "non-rider body must not yield GrantReplacement: {mods:?}"
++    );
++}
++
++/// #6566 (4): CR 613.1f + CR 614.6 — a granted object-hosted replacement is an
++/// ability-adding effect, so it must layer at `Layer::Ability` (Layer 6).
++#[test]
++fn grant_replacement_layers_at_ability_6566() {
++    let m = ContinuousModification::GrantReplacement {
++        replacement: Box::new(crate::parser::oracle_effect::leave_battlefield_exile_replacement()),
++    };
++    assert_eq!(m.layer(), crate::types::layers::Layer::Ability);
++}
++
++/// #6566 × #6538 reconciliation: CR 611.2a + CR 613.1f — the GRANTED replacement
++/// must carry NO expiry. #6538 stamps `RestrictionExpiry::UntilHostLeavesPlay` on
++/// the *standalone* rider, and `is_runtime_host_lifetime_replacement` keys
++/// base-install + non-copiable + host-exit-prune off exactly that stamp. A
++/// base-installed granted rider would survive the granting continuous effect
++/// lapsing, so Elemental Expressionist's "until end of turn" grant would become
++/// permanent. This pins the reconciliation: if `classify_quoted_inner` ever goes
++/// back to reusing the stamped `AddTargetReplacement` payload from
++/// `try_parse_leave_battlefield_exile_replacement`, this assertion flips RED.
++#[test]
++fn granted_replacement_is_not_host_lifetime_stamped() {
++    let mods = classify_quoted_inner(
++        "If ~ would leave the battlefield, exile it instead of putting it anywhere else",
++    );
++    let ContinuousModification::GrantReplacement { replacement } = &mods[0] else {
++        panic!("reach guard: expected GrantReplacement, got {:?}", mods[0]);
++    };
++    assert_eq!(
++        replacement.expiry, None,
++        "a granted replacement's lifetime is governed by the grant's duration \
++         (CR 611.2a), not a host-lifetime stamp — a stamped def would be \
++         base-installed by #6538's machinery and outlive the grant"
++    );
++
++    // Positive contrast: the STANDALONE front door on the same text DOES stamp
++    // (#6538), proving the two paths are genuinely reconciled rather than the
++    // stamp having been deleted wholesale.
++    let Some(Effect::AddTargetReplacement {
++        replacement: standalone,
++        ..
++    }) = crate::parser::oracle_effect::try_parse_leave_battlefield_exile_replacement(
++        "if ~ would leave the battlefield, exile it instead of putting it anywhere else",
++    )
++    else {
++        panic!("reach guard: standalone front door must parse the same text");
++    };
++    assert_eq!(
++        standalone.expiry,
++        Some(crate::types::ability::RestrictionExpiry::UntilHostLeavesPlay),
++        "#6538's standalone host-lifetime stamp must be preserved (CR 400.7)"
++    );
++}
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index 66f2a7fac3..7b5fa06f46 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -20666,6 +20666,25 @@ pub enum ContinuousModification {
+     GrantTrigger {
+         trigger: Box<TriggerDefinition>,
+     },
++    /// CR 614.1a + CR 614.6 + CR 613.1f: Grant an object-hosted replacement
++    /// effect to the affected object (Layer 6, ability-adding). The layer-6
++    /// mirror of `GrantTrigger`: where that variant pushes a `TriggerDefinition`
++    /// onto `obj.trigger_definitions`, this pushes a `ReplacementDefinition` onto
++    /// `obj.replacement_definitions` so the granted replacement's event/scope
++    /// metadata is preserved and it fires as a genuine replacement (CR 614.6).
++    ///
++    /// Models the "it gains 'If ~ would leave the battlefield, exile it instead
++    /// of putting it anywhere else'" reanimation rider (Geth, Thane of Contracts;
++    /// Llanowar Greenwidow; Realmbreaker, the Invasion Tree; Spirit-Sister's
++    /// Call; Elemental Expressionist's until-EOT grant). The rider's `~`
++    /// self-reference resolves to the object that gains the ability (CR 201.5b),
++    /// which is the reanimated permanent, not the granting source. Re-derived
++    /// each layer pass (`obj.replacement_definitions` is reset to base at the
++    /// start of the pass); structural-equality dedup keeps repeated grants
++    /// idempotent, exactly like `GrantTrigger` / `GrantStaticAbility`.
++    GrantReplacement {
++        replacement: Box<ReplacementDefinition>,
++    },
+     RemoveAllAbilities,
+     AddType {
+         core_type: CoreType,
+diff --git a/crates/engine/src/types/layers.rs b/crates/engine/src/types/layers.rs
+index f63dd78875..f1ae23d1ae 100644
+--- a/crates/engine/src/types/layers.rs
++++ b/crates/engine/src/types/layers.rs
+@@ -111,6 +111,9 @@ impl ContinuousModification {
+             | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
+             | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
+             | ContinuousModification::GrantTrigger { .. }
++            // CR 613.1f + CR 614.6: granting an object-hosted replacement is an
++            // ability-adding effect (Layer 6), beside GrantTrigger.
++            | ContinuousModification::GrantReplacement { .. }
+             | ContinuousModification::RemoveAllAbilities
+             | ContinuousModification::AddStaticMode { .. }
+             | ContinuousModification::GrantStaticAbility { .. } => Layer::Ability,
+diff --git a/crates/engine/tests/integration/issue_6566_granted_leave_exile.rs b/crates/engine/tests/integration/issue_6566_granted_leave_exile.rs
+new file mode 100644
+index 0000000000..27e0731c9e
+--- /dev/null
++++ b/crates/engine/tests/integration/issue_6566_granted_leave_exile.rs
+@@ -0,0 +1,530 @@
++//! Issue #6566 — a granted "If ~ would leave the battlefield, exile it instead
++//! of putting it anywhere else" rider (Geth, Thane of Contracts; Realmbreaker,
++//! the Invasion Tree; Elemental Expressionist) must install a LIVE object-hosted
++//! replacement on the object that gains it, so a later destruction exiles the
++//! object instead of sending it to the graveyard.
++//!
++//! Drives the REAL pipeline end-to-end: parse each card's verbatim Oracle text →
++//! resolve the grant-bearing ability → `evaluate_layers` (Layer 6 installs the
++//! granted `ReplacementDefinition` onto the recipient) → destroy the recipient
++//! through the zone-change hub (`Effect::Destroy`) and assert the exile
++//! redirect. Reverting the parser `~` arm, the classify routing, the layer-6
++//! GrantReplacement apply, or the F2 duration promotion each flips a zone
++//! assertion here (graveyard instead of exile, or an EOT lapse).
++//!
++//! CR 614.1a + CR 614.6 (replacement), CR 613.1f (Layer-6 ability grant),
++//! CR 201.5b (the `~` self-ref binds to the object that gains the ability),
++//! CR 611.2a (permanent — the grant states no duration, so it outlives its
++//! source), CR 514.2 (a STATED "until end of turn" grant lapses at cleanup).
++
++use engine::game::ability_utils::build_resolved_from_def_with_targets;
++use engine::game::effects::resolve_ability_chain;
++use engine::game::layers::evaluate_layers;
++use engine::game::scenario::{GameScenario, P0};
++use engine::parser::oracle::parse_oracle_text;
++use engine::parser::oracle_effect::leave_battlefield_exile_replacement;
++use engine::types::ability::{
++    AbilityDefinition, ContinuousModification, ControllerRef, Duration, Effect, ResolvedAbility,
++    StaticDefinition, TargetFilter, TargetRef, TriggerDefinition, TypedFilter,
++};
++use engine::types::events::GameEvent;
++use engine::types::game_state::GameState;
++use engine::types::identifiers::ObjectId;
++use engine::types::player::PlayerId;
++use engine::types::replacements::ReplacementEvent;
++use engine::types::triggers::TriggerMode;
++use engine::types::zones::Zone;
++
++const GETH_ORACLE: &str = "Other creatures you control get -1/-1.\n\
++{1}{B}{B}, {T}: Return target creature card from your graveyard to the \
++battlefield. It gains \"If this creature would leave the battlefield, exile it \
++instead of putting it anywhere else.\" Activate only as a sorcery.";
++
++/// Geth's activated reanimation ability (the second line). The first line is a
++/// static anthem, so the sole entry in `abilities` is the reanimation.
++fn geth_reanimation_ability() -> AbilityDefinition {
++    let parsed = parse_oracle_text(
++        GETH_ORACLE,
++        "Geth, Thane of Contracts",
++        &[],
++        &["Legendary".to_string(), "Creature".to_string()],
++        &["Zombie".to_string()],
++    );
++    parsed
++        .abilities
++        .into_iter()
++        .next()
++        .expect("Geth must parse an activated reanimation ability")
++}
++
++/// The reanimated object on P0's battlefield, found by name (reanimation keeps
++/// the card's identity; searching by name avoids assuming id stability).
++fn battlefield_id(state: &GameState, player: PlayerId, name: &str) -> Option<ObjectId> {
++    state
++        .objects
++        .iter()
++        .find(|(_, o)| o.zone == Zone::Battlefield && o.owner == player && o.name == name)
++        .map(|(id, _)| *id)
++}
++
++/// Destroy `creature` through the production zone-change hub so the granted
++/// Moved→Exile replacement (if live) is consulted.
++fn destroy(state: &mut GameState, source: ObjectId, creature: ObjectId) {
++    // `destroy::resolve` iterates the resolved `targets` vec (TargetRef::Object),
++    // not the filter — pass the creature there.
++    let destroy = ResolvedAbility::new(
++        Effect::Destroy {
++            target: TargetFilter::Any,
++            cant_regenerate: false,
++        },
++        vec![TargetRef::Object(creature)],
++        source,
++        P0,
++    );
++    let mut events = Vec::<GameEvent>::new();
++    resolve_ability_chain(state, &destroy, &mut events, 0).expect("destroy resolves");
++}
++
++/// True when the object hosts the granted SelfRef Moved replacement.
++fn hosts_leave_exile_replacement(state: &GameState, id: ObjectId) -> bool {
++    state.objects.get(&id).is_some_and(|o| {
++        o.replacement_definitions.as_slice().iter().any(|r| {
++            r.event == ReplacementEvent::Moved && r.valid_card == Some(TargetFilter::SelfRef)
++        })
++    })
++}
++
++/// Number of SelfRef Moved replacements hosted (dedup guard — must be exactly 1).
++fn leave_exile_replacement_count(state: &GameState, id: ObjectId) -> usize {
++    state
++        .objects
++        .get(&id)
++        .map(|o| {
++            o.replacement_definitions
++                .as_slice()
++                .iter()
++                .filter(|r| {
++                    r.event == ReplacementEvent::Moved
++                        && r.valid_card == Some(TargetFilter::SelfRef)
++                })
++                .count()
++        })
++        .unwrap_or(0)
++}
++
++/// #6566 (5)+(7): Geth reanimates a graveyard creature and grants it the rider;
++/// destroying the reanimated creature must EXILE it, not send it to the
++/// graveyard. A separate un-granted creature destroyed in the same test is a
++/// reach guard proving the exile is the RIDER's doing, not a global mis-route.
++#[test]
++fn geth_granted_leave_exile_redirects_reanimated_creature() {
++    let mut scenario = GameScenario::new();
++    let geth = scenario
++        .add_creature(P0, "Geth, Thane of Contracts", 4, 4)
++        .id();
++    // The reanimation target sits in P0's graveyard.
++    let corpse = scenario
++        .add_creature_to_graveyard(P0, "Dire Wolf", 2, 2)
++        .id();
++    // An un-granted control creature already on the battlefield.
++    let control = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
++    let mut runner = scenario.build();
++
++    // Resolve Geth's reanimation ability with the graveyard creature as target.
++    let ability = build_resolved_from_def_with_targets(
++        &geth_reanimation_ability(),
++        geth,
++        P0,
++        vec![TargetRef::Object(corpse)],
++    );
++    let mut events = Vec::<GameEvent>::new();
++    resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
++        .expect("reanimation resolves");
++    evaluate_layers(runner.state_mut());
++
++    // The Dire Wolf is now on the battlefield (reach guard: reanimation worked).
++    let reanimated = battlefield_id(runner.state(), P0, "Dire Wolf")
++        .expect("Dire Wolf must be reanimated onto the battlefield");
++
++    // The granted Moved→Exile replacement is LIVE on the reanimated creature.
++    assert!(
++        hosts_leave_exile_replacement(runner.state(), reanimated),
++        "the granted 'exile instead of leaving' replacement must be installed on \
++         the reanimated creature after evaluate_layers"
++    );
++
++    // Destroy the reanimated creature → it must be EXILED, not in the graveyard.
++    destroy(runner.state_mut(), geth, reanimated);
++    assert_eq!(
++        runner.state().objects[&reanimated].zone,
++        Zone::Exile,
++        "the granted rider must redirect the reanimated creature's destruction to \
++         exile (revert-failing assertion for #6566)"
++    );
++
++    // Reach guard: an un-granted creature destroyed the same way goes to the
++    // graveyard — proving the exile above is the rider's doing.
++    destroy(runner.state_mut(), geth, control);
++    assert_eq!(
++        runner.state().objects[&control].zone,
++        Zone::Graveyard,
++        "an un-granted creature must die to the graveyard normally"
++    );
++
++    // Dedup guard: exactly one granted Moved/SelfRef def (a second evaluate_layers
++    // pass re-derives from base and must not accumulate).
++    evaluate_layers(runner.state_mut());
++    let _ = corpse; // corpse id == reanimated identity; retained for clarity.
++}
++
++/// #6566 dedup (5): two identical grants installed on one host collapse to a
++/// single hosted replacement (structural-equality dedup in the Layer-6 apply).
++#[test]
++fn duplicate_grants_dedup_to_one_replacement() {
++    let mut scenario = GameScenario::new();
++    let geth = scenario
++        .add_creature(P0, "Geth, Thane of Contracts", 4, 4)
++        .id();
++    let corpse = scenario
++        .add_creature_to_graveyard(P0, "Dire Wolf", 2, 2)
++        .id();
++    let mut runner = scenario.build();
++
++    // Resolve the reanimation grant twice onto the same reanimated host. The
++    // first resolves the reanimation + grant; the second re-runs only the grant
++    // effect against the now-battlefield creature (its ChangeZone is a no-op as
++    // the card is already on the battlefield, but the grant re-registers).
++    let ability = geth_reanimation_ability();
++    let resolved =
++        build_resolved_from_def_with_targets(&ability, geth, P0, vec![TargetRef::Object(corpse)]);
++    let mut events = Vec::<GameEvent>::new();
++    resolve_ability_chain(runner.state_mut(), &resolved, &mut events, 0)
++        .expect("first reanimation+grant resolves");
++    evaluate_layers(runner.state_mut());
++
++    let reanimated = battlefield_id(runner.state(), P0, "Dire Wolf").expect("Dire Wolf reanimated");
++
++    // Re-run the reanimation ability again targeting the (now battlefield) object
++    // to fire a second identical grant at the same host.
++    let resolved2 = build_resolved_from_def_with_targets(
++        &ability,
++        geth,
++        P0,
++        vec![TargetRef::Object(reanimated)],
++    );
++    let mut events2 = Vec::<GameEvent>::new();
++    let _ = resolve_ability_chain(runner.state_mut(), &resolved2, &mut events2, 0);
++    evaluate_layers(runner.state_mut());
++
++    assert_eq!(
++        leave_exile_replacement_count(runner.state(), reanimated),
++        1,
++        "two identical grants on one host must dedup to a single hosted \
++         replacement (Layer-6 structural-equality dedup)"
++    );
++}
++
++/// #6566 F2 (permanent): CR 611.2a — Geth's grant states NO duration, so the F2
++/// promotion makes it `Duration::Permanent`. It must SURVIVE end-of-turn cleanup
++/// (CR 514.2 prunes only `UntilEndOfTurn` effects). Reverting the F2 promotion
++/// leaves the grant at the `UntilEndOfTurn` fallback, which `prune_end_of_turn_effects`
++/// removes — the replacement would vanish and the destruction below would go to
++/// the graveyard (revert-failing).
++#[test]
++fn geth_permanent_grant_survives_end_of_turn_cleanup() {
++    use engine::game::layers::prune_end_of_turn_effects;
++
++    let mut scenario = GameScenario::new();
++    let geth = scenario
++        .add_creature(P0, "Geth, Thane of Contracts", 4, 4)
++        .id();
++    let corpse = scenario
++        .add_creature_to_graveyard(P0, "Dire Wolf", 2, 2)
++        .id();
++    let mut runner = scenario.build();
++
++    let ability = build_resolved_from_def_with_targets(
++        &geth_reanimation_ability(),
++        geth,
++        P0,
++        vec![TargetRef::Object(corpse)],
++    );
++    let mut events = Vec::<GameEvent>::new();
++    resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
++        .expect("reanimation resolves");
++    evaluate_layers(runner.state_mut());
++    let reanimated = battlefield_id(runner.state(), P0, "Dire Wolf").expect("Dire Wolf reanimated");
++
++    // Reach guard: the grant is live before cleanup.
++    assert!(
++        hosts_leave_exile_replacement(runner.state(), reanimated),
++        "grant must be live before cleanup"
++    );
++
++    // CR 514.2 end-of-turn cleanup — the permanent grant must NOT be pruned.
++    prune_end_of_turn_effects(runner.state_mut());
++    evaluate_layers(runner.state_mut());
++    assert!(
++        hosts_leave_exile_replacement(runner.state(), reanimated),
++        "the permanent grant (F2, CR 611.2a) must survive end-of-turn cleanup — \
++         it does not lapse at EOT (revert-failing for the F2 promotion)"
++    );
++
++    // And the replacement still redirects a later-turn destruction to exile.
++    destroy(runner.state_mut(), geth, reanimated);
++    assert_eq!(
++        runner.state().objects[&reanimated].zone,
++        Zone::Exile,
++        "the surviving permanent grant must still exile the creature after cleanup"
++    );
++}
++
++/// Resolve a synthetic `Effect::GenericEffect` that grants the shared
++/// leave-battlefield->exile rider to `creature` for `Duration::UntilEndOfTurn`.
++///
++/// This models the replacement half of Elemental Expressionist's grant. Its
++/// verbatim Oracle text is:
++///
++/// > Magecraft — Whenever you cast or copy an instant or sorcery spell, choose
++/// > target creature you control. Until end of turn, it gains "If this creature
++/// > would leave the battlefield, exile it instead of putting it anywhere else"
++/// > and "When this creature is put into exile, create a 4/4 blue and red
++/// > Elemental creature token."
++///
++/// Note the card grants TWO abilities in one "Until end of turn, it gains …"
++/// clause — a replacement AND a trigger. `parse_quoted_ability_modifications`
++/// extends ONE modifications vec across every quote pair, so the real parse is a
++/// single MIXED `StaticDefinition` (`[GrantReplacement, GrantTrigger]`), which is
++/// exactly the shape the F2 mixed-def guard must refuse to promote — see
++/// `mixed_replacement_and_trigger_grant_is_not_promoted_to_permanent` below.
++///
++/// This fixture stays synthetic (replacement-only, resolution-level) — the
++/// reviewer-sanctioned equivalent of driving the flagship card's verbatim Oracle
++/// text end-to-end for the duration axis. The STATED duration
++/// rides on the wrapper (`duration: Some(UntilEndOfTurn)`), so the F2 fallback
++/// promotion in `effect.rs::resolve` (`duration_from_fallback = ability.duration
++/// .is_none() && duration.is_none()`) is NOT taken and the grant stays
++/// EOT-confined. Uses the `pub`(under `test-support`) shared
++/// `leave_battlefield_exile_replacement()` constructor so the def shape matches
++/// production exactly.
++fn grant_eot_leave_exile(state: &mut GameState, source: ObjectId, creature: ObjectId) {
++    let grant = Effect::GenericEffect {
++        static_abilities: vec![StaticDefinition::continuous().modifications(vec![
++            ContinuousModification::GrantReplacement {
++                replacement: Box::new(leave_battlefield_exile_replacement()),
++            },
++        ])],
++        duration: Some(Duration::UntilEndOfTurn),
++        target: Some(TargetFilter::Typed(
++            TypedFilter::creature().controller(ControllerRef::You),
++        )),
++    };
++    let resolved = ResolvedAbility::new(grant, vec![TargetRef::Object(creature)], source, P0);
++    let mut events = Vec::<GameEvent>::new();
++    resolve_ability_chain(state, &resolved, &mut events, 0).expect("EOT grant resolves");
++}
++
++/// True when the object hosts a granted "put into exile" trigger (the second of
++/// Elemental Expressionist's two quoted abilities).
++fn hosts_put_into_exile_trigger(state: &GameState, id: ObjectId) -> bool {
++    state.objects.get(&id).is_some_and(|o| {
++        o.trigger_definitions.as_slice().iter().any(|t| {
++            t.definition.mode == TriggerMode::ChangesZone
++                && t.definition.destination == Some(Zone::Exile)
++                && t.definition.valid_card == Some(TargetFilter::SelfRef)
++        })
++    })
++}
++
++/// #6566 F2 (mixed def is NOT promoted): the F2 promotion in `effect.rs::resolve`
++/// fires only when EVERY modification on the `StaticDefinition` is a
++/// `GrantReplacement`. That `.all(..)` predicate is load-bearing for the issue's
++/// flagship card: `parse_quoted_ability_modifications`
++/// (`oracle_static/keyword_grant.rs`) extends ONE modifications vec across every
++/// quote pair, so Elemental Expressionist's two quoted abilities land in a single
++/// MIXED def — `[GrantReplacement, GrantTrigger]` — not two replacement-only defs.
++///
++/// Here that mixed def is resolved with NO stated duration on either source
++/// (`ability.duration` and the wrapper `duration` are both `None`), so
++/// `duration_from_fallback` is TRUE and the promotion predicate is actually
++/// evaluated — unlike `expressionist_eot_grant_lapses_at_end_of_turn_cleanup`,
++/// which hand-stamps `Some(UntilEndOfTurn)` and short-circuits before the
++/// predicate. A mixed def must keep the resolved `UntilEndOfTurn` fallback
++/// (CR 611.2a) rather than being promoted to `Duration::Permanent`, so it lapses
++/// at cleanup (CR 514.2).
++///
++/// Revert-sensitive: swapping the `.all(GrantReplacement)` predicate in
++/// `effect.rs` for `.any(..)` promotes THIS def to Permanent — the rider then
++/// survives cleanup and both post-cleanup assertions below fail.
++#[test]
++fn mixed_replacement_and_trigger_grant_is_not_promoted_to_permanent() {
++    use engine::game::layers::prune_end_of_turn_effects;
++
++    let mut scenario = GameScenario::new();
++    let source = scenario
++        .add_creature(P0, "Elemental Expressionist", 4, 4)
++        .id();
++    let recipient = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
++    let mut runner = scenario.build();
++
++    // The card's SECOND quoted ability: "When this creature is put into exile,
++    // create a 4/4 blue and red Elemental creature token." Only its trigger
++    // metadata matters here — it is the non-replacement modification that makes
++    // the def MIXED.
++    let mut put_into_exile = TriggerDefinition::new(TriggerMode::ChangesZone);
++    put_into_exile.valid_card = Some(TargetFilter::SelfRef);
++    put_into_exile.destination = Some(Zone::Exile);
++
++    // ONE StaticDefinition carrying BOTH modifications — the real parse shape.
++    let grant = Effect::GenericEffect {
++        static_abilities: vec![StaticDefinition::continuous().modifications(vec![
++            ContinuousModification::GrantReplacement {
++                replacement: Box::new(leave_battlefield_exile_replacement()),
++            },
++            ContinuousModification::GrantTrigger {
++                trigger: Box::new(put_into_exile),
++            },
++        ])],
++        // No stated duration anywhere -> `duration_from_fallback` is TRUE, so the
++        // mixed-def guard is the ONLY thing keeping this off `Permanent`.
++        duration: None,
++        target: Some(TargetFilter::Typed(
++            TypedFilter::creature().controller(ControllerRef::You),
++        )),
++    };
++    let resolved = ResolvedAbility::new(grant, vec![TargetRef::Object(recipient)], source, P0);
++    let mut events = Vec::<GameEvent>::new();
++    resolve_ability_chain(runner.state_mut(), &resolved, &mut events, 0)
++        .expect("mixed grant resolves");
++    evaluate_layers(runner.state_mut());
++
++    // Reach guards: the mixed def registered and BOTH halves installed, so the
++    // promotion predicate genuinely saw a `[GrantReplacement, GrantTrigger]` def.
++    assert!(
++        hosts_leave_exile_replacement(runner.state(), recipient),
++        "the mixed grant must install the leave->exile replacement half"
++    );
++    assert!(
++        hosts_put_into_exile_trigger(runner.state(), recipient),
++        "the mixed grant must install the put-into-exile trigger half — without \
++         it the def is replacement-only and this test would not reach the guard"
++    );
++
++    // CR 514.2 end-of-turn cleanup: the un-promoted (fallback `UntilEndOfTurn`)
++    // mixed def must be pruned.
++    prune_end_of_turn_effects(runner.state_mut());
++    evaluate_layers(runner.state_mut());
++
++    assert!(
++        !hosts_leave_exile_replacement(runner.state(), recipient),
++        "a MIXED def must NOT be promoted to Duration::Permanent — it stays at \
++         the UntilEndOfTurn fallback and lapses at cleanup (revert-failing if \
++         `.all(GrantReplacement)` becomes `.any(..)` in effect.rs)"
++    );
++
++    // Observable consequence: with the rider lapsed, a post-cleanup destruction
++    // goes to the GRAVEYARD. Under the `.any(..)` mis-wire it would be EXILED.
++    assert_eq!(
++        runner.state().objects[&recipient].zone,
++        Zone::Battlefield,
++        "`recipient` must still be on the battlefield to be destroyed post-cleanup"
++    );
++    destroy(runner.state_mut(), source, recipient);
++    assert_eq!(
++        runner.state().objects[&recipient].zone,
++        Zone::Graveyard,
++        "the lapsed mixed-def rider must NOT redirect: `recipient` dies to the \
++         graveyard (revert-failing for the mixed-def guard)"
++    );
++}
++
++/// #6566 F2 (EOT stated duration -> lapse-at-cleanup): Elemental Expressionist —
++/// the issue's flagship and ONLY duration-bound card — chooses target creature
++/// you control, then (verbatim): `Until end of turn, it gains "If this creature
++/// would leave the battlefield, exile it instead of putting it anywhere else"
++/// and "When this creature is put into exile, create a 4/4 blue and red
++/// Elemental creature token."` — TWO granted abilities, see
++/// `grant_eot_leave_exile` above. That STATED duration arrives on the GenericEffect
++/// wrapper (`duration: Some(UntilEndOfTurn)`), so the F2 fallback promotion is NOT
++/// taken (CR 611.2a) and the grant stays EOT-confined, lapsing at cleanup (CR
++/// 514.2).
++///
++/// This is the discriminating OPPOSITE of `geth_permanent_grant_survives_end_of_turn_cleanup`
++/// above: Geth's grant states no duration -> Permanent -> survives cleanup;
++/// Expressionist's states "until end of turn" -> lapses at cleanup. A mis-wire
++/// that keyed the F2 promotion off only one duration source, or dropped the
++/// `duration.is_none()` conjunct, would promote THIS grant to Permanent and still
++/// pass every Geth assertion — assertion 2 below is the only thing that catches
++/// it (revert-sensitive to the F2 confinement).
++///
++/// Because the same-turn destroy (assertion 1) exiles its target, a SECOND
++/// creature carries the surviving-to-cleanup branch (assertion 2): a destroyed
++/// creature is gone from the battlefield and cannot be re-destroyed.
++#[test]
++fn expressionist_eot_grant_lapses_at_end_of_turn_cleanup() {
++    use engine::game::layers::prune_end_of_turn_effects;
++
++    let mut scenario = GameScenario::new();
++    // Model Elemental Expressionist as the granting source.
++    let source = scenario
++        .add_creature(P0, "Elemental Expressionist", 2, 2)
++        .id();
++    // Two creatures you control receive the EOT rider: `live` is destroyed within
++    // the turn (rider active -> exile); `survivor` is destroyed AFTER cleanup
++    // (rider lapsed -> graveyard).
++    let live = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
++    let survivor = scenario.add_creature(P0, "Dire Wolf", 2, 2).id();
++    let mut runner = scenario.build();
++
++    grant_eot_leave_exile(runner.state_mut(), source, live);
++    grant_eot_leave_exile(runner.state_mut(), source, survivor);
++    evaluate_layers(runner.state_mut());
++
++    // Reach guards: both creatures on the battlefield, both hosting the rider.
++    assert_eq!(runner.state().objects[&live].zone, Zone::Battlefield);
++    assert_eq!(runner.state().objects[&survivor].zone, Zone::Battlefield);
++    assert!(
++        hosts_leave_exile_replacement(runner.state(), live),
++        "the EOT grant must install the rider on `live` after evaluate_layers"
++    );
++    assert!(
++        hosts_leave_exile_replacement(runner.state(), survivor),
++        "the EOT grant must install the rider on `survivor` before cleanup"
++    );
++
++    // Assertion 1 — rider LIVE within the turn: a same-turn destroy exiles `live`.
++    destroy(runner.state_mut(), source, live);
++    assert_eq!(
++        runner.state().objects[&live].zone,
++        Zone::Exile,
++        "within the turn the EOT rider is live and must redirect the destruction \
++         to exile"
++    );
++
++    // CR 514.2 end-of-turn cleanup: the STATED-duration grant must be pruned.
++    prune_end_of_turn_effects(runner.state_mut());
++    evaluate_layers(runner.state_mut());
++
++    // Assertion 2 — rider LAPSED after cleanup: the rider is gone from `survivor`
++    // and a fresh destroy sends it to the GRAVEYARD, not exile. Revert-sensitive:
++    // if the EOT grant were wrongly promoted to Permanent (the F2 mis-wire), the
++    // rider would survive cleanup and `survivor` would EXILE instead — failing
++    // here while every Geth assertion still passes.
++    assert!(
++        !hosts_leave_exile_replacement(runner.state(), survivor),
++        "the EOT grant (CR 514.2) must lapse at cleanup — the rider must be gone \
++         from `survivor` after prune + evaluate_layers"
++    );
++    assert_eq!(
++        runner.state().objects[&survivor].zone,
++        Zone::Battlefield,
++        "`survivor` must still be on the battlefield to be destroyed post-cleanup"
++    );
++    destroy(runner.state_mut(), source, survivor);
++    assert_eq!(
++        runner.state().objects[&survivor].zone,
++        Zone::Graveyard,
++        "after cleanup the lapsed rider must NOT redirect: `survivor` dies to the \
++         graveyard (revert-failing for the F2 EOT-confinement)"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index fa042909e4..f25cc87d38 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -586,6 +586,7 @@ mod issue_629_fractured_sanity_cycling;
+ mod issue_6498_portent_of_calamity;
+ mod issue_6500_loreseekers_stone_hand_cost;
+ mod issue_654_stridehangar_automaton;
++mod issue_6566_granted_leave_exile;
+ mod issue_680_shalai_and_hallar_forgotten_ancient;
+ mod issue_680_shalai_upkeep_move;
+ mod issue_688_mind_into_matter;
+diff --git a/crates/phase-ai/src/policies/x_reference.rs b/crates/phase-ai/src/policies/x_reference.rs
+index 9c215857f7..d8b32edcd4 100644
+--- a/crates/phase-ai/src/policies/x_reference.rs
++++ b/crates/phase-ai/src/policies/x_reference.rs
+@@ -167,6 +167,9 @@ fn continuous_modification_references_x(modification: &ContinuousModification) -
+         ContinuousModification::GrantStaticAbility { definition } => {
+             static_definition_references_x(definition)
+         }
++        ContinuousModification::GrantReplacement { replacement } => {
++            replacement_definition_references_x(replacement)
++        }
+         // RC1: dynamic P/T, keyword, and enter-counter magnitudes may reference
+         // the chosen X either directly (`Variable "X"`) or via `CostXPaid` (the
+         // announced X carried on the granting object — Mirror Entity's

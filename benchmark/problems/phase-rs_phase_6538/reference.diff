@@ -1,0 +1,972 @@
+diff --git a/crates/engine/src/database/unearth.rs b/crates/engine/src/database/unearth.rs
+index c6fb077ce9..e4690fa556 100644
+--- a/crates/engine/src/database/unearth.rs
++++ b/crates/engine/src/database/unearth.rs
+@@ -17,7 +17,10 @@
+ //! 3. an `Effect::CreateDelayedTrigger` that exiles the card at the next end
+ //!    step (CR 702.84a), and
+ //! 4. an `Effect::AddTargetReplacement` installing the "if it would leave the
+-//!    battlefield, exile it instead" replacement (CR 702.84a / CR 614.1a).
++//!    battlefield, exile it instead" replacement (CR 702.84a / CR 614.1a /
++//!    CR 400.7), stamped `RestrictionExpiry::UntilHostLeavesPlay` so it is
++//!    base-installed (surviving CR 613.1 layer reseeds), non-copiable
++//!    (CR 707.2), and pruned when the host leaves the battlefield.
+ //!
+ //! Steps 2–4 are chained as `sub_ability` continuation steps (CR 608.2c) of the
+ //! primary `ChangeZone`, so they resolve as one action.
+@@ -35,7 +38,7 @@
+ 
+ use crate::types::ability::{
+     AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, DelayedTriggerCondition,
+-    Duration, Effect, ReplacementDefinition, StaticDefinition, TargetFilter,
++    Duration, Effect, ReplacementDefinition, RestrictionExpiry, StaticDefinition, TargetFilter,
+ };
+ use crate::types::card::CardFace;
+ use crate::types::keywords::Keyword;
+@@ -149,14 +152,19 @@ fn delayed_exile_step() -> AbilityDefinition {
+     .description("Exile it at the beginning of the next end step.".to_string())
+ }
+ 
+-/// CR 702.84a / CR 614.1a: "If it would leave the battlefield, exile it instead
+-/// of putting it anywhere else." Installs a `Moved` replacement on the returned
+-/// permanent (`target: SelfRef`); `valid_card: SelfRef` binds the replacement to
+-/// its own host so it fires only for that object, redirecting any
+-/// battlefield-exit to exile.
++/// CR 702.84a / CR 614.1a / CR 400.7: "If it would leave the battlefield, exile
++/// it instead of putting it anywhere else." Installs a `Moved` replacement on
++/// the returned permanent (`target: SelfRef`); `valid_card: SelfRef` binds the
++/// replacement to its own host so it fires only for that object, redirecting any
++/// battlefield-exit to exile. The rider is stamped
++/// `RestrictionExpiry::UntilHostLeavesPlay`: it is a runtime effect bound to the
++/// host object's lifetime, so it is base-installed to survive CR 613.1 layer
++/// reseeds, kept non-copiable (CR 707.2), and pruned on the host's battlefield
++/// exit (CR 400.7) — see the variant doc in `types/ability.rs`.
+ fn leaves_battlefield_exile_step() -> AbilityDefinition {
+     let replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+         .valid_card(TargetFilter::SelfRef)
++        .expiry(RestrictionExpiry::UntilHostLeavesPlay)
+         .execute(AbilityDefinition::new(
+             AbilityKind::Spell,
+             exile_self_from_battlefield_effect(),
+diff --git a/crates/engine/src/database/unearth_tests.rs b/crates/engine/src/database/unearth_tests.rs
+index c53553680d..a11d4ac25a 100644
+--- a/crates/engine/src/database/unearth_tests.rs
++++ b/crates/engine/src/database/unearth_tests.rs
+@@ -14,7 +14,7 @@ use crate::game::triggers::check_delayed_triggers;
+ use crate::game::zones::create_object;
+ use crate::types::ability::{
+     AbilityCost, AbilityDefinition, ContinuousModification, DelayedTriggerCondition, Effect,
+-    TargetFilter,
++    RestrictionExpiry, TargetFilter,
+ };
+ use crate::types::card::CardFace;
+ use crate::types::card_type::CoreType;
+@@ -361,6 +361,41 @@ fn unearth_installs_leaves_battlefield_exile_replacement() {
+         "the replacement must redirect the card to exile, got {:?}",
+         execute.effect
+     );
++    // CR 400.7 + CR 702.84a: the rider is stamped `UntilHostLeavesPlay` so its
++    // lifetime is bound to the returned object.
++    assert_eq!(
++        repl.expiry,
++        Some(RestrictionExpiry::UntilHostLeavesPlay),
++        "the leaves-battlefield rider must carry the host-lifetime expiry stamp"
++    );
++
++    // CR 613.1: the rider is also written to `base_replacement_definitions` so it
++    // survives a layer reseed (which rebuilds live defs from base). Without the
++    // base copy, the first `evaluate_layers` would silently drop the redirect.
++    let base = &state.objects[&source].base_replacement_definitions;
++    let base_repl = base
++        .iter()
++        .find(|r| r.event == ReplacementEvent::Moved)
++        .expect("the rider must be base-installed to survive a layer reseed");
++    assert_eq!(
++        base_repl.expiry,
++        Some(RestrictionExpiry::UntilHostLeavesPlay),
++        "the base-installed rider must carry the host-lifetime expiry stamp"
++    );
++    assert_eq!(base_repl.valid_card, Some(TargetFilter::SelfRef));
++
++    // Discriminating runtime check: after a real layer pass, the live rider must
++    // still be present (repopulated from base). This is the exact reseed that
++    // dropped the live-only rider before the fix.
++    crate::game::layers::evaluate_layers(&mut state);
++    assert!(
++        state.objects[&source]
++            .replacement_definitions
++            .iter_all()
++            .any(|r| r.event == ReplacementEvent::Moved
++                && r.expiry == Some(RestrictionExpiry::UntilHostLeavesPlay)),
++        "the rider must survive a layer reseed (repopulated from base)"
++    );
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/crates/engine/src/game/effects/add_target_replacement.rs b/crates/engine/src/game/effects/add_target_replacement.rs
+index 5706510f6d..fa3d885445 100644
+--- a/crates/engine/src/game/effects/add_target_replacement.rs
++++ b/crates/engine/src/game/effects/add_target_replacement.rs
+@@ -262,6 +262,14 @@ pub fn resolve(
+                     // reset: a damaged creature can gain/lose characteristics
+                     // or enter combat before it dies. Cleanup prunes this
+                     // narrowly scoped base copy at end of turn.
++                    // A host-lifetime rider (CR 702.84a "if it would leave the
++                    // battlefield, exile it instead", stamped
++                    // `UntilHostLeavesPlay`) is the same class: it must survive
++                    // every CR 613.1 reseed so the redirect still fires after the
++                    // returned permanent gains/loses characteristics, and its
++                    // base+live copies are pruned together the instant the host
++                    // leaves the battlefield (`prune_controller_controls_source_on_leave`,
++                    // CR 400.7) so it never revives on a same-ObjectId re-entry.
+                     //
+                     // Acknowledged out-of-scope edges (NOT fixed here): (1) Cleave
+                     // re-baselining only touches spells on the stack (casting.rs)
+@@ -275,7 +283,12 @@ pub fn resolve(
+                         crate::game::printed_cards::is_runtime_target_die_exile_replacement(
+                             &replacement,
+                         );
++                    let host_lifetime =
++                        crate::game::printed_cards::is_runtime_host_lifetime_replacement(
++                            &replacement,
++                        );
+                     let install_to_base = durable_die_exile
++                        || host_lifetime
+                         || matches!(
+                             replacement.condition,
+                             Some(ReplacementCondition::ControllerControlsSource { .. })
+diff --git a/crates/engine/src/game/layers.rs b/crates/engine/src/game/layers.rs
+index 6e7f427dbe..ba42ec2e1a 100644
+--- a/crates/engine/src/game/layers.rs
++++ b/crates/engine/src/game/layers.rs
+@@ -15,7 +15,7 @@ use crate::game::filter::{matches_target_filter, FilterContext};
+ use crate::game::game_object::DisplaySource;
+ use crate::game::printed_cards::{
+     apply_copiable_values, ensure_keyword_triggers_for_copiable_values, intrinsic_copiable_values,
+-    is_runtime_target_die_exile_replacement,
++    is_runtime_host_lifetime_replacement, is_runtime_target_die_exile_replacement,
+ };
+ use crate::game::quantity::{
+     continuous_modification_dynamic_quantity, filter_uses_recipient, quantity_expr_uses_recipient,
+@@ -694,9 +694,13 @@ pub(crate) fn prune_lapsed_controller_controls_source(state: &mut GameState) {
+ /// CR 611.2b + CR 400.7: the captured source leaving play, OR the host leaving
+ /// and re-entering as a new object (same storage ObjectId), ends the can't-untap
+ /// continuous effect permanently — drop the gated def from base+live so it
+-/// cannot revive on a same-ObjectId re-entry. Called from `zones.rs` on a
+-/// battlefield exit, OUTSIDE `evaluate_layers`, so it marks layers full on change
+-/// (mirroring `prune_host_left_effects`).
++/// cannot revive on a same-ObjectId re-entry. The same host-left arm also drops
++/// the turn-bound die-exile rider and the host-lifetime exile rider
++/// (`UntilHostLeavesPlay`, CR 702.84a): a base-installed rider must NOT revive
++/// when the object re-enters as a new CR 400.7 object reusing the same storage
++/// key. Called from `zones.rs` (`:481`) on a battlefield exit, OUTSIDE
++/// `evaluate_layers`, so it marks layers full on change (mirroring
++/// `prune_host_left_effects`).
+ ///
+ /// The predicate is purely id-based (`departed_id`), so no `&state` gate read is
+ /// needed — each object is mutated in a single pass: case (b) the captured
+@@ -720,15 +724,20 @@ pub(crate) fn prune_controller_controls_source_on_leave(
+                         if source == departed_id
+                 )
+         };
+-        // CR 400.7 + CR 611.2a: Only a lapsed `ControllerControlsSource` def or a
+-        // turn-bound die-exile rider on the departing host is eligible to be dropped.
+-        // The host-left arm must not wipe printed replacements or unrelated runtime riders.
++        // CR 400.7 + CR 611.2a: Only a lapsed `ControllerControlsSource` def, a
++        // turn-bound die-exile rider, or a host-lifetime exile rider
++        // (`UntilHostLeavesPlay`, CR 702.84a) on the departing host is eligible
++        // to be dropped. The host-left arm must not wipe printed replacements or
++        // unrelated runtime riders. Dropping the host-lifetime rider from
++        // base+live here is what prevents it reviving on a same-ObjectId
++        // re-entry (CR 400.7 — the returning object is new).
+         let drop = |def: &crate::types::ability::ReplacementDefinition| {
+             (matches!(
+                 def.condition,
+                 Some(ReplacementCondition::ControllerControlsSource { .. })
+             ) && is_lapsed(def))
+                 || (host_left && is_runtime_target_die_exile_replacement(def))
++                || (host_left && is_runtime_host_lifetime_replacement(def))
+         };
+         let before_live = obj.replacement_definitions.len();
+         obj.replacement_definitions.retain(|d| !drop(d));
+diff --git a/crates/engine/src/game/printed_cards.rs b/crates/engine/src/game/printed_cards.rs
+index 8fe5d9d215..d23bfcd28f 100644
+--- a/crates/engine/src/game/printed_cards.rs
++++ b/crates/engine/src/game/printed_cards.rs
+@@ -537,8 +537,22 @@ pub(crate) fn is_runtime_target_die_exile_replacement(def: &ReplacementDefinitio
+         })
+ }
+ 
++/// CR 614.1a + CR 400.7 + CR 707.2: True for a runtime replacement bound to the
++/// lifetime of the OBJECT hosting it — the "if it would leave the battlefield,
++/// exile it instead" rider installed by Unearth (CR 702.84a) and the
++/// parser-driven reanimation cards (Gruesome Encore, Whip of Erebos, …). It is
++/// stamped `RestrictionExpiry::UntilHostLeavesPlay`. Like the die-exile rider it
++/// is persisted in base only to survive CR 613.1 layer reseeds; it is NOT a
++/// copiable value (a copy of the host must not inherit the exile redirect,
++/// CR 707.2) and must lapse when the host leaves the battlefield (CR 400.7).
++pub(crate) fn is_runtime_host_lifetime_replacement(def: &ReplacementDefinition) -> bool {
++    matches!(def.expiry, Some(RestrictionExpiry::UntilHostLeavesPlay))
++}
++
+ pub(crate) fn is_runtime_non_copiable_replacement(def: &ReplacementDefinition) -> bool {
+-    is_runtime_control_gated_replacement(def) || is_runtime_target_die_exile_replacement(def)
++    is_runtime_control_gated_replacement(def)
++        || is_runtime_target_die_exile_replacement(def)
++        || is_runtime_host_lifetime_replacement(def)
+ }
+ 
+ /// CR 707.2 + CR 712.4b: Build the copiable values for a melded permanent
+@@ -1952,6 +1966,88 @@ mod tests {
+         intrinsic_copiable_values(&source)
+     }
+ 
++    /// A bare "Moved SelfRef -> Exile" redirect with NO expiry stamp — the
++    /// Personal Decoy printed-static shape (CMB1 playtest card). This is the
++    /// fixture that kills shape-widening: the runtime detectors must key on the
++    /// `UntilHostLeavesPlay` expiry stamp, NOT on the redirect shape, so a
++    /// printed-static exile redirect is never misclassified as a runtime rider.
++    fn bare_moved_selfref_exile_rider() -> ReplacementDefinition {
++        ReplacementDefinition::new(ReplacementEvent::Moved)
++            .valid_card(TargetFilter::SelfRef)
++            .execute(AbilityDefinition::new(
++                AbilityKind::Spell,
++                Effect::ChangeZone {
++                    origin: Some(Zone::Battlefield),
++                    destination: Zone::Exile,
++                    target: TargetFilter::SelfRef,
++                    owner_library: false,
++                    enter_transformed: false,
++                    enters_under: None,
++                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
++                    enters_attacking: false,
++                    up_to: false,
++                    enter_with_counters: vec![],
++                    conditional_enter_with_counters: vec![],
++                    face_down_profile: None,
++                    enters_modified_if: None,
++                },
++            ))
++    }
++
++    /// R10 (issue #5976): a redirect that lacks the `UntilHostLeavesPlay` stamp
++    /// must be classified as NEITHER a host-lifetime rider NOR non-copiable — the
++    /// detectors key on the expiry stamp, not the Moved->Exile shape, so a
++    /// printed-static exile redirect (Personal Decoy) is never widened into a
++    /// runtime rider.
++    #[test]
++    fn r10_bare_exile_redirect_without_expiry_is_not_runtime_rider() {
++        let def = bare_moved_selfref_exile_rider();
++        assert!(
++            !is_runtime_host_lifetime_replacement(&def),
++            "a redirect with no UntilHostLeavesPlay stamp is NOT a host-lifetime rider"
++        );
++        assert!(
++            !is_runtime_non_copiable_replacement(&def),
++            "a printed-static exile redirect must stay copiable (shape must not widen)"
++        );
++    }
++
++    /// R6 (issue #5976): the same redirect, now stamped `UntilHostLeavesPlay`, IS
++    /// a runtime rider (CR 702.84a) and must be excluded from the host's copiable
++    /// values so a copy does not inherit the exile redirect (CR 707.2). This is
++    /// the production seam the runtime token-copy path
++    /// (`compute_current_copiable_values` -> `copiable_replacement_definitions`)
++    /// consumes.
++    #[test]
++    fn host_lifetime_rider_is_non_copiable_and_excluded_from_copiable_values() {
++        let rider = bare_moved_selfref_exile_rider()
++            .expiry(crate::types::ability::RestrictionExpiry::UntilHostLeavesPlay);
++        assert!(is_runtime_host_lifetime_replacement(&rider));
++        assert!(is_runtime_non_copiable_replacement(&rider));
++
++        let mut obj = GameObject::new(
++            ObjectId(7),
++            CardId(7),
++            PlayerId(0),
++            "Unearthed".to_string(),
++            Zone::Battlefield,
++        );
++        obj.base_replacement_definitions = Arc::new(vec![rider]);
++
++        let copiable = intrinsic_copiable_values(&obj);
++        assert!(
++            copiable
++                .replacement_definitions
++                .iter()
++                .all(|r| !is_runtime_host_lifetime_replacement(r)),
++            "CR 707.2: a copy must not inherit the host-lifetime exile rider"
++        );
++        assert!(
++            copiable.replacement_definitions.is_empty(),
++            "the only rider was the non-copiable host-lifetime one, so copiable defs are empty"
++        );
++    }
++
+     fn copy_recipient(id: u64) -> GameObject {
+         GameObject::new(
+             ObjectId(id),
+diff --git a/crates/engine/src/parser/oracle_effect/mod.rs b/crates/engine/src/parser/oracle_effect/mod.rs
+index 7edf095edd..129447005b 100644
+--- a/crates/engine/src/parser/oracle_effect/mod.rs
++++ b/crates/engine/src/parser/oracle_effect/mod.rs
+@@ -1786,6 +1786,14 @@ fn try_parse_leave_battlefield_exile_replacement(lower: &str) -> Option<Effect>
+ 
+     let replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+         .valid_card(TargetFilter::SelfRef)
++        // CR 400.7: The rider is bound to the lifetime of the object it is
++        // installed on; stamp the expiry here so the lifetime is self-contained
++        // (not dependent on the ability frame's duration threading) and so
++        // `expiry_from_duration`'s `is_none` guard never retags it — mirrors the
++        // die-exile stamp precedent at `try_parse_die_exile_rider` /
++        // `parse_token_creation_replacement_effect`. Base-installed to survive
++        // CR 613.1 layer reseeds, non-copiable (CR 707.2), pruned on host exit.
++        .expiry(RestrictionExpiry::UntilHostLeavesPlay)
+         .execute(AbilityDefinition::new(
+             AbilityKind::Spell,
+             Effect::ChangeZone {
+diff --git a/crates/engine/src/parser/oracle_effect/tests.rs b/crates/engine/src/parser/oracle_effect/tests.rs
+index 581c9a6c63..e7f780da46 100644
+--- a/crates/engine/src/parser/oracle_effect/tests.rs
++++ b/crates/engine/src/parser/oracle_effect/tests.rs
+@@ -39296,6 +39296,14 @@ fn leave_battlefield_exile_rider_adds_replacement() {
+             assert_eq!(replacement.event, ReplacementEvent::Moved);
+             assert_eq!(replacement.valid_card, Some(TargetFilter::SelfRef));
+             assert_eq!(replacement.destination_zone, None);
++            // CR 400.7 (issue #5976): the parsed rider is stamped with the
++            // host-lifetime expiry so it is base-installed, non-copiable, and
++            // pruned on host exit.
++            assert_eq!(
++                replacement.expiry,
++                Some(crate::types::ability::RestrictionExpiry::UntilHostLeavesPlay),
++                "the parsed leaves-battlefield rider must carry UntilHostLeavesPlay"
++            );
+ 
+             let execute = replacement
+                 .execute
+diff --git a/crates/engine/src/types/ability.rs b/crates/engine/src/types/ability.rs
+index b55e8cf8c5..bcf78b9582 100644
+--- a/crates/engine/src/types/ability.rs
++++ b/crates/engine/src/types/ability.rs
+@@ -2602,6 +2602,19 @@ pub enum RestrictionExpiry {
+     UntilEndOfNextTurnOf {
+         player: PlayerId,
+     },
++    /// CR 614.1a + CR 400.7: a runtime-installed replacement bound to the
++    /// lifetime of the OBJECT hosting it (the "if it would leave the
++    /// battlefield, exile it instead" rider of Unearth / Gruesome Encore /
++    /// Whip of Erebos, CR 702.84a). It is ONLY meaningful on an object-hosted
++    /// `ReplacementDefinition::expiry`; it is meaningless for the state-hosted
++    /// `GameRestriction` / `pending_damage_replacements` that share this enum,
++    /// and it is NEVER pruned by turn machinery (no untap/cleanup step ends it).
++    /// It lapses solely via the battlefield-exit prune
++    /// (`zones.rs` -> `layers.rs::prune_controller_controls_source_on_leave`).
++    /// Three operational consequences follow: it is base-installed so it
++    /// survives CR 613.1 layer reseeds; it is non-copiable (CR 707.2); and its
++    /// base+live copies are pruned together when the host leaves play.
++    UntilHostLeavesPlay,
+ }
+ 
+ /// Limits the scope of a game restriction to specific sources or targets.
+diff --git a/crates/engine/tests/integration/issue_5976_unearth_leave_redirect.rs b/crates/engine/tests/integration/issue_5976_unearth_leave_redirect.rs
+new file mode 100644
+index 0000000000..c937b77ca9
+--- /dev/null
++++ b/crates/engine/tests/integration/issue_5976_unearth_leave_redirect.rs
+@@ -0,0 +1,584 @@
++//! GitHub issue #5976 — an unearthed creature's "if it would leave the
++//! battlefield, exile it instead of putting it anywhere else" replacement
++//! (CR 702.84a) is lost after a layer reseed, so sacrificing / destroying /
++//! bouncing the creature sends it to the wrong zone instead of exile.
++//!
++//! CR 702.84a installs a `Moved` replacement on the returned permanent. It is
++//! pushed onto the object's LIVE `replacement_definitions`, but every layer
++//! pass reseeds live defs from `base_replacement_definitions`
++//! (`seed_live_characteristics_from_base` in layers.rs — CR 613.1). Because the
++//! rider is not written to base, the first full layer evaluation after the
++//! return silently drops it, and the redirect (looked up via the host object's
++//! live `replacement_definitions` in replacement.rs `moved_applier`) never
++//! fires. The fix stamps the rider with
++//! `RestrictionExpiry::UntilHostLeavesPlay` and installs it to base (surviving
++//! the reseed, CR 613.1), non-copiable (CR 707.2), and pruned on host exit
++//! (CR 400.7).
++//!
++//! Every row drives the REAL pipeline: activate Unearth, resolve, run a genuine
++//! layer pass (`evaluate_layers`) between install and the leave event — the
++//! exact reseed that used to wipe the rider — then trigger the leave through a
++//! real sacrifice / destroy / bounce effect and assert the object lands in
++//! exile. Reverting the base-install (and expiry stamp) flips R1/R3/R4/R8/R9
++//! back to graveyard/hand.
++
++use engine::game::layers::evaluate_layers;
++use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
++use engine::game::zones::move_to_zone;
++use engine::types::ability::TargetRef;
++use engine::types::actions::GameAction;
++use engine::types::events::GameEvent;
++use engine::types::game_state::{PayCostKind, WaitingFor};
++use engine::types::identifiers::ObjectId;
++use engine::types::mana::{ManaType, ManaUnit};
++use engine::types::phase::Phase;
++use engine::types::player::PlayerId;
++use engine::types::zones::Zone;
++
++// Verbatim keyword line (reminder text is stripped by MTGJSON before the parser
++// sees it, exactly as the runtime card presents). Rotting Rats is a 2/2.
++const ROTTING_RATS: &str =
++    "When this creature enters, each player discards a card.\nUnearth {1}{B}";
++
++// Verbatim Oracle text of the real cards used as leave-event outlets.
++const SACRIFICE: &str = "As an additional cost to cast this spell, sacrifice a creature.\n\
++    Add an amount of {B} equal to the sacrificed creature's mana value.";
++const GRUESOME_ENCORE: &str = "Put target creature card from an opponent's graveyard onto the \
++    battlefield under your control. It gains haste. Exile it at the beginning of the next end step. \
++    If that creature would leave the battlefield, exile it instead of putting it anywhere else.";
++const DESTROY_TARGET: &str = "Destroy target creature.";
++const BOUNCE_TARGET: &str = "Return target creature to its owner's hand.";
++// Real card Goblin Bombardment — a proven activated sacrifice-cost outlet
++// (see ajani_nacatl_pariah_sacrifice_outlet_6018). Its "any target" damage
++// gives a clean reach guard that the ability actually resolved.
++const GOBLIN_BOMBARDMENT: &str =
++    "Sacrifice a creature: This enchantment deals 1 damage to any target.";
++
++// ---------------------------------------------------------------------------
++// Shared harness helpers
++// ---------------------------------------------------------------------------
++
++/// Stage a Rotting-Rats-shape unearth creature in P0's graveyard and fund the
++/// {1}{B} activation. Both hands stay empty so the verbatim ETB "each player
++/// discards a card" resolves as a harmless no-op at return time (nothing to
++/// discard); the leave-event outlet is introduced only AFTER the return.
++fn stage_rats(scenario: &mut GameScenario) -> ObjectId {
++    scenario.at_phase(Phase::PreCombatMain);
++    let rats = scenario
++        .add_creature_to_graveyard(P0, "Rotting Rats", 2, 2)
++        .from_oracle_text(ROTTING_RATS)
++        .id();
++    scenario.with_mana_pool(
++        P0,
++        vec![
++            ManaUnit::new(ManaType::Colorless, rats, false, vec![]),
++            ManaUnit::new(ManaType::Black, rats, false, vec![]),
++        ],
++    );
++    rats
++}
++
++/// Activate the synthesized Unearth ability (the object's only activated
++/// ability, index 0), resolve it, and then run a full layer pass — the CR 613.1
++/// reseed that used to wipe the live-only rider. Returns with the rider on the
++/// battlefield, ready for a leave event.
++fn unearth(runner: &mut GameRunner, rats: ObjectId) {
++    let outcome = runner.activate(rats, 0).resolve();
++    assert_eq!(
++        outcome.zone_of(rats),
++        Zone::Battlefield,
++        "precondition: Unearth returns Rotting Rats to the battlefield (same ObjectId)"
++    );
++    // The genuine layer pass between install and leave. Before the fix this
++    // reseed drops the live-only rider (CR 613.1); after the fix the base copy
++    // repopulates live so the redirect survives.
++    evaluate_layers(runner.state_mut());
++}
++
++/// Fund `player`'s mana pool post-build (the unearth activation drained the
++/// staged pool). Provenance ObjectId is cosmetic for pool accounting.
++fn fund(runner: &mut GameRunner, player: PlayerId, colors: &[ManaType], provenance: ObjectId) {
++    for &c in colors {
++        let _ = runner
++            .state_mut()
++            .add_mana_to_pool(player, ManaUnit::new(c, provenance, false, vec![]));
++    }
++}
++
++/// Move a spell staged in the library into `player`'s hand after the return, so
++/// the ETB discard never sees it.
++fn to_hand(runner: &mut GameRunner, spell: ObjectId) {
++    move_to_zone(runner.state_mut(), spell, Zone::Hand, &mut Vec::new());
++}
++
++fn sacrificed(events: &[GameEvent], id: ObjectId) -> bool {
++    events
++        .iter()
++        .any(|e| matches!(e, GameEvent::PermanentSacrificed { object_id, .. } if *object_id == id))
++}
++
++// ---------------------------------------------------------------------------
++// R1 — the reported bug: sacrifice as an additional cost of the real
++// "Sacrifice" card. rats must land in EXILE, not the graveyard.
++// ---------------------------------------------------------------------------
++
++#[test]
++fn r1_sacrifice_additional_cost_redirects_unearthed_rats_to_exile() {
++    let mut scenario = GameScenario::new();
++    let rats = stage_rats(&mut scenario);
++    // Staged in the library, moved to hand after the return (keeps the ETB
++    // discard a no-op). The real "Sacrifice" card carries the
++    // additional-cost-sacrifice clause verbatim.
++    let sac = scenario
++        .add_spell_to_library_top(P0, "Sacrifice", true)
++        .from_oracle_text(SACRIFICE)
++        .id();
++    let mut runner = scenario.build();
++
++    unearth(&mut runner, rats);
++    to_hand(&mut runner, sac);
++    fund(&mut runner, P0, &[ManaType::Black], rats);
++
++    let outcome = runner.cast(sac).sacrifice_with(&[rats]).resolve();
++
++    // Reach guard: the sacrifice actually happened (not short-circuited on a
++    // cost failure) — CR 701.21a.
++    assert!(
++        sacrificed(outcome.events(), rats),
++        "reach guard: Rotting Rats must be sacrificed as the additional cost \
++         (CR 701.21a); events: {:?}",
++        outcome.events()
++    );
++    // The load-bearing assertion (flips to Graveyard when the base-install is
++    // reverted): CR 702.84a redirect to exile.
++    assert_eq!(
++        outcome.zone_of(rats),
++        Zone::Exile,
++        "issue #5976: an unearthed creature sacrificed to a cost must be EXILED \
++         (CR 702.84a), not put into the graveyard"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// R2 — ability-cost sacrifice outlet ("Sacrifice a creature: You gain 1 life.").
++// ---------------------------------------------------------------------------
++
++#[test]
++fn r2_ability_cost_sacrifice_outlet_redirects_to_exile() {
++    let mut scenario = GameScenario::new();
++    let rats = stage_rats(&mut scenario);
++    // A durable (2-toughness) outlet enchantment already on the battlefield.
++    let outlet = scenario
++        .add_creature(P0, "Goblin Bombardment", 0, 0)
++        .as_enchantment()
++        .from_oracle_text(GOBLIN_BOMBARDMENT)
++        .id();
++    let mut runner = scenario.build();
++
++    unearth(&mut runner, rats);
++    let p1_life_before = runner
++        .state()
++        .players
++        .iter()
++        .find(|p| p.id == P1)
++        .unwrap()
++        .life;
++
++    // Activate the outlet; drive the sacrifice cost and the damage target by
++    // hand so we observe the PayCost::Sacrifice window directly (CR 602.1b).
++    runner
++        .act(GameAction::ActivateAbility {
++            source_id: outlet,
++            ability_index: 0,
++        })
++        .expect("activating Goblin Bombardment must succeed");
++
++    let mut sacrificed_rats = false;
++    let mut targeted = false;
++    for _ in 0..40 {
++        match runner.state().waiting_for.clone() {
++            WaitingFor::PayCost {
++                kind: PayCostKind::Sacrifice,
++                choices,
++                ..
++            } => {
++                assert!(
++                    choices.contains(&rats),
++                    "the unearthed rats must be a legal sacrifice, choices: {choices:?}"
++                );
++                runner
++                    .act(GameAction::SelectCards { cards: vec![rats] })
++                    .expect("sacrificing rats to the ability cost must succeed");
++                sacrificed_rats = true;
++            }
++            WaitingFor::TargetSelection { .. } => {
++                runner
++                    .act(GameAction::SelectTargets {
++                        targets: vec![TargetRef::Player(P1)],
++                    })
++                    .expect("targeting the opponent must succeed");
++                targeted = true;
++            }
++            _ => {
++                runner.advance_until_stack_empty();
++                if matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
++                    && runner.state().stack.is_empty()
++                {
++                    break;
++                }
++            }
++        }
++    }
++
++    // Reach guards: the sacrifice cost was actually paid with rats, and the
++    // ability resolved (1 damage to P1) — CR 601.2b / CR 602.1b.
++    assert!(sacrificed_rats, "the sacrifice cost must be paid with rats");
++    assert!(targeted, "the outlet's damage must select a target");
++    let p1_life_after = runner
++        .state()
++        .players
++        .iter()
++        .find(|p| p.id == P1)
++        .unwrap()
++        .life;
++    assert_eq!(
++        p1_life_after,
++        p1_life_before - 1,
++        "reach guard: the outlet must resolve and deal 1 damage to P1"
++    );
++
++    assert_eq!(
++        runner.state().objects[&rats].zone,
++        Zone::Exile,
++        "issue #5976: rats sacrificed to an ability cost must be EXILED (CR 702.84a)"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// R3 — destruction (a different leave event, CR 702.84a "ANY" exit).
++// ---------------------------------------------------------------------------
++
++#[test]
++fn r3_destroy_redirects_unearthed_rats_to_exile() {
++    let mut scenario = GameScenario::new();
++    let rats = stage_rats(&mut scenario);
++    let destroy = scenario
++        .add_spell_to_library_top(P0, "Doom Blade", false)
++        .from_oracle_text(DESTROY_TARGET)
++        .id();
++    let mut runner = scenario.build();
++
++    unearth(&mut runner, rats);
++    to_hand(&mut runner, destroy);
++    fund(&mut runner, P0, &[ManaType::Black], rats);
++
++    let outcome = runner.cast(destroy).target_objects(&[rats]).resolve();
++
++    assert_eq!(
++        outcome.zone_of(rats),
++        Zone::Exile,
++        "issue #5976: a destroyed unearthed creature must be EXILED (CR 702.84a), \
++         not put into the graveyard"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// R4 — bounce ("Return to its owner's hand" is a battlefield exit too;
++// CR 702.84a redirects ANY leave to exile). Hand must stay unchanged.
++// ---------------------------------------------------------------------------
++
++#[test]
++fn r4_bounce_redirects_unearthed_rats_to_exile_hand_unchanged() {
++    let mut scenario = GameScenario::new();
++    let rats = stage_rats(&mut scenario);
++    let bounce = scenario
++        .add_spell_to_library_top(P0, "Unsummon", true)
++        .from_oracle_text(BOUNCE_TARGET)
++        .id();
++    let mut runner = scenario.build();
++
++    unearth(&mut runner, rats);
++    to_hand(&mut runner, bounce);
++    fund(&mut runner, P0, &[ManaType::Blue], rats);
++
++    let outcome = runner.cast(bounce).target_objects(&[rats]).resolve();
++
++    // Reach guard: the bounce spell resolved cleanly (CR 608.2m) — the pipeline
++    // is back at a Priority window, not stuck on a target/cost prompt.
++    assert!(
++        matches!(
++            outcome.final_waiting_for(),
++            engine::types::game_state::WaitingFor::Priority { .. }
++        ),
++        "reach guard: the bounce must resolve cleanly, halted at {:?}",
++        outcome.final_waiting_for()
++    );
++    assert_eq!(
++        outcome.zone_of(rats),
++        Zone::Exile,
++        "issue #5976: an unearthed creature returned to hand must be EXILED instead \
++         (CR 702.84a — ANY leave event)"
++    );
++    // CR 702.84a: it is exiled INSTEAD of going to hand — the owner's hand must
++    // not gain the card.
++    let owner_hand = &outcome
++        .state()
++        .players
++        .iter()
++        .find(|p| p.id == P0)
++        .expect("P0 exists")
++        .hand;
++    assert!(
++        !owner_hand.contains(&rats),
++        "the card must not reach its owner's hand — it is exiled instead"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// R5 — sibling: a Rotting Rats that was NEVER unearthed carries no rider, so a
++// sacrifice sends it to the GRAVEYARD. Proves the rider is installed by the
++// Unearth ability resolving, not intrinsic to the card shape.
++// ---------------------------------------------------------------------------
++
++#[test]
++fn r5_non_unearthed_rats_sacrifice_goes_to_graveyard() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    // Same-name, same Oracle text, but placed directly on the battlefield (no
++    // Unearth activation), so no leaves-battlefield rider is installed.
++    let rats = scenario
++        .add_creature_from_oracle(P0, "Rotting Rats", 2, 2, ROTTING_RATS)
++        .id();
++    let sac = scenario
++        .add_spell_to_hand_from_oracle(P0, "Sacrifice", true, SACRIFICE)
++        .id();
++    scenario.with_mana_pool(
++        P0,
++        vec![ManaUnit::new(ManaType::Black, rats, false, vec![])],
++    );
++    let mut runner = scenario.build();
++
++    let outcome = runner.cast(sac).sacrifice_with(&[rats]).resolve();
++
++    assert!(
++        sacrificed(outcome.events(), rats),
++        "reach guard: the sibling rats was sacrificed; events: {:?}",
++        outcome.events()
++    );
++    assert_eq!(
++        outcome.zone_of(rats),
++        Zone::Graveyard,
++        "a non-unearthed Rotting Rats has no exile rider — sacrifice goes to the graveyard"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// R7 — host-exit prune + no revival on same-ObjectId re-entry (CR 400.7).
++// A first destroy exiles rats via the rider; the prune then removes the rider
++// from base AND live; after a harness re-entry (same ObjectId), a second
++// destroy must go to the GRAVEYARD (no revived rider).
++// ---------------------------------------------------------------------------
++
++#[test]
++fn r7_host_exit_prunes_rider_no_revival_on_reentry() {
++    let mut scenario = GameScenario::new();
++    let rats = stage_rats(&mut scenario);
++    let destroy1 = scenario
++        .add_spell_to_library_top(P0, "Doom Blade", false)
++        .from_oracle_text(DESTROY_TARGET)
++        .id();
++    let destroy2 = scenario
++        .add_spell_to_library_top(P0, "Terror", false)
++        .from_oracle_text(DESTROY_TARGET)
++        .id();
++    let mut runner = scenario.build();
++
++    unearth(&mut runner, rats);
++    to_hand(&mut runner, destroy1);
++    fund(&mut runner, P0, &[ManaType::Black], rats);
++
++    // First leave event: redirected to exile by the rider.
++    let outcome = runner.cast(destroy1).target_objects(&[rats]).resolve();
++    assert_eq!(
++        outcome.zone_of(rats),
++        Zone::Exile,
++        "first destroy is redirected to exile by the rider"
++    );
++
++    // Prune reach-guard (CR 400.7): the rider must be gone from BOTH base and
++    // live after the host left the battlefield — otherwise it could revive.
++    {
++        let obj = &runner.state().objects[&rats];
++        assert!(
++            obj.base_replacement_definitions.is_empty(),
++            "CR 400.7: the host-lifetime rider must be pruned from base on exit, got {:?}",
++            obj.base_replacement_definitions
++        );
++        assert_eq!(
++            obj.replacement_definitions.len(),
++            0,
++            "CR 400.7: the rider must be pruned from live defs on exit"
++        );
++    }
++
++    // Re-enter the SAME ObjectId via a legitimate harness zone move (the hazard
++    // under test is ObjectId persistence across a CR 400.7 boundary, not the
++    // re-entry route). A fresh object must NOT inherit the pruned rider.
++    move_to_zone(runner.state_mut(), rats, Zone::Battlefield, &mut Vec::new());
++    evaluate_layers(runner.state_mut());
++    assert_eq!(
++        runner.state().objects[&rats].zone,
++        Zone::Battlefield,
++        "precondition: rats re-entered the battlefield"
++    );
++
++    to_hand(&mut runner, destroy2);
++    fund(&mut runner, P0, &[ManaType::Black], rats);
++    let outcome = runner.cast(destroy2).target_objects(&[rats]).resolve();
++    assert_eq!(
++        outcome.zone_of(rats),
++        Zone::Graveyard,
++        "CR 400.7: the re-entered object is new — the pruned rider must NOT revive, \
++         so the second destroy goes to the graveyard"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// R8 — control theft: the rider is OBJECT-bound (valid_card: SelfRef), not
++// controller-bound. After control passes to P1, P1 sacrificing rats still
++// exiles it (CR 400.7 — the redirect follows the object).
++// ---------------------------------------------------------------------------
++
++#[test]
++fn r8_control_change_keeps_rider_object_bound() {
++    let mut scenario = GameScenario::new();
++    let rats = stage_rats(&mut scenario);
++    // P1's sacrifice outlet targets a creature P1 controls once control passes.
++    // Staged in P1's library and moved to hand AFTER the return, so the unearth
++    // ETB ("each player discards a card") stays a no-op — P1's hand is empty at
++    // return time, exactly like R1/R3/R4 (see `stage_rats`).
++    let sac = scenario
++        .add_spell_to_library_top(P1, "Sacrifice", true)
++        .from_oracle_text(SACRIFICE)
++        .id();
++    let mut runner = scenario.build();
++
++    unearth(&mut runner, rats);
++    to_hand(&mut runner, sac);
++
++    // Hand P1 control of rats. Setting `base_controller` mirrors a genuine
++    // control assignment through the Layer-2 baseline
++    // (`obj.base_controller.unwrap_or(obj.owner)`), so a subsequent layer pass
++    // keeps P1 in control rather than reverting to the owner. A control change
++    // leaves the rider — an object-hosted replacement — untouched; only a
++    // battlefield exit prunes it (CR 400.7).
++    {
++        let obj = runner.state_mut().objects.get_mut(&rats).unwrap();
++        obj.controller = P1;
++        obj.base_controller = Some(P1);
++    }
++    evaluate_layers(runner.state_mut());
++    assert_eq!(
++        runner.state().objects[&rats].controller,
++        P1,
++        "precondition: P1 now controls rats"
++    );
++
++    // Hand P1 priority so P1 — the new controller — is the caster. The harness
++    // casts as the player holding priority, and the additional sacrifice cost
++    // requires the caster to control the sacrificed creature (CR 601.2h); only
++    // P1 can pay it now. Sacrifice is an instant, so P1 may cast it at this
++    // priority window (CR 601.3a).
++    {
++        let state = runner.state_mut();
++        state.active_player = P1;
++        state.priority_player = P1;
++        state.waiting_for = WaitingFor::Priority { player: P1 };
++    }
++
++    fund(&mut runner, P1, &[ManaType::Black], rats);
++    let outcome = runner.cast(sac).sacrifice_with(&[rats]).resolve();
++
++    assert!(
++        sacrificed(outcome.events(), rats),
++        "reach guard: P1 sacrificed rats; events: {:?}",
++        outcome.events()
++    );
++    assert_eq!(
++        outcome.zone_of(rats),
++        Zone::Exile,
++        "CR 400.7: the exile rider is object-bound — a new controller sacrificing rats \
++         still exiles it"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// R9 — parsed-rider class via the REAL card Gruesome Encore. The rider is built
++// by the parser path (try_parse_leave_battlefield_exile_replacement), driven
++// through the full cast pipeline; a bounce of the returned creature must exile
++// it instead.
++// ---------------------------------------------------------------------------
++
++#[test]
++fn r9_gruesome_encore_parsed_rider_redirects_bounce_to_exile() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    // A vanilla creature card in an OPPONENT's graveyard (Gruesome Encore
++    // targets "an opponent's graveyard").
++    let bear = scenario
++        .add_creature_to_graveyard(P1, "Grizzly Bears", 2, 2)
++        .id();
++    let encore = scenario
++        .add_spell_to_hand_from_oracle(P0, "Gruesome Encore", false, GRUESOME_ENCORE)
++        .id();
++    let bounce = scenario
++        .add_spell_to_hand_from_oracle(P0, "Unsummon", true, BOUNCE_TARGET)
++        .id();
++    scenario.with_mana_pool(
++        P0,
++        vec![
++            ManaUnit::new(ManaType::Colorless, bear, false, vec![]),
++            ManaUnit::new(ManaType::Colorless, bear, false, vec![]),
++            ManaUnit::new(ManaType::Black, bear, false, vec![]),
++        ],
++    );
++    let mut runner = scenario.build();
++
++    // Cast Gruesome Encore: reanimate the bear under P0's control, installing
++    // the parsed leaves-battlefield rider.
++    let outcome = runner.cast(encore).target_objects(&[bear]).resolve();
++    assert_eq!(
++        outcome.zone_of(bear),
++        Zone::Battlefield,
++        "precondition: Gruesome Encore reanimates the bear"
++    );
++    assert_eq!(
++        outcome.state().objects[&bear].controller,
++        P0,
++        "precondition: the bear is under P0's control"
++    );
++
++    // The genuine layer pass between install and the leave event.
++    evaluate_layers(runner.state_mut());
++    fund(&mut runner, P0, &[ManaType::Blue], bear);
++
++    let outcome = runner.cast(bounce).target_objects(&[bear]).resolve();
++    assert_eq!(
++        outcome.zone_of(bear),
++        Zone::Exile,
++        "issue #5976 (parsed-rider class): the reanimated creature bounced must be \
++         EXILED instead (CR 702.84a / CR 614.1a)"
++    );
++    // Owner (P1) hand must not gain the card — exiled instead of bounced.
++    let p1_hand = &outcome
++        .state()
++        .players
++        .iter()
++        .find(|p| p.id == P1)
++        .expect("P1 exists")
++        .hand;
++    assert!(
++        !p1_hand.contains(&bear),
++        "the reanimated card must not reach its owner's hand — it is exiled instead"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 8e41fba730..587ca2b14d 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -557,6 +557,7 @@ mod issue_5945_kellan_the_kid;
+ mod issue_5946_pest_infestation_bogwater_softlock;
+ mod issue_5963_scavengers_talent_food_sacrifice;
+ mod issue_5972_tracked_set_token_cleanup;
++mod issue_5976_unearth_leave_redirect;
+ mod issue_5977_hunger_tide_chapter_iv;
+ mod issue_5978_roar_chapter_ii_creature_mana;
+ mod issue_5983_sothera_dies_edict;

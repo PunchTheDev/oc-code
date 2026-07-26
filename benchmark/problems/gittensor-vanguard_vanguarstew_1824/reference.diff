@@ -1,0 +1,203 @@
+diff --git a/scripts/compare_eval.py b/scripts/compare_eval.py
+index b1ad77c2..3293ddb5 100644
+--- a/scripts/compare_eval.py
++++ b/scripts/compare_eval.py
+@@ -161,13 +161,18 @@ def _is_generalization(artifact: dict) -> bool:
+ 
+ 
+ def _generalization_diff(baseline: dict, candidate: dict) -> dict:
+-    """Diff the composite means of each partition plus the generalization gap.
++    """Diff the composite means and components of each partition plus the generalization gap.
+ 
+     Every value is read through ``_metric_triplet``/``_delta``, which coerce a missing,
+     ``None``, or non-numeric field to a ``None`` delta rather than crashing — so a partition
+     that only recorded an ``error`` (``scored_repos == 0``) diffs to ``None`` cleanly, and a
+-    placeholder ``composite_mean`` of ``0.0`` on an unscored partition is treated as
+-    unavailable (mirroring ``benchmark/trend.py`` and ``benchmark/report.py``).
++    placeholder ``composite_mean``/``composite_parts`` of ``0.0`` on an unscored partition is
++    treated as unavailable (mirroring ``benchmark/trend.py`` and ``benchmark/report.py``).
++
++    Each partition's ``judge_mean``/``objective_mean`` (when either side reports one) is
++    included as ``composite_parts``, mirroring the standard (non-generalization) diff shape —
++    ``score_pr_delta``'s Pareto floor needs this per-partition, per-axis data to catch an
++    axis regression a net-positive partition composite would otherwise hide (#1821).
+     """
+     out = {}
+     for partition in ("tuned", "held_out"):
+@@ -175,7 +180,16 @@ def _generalization_diff(baseline: dict, candidate: dict) -> dict:
+         cand_part = candidate.get(partition)
+         base_part = base_part if isinstance(base_part, dict) else {}
+         cand_part = cand_part if isinstance(cand_part, dict) else {}
+-        out[partition] = {"composite_mean": _metric_triplet(base_part, cand_part, "composite_mean")}
++        entry = {"composite_mean": _metric_triplet(base_part, cand_part, "composite_mean")}
++        base_parts = _effective_composite_parts(base_part)
++        cand_parts = _effective_composite_parts(cand_part)
++        parts = {}
++        for key in ("judge_mean", "objective_mean"):
++            if key in base_parts or key in cand_parts:
++                parts[key] = _metric_triplet(base_parts, cand_parts, key)
++        if parts:
++            entry["composite_parts"] = parts
++        out[partition] = entry
+     out["generalization_gap"] = _metric_triplet(baseline, candidate, "generalization_gap")
+     return out
+ 
+diff --git a/scripts/score_pr_delta.py b/scripts/score_pr_delta.py
+index 7476f9ac..adc54cda 100644
+--- a/scripts/score_pr_delta.py
++++ b/scripts/score_pr_delta.py
+@@ -106,6 +106,26 @@ def _pareto_axes(diff: dict) -> dict:
+     return {axis: parts.get(axis) for axis in ("judge_mean", "objective_mean")}
+ 
+ 
++def _generalization_pareto_axes(gen: dict) -> dict:
++    """The Pareto axes for a generalization diff: the WORSE of the two partitions' triplets
++    per axis, mirroring how ``banding_delta`` already uses the worse partition's composite
++    delta — so the floor holds even in whichever partition (tuned or held_out) regressed most.
++
++    An axis missing from both partitions (no ``composite_parts`` reported anywhere) yields
++    ``None`` for that axis, same as the standard (non-generalization) shape.
++    """
++    axes = {}
++    for axis in ("judge_mean", "objective_mean"):
++        worst_triplet, worst_delta = None, None
++        for partition in ("tuned", "held_out"):
++            triplet = (gen.get(partition, {}).get("composite_parts") or {}).get(axis)
++            delta = _delta(triplet)
++            if delta is not None and (worst_delta is None or delta < worst_delta):
++                worst_triplet, worst_delta = triplet, delta
++        axes[axis] = worst_triplet
++    return axes
++
++
+ def _band_for_delta(delta: float | None, noise_floor: float) -> str:
+     """Bucket a composite_mean delta into a performance band. ``None`` or <= the noise
+     floor is "none" (no measurable improvement, still mergeable, no multiplier). Otherwise
+@@ -127,6 +147,8 @@ def score_pr_delta(baseline: dict, candidate: dict, noise_floor: float = DEFAULT
+     ``composite_mean``) — the Pareto floor and banding are checked on whichever composite
+     triplet(s) the artifact shape actually produced (generalization uses the MINIMUM of
+     the two partitions' deltas, so a PR can't overfit the tuned set and still band high).
++    The Pareto floor's judge_mean/objective_mean axes are ALSO checked per partition when
++    reported, so a net-positive partition composite can't mask an axis regression (#1821).
+ 
+     ``band`` is one of:
+       - ``"blocked"`` — a scored axis regressed past the noise floor. Hard merge block
+@@ -144,10 +166,14 @@ def score_pr_delta(baseline: dict, candidate: dict, noise_floor: float = DEFAULT
+             part: _delta(gen.get(part, {}).get("composite_mean"))
+             for part in ("tuned", "held_out")
+         }
+-        any_regressed = any(_regressed(d, noise_floor) for d in composite_deltas.values())
++        pareto_axes = _generalization_pareto_axes(gen)
++        axis_deltas = [_delta(v) for v in pareto_axes.values()]
++        any_regressed = (
++            any(_regressed(d, noise_floor) for d in composite_deltas.values())
++            or any(_regressed(d, noise_floor) for d in axis_deltas)
++        )
+         present = [d for d in composite_deltas.values() if d is not None]
+         banding_delta = min(present) if present else None
+-        pareto_axes = {}  # no per-axis (judge/objective) split at the generalization level
+     else:
+         composite_deltas = {"composite_mean": _delta(diff.get("composite_mean"))}
+         pareto_axes = _pareto_axes(diff)
+diff --git a/tests/test_compare_eval.py b/tests/test_compare_eval.py
+index 1cf4e813..7bad7469 100644
+--- a/tests/test_compare_eval.py
++++ b/tests/test_compare_eval.py
+@@ -391,6 +391,30 @@ def test_compare_eval_diffs_generalization_partitions_and_gap():
+     assert "composite_mean" not in diff
+ 
+ 
++def test_generalization_diff_includes_per_partition_composite_parts():
++    # #1821: score_pr_delta's Pareto floor needs judge_mean/objective_mean per partition,
++    # not just the net composite_mean, or an axis regression behind a net gain slips through.
++    baseline = {
++        "repo_set": "foo.json", "generalization_gap": 0.0,
++        "tuned": {"composite_mean": 0.575, "scored_repos": 3,
++                  "composite_parts": {"judge_mean": 0.55, "objective_mean": 0.60}},
++        "held_out": {"composite_mean": 0.575, "scored_repos": 3,
++                     "composite_parts": {"judge_mean": 0.55, "objective_mean": 0.60}},
++    }
++    candidate = {
++        "repo_set": "foo.json", "generalization_gap": 0.0,
++        "tuned": {"composite_mean": 0.6, "scored_repos": 3,
++                  "composite_parts": {"judge_mean": 1.0, "objective_mean": 0.20}},
++        "held_out": {"composite_mean": 0.6, "scored_repos": 3,
++                     "composite_parts": {"judge_mean": 1.0, "objective_mean": 0.20}},
++    }
++    diff = compare_eval_artifacts(baseline, candidate)
++    gen = diff["generalization"]
++    assert gen["tuned"]["composite_parts"]["judge_mean"]["delta"] == 0.45
++    assert gen["tuned"]["composite_parts"]["objective_mean"]["delta"] == -0.4
++    assert gen["held_out"]["composite_parts"]["objective_mean"]["delta"] == -0.4
++
++
+ def test_generalization_diff_tolerates_missing_and_none_partition_scores():
+     # A partition that only recorded an error (no composite_mean) diffs to None, no crash.
+     baseline = {"repo_set": "foo.json",
+diff --git a/tests/test_score_pr_delta.py b/tests/test_score_pr_delta.py
+index 1e83dbf7..1f728d93 100644
+--- a/tests/test_score_pr_delta.py
++++ b/tests/test_score_pr_delta.py
+@@ -126,7 +126,9 @@ def test_generalization_shaped_artifacts_use_the_minimum_partition_delta():
+     }
+     report = score_pr_delta(baseline, candidate)
+     assert report["band"] == "s"  # gated by the WORSE (held_out) partition, not the better one
+-    assert report["pareto_axes"] == {}  # no judge/objective split at this shape
++    # Neither partition reported composite_parts here, so there's no per-axis data to split on
++    # (same "unavailable" shape the non-generalization path reports for the same reason).
++    assert report["pareto_axes"] == {"judge_mean": None, "objective_mean": None}
+ 
+ 
+ def test_generalization_shaped_artifact_catches_a_held_out_regression():
+@@ -147,6 +149,51 @@ def test_generalization_shaped_artifact_catches_a_held_out_regression():
+     assert report["blocks_merge"] is True
+ 
+ 
++def _gen_part(judge_mean, objective_mean, scored_repos=3):
++    return {
++        "scored_repos": scored_repos,
++        "composite_mean": round((judge_mean + objective_mean) / 2, 3),
++        "composite_parts": {"judge_mean": judge_mean, "objective_mean": objective_mean},
++    }
++
++
++def test_generalization_pareto_floor_catches_an_axis_regression_behind_a_net_gain():
++    """#1821: a generalization artifact that games judge_mean up while objective_mean craters
++    must be blocked, even though the net composite_mean move is positive in both partitions —
++    exactly the case the Pareto floor exists to catch, and previously slipped through because
++    the generalization diff never carried composite_parts at all."""
++    baseline = {
++        "repo_set": "curated", "generalization_gap": 0.0,
++        "tuned": _gen_part(0.55, 0.60), "held_out": _gen_part(0.55, 0.60),
++    }
++    candidate = {
++        "repo_set": "curated", "generalization_gap": 0.0,
++        "tuned": _gen_part(1.0, 0.20), "held_out": _gen_part(1.0, 0.20),
++    }
++    report = score_pr_delta(baseline, candidate)
++    assert report["composite_deltas"]["tuned"] > 0  # net composite move looks like an improvement
++    assert report["pareto_axes"]["objective_mean"]["delta"] == -0.4
++    assert report["band"] == "blocked"
++    assert report["blocks_merge"] is True
++
++
++def test_generalization_pareto_axes_report_the_worse_partition_per_axis():
++    """The reported axis triplet is the worse of the two partitions, mirroring how the
++    composite banding already uses the worse partition's delta."""
++    baseline = {
++        "repo_set": "curated", "generalization_gap": 0.0,
++        "tuned": _gen_part(0.60, 0.60), "held_out": _gen_part(0.60, 0.60),
++    }
++    candidate = {
++        "repo_set": "curated", "generalization_gap": 0.0,
++        "tuned": _gen_part(0.60, 0.55),       # objective_mean -0.05 (mild)
++        "held_out": _gen_part(0.60, 0.30),    # objective_mean -0.30 (severe) -- must win
++    }
++    report = score_pr_delta(baseline, candidate)
++    assert report["pareto_axes"]["objective_mean"]["delta"] == -0.3
++    assert report["band"] == "blocked"
++
++
+ def test_missing_composite_parts_excludes_pareto_axis_rather_than_failing_open_or_closed():
+     """An artifact with no composite_parts (e.g. a bare single-repo run) can't be judged on
+     a per-axis floor it never reported — the axis is excluded, not treated as pass or fail."""

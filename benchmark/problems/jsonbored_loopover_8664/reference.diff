@@ -1,0 +1,139 @@
+diff --git a/packages/discovery-index/src/discovery-query.ts b/packages/discovery-index/src/discovery-query.ts
+index 119feca74..1103febbe 100644
+--- a/packages/discovery-index/src/discovery-query.ts
++++ b/packages/discovery-index/src/discovery-query.ts
+@@ -116,6 +116,19 @@ function scopeCacheKey(query: DiscoveryIndexQuery): string {
+   });
+ }
+ 
++/** Surface — as a structured warn-level log line carrying the querying scope's identity — the per-repo
++ *  diagnostics `github-client.ts` already computes (e.g. "GitHub returned 404/500 for N issues", "non-array
++ *  issues payload") but that {@link computeCandidates} otherwise discards at every call site. Without this a
++ *  renamed, misconfigured, or rate-limited repo silently contributes 0 candidates with no per-repo signal,
++ *  distinguishable only from an unattributed aggregate `discovery_index_github_requests_total{outcome="failed"}`
++ *  counter. `source` is the repoFullName for a direct repo fetch, or the GitHub search query (which encodes the
++ *  org/search-term scope) for a search fetch, so an operator can attribute each warning to what produced it. */
++function surfaceGithubWarnings(source: string, warnings: string[]): void {
++  for (const warning of warnings) {
++    console.error(JSON.stringify({ level: "warn", event: "discovery_index_github_warning", source, warning }));
++  }
++}
++
+ async function computeCandidates(query: DiscoveryIndexQuery, deps: DiscoveryQueryDeps): Promise<DiscoveryIndexCandidate[]> {
+   const seen = new Set<string>();
+   const candidates: DiscoveryIndexCandidate[] = [];
+@@ -142,17 +155,22 @@ async function computeCandidates(query: DiscoveryIndexQuery, deps: DiscoveryQuer
+   for (const repoFullName of query.repos) {
+     const verdict = await resolveRepoAiPolicy(repoFullName, deps);
+     if (!verdict.allowed) continue;
+-    const { issues } = await deps.github.fetchRepoIssues(repoFullName);
++    const { issues, warnings } = await deps.github.fetchRepoIssues(repoFullName);
++    surfaceGithubWarnings(repoFullName, warnings);
+     for (const issue of issues) addCandidate(repoFullName, issue, verdict);
+   }
+ 
+   for (const org of query.orgs) {
+-    const { issues } = await deps.github.searchIssues(`org:${org} state:open type:issue`);
++    const searchQuery = `org:${org} state:open type:issue`;
++    const { issues, warnings } = await deps.github.searchIssues(searchQuery);
++    surfaceGithubWarnings(searchQuery, warnings);
+     await addFromSearch(issues);
+   }
+ 
+   for (const term of query.searchTerms) {
+-    const { issues } = await deps.github.searchIssues(`${term} state:open type:issue`);
++    const searchQuery = `${term} state:open type:issue`;
++    const { issues, warnings } = await deps.github.searchIssues(searchQuery);
++    surfaceGithubWarnings(searchQuery, warnings);
+     await addFromSearch(issues);
+   }
+ 
+diff --git a/test/unit/discovery-index/discovery-query.test.ts b/test/unit/discovery-index/discovery-query.test.ts
+index 91bcbb9e8..32686e7b7 100644
+--- a/test/unit/discovery-index/discovery-query.test.ts
++++ b/test/unit/discovery-index/discovery-query.test.ts
+@@ -1,4 +1,4 @@
+-import { beforeEach, describe, expect, it } from "vitest";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { DISCOVERY_INDEX_CONTRACT_VERSION, type AiPolicyVerdict, type DiscoveryIndexCandidate, type DiscoveryIndexQuery } from "@loopover/engine";
+ import { TtlCache } from "../../../packages/discovery-index/src/cache";
+ import { decodeCursor } from "../../../packages/discovery-index/src/cursor";
+@@ -18,6 +18,10 @@ interface StubConfig {
+   issuesByRepo?: Record<string, GitHubIssue[]>;
+   searchResults?: Record<string, GitHubIssue[]>;
+   filesByRepo?: Record<string, Record<string, string | null>>;
++  /** Non-empty diagnostics for a direct repo fetch, keyed by repoFullName (mirrors github-client's field). */
++  warningsByRepo?: Record<string, string[]>;
++  /** Non-empty diagnostics for a search fetch, keyed by the exact search query string. */
++  warningsBySearch?: Record<string, string[]>;
+ }
+ 
+ function makeStubGitHub(config: StubConfig): { github: GitHubClientLike; calls: StubCall[] } {
+@@ -25,11 +29,11 @@ function makeStubGitHub(config: StubConfig): { github: GitHubClientLike; calls:
+   const github: GitHubClientLike = {
+     async fetchRepoIssues(repoFullName: string) {
+       calls.push({ method: "fetchRepoIssues", args: [repoFullName] });
+-      return { issues: config.issuesByRepo?.[repoFullName] ?? [], warnings: [] };
++      return { issues: config.issuesByRepo?.[repoFullName] ?? [], warnings: config.warningsByRepo?.[repoFullName] ?? [] };
+     },
+     async searchIssues(query: string) {
+       calls.push({ method: "searchIssues", args: [query] });
+-      return { issues: config.searchResults?.[query] ?? [], warnings: [] };
++      return { issues: config.searchResults?.[query] ?? [], warnings: config.warningsBySearch?.[query] ?? [] };
+     },
+     async fetchRepoFile(repoFullName: string, path: string) {
+       calls.push({ method: "fetchRepoFile", args: [repoFullName, path] });
+@@ -58,6 +62,10 @@ describe("discovery-index runDiscoveryQuery (#7164)", () => {
+     resetMetrics();
+   });
+ 
++  afterEach(() => {
++    vi.restoreAllMocks();
++  });
++
+   it("builds candidates from an allowed repo's issues, filtering PRs and invalid entries", async () => {
+     const { github, calls } = makeStubGitHub({
+       issuesByRepo: {
+@@ -278,4 +286,42 @@ describe("discovery-index runDiscoveryQuery (#7164)", () => {
+     expect(counterValue("discovery_index_cache_lookups_total", { cache: "policy", outcome: "miss" })).toBe(1);
+     expect(counterValue("discovery_index_cache_lookups_total", { cache: "policy", outcome: "hit" })).toBe(1);
+   });
++
++  it("surfaces github-client warnings with per-scope attribution at all three fetch call sites (#8658)", async () => {
++    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
++    const { github } = makeStubGitHub({
++      issuesByRepo: { "acme/one": [{ number: 1, title: "Direct" }] },
++      searchResults: {
++        "org:acme state:open type:issue": [{ number: 2, title: "Org", repository_url: "https://api.github.com/repos/acme/one" }],
++        "flaky state:open type:issue": [{ number: 3, title: "Term", repository_url: "https://api.github.com/repos/acme/one" }],
++      },
++      warningsByRepo: { "acme/one": ["GitHub returned 404/500 for 2 issues"] },
++      warningsBySearch: {
++        "org:acme state:open type:issue": ["non-array issues payload"],
++        "flaky state:open type:issue": ["GitHub returned 500 for search", "rate limited"],
++      },
++      filesByRepo: { "acme/one": { "AI-USAGE.md": ALLOWED_AI_USAGE } },
++    });
++
++    await runDiscoveryQuery(query({ repos: ["acme/one"], orgs: ["acme"], searchTerms: ["flaky"] }), makeDeps(github));
++
++    const surfaced = errorSpy.mock.calls.map(([line]) => JSON.parse(String(line)));
++    // One log line per warning, each carrying the scope identity of the fetch that produced it.
++    expect(surfaced).toEqual([
++      { level: "warn", event: "discovery_index_github_warning", source: "acme/one", warning: "GitHub returned 404/500 for 2 issues" },
++      { level: "warn", event: "discovery_index_github_warning", source: "org:acme state:open type:issue", warning: "non-array issues payload" },
++      { level: "warn", event: "discovery_index_github_warning", source: "flaky state:open type:issue", warning: "GitHub returned 500 for search" },
++      { level: "warn", event: "discovery_index_github_warning", source: "flaky state:open type:issue", warning: "rate limited" },
++    ]);
++  });
++
++  it("logs nothing when github-client returns no warnings", async () => {
++    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
++    const { github } = makeStubGitHub({
++      issuesByRepo: { "acme/one": [{ number: 1, title: "T" }] },
++      filesByRepo: { "acme/one": { "AI-USAGE.md": ALLOWED_AI_USAGE } },
++    });
++    await runDiscoveryQuery(query({ repos: ["acme/one"] }), makeDeps(github));
++    expect(errorSpy).not.toHaveBeenCalled();
++  });
+ });

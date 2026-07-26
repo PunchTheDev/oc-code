@@ -1,0 +1,403 @@
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index 8a9e5feab8..a9372adf74 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -15166,6 +15166,18 @@ pub(crate) fn find_eligible_discard_targets(
+     find_eligible_hand_cost_targets(state, player, source, filter)
+ }
+ 
++/// CR 701.20a + CR 601.2b: Eligible cards for an `AbilityCost::Reveal` payment
++/// whose `filter` is `Some` (a non-self reveal). The source spell is never a
++/// legal choice for its own additional cost, mirroring discard/exile.
++pub(crate) fn find_eligible_reveal_targets(
++    state: &GameState,
++    player: PlayerId,
++    source: ObjectId,
++    filter: &TargetFilter,
++) -> Vec<ObjectId> {
++    find_eligible_hand_cost_targets(state, player, source, Some(filter))
++}
++
+ /// CR 601.2b + CR 601.2h: Eligible cards for an `AbilityCost::Exile` payment
+ /// whose `zone` is `Hand` (pitch spells) or `Graveyard` (escape, CR 702.138a).
+ /// The cast source itself is never eligible. The cost's `TargetFilter` is
+@@ -17359,7 +17371,7 @@ pub fn handle_cancel_cast(
+ // Cost payment handlers are in casting_costs module.
+ pub(crate) use super::casting_costs::{
+     handle_activation_cost_one_of_choice, handle_discard_for_cost, handle_return_to_hand_for_cost,
+-    handle_sacrifice_for_cost,
++    handle_reveal_for_cost, handle_sacrifice_for_cost,
+ };
+ 
+ fn generic_mana_in_cost(cost: &AbilityCost) -> u32 {
+diff --git a/crates/engine/src/game/casting_costs.rs b/crates/engine/src/game/casting_costs.rs
+index 273d282bfc..dc85ecfa5a 100644
+--- a/crates/engine/src/game/casting_costs.rs
++++ b/crates/engine/src/game/casting_costs.rs
+@@ -6540,6 +6540,51 @@ fn pay_additional_cost_with_source(
+                 },
+             });
+         }
++        AbilityCost::Reveal { count, filter } => {
++            let mut pending = pending;
++            // CR 701.20a: A filter-less reveal is the spell revealing itself —
++            // there is no choice to make, the object is already known.
++            let Some(filter) = filter else {
++                if let Some(obj) = state.objects.get(&pending.object_id) {
++                    pending
++                        .ability
++                        .set_cost_paid_object_recursive(CostPaidObjectSnapshot {
++                            object_id: pending.object_id,
++                            lki: obj.snapshot_for_mana_spent(),
++                        });
++                    events.push(GameEvent::CardsRevealed {
++                        player,
++                        card_ids: vec![pending.object_id],
++                        card_names: vec![obj.name.clone()],
++                    });
++                }
++                return finish_pending_cost_or_cast(state, player, pending, events);
++            };
++            // CR 701.20a + CR 601.2b: A filtered reveal requires interactive
++            // card selection — return a WaitingFor, mirroring Discard.
++            let eligible = super::casting::find_eligible_reveal_targets(
++                state,
++                player,
++                pending.object_id,
++                &filter,
++            );
++            // CR 601.2b: Defense-in-depth — payability already gated this.
++            if eligible.len() < count as usize {
++                return Err(EngineError::ActionNotAllowed(
++                    "Not enough eligible cards in hand to reveal".to_string(),
++                ));
++            }
++            return Ok(WaitingFor::PayCost {
++                player,
++                kind: PayCostKind::Reveal,
++                choices: eligible,
++                count: count as usize,
++                min_count: 0,
++                resume: CostResume::Spell {
++                    spell: Box::new(pending),
++                },
++            });
++        }
+         _ => {
+             // Other cost types (Exile, etc.) — not yet interactive
+         }
+@@ -6548,6 +6593,60 @@ fn pay_additional_cost_with_source(
+     finish_pending_cost_or_cast(state, player, pending, events)
+ }
+ 
++/// CR 701.20a + CR 601.2b: Complete a filtered `AbilityCost::Reveal` payment
++/// after the player selects a matching card from hand. The card stays in
++/// hand — revealing doesn't move it (CR 701.20b) — and becomes the
++/// resolving ability's cost-paid-object referent (CR 608.2k), backing
++/// references like "the revealed card's mana value".
++pub(crate) fn handle_reveal_for_cost(
++    state: &mut GameState,
++    player: PlayerId,
++    mut pending: PendingCast,
++    expected: usize,
++    legal_cards: &[ObjectId],
++    chosen: &[ObjectId],
++    events: &mut Vec<GameEvent>,
++) -> Result<WaitingFor, EngineError> {
++    if chosen.len() != expected {
++        return Err(EngineError::InvalidAction(format!(
++            "Must reveal exactly {} card(s), got {}",
++            expected,
++            chosen.len()
++        )));
++    }
++    for card_id in chosen {
++        if !legal_cards.contains(card_id) {
++            return Err(EngineError::InvalidAction(
++                "Selected card not in hand".to_string(),
++            ));
++        }
++    }
++
++    let mut revealed_names = Vec::with_capacity(chosen.len());
++    for (index, &card_id) in chosen.iter().enumerate() {
++        let obj = state.objects.get(&card_id).ok_or_else(|| {
++            EngineError::InvalidAction("Selected card no longer exists".to_string())
++        })?;
++        revealed_names.push(obj.name.clone());
++        if index == 0 {
++            pending
++                .ability
++                .set_cost_paid_object_recursive(CostPaidObjectSnapshot {
++                    object_id: card_id,
++                    lki: obj.snapshot_for_mana_spent(),
++                });
++        }
++    }
++
++    events.push(GameEvent::CardsRevealed {
++        player,
++        card_ids: chosen.to_vec(),
++        card_names: revealed_names,
++    });
++
++    finish_pending_cost_or_cast(state, player, pending, events)
++}
++
+ pub(crate) fn is_exile_any_number_effect_cost(cost: &AbilityCost) -> bool {
+     exile_any_number_effect_cost_parts(cost).is_some()
+ }
+diff --git a/crates/engine/src/game/engine.rs b/crates/engine/src/game/engine.rs
+index bb4fb0ed70..6a23f1a63a 100644
+--- a/crates/engine/src/game/engine.rs
++++ b/crates/engine/src/game/engine.rs
+@@ -3969,6 +3969,15 @@ fn apply_action(
+                     choices,
+                     &chosen,
+                     &mut events,
++                )?,
++                PayCostKind::Reveal => engine_casting::handle_reveal_for_cost(
++                    state,
++                    *player,
++                    *pending_cast.clone(),
++                    *count,
++                    choices,
++                    &chosen,
++                    &mut events,
+                 )?,
+ 	                PayCostKind::Sacrifice => engine_casting::handle_sacrifice_for_cost(
+ 	                    state,
+@@ -4177,12 +4186,13 @@ fn apply_action(
+                     &chosen,
+                     &mut events,
+                 )?,
+-                // ReturnToHand, ExileFromZone, RemoveCounter, and Behold do not
+-                // have mana-ability cost handlers wired today. If a future mana
+-                // ability uses one of these CR-valid cost shapes, add the
+-                // corresponding mana-ability handler instead of routing it
+-                // through the spell pipeline.
++                // ReturnToHand, Reveal, ExileFromZone, RemoveCounter, and Behold
++                // do not have mana-ability cost handlers wired today. If a
++                // future mana ability uses one of these CR-valid cost shapes,
++                // add the corresponding mana-ability handler instead of
++                // routing it through the spell pipeline.
+                 PayCostKind::ReturnToHand
++                | PayCostKind::Reveal
+                 | PayCostKind::ExileFromZone { .. }
+                 | PayCostKind::ExileMaterials { .. }
+                 | PayCostKind::ExilePermanent { .. }
+diff --git a/crates/engine/src/game/engine_casting.rs b/crates/engine/src/game/engine_casting.rs
+index eb20efb29c..1d8de5fbfc 100644
+--- a/crates/engine/src/game/engine_casting.rs
++++ b/crates/engine/src/game/engine_casting.rs
+@@ -93,6 +93,26 @@ pub(super) fn handle_discard_for_cost(
+     )
+ }
+ 
++pub(super) fn handle_reveal_for_cost(
++    state: &mut GameState,
++    player: PlayerId,
++    pending_cast: PendingCast,
++    count: usize,
++    legal_cards: &[ObjectId],
++    chosen: &[ObjectId],
++    events: &mut Vec<GameEvent>,
++) -> Result<WaitingFor, EngineError> {
++    casting::handle_reveal_for_cost(
++        state,
++        player,
++        pending_cast,
++        count,
++        legal_cards,
++        chosen,
++        events,
++    )
++}
++
+ pub(super) fn handle_activation_cost_one_of_choice(
+     state: &mut GameState,
+     player: PlayerId,
+diff --git a/crates/engine/src/types/game_state.rs b/crates/engine/src/types/game_state.rs
+index 27bc09542d..cbf0d681f6 100644
+--- a/crates/engine/src/types/game_state.rs
++++ b/crates/engine/src/types/game_state.rs
+@@ -4571,6 +4571,11 @@ pub struct CastingVariantChoiceOption {
+ #[serde(tag = "type")]
+ pub enum PayCostKind {
+     Discard,
++    /// CR 701.20a + CR 601.2b: Reveal a card from hand matching the cost's
++    /// filter as an additional/alternative cast cost. The chosen card stays
++    /// in hand (revealing doesn't move it) and becomes the resolving
++    /// ability's cost-paid-object referent (CR 608.2k).
++    Reveal,
+     Sacrifice,
+     ReturnToHand,
+     /// Exile objects from the specified zone.
+diff --git a/crates/engine/tests/integration/calamity_of_the_titans_reveal_cost.rs b/crates/engine/tests/integration/calamity_of_the_titans_reveal_cost.rs
+new file mode 100644
+index 0000000000..83ff61da05
+--- /dev/null
++++ b/crates/engine/tests/integration/calamity_of_the_titans_reveal_cost.rs
+@@ -0,0 +1,135 @@
++//! Issue #6003: Calamity of the Titans never prompts to show a card from hand.
++//!
++//! Oracle text (verified via Scryfall, CMM #713): "As an additional cost to
++//! cast this spell, reveal a colorless creature card from your hand. Exile
++//! each creature and planeswalker with mana value less than the revealed
++//! card's mana value."
++//!
++//! `AbilityCost::Reveal { filter: Some(_), .. }` parsed correctly already, but
++//! `pay_additional_cost_with_source` had no arm for it — it silently fell
++//! through to the no-op `_` branch, so the cast never opened a
++//! `WaitingFor::PayCost` prompt and no card was ever bound as the cost-paid
++//! object the exile clause reads "the revealed card's mana value" from.
++//!
++//! This test drives the real cast pipeline: cast the spell, reveal a
++//! colorless creature from hand, resolve, and assert the exile clause used
++//! the REVEALED card's mana value (4) — not 0 (dropped referent).
++
++use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
++use engine::types::actions::GameAction;
++use engine::types::game_state::{CastPaymentMode, PayCostKind, WaitingFor};
++use engine::types::identifiers::ObjectId;
++use engine::types::mana::{ManaCost, ManaCostShard};
++use engine::types::phase::Phase;
++
++const CALAMITY_OF_THE_TITANS_ORACLE: &str = "As an additional cost to cast this spell, reveal a \
++colorless creature card from your hand.\nExile each creature and planeswalker with mana value \
++less than the revealed card's mana value.";
++
++/// Drive the reveal-cost prompt then pass priority until the spell resolves.
++fn pay_reveal_and_resolve(runner: &mut GameRunner, revealed: ObjectId) {
++    for _ in 0..16 {
++        match runner.state().waiting_for.clone() {
++            WaitingFor::PayCost {
++                kind: PayCostKind::Reveal,
++                choices,
++                ..
++            } => {
++                assert_eq!(
++                    choices,
++                    vec![revealed],
++                    "only the colorless creature card must be an eligible reveal choice"
++                );
++                runner
++                    .act(GameAction::SelectCards {
++                        cards: vec![revealed],
++                    })
++                    .expect("revealing the colorless creature must succeed");
++            }
++            WaitingFor::Priority { .. } => {
++                if runner.state().stack.is_empty() {
++                    return;
++                }
++                if runner.act(GameAction::PassPriority).is_err() {
++                    return;
++                }
++            }
++            other => panic!("unexpected prompt while casting Calamity of the Titans: {other:?}"),
++        }
++    }
++    panic!("cast pipeline did not settle within the prompt budget");
++}
++
++#[test]
++fn reveal_cost_prompts_and_exiles_by_revealed_mana_value() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // The colorless creature card to reveal — mana value 4.
++    let revealed = scenario
++        .add_creature_to_hand(P0, "Eldrazi Husk", 4, 4)
++        .with_mana_cost(ManaCost::generic(4))
++        .id();
++    // A colored creature card in hand — must NOT be an eligible reveal choice.
++    scenario
++        .add_creature_to_hand(P0, "Loyal Warhound", 2, 2)
++        .with_mana_cost(ManaCost::Cost {
++            shards: vec![ManaCostShard::White],
++            generic: 1,
++        })
++        .id();
++
++    // Below the revealed card's mana value (4) — must be exiled.
++    let low_mv = scenario
++        .add_creature(P1, "Low MV Guy", 2, 2)
++        .with_mana_cost(ManaCost::generic(2))
++        .id();
++    // Equal to the revealed card's mana value — "less than" excludes it.
++    let equal_mv = scenario
++        .add_creature(P1, "Equal MV Guy", 4, 4)
++        .with_mana_cost(ManaCost::generic(4))
++        .id();
++    // Above the revealed card's mana value — must survive.
++    let high_mv = scenario
++        .add_creature(P0, "High MV Guy", 6, 6)
++        .with_mana_cost(ManaCost::generic(6))
++        .id();
++
++    let mut builder = scenario.add_spell_to_hand_from_oracle(
++        P0,
++        "Calamity of the Titans",
++        false,
++        CALAMITY_OF_THE_TITANS_ORACLE,
++    );
++    builder.with_mana_cost(ManaCost::generic(0));
++    let spell = builder.id();
++
++    let mut runner = scenario.build();
++    let card_id = runner.state().objects[&spell].card_id;
++    runner
++        .act(GameAction::CastSpell {
++            object_id: spell,
++            card_id,
++            targets: vec![],
++            payment_mode: CastPaymentMode::Auto,
++        })
++        .expect("casting Calamity of the Titans must be accepted");
++
++    pay_reveal_and_resolve(&mut runner, revealed);
++
++    assert_eq!(
++        runner.state().objects[&low_mv].zone,
++        engine::types::zones::Zone::Exile,
++        "a creature with mana value less than the revealed card's (4) must be exiled"
++    );
++    assert_eq!(
++        runner.state().objects[&equal_mv].zone,
++        engine::types::zones::Zone::Battlefield,
++        "a creature with mana value EQUAL to the revealed card's must survive (less than, not less-or-equal)"
++    );
++    assert_eq!(
++        runner.state().objects[&high_mv].zone,
++        engine::types::zones::Zone::Battlefield,
++        "a creature with mana value greater than the revealed card's must survive"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 81284056ba..5854e2b52c 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -49,6 +49,7 @@ mod braids_arisen_nightmare_decline;
+ mod breeches_blastmaker_coin_flip_copy;
+ mod brigid_mana_ability;
+ mod bring_to_light_free_cast_2880;
++mod calamity_of_the_titans_reveal_cost;
+ mod call_damage_control_modal_return;
+ mod captain_america_throw;
+ mod cascade_intervening_if_pipeline;
+diff --git a/crates/phase-ai/src/policies/payment_selection.rs b/crates/phase-ai/src/policies/payment_selection.rs
+index 3366ca9ee2..bb8fd86742 100644
+--- a/crates/phase-ai/src/policies/payment_selection.rs
++++ b/crates/phase-ai/src/policies/payment_selection.rs
+@@ -257,6 +257,10 @@ fn payment_cost(
+ ) -> f64 {
+     match kind {
+         PayCostKind::Discard => card_value(state, obj_id),
++        // CR 701.20a + CR 701.20b: Revealing doesn't move the card — it stays
++        // in hand — so the real resource cost is ~0, mirroring Behold's
++        // reveal-from-hand branch.
++        PayCostKind::Reveal => card_value(state, obj_id) * 0.1,
+         PayCostKind::ReturnToHand => 0.5 + permanent_value(state, obj_id) * 0.5,
+         PayCostKind::ExileFromZone { zone } => match zone {
+             ExileCostSourceZone::Hand => card_value(state, obj_id) * 1.2,

@@ -1,0 +1,985 @@
+diff --git a/dashboard/src/dashboard/api.py b/dashboard/src/dashboard/api.py
+index c530557..dc58c82 100644
+--- a/dashboard/src/dashboard/api.py
++++ b/dashboard/src/dashboard/api.py
+@@ -516,7 +516,7 @@ def __init__(self):
+         self.state = DashboardState()
+         self.nats = NatsStreamManager(self.state)
+         self.chat = ChatEngine(self.state, self.nats)
+-        self.metrics = MetricsMonitor(self.state)
++        self.metrics = MetricsMonitor(self.state, self.nats)
+         self.ctx = DashboardContext(
+             state=self.state,
+             nats=self.nats,
+diff --git a/dashboard/src/dashboard/metrics.py b/dashboard/src/dashboard/metrics.py
+index 0955d49..e889b39 100644
+--- a/dashboard/src/dashboard/metrics.py
++++ b/dashboard/src/dashboard/metrics.py
+@@ -20,12 +20,16 @@
+ from dashboard.system import get_live_metrics
+ from dashboard.util import now_iso
+ 
++if False:  # TYPE_CHECKING
++    from dashboard.nats_stream import NatsStreamManager
++
+ 
+ class MetricsMonitor:
+     """Background health/metrics loops and the cached Docker-stats fetch."""
+ 
+-    def __init__(self, state: DashboardState):
++    def __init__(self, state: DashboardState, nats: "NatsStreamManager | None" = None):
+         self._state = state
++        self._nats = nats
+         self.logger = logging.getLogger("dashboard.metrics")
+ 
+     async def _broadcast(self, message: dict) -> None:
+@@ -168,11 +172,18 @@ async def metrics_broadcast_loop(self):
+                     t0 = time.time()
+                     live = get_live_metrics()
+                     docker = await self.fetch_docker()
++                    if self._nats is not None:
++                        await self._nats.publish_dashboard_metrics()
++                    bus = self._state.bus_metrics_list(
++                        include_dashboard=(
++                            self._nats.local_bus_metrics_snapshot() if self._nats else None
++                        ),
++                    )
+                     self._state.skills.record_call("env.monitor", (time.time() - t0) * 1000)
+                     await self._broadcast(
+                         {
+                             "type": "metrics_update",
+-                            "data": {"live": live, "docker": docker},
++                            "data": {"live": live, "docker": docker, "bus": bus},
+                         }
+                     )
+             except asyncio.CancelledError:
+diff --git a/dashboard/src/dashboard/nats_stream.py b/dashboard/src/dashboard/nats_stream.py
+index e1722f0..f7919a3 100644
+--- a/dashboard/src/dashboard/nats_stream.py
++++ b/dashboard/src/dashboard/nats_stream.py
+@@ -34,6 +34,7 @@
+         "safety.halt.status",
+     }
+ )
++EVENTBUS_METRICS_PREFIX = "eventbus.metrics."
+ 
+ 
+ class NatsStreamManager:
+@@ -52,8 +53,55 @@ def __init__(self, state: DashboardState):
+         self._obs_max_tracked = 50  # cap tracked subjects to bound growth
+         self._last_proposal_broadcast = 0.0
+         self._last_body_frame_ts = 0.0
++        self._local_publish = {"count": 0, "total_ms": 0.0, "max_ms": 0.0}
++        self._local_subscribe = {"count": 0, "total_ms": 0.0, "max_ms": 0.0}
++
++    def _record_latency(self, bucket: dict, latency_ms: float) -> None:
++        bucket["count"] += 1
++        bucket["total_ms"] += latency_ms
++        if latency_ms > bucket["max_ms"]:
++            bucket["max_ms"] = latency_ms
++
++    def local_bus_metrics_snapshot(self) -> dict:
++        """Dashboard NATS client stats (raw nats-py, not SDK EventBus)."""
++        publish = self._local_publish
++        subscribe = self._local_subscribe
++        return {
++            "service": "dashboard",
++            "timestamp_ms": int(time.time() * 1000),
++            "publish": {
++                "count": publish["count"],
++                "avg_ms": (
++                    round(publish["total_ms"] / publish["count"], 3) if publish["count"] else 0
++                ),
++                "max_ms": round(publish["max_ms"], 3),
++                "jetstream_count": 0,
++            },
++            "subscribe": {
++                "count": subscribe["count"],
++                "avg_ms": (
++                    round(subscribe["total_ms"] / subscribe["count"], 3)
++                    if subscribe["count"]
++                    else 0
++                ),
++                "max_ms": round(subscribe["max_ms"], 3),
++            },
++            "request": {"count": 0, "avg_ms": 0, "max_ms": 0},
++        }
++
++    async def publish_dashboard_metrics(self) -> None:
++        """Heartbeat dashboard NATS stats on eventbus.metrics.dashboard."""
++        if self.nc is None:
++            return
++        try:
++            payload = self.local_bus_metrics_snapshot()
++            await self.nc.publish(
++                f"{EVENTBUS_METRICS_PREFIX}dashboard",
++                json.dumps(payload).encode(),
++            )
++        except Exception as e:
++            self.logger.debug("Failed to publish dashboard bus metrics: %s", e)
+ 
+-    # ── status ────────────────────────────────────────────────────────────
+     @property
+     def connected(self) -> bool:
+         """Health flag — true once the connection succeeded (mirrors ``/api/health``)."""
+@@ -67,7 +115,11 @@ def can_publish(self) -> bool:
+     # ── publishing ────────────────────────────────────────────────────────
+     async def publish(self, subject: str, payload: dict) -> None:
+         """Publish a JSON payload to ``subject`` (raises if not connected)."""
++        track = not subject.startswith(EVENTBUS_METRICS_PREFIX)
++        t0 = time.perf_counter()
+         await self.nc.publish(subject, json.dumps(payload).encode())
++        if track:
++            self._record_latency(self._local_publish, (time.perf_counter() - t0) * 1000)
+ 
+     async def try_publish(self, subject: str, payload: dict) -> dict | None:
+         """Publish JSON, returning ``None`` on success or an error dict on failure.
+@@ -89,14 +141,12 @@ async def publish_text_observation(self, text: str) -> None:
+             self.logger.debug(f"Skip publish: nc={self.nc is not None}, text={bool(text)}")
+             return
+         try:
+-            await self.nc.publish(
++            await self.publish(
+                 "observation.text",
+-                json.dumps(
+-                    {
+-                        "provenance": "observation.text",
+-                        "data": text,
+-                    }
+-                ).encode(),
++                {
++                    "provenance": "observation.text",
++                    "data": text,
++                },
+             )
+             self.logger.info(f"Published observation.text ({len(text)} chars)")
+         except Exception as e:
+@@ -131,6 +181,7 @@ async def connect(self) -> None:
+             await nc.subscribe("speech.execute", cb=self._handle_speech_execute)
+             await nc.subscribe("observation.visual.body", cb=self._handle_visual_body)
+             await nc.subscribe("safety.halt.status", cb=self._handle_safe_halt_status)
++            await nc.subscribe("eventbus.metrics.>", cb=self._handle_bus_metrics)
+         except Exception as e:
+             self.logger.warning(f"NATS failed (non-fatal): {e}")
+             self._connected = False
+@@ -140,59 +191,85 @@ async def _broadcast(self, message: dict) -> None:
+ 
+     # ── subscription callbacks ────────────────────────────────────────────
+     async def _handle_msg(self, msg):
+-        if msg.subject in DEDICATED_SUBJECTS or msg.subject.startswith("heartbeat."):
++        if (
++            msg.subject in DEDICATED_SUBJECTS
++            or msg.subject.startswith("heartbeat.")
++            or msg.subject.startswith(EVENTBUS_METRICS_PREFIX)
++        ):
+             return
+ 
+-        # Throttle observation.* subjects to avoid flooding the dashboard feed.
+-        if msg.subject.startswith("observation."):
+-            now = time.time()
+-            # Evict stale entries if tracking too many subjects.
+-            if len(self._obs_last_broadcast) > self._obs_max_tracked:
+-                cutoff = now - 60.0
+-                stale = [k for k, v in self._obs_last_broadcast.items() if v < cutoff]
+-                for k in stale:
+-                    self._obs_last_broadcast.pop(k, None)
+-                    self._obs_dropped.pop(k, None)
+-            last = self._obs_last_broadcast.get(msg.subject, 0.0)
+-            if now - last < self._obs_throttle_interval:
+-                self._obs_dropped[msg.subject] = self._obs_dropped.get(msg.subject, 0) + 1
++        t0 = time.perf_counter()
++        try:
++            # Throttle observation.* subjects to avoid flooding the dashboard feed.
++            if msg.subject.startswith("observation."):
++                now = time.time()
++                # Evict stale entries if tracking too many subjects.
++                if len(self._obs_last_broadcast) > self._obs_max_tracked:
++                    cutoff = now - 60.0
++                    stale = [k for k, v in self._obs_last_broadcast.items() if v < cutoff]
++                    for k in stale:
++                        self._obs_last_broadcast.pop(k, None)
++                        self._obs_dropped.pop(k, None)
++                last = self._obs_last_broadcast.get(msg.subject, 0.0)
++                if now - last < self._obs_throttle_interval:
++                    self._obs_dropped[msg.subject] = self._obs_dropped.get(msg.subject, 0) + 1
++                    self._state.knowledge.learn("observation", "nats_message", f"{msg.subject}")
++                    return
++                self._obs_last_broadcast[msg.subject] = now
++                dropped = self._obs_dropped.pop(msg.subject, 0)
++                try:
++                    data = json.loads(msg.data.decode())
++                except Exception:
++                    data = {"raw": msg.data.decode()[:200]}
++                # Summarize: truncate large payloads, add dropped count.
++                if isinstance(data, dict) and "data" in data:
++                    raw = data["data"]
++                    if isinstance(raw, list) and len(raw) > 8:
++                        data["data"] = raw[:4] + ["..."] + [f"({len(raw)} values)"]
++                msg_info = {
++                    "timestamp": now_iso(),
++                    "subject": msg.subject,
++                    "data": data,
++                }
++                if dropped > 0:
++                    msg_info["dropped"] = dropped
++                self._state.message_buffer.append(msg_info)
+                 self._state.knowledge.learn("observation", "nats_message", f"{msg.subject}")
++                await self._broadcast({"type": "message", "data": msg_info})
+                 return
+-            self._obs_last_broadcast[msg.subject] = now
+-            dropped = self._obs_dropped.pop(msg.subject, 0)
++
+             try:
+                 data = json.loads(msg.data.decode())
+             except Exception:
+-                data = {"raw": msg.data.decode()[:200]}
+-            # Summarize: truncate large payloads, add dropped count.
+-            if isinstance(data, dict) and "data" in data:
+-                raw = data["data"]
+-                if isinstance(raw, list) and len(raw) > 8:
+-                    data["data"] = raw[:4] + ["..."] + [f"({len(raw)} values)"]
++                data = {"raw": msg.data.decode()[:500]}
+             msg_info = {
+                 "timestamp": now_iso(),
+                 "subject": msg.subject,
+                 "data": data,
+             }
+-            if dropped > 0:
+-                msg_info["dropped"] = dropped
+             self._state.message_buffer.append(msg_info)
+             self._state.knowledge.learn("observation", "nats_message", f"{msg.subject}")
+             await self._broadcast({"type": "message", "data": msg_info})
+-            return
++        finally:
++            self._record_latency(self._local_subscribe, (time.perf_counter() - t0) * 1000)
+ 
++    async def _handle_bus_metrics(self, msg):
+         try:
+             data = json.loads(msg.data.decode())
+-        except Exception:
+-            data = {"raw": msg.data.decode()[:500]}
+-        msg_info = {
+-            "timestamp": now_iso(),
+-            "subject": msg.subject,
+-            "data": data,
+-        }
+-        self._state.message_buffer.append(msg_info)
+-        self._state.knowledge.learn("observation", "nats_message", f"{msg.subject}")
+-        await self._broadcast({"type": "message", "data": msg_info})
++            service = data.get("service") or msg.subject.removeprefix(EVENTBUS_METRICS_PREFIX)
++            if not service:
++                return
++            self._state.bus_metrics_by_service[service] = data
++            await self._broadcast(
++                {
++                    "type": "bus_metrics_update",
++                    "data": self._state.bus_metrics_list(
++                        include_dashboard=self.local_bus_metrics_snapshot(),
++                    ),
++                }
++            )
++        except Exception as e:
++            self.logger.debug("Failed to handle bus metrics: %s", e)
+ 
+     async def _handle_heartbeat(self, msg):
+         try:
+diff --git a/dashboard/src/dashboard/routers/stream.py b/dashboard/src/dashboard/routers/stream.py
+index fb4c672..6ffcf00 100644
+--- a/dashboard/src/dashboard/routers/stream.py
++++ b/dashboard/src/dashboard/routers/stream.py
+@@ -61,6 +61,9 @@ async def websocket_endpoint(websocket: WebSocket):
+                         "gateway": state.gateway_status,
+                         "video_sessions": list(state.video_sessions.values()),
+                         "halt_state": get_halt_state(),
++                        "bus_metrics": state.bus_metrics_list(
++                            include_dashboard=nats.local_bus_metrics_snapshot(),
++                        ),
+                     },
+                 }
+             )
+diff --git a/dashboard/src/dashboard/state.py b/dashboard/src/dashboard/state.py
+index 03de887..539acf7 100644
+--- a/dashboard/src/dashboard/state.py
++++ b/dashboard/src/dashboard/state.py
+@@ -93,6 +93,14 @@ def __init__(self):
+         self.watchdog_status: dict[str, Any] = {}
+         self.service_status: dict[str, dict] = {}
+         self.concept_probe_results: list[dict] = []
++        self.bus_metrics_by_service: dict[str, dict] = {}
++
++    def bus_metrics_list(self, *, include_dashboard: dict | None = None) -> list[dict]:
++        """Sorted per-service EventBus metric snapshots for the UI."""
++        merged = dict(self.bus_metrics_by_service)
++        if include_dashboard is not None:
++            merged["dashboard"] = include_dashboard
++        return sorted(merged.values(), key=lambda row: row.get("service", ""))
+ 
+     # ── chat history ──────────────────────────────────────────────────────
+     def append_chat(self, role: str, content: str) -> None:
+diff --git a/dashboard/static/app.js b/dashboard/static/app.js
+index 7a389b4..57d1950 100644
+--- a/dashboard/static/app.js
++++ b/dashboard/static/app.js
+@@ -141,6 +141,7 @@ class ActiveLearningAI {
+                 this.updateTopStats(msg.data);
+                 if (msg.data.halt_state) this.updateHaltUI(msg.data.halt_state);
+                 if (msg.data.kernel_decision_rates) this.renderKernelDecisionRates(msg.data.kernel_decision_rates);
++                if (msg.data.bus_metrics) this.renderBusMetrics(msg.data.bus_metrics);
+                 break;
+             case 'safe_halt_status':
+                 this.updateHaltUI(msg.data);
+@@ -154,6 +155,10 @@ class ActiveLearningAI {
+             case 'metrics_update':
+                 if (msg.data.live) this.updateGauges(msg.data.live);
+                 if (msg.data.docker) this.renderDockerMetrics(msg.data.docker);
++                if (msg.data.bus) this.renderBusMetrics(msg.data.bus);
++                break;
++            case 'bus_metrics_update':
++                this.renderBusMetrics(msg.data);
+                 break;
+             case 'message':
+                 this.appendNATSMessage(msg.data);
+@@ -891,6 +896,27 @@ class ActiveLearningAI {
+         `).join('');
+     }
+ 
++    renderBusMetrics(metrics) {
++        const el = document.getElementById('bus-metrics-list');
++        if (!el) return;
++        if (!metrics || !metrics.length) {
++            el.innerHTML = '<div class="sys-loading">Waiting for metrics…</div>';
++            return;
++        }
++        el.innerHTML = metrics.map(m => {
++            const pub = m.publish || {};
++            const sub = m.subscribe || {};
++            const req = m.request || {};
++            return `
++            <div class="bus-item">
++                <div class="bus-name">${this.esc(m.service || '?')}</div>
++                <div class="bus-row"><span>Publish</span><span class="val">${pub.count || 0} · ${(pub.avg_ms || 0).toFixed(1)}ms</span></div>
++                <div class="bus-row"><span>Subscribe</span><span class="val">${sub.count || 0} · ${(sub.avg_ms || 0).toFixed(1)}ms</span></div>
++                <div class="bus-row"><span>Request</span><span class="val">${req.count || 0} · ${(req.avg_ms || 0).toFixed(1)}ms</span></div>
++            </div>`;
++        }).join('');
++    }
++
+     // ─── Top Stats ───────────────────────────────────────────────────
+ 
+     updateTopStats(data) {
+diff --git a/dashboard/static/index.html b/dashboard/static/index.html
+index b0c4e3f..4a7dd42 100644
+--- a/dashboard/static/index.html
++++ b/dashboard/static/index.html
+@@ -429,6 +429,14 @@ <h2><span class="panel-icon">🤖</span> Virtual Body</h2>
+                 <div id="body-status" style="margin-top:8px; font-size:11px; color:var(--text-3);"></div>
+             </section>
+ 
++            <!-- Bus Health -->
++            <section class="panel">
++                <h2><span class="panel-icon">📊</span> Bus Health</h2>
++                <div class="bus-metrics-list" id="bus-metrics-list">
++                    <div class="sys-loading">Waiting for metrics…</div>
++                </div>
++            </section>
++
+             <!-- Containers -->
+             <section class="panel">
+                 <h2><span class="panel-icon">🐳</span> Containers</h2>
+diff --git a/dashboard/static/style.css b/dashboard/static/style.css
+index 6d6e049..33cfa1c 100644
+--- a/dashboard/static/style.css
++++ b/dashboard/static/style.css
+@@ -644,6 +644,14 @@ html, body {
+ 
+ /* ─── Container List ────────────────────────────────────────────── */
+ .container-list { display: flex; flex-direction: column; gap: 4px; max-height: 200px; overflow-y: auto; }
++.bus-metrics-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
++.bus-item {
++    display: flex; flex-direction: column; gap: 2px;
++    padding: 6px 7px; background: var(--bg-3); border-radius: var(--radius-sm); font-size: 10px;
++}
++.bus-name { font-weight: 600; color: var(--green, #6fcf97); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.bus-row { display: flex; justify-content: space-between; color: var(--text-2); }
++.bus-row .val { color: var(--text-1); font-weight: 500; }
+ .ctn-item {
+     display: flex; flex-direction: column; gap: 2px;
+     padding: 6px 7px; background: var(--bg-3); border-radius: var(--radius-sm); font-size: 10px;
+diff --git a/dashboard/tests/test_nats_stream.py b/dashboard/tests/test_nats_stream.py
+index 6f91690..041c26f 100644
+--- a/dashboard/tests/test_nats_stream.py
++++ b/dashboard/tests/test_nats_stream.py
+@@ -200,3 +200,26 @@ def test_large_observation_payload_is_summarized():
+     assert stored[:4] == [0, 1, 2, 3]
+     assert "..." in stored
+     assert any("20 values" in str(x) for x in stored)
++
++
++def test_handle_bus_metrics_stores_service_and_broadcasts():
++    mgr, state, ws = _manager()
++    payload = {
++        "service": "kernel",
++        "publish": {"count": 3, "avg_ms": 1.0, "max_ms": 2.0, "jetstream_count": 1},
++        "subscribe": {"count": 10, "avg_ms": 0.5, "max_ms": 1.0},
++        "request": {"count": 2, "avg_ms": 5.0, "max_ms": 8.0},
++    }
++    asyncio.run(mgr._handle_bus_metrics(_FakeMsg("eventbus.metrics.kernel", payload)))
++    assert state.bus_metrics_by_service["kernel"] == payload
++    assert ws.sent[-1]["type"] == "bus_metrics_update"
++    services = {row["service"] for row in ws.sent[-1]["data"]}
++    assert "kernel" in services
++    assert "dashboard" in services
++
++
++def test_eventbus_metrics_subject_skipped_by_wildcard_handler():
++    mgr, state, ws = _manager()
++    asyncio.run(mgr._handle_msg(_FakeMsg("eventbus.metrics.kernel", {"service": "kernel"})))
++    assert len(state.message_buffer) == 0
++    assert ws.sent == []
+diff --git a/dashboard/tests/test_routers.py b/dashboard/tests/test_routers.py
+index b0e42d9..253d467 100644
+--- a/dashboard/tests/test_routers.py
++++ b/dashboard/tests/test_routers.py
+@@ -50,6 +50,15 @@ async def try_publish(self, subject, payload):
+         self.published.append((subject, payload))
+         return None
+ 
++    def local_bus_metrics_snapshot(self) -> dict:
++        return {
++            "service": "dashboard",
++            "timestamp_ms": 0,
++            "publish": {"count": 0, "avg_ms": 0, "max_ms": 0, "jetstream_count": 0},
++            "subscribe": {"count": 0, "avg_ms": 0, "max_ms": 0},
++            "request": {"count": 0, "avg_ms": 0, "max_ms": 0},
++        }
++
+ 
+ class _FakeChat:
+     llm_model = "fake-model"
+diff --git a/docs/adr/0001-nats-authz.md b/docs/adr/0001-nats-authz.md
+index f652d27..bc6bce7 100644
+--- a/docs/adr/0001-nats-authz.md
++++ b/docs/adr/0001-nats-authz.md
+@@ -349,6 +349,7 @@ prefix/token family; the allowlist entry uses the wildcard form.
+ | `system.shutdown` | operator | all services | Broadcast. |
+ | `system.health` | all services | dashboard | Liveness. |
+ | `heartbeat.*` | all services | dashboard | Per-service heartbeat (`heartbeat.<service>`). |
++| `eventbus.metrics.>` | all services, dashboard | dashboard | Periodic EventBus publish/subscribe/request latency snapshots (`eventbus.metrics.<service>`). |
+ 
+ > The dashboard additionally holds a single broad **subscribe-only** grant on
+ > `>` to drive the live UI. It conveys **no** publish rights. This is the one
+diff --git a/sdk/src/activelearning/base_service.py b/sdk/src/activelearning/base_service.py
+index 19bf47c..f3744f8 100644
+--- a/sdk/src/activelearning/base_service.py
++++ b/sdk/src/activelearning/base_service.py
+@@ -102,6 +102,9 @@ async def start(self) -> None:
+         # Service-specific setup
+         await self._setup()
+ 
++        if self.event_bus is not None:
++            await self.event_bus.start_metrics_reporter()
++
+         self.logger.info(f"{self.service_name} service started successfully")
+ 
+     async def stop(self) -> None:
+diff --git a/sdk/src/activelearning/bus_metrics.py b/sdk/src/activelearning/bus_metrics.py
+new file mode 100644
+index 0000000..242edd9
+--- /dev/null
++++ b/sdk/src/activelearning/bus_metrics.py
+@@ -0,0 +1,66 @@
++"""In-process publish/subscribe/request counters and latency stats for EventBus."""
++
++from __future__ import annotations
++
++import time
++from dataclasses import dataclass, field
++from typing import Any
++
++
++@dataclass
++class LatencyStats:
++    """Running latency aggregate (count, mean, max)."""
++
++    count: int = 0
++    total_ms: float = 0.0
++    max_ms: float = 0.0
++
++    def record(self, latency_ms: float) -> None:
++        self.count += 1
++        self.total_ms += latency_ms
++        if latency_ms > self.max_ms:
++            self.max_ms = latency_ms
++
++    def avg_ms(self) -> float:
++        return self.total_ms / self.count if self.count else 0.0
++
++    def to_dict(self) -> dict[str, float | int]:
++        return {
++            "count": self.count,
++            "avg_ms": round(self.avg_ms(), 3),
++            "max_ms": round(self.max_ms, 3),
++        }
++
++
++@dataclass
++class EventBusMetrics:
++    """Mutable counters updated by EventBus publish/subscribe/request paths."""
++
++    publish: LatencyStats = field(default_factory=LatencyStats)
++    subscribe_delivery: LatencyStats = field(default_factory=LatencyStats)
++    request: LatencyStats = field(default_factory=LatencyStats)
++    publish_jetstream_count: int = 0
++
++    def record_publish(self, latency_ms: float, *, jetstream: bool = False) -> None:
++        self.publish.record(latency_ms)
++        if jetstream:
++            self.publish_jetstream_count += 1
++
++    def record_subscribe_delivery(self, latency_ms: float) -> None:
++        self.subscribe_delivery.record(latency_ms)
++
++    def record_request(self, latency_ms: float) -> None:
++        self.request.record(latency_ms)
++
++    def snapshot(self, service_name: str) -> dict[str, Any]:
++        """JSON-serializable payload for eventbus.metrics.{service_name}."""
++        return {
++            "service": service_name,
++            "timestamp_ms": int(time.time() * 1000),
++            "publish": {
++                **self.publish.to_dict(),
++                "jetstream_count": self.publish_jetstream_count,
++            },
++            "subscribe": self.subscribe_delivery.to_dict(),
++            "request": self.request.to_dict(),
++        }
+diff --git a/sdk/src/activelearning/nats_client.py b/sdk/src/activelearning/nats_client.py
+index 72ea420..c5692eb 100644
+--- a/sdk/src/activelearning/nats_client.py
++++ b/sdk/src/activelearning/nats_client.py
+@@ -21,6 +21,7 @@
+ from nats.js import JetStreamContext
+ from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy, StreamConfig
+ 
++from activelearning.bus_metrics import EventBusMetrics
+ from activelearning.connection_logging import (
+     TRANSITION_ALREADY_CONNECTED,
+     TRANSITION_CLOSED,
+@@ -43,7 +44,12 @@
+     validate_payload,
+ )
+ from activelearning.signing import verify_decision
+-from activelearning.subjects import Subjects, code_decision_subject, decision_subject
++from activelearning.subjects import (
++    Subjects,
++    code_decision_subject,
++    decision_subject,
++    eventbus_metrics_subject,
++)
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -152,6 +158,9 @@ def __init__(
+         # redelivery or unprocessable). Optional; the DLQ subject is always used.
+         self._poison_handlers: dict[str, MessageHandler] = {}
+         self._connected = asyncio.Event()
++        self._metrics = EventBusMetrics()
++        self._metrics_task: asyncio.Task[None] | None = None
++        self._metrics_interval_s = float(os.environ.get("EVENTBUS_METRICS_INTERVAL_S", "10"))
+ 
+     async def connect(self) -> None:
+         """Connect to the NATS server."""
+@@ -221,6 +230,7 @@ async def connect(self) -> None:
+ 
+     async def close(self) -> None:
+         """Close the NATS connection."""
++        await self.stop_metrics_reporter()
+         if self._nc is not None:
+             log_connection_event(
+                 TRANSITION_CLOSING,
+@@ -269,6 +279,11 @@ def _is_safety_critical(subject: str) -> bool:
+             return True
+         return False
+ 
++    @staticmethod
++    def _is_metrics_subject(subject: str) -> bool:
++        """Metrics heartbeats are excluded from publish counters."""
++        return subject.startswith(Subjects.EVENTBUS_METRICS_PREFIX)
++
+     async def publish(
+         self,
+         subject: str,
+@@ -292,7 +307,10 @@ async def publish(
+         if isinstance(data, dict):
+             data = validate_payload(subject, data, message_model)
+         payload = serialize_message(data)
+-        if self._is_safety_critical(subject):
++        track_publish = not self._is_metrics_subject(subject)
++        t0 = time.perf_counter()
++        is_js = self._is_safety_critical(subject)
++        if is_js:
+             assert self._js is not None
+             ack = await self._js.publish(subject, payload)
+             logger.debug("JS-published to %s (seq=%d): %d bytes", subject, ack.seq, len(payload))
+@@ -300,6 +318,8 @@ async def publish(
+             assert self._nc is not None
+             await self._nc.publish(subject, payload)
+             logger.debug("Published to %s: %d bytes", subject, len(payload))
++        if track_publish:
++            self._metrics.record_publish((time.perf_counter() - t0) * 1000, jetstream=is_js)
+ 
+     async def subscribe(
+         self,
+@@ -333,6 +353,7 @@ async def subscribe(
+         wire_model = message_model or schema_for_subject(subject)
+ 
+         async def message_callback(msg: Msg) -> None:
++            t0 = time.perf_counter()
+             try:
+                 data = deserialize_message(msg.data)
+                 if not isinstance(data, dict):
+@@ -376,6 +397,8 @@ async def message_callback(msg: Msg) -> None:
+                         )
+                     except Exception:
+                         pass  # best-effort error reply
++            finally:
++                self._metrics.record_subscribe_delivery((time.perf_counter() - t0) * 1000)
+ 
+         assert self._nc is not None
+         sub = await self._nc.subscribe(
+@@ -446,53 +469,57 @@ async def js_subscribe(
+             self._poison_handlers[subject] = poison_handler
+ 
+         async def _js_message_callback(msg: Msg) -> None:
+-            # Structurally bad messages can never succeed on retry → poison now.
+-            # This block only parses and validates — the handler runs exactly
+-            # once, in the delivery block below. (A duplicated handler+ack here
+-            # used to double-invoke every JS handler and double-ack the message,
+-            # surfacing as MsgAlreadyAckdError and spurious redeliveries.)
++            t0 = time.perf_counter()
+             try:
+-                data = deserialize_message(msg.data)
+-                if not isinstance(data, dict):
+-                    raise MessageValidationError(
+-                        subject,
+-                        f"expected JSON object, got {type(data).__name__}",
+-                    )
+-                data = validate_payload(subject, data, wire_model)
+-            except MessageValidationError as e:
+-                logger.error("Poisoning unprocessable message on %s: %s", subject, e)
+-                await self._route_to_poison(subject, msg, f"validation_error: {e}")
+-                await msg.term()
+-                return
+-
+-            try:
+-                await handler(data)
+-                await msg.ack()  # exactly-once ack, only after success
+-            except Exception as e:
+-                delivered = self._num_delivered(msg)
+-                if delivered >= max_deliver:
+-                    # Exhausted bounded redelivery → dead-letter, then term so it
+-                    # stops redelivering (never an infinite loop, never dropped).
+-                    logger.error(
+-                        "Poisoning %s after %d/%d deliveries: %s",
+-                        subject,
+-                        delivered,
+-                        max_deliver,
+-                        e,
+-                    )
+-                    await self._route_to_poison(
+-                        subject, msg, f"max_deliver_exhausted({delivered}): {e}"
+-                    )
++                # Structurally bad messages can never succeed on retry → poison now.
++                # This block only parses and validates — the handler runs exactly
++                # once, in the delivery block below. (A duplicated handler+ack here
++                # used to double-invoke every JS handler and double-ack the message,
++                # surfacing as MsgAlreadyAckdError and spurious redeliveries.)
++                try:
++                    data = deserialize_message(msg.data)
++                    if not isinstance(data, dict):
++                        raise MessageValidationError(
++                            subject,
++                            f"expected JSON object, got {type(data).__name__}",
++                        )
++                    data = validate_payload(subject, data, wire_model)
++                except MessageValidationError as e:
++                    logger.error("Poisoning unprocessable message on %s: %s", subject, e)
++                    await self._route_to_poison(subject, msg, f"validation_error: {e}")
+                     await msg.term()
+-                else:
+-                    logger.warning(
+-                        "Handler failed on %s (delivery %d/%d), will redeliver: %s",
+-                        subject,
+-                        delivered,
+-                        max_deliver,
+-                        e,
+-                    )
+-                    await msg.nak()
++                    return
++
++                try:
++                    await handler(data)
++                    await msg.ack()  # exactly-once ack, only after success
++                except Exception as e:
++                    delivered = self._num_delivered(msg)
++                    if delivered >= max_deliver:
++                        # Exhausted bounded redelivery → dead-letter, then term so it
++                        # stops redelivering (never an infinite loop, never dropped).
++                        logger.error(
++                            "Poisoning %s after %d/%d deliveries: %s",
++                            subject,
++                            delivered,
++                            max_deliver,
++                            e,
++                        )
++                        await self._route_to_poison(
++                            subject, msg, f"max_deliver_exhausted({delivered}): {e}"
++                        )
++                        await msg.term()
++                    else:
++                        logger.warning(
++                            "Handler failed on %s (delivery %d/%d), will redeliver: %s",
++                            subject,
++                            delivered,
++                            max_deliver,
++                            e,
++                        )
++                        await msg.nak()
++            finally:
++                self._metrics.record_subscribe_delivery((time.perf_counter() - t0) * 1000)
+ 
+         config = ConsumerConfig(
+             durable_name=durable,
+@@ -589,7 +616,9 @@ async def request(
+         await self._ensure_connected()
+         assert self._nc is not None
+         payload = serialize_message(data)
++        t0 = time.perf_counter()
+         response = await self._nc.request(subject, payload, timeout=timeout)
++        self._metrics.record_request((time.perf_counter() - t0) * 1000)
+         return deserialize_message(response.data)
+ 
+     async def wait_for_decision(
+@@ -623,6 +652,7 @@ async def wait_for_decision(
+ 
+         async def _js_handler(msg: Msg) -> None:
+             nonlocal result
++            t0 = time.perf_counter()
+             try:
+                 data = deserialize_message(msg.data)
+                 if not isinstance(data, dict):
+@@ -648,6 +678,8 @@ async def _js_handler(msg: Msg) -> None:
+             except MessageValidationError as e:
+                 logger.error(str(e))
+                 await msg.ack()
++            finally:
++                self._metrics.record_subscribe_delivery((time.perf_counter() - t0) * 1000)
+ 
+         assert self._js is not None
+         sub = await self._js.subscribe(
+@@ -801,6 +833,43 @@ async def _reconnected_callback(self) -> None:
+             nats_url=self.nats_url,
+         )
+ 
++    def get_metrics(self) -> dict[str, Any]:
++        """Return a snapshot of in-process publish/subscribe/request stats."""
++        return self._metrics.snapshot(self.name)
++
++    async def start_metrics_reporter(self, interval_s: float | None = None) -> None:
++        """Periodically publish metrics to eventbus.metrics.{name}."""
++        if self._metrics_task is not None:
++            return
++        interval = interval_s if interval_s is not None else self._metrics_interval_s
++
++        async def _loop() -> None:
++            while True:
++                try:
++                    await asyncio.sleep(interval)
++                    if self.is_connected:
++                        await self.publish(
++                            eventbus_metrics_subject(self.name),
++                            self.get_metrics(),
++                        )
++                except asyncio.CancelledError:
++                    break
++                except Exception as e:
++                    logger.debug("EventBus metrics reporter: %s", e)
++
++        self._metrics_task = asyncio.create_task(_loop())
++
++    async def stop_metrics_reporter(self) -> None:
++        """Stop the periodic metrics publisher."""
++        if self._metrics_task is None:
++            return
++        self._metrics_task.cancel()
++        try:
++            await self._metrics_task
++        except asyncio.CancelledError:
++            pass
++        self._metrics_task = None
++
+ 
+ # Global event bus instance for convenience
+ _global_bus: EventBus | None = None
+diff --git a/sdk/src/activelearning/subjects.py b/sdk/src/activelearning/subjects.py
+index d71de32..da2e6c3 100644
+--- a/sdk/src/activelearning/subjects.py
++++ b/sdk/src/activelearning/subjects.py
+@@ -66,6 +66,8 @@ class Subjects:
+     # System
+     SYSTEM_SHUTDOWN = "system.shutdown"
+     SYSTEM_HEALTH = "system.health"
++    EVENTBUS_METRICS_PREFIX = "eventbus.metrics."
++    EVENTBUS_METRICS_WILDCARD = "eventbus.metrics.>"
+ 
+     # Meta-programmer / learning
+     KNOWLEDGE_GAP = "knowledge.gap"
+@@ -87,3 +89,8 @@ def code_decision_subject(trace_id: str) -> str:
+ def observation_subject(sensor_id: str) -> str:
+     """Per-sensor observation subject."""
+     return f"{Subjects.OBSERVATION.removesuffix('*')}{sensor_id}"
++
++
++def eventbus_metrics_subject(service_name: str) -> str:
++    """Per-service EventBus metrics subject."""
++    return f"{Subjects.EVENTBUS_METRICS_PREFIX}{service_name}"
+diff --git a/sdk/tests/test_bus_metrics.py b/sdk/tests/test_bus_metrics.py
+new file mode 100644
+index 0000000..31ab64c
+--- /dev/null
++++ b/sdk/tests/test_bus_metrics.py
+@@ -0,0 +1,133 @@
++"""Tests for EventBus in-process metrics."""
++
++from __future__ import annotations
++
++import asyncio
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from activelearning.bus_metrics import EventBusMetrics, LatencyStats
++from activelearning.nats_client import EventBus
++from activelearning.subjects import eventbus_metrics_subject
++
++
++class TestLatencyStats:
++    def test_avg_and_max(self):
++        stats = LatencyStats()
++        stats.record(10.0)
++        stats.record(20.0)
++        d = stats.to_dict()
++        assert d["count"] == 2
++        assert d["avg_ms"] == 15.0
++        assert d["max_ms"] == 20.0
++
++
++class TestEventBusMetrics:
++    def test_snapshot_shape(self):
++        metrics = EventBusMetrics()
++        metrics.record_publish(1.5, jetstream=True)
++        metrics.record_subscribe_delivery(2.0)
++        metrics.record_request(3.0)
++        snap = metrics.snapshot("kernel")
++        assert snap["service"] == "kernel"
++        assert snap["publish"]["count"] == 1
++        assert snap["publish"]["jetstream_count"] == 1
++        assert snap["subscribe"]["count"] == 1
++        assert snap["request"]["count"] == 1
++        assert "timestamp_ms" in snap
++
++
++class TestEventBusInstrumentation:
++    @pytest.mark.asyncio
++    async def test_publish_records_latency(self):
++        bus = EventBus(name="test-pub")
++        bus._nc = MagicMock()
++        bus._nc.is_connected = True
++        bus._nc.publish = AsyncMock()
++        bus._connected.set()
++
++        await bus.publish("observation.camera", {"frame": "x"})
++        assert bus._metrics.publish.count == 1
++        assert bus._metrics.publish.max_ms >= 0
++
++    @pytest.mark.asyncio
++    async def test_metrics_subject_not_counted(self):
++        bus = EventBus(name="test-metrics")
++        bus._nc = MagicMock()
++        bus._nc.is_connected = True
++        bus._nc.publish = AsyncMock()
++        bus._connected.set()
++
++        await bus.publish(eventbus_metrics_subject("test-metrics"), {"service": "x"})
++        assert bus._metrics.publish.count == 0
++
++    @pytest.mark.asyncio
++    async def test_request_records_latency(self):
++        bus = EventBus(name="test-req")
++        bus._nc = MagicMock()
++        bus._nc.is_connected = True
++        bus._connected.set()
++
++        response = MagicMock()
++        response.data = b'{"ok": true}'
++        bus._nc.request = AsyncMock(return_value=response)
++
++        result = await bus.request("beliefs.query", {"q": "x"})
++        assert result == {"ok": True}
++        assert bus._metrics.request.count == 1
++
++    @pytest.mark.asyncio
++    async def test_subscribe_callback_records_delivery(self):
++        bus = EventBus(name="test-sub")
++        received: list[dict] = []
++
++        async def handler(data: dict) -> None:
++            received.append(data)
++
++        bus._nc = MagicMock()
++        bus._nc.is_connected = True
++        bus._connected.set()
++
++        captured_cb = None
++
++        async def capture_subscribe(subject, cb, **kwargs):
++            nonlocal captured_cb
++            captured_cb = cb
++            return MagicMock()
++
++        bus._nc.subscribe = AsyncMock(side_effect=capture_subscribe)
++        await bus.subscribe("observation.test", handler)
++
++        msg = MagicMock()
++        msg.data = b'{"value": 1}'
++        msg.reply = ""
++        assert captured_cb is not None
++        await captured_cb(msg)
++
++        assert received == [{"value": 1}]
++        assert bus._metrics.subscribe_delivery.count == 1
++
++    @pytest.mark.asyncio
++    async def test_metrics_reporter_publishes_snapshot(self):
++        bus = EventBus(name="reporter")
++        bus._nc = MagicMock()
++        bus._nc.is_connected = True
++        bus._nc.publish = AsyncMock()
++        bus._connected.set()
++        bus._metrics_interval_s = 0.05
++
++        await bus.start_metrics_reporter(interval_s=0.05)
++        await asyncio.sleep(0.12)
++        await bus.stop_metrics_reporter()
++
++        assert bus._nc.publish.await_count >= 1
++        subject = bus._nc.publish.await_args_list[0].args[0]
++        assert subject == eventbus_metrics_subject("reporter")
++
++    def test_get_metrics_returns_snapshot(self):
++        bus = EventBus(name="snap")
++        bus._metrics.record_publish(1.0)
++        snap = bus.get_metrics()
++        assert snap["service"] == "snap"
++        assert snap["publish"]["count"] == 1

@@ -1,0 +1,1257 @@
+diff --git a/crates/engine/src/game/static_abilities.rs b/crates/engine/src/game/static_abilities.rs
+index 444ce054cd..059f912406 100644
+--- a/crates/engine/src/game/static_abilities.rs
++++ b/crates/engine/src/game/static_abilities.rs
+@@ -402,7 +402,16 @@ pub(crate) fn prohibition_scope_matches_player(
+         return false;
+     };
+     match scope {
+-        ProhibitionScope::Opponents => player != source_obj.controller,
++        // CR 102.2 / CR 102.3: "each opponent" is team-aware. In a multiplayer team
++        // game (e.g. Two-Headed Giant) a player's opponents are only players NOT on
++        // their team, so a naive `player != source_obj.controller` inequality wrongly
++        // treats a teammate as an opponent (barring them from casting). Route through
++        // the team-aware authority; in a two-player / FFA `IndividualSeats` topology
++        // `is_opponent` reduces to `!=`, so 2-player and free-for-all behavior is
++        // byte-identical. Mirrors the affected-filter fix in `static_filter_matches`.
++        ProhibitionScope::Opponents => {
++            crate::game::players::is_opponent(state, source_obj.controller, player)
++        }
+         ProhibitionScope::AllPlayers => true,
+         ProhibitionScope::Controller => player == source_obj.controller,
+         // CR 303.4e: For an Aura attached to an object ("enchanted creature's
+@@ -1669,6 +1678,37 @@ fn check_static_other_by_name(state: &GameState, name: &str, context: &StaticChe
+             ) {
+                 continue;
+             }
++            // CR 101.2 + CR 109.5 + CR 115.10: per-affected-player applicability
++            // gate — the same read `check_static_ability` performs for typed
++            // prohibition modes. An `Other` static carrying a per-player
++            // relative-count predicate (Ward of Bones: "each opponent who controls
++            // more lands than you can't play lands" → `CantPlayLand` +
++            // `per_player_condition`) applies to the queried player ONLY when that
++            // predicate holds for them. Evaluated against the affected player
++            // (target-owner, else the queried `player_id`) with `ScopedPlayer`
++            // bound to them and "you" to the source's controller. Fail closed when
++            // no affected player is in context so an under-specified query never
++            // over-applies the prohibition.
++            if let Some(ref cond) = def.per_player_condition {
++                let affected_player = context
++                    .target_id
++                    .and_then(|id| state.objects.get(&id))
++                    .map(|o| o.controller)
++                    .or(context.player_id);
++                match affected_player {
++                    Some(p) => {
++                        if !crate::game::restrictions::evaluate_condition(
++                            state,
++                            p,
++                            source_obj.id,
++                            cond,
++                        ) {
++                            continue;
++                        }
++                    }
++                    None => continue,
++                }
++            }
+             return true;
+         }
+     }
+@@ -1873,9 +1913,16 @@ pub(crate) fn static_filter_matches(
+                         crate::types::ability::ControllerRef::You => {
+                             source_controller == Some(player_id)
+                         }
+-                        crate::types::ability::ControllerRef::Opponent => {
+-                            source_controller.is_some() && source_controller != Some(player_id)
+-                        }
++                        // CR 102.2 / CR 102.3: "each opponent" is team-aware. In a
++                        // multiplayer team game (e.g. Two-Headed Giant) a player's
++                        // opponents are only players NOT on their team, so a naive
++                        // `source_controller != player_id` inequality wrongly treats a
++                        // teammate as an opponent. Route through the team-aware
++                        // authority; in a two-player game `is_opponent` reduces to `!=`.
++                        crate::types::ability::ControllerRef::Opponent => source_controller
++                            .is_some_and(|sc| {
++                                crate::game::players::is_opponent(state, sc, player_id)
++                            }),
+                         // CR 109.4: Static abilities have no ability-target context
+                         // in which to resolve a target player. Fail closed — the
+                         // parser never emits this variant for static filters.
+diff --git a/crates/engine/src/parser/oracle_static/mod.rs b/crates/engine/src/parser/oracle_static/mod.rs
+index dd40da8ab6..560f00c490 100644
+--- a/crates/engine/src/parser/oracle_static/mod.rs
++++ b/crates/engine/src/parser/oracle_static/mod.rs
+@@ -130,7 +130,7 @@ mod support {
+     };
+     pub(super) use super::restriction::{
+         parse_cant_be_activated_exemption_in_text, parse_cast_and_activate_only_during,
+-        strip_casting_prohibition_subject,
++        parse_relative_count_typed_cast_prohibitions, strip_casting_prohibition_subject,
+     };
+     pub(super) use super::shared::*;
+     pub(super) use super::static_helpers::*;
+diff --git a/crates/engine/src/parser/oracle_static/restriction.rs b/crates/engine/src/parser/oracle_static/restriction.rs
+index b0ee77cfe0..e24536de1a 100644
+--- a/crates/engine/src/parser/oracle_static/restriction.rs
++++ b/crates/engine/src/parser/oracle_static/restriction.rs
+@@ -957,6 +957,28 @@ pub(crate) fn parse_per_player_conditional_prohibition(
+             ParsedCondition::YouCastSpellThisTurn { filter: None },
+             tag::<_, _, OracleError<'_>>("cast a spell this turn"),
+         ),
++        // CR 109.4 + CR 109.5 + CR 115.10 (Ward of Bones line 2): the board-state
++        // relative-count predicate "controls more <type> than you". Unlike the
++        // turn-activity predicates above, this is a LIVE per-affected-player board
++        // comparison (re-evaluated on each query), built by the shared
++        // `controls_more_than_you_condition` as
++        // `ObjectCount(<type>, ScopedPlayer) GT ObjectCount(<type>, You)`. Pairs
++        // with the "play lands" verb branch below for "each opponent who controls
++        // more lands than you can't play lands".
++        map(
++            preceded(
++                tag::<_, _, OracleError<'_>>("controls more "),
++                terminated(nom_target::parse_type_filter_word, tag(" than you")),
++            ),
++            controls_more_than_you_condition,
++        ),
++        // NOTE: the *multi-type cast* relative-count predicate ("... can't cast
++        // <type> spells. The same is true for <T1> and <T2>", Ward of Bones line 1)
++        // is NOT routed here — each type is an independent prohibition needing a
++        // multi-def result, owned by `parse_relative_count_typed_cast_prohibitions`
++        // on the multi-static path, which runs before this single-def parser. The
++        // condition arm above only ever pairs with a single-type verb (play lands);
++        // the multi-type cast verbs fall through to `None` below.
+     ))
+     .parse(rest)
+     .ok()?;
+@@ -964,7 +986,7 @@ pub(crate) fn parse_per_player_conditional_prohibition(
+     // 3. Strip the prohibition connector " can't " and dispatch on the verb.
+     let rest = nom_tag_lower(rest, rest, " can't ")?;
+ 
+-    // CR 601.3a: "... can't cast spells" — cast-side prohibition.
++    // CR 601.3a: "... can't cast spells" — bare (untyped) cast-side prohibition.
+     if let Some(tail) = nom_tag_lower(rest, rest, "cast spells") {
+         if tail.trim_end_matches('.').is_empty() {
+             return Some(
+@@ -998,9 +1020,137 @@ pub(crate) fn parse_per_player_conditional_prohibition(
+         }
+     }
+ 
++    // CR 305.1 (Ward of Bones line 2): "... can't play lands" — land-play
++    // prohibition. `CantPlayLand` is a player-scoped `Other` mode with no `who`
++    // field, so the opponent scope rides on the `affected` filter (opponents'
++    // player scope: `ControllerRef::Opponent` resolves against the source's
++    // controller in `static_filter_matches`). The per-player relative-count gate
++    // ("controls more lands than you") rides on `per_player_condition`; the
++    // runtime CantPlayLand seam (`check_static_other_by_name`) evaluates it and
++    // bars ONLY an opponent controlling strictly more lands than the source's
++    // controller. This emits the exact `StaticMode::Other("CantPlayLand")` string
++    // the unconditional dispatch.rs path uses, so `player_has_static_other` /
++    // `handle_play_land` enforce both the conditional and unconditional forms.
++    if let Some(tail) = nom_tag_lower(rest, rest, "play lands") {
++        if tail.trim_end_matches('.').is_empty() {
++            let affected =
++                TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent));
++            return Some(
++                StaticDefinition::new(StaticMode::Other("CantPlayLand".to_string()))
++                    .affected(affected)
++                    .per_player_condition(cond)
++                    .description(text.to_string()),
++            );
++        }
++    }
++
+     None
+ }
+ 
++/// CR 109.4 + CR 109.5 + CR 115.10: Build the per-affected-player predicate
++/// "controls more `<type>` than you" as a board-count comparison.
++///
++/// The evaluated candidate — the player the enclosing prohibition scopes over —
++/// is `ControllerRef::ScopedPlayer` (CR 115.10: bound to the evaluated player by
++/// `resolve_quantity_scoped`); "you" is the source's controller
++/// (CR 109.5 → `ControllerRef::You`). The predicate holds when the candidate
++/// controls strictly more (`Comparator::GT`) permanents of `<type>` than the
++/// source's controller. Built entirely from the shared `QuantityRef::ObjectCount`
++/// building block — no new condition variant, no new evaluator arm. Takes the
++/// filter by value and clones it once for the `lhs`, moving it into the `rhs`.
++fn controls_more_than_you_condition(type_filter: TypeFilter) -> ParsedCondition {
++    let count_controlled_by = |ctrl: ControllerRef, tf: TypeFilter| QuantityExpr::Ref {
++        qty: QuantityRef::ObjectCount {
++            filter: TargetFilter::Typed(TypedFilter::new(tf).controller(ctrl)),
++        },
++    };
++    ParsedCondition::QuantityComparison {
++        lhs: count_controlled_by(ControllerRef::ScopedPlayer, type_filter.clone()),
++        comparator: Comparator::GT,
++        rhs: count_controlled_by(ControllerRef::You, type_filter),
++    }
++}
++
++/// Parse the Ward-of-Bones predicate frame (the subject is already stripped):
++/// "who controls more `<T0>` than you can't cast `<T0>` spells\[. the same is true
++/// for `<T1>` and `<T2>`\]\[.\]". `input` is the already-lowercase predicate.
++/// Returns `(count_type, primary_spell_type, continuation)` — the caller gates on
++/// `count_type == primary_spell_type` and full consumption. The continuation
++/// reuses the two-conjunct "and"-only "the same is true for" grammar.
++#[allow(clippy::type_complexity)]
++fn parse_relative_count_prohibition_frame(
++    input: &str,
++) -> OracleResult<'_, (TypeFilter, TypeFilter, Option<Vec<TypeFilter>>)> {
++    let (input, _) = tag::<_, _, OracleError<'_>>("who controls more ").parse(input)?;
++    let (input, count_type) = nom_target::parse_type_filter_word(input)?;
++    let (input, _) = tag(" than you can't cast ").parse(input)?;
++    let (input, spell_type) = nom_target::parse_type_filter_word(input)?;
++    let (input, _) = tag(" spells").parse(input)?;
++    let (input, continuation) = opt(preceded(
++        tag(". the same is true for "),
++        separated_list1(tag(" and "), nom_target::parse_type_filter_word),
++    ))
++    .parse(input)?;
++    let (input, _) = opt(tag(".")).parse(input)?;
++    Ok((input, (count_type, spell_type, continuation)))
++}
++
++/// CR 101.2 + CR 109.4 + CR 109.5 + CR 115.10 + CR 601.3a (Ward of Bones): "Each
++/// opponent who controls more `<T0>` than you can't cast `<T0>` spells\[. The same
++/// is true for `<T1>` and `<T2>`\]." — a *relative-count* cast prohibition.
++///
++/// Each type is an INDEPENDENT prohibition: an opponent controlling more `<Ti>`
++/// than you can't cast `<Ti>` spells, gated on its OWN "controls more `<Ti>` than
++/// you" count. This emits one `CantBeCast` static per type. Collapsing all types
++/// onto a single (creature) count is rules-incorrect per the card's 2008-08-01
++/// ruling: an opponent with more artifacts but not more creatures would be
++/// wrongly ALLOWED to cast artifact spells (and the converse wrongly prohibited).
++///
++/// The "the same is true for" continuation replicates the WHOLE sentence — both
++/// the count subject and the cast predicate — per type, so the count-type and the
++/// spell-type move together and are the SAME `TypeFilter` in each emitted static
++/// (the caller enforces `count_type == spell_type`). Mirrors the
++/// one-static-per-listed-item pattern of `parse_keyword_grant_from_exiled_object_static`
++/// (Rayami) and `parse_color_conditional_keyword_grants` (Scion of Draco).
++pub(crate) fn parse_relative_count_typed_cast_prohibitions(
++    text: &str,
++) -> Option<Vec<StaticDefinition>> {
++    let lower = text.to_lowercase();
++    let tp = TextPair::new(text, &lower);
++
++    // Subject → scope. Only opponent-scoped text is printed in this class.
++    let (who, predicate) = strip_casting_prohibition_subject(tp.lower)?;
++    if who != ProhibitionScope::Opponents {
++        return None;
++    }
++
++    let (rest, (count_type, spell_type, continuation)) =
++        parse_relative_count_prohibition_frame(predicate).ok()?;
++    // The whole frame must be consumed, and the count-type must name the same
++    // type as the primary spell-type ("more creatures … creature spells"); a
++    // leftover tail or a type mismatch means another parser should claim the line.
++    if !rest.trim().is_empty() || count_type != spell_type {
++        return None;
++    }
++
++    let mut types = vec![spell_type];
++    if let Some(more) = continuation {
++        types.extend(more);
++    }
++    // One independent static per type: an opponent controlling more `<Ti>` than
++    // you can't cast `<Ti>` spells (CR 601.3a), gated on that type's own count.
++    let defs = types
++        .into_iter()
++        .map(|tf| {
++            StaticDefinition::new(StaticMode::CantBeCast { who: who.clone() })
++                .affected(TargetFilter::Typed(TypedFilter::new(tf.clone())))
++                .per_player_condition(controls_more_than_you_condition(tf))
++                .description(text.to_string())
++        })
++        .collect();
++    Some(defs)
++}
++
+ /// CR 101.2: Parse casting prohibition from Oracle text.
+ /// Handles multiple patterns:
+ /// - "[Subject] can't cast [type] spells" (Steel Golem, Hymn of the Wilds)
+@@ -3114,6 +3264,198 @@ mod spend_any_color_to_activate_abilities_tests {
+     }
+ }
+ 
++#[cfg(test)]
++mod per_player_conditional_prohibition_tests {
++    use super::*;
++
++    fn parse(text: &str) -> StaticDefinition {
++        let lower = text.to_ascii_lowercase();
++        let tp = TextPair::new(text, &lower);
++        parse_per_player_conditional_prohibition(&tp, text)
++            .unwrap_or_else(|| panic!("line must lower to a per-player prohibition static: {text}"))
++    }
++
++    /// Helper: the count of `type_filter` permanents controlled by `ctrl`.
++    fn object_count(type_filter: TypeFilter, ctrl: ControllerRef) -> QuantityExpr {
++        QuantityExpr::Ref {
++            qty: QuantityRef::ObjectCount {
++                filter: TargetFilter::Typed(TypedFilter::new(type_filter).controller(ctrl)),
++            },
++        }
++    }
++
++    /// CR 101.2 + CR 109.4 + CR 115.10: Ward of Bones' first line lowers to THREE
++    /// INDEPENDENT `CantBeCast { Opponents }` statics — one per type
++    /// (creature/artifact/enchantment) — each `affected` by only THAT type's spells
++    /// and each gated on ITS OWN "controls more <that type> than you" count.
++    /// Modeling all three under a single creature count is rules-incorrect (the
++    /// card's 2008-08-01 ruling): an opponent with more artifacts but not more
++    /// creatures could still cast artifact spells.
++    #[test]
++    fn parses_ward_of_bones_first_line_as_independent_per_type_prohibitions() {
++        let defs = parse_relative_count_typed_cast_prohibitions(
++            "Each opponent who controls more creatures than you can't cast creature spells. \
++             The same is true for artifacts and enchantments.",
++        )
++        .expect("Ward of Bones must lower to per-type prohibitions");
++
++        // One static per type, in written order — NOT one Or-of-three under a
++        // shared creature count.
++        let expected = [
++            TypeFilter::Creature,
++            TypeFilter::Artifact,
++            TypeFilter::Enchantment,
++        ];
++        assert_eq!(
++            defs.len(),
++            expected.len(),
++            "one independent prohibition per type: {defs:?}"
++        );
++        for (def, tf) in defs.iter().zip(expected) {
++            assert_eq!(
++                def.mode,
++                StaticMode::CantBeCast {
++                    who: ProhibitionScope::Opponents
++                }
++            );
++            // Affected = ONLY this type's spells.
++            assert_eq!(
++                def.affected,
++                Some(TargetFilter::Typed(TypedFilter::new(tf.clone())))
++            );
++            // Gate = THIS type's own count (candidate `ScopedPlayer` GT `You`),
++            // not a shared creature count.
++            assert_eq!(
++                def.per_player_condition,
++                Some(ParsedCondition::QuantityComparison {
++                    lhs: object_count(tf.clone(), ControllerRef::ScopedPlayer),
++                    comparator: Comparator::GT,
++                    rhs: object_count(tf, ControllerRef::You),
++                })
++            );
++        }
++    }
++
++    /// The single-type shape (no "the same is true" continuation) yields exactly
++    /// one prohibition, gated on that type's own count.
++    #[test]
++    fn parses_single_type_without_continuation() {
++        let defs = parse_relative_count_typed_cast_prohibitions(
++            "Each opponent who controls more creatures than you can't cast creature spells.",
++        )
++        .expect("single-type relative-count prohibition must parse");
++        assert_eq!(defs.len(), 1, "exactly one prohibition: {defs:?}");
++        assert_eq!(
++            defs[0].affected,
++            Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)))
++        );
++        assert_eq!(
++            defs[0].per_player_condition,
++            Some(ParsedCondition::QuantityComparison {
++                lhs: object_count(TypeFilter::Creature, ControllerRef::ScopedPlayer),
++                comparator: Comparator::GT,
++                rhs: object_count(TypeFilter::Creature, ControllerRef::You),
++            })
++        );
++    }
++
++    /// Regression: the bare (untyped) "can't cast spells" Angelic Arbiter path is
++    /// unchanged by the new typed arm — no `affected` filter, and the turn-activity
++    /// predicate is preserved verbatim. Revert either the bare-arm ordering or the
++    /// turn-activity alt and this flips.
++    #[test]
++    fn bare_cast_spells_path_unchanged() {
++        let def = parse("Each opponent who attacked with a creature this turn can't cast spells.");
++        assert_eq!(
++            def.mode,
++            StaticMode::CantBeCast {
++                who: ProhibitionScope::Opponents
++            }
++        );
++        assert_eq!(def.affected, None);
++        assert_eq!(
++            def.per_player_condition,
++            Some(ParsedCondition::YouAttackedThisTurn)
++        );
++    }
++
++    /// The relative-count parser must DECLINE a bare (untyped) Angelic Arbiter
++    /// cast-lock — it carries no "controls more <type> than you" frame — so the
++    /// single-def per-player path claims it instead (proven by
++    /// `bare_cast_spells_path_unchanged` above). Guards against the multi-def arm
++    /// greedily swallowing every "Each opponent who … can't cast …" line.
++    #[test]
++    fn relative_count_parser_declines_bare_cast_spells() {
++        assert!(parse_relative_count_typed_cast_prohibitions(
++            "Each opponent who attacked with a creature this turn can't cast spells."
++        )
++        .is_none());
++    }
++
++    /// The count-type and the primary spell-type must name the SAME type. A
++    /// mismatched frame ("more creatures … can't cast artifact spells") is not a
++    /// printed card and must be declined, not silently mis-modeled.
++    #[test]
++    fn relative_count_parser_declines_type_mismatch() {
++        assert!(parse_relative_count_typed_cast_prohibitions(
++            "Each opponent who controls more creatures than you can't cast artifact spells."
++        )
++        .is_none());
++    }
++
++    /// CR 305.1 + CR 109.4 + CR 115.10 (Ward of Bones line 2): "Each opponent who
++    /// controls more lands than you can't play lands" lowers to a single
++    /// player-scoped `CantPlayLand` `Other` static — opponent-scoped via the
++    /// `affected` filter (the mode has no `who` field) and gated on the
++    /// per-affected-player "controls more lands than you" count. Revert either the
++    /// relative-count condition arm or the "play lands" verb branch and this parse
++    /// returns `None`, panicking the `parse` helper.
++    #[test]
++    fn parses_ward_of_bones_land_clause_as_conditional_cant_play_land() {
++        let def = parse("Each opponent who controls more lands than you can't play lands.");
++        assert_eq!(def.mode, StaticMode::Other("CantPlayLand".to_string()));
++        // Opponent scope rides on the affected filter (Other mode has no `who`).
++        assert_eq!(
++            def.affected,
++            Some(TargetFilter::Typed(
++                TypedFilter::default().controller(ControllerRef::Opponent)
++            ))
++        );
++        // Gate = "this opponent controls more lands than you" (ScopedPlayer GT You).
++        assert_eq!(
++            def.per_player_condition,
++            Some(ParsedCondition::QuantityComparison {
++                lhs: object_count(TypeFilter::Land, ControllerRef::ScopedPlayer),
++                comparator: Comparator::GT,
++                rhs: object_count(TypeFilter::Land, ControllerRef::You),
++            })
++        );
++    }
++
++    /// Regression: the UNCONDITIONAL "<subject> can't play lands" cards (Rock
++    /// Jockey, Limited Resources, plain "You can't play lands") carry no "who
++    /// controls more <type> than you" relative-clause frame, so the per-player
++    /// conditional parser must DECLINE them and let the generic `CantPlayLand`
++    /// dispatch in `dispatch.rs` claim them (unchanged). Revert the `who` /
++    /// relative-clause gates and the conditional parser would greedily swallow
++    /// every "can't play lands" line, dropping their unconditional enforcement.
++    #[test]
++    fn per_player_parser_declines_unconditional_cant_play_lands() {
++        for text in [
++            "You can't play lands.",
++            "Players can't play lands.",
++            "Each opponent can't play lands.",
++        ] {
++            let lower = text.to_ascii_lowercase();
++            let tp = TextPair::new(text, &lower);
++            assert!(
++                parse_per_player_conditional_prohibition(&tp, text).is_none(),
++                "unconditional line must not be claimed by the per-player parser: {text}"
++            );
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod filtered_spend_any_type_tests {
+     use super::*;
+diff --git a/crates/engine/src/parser/oracle_static/shared.rs b/crates/engine/src/parser/oracle_static/shared.rs
+index 077737eca4..812328090e 100644
+--- a/crates/engine/src/parser/oracle_static/shared.rs
++++ b/crates/engine/src/parser/oracle_static/shared.rs
+@@ -1723,6 +1723,17 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
+         return defs;
+     }
+ 
++    // CR 101.2 + CR 109.4 + CR 601.3a (Ward of Bones): "Each opponent who controls
++    // more <T0> than you can't cast <T0> spells. The same is true for <T1> and
++    // <T2>." — one INDEPENDENT relative-count cast prohibition per type, each gated
++    // on that type's own count. Must precede generic multi-sentence splitting,
++    // which would split the "the same is true for" continuation into a bogus
++    // standalone sentence and strand the count on the first type (the observed bug:
++    // every type gated on the single creature count).
++    if let Some(defs) = parse_relative_count_typed_cast_prohibitions(&stripped) {
++        return defs;
++    }
++
+     // CR 613.1f + CR 105.2 (Scion of Draco): "<subject> has <K0> if it's <C0>, …, and
+     // <Kn> if it's <Cn>." — the COLOR-qualified sibling of the exiled-object grant
+     // above: one independent grant per listed pair, each color folded into its own
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index e005591914..150179732c 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -788,6 +788,8 @@ mod vivien_invocation_reflexive_power;
+ mod vizier_of_many_faces_embalm_copy_panic_5278;
+ mod volatile_fault_that_player_search;
+ mod vraska_betrayals_sting;
++mod ward_of_bones_relative_count_cast_prohibition;
++mod ward_of_bones_relative_count_land_prohibition;
+ mod wedding_ring_etb_token_copy;
+ mod well_of_lost_dreams_may_pay_x;
+ mod wernog_riders_chaplain_investigate_count;
+diff --git a/crates/engine/tests/integration/ward_of_bones_relative_count_cast_prohibition.rs b/crates/engine/tests/integration/ward_of_bones_relative_count_cast_prohibition.rs
+new file mode 100644
+index 0000000000..bccd19e790
+--- /dev/null
++++ b/crates/engine/tests/integration/ward_of_bones_relative_count_cast_prohibition.rs
+@@ -0,0 +1,370 @@
++//! Ward of Bones — production-path proof that the *relative-count* cast
++//! prohibition is enforced PER TYPE, not collapsed onto one shared count.
++//!
++//! Oracle (verbatim first line): "Each opponent who controls more creatures than
++//! you can't cast creature spells. The same is true for artifacts and
++//! enchantments."
++//!
++//! CR 101.2 + CR 109.4 + CR 601.3a: each type is an INDEPENDENT prohibition — an
++//! opponent controlling more `<T>` than you can't cast `<T>` spells, gated on that
++//! type's OWN count. The parser now emits one `CantBeCast` static per type. These
++//! tests drive the REAL pre-payment gate (`can_cast_object_now` →
++//! `is_blocked_by_cant_be_cast_for`) and prove the cast is rejected ONLY for the
++//! type whose count comparison holds. Under the previous single-static model
++//! (one `Or[creature,artifact,enchantment]` gated on the creature count) the
++//! artifact/enchantment "allowed" assertions FAIL — an opponent with more
++//! creatures would be wrongly barred from every spell type. So each test is its
++//! own revert-probe. The "allowed" assertions also reach-guard the "blocked"
++//! ones: they prove a {0}-cost sorcery-speed spell is otherwise castable now, so
++//! the block is the prohibition, not a timing/mana artifact.
++
++use engine::game::casting::can_cast_object_now;
++use engine::game::layers::evaluate_layers;
++use engine::game::scenario::{GameScenario, P0, P1};
++use engine::types::format::FormatConfig;
++use engine::types::identifiers::ObjectId;
++use engine::types::mana::ManaCost;
++use engine::types::phase::Phase;
++use engine::types::player::PlayerId;
++
++// Verbatim first line (Scryfall). The second line ("controls more lands than you
++// can't play lands") is a separate land-play prohibition, inert for these cast
++// tests; parsing the whole first line proves the three cast statics are extracted
++// from the real multi-clause sentence.
++const WARD_OF_BONES_CAST_LINE: &str =
++    "Each opponent who controls more creatures than you can't cast creature spells. \
++     The same is true for artifacts and enchantments.";
++
++fn zero_creature_spell(
++    scenario: &mut GameScenario,
++    owner: engine::types::player::PlayerId,
++) -> ObjectId {
++    scenario
++        .add_creature_to_hand(owner, "Test Creature Spell", 1, 1)
++        .with_mana_cost(ManaCost::generic(0))
++        .id()
++}
++
++fn zero_artifact_spell(
++    scenario: &mut GameScenario,
++    owner: engine::types::player::PlayerId,
++) -> ObjectId {
++    scenario
++        .add_creature_to_hand(owner, "Test Artifact Spell", 0, 0)
++        .as_artifact()
++        .with_mana_cost(ManaCost::generic(0))
++        .id()
++}
++
++fn zero_enchantment_spell(
++    scenario: &mut GameScenario,
++    owner: engine::types::player::PlayerId,
++) -> ObjectId {
++    scenario
++        .add_creature_to_hand(owner, "Test Enchantment Spell", 0, 0)
++        .as_enchantment()
++        .with_mana_cost(ManaCost::generic(0))
++        .id()
++}
++
++/// P1 controls MORE creatures than P0 (2 vs 0) but NOT more artifacts (0 vs P0's
++/// Ward of Bones) nor more enchantments (0 vs 0). Only P1's CREATURE spell is
++/// prohibited; its artifact and enchantment spells stay castable.
++#[test]
++fn more_creatures_blocks_only_creature_spells() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Ward of Bones is an artifact P0 controls (so P0's artifact count is 1).
++    scenario
++        .add_creature(P0, "Ward of Bones", 0, 0)
++        .as_artifact()
++        .from_oracle_text(WARD_OF_BONES_CAST_LINE);
++
++    // P1 controls two creatures — strictly more than P0's zero.
++    scenario.add_creature(P1, "P1 Bear A", 2, 2);
++    scenario.add_creature(P1, "P1 Bear B", 2, 2);
++
++    let creature_spell = zero_creature_spell(&mut scenario, P1);
++    let artifact_spell = zero_artifact_spell(&mut scenario, P1);
++    let enchantment_spell = zero_enchantment_spell(&mut scenario, P1);
++
++    let mut runner = scenario.build();
++    // Sorcery-speed casts require it to be P1's main phase with an empty stack.
++    runner.state_mut().active_player = P1;
++    runner.state_mut().layers_dirty.mark_full();
++    evaluate_layers(runner.state_mut());
++
++    // CR 601.3a: P1 controls more creatures → creature spells prohibited.
++    assert!(
++        !can_cast_object_now(runner.state(), P1, creature_spell),
++        "P1 controls more creatures than you → creature spell must be prohibited"
++    );
++    // Per-type independence + reach-guard: P1 does NOT control more artifacts
++    // (0 vs Ward of Bones' 1), so the artifact spell stays castable. FAILS under
++    // the old single-Or-gated-on-creature-count model.
++    assert!(
++        can_cast_object_now(runner.state(), P1, artifact_spell),
++        "P1 does NOT control more artifacts than you → artifact spell must stay castable \
++         (revert-probe for the collapsed single-count model)"
++    );
++    assert!(
++        can_cast_object_now(runner.state(), P1, enchantment_spell),
++        "P1 does NOT control more enchantments than you → enchantment spell must stay castable"
++    );
++}
++
++/// The inverse: P1 controls MORE artifacts than P0 (2 vs Ward of Bones' 1) but NOT
++/// more creatures (0 vs 0). Only P1's ARTIFACT spell is prohibited; its creature
++/// spell stays castable. Together with the test above this pins the per-type
++/// discrimination in BOTH directions (the reviewer's creature-vs-artifact case).
++#[test]
++fn more_artifacts_blocks_only_artifact_spells() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    scenario
++        .add_creature(P0, "Ward of Bones", 0, 0)
++        .as_artifact()
++        .from_oracle_text(WARD_OF_BONES_CAST_LINE);
++
++    // P1 controls two artifacts — strictly more than P0's one (Ward of Bones).
++    scenario.add_creature(P1, "P1 Relic A", 0, 0).as_artifact();
++    scenario.add_creature(P1, "P1 Relic B", 0, 0).as_artifact();
++
++    let creature_spell = zero_creature_spell(&mut scenario, P1);
++    let artifact_spell = zero_artifact_spell(&mut scenario, P1);
++
++    let mut runner = scenario.build();
++    runner.state_mut().active_player = P1;
++    runner.state_mut().layers_dirty.mark_full();
++    evaluate_layers(runner.state_mut());
++
++    // CR 601.3a: P1 controls more artifacts → artifact spells prohibited.
++    assert!(
++        !can_cast_object_now(runner.state(), P1, artifact_spell),
++        "P1 controls more artifacts than you → artifact spell must be prohibited"
++    );
++    // Per-type independence + reach-guard: P1 does NOT control more creatures
++    // (0 vs 0), so the creature spell stays castable — the SAME creature spell the
++    // first test proves is blocked when P1 has more creatures.
++    assert!(
++        can_cast_object_now(runner.state(), P1, creature_spell),
++        "P1 does NOT control more creatures than you → creature spell must stay castable \
++         (revert-probe for the collapsed single-count model)"
++    );
++}
++
++/// The ENCHANTMENT arm of the per-type independence. P1 controls MORE enchantments
++/// than P0 (1 vs 0) but NOT more creatures (0 vs 0) nor more artifacts (0 vs Ward
++/// of Bones' 1). Only P1's ENCHANTMENT spell is prohibited; its creature and
++/// artifact spells stay castable. The existing tests never proved an enchantment
++/// cast is BLOCKED — this closes that gap and, together with the creature/artifact
++/// tests, pins the enchantment count as its OWN independent gate.
++#[test]
++fn more_enchantments_blocks_only_enchantment_spells() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Ward of Bones is an artifact P0 controls (P0 artifacts = 1, creatures = 0,
++    // enchantments = 0).
++    scenario
++        .add_creature(P0, "Ward of Bones", 0, 0)
++        .as_artifact()
++        .from_oracle_text(WARD_OF_BONES_CAST_LINE);
++
++    // P1 controls a single enchantment permanent — strictly more than P0's zero.
++    // `as_enchantment` strips the creature type, so this counts ONLY as an
++    // enchantment (not toward P1's creature count).
++    scenario
++        .add_creature(P1, "P1 Enchantment", 0, 0)
++        .as_enchantment();
++
++    let creature_spell = zero_creature_spell(&mut scenario, P1);
++    let artifact_spell = zero_artifact_spell(&mut scenario, P1);
++    let enchantment_spell = zero_enchantment_spell(&mut scenario, P1);
++
++    let mut runner = scenario.build();
++    runner.state_mut().active_player = P1;
++    runner.state_mut().layers_dirty.mark_full();
++    evaluate_layers(runner.state_mut());
++
++    // CR 601.3a: P1 controls more enchantments → enchantment spells prohibited.
++    assert!(
++        !can_cast_object_now(runner.state(), P1, enchantment_spell),
++        "P1 controls more enchantments than you → enchantment spell must be prohibited"
++    );
++    // Per-type independence + reach-guard: P1 does NOT control more creatures
++    // (0 vs 0) nor more artifacts (0 vs Ward of Bones' 1), so those spells stay
++    // castable. FAILS under any model that collapses the enchantment gate onto a
++    // shared (creature) count.
++    assert!(
++        can_cast_object_now(runner.state(), P1, creature_spell),
++        "P1 does NOT control more creatures than you → creature spell must stay castable"
++    );
++    assert!(
++        can_cast_object_now(runner.state(), P1, artifact_spell),
++        "P1 does NOT control more artifacts than you → artifact spell must stay castable"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// Two-Headed Giant: "each opponent" must not treat a TEAMMATE as an opponent
++// on the CAST seam (sibling of the land-play fix).
++//
++// CR 102.2 / CR 102.3 + CR 810.1: In a multiplayer team game a player's
++// opponents are only players NOT on their team. Ward of Bones' three per-type
++// prohibitions lower to `CantBeCast { who: ProhibitionScope::Opponents }`; the
++// cast gate consumes them through `casting_prohibition_scope_matches` →
++// `prohibition_scope_matches_player`, whose `Opponents` arm previously used the
++// naive inequality `player != source_obj.controller`. In Two-Headed Giant, P0
++// and P1 are TEAMMATES with different ids, so that inequality wrongly barred a
++// teammate from CASTING. Routing the arm through the team-aware `is_opponent`
++// authority fixes every `CantBeCast`/Opponents static; in a two-player game
++// `is_opponent` reduces to `!=`, so the tests above are unchanged.
++// ---------------------------------------------------------------------------
++
++/// Player 2 (opposing team, seat 2). Under the Two-Headed Giant
++/// `FixedTeams { team_size: 2 }` topology, team A = {P0, P1}, team B = {P2, P3}.
++const P2: PlayerId = PlayerId(2);
++
++/// Build a 4-player Two-Headed Giant board (team A = {P0, P1}, team B =
++/// {P2, P3}). P0 controls Ward of Bones (an artifact) plus one creature, so
++/// P0's creature count is 1 and artifact count is 1. Teammate P1 and opponent
++/// P2 each control 3 creatures — strictly MORE than P0's 1 — so Ward's "controls
++/// more creatures than you" per-player predicate holds for BOTH; the only
++/// difference between them is team membership. Each of P1 and P2 holds a {0}
++/// creature spell (the prohibition's subject) and a {0} noncreature-artifact
++/// spell (a reach-guard: neither controls more artifacts than P0, so the
++/// artifact prohibition never fires and its castability proves the sorcery-speed
++/// window and mana are otherwise clear). Returns the runner (switched to the
++/// Two-Headed Giant topology) plus P1's and P2's creature and artifact spell ids.
++fn two_hg_ward_cast_scenario() -> (
++    engine::game::scenario::GameRunner,
++    ObjectId, // P1 creature spell
++    ObjectId, // P1 artifact spell
++    ObjectId, // P2 creature spell
++    ObjectId, // P2 artifact spell
++) {
++    let mut scenario = GameScenario::new_n_player(4, 42);
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Ward of Bones is an artifact P0 controls (P0 artifacts = 1, creatures = 0
++    // from Ward itself). Parse the full first line so all three CantBeCast
++    // statics exist.
++    scenario
++        .add_creature(P0, "Ward of Bones", 0, 0)
++        .as_artifact()
++        .from_oracle_text(WARD_OF_BONES_CAST_LINE);
++
++    // P0 controls exactly one creature → the relative-count threshold is 1.
++    scenario.add_creature(P0, "P0 Bear", 2, 2);
++
++    // Teammate P1 and opponent P2: 3 creatures each — strictly MORE than P0's 1.
++    for i in 0..3 {
++        scenario.add_creature(P1, &format!("P1 Bear {i}"), 2, 2);
++        scenario.add_creature(P2, &format!("P2 Bear {i}"), 2, 2);
++    }
++
++    let p1_creature = zero_creature_spell(&mut scenario, P1);
++    let p1_artifact = zero_artifact_spell(&mut scenario, P1);
++    let p2_creature = zero_creature_spell(&mut scenario, P2);
++    let p2_artifact = zero_artifact_spell(&mut scenario, P2);
++
++    let mut runner = scenario.build();
++    {
++        let state = runner.state_mut();
++        // CR 810.1 + CR 102.3: switch to the Two-Headed Giant topology so P0/P1
++        // are teammates and P2/P3 are the opposing team. `is_opponent` reads
++        // `format_config.topology()`, so this is the single field that makes the
++        // team relationships real for the runtime cast gate.
++        state.format_config = FormatConfig::two_headed_giant();
++        state.layers_dirty.mark_full();
++    }
++    evaluate_layers(runner.state_mut());
++    (runner, p1_creature, p1_artifact, p2_creature, p2_artifact)
++}
++
++/// DISCRIMINATING + positive-control + reach-guard on the CAST seam.
++///
++/// Both the teammate P1 and the opponent P2 control MORE creatures than Ward's
++/// controller P0 (3 vs 1), so Ward's per-player creature predicate holds for
++/// BOTH. The ONLY axis separating them is team membership — exactly what the
++/// team-aware `is_opponent` fix discriminates on. The prohibition-scope check
++/// (`prohibition_scope_matches_player`) is turn-INDEPENDENT — it reads only
++/// controller/team relationships — so each caster is made the active player when
++/// its own cast is probed (exactly as the two-player cast tests above do). This
++/// satisfies the CR 307.1 sorcery-speed active-player timing gate and isolates
++/// the pure opponent-scope determination the fix touches. (The separate question
++/// of whether a NON-active teammate may cast a sorcery-speed spell under shared
++/// team turns lives in `check_spell_timing` and is out of scope for this fix.)
++///
++/// - Teammate P1 CAN cast a creature spell (DISCRIMINATING): under the old
++///   `player != source_obj.controller` arm, P1 != P0 made P1 an "opponent", the
++///   creature predicate held (3 > 1), and the cast was wrongly blocked. The fix
++///   recognizes P1 as a teammate (`is_opponent(P0, P1) == false`), so the static
++///   never applies. Revert-probe: reverting the arm to `!=` flips this assertion
++///   to failure (verified locally — reverted → this assertion fails → restored).
++/// - Opposing P2 CANNOT cast a creature spell (positive control): P2 is on the
++///   other team, `is_opponent(P0, P2)` holds, the predicate fires, and the cast
++///   stays prohibited — the fix narrows "opponent" to the other team WITHOUT
++///   disabling the prohibition for true opponents.
++/// - Reach-guards: each player's {0} noncreature-artifact spell is castable now
++///   (neither controls more artifacts than P0, so the artifact prohibition never
++///   fires), proving the creature-spell block is the prohibition itself and not a
++///   timing or mana artifact.
++#[test]
++fn two_headed_giant_teammate_can_cast_but_true_opponent_cannot() {
++    let (mut runner, p1_creature, p1_artifact, p2_creature, p2_artifact) =
++        two_hg_ward_cast_scenario();
++
++    // --- Probe teammate P1's own casts (P1 active). CR 307.1: making P1 the
++    // active player satisfies the sorcery-speed timing gate; the opponent-scope
++    // determination the fix touches is turn-independent, so team membership
++    // (P0/P1 same team) is the only axis in play. ---
++    runner.state_mut().active_player = P1;
++    runner.state_mut().layers_dirty.mark_full();
++    evaluate_layers(runner.state_mut());
++
++    // DISCRIMINATING: teammate P1 controls more creatures than P0 (3 > 1) but is
++    // NOT an opponent → the creature prohibition must not apply. FAILS under the
++    // old `!=` opponent check.
++    assert!(
++        can_cast_object_now(runner.state(), P1, p1_creature),
++        "P1 is P0's TEAMMATE in Two-Headed Giant, not an opponent → Ward of Bones \
++         must NOT block P1's creature spell even though P1 controls more creatures \
++         than P0 (revert-probe for the naive `!=` opponent check)"
++    );
++    // Reach-guard for P1: the noncreature-artifact spell is castable (P1 controls
++    // 0 artifacts, not more than P0's 1), proving P1's sorcery-speed timing and
++    // mana are clear and the creature-cast permission above is genuine.
++    assert!(
++        can_cast_object_now(runner.state(), P1, p1_artifact),
++        "P1 does NOT control more artifacts than P0 → the artifact prohibition never \
++         fires; the spell must be castable (reach-guard: timing/mana are clear)"
++    );
++
++    // --- Probe true opponent P2's own casts (P2 active), satisfying the same
++    // sorcery-speed timing gate for P2's creature/artifact spells. ---
++    runner.state_mut().active_player = P2;
++    runner.state_mut().layers_dirty.mark_full();
++    evaluate_layers(runner.state_mut());
++
++    // Positive control: true opponent P2 controls more creatures than P0 (3 > 1)
++    // → the creature prohibition still fires for a real opponent.
++    assert!(
++        !can_cast_object_now(runner.state(), P2, p2_creature),
++        "P2 is a true opponent controlling more creatures than P0 → Ward of Bones \
++         must still block P2's creature spell"
++    );
++    // Reach-guard for P2: the noncreature-artifact spell IS castable now (P2
++    // controls 0 artifacts, not more than P0's 1), proving P2's creature-spell
++    // block above is the creature prohibition itself — not a sorcery-speed-window,
++    // priority, or mana artifact that would suppress every one of P2's spells.
++    assert!(
++        can_cast_object_now(runner.state(), P2, p2_artifact),
++        "P2 does NOT control more artifacts than P0 → the artifact prohibition never \
++         fires; the spell must be castable (reach-guard: P2's block is the creature \
++         prohibition, not a timing/mana artifact)"
++    );
++}
+diff --git a/crates/engine/tests/integration/ward_of_bones_relative_count_land_prohibition.rs b/crates/engine/tests/integration/ward_of_bones_relative_count_land_prohibition.rs
+new file mode 100644
+index 0000000000..5badbe3366
+--- /dev/null
++++ b/crates/engine/tests/integration/ward_of_bones_relative_count_land_prohibition.rs
+@@ -0,0 +1,368 @@
++//! Ward of Bones — production-path proof that the *relative-count* LAND-PLAY
++//! prohibition (the card's second line) is enforced per the per-player land
++//! count, not collapsed onto an unconditional opponent lock.
++//!
++//! Oracle (verbatim second line): "Each opponent who controls more lands than you
++//! can't play lands."
++//!
++//! CR 305.1 + CR 109.4 + CR 109.5 + CR 115.10: an opponent may play a land only
++//! while they do NOT control more lands than Ward of Bones' controller. Under the
++//! previous model this line lowered to an UNCONDITIONAL `CantPlayLand` opponent
++//! lock — the "controls more lands than you" relative-count predicate was dropped,
++//! so an opponent with FEWER/EQUAL lands was wrongly barred. These tests drive the
++//! REAL play-land special action (`GameAction::PlayLand` through `apply()` →
++//! `handle_play_land` → `player_has_static_other(.., "CantPlayLand")`) and prove
++//! the play is rejected ONLY when the opponent's land count exceeds yours.
++//!
++//! The equal-count test is the reach-guard for the blocked test: same board shape,
++//! same active-player/priority/phase, but P1's land count equals P0's — the play
++//! now succeeds, proving the rejection is the relative-count prohibition, not a
++//! land-limit, phase, or priority artifact. Revert the runtime
++//! `check_static_other_by_name` per-player gate and the equal-count play is
++//! wrongly rejected; revert the parser "play lands" branch and neither play is
++//! blocked (the line lowers to an unconditional lock or falls through).
++
++use engine::game::layers::evaluate_layers;
++use engine::game::scenario::{GameScenario, P0, P1};
++use engine::game::EngineError;
++use engine::types::actions::GameAction;
++use engine::types::format::FormatConfig;
++use engine::types::game_state::WaitingFor;
++use engine::types::mana::ManaColor;
++use engine::types::phase::Phase;
++use engine::types::player::PlayerId;
++
++// Verbatim full Oracle text (Scryfall). Parsing BOTH lines proves the land clause
++// is extracted from the real multi-line card alongside the three cast statics; the
++// cast statics are inert for a land play (they gate spell casts, not land drops).
++const WARD_OF_BONES_ORACLE: &str =
++    "Each opponent who controls more creatures than you can't cast creature spells. \
++     The same is true for artifacts and enchantments.\n\
++     Each opponent who controls more lands than you can't play lands.";
++
++/// Build a Ward-of-Bones board: P0 controls Ward of Bones (an artifact) plus
++/// `p0_lands` basic lands; P1 controls `p1_lands` basic lands and holds one land
++/// in hand. Returns the runner (with P1 active, holding priority, in a main phase)
++/// and P1's hand-land `ObjectId`.
++fn ward_of_bones_land_scenario(
++    p0_lands: usize,
++    p1_lands: usize,
++) -> (
++    engine::game::scenario::GameRunner,
++    engine::types::identifiers::ObjectId,
++) {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++
++    // Ward of Bones is an artifact (never a land) — it does not count toward either
++    // player's land total.
++    scenario
++        .add_creature(P0, "Ward of Bones", 0, 0)
++        .as_artifact()
++        .from_oracle_text(WARD_OF_BONES_ORACLE);
++
++    let colors = [
++        ManaColor::White,
++        ManaColor::Blue,
++        ManaColor::Black,
++        ManaColor::Red,
++        ManaColor::Green,
++    ];
++    for i in 0..p0_lands {
++        scenario.add_basic_land(P0, colors[i % colors.len()]);
++    }
++    for i in 0..p1_lands {
++        scenario.add_basic_land(P1, colors[i % colors.len()]);
++    }
++
++    let hand_land = scenario.add_land_to_hand(P1, "P1 Land Drop").id();
++
++    let mut runner = scenario.build();
++    {
++        let state = runner.state_mut();
++        // Sorcery-speed land play requires P1's own main phase, empty stack, and
++        // P1 holding priority.
++        state.active_player = P1;
++        state.priority_player = P1;
++        state.waiting_for = WaitingFor::Priority { player: P1 };
++        state.lands_played_this_turn = 0;
++        state.layers_dirty.mark_full();
++    }
++    evaluate_layers(runner.state_mut());
++    (runner, hand_land)
++}
++
++/// Submit P1's play-land special action through the real `apply()` pipeline.
++fn play_hand_land(
++    runner: &mut engine::game::scenario::GameRunner,
++    hand_land: engine::types::identifiers::ObjectId,
++) -> Result<engine::types::game_state::ActionResult, EngineError> {
++    let card_id = runner.state().objects[&hand_land].card_id;
++    runner.act(GameAction::PlayLand {
++        object_id: hand_land,
++        card_id,
++    })
++}
++
++/// P1 controls MORE lands than P0 (2 vs 1). CR 305.2: the play-land special action
++/// is suppressed for P1 — `handle_play_land` rejects it via the per-player
++/// `CantPlayLand` gate.
++#[test]
++fn more_lands_blocks_opponent_land_play() {
++    let (mut runner, hand_land) = ward_of_bones_land_scenario(1, 2);
++
++    let result = play_hand_land(&mut runner, hand_land);
++
++    // Specifically the CantPlayLand gate — not a land-limit, phase, or priority
++    // rejection. The message text is the CR 305.2 gate's own.
++    assert!(
++        matches!(&result, Err(EngineError::ActionNotAllowed(msg)) if msg.contains("CantPlayLand")),
++        "P1 controls more lands than you → the land play must be rejected by the \
++         CantPlayLand gate, got {result:?}"
++    );
++    // The land never left P1's hand.
++    assert_eq!(
++        runner.state().objects[&hand_land].zone,
++        engine::types::zones::Zone::Hand,
++        "the rejected land must remain in P1's hand"
++    );
++}
++
++/// Reach-guard + boundary: P1 controls EQUAL lands to P0 (2 vs 2). "Controls more
++/// lands than you" is strict (`Comparator::GT`), so an equal count does NOT bar
++/// P1 — the SAME play-land action the blocked test rejects now succeeds. This
++/// proves the block above is the relative-count prohibition, not a timing/limit
++/// artifact, and pins the GT strictness (revert the runtime per-player gate and
++/// this play is wrongly rejected).
++#[test]
++fn equal_lands_allows_opponent_land_play() {
++    let (mut runner, hand_land) = ward_of_bones_land_scenario(2, 2);
++
++    let result = play_hand_land(&mut runner, hand_land);
++
++    assert!(
++        result.is_ok(),
++        "P1 controls EQUAL (not more) lands than you → the land play must succeed \
++         (GT is strict): {result:?}"
++    );
++    // The land actually resolved onto the battlefield under P1's control.
++    let land = &runner.state().objects[&hand_land];
++    assert_eq!(
++        land.zone,
++        engine::types::zones::Zone::Battlefield,
++        "the permitted land must have entered the battlefield"
++    );
++    assert_eq!(land.controller, PlayerId(1), "P1 controls the played land");
++}
++
++/// Reach-guard (fewer): P1 controls FEWER lands than P0 (1 vs 3). Clearly below the
++/// threshold — the land play succeeds. Complements the equal-count boundary case.
++#[test]
++fn fewer_lands_allows_opponent_land_play() {
++    let (mut runner, hand_land) = ward_of_bones_land_scenario(3, 1);
++
++    let result = play_hand_land(&mut runner, hand_land);
++
++    assert!(
++        result.is_ok(),
++        "P1 controls fewer lands than you → the land play must succeed: {result:?}"
++    );
++}
++
++// ---------------------------------------------------------------------------
++// Two-Headed Giant: "each opponent" must not treat a TEAMMATE as an opponent.
++//
++// CR 102.2 / CR 102.3 + CR 810.1: In a multiplayer team game a player's
++// opponents are only players NOT on their team. Ward of Bones' land prohibition
++// lowers to `CantPlayLand` with `affected = TypedFilter{controller: Opponent}`;
++// the player-context branch that consumes it (`static_filter_matches`, the
++// `ControllerRef::Opponent` arm) previously implemented "opponent" as the naive
++// inequality `source_controller != player_id`. In Two-Headed Giant, P0 and P1
++// are TEAMMATES with different ids, so that inequality wrongly barred a teammate
++// from playing lands. Routing the arm through the team-aware `is_opponent`
++// authority fixes EVERY `Other`-mode static with an `Opponent` filter; in a
++// two-player game `is_opponent` reduces to `!=`, so the tests above are
++// unchanged.
++// ---------------------------------------------------------------------------
++
++/// Player 2 (opposing team, seat 2). Under the Two-Headed Giant
++/// `FixedTeams { team_size: 2 }` topology, team A = {P0, P1} and team B =
++/// {P2, P3}.
++const P2: PlayerId = PlayerId(2);
++
++/// Build a 4-player Two-Headed Giant board (team A = {P0, P1}, team B =
++/// {P2, P3}). P0 controls Ward of Bones (an artifact) plus 2 lands. Teammate P1
++/// and opponent P2 each control 4 lands — strictly MORE than P0 — and hold one
++/// land in hand; P0 also holds a land in hand for the controller reach-guard.
++/// Returns the runner (switched to the Two-Headed Giant topology) plus P0's,
++/// P1's, and P2's hand-land `ObjectId`s.
++fn two_hg_ward_scenario() -> (
++    engine::game::scenario::GameRunner,
++    engine::types::identifiers::ObjectId,
++    engine::types::identifiers::ObjectId,
++    engine::types::identifiers::ObjectId,
++) {
++    let mut scenario = GameScenario::new_n_player(4, 42);
++    scenario.at_phase(Phase::PreCombatMain);
++
++    scenario
++        .add_creature(P0, "Ward of Bones", 0, 0)
++        .as_artifact()
++        .from_oracle_text(WARD_OF_BONES_ORACLE);
++
++    let colors = [
++        ManaColor::White,
++        ManaColor::Blue,
++        ManaColor::Black,
++        ManaColor::Red,
++        ManaColor::Green,
++    ];
++    // P0 (Ward's controller): 2 lands.
++    for i in 0..2 {
++        scenario.add_basic_land(P0, colors[i % colors.len()]);
++    }
++    // Teammate P1 and opponent P2: 4 lands each — strictly MORE than P0's 2, so
++    // Ward's "controls more lands than you" relative-count predicate holds for
++    // BOTH. The only difference between them is team membership, which is exactly
++    // the axis the fix must discriminate on.
++    for i in 0..4 {
++        scenario.add_basic_land(P1, colors[i % colors.len()]);
++        scenario.add_basic_land(P2, colors[i % colors.len()]);
++    }
++
++    let p0_hand = scenario.add_land_to_hand(P0, "P0 Land Drop").id();
++    let p1_hand = scenario.add_land_to_hand(P1, "P1 Land Drop").id();
++    let p2_hand = scenario.add_land_to_hand(P2, "P2 Land Drop").id();
++
++    let mut runner = scenario.build();
++    {
++        let state = runner.state_mut();
++        // CR 810.1 + CR 102.3: switch to the Two-Headed Giant topology so P0/P1
++        // are teammates and P2/P3 are the opposing team. `is_opponent` reads
++        // `format_config.topology()`, so this is the single field that makes the
++        // team relationships real for the runtime gate.
++        state.format_config = FormatConfig::two_headed_giant();
++        state.layers_dirty.mark_full();
++    }
++    evaluate_layers(runner.state_mut());
++    (runner, p0_hand, p1_hand, p2_hand)
++}
++
++/// Submit `actor`'s play-land action during `active`'s (team's) turn through the
++/// real `apply()` pipeline. Resets every player's per-turn land count (under
++/// shared team turns `handle_play_land` reads the per-player counter) so the
++/// once-per-turn allowance can never mask the `CantPlayLand` gate.
++fn play_land_during_team_turn(
++    runner: &mut engine::game::scenario::GameRunner,
++    active: PlayerId,
++    actor: PlayerId,
++    hand_land: engine::types::identifiers::ObjectId,
++) -> Result<engine::types::game_state::ActionResult, EngineError> {
++    {
++        let state = runner.state_mut();
++        // CR 805.4c: under shared team turns any player on the active team may
++        // play a land during that team's turn; `active` is the team's nominal
++        // active player, `actor` is the teammate submitting the land drop.
++        state.active_player = active;
++        state.priority_player = actor;
++        state.waiting_for = WaitingFor::Priority { player: actor };
++        for p in state.players.iter_mut() {
++            p.lands_played_this_turn = 0;
++        }
++        state.lands_played_this_turn = 0;
++        state.layers_dirty.mark_full();
++    }
++    evaluate_layers(runner.state_mut());
++    let card_id = runner.state().objects[&hand_land].card_id;
++    runner.act(GameAction::PlayLand {
++        object_id: hand_land,
++        card_id,
++    })
++}
++
++/// DISCRIMINATING ASSERTION: it is team A's turn (P0 active) and the non-active
++/// teammate P1 — who controls MORE lands than P0 (4 vs 2) — plays a land.
++///
++/// Under the OLD `source_controller != player_id` opponent check, Ward's
++/// `CantPlayLand`/Opponent static matched P1 (P1 != P0) and the relative-count
++/// predicate (4 > 2) held, so `player_has_static_other(state, P1, "CantPlayLand")`
++/// returned true and `handle_play_land` REJECTED P1's land play. The team-aware
++/// `is_opponent` fix recognizes P1 as a TEAMMATE (`is_opponent(P0, P1) == false`),
++/// so the static never applies and the play succeeds.
++///
++/// This assertion FLIPS if the `is_opponent` change is reverted: revert it and
++/// `result` becomes `Err(ActionNotAllowed("... CantPlayLand ..."))` and the land
++/// stays in P1's hand, failing the `result.is_ok()` and battlefield-zone checks.
++#[test]
++fn two_headed_giant_teammate_is_not_treated_as_opponent() {
++    let (mut runner, _p0_hand, p1_hand, _p2_hand) = two_hg_ward_scenario();
++
++    let result = play_land_during_team_turn(&mut runner, P0, P1, p1_hand);
++
++    assert!(
++        result.is_ok(),
++        "P1 is P0's TEAMMATE in Two-Headed Giant, not an opponent → Ward of Bones \
++         (\"each opponent who controls more lands than you can't play lands\") must \
++         NOT block P1's land play even though P1 controls more lands than P0: \
++         {result:?}"
++    );
++    let land = &runner.state().objects[&p1_hand];
++    assert_eq!(
++        land.zone,
++        engine::types::zones::Zone::Battlefield,
++        "the teammate's permitted land must have entered the battlefield"
++    );
++    assert_eq!(land.controller, P1, "P1 controls the played land");
++}
++
++/// POSITIVE CONTROL: it is team B's turn (P2 active) and the true opponent P2 —
++/// who controls MORE lands than Ward's controller P0 (4 vs 2) — attempts a land
++/// play. P2 is on the OTHER team, so `is_opponent(P0, P2)` holds and the
++/// relative-count predicate fires: the play must still be rejected by the
++/// CR 305.2 `CantPlayLand` gate. This proves the team-aware fix narrows
++/// "opponent" to the other team WITHOUT disabling the prohibition for real
++/// opponents.
++#[test]
++fn two_headed_giant_true_opponent_land_play_still_blocked() {
++    let (mut runner, _p0_hand, _p1_hand, p2_hand) = two_hg_ward_scenario();
++
++    let result = play_land_during_team_turn(&mut runner, P2, P2, p2_hand);
++
++    // The `msg.contains("CantPlayLand")` assertion doubles as the reach-guard: it
++    // proves the action passed the phase, team-membership, and land-limit gates
++    // and was rejected SPECIFICALLY by the CR 305.2 CantPlayLand static — not by
++    // an unrelated upstream short-circuit (e.g. wrong phase or "only the active
++    // team may play lands").
++    assert!(
++        matches!(&result, Err(EngineError::ActionNotAllowed(msg)) if msg.contains("CantPlayLand")),
++        "P2 is a true opponent controlling more lands than P0 → the land play must \
++         be rejected by the CantPlayLand gate, got {result:?}"
++    );
++    assert_eq!(
++        runner.state().objects[&p2_hand].zone,
++        engine::types::zones::Zone::Hand,
++        "the rejected land must remain in P2's hand"
++    );
++}
++
++/// REACH-GUARD: Ward's own controller P0 is never their own opponent
++/// (`is_opponent(P0, P0) == false`), so the `CantPlayLand`/Opponent static never
++/// applies to P0 regardless of land counts — P0 plays a land normally during
++/// team A's turn.
++#[test]
++fn two_headed_giant_ward_controller_can_play_land() {
++    let (mut runner, p0_hand, _p1_hand, _p2_hand) = two_hg_ward_scenario();
++
++    let result = play_land_during_team_turn(&mut runner, P0, P0, p0_hand);
++
++    assert!(
++        result.is_ok(),
++        "P0 is never their own opponent → Ward of Bones must not block its own \
++         controller's land play: {result:?}"
++    );
++    assert_eq!(
++        runner.state().objects[&p0_hand].zone,
++        engine::types::zones::Zone::Battlefield,
++        "the controller's permitted land must have entered the battlefield"
++    );
++}

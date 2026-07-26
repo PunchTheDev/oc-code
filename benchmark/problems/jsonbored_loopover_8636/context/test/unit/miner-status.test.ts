@@ -1,0 +1,544 @@
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { resolveEventLedgerDbPath } from "../../packages/loopover-miner/lib/event-ledger.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  buildEngineVersionDisplay,
+  buildEngineVersionSkewCheck,
+  checkCodingAgentCredential,
+  checkGitHubTokenPresent,
+  checkConfigContent,
+  collectStatus,
+  compareInstalledEngineVersion,
+  readExpectedEnginePackageVersion,
+  readExpectedEnginePackageVersionFromPaths,
+  readInstalledEnginePackageVersion,
+  readInstalledEnginePackageVersionFromPaths,
+  resolveMinerStateDir,
+  runDoctor,
+  runDoctorChecks,
+  runStatus,
+} from "../../packages/loopover-miner/lib/status.js";
+import { initLaptopState } from "../../packages/loopover-miner/lib/laptop-init.js";
+
+// Read live, never hardcode: a hardcoded snapshot of this range (e.g. "^3.0.0") goes stale the moment
+// packages/loopover-miner/package.json's @loopover/engine dependency is bumped by a real release, and
+// silently starts asserting the WRONG expected value instead of failing loudly (confirmed live: the
+// linked-versions release group, #7123, bumped it to ^3.2.1 and broke a hardcoded "^3.0.0" here).
+const DECLARED_ENGINE_DEPENDENCY_RANGE: string = JSON.parse(
+  readFileSync("packages/loopover-miner/package.json", "utf8"),
+).dependencies["@loopover/engine"];
+
+const roots: string[] = [];
+
+function tempRoot() {
+  const root = mkdtempSync(join(tmpdir(), "loopover-miner-status-"));
+  roots.push(root);
+  return root;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+/** Creates an executable file `name` in a fresh bin dir and returns that dir (usable directly as PATH). */
+function fakeBinDir(name: string): string {
+  const dir = tempRoot();
+  writeFileSync(join(dir, name), "#!/bin/sh\n");
+  chmodSync(join(dir, name), 0o755);
+  return dir;
+}
+
+describe("loopover-miner status/doctor (#2288)", () => {
+  it("resolves the state dir from the config-dir override, XDG, then the home default", () => {
+    expect(resolveMinerStateDir({ LOOPOVER_MINER_CONFIG_DIR: "/custom/state" })).toBe("/custom/state");
+    expect(resolveMinerStateDir({ XDG_CONFIG_HOME: "/xdg" })).toBe(join("/xdg", "loopover-miner"));
+    expect(resolveMinerStateDir({})).toBe(join(homedir(), ".config", "loopover-miner"));
+  });
+
+  it("collectStatus reports the installed versions, state dir, and config-file discovery", () => {
+    const root = tempRoot();
+    writeFileSync(join(root, ".loopover-miner.yml"), "minerEnabled: true\n");
+    const status = collectStatus({ LOOPOVER_MINER_CONFIG_DIR: join(root, "state") }, root);
+    expect(status.package.name).toBe("@loopover/miner");
+    expect(typeof status.package.version).toBe("string");
+    expect(status.engine.name).toBe("@loopover/engine");
+    expect(status.stateDir).toBe(join(root, "state"));
+    expect(status.configFile).toBe(join(root, ".loopover-miner.yml")); // discovered
+  });
+
+  it("REGRESSION: collectStatus reports the REAL installed engine version, not the declared dependency range", () => {
+    const root = tempRoot();
+    const status = collectStatus({ LOOPOVER_MINER_CONFIG_DIR: join(root, "state") }, root);
+    // A self-hoster asking "what's installed" needs the real resolved semver (matching what doctor's own
+    // engine-version-skew check already shows), not the declared dependency range.
+    expect(status.engine.version).toBe(readInstalledEnginePackageVersion());
+    expect(status.engine.version).not.toBe(DECLARED_ENGINE_DEPENDENCY_RANGE);
+  });
+
+  it("buildEngineVersionDisplay prefers a real resolved version when available", () => {
+    expect(buildEngineVersionDisplay(() => "9.9.9")).toBe("9.9.9");
+  });
+
+  it("REGRESSION: buildEngineVersionDisplay falls back to the declared dependency range when real resolution comes up empty", () => {
+    expect(buildEngineVersionDisplay(() => null)).toBe(DECLARED_ENGINE_DEPENDENCY_RANGE);
+  });
+
+  it("collectStatus prefers LOOPOVER_MINER_VERSION over package.json (#4310)", () => {
+    const status = collectStatus(
+      {
+        LOOPOVER_MINER_CONFIG_DIR: "/s",
+        LOOPOVER_MINER_VERSION: "loopover-miner-fleet@deadbeef",
+      },
+      tempRoot(),
+    );
+    expect(status.package.version).toBe("loopover-miner-fleet@deadbeef");
+  });
+
+  it("runStatus prints human-readable text (0) and machine JSON with --json", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    expect(runStatus([], { LOOPOVER_MINER_CONFIG_DIR: "/s" }, tempRoot())).toBe(0);
+    expect(String(log.mock.calls[0]?.[0])).toContain("@loopover/miner");
+    log.mockClear();
+    expect(runStatus(["--json"], { LOOPOVER_MINER_CONFIG_DIR: "/s" }, tempRoot())).toBe(0);
+    expect(JSON.parse(String(log.mock.calls[0]?.[0])).stateDir).toBe("/s");
+  });
+
+  it("doctor passes on a healthy setup (writable state dir, initialized sqlite, optional Docker)", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    // A healthy setup now also requires GITHUB_TOKEN (#5170); no coding-agent provider is configured, so the
+    // provider-credential check is a clean skip.
+    const env = { LOOPOVER_MINER_CONFIG_DIR: join(tempRoot(), "state"), GITHUB_TOKEN: "ghp_present" };
+    initLaptopState(env);
+    const cwd = tempRoot(); // a config-less working dir ⇒ config-content check is a clean pass
+    const checks = runDoctorChecks(env, cwd);
+    expect(checks.every((check) => check.ok)).toBe(true);
+    expect(checks.map((check) => check.name)).toEqual([
+      "node-version",
+      "engine-resolves",
+      "engine-version-skew",
+      "state-dir-writable",
+      "laptop-state-sqlite",
+      "docker-present",
+      "claude-cli-present",
+      "codex-cli-present",
+      "github-token",
+      "coding-agent-credential",
+      "config-content",
+      "ams-backtest-proposals",
+      "store-integrity:event-ledger",
+      "store-integrity:governor-ledger",
+      "store-integrity:prediction-ledger",
+      "store-integrity:portfolio-queue",
+      "store-integrity:claim-ledger",
+      "store-integrity:run-state",
+      "store-integrity:plan-store",
+      "store-integrity:governor-state",
+      "store-integrity:attempt-log",
+      "store-integrity:replay-snapshot",
+      "store-integrity:worktree-allocator",
+      "store-integrity:contribution-profile",
+      "store-integrity:policy-verdict-cache",
+      "store-integrity:policy-doc-cache",
+      "store-integrity:ranked-candidates",
+      "store-integrity:deny-hook-synthesis",
+      "store-integrity:orb-export",
+    ]);
+    // REGRESSION (#6768): doctor previously omitted these four durable local stores from the integrity sweep.
+    expect(checks.map((check) => check.name)).toEqual(
+      expect.arrayContaining([
+        "store-integrity:governor-state",
+        "store-integrity:attempt-log",
+        "store-integrity:replay-snapshot",
+        "store-integrity:worktree-allocator",
+      ]),
+    );
+    // REGRESSION (#8008): ranked-candidates and deny-hook-synthesis were likewise omitted from the sweep.
+    expect(checks.map((check) => check.name)).toEqual(
+      expect.arrayContaining(["store-integrity:ranked-candidates", "store-integrity:deny-hook-synthesis"]),
+    );
+    expect(runDoctor([], env, cwd)).toBe(0);
+    expect(log).toHaveBeenCalled();
+  });
+
+  it("doctor flags a corrupted store (#4834)", () => {
+    const env = { LOOPOVER_MINER_CONFIG_DIR: join(tempRoot(), "state") };
+    const eventLedgerPath = resolveEventLedgerDbPath(env);
+    mkdirSync(dirname(eventLedgerPath), { recursive: true });
+    writeFileSync(eventLedgerPath, "this is not a sqlite database");
+    const checks = runDoctorChecks(env);
+    expect(checks.find((check) => check.name === "store-integrity:event-ledger")?.ok).toBe(false);
+    expect(runDoctor([], env)).toBe(1); // a failed check makes doctor exit non-zero
+  });
+
+  describe("checkConfigContent (#4873)", () => {
+    it("is a clean pass when no config file is present (defaults apply)", () => {
+      const result = checkConfigContent(tempRoot());
+      expect(result).toMatchObject({ name: "config-content", ok: true });
+      expect(result.detail).toContain("no .loopover-miner config");
+    });
+
+    it("passes a well-formed config", () => {
+      const cwd = tempRoot();
+      writeFileSync(join(cwd, ".loopover-miner.yml"), "wantedPaths:\n  - src\n");
+      const result = checkConfigContent(cwd);
+      expect(result.ok).toBe(true);
+      expect(result.detail).toContain("valid");
+    });
+
+    it("flags a malformed config with the parser's specific warnings", () => {
+      const cwd = tempRoot();
+      // wantedPaths must be a list; a scalar triggers a parser warning rather than a silent default.
+      writeFileSync(join(cwd, ".loopover-miner.yml"), "wantedPaths: not-a-list\n");
+      const result = checkConfigContent(cwd);
+      expect(result.ok).toBe(false);
+      expect(result.detail).toMatch(/wantedPaths/);
+    });
+
+    it("reports a read failure (config discovered but unreadable)", () => {
+      const cwd = tempRoot();
+      writeFileSync(join(cwd, ".loopover-miner.yml"), "wantedPaths:\n  - src\n");
+      const throwingRead = () => {
+        throw new Error("EACCES: permission denied");
+      };
+      const result = checkConfigContent(cwd, throwingRead);
+      expect(result.ok).toBe(false);
+      expect(result.detail).toContain("permission denied");
+    });
+  });
+
+  it("doctor flags a malformed config file (#4873)", () => {
+    const env = { LOOPOVER_MINER_CONFIG_DIR: join(tempRoot(), "state") };
+    const cwd = tempRoot();
+    writeFileSync(join(cwd, ".loopover-miner.yml"), "wantedPaths: not-a-list\n");
+    expect(runDoctorChecks(env, cwd).find((check) => check.name === "config-content")?.ok).toBe(false);
+    expect(runDoctor([], env, cwd)).toBe(1);
+  });
+
+  it("engine version skew helpers compare installed vs expected semver", () => {
+    expect(compareInstalledEngineVersion("0.2.0", "0.2.0")).toBe(0);
+    expect(compareInstalledEngineVersion("0.1.0", "0.2.0")).toBe(-1);
+    expect(compareInstalledEngineVersion("0.3.0", "0.2.0")).toBe(1);
+    expect(compareInstalledEngineVersion("not-semver", "0.2.0")).toBe(-1);
+    expect(typeof readInstalledEnginePackageVersion()).toBe("string");
+    expect(readExpectedEnginePackageVersion()).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  it("buildEngineVersionSkewCheck skips when expected version is unavailable", () => {
+    const skewCheck = buildEngineVersionSkewCheck(
+      () => "0.2.0",
+      () => null,
+    );
+    expect(skewCheck.ok).toBe(true);
+    expect(skewCheck.detail).toContain("skipped");
+  });
+
+  it("buildEngineVersionSkewCheck fails when installed engine is missing", () => {
+    const skewCheck = buildEngineVersionSkewCheck(
+      () => null,
+      () => "0.2.0",
+    );
+    expect(skewCheck.ok).toBe(false);
+    expect(skewCheck.detail).toContain("not installed");
+  });
+
+  it("readExpectedEnginePackageVersionFromPaths prefers monorepo package.json then the pin file", () => {
+    const root = tempRoot();
+    const monorepoPkg = join(root, "engine-package.json");
+    const pinFile = join(root, "expected-engine.version");
+    writeFileSync(monorepoPkg, JSON.stringify({ version: "0.2.0" }));
+    writeFileSync(pinFile, "0.1.0\n");
+    expect(readExpectedEnginePackageVersionFromPaths(monorepoPkg, pinFile)).toBe("0.2.0");
+
+    expect(readExpectedEnginePackageVersionFromPaths(join(root, "missing.json"), pinFile)).toBe("0.1.0");
+    expect(readExpectedEnginePackageVersionFromPaths(join(root, "missing.json"), join(root, "missing-pin"))).toBeNull();
+    writeFileSync(join(root, "broken.json"), "not-json");
+    expect(readExpectedEnginePackageVersionFromPaths(join(root, "broken.json"), pinFile)).toBeNull();
+  });
+
+  it("readInstalledEnginePackageVersionFromPaths falls back to the workspace engine package", () => {
+    const root = tempRoot();
+    const workspacePkg = join(root, "loopover-engine-package.json");
+    writeFileSync(workspacePkg, JSON.stringify({ version: "0.2.0" }));
+    expect(readInstalledEnginePackageVersionFromPaths("/missing/entry", workspacePkg)).toBe("0.2.0");
+    writeFileSync(workspacePkg, "not-json");
+    expect(readInstalledEnginePackageVersionFromPaths("/missing/entry", workspacePkg)).toBeNull();
+    writeFileSync(workspacePkg, "{}");
+    expect(readInstalledEnginePackageVersionFromPaths("/missing/entry", workspacePkg)).toBeNull();
+    expect(readInstalledEnginePackageVersionFromPaths("/missing/entry", join(root, "missing.json"))).toBeNull();
+
+    const installedPkg = join(root, "installed", "package.json");
+    mkdirSync(join(root, "installed"), { recursive: true });
+    writeFileSync(installedPkg, JSON.stringify({ version: "0.2.1" }));
+    expect(readInstalledEnginePackageVersionFromPaths(join(root, "installed", "index.js"), workspacePkg)).toBe("0.2.1");
+  });
+
+  it("returns null when all injected installed-version candidates are invalid or unreadable", () => {
+    const deps = {
+      existsSync: () => true,
+      readFileSync: () => {
+        throw new Error("EACCES");
+      },
+    };
+    expect(readInstalledEnginePackageVersionFromPaths("/entry/index.js", "/workspace/package.json", deps)).toBeNull();
+  });
+
+  it("covers empty pins and malformed installed package candidates without reporting a version", () => {
+    const root = tempRoot();
+    const emptyPin = join(root, "empty-pin");
+    writeFileSync(emptyPin, "  \n");
+    expect(readExpectedEnginePackageVersionFromPaths(join(root, "missing.json"), emptyPin)).toBeNull();
+    const packageWithoutVersion = join(root, "engine-package-without-version.json");
+    writeFileSync(packageWithoutVersion, "{}");
+    expect(readExpectedEnginePackageVersionFromPaths(packageWithoutVersion, emptyPin)).toBeNull();
+    expect(
+      readInstalledEnginePackageVersionFromPaths(
+        join(root, "missing", "index.js"),
+        join(root, "missing-workspace.json"),
+        { existsSync: () => false, readFileSync },
+      ),
+    ).toBeNull();
+  });
+
+  it("reports credential and token availability across configured provider variants without exposing secrets", () => {
+    expect(checkGitHubTokenPresent({ GITHUB_TOKEN: "present" }).ok).toBe(true);
+    expect(checkCodingAgentCredential({ MINER_CODING_AGENT_PROVIDER: "noop" }).detail).toContain("needs no credential");
+    expect(checkCodingAgentCredential({ MINER_CODING_AGENT_PROVIDER: "agent-sdk" }).ok).toBe(false);
+    expect(checkCodingAgentCredential({ MINER_CODING_AGENT_PROVIDER: "claude-cli", ANTHROPIC_API_KEY: "key" }).ok).toBe(true);
+
+    const authPath = join(tempRoot(), "auth.json");
+    writeFileSync(authPath, "{}");
+    expect(
+      checkCodingAgentCredential(
+        { MINER_CODING_AGENT_PROVIDER: "codex-cli" },
+        () => authPath,
+      ),
+    ).toMatchObject({ ok: true, detail: expect.stringContaining(authPath) });
+    expect(
+      checkCodingAgentCredential(
+        { MINER_CODING_AGENT_PROVIDER: "codex-cli" },
+        () => join(authPath, "missing"),
+      ),
+    ).toMatchObject({ ok: false, detail: expect.stringContaining("missing or unreadable") });
+  });
+
+  it("runDoctor supports --json output", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const env = { LOOPOVER_MINER_CONFIG_DIR: join(tempRoot(), "state"), GITHUB_TOKEN: "ghp_present" };
+    initLaptopState(env);
+    expect(runDoctor(["--json"], env)).toBe(0);
+    expect(JSON.parse(String(log.mock.calls[0]?.[0])).checks).toBeDefined();
+  });
+
+  it("buildEngineVersionSkewCheck reports behind when installed engine lags expected", () => {
+    const skewCheck = buildEngineVersionSkewCheck(
+      () => "0.1.0",
+      () => "0.2.0",
+    );
+    expect(skewCheck.ok).toBe(false);
+    expect(skewCheck.detail).toContain("behind");
+  });
+
+  it("buildEngineVersionSkewCheck reports ahead when installed engine exceeds expected", () => {
+    const skewCheck = buildEngineVersionSkewCheck(
+      () => "0.3.0",
+      () => "0.2.0",
+    );
+    expect(skewCheck.ok).toBe(true);
+    expect(skewCheck.detail).toContain("ahead");
+  });
+
+  it("doctor fails (exit 1) when the state directory cannot be created", () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Point the state dir UNDER a regular file → mkdir throws ENOTDIR.
+    const root = tempRoot();
+    const filePath = join(root, "not-a-dir");
+    writeFileSync(filePath, "");
+    const env = { LOOPOVER_MINER_CONFIG_DIR: join(filePath, "state") };
+    expect(runDoctorChecks(env).find((check) => check.name === "state-dir-writable")?.ok).toBe(false);
+    expect(runDoctor([], env)).toBe(1);
+    expect(errorLog).toHaveBeenCalled();
+  });
+
+  it("makes no network calls", () => {
+    const fetchStub = vi.fn(() => {
+      throw new Error("network calls are forbidden");
+    });
+    vi.stubGlobal("fetch", fetchStub);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const env = { LOOPOVER_MINER_CONFIG_DIR: join(tempRoot(), "state") };
+    initLaptopState(env);
+    runStatus(["--json"], env, tempRoot());
+    runDoctor([], env);
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  describe("driver section of status/status --json (#5164)", () => {
+    it("reports provider: null, modelEnvVar: null, cliPresent: null when no provider is configured", () => {
+      const status = collectStatus({ LOOPOVER_MINER_CONFIG_DIR: "/s", PATH: "" }, tempRoot());
+      expect(status.driver).toEqual({ provider: null, modelEnvVar: null, cliPresent: null });
+    });
+
+    it("reports the noop provider with no model env var and no CLI to check (cliPresent: null)", () => {
+      const status = collectStatus(
+        { LOOPOVER_MINER_CONFIG_DIR: "/s", PATH: "", MINER_CODING_AGENT_PROVIDER: "noop" },
+        tempRoot(),
+      );
+      expect(status.driver).toEqual({ provider: "noop", modelEnvVar: null, cliPresent: null });
+    });
+
+    it("reports the agent-sdk provider with no model env var and no CLI to check (cliPresent: null)", () => {
+      const status = collectStatus(
+        { LOOPOVER_MINER_CONFIG_DIR: "/s", PATH: "", MINER_CODING_AGENT_PROVIDER: "agent-sdk" },
+        tempRoot(),
+      );
+      expect(status.driver).toEqual({ provider: "agent-sdk", modelEnvVar: null, cliPresent: null });
+    });
+
+    it("renders provider configurations that have no model variable or known CLI binary", () => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      runStatus([], { LOOPOVER_MINER_CONFIG_DIR: "/s", PATH: "", MINER_CODING_AGENT_PROVIDER: "agent-sdk" }, tempRoot());
+      expect(String(log.mock.calls[0]?.[0])).toContain("driver: agent-sdk (CLI present: n/a)");
+      log.mockClear();
+      runStatus([], { LOOPOVER_MINER_CONFIG_DIR: "/s", PATH: "", MINER_CODING_AGENT_PROVIDER: "not-a-driver" }, tempRoot());
+      expect(String(log.mock.calls[0]?.[0])).toContain("driver: none configured");
+    });
+
+    it("claude-cli configured + CLI present on PATH: reports the model env-var name and cliPresent: true", () => {
+      const status = collectStatus(
+        {
+          LOOPOVER_MINER_CONFIG_DIR: "/s",
+          MINER_CODING_AGENT_PROVIDER: "claude-cli",
+          PATH: fakeBinDir("claude"),
+        },
+        tempRoot(),
+      );
+      expect(status.driver).toEqual({
+        provider: "claude-cli",
+        modelEnvVar: "MINER_CODING_AGENT_CLAUDE_MODEL",
+        cliPresent: true,
+      });
+    });
+
+    it("claude-cli configured + CLI absent from PATH: cliPresent: false", () => {
+      const status = collectStatus(
+        { LOOPOVER_MINER_CONFIG_DIR: "/s", MINER_CODING_AGENT_PROVIDER: "claude-cli", PATH: tempRoot() },
+        tempRoot(),
+      );
+      expect(status.driver.cliPresent).toBe(false);
+    });
+
+    it("codex-cli configured + CLI present on PATH: reports the model env-var name and cliPresent: true", () => {
+      const status = collectStatus(
+        {
+          LOOPOVER_MINER_CONFIG_DIR: "/s",
+          MINER_CODING_AGENT_PROVIDER: "codex-cli",
+          PATH: fakeBinDir("codex"),
+        },
+        tempRoot(),
+      );
+      expect(status.driver).toEqual({
+        provider: "codex-cli",
+        modelEnvVar: "MINER_CODING_AGENT_CODEX_MODEL",
+        cliPresent: true,
+      });
+    });
+
+    it("codex-cli configured + CLI absent from PATH: cliPresent: false", () => {
+      const status = collectStatus(
+        { LOOPOVER_MINER_CONFIG_DIR: "/s", MINER_CODING_AGENT_PROVIDER: "codex-cli", PATH: tempRoot() },
+        tempRoot(),
+      );
+      expect(status.driver.cliPresent).toBe(false);
+    });
+
+    it("human-readable status text renders the driver line for both configured and unconfigured cases", () => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      runStatus([], { LOOPOVER_MINER_CONFIG_DIR: "/s", PATH: "" }, tempRoot());
+      expect(String(log.mock.calls[0]?.[0])).toContain("driver: none configured");
+      log.mockClear();
+      runStatus(
+        [],
+        { LOOPOVER_MINER_CONFIG_DIR: "/s", MINER_CODING_AGENT_PROVIDER: "codex-cli", PATH: fakeBinDir("codex") },
+        tempRoot(),
+      );
+      expect(String(log.mock.calls[0]?.[0])).toContain(
+        "driver: codex-cli (CLI present: yes, model env: MINER_CODING_AGENT_CODEX_MODEL)",
+      );
+      log.mockClear();
+      runStatus(
+        [],
+        { LOOPOVER_MINER_CONFIG_DIR: "/s", MINER_CODING_AGENT_PROVIDER: "codex-cli", PATH: tempRoot() },
+        tempRoot(),
+      );
+      expect(String(log.mock.calls[0]?.[0])).toContain("driver: codex-cli (CLI present: no");
+    });
+
+    it("invariant: no env-var VALUE or secret-shaped string ever appears in status --json output across provider permutations", () => {
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+      const secretModelValue = "sk-ant-should-never-appear-in-output";
+      const providers = [undefined, "noop", "claude-cli", "codex-cli", "agent-sdk"];
+      for (const provider of providers) {
+        log.mockClear();
+        runStatus(
+          ["--json"],
+          {
+            LOOPOVER_MINER_CONFIG_DIR: "/s",
+            ...(provider ? { MINER_CODING_AGENT_PROVIDER: provider } : {}),
+            MINER_CODING_AGENT_CLAUDE_MODEL: secretModelValue,
+            MINER_CODING_AGENT_CODEX_MODEL: secretModelValue,
+            PATH: fakeBinDir("claude"),
+          },
+          tempRoot(),
+        );
+        const output = String(log.mock.calls[0]?.[0]);
+        expect(output).not.toContain(secretModelValue);
+        const parsed = JSON.parse(output);
+        expect(typeof parsed.driver.cliPresent === "boolean" || parsed.driver.cliPresent === null).toBe(true);
+      }
+    });
+  });
+});
+
+describe("checkAmsBacktestProposals (#8186)", () => {
+  it("is informational (always ok): explicit none-line empty, evidence + no-autonomy line with proposals, fail-open on a broken ledger", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { initEventLedger, resolveEventLedgerDbPath } = await import("../../packages/loopover-miner/lib/event-ledger.js");
+    const { backtestMinRankCandidate, recordAmsThresholdBacktestRun } = await import("../../packages/loopover-miner/lib/ams-calibration.js");
+    const { checkAmsBacktestProposals } = await import("../../packages/loopover-miner/lib/status.js");
+
+    const dir = mkdtempSync(join(tmpdir(), "miner-status-ams-"));
+    try {
+      const env = { LOOPOVER_MINER_CONFIG_DIR: dir };
+      const empty = checkAmsBacktestProposals(env);
+      expect(empty.ok).toBe(true);
+      expect(empty.detail).toContain("no backtest-cleared min-rank proposals");
+
+      const ledger = initEventLedger(resolveEventLedgerDbPath(env));
+      for (let i = 1; i <= 60; i += 1) {
+        ledger.appendEvent({ type: "discovered_issue", repoFullName: "acme/widgets", payload: { issueNumber: i, rankScore: 0.15, title: "t", labels: [] } });
+        ledger.appendEvent({ type: "pr_outcome", repoFullName: "acme/widgets", payload: { prNumber: 1000 + i, decision: "closed", closedAt: "2026-07-10T00:00:00Z", reason: null, issueNumber: i } });
+      }
+      const result = backtestMinRankCandidate(ledger.readEvents(), 0, 0.2)!;
+      recordAmsThresholdBacktestRun(result, { eventLedger: ledger });
+      ledger.close();
+
+      const withProposal = checkAmsBacktestProposals(env);
+      expect(withProposal.ok).toBe(true);
+      expect(withProposal.detail).toContain("min-rank 0 -> 0.2");
+      expect(withProposal.detail).toContain("nothing applies automatically");
+
+      const broken = checkAmsBacktestProposals({ LOOPOVER_MINER_EVENT_LEDGER_DB: "/dev/null/nope/ledger.sqlite" });
+      expect(broken.ok).toBe(true);
+      expect(broken.detail).toContain("unavailable");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

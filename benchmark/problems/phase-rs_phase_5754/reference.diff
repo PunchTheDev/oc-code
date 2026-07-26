@@ -1,0 +1,619 @@
+diff --git a/crates/engine/src/game/engine.rs b/crates/engine/src/game/engine.rs
+index 3df8ffbdcc..95e63b330e 100644
+--- a/crates/engine/src/game/engine.rs
++++ b/crates/engine/src/game/engine.rs
+@@ -10,9 +10,9 @@ use crate::types::actions::{
+ };
+ use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState, PlayerActionKind};
+ use crate::types::game_state::{
+-    ActionResult, AssistState, AutoPassMode, AutoPassRequest, CastOfferKind, ConvokeMode,
+-    CostResume, GameState, LandPlayRecord, LoopDetectionMode, MayTriggerAutoChoiceKey, PayCostKind,
+-    RetargetScope, StackEntry, StackEntryKind, WaitingFor,
++    ActionResult, AssistState, AutoMayChoice, AutoPassMode, AutoPassRequest, CastOfferKind,
++    ConvokeMode, CostResume, GameState, LandPlayRecord, LoopDetectionMode, MayTriggerAutoChoiceKey,
++    PayCostKind, RetargetScope, StackEntry, StackEntryKind, WaitingFor,
+ };
+ use crate::types::identifiers::{CardId, ObjectId};
+ use crate::types::match_config::MatchType;
+@@ -7041,6 +7041,34 @@ fn apply_retarget(
+     Ok(state.waiting_for.clone())
+ }
+ 
++/// CR 603.3c + CR 608.2c: Drop a mid-construction optional triggered modal that
++/// was declined before mode choice.
++pub(super) fn drop_mid_construction_pending_trigger(state: &mut GameState) {
++    if let Some(entry_id) = state.pending_trigger_entry.take() {
++        if state.stack.back().map(|e| e.id) == Some(entry_id) {
++            state.stack.pop_back();
++            state.stack_paid_facts.remove(&entry_id);
++            state.stack_trigger_event_batches.remove(&entry_id);
++        }
++    }
++    state.pending_trigger = None;
++}
++
++/// Clear optionality after the controller accepts a "you may choose N" gate so
++/// mode choice can proceed and resolution does not re-prompt.
++pub(super) fn clear_pending_trigger_optional(state: &mut GameState) {
++    if let Some(trigger) = state.pending_trigger.as_mut() {
++        trigger.ability.optional = false;
++    }
++    if let Some(entry_id) = state.pending_trigger_entry {
++        if let Some(entry) = state.stack.iter_mut().find(|e| e.id == entry_id) {
++            if let Some(ability) = entry.ability_mut() {
++                ability.optional = false;
++            }
++        }
++    }
++}
++
+ /// Run state-based actions, exile returns, delayed triggers, and trigger processing
+ /// after an action that produced `WaitingFor::Priority`. Returns the resulting
+ /// `WaitingFor` state — may be terminal (GameOver, interactive choice) or
+@@ -7066,17 +7094,23 @@ pub(super) fn begin_pending_trigger_target_selection(
+             let source_id = trigger.source_id;
+             let mode_abilities = trigger.mode_abilities.clone();
+             let trigger_event = trigger.trigger_event.clone();
++            // Clone optional-gate fields before any `&mut state` borrow so the
++            // `pending_trigger` imm borrow from `trigger` does not overlap.
++            let ability_optional = trigger.ability.optional;
++            let may_trigger_origin = trigger.may_trigger_origin;
++            let trigger_description = trigger.description.clone();
+             let trigger_events = if state.pending_trigger_event_batch.is_empty() {
+                 trigger_event.iter().cloned().collect::<Vec<_>>()
+             } else {
+                 state.pending_trigger_event_batch.clone()
+             };
+             let subject_match_count = trigger.subject_match_count;
++            let modal = modal.clone();
+             let modal = modal_choice_for_player(
+                 state,
+                 player,
+                 source_id,
+-                modal,
++                &modal,
+                 &crate::types::ability::SpellContext::default(),
+             );
+             let mut unavailable_modes = compute_unavailable_modes(state, source_id, &modal);
+@@ -7159,6 +7193,48 @@ pub(super) fn begin_pending_trigger_target_selection(
+                 return Ok(None);
+             }
+ 
++            // CR 608.2c: "you may choose N" (Shadrix Silverquill) — modes are
++            // chosen as the triggered ability is put on the stack (CR 700.2b +
++            // CR 603.3d). Offer the decline first so accepting still requires
++            // exactly `min_choices` modes; declining removes the mid-construction
++            // stack entry without choosing zero modes (count stays fixed).
++            if ability_optional {
++                let may_trigger_key = may_trigger_origin.map(|origin| MayTriggerAutoChoiceKey {
++                    player,
++                    source_id,
++                    origin,
++                });
++                if let Some(ref key) = may_trigger_key {
++                    if let Some(choice) = state.may_trigger_auto_choice(key) {
++                        match choice {
++                            AutoMayChoice::Decline => {
++                                drop_mid_construction_pending_trigger(state);
++                                return Ok(None);
++                            }
++                            AutoMayChoice::Accept => {
++                                clear_pending_trigger_optional(state);
++                                return Ok(Some(WaitingFor::AbilityModeChoice {
++                                    player,
++                                    modal,
++                                    source_id,
++                                    mode_abilities,
++                                    is_activated: false,
++                                    ability_index: None,
++                                    ability_cost: None,
++                                    unavailable_modes,
++                                }));
++                            }
++                        }
++                    }
++                }
++                return Ok(Some(WaitingFor::OptionalEffectChoice {
++                    player,
++                    source_id,
++                    description: trigger_description,
++                    may_trigger_key,
++                }));
++            }
++
+             return Ok(Some(WaitingFor::AbilityModeChoice {
+                 player,
+                 modal,
+diff --git a/crates/engine/src/game/engine_payment_choices.rs b/crates/engine/src/game/engine_payment_choices.rs
+index ae18596162..bc89dc1a2e 100644
+--- a/crates/engine/src/game/engine_payment_choices.rs
++++ b/crates/engine/src/game/engine_payment_choices.rs
+@@ -73,6 +73,31 @@ pub(super) fn handle_optional_effect_choice(
+             state.current_trigger_event = previous_trigger_event;
+             state.current_trigger_match_count = previous_trigger_match_count;
+             result.map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
++        } else if state.pending_trigger.as_ref().is_some_and(|t| {
++            t.ability.optional
++                && t.modal
++                    .as_ref()
++                    .is_some_and(|_| !t.mode_abilities.is_empty())
++        }) {
++            // CR 608.2c + CR 700.2b: Optional triggered modal ("you may choose N") —
++            // the decline/accept gate runs before mode selection while the stack
++            // entry is still mid-construction.
++            if accept {
++                super::engine::clear_pending_trigger_optional(state);
++                if let Some(waiting) = super::engine::begin_pending_trigger_target_selection(state)?
++                {
++                    state.waiting_for = waiting;
++                } else {
++                    state.waiting_for = WaitingFor::Priority {
++                        player: state.active_player,
++                    };
++                }
++            } else {
++                super::engine::drop_mid_construction_pending_trigger(state);
++                state.waiting_for = WaitingFor::Priority {
++                    player: state.active_player,
++                };
++            }
+         }
+     }
+ 
+diff --git a/crates/engine/src/parser/oracle_ir/ast.rs b/crates/engine/src/parser/oracle_ir/ast.rs
+index 71ed238167..7402559b98 100644
+--- a/crates/engine/src/parser/oracle_ir/ast.rs
++++ b/crates/engine/src/parser/oracle_ir/ast.rs
+@@ -1817,6 +1817,21 @@ pub(crate) struct ModalHeaderAst {
+     /// CR 700.2 + CR 107.3m: Dynamic max ("choose up to X —") — `Some` carries
+     /// the cost {X} reference resolved live at runtime; `None` for fixed caps.
+     pub(crate) dynamic_max_choices: Option<crate::types::ability::QuantityExpr>,
++    /// CR 608.2c: Triggered modal headers of the form "you may choose N"
++    /// (Shadrix Silverquill) make the entire triggered ability optional — the
++    /// controller may decline to choose any modes. Distinct from "you may choose
++    /// up to N", which only lowers `min_choices` to 0 while the trigger remains
++    /// mandatory.
++    pub(crate) optionality: ModalOptionality,
++}
++
++/// CR 608.2c: Whether a modal header makes its enclosing triggered ability
++/// optional. This remains distinct from a modal's `min_choices`, which models
++/// how many modes a mandatory ability may select.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
++pub(crate) enum ModalOptionality {
++    Mandatory,
++    MayDecline,
+ }
+ 
+ // --- ActivatedConstraintAst (moved from oracle.rs) ---
+diff --git a/crates/engine/src/parser/oracle_modal.rs b/crates/engine/src/parser/oracle_modal.rs
+index 9158b6da72..69e0bb1a8d 100644
+--- a/crates/engine/src/parser/oracle_modal.rs
++++ b/crates/engine/src/parser/oracle_modal.rs
+@@ -25,7 +25,7 @@ use super::oracle_nom::primitives::{self as nom_primitives, scan_preceded};
+ use super::oracle_static::{parse_pt_mod, parse_static_line};
+ use super::oracle_trigger::parse_trigger_lines;
+ use super::oracle_util::{parse_mana_symbols, strip_reminder_text, TextPair};
+-use crate::parser::oracle_ir::ast::{ModalHeaderAst, ModeAst, OracleBlockAst};
++use crate::parser::oracle_ir::ast::{ModalHeaderAst, ModalOptionality, ModeAst, OracleBlockAst};
+ 
+ pub(crate) fn parse_oracle_block(lines: &[&str], start: usize) -> Option<(OracleBlockAst, usize)> {
+     let line = strip_reminder_text(lines.get(start)?.trim());
+@@ -153,6 +153,7 @@ pub(crate) fn parse_oracle_block(lines: &[&str], start: usize) -> Option<(Oracle
+             chooser: PlayerFilter::Controller,
+             selection: TargetSelectionMode::Chosen,
+             dynamic_max_choices: None,
++            optionality: ModalOptionality::Mandatory,
+         };
+         return Some((OracleBlockAst::Modal { header, modes }, next));
+     }
+@@ -172,6 +173,7 @@ pub(crate) fn parse_oracle_block(lines: &[&str], start: usize) -> Option<(Oracle
+             chooser: PlayerFilter::Controller,
+             selection: TargetSelectionMode::Chosen,
+             dynamic_max_choices: None,
++            optionality: ModalOptionality::Mandatory,
+         };
+         return Some((OracleBlockAst::Modal { header, modes }, next));
+     }
+@@ -483,6 +485,7 @@ fn parse_tiered_shared_effect_block(
+         chooser: PlayerFilter::Controller,
+         selection: TargetSelectionMode::Chosen,
+         dynamic_max_choices: None,
++        optionality: ModalOptionality::Mandatory,
+     };
+     Some((OracleBlockAst::Modal { header, modes }, next))
+ }
+@@ -711,6 +714,20 @@ pub(crate) fn parse_modal_header_ast(text: &str) -> Option<ModalHeaderAst> {
+         TargetSelectionMode::Chosen
+     };
+ 
++    // CR 608.2c: "you may choose N" makes the triggered ability optional; "you
++    // may choose up to N" only lowers min_choices (handled by count parsing).
++    let optionality = if tag::<_, _, OracleError<'_>>("you may choose ")
++        .parse(header_lower.as_str())
++        .is_ok()
++        && tag::<_, _, OracleError<'_>>("you may choose up to ")
++            .parse(header_lower.as_str())
++            .is_err()
++    {
++        ModalOptionality::MayDecline
++    } else {
++        ModalOptionality::Mandatory
++    };
++
+     Some(ModalHeaderAst {
+         raw: text.to_string(),
+         min_choices,
+@@ -720,6 +737,7 @@ pub(crate) fn parse_modal_header_ast(text: &str) -> Option<ModalHeaderAst> {
+         chooser,
+         selection,
+         dynamic_max_choices,
++        optionality,
+     })
+ }
+ 
+@@ -1027,6 +1045,12 @@ pub(crate) fn lower_oracle_block(
+                 relative_player_scope,
+                 host_self_reference,
+             );
++            if matches!(header.optionality, ModalOptionality::MayDecline) {
++                // CR 608.2c: Resolution-time optionality lives on the execute
++                // ability (`build_triggered_ability` clones it); the trigger
++                // definition flag is stamped for coverage and card-data export.
++                modal_ability.optional = true;
++            }
+ 
+             let execute = match optional_cost {
+                 // CR 603.12 + CR 700.2b: The modal is gated behind a reflexive
+@@ -1055,6 +1079,9 @@ pub(crate) fn lower_oracle_block(
+ 
+             for trigger in &mut triggers {
+                 trigger.execute = Some(execute.clone());
++                if matches!(header.optionality, ModalOptionality::MayDecline) {
++                    trigger.optional = true;
++                }
+             }
+             result.triggers.extend(triggers);
+         }
+@@ -2131,6 +2158,32 @@ mod tests {
+         ModalCountSpec::Fixed { min, max }
+     }
+ 
++    #[test]
++    fn parse_modal_header_you_may_choose_fixed_count_sets_optional_trigger() {
++        // CR 608.2c: Shadrix Silverquill — "you may choose two" declines the
++        // entire triggered ability; when accepted, exactly two modes are chosen.
++        let header =
++            parse_modal_header_ast("you may choose two. Each mode must target a different player.")
++                .expect("modal header recognized");
++        assert_eq!(header.optionality, ModalOptionality::MayDecline);
++        assert_eq!(header.min_choices, 2);
++        assert_eq!(header.max_choices, 2);
++        assert_eq!(
++            header.constraints,
++            vec![ModalSelectionConstraint::DifferentTargetPlayers]
++        );
++    }
++
++    #[test]
++    fn parse_modal_header_you_may_choose_up_to_does_not_set_optional_trigger() {
++        // "you may choose up to N" lowers min_choices only; the trigger stays mandatory.
++        let header =
++            parse_modal_header_ast("you may choose up to two.").expect("modal header recognized");
++        assert_eq!(header.optionality, ModalOptionality::Mandatory);
++        assert_eq!(header.min_choices, 0);
++        assert_eq!(header.max_choices, 2);
++    }
++
+     #[test]
+     fn parse_modal_choose_count_variants() {
+         assert_eq!(parse_modal_choose_count("choose one —"), fixed(1, 1));
+diff --git a/crates/engine/src/parser/oracle_tests.rs b/crates/engine/src/parser/oracle_tests.rs
+index f106ac2012..1cde8afdb2 100644
+--- a/crates/engine/src/parser/oracle_tests.rs
++++ b/crates/engine/src/parser/oracle_tests.rs
+@@ -10486,10 +10486,18 @@ fn triggered_modal_header_supports_you_may_choose_and_constraints() {
+             &[],
+         );
+     assert_eq!(r.triggers.len(), 1);
++    assert!(
++        r.triggers[0].optional,
++        "you may choose two header must make the trigger optional"
++    );
+     let execute = r.triggers[0]
+         .execute
+         .as_ref()
+         .expect("trigger should have execute");
++    assert!(
++        execute.optional,
++        "optional triggered modal must stamp execute.optional for resolution"
++    );
+     let modal = execute.modal.as_ref().expect("execute should be modal");
+     assert_eq!(modal.min_choices, 2);
+     assert_eq!(modal.max_choices, 2);
+diff --git a/crates/engine/src/parser/oracle_trigger.rs b/crates/engine/src/parser/oracle_trigger.rs
+index 7b58ab09f4..e5ea97e129 100644
+--- a/crates/engine/src/parser/oracle_trigger.rs
++++ b/crates/engine/src/parser/oracle_trigger.rs
+@@ -1625,7 +1625,16 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
+             }
+             Some(Box::new(ability))
+         }
+-        Some(TriggerBody::PreLowered(ability)) => Some(ability.clone()),
++        Some(TriggerBody::PreLowered(ability)) => {
++            // CR 603.5: Pre-lowered bodies (inline modals, vote blocks, etc.)
++            // may not have stamped `optional` during extraction even when the
++            // trigger effect began with "you may".
++            let mut ability = ability.clone();
++            if modifiers.optional {
++                ability.optional = true;
++            }
++            Some(ability)
++        }
+         None => None,
+     };
+ 
+diff --git a/crates/engine/tests/integration/issue_5640_shadrix_optional_triggered_modal.rs b/crates/engine/tests/integration/issue_5640_shadrix_optional_triggered_modal.rs
+new file mode 100644
+index 0000000000..845bdf009b
+--- /dev/null
++++ b/crates/engine/tests/integration/issue_5640_shadrix_optional_triggered_modal.rs
+@@ -0,0 +1,246 @@
++//! Issue #5640 — Shadrix Silverquill: the begin-combat triggered modal
++//! ("you may choose two") must offer a decline for the entire ability and, when
++//! accepted, require exactly two modes targeting different players.
++//!
++//! Parser-shape assertions alone cannot prove runtime behavior: this file drives
++//! the real begin-combat pipeline and exercises both the decline and accept
++//! branches.
++//!
++//! CR 508.1 (begin-combat step) + CR 603.2 (triggered abilities on the stack) +
++//! CR 608.2c (optional triggered effects) + CR 700.2b (modal choice).
++
++use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
++use engine::types::ability::TargetRef;
++use engine::types::actions::GameAction;
++use engine::types::game_state::WaitingFor;
++use engine::types::identifiers::ObjectId;
++use engine::types::phase::Phase;
++use engine::types::player::PlayerId;
++use engine::types::zones::Zone;
++
++const SHADRIX_ORACLE: &str = "Flying, double strike\n\
++At the beginning of combat on your turn, you may choose two. Each mode must target a different player.\n\
++• Target player creates a 2/1 white and black Inkling creature token with flying.\n\
++• Target player draws a card and loses 1 life.\n\
++• Target player puts a +1/+1 counter on each creature they control.";
++
++fn life(runner: &GameRunner, player: PlayerId) -> i32 {
++    runner
++        .state()
++        .players
++        .iter()
++        .find(|p| p.id == player)
++        .expect("player exists")
++        .life
++}
++
++fn hand_len(runner: &GameRunner, player: PlayerId) -> usize {
++    runner
++        .state()
++        .players
++        .iter()
++        .find(|p| p.id == player)
++        .expect("player exists")
++        .hand
++        .len()
++}
++
++fn inkling_tokens_for(runner: &GameRunner, controller: PlayerId) -> Vec<ObjectId> {
++    runner
++        .state()
++        .objects
++        .values()
++        .filter(|o| {
++            o.controller == controller
++                && o.zone == Zone::Battlefield
++                && o.is_token
++                && o.power == Some(2)
++                && o.toughness == Some(1)
++        })
++        .map(|o| o.id)
++        .collect()
++}
++
++fn seed_library(scenario: &mut GameScenario, n: usize) {
++    for i in 0..n {
++        scenario.add_card_to_library_top(P0, &format!("Library Card {i}"));
++    }
++}
++
++fn shadrix_board(library_cards: usize) -> GameRunner {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    scenario.add_creature_from_oracle(P0, "Shadrix Silverquill", 2, 5, SHADRIX_ORACLE);
++    seed_library(&mut scenario, library_cards);
++    scenario.build()
++}
++
++/// Advance from PreCombatMain through the begin-combat step so Shadrix's trigger
++/// fires and reaches the stack.
++fn fire_begin_combat_trigger(runner: &mut GameRunner) {
++    runner.pass_both_players();
++    assert_eq!(
++        runner.state().phase,
++        Phase::BeginCombat,
++        "Shadrix regression must fire from a genuine begin-combat step"
++    );
++}
++
++/// Bounded drive loop for Shadrix's optional triggered modal resolution.
++fn drive_shadrix(
++    runner: &mut GameRunner,
++    accept_optional: bool,
++    modes: &[usize],
++    mode_targets: &[PlayerId],
++) {
++    let mut target_idx = 0usize;
++    for _ in 0..80 {
++        match runner.state().waiting_for.clone() {
++            WaitingFor::OrderTriggers { .. } => {
++                engine::game::triggers::drain_order_triggers_with_identity(runner.state_mut());
++            }
++            WaitingFor::Priority { .. } => {
++                if runner.state().stack.is_empty() {
++                    return;
++                }
++                if runner.act(GameAction::PassPriority).is_err() {
++                    return;
++                }
++            }
++            WaitingFor::OptionalEffectChoice { .. } => {
++                runner
++                    .act(GameAction::DecideOptionalEffect {
++                        accept: accept_optional,
++                    })
++                    .expect("Shadrix optional begin-combat trigger must offer decline");
++            }
++            WaitingFor::AbilityModeChoice { .. } => {
++                assert!(
++                    accept_optional,
++                    "declining Shadrix must not reach AbilityModeChoice"
++                );
++                runner
++                    .act(GameAction::SelectModes {
++                        indices: modes.to_vec(),
++                    })
++                    .expect("choosing Shadrix modes must succeed");
++            }
++            WaitingFor::TriggerTargetSelection { .. } | WaitingFor::TargetSelection { .. } => {
++                let player = mode_targets[target_idx];
++                target_idx += 1;
++                runner
++                    .act(GameAction::ChooseTarget {
++                        target: Some(TargetRef::Player(player)),
++                    })
++                    .expect("selecting a Shadrix mode target must succeed");
++            }
++            other => panic!("unexpected waiting state during Shadrix resolution: {other:?}"),
++        }
++    }
++    panic!("Shadrix resolution did not settle after 80 iterations — likely a stall");
++}
++
++#[test]
++fn shadrix_begin_combat_declining_optional_skips_all_modes() {
++    let mut runner = shadrix_board(4);
++
++    let p0_life_before = life(&runner, P0);
++    let p1_life_before = life(&runner, P1);
++    let p0_hand_before = hand_len(&runner, P0);
++    let p1_hand_before = hand_len(&runner, P1);
++
++    fire_begin_combat_trigger(&mut runner);
++    drive_shadrix(&mut runner, false, &[], &[]);
++
++    assert!(
++        inkling_tokens_for(&runner, P0).is_empty() && inkling_tokens_for(&runner, P1).is_empty(),
++        "declining Shadrix must create no Inkling tokens"
++    );
++    assert_eq!(
++        hand_len(&runner, P0),
++        p0_hand_before,
++        "declining Shadrix must draw no cards for P0"
++    );
++    assert_eq!(
++        hand_len(&runner, P1),
++        p1_hand_before,
++        "declining Shadrix must draw no cards for P1"
++    );
++    assert_eq!(
++        life(&runner, P0),
++        p0_life_before,
++        "declining Shadrix must change no life totals"
++    );
++    assert_eq!(
++        life(&runner, P1),
++        p1_life_before,
++        "declining Shadrix must change no life totals"
++    );
++}
++
++#[test]
++fn shadrix_begin_combat_accepting_requires_exactly_two_modes() {
++    let mut runner = shadrix_board(4);
++    fire_begin_combat_trigger(&mut runner);
++
++    for _ in 0..80 {
++        match runner.state().waiting_for.clone() {
++            WaitingFor::Priority { .. } => {
++                if runner.state().stack.is_empty() {
++                    break;
++                }
++                runner.act(GameAction::PassPriority).ok();
++            }
++            WaitingFor::OptionalEffectChoice { .. } => {
++                runner
++                    .act(GameAction::DecideOptionalEffect { accept: true })
++                    .expect("accepting Shadrix optional trigger must succeed");
++            }
++            WaitingFor::AbilityModeChoice { .. } => {
++                let err = runner.act(GameAction::SelectModes { indices: vec![0] });
++                assert!(
++                    err.is_err(),
++                    "Shadrix must reject choosing only one mode when min_choices is 2"
++                );
++                return;
++            }
++            WaitingFor::OrderTriggers { .. } => {
++                engine::game::triggers::drain_order_triggers_with_identity(runner.state_mut());
++            }
++            other => panic!("expected AbilityModeChoice after accepting Shadrix, got {other:?}"),
++        }
++    }
++    panic!("never reached AbilityModeChoice while accepting Shadrix");
++}
++
++#[test]
++fn shadrix_begin_combat_accepting_two_modes_resolves_both() {
++    let mut runner = shadrix_board(4);
++
++    let p0_life_before = life(&runner, P0);
++    let p0_hand_before = hand_len(&runner, P0);
++
++    fire_begin_combat_trigger(&mut runner);
++    // Mode 0: Inkling for P1. Mode 1: draw + lose 1 life for P0.
++    drive_shadrix(&mut runner, true, &[0, 1], &[P1, P0]);
++
++    assert_eq!(
++        inkling_tokens_for(&runner, P1).len(),
++        1,
++        "mode 0 must create exactly one Inkling token for the chosen player"
++    );
++    assert!(
++        inkling_tokens_for(&runner, P0).is_empty(),
++        "mode 0 targeted P1, so P0 must receive no Inkling"
++    );
++    assert_eq!(
++        hand_len(&runner, P0),
++        p0_hand_before + 1,
++        "mode 1 must draw P0 a card"
++    );
++    assert_eq!(
++        life(&runner, P0),
++        p0_life_before - 1,
++        "mode 1 must make P0 lose 1 life"
++    );
++}
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 845df9588b..f8ee7affbc 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -486,6 +486,7 @@ mod issue_536_six_grants_retrace;
+ mod issue_541_endurance_graveyard_to_bottom;
+ mod issue_544_krark_clan_ironworks_auto_pass;
+ mod issue_5631_dragon_kami_reborn_hatching_counter;
++mod issue_5640_shadrix_optional_triggered_modal;
+ mod issue_564_wishclaw_talisman_control;
+ mod issue_5657_zurs_weirding;
+ mod issue_565_birthing_ritual_end_step_trigger;

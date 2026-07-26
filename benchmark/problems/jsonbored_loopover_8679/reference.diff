@@ -1,0 +1,148 @@
+diff --git a/src/mcp/server.ts b/src/mcp/server.ts
+index 1d4c15954..079078f94 100644
+--- a/src/mcp/server.ts
++++ b/src/mcp/server.ts
+@@ -193,6 +193,7 @@ import { SCENARIO_MAX_BRANCH_REF_CHARS, SCENARIO_MAX_LINKED_ISSUE_NUMBERS, SCENA
+ import { loadUpstreamStatus } from "../upstream/ruleset";
+ import {
+   authoritativeGateOverride,
++  deleteLiveOverride,
+   listOverrideAudit,
+   loadOverride,
+   loadShadowOverride,
+@@ -242,6 +243,16 @@ const selftuneOverrideAuditShape = {
+   limit: z.number().int().positive().optional(),
+ };
+ 
++// (#8660) write-side mirror of DELETE /v1/repos/:owner/:repo/selftune/overrides. `confirm` is the required
++// confirmation field this destructive reset must carry, matching the sibling maintainer-mutation tools'
++// deliberate action params (loopover_set_agent_paused's `paused`, loopover_set_action_autonomy's action/level)
++// and the REST route's own "an optional body is treated as a confirmation of the override being cleared" intent.
++const clearSelftuneOverrideShape = {
++  owner: z.string().min(1),
++  repo: z.string().min(1),
++  confirm: z.literal(true),
++};
++
+ const windowOnlyShape = {
+   windowDays: z.number().int().positive().optional(),
+ };
+@@ -1100,6 +1111,12 @@ const selftuneOverrideAuditOutputSchema = {
+   audit: z.array(z.unknown()).optional(),
+ };
+ 
++// (#8660) confirmation shape for the write-side clear: mirrors the REST route's { repoFullName, cleared: true }.
++const clearSelftuneOverrideOutputSchema = {
++  repoFullName: z.string().optional(),
++  cleared: z.boolean().optional(),
++};
++
+ // #5825 - maintainer-authenticated skipped-PR audit trail, mirroring GET /v1/app/skipped-pr-audit's
+ // filters (all optional: a bare call returns the caller's own repo-scoped feed). No owner/repo shape
+ // here on purpose: unlike ownerRepoShape tools this report can legitimately span every repo the caller
+@@ -1978,6 +1995,7 @@ export const MCP_TOOL_CATEGORIES: Record<string, McpToolCategory> = {
+   loopover_get_outcome_calibration: "maintainer",
+   loopover_get_gate_precision: "maintainer",
+   loopover_get_selftune_override_audit: "maintainer",
++  loopover_clear_selftune_override: "maintainer",
+   loopover_get_skipped_pr_audit: "maintainer",
+   loopover_get_fleet_analytics: "maintainer",
+   loopover_get_recommendation_quality: "maintainer",
+@@ -2255,6 +2273,20 @@ export class LoopoverMcp {
+       async (input) => this.toolResult(await this.getSelftuneOverrideAudit(input)),
+     );
+ 
++    // (#8660) write-side counterpart to loopover_get_selftune_override_audit: the missing MCP mirror of
++    // DELETE /v1/repos/:owner/:repo/selftune/overrides. Maintainer-manage access required, same as the other
++    // maintainer-mutation tools (loopover_set_agent_paused/loopover_set_action_autonomy/loopover_decide_pending_action).
++    register(
++      "loopover_clear_selftune_override",
++      {
++        description:
++          "Clear a repo's LIVE self-tune gate override (the operator's \"reset to config base\" control), mirroring DELETE /v1/repos/:owner/:repo/selftune/overrides. Requires confirm:true; the automatic self-tune promote path is untouched. Maintainer access required.",
++        inputSchema: clearSelftuneOverrideShape,
++        outputSchema: clearSelftuneOverrideOutputSchema,
++      },
++      async (input) => this.toolResult(await this.clearSelftuneOverride(input)),
++    );
++
+     register(
+       "loopover_get_skipped_pr_audit",
+       {
+@@ -4140,6 +4172,20 @@ export class LoopoverMcp {
+     };
+   }
+ 
++  // (#8660) MCP surface for DELETE /v1/repos/:owner/:repo/selftune/overrides. Uses the same maintainer-MANAGE
++  // gate as the sibling write tools (loopover_set_agent_paused/loopover_set_action_autonomy) — stricter than the
++  // audit tool's read gate — and calls the exact deleteLiveOverride the REST route already uses, returning the
++  // route's { repoFullName, cleared: true } shape. Branch-free: `confirm` is enforced by the input schema.
++  private async clearSelftuneOverride(input: z.infer<z.ZodObject<typeof clearSelftuneOverrideShape>>): Promise<ToolPayload> {
++    const fullName = `${input.owner}/${input.repo}`;
++    await this.requireRepoManageAccess(fullName);
++    await deleteLiveOverride(this.env as unknown as StorageEnv, fullName);
++    return {
++      summary: `Cleared the live self-tune gate override for ${fullName}.`,
++      data: { repoFullName: fullName, cleared: true },
++    };
++  }
++
+   // #5825 - repo-scope resolution for the skipped-PR audit tool. Mirrors skippedPrAuditRepoScope in
+   // src/api/routes.ts (same underlying loadControlPanelRoleSummary/loadControlPanelAccessScope calls,
+   // same maintainer/owner/operator role gate, same "no filter -> caller's own scoped repos" fallback),
+diff --git a/test/unit/mcp-clear-selftune-override.test.ts b/test/unit/mcp-clear-selftune-override.test.ts
+new file mode 100644
+index 000000000..a07e4cbf0
+--- /dev/null
++++ b/test/unit/mcp-clear-selftune-override.test.ts
+@@ -0,0 +1,50 @@
++import { Client } from "@modelcontextprotocol/sdk/client/index.js";
++import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
++import { describe, expect, it } from "vitest";
++import { LoopoverMcp } from "../../src/mcp/server";
++import { loadOverride, writeLiveOverride, type StorageEnv } from "../../src/review/auto-apply";
++import { createTestEnv } from "../helpers/d1";
++
++const REPO = "owner/widgets";
++
++async function connect(env: Env) {
++  const server = new LoopoverMcp(env).createServer();
++  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
++  await server.connect(serverTransport);
++  const client = new Client({ name: "loopover-clear-selftune-override-test", version: "0.1.0" }, { capabilities: {} });
++  await client.connect(clientTransport);
++  return client;
++}
++
++describe("MCP loopover_clear_selftune_override (#8660)", () => {
++  it("clears a repo's live self-tune override for an authorized caller and the override is gone afterward", async () => {
++    const env = createTestEnv();
++    const storageEnv = env as unknown as StorageEnv;
++    await writeLiveOverride(storageEnv, REPO, { confidenceFloor: 0.42, scopeCap: { files: 5, lines: 200 } });
++    // Guard the precondition: the override really is live before the tool runs.
++    expect(await loadOverride(storageEnv, REPO)).not.toBeNull();
++
++    const client = await connect(env);
++    const result = await client.callTool({ name: "loopover_clear_selftune_override", arguments: { owner: "owner", repo: "widgets", confirm: true } });
++    expect(result.isError).toBeFalsy();
++    expect(result.structuredContent).toEqual({ repoFullName: REPO, cleared: true });
++    expect(JSON.stringify(result.content)).toContain("Cleared the live self-tune gate override for owner/widgets");
++
++    // Deliverable (a): the override is verifiably gone via a direct store read.
++    expect(await loadOverride(storageEnv, REPO)).toBeNull();
++  });
++
++  it("rejects a non-maintainer caller when the repo is not in MCP_ACTUATION_REPO_ALLOWLIST", async () => {
++    const env = createTestEnv({ MCP_ACTUATION_REPO_ALLOWLIST: "" });
++    const storageEnv = env as unknown as StorageEnv;
++    await writeLiveOverride(storageEnv, REPO, { confidenceFloor: 0.42 });
++
++    const client = await connect(env); // default identity: { kind: "static", actor: "mcp" }
++    const result = await client.callTool({ name: "loopover_clear_selftune_override", arguments: { owner: "owner", repo: "widgets", confirm: true } });
++    expect(result.isError).toBe(true);
++    expect(JSON.stringify(result)).toMatch(/MCP_ACTUATION_REPO_ALLOWLIST/);
++
++    // Deliverable (b): the rejected call must not have touched the override.
++    expect(await loadOverride(storageEnv, REPO)).not.toBeNull();
++  });
++});

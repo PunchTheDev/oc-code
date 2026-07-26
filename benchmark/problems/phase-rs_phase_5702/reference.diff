@@ -1,0 +1,395 @@
+diff --git a/crates/engine/src/game/casting_costs.rs b/crates/engine/src/game/casting_costs.rs
+index 967e13cde0..25c83fe5ae 100644
+--- a/crates/engine/src/game/casting_costs.rs
++++ b/crates/engine/src/game/casting_costs.rs
+@@ -11780,6 +11780,152 @@ mod tests {
+         );
+     }
+ 
++    /// CR 202.3 + CR 601.2f (#5606): the mana-value gate parsed onto a typed
++    /// cost-reduction filter must reach the cost resolver. A permanent granting
++    /// "Instant and sorcery spells you cast with mana value 4 or greater cost {1}
++    /// less to cast" reduces a qualifying instant (MV 5) but NOT a sub-threshold
++    /// instant (MV 3) nor an off-type creature (MV 5). Reverting the parser fix
++    /// (which restored `spell_filter`) makes `effective_spell_cost` reduce all
++    /// three, so this regression flips. Parses the real static line, so it also
++    /// exercises the parser → runtime path end-to-end.
++    #[test]
++    fn mana_value_gated_cost_reduction_reaches_cost_resolver() {
++        let mut state = GameState::new_two_player(42);
++        let caster = PlayerId(0);
++
++        let source = create_object(
++            &mut state,
++            CardId(10),
++            caster,
++            "Cost Reducer".to_string(),
++            Zone::Battlefield,
++        );
++        let static_def = crate::parser::oracle_static::parse_static_line(
++            "Instant and sorcery spells you cast with mana value 4 or greater cost {1} less to cast.",
++        )
++        .expect("cost reduction should parse");
++        state
++            .objects
++            .get_mut(&source)
++            .unwrap()
++            .static_definitions
++            .push(static_def);
++
++        let mut add_spell = |id: u64, core: CoreType, mv: u32| -> ObjectId {
++            let obj_id = create_object(
++                &mut state,
++                CardId(id),
++                caster,
++                format!("Spell {id}"),
++                Zone::Hand,
++            );
++            let obj = state.objects.get_mut(&obj_id).unwrap();
++            obj.card_types.core_types.push(core);
++            // Mana value is derived from the printed mana cost.
++            obj.mana_cost = ManaCost::generic(mv);
++            obj_id
++        };
++
++        // Qualifying: instant with mana value 5 (≥ 4).
++        let big_instant = add_spell(11, CoreType::Instant, 5);
++        // Sub-threshold: instant with mana value 3 (< 4) — the Cmc gate excludes it.
++        let small_instant = add_spell(12, CoreType::Instant, 3);
++        // Off-type: creature with mana value 5 — the type restriction excludes it.
++        let big_creature = add_spell(13, CoreType::Creature, 5);
++
++        // `display_spell_cost` is the engine-authoritative post-modifier cost;
++        // it suppresses affordability/timing (the test player has no mana pool)
++        // while still applying every cost-modification static.
++        let cost = |id| crate::game::casting::display_spell_cost(&state, caster, id);
++
++        // CR 601.2f: qualifying instant is reduced by {1} → 5 generic becomes 4.
++        assert_eq!(
++            cost(big_instant),
++            Some(ManaCost::generic(4)),
++            "instant with mana value 5 must receive the {{1}} reduction"
++        );
++        // CR 202.3: the mana-value gate reached the resolver — the sub-threshold
++        // instant is NOT reduced (this flips if the parser fix is reverted).
++        assert_eq!(
++            cost(small_instant),
++            Some(ManaCost::generic(3)),
++            "instant with mana value 3 (< 4) must NOT be reduced"
++        );
++        // The type restriction excludes the creature entirely.
++        assert_eq!(
++            cost(big_creature),
++            Some(ManaCost::generic(5)),
++            "creature must NOT be reduced (type restriction)"
++        );
++    }
++
++    /// CR 202.3 + CR 601.2f (#5606): drive the full cast/payment pipeline. A
++    /// battlefield permanent granting "Instant and sorcery spells you cast with
++    /// mana value 4 or greater cost {1} less to cast" reduces the mana actually
++    /// PAID when the controller casts a qualifying instant, but not a
++    /// sub-threshold one. Each instant is funded to its full printed cost and
++    /// cast through `GameRunner::cast(..).resolve()`; the leftover pool proves the
++    /// reduction reached the payment step, not just the cost-display helper.
++    /// Reverting the parser fix (`spell_filter` → null) reduces the MV-3 spell
++    /// too, so the second assertion flips.
++    #[test]
++    fn mana_value_gated_cost_reduction_through_cast_pipeline() {
++        let caster = PlayerId(0);
++        // Cast an instant of printed mana value `mv` under the reducer, funded to
++        // its full printed cost; return the unspent mana (funded − paid).
++        let leftover_after_casting = |mv: u32| -> u32 {
++            let mut scenario = crate::game::scenario::GameScenario::new();
++            scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
++            scenario.add_creature_from_oracle(
++                caster,
++                "Cost Reducer",
++                2,
++                2,
++                "Instant and sorcery spells you cast with mana value 4 or greater cost {1} less to cast.",
++            );
++            let spell = scenario
++                .add_spell_to_hand_from_oracle(caster, "Test Instant", true, "You gain 1 life.")
++                .with_mana_cost(ManaCost::generic(mv))
++                .id();
++            scenario.with_mana_pool(
++                caster,
++                (0..mv)
++                    .map(|_| {
++                        crate::types::mana::ManaUnit::new(
++                            crate::types::mana::ManaType::Colorless,
++                            ObjectId(9999),
++                            false,
++                            vec![],
++                        )
++                    })
++                    .collect(),
++            );
++            let mut runner = scenario.build();
++            let outcome = runner.cast(spell).resolve();
++            outcome
++                .state()
++                .players
++                .iter()
++                .find(|p| p.id == caster)
++                .map(|p| p.mana_pool.total() as u32)
++                .unwrap_or(0)
++        };
++
++        // CR 202.3: MV 5 (≥ 4) instant pays {4} of {5} funded → 1 mana left.
++        assert_eq!(
++            leftover_after_casting(5),
++            1,
++            "MV 5 instant must receive the {{1}} reduction through the cast pipeline"
++        );
++        // CR 202.3: the mana-value gate excludes the MV 3 (< 4) instant → full {3}
++        // paid → 0 left (this flips to 1 if the parser fix is reverted).
++        assert_eq!(
++            leftover_after_casting(3),
++            0,
++            "MV 3 instant must NOT be reduced through the cast pipeline"
++        );
++    }
++
+     /// CR 118.9 + CR 107.14: Primal Prayers grants {E} as an alternative cost
+     /// for creature spells with MV ≤ 3 that the controller casts.
+     #[test]
+diff --git a/crates/engine/src/parser/oracle_static/static_helpers.rs b/crates/engine/src/parser/oracle_static/static_helpers.rs
+index 519f0af480..0499eac05d 100644
+--- a/crates/engine/src/parser/oracle_static/static_helpers.rs
++++ b/crates/engine/src/parser/oracle_static/static_helpers.rs
+@@ -53,6 +53,80 @@ fn parse_bare_supertype_spell_filter(base: &str) -> Option<TargetFilter> {
+     ])))
+ }
+ 
++/// CR 202.3: Nom parse of a trailing "with/of mana value N or greater/less"
++/// (also "or more"/"or fewer") qualifier — returns the prefix BEFORE the
++/// qualifier plus the `FilterProp::Cmc` it selects. Fails (nom `Err`) when no
++/// mana-value qualifier is present.
++fn parse_cost_mod_mana_value_qualifier(prefix: &str) -> OracleResult<'_, (&str, FilterProp)> {
++    let (rest, before) = alt((
++        take_until::<_, _, OracleError<'_>>(" with mana value "),
++        take_until(" of mana value "),
++    ))
++    .parse(prefix)?;
++    let (rest, _) = alt((tag(" with mana value "), tag(" of mana value "))).parse(rest)?;
++    let (rest, mv) = nom_primitives::parse_number(rest)?;
++    let (rest, comparator) = alt((
++        value(Comparator::GE, alt((tag(" or greater"), tag(" or more")))),
++        value(Comparator::LE, alt((tag(" or less"), tag(" or fewer")))),
++    ))
++    .parse(rest)?;
++    Ok((
++        rest,
++        (
++            before,
++            FilterProp::Cmc {
++                comparator,
++                value: QuantityExpr::Fixed { value: mv as i32 },
++            },
++        ),
++    ))
++}
++
++/// CR 202.3 + CR 601.2f: Peel a trailing "with mana value N or greater/less"
++/// spell-selection qualifier off a cost-modifier subject prefix, returning the
++/// prefix WITHOUT the qualifier plus the parsed `FilterProp::Cmc`. The mana-value
++/// gate sits AFTER the "spells you cast" infix ("Instant and sorcery spells you
++/// cast with mana value 4 or greater cost {X} less" — The Scarlet Witch, #5606),
++/// so the caller's "you cast"/"spells" end-trims cannot reach the type words
++/// until this qualifier is peeled. Covers the whole MV-gated cost-modifier class,
++/// not one card.
++fn strip_cost_mod_mana_value_qualifier(prefix: &str) -> (&str, Option<FilterProp>) {
++    match parse_cost_mod_mana_value_qualifier(prefix) {
++        Ok((_, (before, prop))) => (before, Some(prop)),
++        Err(_) => (prefix, None),
++    }
++}
++
++/// Compose an optional mana-value `FilterProp::Cmc` (from
++/// `strip_cost_mod_mana_value_qualifier`) into the cost-modifier spell filter.
++/// A typed filter absorbs the prop directly; an `Or` (or any non-`Typed`)
++/// filter is `And`-wrapped with a card+prop leaf; a bare mana-value gate with no
++/// type restriction ("spells you cast with mana value 4 or greater") becomes a
++/// card filter carrying the prop.
++fn compose_cost_mod_mana_value(
++    filter: Option<TargetFilter>,
++    prop: Option<FilterProp>,
++) -> Option<TargetFilter> {
++    let Some(prop) = prop else {
++        return filter;
++    };
++    match filter {
++        Some(TargetFilter::Typed(mut tf)) => {
++            tf.properties.push(prop);
++            Some(TargetFilter::Typed(tf))
++        }
++        Some(other) => Some(TargetFilter::And {
++            filters: vec![
++                other,
++                TargetFilter::Typed(TypedFilter::card().properties(vec![prop])),
++            ],
++        }),
++        None => Some(TargetFilter::Typed(
++            TypedFilter::card().properties(vec![prop]),
++        )),
++    }
++}
++
+ fn parse_cost_mod_spell_type_prefix(type_desc: &str) -> Option<TargetFilter> {
+     let base = type_desc.trim();
+     let base = tag::<_, _, OracleError<'_>>("each ")
+@@ -544,6 +618,12 @@ pub(crate) fn try_parse_cost_modification(
+         } else {
+             (without_chosen, false)
+         };
++        // CR 202.3 + CR 601.2f: Peel a trailing "with mana value N or greater/less"
++        // gate BEFORE the "you cast"/"spells" end-trims. The qualifier sits after
++        // the "spells you cast" infix, so without peeling it the trims never reach
++        // the type words and the whole type+MV restriction is dropped (The Scarlet
++        // Witch reduced EVERY spell, not just instants/sorceries — #5606).
++        let (without_chosen, mana_value_prop) = strip_cost_mod_mana_value_qualifier(without_chosen);
+         let type_desc = without_chosen
+             .trim_end_matches(" you cast") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
+             .trim_end_matches(" your opponents cast") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
+@@ -587,13 +667,15 @@ pub(crate) fn try_parse_cost_modification(
+         // Compose chosen-name constraint with the typed prefix (if any). Bare
+         // "Spells with the chosen name" → `HasChosenName` alone; typed
+         // "<Type> spells with the chosen name" → `And{Typed, HasChosenName}`.
+-        match (typed_filter, has_chosen_name) {
++        let base_filter = match (typed_filter, has_chosen_name) {
+             (Some(tf), true) => Some(TargetFilter::And {
+                 filters: vec![tf, TargetFilter::HasChosenName],
+             }),
+             (None, true) => Some(TargetFilter::HasChosenName),
+             (tf, false) => tf,
+-        }
++        };
++        // CR 202.3: fold the peeled mana-value gate back into the spell filter.
++        compose_cost_mod_mana_value(base_filter, mana_value_prop)
+     } else {
+         None
+     };
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index 28c3fed19d..25ede5e41a 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -1469,6 +1469,117 @@ fn dual_gated_attached_subject_defers_from_self_ref_splitter() {
+     }
+ }
+ 
++/// CR 202.3 + CR 601.2f (#5606): The Scarlet Witch — "Instant and sorcery spells
++/// you cast with mana value 4 or greater cost {N} less" restricts the reduction
++/// to instant/sorcery spells of mana value ≥ 4. Before the fix, the trailing
++/// mana-value gate sat after the "spells you cast" infix and blocked the type
++/// trims, so `spell_filter` came out `null` and EVERY spell was reduced (the
++/// reported bug). The gate now folds into `And{ Or{Instant,Sorcery}, Cmc ≥ 4 }`.
++#[test]
++fn cost_mod_mana_value_gate_instant_sorcery_ge() {
++    let def = parse_static_line(
++        "Instant and sorcery spells you cast with mana value 4 or greater cost {1} less to cast.",
++    )
++    .expect("cost reduction should parse");
++    let StaticMode::ModifyCost { spell_filter, .. } = &def.mode else {
++        panic!("expected ModifyCost, got {:?}", def.mode);
++    };
++    let filter = spell_filter
++        .as_ref()
++        .expect("spell_filter must not be null (#5606)");
++    let TargetFilter::And { filters } = filter else {
++        panic!("expected And{{type, mana-value}}, got {filter:?}");
++    };
++    assert!(
++        filters
++            .iter()
++            .any(|f| matches!(f, TargetFilter::Or { filters: or } if or.len() == 2)),
++        "missing instant/sorcery type restriction: {filters:?}"
++    );
++    assert!(
++        filters.iter().any(|f| matches!(f,
++            TargetFilter::Typed(tf) if tf.properties.iter().any(|p| matches!(p,
++                FilterProp::Cmc { comparator: Comparator::GE, value: QuantityExpr::Fixed { value: 4 } })))),
++        "missing Cmc >= 4 gate: {filters:?}"
++    );
++}
++
++/// CR 202.3 (#5606): single-type + "mana value N or less" gate folds the Cmc prop
++/// directly onto the typed filter (no `And` wrapper needed for a single `Typed`).
++#[test]
++fn cost_mod_mana_value_gate_single_type_le() {
++    let def = parse_static_line(
++        "Creature spells you cast with mana value 3 or less cost {1} less to cast.",
++    )
++    .expect("cost reduction should parse");
++    let StaticMode::ModifyCost { spell_filter, .. } = &def.mode else {
++        panic!("expected ModifyCost, got {:?}", def.mode);
++    };
++    let Some(TargetFilter::Typed(tf)) = spell_filter.as_ref() else {
++        panic!("expected Typed(Creature + Cmc), got {spell_filter:?}");
++    };
++    assert!(
++        tf.type_filters.contains(&TypeFilter::Creature),
++        "creature type restriction lost: {tf:?}"
++    );
++    assert!(
++        tf.properties.iter().any(|p| matches!(
++            p,
++            FilterProp::Cmc {
++                comparator: Comparator::LE,
++                value: QuantityExpr::Fixed { value: 3 }
++            }
++        )),
++        "missing Cmc <= 3 gate: {tf:?}"
++    );
++}
++
++/// CR 202.3 (#5606): a bare (type-less) mana-value gate — "spells you cast with
++/// mana value 5 or greater" — yields a card filter carrying just the Cmc prop.
++#[test]
++fn cost_mod_mana_value_gate_bare_no_type() {
++    let def =
++        parse_static_line("Spells you cast with mana value 5 or greater cost {2} less to cast.")
++            .expect("cost reduction should parse");
++    let StaticMode::ModifyCost { spell_filter, .. } = &def.mode else {
++        panic!("expected ModifyCost, got {:?}", def.mode);
++    };
++    let Some(TargetFilter::Typed(tf)) = spell_filter.as_ref() else {
++        panic!("expected Typed(card + Cmc), got {spell_filter:?}");
++    };
++    assert!(
++        tf.properties.iter().any(|p| matches!(
++            p,
++            FilterProp::Cmc {
++                comparator: Comparator::GE,
++                value: QuantityExpr::Fixed { value: 5 }
++            }
++        )),
++        "missing Cmc >= 5 gate: {tf:?}"
++    );
++}
++
++/// Regression (#5606): an "Instant and sorcery spells you cast cost {N} less"
++/// line with NO mana-value gate is unchanged — no spurious Cmc prop is added
++/// (Goblin Electromancer class).
++#[test]
++fn cost_mod_no_mana_value_gate_unchanged() {
++    let def = parse_static_line("Instant and sorcery spells you cast cost {1} less to cast.")
++        .expect("cost reduction should parse");
++    let StaticMode::ModifyCost { spell_filter, .. } = &def.mode else {
++        panic!("expected ModifyCost, got {:?}", def.mode);
++    };
++    assert!(
++        matches!(spell_filter.as_ref(), Some(TargetFilter::Or { filters }) if filters.len() == 2),
++        "expected bare Or{{Instant,Sorcery}} with no Cmc, got {spell_filter:?}"
++    );
++    // No mana-value prop anywhere in the filter.
++    assert!(
++        !format!("{spell_filter:?}").contains("Cmc"),
++        "unexpected Cmc gate on a card with no mana-value qualifier: {spell_filter:?}"
++    );
++}
++
+ /// CR 508.1c + CR 509.1b: Grant + dual-gated restrictions emit the pump grant
+ /// plus both gated combat statics on the enchanted/equipped host.
+ #[test]

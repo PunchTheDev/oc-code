@@ -1,0 +1,779 @@
+diff --git a/src/mcp-server.ts b/src/mcp-server.ts
+index b86cb4c972..c7c1c92ad6 100644
+--- a/src/mcp-server.ts
++++ b/src/mcp-server.ts
+@@ -145,6 +145,12 @@ import {
+   LIST_SUBNET_EVIDENCE_OUTPUT_SCHEMA,
+   loadSubnetEvidenceList,
+ } from "./subnet-evidence-mcp.ts";
++import {
++  LIST_SUBNET_GAPS_INSTRUCTIONS,
++  LIST_SUBNET_GAPS_MCP_TOOL,
++  LIST_SUBNET_GAPS_OUTPUT_SCHEMA,
++  loadSubnetGapsList,
++} from "./subnet-gaps-mcp.ts";
+ import {
+   LIST_SUBNET_CANDIDATES_INSTRUCTIONS,
+   LIST_SUBNET_CANDIDATES_MCP_TOOL,
+@@ -894,7 +900,9 @@ export const MCP_INSTRUCTIONS =
+   "Use list_enrichment_targets to plan coverage-depth work across schemas, " +
+   "fixtures, examples, provenance, and candidate-review gaps, and " +
+   "get_subnet_gaps for one subnet's interface gap priorities and contributor " +
+-  "enrichment queue. " +
++  "enrichment queue, " +
++  LIST_SUBNET_GAPS_INSTRUCTIONS +
++  "and more. " +
+   "For goal-shaped flows, find_subnet_for_task turns a plain-language task into " +
+   "callable subnets and how_do_i_call returns concrete call instructions " +
+   "(base URL, auth, schema, health) for one subnet. For on-chain economics and " +
+@@ -10683,6 +10691,12 @@ export const MCP_TOOLS = [
+       return gaps;
+     },
+   },
++  {
++    ...LIST_SUBNET_GAPS_MCP_TOOL,
++    async handler(args: Row, ctx: McpCtx) {
++      return loadSubnetGapsList(asMcpLoaderCtx(ctx), args);
++    },
++  },
+   {
+     name: "find_subnet_opportunities",
+     title: "Rank subnets by economic opportunity",
+@@ -15635,6 +15649,7 @@ const TOOL_OUTPUT_SCHEMAS = {
+       enrichment_queue: { type: "array", items: { type: "object" } },
+     },
+   },
++  list_subnet_gaps: LIST_SUBNET_GAPS_OUTPUT_SCHEMA,
+   find_subnet_for_task: {
+     type: "object",
+     additionalProperties: true,
+diff --git a/src/subnet-gaps-mcp.ts b/src/subnet-gaps-mcp.ts
+new file mode 100644
+index 0000000000..4b9a4a2451
+--- /dev/null
++++ b/src/subnet-gaps-mcp.ts
+@@ -0,0 +1,292 @@
++// Per-subnet interface gap-priority list loader for MCP parity on
++// GET /api/v1/subnets/{netuid}/gaps. Applies the same list-query transforms
++// as the REST route over the baked /metagraph/review/gaps/{netuid}.json
++// artifact.
++
++import { applyQueryFilters, type Row } from "../workers/list-query.ts";
++import type { StorageReadResult } from "../workers/storage.ts";
++import { API_QUERY_COLLECTIONS, QUERY_ENUMS } from "./contracts.ts";
++
++// The REST route pages this artifact through the review-gap-priorities
++// collection (rows live under `priorities`), not the network-wide `gaps`
++// collection -- keep both the sort fields and the filter set sourced from it.
++const GAP_PRIORITY_SORT_FIELDS =
++  API_QUERY_COLLECTIONS["review-gap-priorities"].sort_fields;
++const CURATION_LEVELS = QUERY_ENUMS.curationLevel;
++const SURFACE_KINDS = QUERY_ENUMS.surfaceKind;
++// netuid is the path param (excluded from the REST list query).
++const SUBNET_GAPS_QUERY_FILTER_NAMES = [
++  "curation_level",
++  "missing_kinds",
++  "review_state",
++];
++
++export function subnetGapsArtifactPath(netuid: unknown): string {
++  return `/metagraph/review/gaps/${netuid}.json`;
++}
++
++export interface SubnetGapsMcpError extends Error {
++  toolError: true;
++  code: string;
++}
++
++export function subnetGapsMcpError(
++  code: string,
++  message: string,
++): SubnetGapsMcpError {
++  const error = new Error(message) as SubnetGapsMcpError;
++  error.toolError = true;
++  error.code = code;
++  return error;
++}
++
++function requireNetuid(
++  args: Record<string, unknown> | null | undefined,
++): number {
++  const netuid = args?.netuid;
++  if (typeof netuid !== "number" || !Number.isInteger(netuid) || netuid < 0) {
++    throw subnetGapsMcpError(
++      "invalid_params",
++      "netuid must be a non-negative integer.",
++    );
++  }
++  return netuid;
++}
++
++function optionalString(
++  args: Record<string, unknown> | null | undefined,
++  key: string,
++): string | null {
++  const value = args?.[key];
++  if (value === undefined || value === null || value === "") return null;
++  if (typeof value !== "string" || value.trim() === "") {
++    throw subnetGapsMcpError(
++      "invalid_params",
++      `Argument \`${key}\` must be a non-empty string when provided.`,
++    );
++  }
++  return value.trim();
++}
++
++function optionalEnum(
++  args: Record<string, unknown> | null | undefined,
++  key: string,
++  allowed: string[],
++): string | null {
++  const value = args?.[key];
++  if (value === undefined || value === null || value === "") return null;
++  if (typeof value !== "string" || !allowed.includes(value)) {
++    throw subnetGapsMcpError(
++      "invalid_params",
++      `Argument \`${key}\` must be one of: ${allowed.join(", ")}.`,
++    );
++  }
++  return value;
++}
++
++function clampLimit(value: unknown, fallback: number, max: number): number {
++  if (typeof value !== "number") return fallback;
++  if (!Number.isFinite(value) || value < 1) return fallback;
++  return Math.min(max, Math.floor(value));
++}
++
++export function subnetGapsQueryUrl(
++  args: Record<string, unknown> | null | undefined,
++): URL {
++  const url = new URL("https://mcp.internal/subnets/gaps");
++  requireNetuid(args);
++  const curationLevel = optionalEnum(args, "curation_level", CURATION_LEVELS);
++  if (curationLevel) url.searchParams.set("curation_level", curationLevel);
++  const missingKinds = optionalEnum(args, "missing_kinds", SURFACE_KINDS);
++  if (missingKinds) url.searchParams.set("missing_kinds", missingKinds);
++  const reviewState = optionalString(args, "review_state");
++  if (reviewState) url.searchParams.set("review_state", reviewState);
++  const sort = optionalEnum(args, "sort", GAP_PRIORITY_SORT_FIELDS);
++  if (sort) url.searchParams.set("sort", sort);
++  const order = optionalEnum(args, "order", ["asc", "desc"]);
++  if (order) url.searchParams.set("order", order);
++  const fields = optionalString(args, "fields");
++  if (fields) url.searchParams.set("fields", fields);
++  if (args?.limit !== undefined) {
++    url.searchParams.set("limit", String(clampLimit(args.limit, 50, 100)));
++  }
++  if (args?.cursor !== undefined) {
++    const cursor = args.cursor;
++    if (typeof cursor !== "number" || !Number.isInteger(cursor) || cursor < 0) {
++      throw subnetGapsMcpError(
++        "invalid_params",
++        "cursor must be a non-negative integer.",
++      );
++    }
++    url.searchParams.set("cursor", String(cursor));
++  }
++  return url;
++}
++
++export interface SubnetGapsListResult {
++  generated_at: unknown;
++  netuid: unknown;
++  priorities: Row[];
++  total: unknown;
++  returned: unknown;
++  limit: unknown;
++  cursor: unknown;
++  next_cursor: unknown;
++  sort: unknown;
++  order: unknown;
++}
++
++export async function loadSubnetGapsList(
++  ctx: {
++    env: Env;
++    readArtifact: (env: Env, path: string) => Promise<StorageReadResult>;
++  },
++  args: Record<string, unknown> | null | undefined,
++  {
++    readArtifact,
++  }: {
++    readArtifact?: (env: Env, path: string) => Promise<StorageReadResult>;
++  } = {},
++): Promise<SubnetGapsListResult> {
++  const netuid = requireNetuid(args);
++  const queryUrl = subnetGapsQueryUrl(args);
++  const artifactPath = subnetGapsArtifactPath(netuid);
++  const read = readArtifact ?? ctx.readArtifact;
++  const result = await read(ctx.env, artifactPath);
++  if (!result?.ok) {
++    const code =
++      (result as { code?: string } | undefined)?.code || "artifact_unavailable";
++    if (code === "artifact_not_found") {
++      throw subnetGapsMcpError(
++        "not_found",
++        `No gap report exists for netuid ${netuid}.`,
++      );
++    }
++    throw subnetGapsMcpError(code, `Could not load ${artifactPath} (${code}).`);
++  }
++  const blob = result.data;
++  if (!blob || typeof blob !== "object") {
++    throw subnetGapsMcpError(
++      "not_found",
++      `No gap report exists for netuid ${netuid}.`,
++    );
++  }
++  const transformed = applyQueryFilters(
++    blob as Record<string, unknown>,
++    queryUrl,
++    // Collection KEY (indexes API_QUERY_COLLECTIONS), not the row key -- the
++    // rows themselves live under this collection's data_key, `priorities`.
++    "review-gap-priorities",
++    SUBNET_GAPS_QUERY_FILTER_NAMES,
++  );
++  if (transformed.error) {
++    throw subnetGapsMcpError("invalid_params", transformed.error.message);
++  }
++  const data = transformed.data as Record<string, unknown>;
++  const meta = transformed.meta as Record<string, unknown>;
++  const page = (meta.pagination as Record<string, unknown>) || {};
++  const rows = Array.isArray(data.priorities) ? (data.priorities as Row[]) : [];
++  const rowLen = rows.length;
++  return {
++    generated_at: data.generated_at ?? null,
++    netuid: data.netuid ?? netuid,
++    priorities: rows,
++    total: page.total ?? rowLen,
++    returned: page.returned ?? rowLen,
++    limit: page.limit ?? rowLen,
++    cursor: page.cursor ?? 0,
++    next_cursor: page.next_cursor ?? null,
++    sort: page.sort ?? null,
++    order: page.order ?? null,
++  };
++}
++
++export const LIST_SUBNET_GAPS_INSTRUCTIONS =
++  "list_subnet_gaps one subnet's interface gap priorities with REST list-query " +
++  "filters (curation_level, missing_kinds, review_state, and pagination; " +
++  "mirrors GET /api/v1/subnets/{netuid}/gaps), ";
++
++export const LIST_SUBNET_GAPS_MCP_TOOL = {
++  name: "list_subnet_gaps",
++  title: "List one subnet's interface gap priorities",
++  description:
++    "Fetch interface gap priorities for one subnet by netuid: the surface " +
++    "kinds still missing, the subnet's curation level, and the review state " +
++    "driving contributor targeting. Filter by curation_level, missing_kinds, " +
++    "or review_state; sort with sort + order; and page with limit (1-100) / " +
++    "cursor. Distinct from get_subnet_gaps (raw artifact dump, which also " +
++    "carries the enrichment queue). Mirrors GET /api/v1/subnets/{netuid}/gaps.",
++  inputSchema: {
++    type: "object",
++    properties: {
++      netuid: {
++        type: "integer",
++        description: "Subnet netuid.",
++        minimum: 0,
++      },
++      curation_level: {
++        type: "string",
++        enum: CURATION_LEVELS,
++        description: "Filter by the subnet's curation level.",
++      },
++      missing_kinds: {
++        type: "string",
++        enum: SURFACE_KINDS,
++        description: "Filter to rows missing this surface kind.",
++      },
++      review_state: {
++        type: "string",
++        description: "Filter by review state.",
++      },
++      sort: {
++        type: "string",
++        enum: GAP_PRIORITY_SORT_FIELDS,
++        description: "Field to sort by before paging.",
++      },
++      order: {
++        type: "string",
++        enum: ["asc", "desc"],
++        description: "Sort direction for sort (default asc).",
++      },
++      fields: {
++        type: "string",
++        description:
++          "Comma-separated projection of gap-priority row fields to return.",
++      },
++      limit: {
++        type: "integer",
++        description: "Max rows to return (1-100). Enables pagination.",
++        minimum: 1,
++        maximum: 100,
++      },
++      cursor: {
++        type: "integer",
++        description: "Pagination cursor from a prior response's next_cursor.",
++        minimum: 0,
++      },
++    },
++    required: ["netuid"],
++    additionalProperties: false,
++  },
++};
++
++const NULLABLE_STRING = { type: ["string", "null"] };
++const NULLABLE_INT = { type: ["integer", "null"] };
++
++export const LIST_SUBNET_GAPS_OUTPUT_SCHEMA = {
++  type: "object",
++  additionalProperties: true,
++  required: ["priorities"],
++  properties: {
++    generated_at: NULLABLE_STRING,
++    netuid: NULLABLE_INT,
++    priorities: { type: "array", items: { type: "object" } },
++    total: { type: "integer" },
++    returned: { type: "integer" },
++    limit: { type: "integer" },
++    cursor: { type: "integer" },
++    next_cursor: NULLABLE_INT,
++    sort: NULLABLE_STRING,
++    order: NULLABLE_STRING,
++  },
++};
+diff --git a/tests/subnet-gaps-mcp.test.ts b/tests/subnet-gaps-mcp.test.ts
+new file mode 100644
+index 0000000000..2260f2e7f8
+--- /dev/null
++++ b/tests/subnet-gaps-mcp.test.ts
+@@ -0,0 +1,426 @@
++import assert from "node:assert/strict";
++import { describe, test, vi } from "vitest";
++import { Ajv2020 } from "ajv/dist/2020.js";
++import * as listQuery from "../workers/list-query.ts";
++import {
++  LIST_SUBNET_GAPS_INSTRUCTIONS,
++  LIST_SUBNET_GAPS_MCP_TOOL,
++  LIST_SUBNET_GAPS_OUTPUT_SCHEMA,
++  loadSubnetGapsList,
++  subnetGapsArtifactPath,
++  subnetGapsMcpError,
++  subnetGapsQueryUrl,
++} from "../src/subnet-gaps-mcp.ts";
++import type { Row } from "./row-type.ts";
++
++type LoadCtx = Parameters<typeof loadSubnetGapsList>[0];
++type LoadDeps = Parameters<typeof loadSubnetGapsList>[2];
++
++import { MCP_INSTRUCTIONS, MCP_TOOLS } from "../src/mcp-server.ts";
++
++const NETUID = 7;
++const ARTIFACT = subnetGapsArtifactPath(NETUID);
++
++const SAMPLE_BLOB = {
++  generated_at: "2026-07-01T00:00:00.000Z",
++  netuid: NETUID,
++  priorities: [
++    {
++      netuid: NETUID,
++      name: "alpha",
++      curation_level: "native",
++      missing_kinds: "openapi",
++      review_state: "pending",
++      priority_score: 90,
++    },
++    {
++      netuid: NETUID,
++      name: "beta",
++      curation_level: "community-seeded",
++      missing_kinds: "openapi",
++      review_state: "pending",
++      priority_score: 50,
++    },
++    {
++      netuid: NETUID,
++      name: "gamma",
++      curation_level: "community-seeded",
++      missing_kinds: "docs",
++      review_state: "done",
++      priority_score: 10,
++    },
++  ],
++};
++
++function readArtifact(_env: unknown, path: string) {
++  if (path === ARTIFACT) {
++    return Promise.resolve({ ok: true, data: SAMPLE_BLOB });
++  }
++  return Promise.resolve({ ok: false, code: "artifact_not_found" });
++}
++
++describe("subnet-gaps-mcp", () => {
++  test("subnetGapsMcpError is shaped for MCP toolError handling", () => {
++    const err = subnetGapsMcpError("invalid_params", "bad curation_level");
++    assert.equal(err.code, "invalid_params");
++    assert.equal(err.toolError, true);
++  });
++
++  test("subnetGapsQueryUrl validates filters and cursor", () => {
++    const url = subnetGapsQueryUrl({
++      netuid: NETUID,
++      curation_level: "native",
++      missing_kinds: "openapi",
++      review_state: "pending",
++      sort: "priority_score",
++      order: "desc",
++      fields: "name,priority_score",
++      limit: 10,
++      cursor: 5,
++    });
++    assert.equal(url.searchParams.get("curation_level"), "native");
++    assert.equal(url.searchParams.get("missing_kinds"), "openapi");
++    assert.equal(url.searchParams.get("review_state"), "pending");
++    assert.equal(url.searchParams.get("sort"), "priority_score");
++    assert.equal(url.searchParams.get("order"), "desc");
++    assert.equal(url.searchParams.get("limit"), "10");
++    assert.equal(url.searchParams.get("cursor"), "5");
++  });
++
++  test("subnetGapsQueryUrl rejects missing netuid", () => {
++    assert.throws(
++      () => subnetGapsQueryUrl({}),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetGapsQueryUrl rejects invalid curation_level", () => {
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: NETUID, curation_level: "bogus" }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetGapsQueryUrl rejects invalid missing_kinds", () => {
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: NETUID, missing_kinds: "bogus" }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetGapsQueryUrl rejects empty review_state and invalid sort", () => {
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: NETUID, review_state: "   " }),
++      (err: Row) => err.code === "invalid_params",
++    );
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: NETUID, sort: "not_a_column" }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetGapsQueryUrl rejects non-string review_state and invalid order", () => {
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: NETUID, review_state: 42 }),
++      (err: Row) => err.code === "invalid_params",
++    );
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: NETUID, order: "sideways" }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetGapsQueryUrl rejects empty fields and non-string fields", () => {
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: NETUID, fields: "   " }),
++      (err: Row) => err.code === "invalid_params",
++    );
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: NETUID, fields: 42 }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetGapsQueryUrl clamps a non-numeric limit to the default", () => {
++    const url = subnetGapsQueryUrl({ netuid: NETUID, limit: "lots" });
++    assert.equal(url.searchParams.get("limit"), "50");
++  });
++
++  test("subnetGapsQueryUrl clamps a sub-minimum numeric limit to the default", () => {
++    const url = subnetGapsQueryUrl({ netuid: NETUID, limit: 0 });
++    assert.equal(url.searchParams.get("limit"), "50");
++  });
++
++  test("subnetGapsQueryUrl clamps limit above the MCP maximum", () => {
++    const url = subnetGapsQueryUrl({ netuid: NETUID, limit: 500 });
++    assert.equal(url.searchParams.get("limit"), "100");
++  });
++
++  test("subnetGapsQueryUrl rejects a fractional netuid", () => {
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: 1.5 }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetGapsQueryUrl rejects a fractional cursor", () => {
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: NETUID, cursor: 1.5 }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("subnetGapsQueryUrl rejects negative cursor", () => {
++    assert.throws(
++      () => subnetGapsQueryUrl({ netuid: NETUID, cursor: -1 }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  // The deliverables the issue names: a curation_level filter and a
++  // missing_kinds filter.
++  test("loadSubnetGapsList filters by curation_level", async () => {
++    const out = await loadSubnetGapsList(
++      { env: {}, readArtifact } as unknown as LoadCtx,
++      { netuid: NETUID, curation_level: "native" },
++    );
++    assert.equal(out.returned, 1);
++    assert.equal(out.priorities[0].name, "alpha");
++    assert.equal(out.netuid, NETUID);
++  });
++
++  test("loadSubnetGapsList filters by missing_kinds", async () => {
++    const out = await loadSubnetGapsList(
++      { env: {}, readArtifact } as unknown as LoadCtx,
++      { netuid: NETUID, missing_kinds: "openapi" },
++    );
++    assert.equal(out.returned, 2);
++    assert.deepEqual(
++      out.priorities.map((row: Row) => row.name),
++      ["alpha", "beta"],
++    );
++  });
++
++  test("loadSubnetGapsList combines both filters, then sorts and pages", async () => {
++    const out = await loadSubnetGapsList(
++      { env: {}, readArtifact } as unknown as LoadCtx,
++      {
++        netuid: NETUID,
++        curation_level: "community-seeded",
++        missing_kinds: "openapi",
++        sort: "priority_score",
++        order: "desc",
++        limit: 1,
++      },
++    );
++    assert.equal(out.returned, 1);
++    assert.equal(out.total, 1);
++    assert.equal(out.priorities[0].name, "beta");
++    assert.equal(out.next_cursor, null);
++  });
++
++  test("loadSubnetGapsList pages through to next_cursor and back", async () => {
++    const first = await loadSubnetGapsList(
++      { env: {}, readArtifact } as unknown as LoadCtx,
++      { netuid: NETUID, missing_kinds: "openapi", sort: "name", limit: 1 },
++    );
++    assert.equal(first.priorities[0].name, "alpha");
++    assert.equal(first.next_cursor, 1);
++    const second = await loadSubnetGapsList(
++      { env: {}, readArtifact } as unknown as LoadCtx,
++      {
++        netuid: NETUID,
++        missing_kinds: "openapi",
++        sort: "name",
++        limit: 1,
++        cursor: 1,
++      },
++    );
++    assert.equal(second.priorities[0].name, "beta");
++    assert.equal(second.next_cursor, null);
++  });
++
++  test("loadSubnetGapsList uses an injected readArtifact dep", async () => {
++    const out = await loadSubnetGapsList(
++      {
++        env: {},
++        readArtifact: async () => ({ ok: false }),
++      } as unknown as LoadCtx,
++      { netuid: 0 },
++      {
++        readArtifact: async () => ({
++          ok: true,
++          data: { priorities: [{ netuid: 0, name: "solo" }] },
++        }),
++      } as unknown as LoadDeps,
++    );
++    assert.equal(out.priorities[0].netuid, 0);
++  });
++
++  test("loadSubnetGapsList maps artifact_not_found to not_found", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetGapsList(
++          {
++            env: {},
++            readArtifact: async () => ({
++              ok: false,
++              code: "artifact_not_found",
++            }),
++          } as unknown as LoadCtx,
++          { netuid: NETUID },
++        ),
++      (err: Row) => err.code === "not_found",
++    );
++  });
++
++  test("loadSubnetGapsList surfaces other artifact failures", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetGapsList(
++          {
++            env: {},
++            readArtifact: async () => ({
++              ok: false,
++              code: "artifact_timeout",
++            }),
++          } as unknown as LoadCtx,
++          { netuid: NETUID },
++        ),
++      (err: Row) =>
++        err.code === "artifact_timeout" && /gaps\/7\.json/.test(err.message),
++    );
++  });
++
++  test("loadSubnetGapsList rejects invalid list-query params from REST parity", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetGapsList({ env: {}, readArtifact } as unknown as LoadCtx, {
++          netuid: NETUID,
++          fields: "not_a_column",
++        }),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("loadSubnetGapsList projects row fields when requested", async () => {
++    const out = await loadSubnetGapsList(
++      { env: {}, readArtifact } as unknown as LoadCtx,
++      { netuid: NETUID, fields: "name,priority_score", limit: 1 },
++    );
++    assert.deepEqual(out.priorities[0], {
++      name: "alpha",
++      priority_score: 90,
++    });
++  });
++
++  test("loadSubnetGapsList omits nullable artifact metadata when absent", async () => {
++    const out = await loadSubnetGapsList(
++      {
++        env: {},
++        readArtifact: async () => ({
++          ok: true,
++          data: { priorities: [{ netuid: 0, name: "solo" }] },
++        }),
++      } as unknown as LoadCtx,
++      { netuid: 0 },
++    );
++    assert.equal(out.generated_at, null);
++  });
++
++  test("loadSubnetGapsList treats a non-array priorities key as empty", async () => {
++    const out = await loadSubnetGapsList(
++      {
++        env: {},
++        readArtifact: async () => ({ ok: true, data: { priorities: null } }),
++      } as unknown as LoadCtx,
++      { netuid: NETUID },
++    );
++    assert.deepEqual(out.priorities, []);
++    assert.equal(out.total, 0);
++  });
++
++  test("loadSubnetGapsList falls back when pagination meta is absent", async () => {
++    const spy = vi.spyOn(listQuery, "applyQueryFilters").mockReturnValue({
++      data: { priorities: [{ netuid: 9 }, { netuid: 9 }] },
++      meta: {},
++    });
++    try {
++      const out = await loadSubnetGapsList(
++        { env: {}, readArtifact } as unknown as LoadCtx,
++        { netuid: NETUID },
++      );
++      assert.equal(out.total, 2);
++      assert.equal(out.returned, 2);
++      assert.equal(out.limit, 2);
++      assert.equal(out.cursor, 0);
++      assert.equal(out.next_cursor, null);
++      assert.equal(out.sort, null);
++      assert.equal(out.order, null);
++    } finally {
++      spy.mockRestore();
++    }
++  });
++
++  test("loadSubnetGapsList rejects a malformed artifact payload", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetGapsList(
++          {
++            env: {},
++            readArtifact: async () => ({ ok: true, data: null }),
++          } as unknown as LoadCtx,
++          { netuid: NETUID },
++        ),
++      (err: Row) => err.code === "not_found",
++    );
++  });
++
++  test("loadSubnetGapsList defaults code when the read result is bare", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetGapsList(
++          {
++            env: {},
++            readArtifact: async () => ({ ok: false }),
++          } as unknown as LoadCtx,
++          { netuid: NETUID },
++        ),
++      (err: Row) => err.code === "artifact_unavailable",
++    );
++  });
++
++  test("loadSubnetGapsList rejects missing netuid", async () => {
++    await assert.rejects(
++      () =>
++        loadSubnetGapsList({ env: {}, readArtifact } as unknown as LoadCtx, {}),
++      (err: Row) => err.code === "invalid_params",
++    );
++  });
++
++  test("MCP tool metadata and outputSchema compile", () => {
++    assert.equal(LIST_SUBNET_GAPS_MCP_TOOL.name, "list_subnet_gaps");
++    assert.match(LIST_SUBNET_GAPS_INSTRUCTIONS, /list_subnet_gaps/);
++    assert.ok(
++      new Ajv2020({ strict: false }).compile(LIST_SUBNET_GAPS_OUTPUT_SCHEMA),
++    );
++  });
++
++  test("MCP server exports wire list_subnet_gaps", () => {
++    assert.match(MCP_INSTRUCTIONS, /list_subnet_gaps/);
++    const tool = MCP_TOOLS.find((t: Row) => t.name === "list_subnet_gaps");
++    assert.ok(tool);
++    assert.equal(tool.title, "List one subnet's interface gap priorities");
++  });
++
++  test("the registered tool handler delegates to loadSubnetGapsList", async () => {
++    const tool = MCP_TOOLS.find((t: Row) => t.name === "list_subnet_gaps");
++    assert.ok(tool);
++    const out = await tool.handler(
++      { netuid: NETUID, curation_level: "native" },
++      { env: {}, readArtifact } as unknown as LoadCtx,
++    );
++    assert.equal(out.returned, 1);
++    assert.equal(out.priorities[0].name, "alpha");
++  });
++});

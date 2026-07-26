@@ -1,0 +1,426 @@
+diff --git a/docs/EVENTBUS-TIMEOUT-POLICY.md b/docs/EVENTBUS-TIMEOUT-POLICY.md
+new file mode 100644
+index 0000000..e606dd1
+--- /dev/null
++++ b/docs/EVENTBUS-TIMEOUT-POLICY.md
+@@ -0,0 +1,102 @@
++# EventBus Request-Reply Timeout Policy
++
++> **Milestone:** M2 — Reliable Backbone
++> **Issue:** [M2.10] Formalize the EventBus request-reply timeout policy across all services (#233)
++> **Status:** Canonical — all EventBus timeout usage MUST conform to this document.
++
++Request-reply and decision-wait timeouts on the `EventBus`
++([`sdk/src/activelearning/nats_client.py`](../sdk/src/activelearning/nats_client.py))
++used to be hardcoded ad hoc at each call site (`30.0`, `10.0`, `5.0`, and
++caller-supplied values with no shared default), which made failure behavior
++inconsistent and hard to reason about across services. This document defines the
++single source of truth for those timeouts and how to override them.
++
++---
++
++## 1. Centralized defaults
++
++All EventBus timeouts derive from module-level constants in `nats_client.py`.
++Nothing in the client hardcodes a timeout literal anymore; each constant is
++resolved once at import time from an environment variable, falling back to a
++documented default.
++
++| Constant | Env override | Default | Applies to |
++|----------|--------------|---------|------------|
++| `DEFAULT_REQUEST_TIMEOUT_S` | `ENGRAM_REQUEST_TIMEOUT_S` | `30.0` s | `EventBus.request()` request-reply RPCs |
++| `DEFAULT_DECISION_TIMEOUT_S` | `ENGRAM_DECISION_TIMEOUT_S` | `30.0` s | `EventBus.wait_for_decision()` Kernel gate waits |
++| `RECONNECT_WAIT_TIMEOUT_S` | `ENGRAM_RECONNECT_WAIT_TIMEOUT_S` | `10.0` s | `_ensure_connected()` wait for auto-reconnect |
++| `CONNECTION_DRAIN_TIMEOUT_S` | `ENGRAM_CONNECTION_DRAIN_TIMEOUT_S` | `5.0` s | draining a dead connection in `force_reconnect()` |
++
++All four constants are also re-exported from the `activelearning` package for
++discoverability:
++
++```python
++from activelearning import DEFAULT_REQUEST_TIMEOUT_S, DEFAULT_DECISION_TIMEOUT_S
++```
++
++---
++
++## 2. Override mechanism
++
++There are two override levels, in increasing precedence:
++
++### 2.1 Deployment-wide (environment variable)
++
++Set the relevant env var before the process starts. This changes the default for
++**every** call in that process that does not pass an explicit timeout:
++
++```bash
++# e.g. a slow/loaded deployment that needs more headroom
++export ENGRAM_REQUEST_TIMEOUT_S=45
++export ENGRAM_DECISION_TIMEOUT_S=45
++```
++
++Validation: a missing, non-numeric, or non-positive value logs a warning and
++falls back to the built-in default. A timeout can therefore never be silently set
++to `0` or a negative number (which would make a call hang forever or fail
++instantly).
++
++### 2.2 Per-call (explicit argument)
++
++Pass `timeout=<seconds>` to override a single call. Reserve this for calls whose
++latency profile genuinely differs from the default — e.g. the Kernel's fast
++safety-analysis probes intentionally use short timeouts so the gate fails closed
++quickly:
++
++```python
++# Kernel: a deliberately short probe (documented deviation from the default)
++resp = await self.event_bus.request(subject, payload, timeout=2.0)
++```
++
++`timeout=None` (the default value of the argument) means "use the policy
++default". Prefer `None` over restating `30.0` at a call site so a deployment-wide
++override actually takes effect.
++
++---
++
++## 3. Failure semantics
++
++- `EventBus.request()` raises `asyncio.TimeoutError` when no reply arrives in
++  time. Callers should catch it and degrade safely (retry, return an error, or
++  fail closed depending on context).
++- `EventBus.wait_for_decision()` raises `asyncio.TimeoutError` on timeout. Callers
++  **MUST fail closed** (deny / halt) — never default-allow. This is a safety
++  invariant (see [CLAUDE.md](../CLAUDE.md) §3 and
++  [`docs/SDK-BASESERVICE-CONTRACT.md`](SDK-BASESERVICE-CONTRACT.md) §3.10).
++
++---
++
++## 4. Guidance for call sites
++
++- **Default first.** Call `request()` / `wait_for_decision()` without a `timeout`
++  argument unless you have a specific reason not to.
++- **Document deviations.** If you pass an explicit timeout, add a short comment
++  explaining why the default is inappropriate (e.g. "fast fail-closed probe").
++- **Tune per deployment, not per call.** If a whole environment needs a different
++  budget, set the env var rather than editing many call sites.
++- **Never pass `0` or a negative timeout.** Use a small positive value if you need
++  a near-immediate check.
++
++---
++
++*Document owner: SDK / backbone team.*
+diff --git a/docs/SDK-BASESERVICE-CONTRACT.md b/docs/SDK-BASESERVICE-CONTRACT.md
+index 0daa87b..f4fa42e 100644
+--- a/docs/SDK-BASESERVICE-CONTRACT.md
++++ b/docs/SDK-BASESERVICE-CONTRACT.md
+@@ -123,11 +123,13 @@ Every `publish()`, `subscribe()`, `request()`, and `js_subscribe()` call
+ `_ensure_connected()` before touching the NATS client:
+ 
+ - If already connected: returns immediately.
+-- If reconnecting: waits up to **10 s** for `_connected` to be set.
+-- If still not connected after 10 s: raises `RuntimeError("Not connected to NATS")`.
++- If reconnecting: waits up to `RECONNECT_WAIT_TIMEOUT_S` (**10 s** default,
++  env-overridable via `ENGRAM_RECONNECT_WAIT_TIMEOUT_S`) for `_connected` to be set.
++- If still not connected after that window: raises `RuntimeError("Not connected to NATS")`.
+ 
+-This means a brief outage (< 10 s) is transparently absorbed; a sustained outage
+-surfaces as a `RuntimeError` to the caller.
++This means a brief outage (below the window) is transparently absorbed; a sustained
++outage surfaces as a `RuntimeError` to the caller. See
++[`docs/EVENTBUS-TIMEOUT-POLICY.md`](EVENTBUS-TIMEOUT-POLICY.md).
+ 
+ ### 3.4 `force_reconnect()` — manual recovery
+ 
+@@ -217,10 +219,15 @@ On validation failure:
+ **Caller side:**
+ 
+ ```python
+-response = await self.event_bus.request(subject, payload, timeout=30.0)
++response = await self.event_bus.request(subject, payload)  # uses the shared default
+ # response is a dict; raises asyncio.TimeoutError if no reply within timeout
+ ```
+ 
++Passing `timeout=None` (the default) uses the centralized
++`DEFAULT_REQUEST_TIMEOUT_S` policy value (env-overridable via
++`ENGRAM_REQUEST_TIMEOUT_S`). Pass an explicit `timeout` only when a specific call
++must deviate. See [`docs/EVENTBUS-TIMEOUT-POLICY.md`](EVENTBUS-TIMEOUT-POLICY.md).
++
+ **Handler side** (registered with `is_request_handler=True`):
+ 
+ ```python
+@@ -252,9 +259,12 @@ await self.event_bus.js_subscribe(subject, handler, durable="my-consumer-name")
+ ### 3.10 Decision waiting
+ 
+ ```python
+-decision = await self.event_bus.wait_for_decision(trace_id, timeout=30.0)
++decision = await self.event_bus.wait_for_decision(trace_id)  # uses the shared default
+ ```
+ 
++- Uses the centralized `DEFAULT_DECISION_TIMEOUT_S` policy value when `timeout` is
++  `None` (env-overridable via `ENGRAM_DECISION_TIMEOUT_S`). See
++  [`docs/EVENTBUS-TIMEOUT-POLICY.md`](EVENTBUS-TIMEOUT-POLICY.md).
+ - Creates a per-trace JetStream consumer with `deliver_all` policy so decisions
+   published before the call is made are not missed.
+ - Consumers auto-expire after 60 s of inactivity.
+@@ -332,6 +342,10 @@ All configuration is loaded from environment variables by `ServiceConfig.from_en
+ | `LOG_LEVEL` | `INFO` | Python logging level |
+ | `ENGRAM_DECISION_KEY` | *(unset)* | HMAC signing secret. **Unset = signing disabled (dev mode).** |
+ | `ENGRAM_DECISION_KEY_SECONDARY` | *(unset)* | Verify-only second signing key, accepted alongside `ENGRAM_DECISION_KEY`. Used only during key rotation — see [`docs/DECISION-KEY-ROTATION.md`](DECISION-KEY-ROTATION.md). |
++| `ENGRAM_REQUEST_TIMEOUT_S` | `30.0` | Default `EventBus.request()` request-reply timeout (seconds). See [`docs/EVENTBUS-TIMEOUT-POLICY.md`](EVENTBUS-TIMEOUT-POLICY.md). |
++| `ENGRAM_DECISION_TIMEOUT_S` | `30.0` | Default `EventBus.wait_for_decision()` timeout (seconds). |
++| `ENGRAM_RECONNECT_WAIT_TIMEOUT_S` | `10.0` | How long a queued op waits for auto-reconnect before raising. |
++| `ENGRAM_CONNECTION_DRAIN_TIMEOUT_S` | `5.0` | Grace period to drain a dead connection during `force_reconnect()`. |
+ 
+ ---
+ 
+diff --git a/sdk/src/activelearning/__init__.py b/sdk/src/activelearning/__init__.py
+index bc093b6..0ee6263 100644
+--- a/sdk/src/activelearning/__init__.py
++++ b/sdk/src/activelearning/__init__.py
+@@ -37,7 +37,15 @@
+     schema_for_subject,
+     validate_payload,
+ )
+-from activelearning.nats_client import EventBus, close_event_bus, get_event_bus
++from activelearning.nats_client import (
++    CONNECTION_DRAIN_TIMEOUT_S,
++    DEFAULT_DECISION_TIMEOUT_S,
++    DEFAULT_REQUEST_TIMEOUT_S,
++    RECONNECT_WAIT_TIMEOUT_S,
++    EventBus,
++    close_event_bus,
++    get_event_bus,
++)
+ from activelearning.plugins import ActuatorPlugin, SensorPlugin, register_actuator, register_sensor
+ from activelearning.qdrant_store import QdrantHit, QdrantPoint, QdrantStore
+ from activelearning.signing import (
+@@ -79,6 +87,11 @@
+     "EventBus",
+     "get_event_bus",
+     "close_event_bus",
++    # EventBus timeout policy (issue #233)
++    "DEFAULT_REQUEST_TIMEOUT_S",
++    "DEFAULT_DECISION_TIMEOUT_S",
++    "RECONNECT_WAIT_TIMEOUT_S",
++    "CONNECTION_DRAIN_TIMEOUT_S",
+     # Database
+     "Database",
+     "get_database",
+diff --git a/sdk/src/activelearning/nats_client.py b/sdk/src/activelearning/nats_client.py
+index 8dab106..c00641e 100644
+--- a/sdk/src/activelearning/nats_client.py
++++ b/sdk/src/activelearning/nats_client.py
+@@ -112,6 +112,44 @@
+ DLQ_SUBJECT_PREFIX: str = "dlq."
+ 
+ 
++def _env_timeout(name: str, default: float) -> float:
++    """Read a positive-float timeout override from the environment.
++
++    Invalid or non-positive values fall back to ``default`` with a warning so a
++    typo can never silently disable a timeout (which would let a call hang
++    forever).
++    """
++    raw = os.environ.get(name)
++    if raw is None:
++        return default
++    try:
++        value = float(raw)
++    except (TypeError, ValueError):
++        logger.warning("Invalid %s=%r (not a number); using default %.1fs", name, raw, default)
++        return default
++    if value <= 0:
++        logger.warning("Invalid %s=%r (must be > 0); using default %.1fs", name, raw, default)
++        return default
++    return value
++
++
++# --- Centralized request-reply timeout policy (issue #233) ---
++#
++# Every EventBus request-reply and decision-wait uses one of these shared
++# defaults unless a caller passes an explicit ``timeout``. Each is overridable
++# per-deployment via an environment variable so operators can tune failure
++# behavior without editing call sites. See docs/EVENTBUS-TIMEOUT-POLICY.md.
++#
++# Default timeout (seconds) for EventBus.request() request-reply RPCs.
++DEFAULT_REQUEST_TIMEOUT_S: float = _env_timeout("ENGRAM_REQUEST_TIMEOUT_S", 30.0)
++# Default timeout (seconds) for EventBus.wait_for_decision() Kernel gate waits.
++DEFAULT_DECISION_TIMEOUT_S: float = _env_timeout("ENGRAM_DECISION_TIMEOUT_S", 30.0)
++# How long a queued operation waits for auto-reconnect before giving up.
++RECONNECT_WAIT_TIMEOUT_S: float = _env_timeout("ENGRAM_RECONNECT_WAIT_TIMEOUT_S", 10.0)
++# Grace period for draining a dead connection during force_reconnect().
++CONNECTION_DRAIN_TIMEOUT_S: float = _env_timeout("ENGRAM_CONNECTION_DRAIN_TIMEOUT_S", 5.0)
++
++
+ def poison_subject(subject: str) -> str:
+     """Dead-letter subject for a poisoned safety-critical message."""
+     return f"{DLQ_SUBJECT_PREFIX}{subject}"
+@@ -713,7 +751,7 @@ async def request(
+         self,
+         subject: str,
+         data: Any,
+-        timeout: float = 30.0,
++        timeout: float | None = None,
+     ) -> dict[str, Any]:
+         """
+         Send a request and wait for a response.
+@@ -721,7 +759,10 @@ async def request(
+         Args:
+             subject: NATS subject
+             data: Request payload
+-            timeout: Timeout in seconds
++            timeout: Timeout in seconds. ``None`` (the default) uses the shared
++                ``DEFAULT_REQUEST_TIMEOUT_S`` policy value (env-overridable via
++                ``ENGRAM_REQUEST_TIMEOUT_S``). Pass an explicit value only when a
++                specific call needs to deviate — see docs/EVENTBUS-TIMEOUT-POLICY.md.
+ 
+         Returns:
+             Response data as dict
+@@ -729,18 +770,19 @@ async def request(
+         Raises:
+             asyncio.TimeoutError: If no response within timeout
+         """
++        effective_timeout = DEFAULT_REQUEST_TIMEOUT_S if timeout is None else timeout
+         await self._ensure_connected()
+         assert self._nc is not None
+         payload = serialize_message(data)
+         t0 = time.perf_counter()
+-        response = await self._nc.request(subject, payload, timeout=timeout)
++        response = await self._nc.request(subject, payload, timeout=effective_timeout)
+         self._metrics.record_request((time.perf_counter() - t0) * 1000)
+         return deserialize_message(response.data)
+ 
+     async def wait_for_decision(
+         self,
+         trace_id: str,
+-        timeout: float = 30.0,
++        timeout: float | None = None,
+         *,
+         code: bool = False,
+     ) -> dict[str, Any]:
+@@ -754,13 +796,17 @@ async def wait_for_decision(
+ 
+         Args:
+             trace_id: The trace ID to wait for
+-            timeout: Timeout in seconds
++            timeout: Timeout in seconds. ``None`` (the default) uses the shared
++                ``DEFAULT_DECISION_TIMEOUT_S`` policy value (env-overridable via
++                ``ENGRAM_DECISION_TIMEOUT_S``). On timeout the caller MUST fail
++                closed (deny/halt) — see docs/EVENTBUS-TIMEOUT-POLICY.md.
+             code: When True, wait on ``code.decision.{trace_id}`` instead of
+                 ``decision.{trace_id}`` (Kernel code-proposal gate).
+ 
+         Returns:
+             Decision data as dict
+         """
++        effective_timeout = DEFAULT_DECISION_TIMEOUT_S if timeout is None else timeout
+         subject = code_decision_subject(trace_id) if code else decision_subject(trace_id)
+         durable = f"waiter-{'code' if code else 'action'}-{trace_id}"
+         decision_received = asyncio.Event()
+@@ -824,7 +870,7 @@ async def _js_handler(msg: Msg) -> None:
+             ),
+         )
+         try:
+-            await asyncio.wait_for(decision_received.wait(), timeout=timeout)
++            await asyncio.wait_for(decision_received.wait(), timeout=effective_timeout)
+             return result
+         finally:
+             await sub.unsubscribe()
+@@ -858,7 +904,7 @@ async def force_reconnect(self) -> None:
+         # Best-effort close of old connection
+         if self._nc is not None:
+             try:
+-                await asyncio.wait_for(self._nc.close(), timeout=5.0)
++                await asyncio.wait_for(self._nc.close(), timeout=CONNECTION_DRAIN_TIMEOUT_S)
+             except Exception as e:
+                 log_connection_event(
+                     TRANSITION_FORCE_RECONNECT_CLOSE_FAILED,
+@@ -917,11 +963,12 @@ async def _ensure_connected(self) -> None:
+         """Ensure we're connected, waiting briefly for reconnection if needed."""
+         if self.is_connected:
+             return
+-        # NATS client may be reconnecting — wait up to 10s before giving up.
+-        # This prevents transient disconnects from crashing publish loops.
++        # NATS client may be reconnecting — wait up to RECONNECT_WAIT_TIMEOUT_S
++        # before giving up. This prevents transient disconnects from crashing
++        # publish loops.
+         if self._nc is not None:
+             try:
+-                await asyncio.wait_for(self._connected.wait(), timeout=10.0)
++                await asyncio.wait_for(self._connected.wait(), timeout=RECONNECT_WAIT_TIMEOUT_S)
+                 return
+             except TimeoutError:
+                 pass
+diff --git a/sdk/tests/test_timeout_policy.py b/sdk/tests/test_timeout_policy.py
+new file mode 100644
+index 0000000..04bcb62
+--- /dev/null
++++ b/sdk/tests/test_timeout_policy.py
+@@ -0,0 +1,70 @@
++"""Unit tests for the centralized EventBus timeout policy (issue #233).
++
++These are broker-free: they exercise the env-parsing helper and the module-level
++policy constants, not live NATS request-reply.
++"""
++
++import importlib
++
++import activelearning.nats_client as nats_client
++from activelearning.nats_client import _env_timeout
++
++
++class TestEnvTimeout:
++    def test_returns_default_when_unset(self, monkeypatch):
++        monkeypatch.delenv("ENGRAM_TEST_TIMEOUT_S", raising=False)
++        assert _env_timeout("ENGRAM_TEST_TIMEOUT_S", 30.0) == 30.0
++
++    def test_parses_valid_override(self, monkeypatch):
++        monkeypatch.setenv("ENGRAM_TEST_TIMEOUT_S", "45")
++        assert _env_timeout("ENGRAM_TEST_TIMEOUT_S", 30.0) == 45.0
++
++    def test_non_numeric_falls_back_to_default(self, monkeypatch):
++        monkeypatch.setenv("ENGRAM_TEST_TIMEOUT_S", "not-a-number")
++        assert _env_timeout("ENGRAM_TEST_TIMEOUT_S", 30.0) == 30.0
++
++    def test_zero_falls_back_to_default(self, monkeypatch):
++        # A zero timeout would let a call hang forever — must be rejected.
++        monkeypatch.setenv("ENGRAM_TEST_TIMEOUT_S", "0")
++        assert _env_timeout("ENGRAM_TEST_TIMEOUT_S", 30.0) == 30.0
++
++    def test_negative_falls_back_to_default(self, monkeypatch):
++        monkeypatch.setenv("ENGRAM_TEST_TIMEOUT_S", "-5")
++        assert _env_timeout("ENGRAM_TEST_TIMEOUT_S", 30.0) == 30.0
++
++
++class TestPolicyConstants:
++    def test_defaults_are_positive_floats(self):
++        for value in (
++            nats_client.DEFAULT_REQUEST_TIMEOUT_S,
++            nats_client.DEFAULT_DECISION_TIMEOUT_S,
++            nats_client.RECONNECT_WAIT_TIMEOUT_S,
++            nats_client.CONNECTION_DRAIN_TIMEOUT_S,
++        ):
++            assert isinstance(value, float)
++            assert value > 0
++
++    def test_documented_default_values(self):
++        assert nats_client.DEFAULT_REQUEST_TIMEOUT_S == 30.0
++        assert nats_client.DEFAULT_DECISION_TIMEOUT_S == 30.0
++        assert nats_client.RECONNECT_WAIT_TIMEOUT_S == 10.0
++        assert nats_client.CONNECTION_DRAIN_TIMEOUT_S == 5.0
++
++    def test_env_override_applied_on_reload(self, monkeypatch):
++        # Constants are resolved at import time; a deployment-wide override takes
++        # effect on (re)import of the module.
++        monkeypatch.setenv("ENGRAM_REQUEST_TIMEOUT_S", "42")
++        try:
++            reloaded = importlib.reload(nats_client)
++            assert reloaded.DEFAULT_REQUEST_TIMEOUT_S == 42.0
++        finally:
++            monkeypatch.delenv("ENGRAM_REQUEST_TIMEOUT_S", raising=False)
++            importlib.reload(nats_client)
++
++    def test_exported_from_package(self):
++        import activelearning
++
++        assert hasattr(activelearning, "DEFAULT_REQUEST_TIMEOUT_S")
++        assert hasattr(activelearning, "DEFAULT_DECISION_TIMEOUT_S")
++        assert hasattr(activelearning, "RECONNECT_WAIT_TIMEOUT_S")
++        assert hasattr(activelearning, "CONNECTION_DRAIN_TIMEOUT_S")

@@ -1,0 +1,140 @@
+diff --git a/strategy/runner.py b/strategy/runner.py
+index a2a2174..7813185 100644
+--- a/strategy/runner.py
++++ b/strategy/runner.py
+@@ -117,6 +117,17 @@ def run(n: int, cfg: Config, fill: str = "lowrank", verify: bool = False,
+     return info
+ 
+ 
++# Peak float64 row-blocks held together inside _rel_frobenius_streamed:
++# the two cast operands plus one reused difference scratch (issue #293).
++_REL_ERR_LIVE_F64_BLOCKS = 3
++
++
++def _rel_err_row_block(n: int, block_bytes: int) -> int:
++    """Rows per stream step so live float64 buffers stay within ``block_bytes``."""
++    row_bytes = max(1, n * 8)
++    return max(1, min(n, block_bytes // (row_bytes * _REL_ERR_LIVE_F64_BLOCKS)))
++
++
+ def _rel_frobenius_streamed(Ce, Cs, block_bytes: int = 256 * 1024**2) -> float:
+     """Relative Frobenius error ||Cs - Ce||_F / ||Ce||_F, one row-block at a time.
+ 
+@@ -124,19 +135,28 @@ def _rel_frobenius_streamed(Ce, Cs, block_bytes: int = 256 * 1024**2) -> float:
+     point of the streaming engine), so we must never cast the full (n, n) product to
+     float64 at once -- doing so force-loads both matrices plus a diff temporary into
+     host RAM (~3*n^2*8 bytes) and OOMs the host. The Frobenius norm is separable over
+-    rows, so accumulating squared sums block-by-block is numerically identical while
+-    keeping only one float64 row-block of each operand resident."""
++    rows, so accumulating squared sums block-by-block is numerically identical.
++
++    Each step keeps three float64 row-blocks live (``ce``, ``cs``, and a reused
++    ``diff`` scratch). ``block_bytes`` budgets that whole set — charging only one
++    block under-budgeted the stream by ~3–4x and could still host-OOM at the
++    out-of-core sizes --compare targets (#293)."""
+     n = Ce.shape[0]
+-    row_bytes = max(1, n * 8)                       # one float64 row
+-    blk = max(1, min(n, block_bytes // row_bytes))
++    blk = _rel_err_row_block(n, block_bytes)
+     num_sq = 0.0
+     den_sq = 0.0
++    diff = None
+     for r0 in range(0, n, blk):
+         r1 = min(n, r0 + blk)
++        rows = r1 - r0
+         ce = np.asarray(Ce[r0:r1], dtype=np.float64)
+         cs = np.asarray(Cs[r0:r1], dtype=np.float64)
+-        num_sq += float(np.sum((cs - ce) ** 2))
+-        den_sq += float(np.sum(ce ** 2))
++        if diff is None or diff.shape[0] != rows:
++            diff = np.empty((rows, n), dtype=np.float64)
++        np.subtract(cs, ce, out=diff)
++        # Dot products avoid extra (cs-ce)**2 / ce**2 array temporaries.
++        num_sq += float(np.dot(diff.ravel(), diff.ravel()))
++        den_sq += float(np.dot(ce.ravel(), ce.ravel()))
+     den = np.sqrt(den_sq)
+     return float(np.sqrt(num_sq) / (den or 1.0))
+ 
+diff --git a/strategy/tests/test_rel_err_temp_budget.py b/strategy/tests/test_rel_err_temp_budget.py
+new file mode 100644
+index 0000000..851191a
+--- /dev/null
++++ b/strategy/tests/test_rel_err_temp_budget.py
+@@ -0,0 +1,77 @@
++"""CPU-only: streamed compare rel_err must honour its host-memory budget (#293).
++
++``block_bytes`` used to size a *single* float64 row-block while each step also
++built subtraction/square temporaries on top of ``ce`` and ``cs``. A 256 MiB
++budget could therefore peak near 1 GiB. The helper now charges three live
++float64 blocks and reuses a diff scratch so peak matches the budget.
++
++Run:  python strategy/tests/test_rel_err_temp_budget.py
++"""
++from __future__ import annotations
++
++import os
++import sys
++
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
++
++from strategy.runner import (
++    _REL_ERR_LIVE_F64_BLOCKS,
++    _rel_err_row_block,
++    _rel_frobenius_streamed,
++)
++
++
++def _naive(Ce, Cs):
++    ref = np.asarray(Ce, dtype=np.float64)
++    return float(
++        np.linalg.norm(np.asarray(Cs, dtype=np.float64) - ref)
++        / (np.linalg.norm(ref) or 1.0)
++    )
++
++
++def test_live_block_charge_is_three():
++    assert _REL_ERR_LIVE_F64_BLOCKS == 3
++
++
++def test_row_block_shrinks_by_live_factor():
++    n = 4096
++    row_bytes = n * 8
++    # Keep both the naive and charged row counts strictly below n.
++    budget = 24 * 1024**2  # 24 MiB → naive 768 rows, charged 256 rows
++    naive_rows = budget // row_bytes
++    charged = _rel_err_row_block(n, budget)
++    assert naive_rows < n
++    assert charged == naive_rows // _REL_ERR_LIVE_F64_BLOCKS
++    assert charged * row_bytes * _REL_ERR_LIVE_F64_BLOCKS <= budget
++
++
++def test_tiny_budget_still_clamps_to_one_row():
++    assert _rel_err_row_block(512, 1) == 1
++
++
++def test_streamed_result_matches_naive_after_budget_fix():
++    rng = np.random.default_rng(11)
++    n = 96
++    Ce = rng.standard_normal((n, n)).astype(np.float32)
++    Cs = Ce + 0.02 * rng.standard_normal((n, n)).astype(np.float32)
++    # Force multi-block streaming under the three-block charge.
++    got = _rel_frobenius_streamed(Ce, Cs, block_bytes=n * 8 * 9)
++    assert abs(got - _naive(Ce, Cs)) < 1e-12
++
++
++def test_block_invariant_under_tight_three_block_budget():
++    rng = np.random.default_rng(12)
++    n = 80
++    Ce = rng.standard_normal((n, n)).astype(np.float32)
++    Cs = rng.standard_normal((n, n)).astype(np.float32)
++    ref = _rel_frobenius_streamed(Ce, Cs)
++    for rows in (1, 3, 7, n):
++        bb = rows * n * 8 * _REL_ERR_LIVE_F64_BLOCKS
++        assert abs(_rel_frobenius_streamed(Ce, Cs, block_bytes=bb) - ref) < 1e-12
++
++
++if __name__ == "__main__":
++    import pytest
++    raise SystemExit(pytest.main([__file__, "-v"]))

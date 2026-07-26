@@ -1,0 +1,244 @@
+diff --git a/crates/engine/src/game/effects/copy_spell.rs b/crates/engine/src/game/effects/copy_spell.rs
+index 875072317e..4f209d25ea 100644
+--- a/crates/engine/src/game/effects/copy_spell.rs
++++ b/crates/engine/src/game/effects/copy_spell.rs
+@@ -532,6 +532,23 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Sta
+             }
+         }
+     }
++    // CR 707.10 + CR 607.2a (#5576 Saruman of Many Colors): an exile-linked copy
++    // ("Copy the exiled card" → `ExiledBySource`; Isochron Scepter imprint →
++    // `TrackedSet`) binds its source from the durable exile link / tracked set,
++    // NOT from `ability.targets`. This MUST precede the generic
++    // Object-target-on-stack lookup below: `resolve_ability_chain` propagates a
++    // parent exile clause's chosen target ("exile target … card") onto this
++    // CopySpell sub-ability, but that object is now in exile — not on the stack —
++    // so the stack lookup would find nothing and (before this reordering) the
++    // exile-linked branch was never reached, so the copy silently no-op'd.
++    if let Effect::CopySpell { target, .. } = &ability.effect {
++        if target.references_exiled_by_source() {
++            return copy_source_from_exiled_by_source(state, ability, target);
++        }
++        if references_tracked_set(target) {
++            return copy_source_from_tracked_set(state, ability, target);
++        }
++    }
+     let target_id = ability.targets.iter().find_map(|target| match target {
+         TargetRef::Object(id) => Some(*id),
+         TargetRef::Player(_) => None,
+@@ -554,14 +571,6 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Sta
+             })
+             .cloned();
+     }
+-    if let Effect::CopySpell { target, .. } = &ability.effect {
+-        if target.references_exiled_by_source() {
+-            return copy_source_from_exiled_by_source(state, ability, target);
+-        }
+-        if references_tracked_set(target) {
+-            return copy_source_from_tracked_set(state, ability, target);
+-        }
+-    }
+     if matches!(
+         &ability.effect,
+         Effect::CopySpell {
+@@ -3289,4 +3298,88 @@ mod tests {
+             "ETB must seed loyalty counters from the stamped entering face"
+         );
+     }
++
++    /// CR 707.10 + CR 607.2a (#5576 Saruman of Many Colors): a same-chain
++    /// plain-targeted `ChangeZone{Exile}` feeding "Copy the exiled card" now
++    /// binds the copy to `ExiledBySource`. End-to-end, the exile step publishes
++    /// an `ExileLink` (`should_track_exiled_by_source` sees the `ExiledBySource`
++    /// consumer) and the copy replicates the just-exiled card. Before the parser
++    /// fix the copy bound `TrackedSet(0)`, which a plain-targeted exile never
++    /// publishes — `copy_source_from_tracked_set` fell back to a global scan and,
++    /// with none present, copied nothing. Driven through the real parser so a
++    /// revert of the routing flips the copy target back and this fails.
++    #[test]
++    fn copy_the_exiled_card_after_targeted_graveyard_exile_copies_that_card() {
++        use crate::game::ability_utils::build_resolved_from_def_with_targets;
++        use crate::parser::oracle_effect::parse_effect_chain;
++        use crate::types::ability::{AbilityDefinition, AbilityKind};
++        use crate::types::card_type::CoreType;
++
++        let mut state = GameState::new_two_player(42);
++        let source_id = ObjectId(5);
++        state.objects.insert(
++            source_id,
++            GameObject::new(
++                source_id,
++                CardId(99),
++                PlayerId(0),
++                "Saruman of Many Colors".to_string(),
++                Zone::Battlefield,
++            ),
++        );
++
++        // An instant card in the OPPONENT's graveyard — the exile+copy target.
++        let target_card = ObjectId(10);
++        let mut gy = GameObject::new(
++            target_card,
++            CardId(1),
++            PlayerId(1),
++            "Shock".to_string(),
++            Zone::Graveyard,
++        );
++        gy.card_types.core_types.push(CoreType::Instant);
++        gy.abilities = std::sync::Arc::new(vec![AbilityDefinition::new(
++            AbilityKind::Spell,
++            Effect::DealDamage {
++                amount: QuantityExpr::Fixed { value: 2 },
++                target: TargetFilter::Any,
++                damage_source: None,
++                excess: None,
++            },
++        )]);
++        state.objects.insert(target_card, gy);
++
++        // Real parser output for the same-chain "exile target … Copy the exiled
++        // card" class: ChangeZone{Graveyard→Exile} → CopySpell{ExiledBySource}.
++        let def = parse_effect_chain(
++            "Exile target instant card from an opponent's graveyard. Copy the exiled card.",
++            AbilityKind::Activated,
++        );
++        let resolved = build_resolved_from_def_with_targets(
++            &def,
++            source_id,
++            PlayerId(0),
++            vec![TargetRef::Object(target_card)],
++        );
++        let mut events = Vec::new();
++        crate::game::effects::resolve_ability_chain(&mut state, &resolved, &mut events, 0).unwrap();
++
++        assert_eq!(
++            state.objects[&target_card].zone,
++            Zone::Exile,
++            "the targeted graveyard card must be exiled"
++        );
++        // A copy of THAT card (its DealDamage spell) is on the stack — a distinct
++        // object from the exiled original.
++        let copy = state.stack.iter().find_map(|e| {
++            let a = e.ability()?;
++            (e.id != target_card && matches!(a.effect, Effect::DealDamage { .. })).then_some(e.id)
++        });
++        assert!(
++            copy.is_some(),
++            "a copy of the exiled instant must be on the stack (ExiledBySource read), \
++             got stack of {} entries",
++            state.stack.len()
++        );
++    }
+ }
+diff --git a/crates/engine/src/parser/oracle_effect/imperative.rs b/crates/engine/src/parser/oracle_effect/imperative.rs
+index fa12226575..6b2b4f741c 100644
+--- a/crates/engine/src/parser/oracle_effect/imperative.rs
++++ b/crates/engine/src/parser/oracle_effect/imperative.rs
+@@ -4872,18 +4872,24 @@ pub(super) fn parse_utility_imperative_ast(
+                                 CopyRetargetPermission::KeepOriginalTargets
+                             };
+                         // CR 406.6 + CR 607.2a + CR 707.10: "copy the exiled
+-                        // card" — when no earlier clause in this SAME chain
+-                        // exiled a card, the referenced exile happened in an
+-                        // earlier, separately-resolved ability (ETB Imprint,
+-                        // e.g. Isochron Scepter), so bind durably via
+-                        // `ExiledBySource` rather than the ephemeral
+-                        // chain-local `TrackedSet{0}` sentinel.
++                        // card" binds durably via `ExiledBySource` in BOTH
++                        // exile-source cases. Cross-resolution (ETB Imprint,
++                        // e.g. Isochron Scepter) always did. Same-chain (#5576
++                        // Saruman of Many Colors: "exile target … card … Copy
++                        // the exiled card") must too: a plain-targeted
++                        // `ChangeZone{Exile}` never publishes a chain-local
++                        // `TrackedSet`, so the old `TrackedSet{0}` sentinel
++                        // resolved to nothing and `copy_source_from_tracked_set`
++                        // fell back to a global scan, copying the wrong card.
++                        // Binding to `ExiledBySource` makes the exile a linked
++                        // consumer (`should_track_exiled_by_source`), publishing
++                        // the `ExileLink` that `copy_source_from_exiled_by_source`
++                        // reads. The distinct CastFromZone "cast the exiled card"
++                        // sites keep their own same-chain bindings.
+                         return Some(UtilityImperativeAst::Copy {
+                             target: resolve_singular_exiled_card_target(
+                                 ctx.chain_has_prior_exile_producer,
+-                                TargetFilter::TrackedSet {
+-                                    id: crate::types::identifiers::TrackedSetId(0),
+-                                },
++                                TargetFilter::ExiledBySource,
+                             ),
+                             retarget,
+                         });
+diff --git a/crates/engine/src/parser/oracle_trigger_tests.rs b/crates/engine/src/parser/oracle_trigger_tests.rs
+index 58e23ac410..964b96c7b6 100644
+--- a/crates/engine/src/parser/oracle_trigger_tests.rs
++++ b/crates/engine/src/parser/oracle_trigger_tests.rs
+@@ -23556,3 +23556,69 @@ fn self_power_counter_on_source_keeps_source_scope() {
+         );
+     }
+ }
++
++/// #5576 (Saruman of Many Colors): the same-chain "exile target … card …
++/// **Copy the exiled card**" reference must bind the copy to
++/// `TargetFilter::ExiledBySource`, not the chain-local `TrackedSet(0)`
++/// sentinel. A plain-targeted `ChangeZone{Exile}` never publishes a tracked
++/// set, so `TrackedSet(0)` resolved to nothing and the copy fell back to a
++/// global scan (wrong card / no copy). Binding to `ExiledBySource` makes the
++/// exile a linked consumer that publishes an `ExileLink` the copy reads.
++///
++/// Discriminator: on `main` the recursively-found CopySpell target is
++/// `{"type":"TrackedSet","id":0}`, so the `ExiledBySource` assertion fails.
++#[test]
++fn saruman_copy_the_exiled_card_binds_exiled_by_source_not_tracked_set() {
++    fn find_copyspell_targets(v: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
++        match v {
++            serde_json::Value::Object(map) => {
++                if map.get("type").and_then(|t| t.as_str()) == Some("CopySpell") {
++                    if let Some(target) = map.get("target") {
++                        out.push(target.clone());
++                    }
++                }
++                for val in map.values() {
++                    find_copyspell_targets(val, out);
++                }
++            }
++            serde_json::Value::Array(items) => {
++                for val in items {
++                    find_copyspell_targets(val, out);
++                }
++            }
++            _ => {}
++        }
++    }
++
++    let parsed = parse_oracle_text(
++        "Ward—Discard an enchantment, instant, or sorcery card.\nWhenever you cast your \
++         second spell each turn, each opponent mills two cards. When one or more cards are \
++         milled this way, exile target enchantment, instant, or sorcery card with equal or \
++         lesser mana value than that spell from an opponent's graveyard. Copy the exiled \
++         card. You may cast the copy without paying its mana cost.",
++        "Saruman of Many Colors",
++        &[],
++        &["Legendary".to_string(), "Creature".to_string()],
++        &[],
++    );
++
++    let execute = parsed.triggers[0]
++        .execute
++        .as_ref()
++        .expect("Saruman's spell-cast trigger has an execute chain");
++    let json = serde_json::to_value(execute).expect("serialize the execute chain");
++
++    let mut targets = Vec::new();
++    find_copyspell_targets(&json, &mut targets);
++    assert_eq!(
++        targets.len(),
++        1,
++        "exactly one CopySpell in Saruman's chain, got {targets:?}"
++    );
++    assert_eq!(
++        targets[0],
++        serde_json::json!({ "type": "ExiledBySource" }),
++        "Saruman's copy must bind ExiledBySource (was TrackedSet(0)); got {:?}",
++        targets[0]
++    );
++}

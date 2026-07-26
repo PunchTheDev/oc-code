@@ -1,0 +1,282 @@
+diff --git a/cache/src/cache/llm_cache.py b/cache/src/cache/llm_cache.py
+index 73c9196f..6453b998 100644
+--- a/cache/src/cache/llm_cache.py
++++ b/cache/src/cache/llm_cache.py
+@@ -15,6 +15,7 @@
+     QdrantStore,
+     current_timestamp,
+     get_embedding_service,
++    is_zero_vector,
+ )
+ 
+ logger = logging.getLogger(__name__)
+@@ -69,9 +70,9 @@ def __init__(
+         self.collection_name = "llm_cache"
+ 
+         # Shared SDK infrastructure (injectable for testing): embeddings via the
+-        # EmbeddingService (which raises instead of returning a zero vector that
+-        # would corrupt the cache), Qdrant via the shared QdrantStore. The
+-        # embedding service is owned and closed by the service.
++        # EmbeddingService (returns a zero vector on failure — guarded below),
++        # Qdrant via the shared QdrantStore. The embedding service is owned and
++        # closed by the service.
+         self._qdrant = store if store is not None else QdrantStore(qdrant_url)
+         self._embeddings = (
+             embedding_service if embedding_service is not None else get_embedding_service()
+@@ -116,10 +117,14 @@ async def get(self, prompt: str, model: str = "deepseek-coder:6.7b") -> dict | N
+             Cached response dict if found with high confidence, else None
+         """
+         try:
+-            # Get prompt embedding (raises if the embedding service is down,
+-            # which the except below turns into a clean cache miss rather than
+-            # searching against a zero vector).
++            # EmbeddingService.embed_text() returns a zero vector (not raises)
++            # when the backend is unavailable — guard here so a zero vector
++            # never reaches Qdrant and produces false similarity scores.
+             embedding = await self._embeddings.embed_text(prompt)
++            if is_zero_vector(embedding):
++                logger.warning("Cache lookup skipped: embedding unavailable for prompt")
++                self._cache_misses += 1
++                return None
+ 
+             # Search for similar cached prompts
+             results = await self._qdrant.search(self.collection_name, embedding, limit=1)
+@@ -184,8 +189,12 @@ async def set(
+             # Generate prompt hash for deduplication
+             prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+ 
+-            # Get prompt embedding
++            # Guard: zero vector means the embedding backend is down; storing
++            # it would corrupt the cache with a meaningless similarity anchor.
+             embedding = await self._embeddings.embed_text(prompt)
++            if is_zero_vector(embedding):
++                logger.warning("Cache store skipped: embedding unavailable for prompt")
++                return False
+ 
+             # Untagged entries store None so they never match a tag query.
+             cache_entry = {
+diff --git a/cache/tests/test_llm_cache.py b/cache/tests/test_llm_cache.py
+index 4e1da19d..25b3a7bf 100644
+--- a/cache/tests/test_llm_cache.py
++++ b/cache/tests/test_llm_cache.py
+@@ -101,6 +101,17 @@ def test_get_embedding_failure_is_clean_miss_without_search():
+     assert cache.get_metrics()["cache_misses"] == 1
+ 
+ 
++def test_get_zero_vector_embedding_is_clean_miss_without_search():
++    """EmbeddingService returns a zero vector (not raises) when the backend is down.
++    get() must detect the sentinel and skip Qdrant rather than searching against
++    the origin and returning a false cache hit."""
++    cache, store, _, _ = _make(embed=[0.0, 0.0])
++
++    assert asyncio.run(cache.get("prompt")) is None
++    store.search.assert_not_called()
++    assert cache.get_metrics()["cache_misses"] == 1
++
++
+ # ── set ─────────────────────────────────────────────────────────────────────
+ 
+ 
+@@ -132,6 +143,19 @@ def test_set_embedding_failure_returns_false_without_upsert():
+     db.execute.assert_not_called()
+ 
+ 
++def test_set_zero_vector_embedding_returns_false_without_upsert():
++    """EmbeddingService returns a zero vector (not raises) when the backend is down.
++    set() must detect the sentinel and skip the upsert rather than storing a
++    corrupt entry that matches everything via cosine similarity."""
++    cache, store, _, db = _make(embed=[0.0, 0.0])
++
++    ok = asyncio.run(cache.set("prompt", "resp"))
++
++    assert ok is False
++    store.upsert.assert_not_called()
++    db.execute.assert_not_called()
++
++
+ def test_set_rolls_back_qdrant_when_mirror_write_fails():
+     """A failed SQLite mirror write fails the call and removes the vector, so the
+     two stores stay consistent."""
+diff --git a/coordinator/src/coordinator/task_coordinator.py b/coordinator/src/coordinator/task_coordinator.py
+index f56503da..37247c3a 100644
+--- a/coordinator/src/coordinator/task_coordinator.py
++++ b/coordinator/src/coordinator/task_coordinator.py
+@@ -18,6 +18,7 @@
+     QdrantStore,
+     generate_trace_id,
+     get_embedding_service,
++    is_zero_vector,
+ )
+ 
+ logger = logging.getLogger(__name__)
+@@ -53,9 +54,9 @@ def __init__(
+         self._sensor_manager = sensor_manager
+ 
+         # Shared SDK infrastructure (injectable for testing): embeddings via the
+-        # EmbeddingService (which raises instead of returning a zero vector that
+-        # would silently search against the origin), Qdrant via the shared
+-        # QdrantStore. The embedding service is owned and closed by the service.
++        # EmbeddingService (returns a zero vector on failure — guarded below),
++        # Qdrant via the shared QdrantStore. The embedding service is owned and
++        # closed by the service.
+         self._qdrant = store if store is not None else QdrantStore(qdrant_url)
+         self._embeddings = (
+             embedding_service if embedding_service is not None else get_embedding_service()
+@@ -87,10 +88,18 @@ async def find_task(self, query: str) -> dict:
+                 - confidence: float
+                 - action: "execute", "adapt", or "learn"
+         """
+-        # Get query embedding (raises if the embedding service is unavailable —
+-        # surfacing the failure instead of silently searching against a zero
+-        # vector, which would return unrelated tasks).
++        # EmbeddingService.embed_text() returns a zero vector (not raises) when
++        # the backend is unavailable — guard here so a zero vector never reaches
++        # Qdrant and returns unrelated tasks via false cosine similarity.
+         embedding = await self._embeddings.embed_text(query)
++        if is_zero_vector(embedding):
++            logger.warning("Task lookup skipped: embedding unavailable for query")
++            return {
++                "found": False,
++                "task_id": None,
++                "confidence": 0.0,
++                "action": "learn",
++            }
+ 
+         # Search Qdrant for similar tasks
+         results = await self._qdrant.search(
+@@ -262,9 +271,13 @@ async def index_task(self, task_id: str) -> bool:
+             with open(metadata_path) as f:
+                 metadata = json.load(f)
+ 
+-            # Get embedding for description
++            # Guard: zero vector means the embedding backend is down; indexing
++            # it would store a meaningless anchor that matches everything.
+             description = metadata.get("description", "")
+             embedding = await self._embeddings.embed_text(description)
++            if is_zero_vector(embedding):
++                logger.warning("Task indexing skipped: embedding unavailable for task %s", task_id)
++                return False
+ 
+             # Store in Qdrant
+             await self._qdrant.upsert(
+diff --git a/coordinator/tests/test_task_coordinator.py b/coordinator/tests/test_task_coordinator.py
+index 8a3b2e64..0a90d568 100644
+--- a/coordinator/tests/test_task_coordinator.py
++++ b/coordinator/tests/test_task_coordinator.py
+@@ -105,11 +105,12 @@ def test_find_task_no_results_learns():
+     }
+ 
+ 
+-# ── the zero-vector trap fix ────────────────────────────────────────────────
++# ── zero-vector guard (issue #237) ──────────────────────────────────────────
+ 
+ 
+-def test_find_task_propagates_embedding_failure_without_zero_vector():
+-    """A failed embedding must surface, not silently search a zero vector."""
++def test_find_task_propagates_embedding_exception_without_search():
++    """If embed_text somehow raises (secondary defence), the exception surfaces
++    rather than silently querying Qdrant."""
+     coord, store, _ = _make(embed_error=RuntimeError("Ollama down"))
+ 
+     try:
+@@ -119,7 +120,24 @@ def test_find_task_propagates_embedding_failure_without_zero_vector():
+         raised = "Ollama down" in str(e)
+ 
+     assert raised, "find_task should propagate the embedding failure"
+-    store.search.assert_not_called()  # never queried with a zero vector
++    store.search.assert_not_called()
++
++
++def test_find_task_zero_vector_returns_learn_without_search():
++    """EmbeddingService returns a zero vector (not raises) when the backend is
++    down.  find_task() must detect the sentinel and skip Qdrant rather than
++    returning unrelated tasks via false cosine similarity."""
++    coord, store, _ = _make(embed=[0.0, 0.0, 0.0])
++
++    result = asyncio.run(coord.find_task("q"))
++
++    assert result == {
++        "found": False,
++        "task_id": None,
++        "confidence": 0.0,
++        "action": "learn",
++    }
++    store.search.assert_not_called()
+ 
+ 
+ # ── index_task ──────────────────────────────────────────────────────────────
+@@ -170,6 +188,19 @@ def test_index_task_embedding_failure_returns_false_without_upsert(tmp_path):
+     store.upsert.assert_not_called()  # no zero-vector point written
+ 
+ 
++def test_index_task_zero_vector_returns_false_without_upsert(tmp_path):
++    """EmbeddingService returns a zero vector (not raises) when the backend is
++    down.  index_task() must detect the sentinel and skip the upsert rather
++    than storing a corrupt point that matches every future query."""
++    coord, store, _ = _make(embed=[0.0, 0.0, 0.0], tasks_root=str(tmp_path))
++    _write_task(str(tmp_path), "task-3", {"description": "pour water"})
++
++    ok = asyncio.run(coord.index_task("task-3"))
++
++    assert ok is False
++    store.upsert.assert_not_called()
++
++
+ def test_index_task_missing_metadata_returns_false(tmp_path):
+     coord, store, _ = _make(tasks_root=str(tmp_path))
+     ok = asyncio.run(coord.index_task("nope"))
+diff --git a/external-api/src/external_api/conflict_detection.py b/external-api/src/external_api/conflict_detection.py
+index eb26b667..b38faf8f 100644
+--- a/external-api/src/external_api/conflict_detection.py
++++ b/external-api/src/external_api/conflict_detection.py
+@@ -6,6 +6,8 @@
+ import math
+ from typing import Any, Protocol
+ 
++from activelearning.embeddings import is_zero_vector
++
+ logger = logging.getLogger(__name__)
+ 
+ DEFAULT_SEMANTIC_SIMILARITY_THRESHOLD = 0.75
+@@ -28,10 +30,6 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
+     return dot / (norm_a * norm_b)
+ 
+ 
+-def _is_zero_vector(vector: list[float]) -> bool:
+-    return bool(vector) and all(v == 0.0 for v in vector)
+-
+-
+ def word_overlap_conflict(
+     local_text: str,
+     external_text: str,
+@@ -67,7 +65,7 @@ async def detect_knowledge_conflict(
+         try:
+             local_vec = await embedding_service.embed_text(local_text)
+             external_vec = await embedding_service.embed_text(external_response)
+-            if not _is_zero_vector(local_vec) and not _is_zero_vector(external_vec):
++            if not is_zero_vector(local_vec) and not is_zero_vector(external_vec):
+                 similarity = cosine_similarity(local_vec, external_vec)
+                 return similarity < semantic_threshold
+         except Exception as exc:
+diff --git a/sdk/src/activelearning/__init__.py b/sdk/src/activelearning/__init__.py
+index 0fe8575d..1dc3898d 100644
+--- a/sdk/src/activelearning/__init__.py
++++ b/sdk/src/activelearning/__init__.py
+@@ -27,6 +27,8 @@
+     embed_batch,
+     embed_text,
+     get_embedding_service,
++    is_zero_vector,
++    zero_vector,
+ )
+ from activelearning.llm import LLMClient, LLMConfig, LLMError
+ from activelearning.messages import (
+@@ -101,6 +103,8 @@
+     "get_embedding_service",
+     "embed_text",
+     "embed_batch",
++    "is_zero_vector",
++    "zero_vector",
+     # Vector store
+     "QdrantStore",
+     "QdrantHit",

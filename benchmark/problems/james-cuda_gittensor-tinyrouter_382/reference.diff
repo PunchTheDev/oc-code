@@ -1,0 +1,321 @@
+diff --git a/src/trinity/analysis/optimizer_ranking.py b/src/trinity/analysis/optimizer_ranking.py
+new file mode 100644
+index 0000000..133564a
+--- /dev/null
++++ b/src/trinity/analysis/optimizer_ranking.py
+@@ -0,0 +1,183 @@
++"""Offline R8 check: does the optimizer ranking sep-CMA-ES > SFT > RS > REINFORCE hold?
++
++``docs/SPEC.md`` §1.3 invariant **R8** — *"sep-CMA-ES > SFT > RS > REINFORCE on all 4
++tasks"* (Table 4) — is a replication requirement the SPEC itself flags as *"a
++hypothesis to test, not a given"* (the block-ε-separability that justifies sep-CMA-ES
++was measured on the paper's 7-agent representation, not our 3-model pool). Yet nothing
++in ``src/`` verifies the claim. R8 is the whole reason the outer loop is a
++derivative-free ES rather than SFT or a policy gradient: if RS or REINFORCE matched
++sep-CMA-ES, the expensive evolutionary search would not be earning its keep.
++
++This reads, per task, the final fitness of each optimizer and reports whether the
++observed best→worst order matches the expected chain sep-CMA-ES > SFT > RS > REINFORCE
++(strictly, within a tolerance), which adjacent pairs invert it, and whether R8 holds on
++every scored task. Optimizers absent from a task are simply skipped — the chain is
++checked among those present, in expected order.
++
++Pure numpy/stdlib over plain numbers -- no torch, no network, no GPU.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Mapping
++
++__all__ = [
++    "EXPECTED_ORDER",
++    "OptimizerRanking",
++    "canonical_optimizer",
++    "analyze_task",
++    "analyze_tasks",
++    "render",
++]
++
++#: The R8 optimizer chain, best → worst (docs/SPEC.md §1.3, Table 4).
++EXPECTED_ORDER: tuple[str, ...] = ("sep_cmaes", "sft", "rs", "reinforce")
++
++_ALIASES: dict[str, str] = {
++    "sep_cmaes": "sep_cmaes", "sepcmaes": "sep_cmaes", "sep-cmaes": "sep_cmaes",
++    "sep-cma-es": "sep_cmaes", "sepcma": "sep_cmaes", "cma": "sep_cmaes",
++    "cmaes": "sep_cmaes", "cma-es": "sep_cmaes", "cma_es": "sep_cmaes",
++    "sft": "sft",
++    "rs": "rs", "randomsearch": "rs", "random_search": "rs", "random-search": "rs",
++    "reinforce": "reinforce", "policy_gradient": "reinforce", "pg": "reinforce",
++}
++
++_TOL = 1e-9
++_RANK = {name: i for i, name in enumerate(EXPECTED_ORDER)}
++
++
++def _is_num(x: Any) -> bool:
++    return isinstance(x, (int, float)) and not isinstance(x, bool)
++
++
++def canonical_optimizer(name: Any) -> str | None:
++    """Map an optimizer label to its canonical R8 name, or ``None`` if unknown.
++
++    Case- and separator-insensitive: ``"Sep-CMA-ES"``, ``"random search"``,
++    ``"policy_gradient"`` all resolve. Returns ``None`` for a label outside the
++    ``sep_cmaes`` / ``sft`` / ``rs`` / ``reinforce`` family so a stray key never
++    silently joins the chain.
++    """
++    if not isinstance(name, str):
++        return None
++    key = name.strip().lower().replace(" ", "_").replace("-", "_")
++    if key in _ALIASES:
++        return _ALIASES[key]
++    return _ALIASES.get(key.replace("_", ""))
++
++
++@dataclass(frozen=True)
++class OptimizerRanking:
++    """R8 diagnostics for one task's optimizer→final-fitness scores.
++
++    ``observed`` is the optimizers present, ordered by measured fitness (best first).
++    ``expected`` is those same optimizers in the SPEC's expected order. ``inversions``
++    lists the adjacent expected-order pairs ``(better, worse)`` where the expected-
++    better optimizer did **not** strictly exceed the next one. ``holds`` is the R8
++    verdict for this task: at least two optimizers present and no inversion.
++    """
++
++    task: str
++    scores: dict[str, float]
++    observed: list[str]
++    expected: list[str]
++    inversions: list[tuple[str, str]]
++    holds: bool
++
++    @property
++    def n_present(self) -> int:
++        return len(self.scores)
++
++    def to_dict(self) -> dict[str, Any]:
++        """JSON-serializable view."""
++        return {
++            "task": self.task,
++            "scores": dict(self.scores),
++            "observed": list(self.observed),
++            "expected": list(self.expected),
++            "inversions": [list(p) for p in self.inversions],
++            "n_present": self.n_present,
++            "holds": self.holds,
++        }
++
++
++def analyze_task(scores: Mapping[str, Any], *, task: str = "?", tol: float = _TOL) -> OptimizerRanking:
++    """Check the R8 optimizer ordering for one task.
++
++    Args:
++        scores: ``{optimizer: final_fitness}``. Keys are canonicalized (see
++            :func:`canonical_optimizer`); unknown or non-numeric entries are dropped.
++            A later duplicate of the same canonical optimizer overwrites an earlier one.
++        task: Name for the report row.
++        tol: An expected-better optimizer must exceed the next by more than ``tol`` to
++            avoid counting a tie as an ordering pass.
++
++    Returns:
++        An :class:`OptimizerRanking`. With fewer than two recognized optimizers the
++        chain cannot be judged, so ``holds`` is ``False``.
++    """
++    clean: dict[str, float] = {}
++    for name, value in scores.items():
++        canon = canonical_optimizer(name)
++        if canon is not None and _is_num(value):
++            clean[canon] = float(value)
++
++    present_expected = [o for o in EXPECTED_ORDER if o in clean]
++    observed = sorted(clean, key=lambda o: (-clean[o], _RANK[o]))
++    inversions: list[tuple[str, str]] = []
++    for better, worse in zip(present_expected, present_expected[1:]):
++        if not (clean[better] - clean[worse] > tol):
++            inversions.append((better, worse))
++    holds = len(clean) >= 2 and not inversions
++    return OptimizerRanking(
++        task=task, scores=clean, observed=observed,
++        expected=present_expected, inversions=inversions, holds=holds,
++    )
++
++
++def analyze_tasks(tasks: Mapping[str, Any], *, tol: float = _TOL) -> dict[str, Any]:
++    """Per-task R8 rankings plus the across-tasks verdict.
++
++    Args:
++        tasks: ``{task: {optimizer: final_fitness}}``.
++        tol: Ordering tolerance (see :func:`analyze_task`).
++
++    Returns:
++        ``{"per_task": [OptimizerRanking.to_dict, ...], "r8_holds": bool,
++           "n_tasks_scored": int, "violations": [task, ...]}``. ``r8_holds`` is True
++        iff at least one task was scorable (>= 2 optimizers) and **every** scorable
++        task holds — matching the SPEC's "on all 4 tasks".
++    """
++    results = [analyze_task(s, task=str(t), tol=tol) for t, s in sorted(tasks.items())]
++    scored = [r for r in results if r.n_present >= 2]
++    violations = [r.task for r in scored if not r.holds]
++    return {
++        "per_task": [r.to_dict() for r in results],
++        "r8_holds": bool(scored) and not violations,
++        "n_tasks_scored": len(scored),
++        "violations": violations,
++    }
++
++
++def render(tasks: Mapping[str, Any], *, tol: float = _TOL) -> str:
++    """A compact text report of the per-task R8 ordering and the across-tasks verdict."""
++    report = analyze_tasks(tasks, tol=tol)
++    lines = ["| task | observed order (best->worst) | R8 |", "|---|---|---|"]
++    for r in report["per_task"]:
++        order = " > ".join(r["observed"]) or "-"
++        if r["n_present"] < 2:
++            flag = "n/a"
++        elif r["holds"]:
++            flag = "ok"
++        else:
++            flag = "inverts " + ", ".join(f"{b}<={w}" for b, w in r["inversions"])
++        lines.append(f"| {r['task']} | {order} | {flag} |")
++    verdict = "HOLDS" if report["r8_holds"] else "VIOLATED"
++    lines.append("")
++    lines.append(
++        f"R8 (sep-CMA-ES > SFT > RS > REINFORCE): {verdict} "
++        f"({report['n_tasks_scored']} task(s) scored)"
++    )
++    if report["violations"]:
++        lines.append(f"violations: {', '.join(report['violations'])}")
++    return "\n".join(lines)
+diff --git a/tests/test_optimizer_ranking.py b/tests/test_optimizer_ranking.py
+new file mode 100644
+index 0000000..4b92e42
+--- /dev/null
++++ b/tests/test_optimizer_ranking.py
+@@ -0,0 +1,126 @@
++"""Offline tests for the R8 (sep-CMA-ES > SFT > RS > REINFORCE) verifier.
++
++No network, no GPU, no torch — plain numbers only.
++"""
++from __future__ import annotations
++
++from trinity.analysis.optimizer_ranking import (
++    EXPECTED_ORDER,
++    analyze_task,
++    analyze_tasks,
++    canonical_optimizer,
++    render,
++)
++
++
++# --------------------------------------------------------------------------- #
++# canonical_optimizer
++# --------------------------------------------------------------------------- #
++def test_canonicalizes_aliases_and_rejects_unknown():
++    assert canonical_optimizer("Sep-CMA-ES") == "sep_cmaes"
++    assert canonical_optimizer("cma") == "sep_cmaes"
++    assert canonical_optimizer("random search") == "rs"
++    assert canonical_optimizer("random_search") == "rs"
++    assert canonical_optimizer("policy_gradient") == "reinforce"
++    assert canonical_optimizer("SFT") == "sft"
++    assert canonical_optimizer("adam") is None
++    assert canonical_optimizer(42) is None
++
++
++def test_expected_order_is_the_spec_chain():
++    assert EXPECTED_ORDER == ("sep_cmaes", "sft", "rs", "reinforce")
++
++
++# --------------------------------------------------------------------------- #
++# analyze_task
++# --------------------------------------------------------------------------- #
++def test_correct_full_chain_holds():
++    r = analyze_task(
++        {"sep_cmaes": 0.72, "sft": 0.66, "rs": 0.60, "reinforce": 0.55}, task="math500"
++    )
++    assert r.holds
++    assert r.observed == ["sep_cmaes", "sft", "rs", "reinforce"]
++    assert r.inversions == []
++
++
++def test_alias_keys_are_accepted():
++    r = analyze_task(
++        {"Sep-CMA-ES": 0.72, "SFT": 0.66, "Random Search": 0.60, "REINFORCE": 0.55}
++    )
++    assert r.holds and r.observed == ["sep_cmaes", "sft", "rs", "reinforce"]
++
++
++def test_an_inversion_is_reported_and_breaks_r8():
++    # RS beats SFT -> the (sft, rs) expected pair inverts.
++    r = analyze_task({"sep_cmaes": 0.72, "sft": 0.58, "rs": 0.60, "reinforce": 0.55})
++    assert not r.holds
++    assert ("sft", "rs") in r.inversions
++    assert r.observed[0] == "sep_cmaes"          # cma still best
++    assert r.observed.index("rs") < r.observed.index("sft")  # rs measured above sft
++
++
++def test_tie_is_not_a_strict_pass():
++    r = analyze_task({"sep_cmaes": 0.60, "sft": 0.60, "rs": 0.50, "reinforce": 0.40})
++    assert not r.holds
++    assert ("sep_cmaes", "sft") in r.inversions
++
++
++def test_subset_of_optimizers_checks_only_present_chain():
++    # Only cma / rs / reinforce present -> chain checked among them, in expected order.
++    r = analyze_task({"cma": 0.7, "rs": 0.6, "reinforce": 0.5})
++    assert r.holds
++    assert r.expected == ["sep_cmaes", "rs", "reinforce"]
++
++
++def test_fewer_than_two_recognized_optimizers_cannot_hold():
++    assert analyze_task({"sep_cmaes": 0.7}).holds is False
++    assert analyze_task({"adam": 0.9, "sgd": 0.8}).holds is False   # none recognized
++
++
++def test_non_numeric_and_unknown_entries_are_dropped():
++    r = analyze_task({"sep_cmaes": 0.7, "sft": "n/a", "rs": 0.6, "adam": 0.99})
++    assert set(r.scores) == {"sep_cmaes", "rs"}
++    assert r.holds and r.expected == ["sep_cmaes", "rs"]
++
++
++# --------------------------------------------------------------------------- #
++# analyze_tasks: across-tasks verdict
++# --------------------------------------------------------------------------- #
++def test_r8_holds_only_when_every_scored_task_holds():
++    report = analyze_tasks({
++        "math500": {"sep_cmaes": 0.72, "sft": 0.66, "rs": 0.60, "reinforce": 0.55},
++        "mmlu": {"sep_cmaes": 0.68, "sft": 0.60, "rs": 0.58, "reinforce": 0.50},
++    })
++    assert report["r8_holds"] is True
++    assert report["n_tasks_scored"] == 2
++    assert report["violations"] == []
++
++
++def test_one_violating_task_fails_the_whole_invariant():
++    report = analyze_tasks({
++        "math500": {"sep_cmaes": 0.72, "sft": 0.66, "rs": 0.60, "reinforce": 0.55},
++        "livecodebench": {"sep_cmaes": 0.50, "sft": 0.66, "rs": 0.60, "reinforce": 0.55},
++    })
++    assert report["r8_holds"] is False
++    assert report["violations"] == ["livecodebench"]
++
++
++def test_all_unscorable_does_not_hold():
++    report = analyze_tasks({"math500": {"sep_cmaes": 0.7}})   # only one optimizer
++    assert report["r8_holds"] is False
++    assert report["n_tasks_scored"] == 0
++
++
++# --------------------------------------------------------------------------- #
++# render
++# --------------------------------------------------------------------------- #
++def test_render_reports_holds_and_order():
++    md = render({"math500": {"sep_cmaes": 0.72, "sft": 0.66, "rs": 0.60, "reinforce": 0.55}})
++    assert "R8 (sep-CMA-ES > SFT > RS > REINFORCE): HOLDS" in md
++    assert "sep_cmaes > sft > rs > reinforce" in md
++
++
++def test_render_flags_a_violation():
++    md = render({"t": {"sep_cmaes": 0.72, "sft": 0.58, "rs": 0.60, "reinforce": 0.55}})
++    assert "VIOLATED" in md and "violations: t" in md
++    assert "inverts sft<=rs" in md

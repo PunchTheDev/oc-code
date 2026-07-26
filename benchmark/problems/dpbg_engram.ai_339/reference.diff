@@ -1,0 +1,223 @@
+diff --git a/sdk/src/activelearning/database.py b/sdk/src/activelearning/database.py
+index 89e5527..8ef9c8b 100644
+--- a/sdk/src/activelearning/database.py
++++ b/sdk/src/activelearning/database.py
+@@ -7,6 +7,7 @@
+ 
+ import logging
+ import os
++import sqlite3
+ import sys
+ from pathlib import Path
+ from typing import Any, cast
+@@ -62,10 +63,13 @@ def _load_schema() -> str:
+ # shape changed; executescript then recreates them. This keeps the table DDL in
+ # schema.sql as the single source of truth.
+ _MIGRATIONS: list[tuple[str, ...]] = [
+-    # v1: llm_cache changed shape (added model/tags/cached_at, dropped legacy
+-    # columns). It is a disposable index over the Qdrant cache, so drop the old
+-    # table and let the schema recreate it with the current columns.
++    # v0 → v1: llm_cache changed shape (added model/tags/cached_at, dropped
++    # legacy columns). It is a disposable index over the Qdrant cache, so drop
++    # the old table and let the schema recreate it with the current columns.
+     ("DROP TABLE IF EXISTS llm_cache",),
++    # v1 → v2: add latency_ms to kernel_decisions so per-decision processing
++    # time can be persisted alongside the decision record (supports SLO audits).
++    ("ALTER TABLE kernel_decisions ADD COLUMN latency_ms REAL",),
+ ]
+ SCHEMA_VERSION = len(_MIGRATIONS)
+ 
+@@ -116,7 +120,6 @@ async def _migrate(self) -> None:
+         Tracks progress with PRAGMA user_version; a fresh database starts at 0
+         and the pending statements are no-ops on it.
+         """
+-        cursor = await self._connection.execute("PRAGMA user_version")  # type: ignore[union-attr]
+         assert self._connection is not None
+         conn = self._connection
+         cursor = await conn.execute("PRAGMA user_version")
+@@ -131,8 +134,18 @@ async def _migrate(self) -> None:
+ 
+         for statements in _MIGRATIONS[version:]:
+             for statement in statements:
+-                await self._connection.execute(statement)  # type: ignore[union-attr]
+-                await conn.execute(statement)
++                try:
++                    await conn.execute(statement)
++                except sqlite3.OperationalError as exc:
++                    # ALTER TABLE on a missing table is safe to skip on a fresh
++                    # database: executescript creates the table (with all current
++                    # columns already in schema.sql) immediately after _migrate()
++                    # returns, so the column will exist regardless.
++                    if "no such table" in str(exc) and statement.strip().upper().startswith(
++                        "ALTER TABLE"
++                    ):
++                        continue
++                    raise
+ 
+     async def close(self) -> None:
+         """Close the database connection."""
+diff --git a/sdk/src/activelearning/schema.sql b/sdk/src/activelearning/schema.sql
+index 95cc1d0..6a11dd9 100644
+--- a/sdk/src/activelearning/schema.sql
++++ b/sdk/src/activelearning/schema.sql
+@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS kernel_decisions (
+     flags TEXT,                           -- JSON array of risk flags
+     norm_violations TEXT,                 -- JSON array of violated norms
+     body_profile TEXT,                    -- active body profile name
++    latency_ms REAL,                      -- end-to-end decision latency in milliseconds (added v2)
+     issued_at INTEGER NOT NULL,
+     expires_at INTEGER,
+     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
+diff --git a/sdk/tests/test_unified_db_migration.py b/sdk/tests/test_unified_db_migration.py
+new file mode 100644
+index 0000000..ccf5ee5
+--- /dev/null
++++ b/sdk/tests/test_unified_db_migration.py
+@@ -0,0 +1,147 @@
++"""Regression tests: unified.db schema migration path (issue #262).
++
++Proves that a database with an outdated column set is migrated correctly on
++startup — ALTER TABLE statements in _MIGRATIONS apply to existing tables, and
++existing rows survive untouched.
++
++Async code is driven through asyncio.run() so pytest-asyncio is not required.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import sqlite3
++import tempfile
++from pathlib import Path
++
++from activelearning.database import _MIGRATIONS, SCHEMA_VERSION, Database
++
++# DDL for kernel_decisions as it existed at schema v1 (before the latency_ms
++# column was added in v2).  A deployed instance that never picked up the new
++# schema.sql would have exactly this shape.
++_KERNEL_DECISIONS_V1 = """
++CREATE TABLE IF NOT EXISTS kernel_decisions (
++    id TEXT PRIMARY KEY,
++    trace_id TEXT NOT NULL,
++    proposal_type TEXT NOT NULL,
++    decision_type TEXT NOT NULL,
++    source TEXT,
++    reason TEXT,
++    risk_score REAL NOT NULL DEFAULT 0.0,
++    flags TEXT,
++    norm_violations TEXT,
++    body_profile TEXT,
++    issued_at INTEGER NOT NULL,
++    expires_at INTEGER,
++    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
++);
++"""
++
++
++def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
++    cursor = conn.execute(f"PRAGMA table_info({table})")
++    return {row[1] for row in cursor.fetchall()}
++
++
++def _user_version(conn: sqlite3.Connection) -> int:
++    return conn.execute("PRAGMA user_version").fetchone()[0]
++
++
++def test_alter_table_migration_adds_column_preserves_rows() -> None:
++    """An old-schema DB at v1 gets latency_ms added without losing existing rows.
++
++    This is the core regression for issue #262: CREATE TABLE IF NOT EXISTS
++    alone would silently skip the new column on a deployed instance.
++    The v1→v2 ALTER TABLE migration in _MIGRATIONS must patch the live table.
++    """
++    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
++        db_path = f.name
++
++    try:
++        # Seed: kernel_decisions at v1 schema with one existing decision row.
++        with sqlite3.connect(db_path) as seed:
++            seed.executescript(_KERNEL_DECISIONS_V1)
++            seed.execute(
++                "INSERT INTO kernel_decisions "
++                "(id, trace_id, proposal_type, decision_type, risk_score, issued_at, created_at) "
++                "VALUES (?, ?, ?, ?, ?, ?, ?)",
++                ("row-1", "trace-abc", "action", "ALLOW", 0.1, 1_000_000, 1_000_000),
++            )
++            seed.execute("PRAGMA user_version = 1")
++            seed.commit()
++
++        # Run initialize() — should apply the v1→v2 migration.
++        db = Database(db_path)
++        asyncio.run(db.initialize())
++        asyncio.run(db.close())
++
++        with sqlite3.connect(db_path) as check:
++            cols = _column_names(check, "kernel_decisions")
++            assert (
++                "latency_ms" in cols
++            ), f"latency_ms column not added by migration; columns present: {cols}"
++            row = check.execute(
++                "SELECT id, trace_id, decision_type FROM kernel_decisions WHERE id = 'row-1'"
++            ).fetchone()
++            assert row is not None, "existing row was deleted during migration"
++            assert row[1] == "trace-abc", f"row data corrupted after migration: {row}"
++            assert row[2] == "ALLOW", f"row data corrupted after migration: {row}"
++            assert _user_version(check) == SCHEMA_VERSION
++    finally:
++        Path(db_path).unlink(missing_ok=True)
++
++
++def test_fresh_database_reaches_current_schema_version() -> None:
++    """A brand-new DB ends at SCHEMA_VERSION with all tables and columns present."""
++    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
++        db_path = f.name
++
++    try:
++        db = Database(db_path)
++        asyncio.run(db.initialize())
++        asyncio.run(db.close())
++
++        with sqlite3.connect(db_path) as check:
++            assert _user_version(check) == SCHEMA_VERSION
++
++            # kernel_decisions has the v2 column.
++            cols = _column_names(check, "kernel_decisions")
++            assert "latency_ms" in cols
++
++            # llm_cache was dropped (v0→v1) and recreated with the current shape.
++            llm_cols = _column_names(check, "llm_cache")
++            assert "model" in llm_cols
++            assert "tags" in llm_cols
++            assert "cached_at" in llm_cols
++    finally:
++        Path(db_path).unlink(missing_ok=True)
++
++
++def test_schema_version_equals_migration_count() -> None:
++    """SCHEMA_VERSION tracks len(_MIGRATIONS) — the contract that keeps _migrate() correct."""
++    assert SCHEMA_VERSION == len(_MIGRATIONS), (
++        f"SCHEMA_VERSION ({SCHEMA_VERSION}) does not equal len(_MIGRATIONS) "
++        f"({len(_MIGRATIONS)}). Update SCHEMA_VERSION when adding a migration entry."
++    )
++
++
++def test_newer_database_raises_on_open() -> None:
++    """A DB from a future build (user_version > SCHEMA_VERSION) is refused, not silently opened."""
++    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
++        db_path = f.name
++
++    try:
++        with sqlite3.connect(db_path) as seed:
++            seed.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
++            seed.commit()
++
++        db = Database(db_path)
++        try:
++            asyncio.run(db.initialize())
++            assert False, "expected RuntimeError for newer schema version"
++        except RuntimeError as exc:
++            assert "newer" in str(exc).lower(), f"unexpected error message: {exc}"
++        finally:
++            asyncio.run(db.close())
++    finally:
++        Path(db_path).unlink(missing_ok=True)

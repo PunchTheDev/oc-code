@@ -1,0 +1,370 @@
+diff --git a/src/trinity/orchestration/dataset.py b/src/trinity/orchestration/dataset.py
+index 4d724ff..9d51d94 100644
+--- a/src/trinity/orchestration/dataset.py
++++ b/src/trinity/orchestration/dataset.py
+@@ -357,7 +357,7 @@ def _load_livecodebench_hf(split: str) -> list[Task] | None:
+                 prompt=str(question),
+                 answer={
+                     "tests": tests,
+-                    "fn_name": _row_get(row, "fn_name", "func_name"),
++                    "fn_name": _lcb_fn_name(row),
+                     "starter_code": _row_get(row, "starter_code"),
+                 },
+                 meta={
+@@ -397,12 +397,40 @@ def _lcb_version_for_split(split: str) -> str:
+     return "release_v1"
+ 
+ 
++def _lcb_fn_name(row: Any) -> str | None:
++    """Extract the call-based entry-point name for a LiveCodeBench row.
++
++    LiveCodeBench stores it inside a JSON ``metadata`` blob under ``func_name``;
++    some mirrors also surface it as a top-level ``fn_name``/``func_name`` column.
++    Returns ``None`` for stdin/stdout problems (which have no call entry point) so
++    the reward checker keeps its historical stdin behavior for them.
++    """
++    import json
++
++    direct = _row_get(row, "fn_name", "func_name")
++    if direct:
++        return str(direct)
++    meta = _row_get(row, "metadata")
++    if isinstance(meta, str):
++        try:
++            meta = json.loads(meta)
++        except (ValueError, TypeError):
++            meta = None
++    if isinstance(meta, dict):
++        fn = meta.get("func_name") or meta.get("fn_name")
++        if fn:
++            return str(fn)
++    return None
++
++
+ def _parse_lcb_tests(row: Any) -> list[dict[str, str]]:
+     """Best-effort extraction of LiveCodeBench public test cases.
+ 
+     LiveCodeBench schemas vary across mirrors. We accept either a JSON-encoded
+     string or an already-parsed list under several common keys, and normalise to
+-    a list of ``{"input": ..., "output": ...}`` dicts. Returns ``[]`` if nothing
++    a list of ``{"input": ..., "output": ...}`` dicts. Each case's ``testtype``
++    (``"stdin"`` vs ``"functional"``) is preserved when present so the reward
++    checker can pick stdin-vs-call-based execution. Returns ``[]`` if nothing
+     parseable is found (the reward checker treats empty tests as unscoreable).
+     """
+     import json
+@@ -422,7 +450,11 @@ def _parse_lcb_tests(row: Any) -> list[dict[str, str]]:
+         if isinstance(case, dict):
+             inp = case.get("input", case.get("stdin", ""))
+             out = case.get("output", case.get("expected_output", ""))
+-            tests.append({"input": str(inp), "output": str(out)})
++            entry = {"input": str(inp), "output": str(out)}
++            ttype = case.get("testtype")
++            if ttype is not None:
++                entry["testtype"] = str(ttype)
++            tests.append(entry)
+     return tests
+ 
+ 
+diff --git a/src/trinity/orchestration/reward.py b/src/trinity/orchestration/reward.py
+index 5676906..12e707f 100644
+--- a/src/trinity/orchestration/reward.py
++++ b/src/trinity/orchestration/reward.py
+@@ -769,20 +769,25 @@ def extract_code(text: str) -> str:
+     return text.strip()
+ 
+ 
+-def _coerce_test_spec(reference: object) -> tuple[list, int]:
+-    """Normalize a code reference into ``(tests, timeout_s)``.
++def _coerce_test_spec(reference: object) -> tuple[list, int, str | None]:
++    """Normalize a code reference into ``(tests, timeout_s, fn_name)``.
+ 
+     The ``Task.answer`` for code benchmarks may be:
+       * a ``list`` of tests, or
+-      * a ``dict`` with key ``"tests"`` and optional ``"timeout_s"``, or
++      * a ``dict`` with key ``"tests"`` and optional ``"timeout_s"`` /
++        ``"fn_name"``, or
+       * a JSON string encoding either of the above.
+ 
+     Each test is one of:
+       * a ``str`` of assert-based Python (executed after the candidate code), or
+       * a ``dict`` ``{"stdin": str, "expected_stdout": str}`` for I/O tests, or
+       * a 2-tuple/list ``(stdin, expected_stdout)``.
++
++    ``fn_name`` (LiveCodeBench call-based problems) is ``None`` for stdin/assert
++    specs and selects the functional execution path when present.
+     """
+     timeout_s = 10
++    fn_name: str | None = None
+     spec: object = reference
+     if isinstance(spec, str):
+         try:
+@@ -791,6 +796,8 @@ def _coerce_test_spec(reference: object) -> tuple[list, int]:
+             spec = [spec]
+     if isinstance(spec, dict):
+         timeout_s = int(spec.get("timeout_s", timeout_s))
++        raw_fn = spec.get("fn_name")
++        fn_name = str(raw_fn) if raw_fn else None
+         tests = spec.get("tests", [])
+     else:
+         tests = spec
+@@ -798,7 +805,7 @@ def _coerce_test_spec(reference: object) -> tuple[list, int]:
+         tests = []
+     if not isinstance(tests, list):
+         tests = [tests]
+-    return tests, timeout_s
++    return tests, timeout_s, fn_name
+ 
+ 
+ def _check_code(candidate: str, reference: object) -> bool:
+@@ -806,11 +813,13 @@ def _check_code(candidate: str, reference: object) -> bool:
+     code = extract_code(candidate)
+     if not code.strip():
+         return False
+-    tests, timeout_s = _coerce_test_spec(reference)
+-    return run_pass_at_1(code, tests, timeout_s=timeout_s)
++    tests, timeout_s, fn_name = _coerce_test_spec(reference)
++    return run_pass_at_1(code, tests, timeout_s=timeout_s, fn_name=fn_name)
+ 
+ 
+-def run_pass_at_1(code: str, tests: Sequence, timeout_s: int = 10) -> bool:
++def run_pass_at_1(
++    code: str, tests: Sequence, timeout_s: int = 10, fn_name: str | None = None
++) -> bool:
+     """Execute candidate ``code`` against ``tests`` in an isolated subprocess.
+ 
+     The candidate code is **never** executed in-process. Each invocation writes
+@@ -829,11 +838,18 @@ def run_pass_at_1(code: str, tests: Sequence, timeout_s: int = 10) -> bool:
+       ``stdin`` on standard input, and its stdout is compared (whitespace-
+       trimmed per line) to ``expected_stdout``. Use this for competitive-
+       programming style benchmarks (LiveCodeBench).
++    * **call-based** (``dict`` with ``testtype == "functional"``, plus a
++      ``fn_name``): the candidate exposes ``fn_name`` as a ``Solution`` method or
++      module-level function; it is called with the newline-separated JSON
++      arguments in ``input`` and its return value is compared (tuples normalized
++      to lists) to the JSON ``output``. This is LiveCodeBench's functional flavor.
+ 
+     Args:
+         code: Candidate Python source (already fence-stripped).
+         tests: Sequence of tests as described above.
+         timeout_s: Per-test wall-clock timeout in seconds.
++        fn_name: Call-based entry-point name. When ``None`` (stdin problems),
++            every test uses the historical stdin/assert behavior.
+ 
+     Returns:
+         ``True`` iff the candidate passes all tests (and there is at least one
+@@ -844,13 +860,78 @@ def run_pass_at_1(code: str, tests: Sequence, timeout_s: int = 10) -> bool:
+     if not tests:
+         return False
+     for test in tests:
+-        if not _run_one_test(code, test, timeout_s):
++        if not _run_one_test(code, test, timeout_s, fn_name=fn_name):
+             return False
+     return True
+ 
+ 
+-def _run_one_test(code: str, test: object, timeout_s: int) -> bool:
++def _functional_harness(fn_name: str, stdin_data: str, expected_output: str) -> str:
++    """Build a self-checking script for a LiveCodeBench call-based test.
++
++    LiveCodeBench passes newline-separated JSON arguments and expects a
++    JSON-encoded return value from ``fn_name`` (a ``Solution`` method or a
++    module-level function). The generated script decodes the args, calls the
++    function, normalizes tuples to lists (so ``(0, 1)`` matches ``[0, 1]``), and
++    asserts equality with the expected output — exiting ``0`` iff correct. All
++    three values are embedded as Python literals via ``repr`` so no candidate or
++    test text can break out of the harness.
++    """
++    lines = [
++        "import json as _json",
++        "def _norm(_x):",
++        "    if isinstance(_x, tuple):",
++        "        _x = list(_x)",
++        "    if isinstance(_x, list):",
++        "        return [_norm(_e) for _e in _x]",
++        "    if isinstance(_x, dict):",
++        "        return {_k: _norm(_v) for _k, _v in _x.items()}",
++        "    return _x",
++        f"_fn_name = {fn_name!r}",
++        f"_raw_in = {stdin_data!r}",
++        f"_raw_out = {expected_output!r}",
++        "_args = [_json.loads(_ln) for _ln in _raw_in.split(chr(10)) if _ln.strip() != '']",
++        "_obj = Solution() if 'Solution' in dir() else None",
++        "if _obj is not None and hasattr(_obj, _fn_name):",
++        "    _target = getattr(_obj, _fn_name)",
++        "else:",
++        "    _target = globals()[_fn_name]",
++        "_result = _norm(_target(*_args))",
++        "try:",
++        "    _expected = _norm(_json.loads(_raw_out))",
++        "except Exception:",
++        "    _expected = _raw_out.strip()",
++        "    _result = _result if isinstance(_result, str) else _json.dumps(_result)",
++        "    _result = _result.strip()",
++        "assert _result == _expected",
++    ]
++    return "\n".join(lines) + "\n"
++
++
++def _run_one_test(
++    code: str, test: object, timeout_s: int, fn_name: str | None = None
++) -> bool:
+     """Run a single test in an isolated subprocess. Returns pass/fail."""
++    # Call-based (LiveCodeBench "functional") path. The mode is chosen ONLY by an
++    # explicit ``testtype == "functional"`` — the authoritative per-test signal
++    # preserved by dataset.py — never by the mere presence of ``fn_name``.
++    # ``fn_name`` only names the callable target (Solution method / module
++    # function). This keeps a stray ``fn_name`` on a stdin (or untyped) case from
++    # silently switching the grader to the wrong path: anything not explicitly
++    # ``functional`` falls through to the stdin/assert handling below.
++    if isinstance(test, dict):
++        ttype = str(test.get("testtype", "")).strip().lower()
++        has_io = (
++            "stdin" in test
++            or "input" in test
++            or "expected_stdout" in test
++            or "output" in test
++        )
++        if ttype == "functional" and has_io:
++            stdin_data = str(test.get("stdin", test.get("input", "")))
++            expected = str(test.get("expected_stdout", test.get("output", "")))
++            script = code + "\n\n" + _functional_harness(fn_name or "", stdin_data, expected)
++            return _exec_script(script, stdin_data="", timeout_s=timeout_s)
++
+     stdin_data: str | None = None
+     expected_stdout: str | None = None
+     assert_block: str | None = None
+diff --git a/tests/test_livecodebench_functional.py b/tests/test_livecodebench_functional.py
+new file mode 100644
+index 0000000..381e679
+--- /dev/null
++++ b/tests/test_livecodebench_functional.py
+@@ -0,0 +1,128 @@
++"""Offline tests for LiveCodeBench call-based ("functional") scoring (#105).
++
++Before this fix every functional problem scored 0: `fn_name` was read as a
++top-level column (it lives in the `metadata` JSON), `testtype` was discarded,
++and the grader only ran stdin/stdout programs. These tests cover the loader
++(metadata `func_name`, preserved `testtype`) and the reward execution path
++(call-based function invocation, tuple normalization) while asserting the
++historical stdin path is untouched. Pure stdlib: they execute local Python in
++the same isolated subprocess sandbox the grader uses (no network / GPU / torch).
++"""
++from __future__ import annotations
++
++import json
++
++import trinity.orchestration.dataset as D
++import trinity.orchestration.reward as R
++
++_TWO_SUM = (
++    "class Solution:\n"
++    "    def twoSum(self, nums, target):\n"
++    "        seen = {}\n"
++    "        for i, v in enumerate(nums):\n"
++    "            if target - v in seen:\n"
++    "                return [seen[target - v], i]\n"
++    "            seen[v] = i\n"
++)
++
++
++def _fence(code: str) -> str:
++    return "```python\n" + code + "\n```"
++
++
++def _fspec(fn_name="twoSum", testtype="functional"):
++    test = {"input": "[2,7,11,15]\n9", "output": "[0,1]"}
++    if testtype is not None:
++        test["testtype"] = testtype
++    return {"tests": [test], "fn_name": fn_name}
++
++
++def test_functional_solution_method_scores_correct():
++    assert R.score_text("livecodebench", _fence(_TWO_SUM), _fspec()) == 1.0
++
++
++def test_functional_wrong_answer_scores_zero():
++    bad = (
++        "class Solution:\n"
++        "    def twoSum(self, nums, target):\n"
++        "        return [9, 9]\n"
++    )
++    assert R.score_text("livecodebench", _fence(bad), _fspec()) == 0.0
++
++
++def test_functional_tuple_return_normalizes_to_list():
++    tup = (
++        "class Solution:\n"
++        "    def twoSum(self, nums, target):\n"
++        "        return (0, 1)\n"
++    )
++    assert R.score_text("livecodebench", _fence(tup), _fspec()) == 1.0
++
++
++def test_functional_module_level_function():
++    spec = {"tests": [{"input": "5", "output": "25", "testtype": "functional"}], "fn_name": "square"}
++    assert R.score_text("livecodebench", _fence("def square(n):\n    return n * n\n"), spec) == 1.0
++
++
++def test_stray_fn_name_without_functional_testtype_uses_stdout():
++    # testtype is the authoritative mode signal (review on #114): a stray fn_name
++    # on a stdin/untyped case must NOT switch to the call-based harness, else a
++    # normal stdin program would be graded call-based and falsely fail.
++    spec = {"tests": [{"input": "3\n", "output": "9\n"}], "fn_name": "solve"}
++    good = "import sys\nn=int(sys.stdin.read())\nprint(n*n)"
++    assert R.score_text("livecodebench", _fence(good), spec) == 1.0
++    # And a genuine functional case (explicit testtype) still grades call-based.
++    assert R.score_text("livecodebench", _fence(_TWO_SUM), _fspec()) == 1.0
++
++
++def test_stdin_problem_still_scored_by_stdout():
++    spec = {
++        "tests": [{"input": "3\n", "output": "9\n"}, {"input": "5\n", "output": "25\n"}],
++        "fn_name": None,
++    }
++    good = "import sys\nn=int(sys.stdin.read())\nprint(n*n)"
++    bad = "import sys\nn=int(sys.stdin.read())\nprint(n+n)"
++    assert R.score_text("livecodebench", _fence(good), spec) == 1.0
++    assert R.score_text("livecodebench", _fence(bad), spec) == 0.0
++
++
++def test_explicit_stdin_testtype_uses_stdout_even_with_fn_name():
++    # testtype == "stdin" forces the stdout path regardless of a stray fn_name.
++    spec = {
++        "tests": [{"input": "3\n", "output": "9\n", "testtype": "stdin"}],
++        "fn_name": "irrelevant",
++    }
++    good = "import sys\nn=int(sys.stdin.read())\nprint(n*n)"
++    assert R.score_text("livecodebench", _fence(good), spec) == 1.0
++
++
++def test_loader_reads_func_name_from_metadata_json():
++    row = {"metadata": json.dumps({"func_name": "foo"})}
++    assert D._lcb_fn_name(row) == "foo"
++
++
++def test_loader_reads_top_level_fn_name_fallback():
++    assert D._lcb_fn_name({"fn_name": "bar"}) == "bar"
++
++
++def test_loader_returns_none_for_stdin_problem():
++    assert D._lcb_fn_name({"metadata": json.dumps({})}) is None
++    assert D._lcb_fn_name({"fn_name": None}) is None
++
++
++def test_parse_lcb_tests_preserves_testtype_when_present():
++    row = {"public_test_cases": [{"input": "1", "output": "2", "testtype": "functional"}]}
++    parsed = D._parse_lcb_tests(row)
++    assert parsed == [{"input": "1", "output": "2", "testtype": "functional"}]
++
++
++def test_parse_lcb_tests_omits_testtype_when_absent():
++    row = {"public_test_cases": [{"input": "1", "output": "2"}]}
++    assert D._parse_lcb_tests(row) == [{"input": "1", "output": "2"}]
++
++
++def test_coerce_test_spec_extracts_fn_name():
++    tests, timeout_s, fn_name = R._coerce_test_spec({"tests": [], "fn_name": "twoSum"})
++    assert fn_name == "twoSum"
++    tests, timeout_s, fn_name = R._coerce_test_spec({"tests": []})
++    assert fn_name is None

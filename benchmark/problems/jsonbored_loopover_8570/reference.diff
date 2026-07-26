@@ -1,0 +1,514 @@
+diff --git a/packages/loopover-miner/lib/purge-cli.ts b/packages/loopover-miner/lib/purge-cli.ts
+index d61b8ee80..04f04d08c 100644
+--- a/packages/loopover-miner/lib/purge-cli.ts
++++ b/packages/loopover-miner/lib/purge-cli.ts
+@@ -37,6 +37,8 @@ import { openReplaySnapshotStore, resolveReplaySnapshotDbPath } from "./replay-s
+ import type { ReplaySnapshotStore } from "./replay-snapshot.js";
+ import { initDenyHookSynthesisStore, resolveDenyHookSynthesisDbPath } from "./deny-hook-synthesis.js";
+ import type { DenyHookSynthesisStore } from "./deny-hook-synthesis.js";
++import { openWorktreeAllocator, resolveWorktreeAllocatorDbPath } from "./worktree-allocator.js";
++import type { WorktreeAllocator } from "./worktree-allocator.js";
+ import { resolveAttemptLogDbPath } from "./attempt-log.js";
+ import {
+   CLAIM_LEDGER_PURGE_SPEC,
+@@ -52,6 +54,7 @@ import {
+   RANKED_CANDIDATES_PURGE_SPEC,
+   REPLAY_SNAPSHOT_PURGE_SPEC,
+   DENY_HOOK_SYNTHESIS_PURGE_SPEC,
++  WORKTREE_ALLOCATOR_PURGE_SPEC,
+   countStoreByRepo,
+   describeError,
+ } from "./store-maintenance.js";
+@@ -79,7 +82,8 @@ type PurgeOpenerKey =
+   | "initPolicyVerdictCacheStore"
+   | "initRankedCandidatesStore"
+   | "openReplaySnapshotStore"
+-  | "initDenyHookSynthesisStore";
++  | "initDenyHookSynthesisStore"
++  | "openWorktreeAllocator";
+ 
+ export type PurgeCliOptions = {
+   openClaimLedger?: () => ClaimLedger;
+@@ -94,6 +98,7 @@ export type PurgeCliOptions = {
+   initRankedCandidatesStore?: () => RankedCandidatesStore;
+   openReplaySnapshotStore?: () => ReplaySnapshotStore;
+   initDenyHookSynthesisStore?: () => DenyHookSynthesisStore;
++  openWorktreeAllocator?: () => WorktreeAllocator;
+   resolveDbPaths?: Record<string, () => string>;
+ };
+ 
+@@ -124,6 +129,10 @@ const REAL_PURGE_TARGETS: PurgeTarget[] = [
+   { name: "ranked-candidates", optionKey: "initRankedCandidatesStore", opener: initRankedCandidatesStore, resolveDbPath: resolveRankedCandidatesDbPath, spec: RANKED_CANDIDATES_PURGE_SPEC },
+   { name: "replay-snapshot", optionKey: "openReplaySnapshotStore", opener: openReplaySnapshotStore, resolveDbPath: resolveReplaySnapshotDbPath, spec: REPLAY_SNAPSHOT_PURGE_SPEC },
+   { name: "deny-hook-synthesis", optionKey: "initDenyHookSynthesisStore", opener: initDenyHookSynthesisStore, resolveDbPath: resolveDenyHookSynthesisDbPath, spec: DENY_HOOK_SYNTHESIS_PURGE_SPEC },
++  // worktree-allocator (#8320): a fixed-pool store, not an append-only ledger — its own purgeByRepo only
++  // blanks a `free` row's repo_full_name (never deletes, never touches an `active` row), and the spec's
++  // extraWhereSql keeps this dry-run count in lockstep with that same restriction.
++  { name: "worktree-allocator", optionKey: "openWorktreeAllocator", opener: openWorktreeAllocator, resolveDbPath: resolveWorktreeAllocatorDbPath, spec: WORKTREE_ALLOCATOR_PURGE_SPEC },
+ ];
+ 
+ export type ParsedPurgeArgs = { json: boolean; dryRun: boolean; repoFullName: string } | { error: string };
+diff --git a/packages/loopover-miner/lib/store-maintenance.ts b/packages/loopover-miner/lib/store-maintenance.ts
+index e2f180310..6a0630c95 100644
+--- a/packages/loopover-miner/lib/store-maintenance.ts
++++ b/packages/loopover-miner/lib/store-maintenance.ts
+@@ -27,7 +27,14 @@ export const EVENT_LEDGER_RETENTION_SPEC: LedgerRetentionSpec = { table: "miner_
+ export const GOVERNOR_LEDGER_RETENTION_SPEC: LedgerRetentionSpec = { table: "governor_events", timestampColumn: "ts", orderColumn: "id" };
+ export const PREDICTION_LEDGER_RETENTION_SPEC: LedgerRetentionSpec = { table: "predictions", timestampColumn: "ts", orderColumn: "id" };
+ 
+-export type LedgerPurgeSpec = { table: string; repoColumn: string };
++/** `extraWhereSql` is an optional, ANDed, internal-constant-only SQL condition for a store whose real purge
++ *  must not match every row a plain `repoColumn = ?` would — e.g. a fixed-pool slot table where only a `free`
++ *  row is safe to clear (#8320). Only `countStoreByRepo` (the read-only dry-run counter) honors it; the
++ *  real-delete path, `purgeStoreByRepo`, is never used for such a store (it does an unconditional `DELETE`,
++ *  wrong for a row that must be preserved and merely blanked) — its own custom `purgeByRepo` method is used
++ *  instead, and `--dry-run` must count using the identical condition so its preview never overstates what a
++ *  real purge would remove. */
++export type LedgerPurgeSpec = { table: string; repoColumn: string; extraWhereSql?: string };
+ 
+ /** Fixed purge specs (#5564, #6599) for the six stores whose rows are directly scoped by a `repoColumn`. Same
+  *  internal-constant-only discipline as the retention specs above. `attempt-log.js` is deliberately absent: its
+@@ -70,6 +77,14 @@ export const RANKED_CANDIDATES_PURGE_SPEC: LedgerPurgeSpec = { table: "miner_ran
+ export const REPLAY_SNAPSHOT_PURGE_SPEC: LedgerPurgeSpec = { table: "replay_snapshots", repoColumn: "repo_full_name" };
+ export const DENY_HOOK_SYNTHESIS_PURGE_SPEC: LedgerPurgeSpec = { table: "deny_rule_proposals", repoColumn: "repo_full_name" };
+ 
++/** worktree-allocator's `worktree_slots` (#8320), the last repo-scoped store the #5564/#7091/#6987/#8009 sweeps
++ *  missed. Unlike every spec above, this table is a fixed pool — `slot_index` is the primary key and every slot
++ *  0..maxConcurrency-1 always exists, so a purge must never delete a row, and must never touch a `status =
++ *  'active'` row (a live, in-flight attempt's real on-disk worktree checkout). `extraWhereSql` restricts even
++ *  the read-only dry-run count to the same `status = 'free'` condition the real purge (worktree-allocator.js's
++ *  own hand-written `purgeByRepo`, not this file's generic `purgeStoreByRepo`) enforces. */
++export const WORKTREE_ALLOCATOR_PURGE_SPEC: LedgerPurgeSpec = { table: "worktree_slots", repoColumn: "repo_full_name", extraWhereSql: "status = 'free'" };
++
+ export type StoreIntegrityResult = { name: string; ok: boolean; detail: string };
+ export type LedgerRetentionPolicy = { maxAgeMs?: number; maxRows?: number };
+ 
+@@ -205,6 +220,9 @@ export function countStoreByRepo(db: DatabaseSync, spec: LedgerPurgeSpec, repoFu
+   for (const identifier of [spec.table, spec.repoColumn]) {
+     if (!SQL_IDENTIFIER.test(identifier)) throw new Error(`unsafe SQL identifier: ${identifier}`);
+   }
+-  const row = db.prepare(`SELECT COUNT(*) AS count FROM ${spec.table} WHERE ${spec.repoColumn} = ?`).get(repoFullName);
++  // extraWhereSql is only ever one of this file's own internal constants (never caller/user text), so it is
++  // ANDed in verbatim rather than parsed as an identifier — see LedgerPurgeSpec's doc comment (#8320).
++  const extraWhere = spec.extraWhereSql ? ` AND (${spec.extraWhereSql})` : "";
++  const row = db.prepare(`SELECT COUNT(*) AS count FROM ${spec.table} WHERE ${spec.repoColumn} = ?${extraWhere}`).get(repoFullName);
+   return Number(row?.count);
+ }
+diff --git a/packages/loopover-miner/lib/worktree-allocator.ts b/packages/loopover-miner/lib/worktree-allocator.ts
+index ac7cd40df..95b7c7a6f 100644
+--- a/packages/loopover-miner/lib/worktree-allocator.ts
++++ b/packages/loopover-miner/lib/worktree-allocator.ts
+@@ -38,6 +38,7 @@ export type WorktreeAllocator = {
+   acquire(attemptId: string, repoFullName: string): WorktreeAllocation;
+   release(attemptId: string): WorktreeAllocation | null;
+   listSlots(): WorktreeAllocation[];
++  purgeByRepo(repoFullName: string): number;
+   close(): void;
+ };
+ 
+@@ -304,6 +305,18 @@ export function openWorktreeAllocator(options: {
+   const listSlots = db.prepare(
+     "SELECT slot_index, worktree_path, attempt_id, repo_full_name, status, owner_pid, owner_host, allocated_at FROM worktree_slots ORDER BY slot_index",
+   );
++  // #8320: right-to-be-forgotten for a fixed-pool store. Never DELETE (every slot_index 0..maxConcurrency-1
++  // must always exist) and never touch an `active` row — its repo_full_name reflects a live, currently-running
++  // attempt's real on-disk worktree checkout, and force-clearing it while active would desync the allocator
++  // from that live checkout. Only a `free` row can ever carry a stale repo_full_name in practice (release()/
++  // reclaimOrphanedAllocations() already blank it on every path that frees a slot), so this is expected to
++  // affect 0 rows in the overwhelming majority of real calls — it exists as a defensive backstop for a row that
++  // predates this fix or was left stale by an unexpected crash path, not as the primary cleanup mechanism.
++  const purgeFreeSlotsByRepo = db.prepare(`
++    UPDATE worktree_slots
++    SET repo_full_name = NULL, attempt_id = NULL, owner_pid = NULL, owner_host = NULL, allocated_at = NULL
++    WHERE status = 'free' AND repo_full_name = ?
++  `);
+ 
+   const allocator: WorktreeAllocator = {
+     dbPath: resolvedPath,
+@@ -358,6 +371,11 @@ export function openWorktreeAllocator(options: {
+     listSlots() {
+       return (listSlots.all() as WorktreeSlotRow[]).map(rowToAllocation);
+     },
++    purgeByRepo(repoFullName) {
++      const normalized = normalizeRepoFullName(repoFullName);
++      const info = purgeFreeSlotsByRepo.run(normalized);
++      return Number(info.changes);
++    },
+     close() {
+       db.close();
+     },
+diff --git a/test/unit/miner-attempt-cli.test.ts b/test/unit/miner-attempt-cli.test.ts
+index 8cd1c9c15..97bc0cd39 100644
+--- a/test/unit/miner-attempt-cli.test.ts
++++ b/test/unit/miner-attempt-cli.test.ts
+@@ -1508,6 +1508,7 @@ describe("runAttempt (#5132)", () => {
+         },
+         release: vi.fn(),
+         listSlots: () => [],
++        purgeByRepo: vi.fn(() => 0),
+         close: vi.fn(),
+       }),
+       openClaimLedger: () => claimLedger,
+diff --git a/test/unit/miner-purge-cli.test.ts b/test/unit/miner-purge-cli.test.ts
+index 1355f0b8a..a5b847c3f 100644
+--- a/test/unit/miner-purge-cli.test.ts
++++ b/test/unit/miner-purge-cli.test.ts
+@@ -1,6 +1,7 @@
+ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
++import { DatabaseSync } from "node:sqlite";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import { openClaimLedger, closeDefaultClaimLedger } from "../../packages/loopover-miner/lib/claim-ledger.js";
+ import { initEventLedger, closeDefaultEventLedger } from "../../packages/loopover-miner/lib/event-ledger.js";
+@@ -21,6 +22,7 @@ import { openGovernorState } from "../../packages/loopover-miner/lib/governor-st
+ import { initRankedCandidatesStore } from "../../packages/loopover-miner/lib/ranked-candidates.js";
+ import { openReplaySnapshotStore } from "../../packages/loopover-miner/lib/replay-snapshot.js";
+ import { initDenyHookSynthesisStore } from "../../packages/loopover-miner/lib/deny-hook-synthesis.js";
++import { openWorktreeAllocator } from "../../packages/loopover-miner/lib/worktree-allocator.js";
+ import { emptyContributionProfile } from "../../packages/loopover-miner/lib/contribution-profile.js";
+ import {
+   ATTEMPT_LOG_NOT_PURGEABLE_NOTE,
+@@ -88,7 +90,7 @@ describe("parsePurgeArgs (#5564)", () => {
+ });
+ 
+ describe("runPurge --dry-run (#5564, #6599)", () => {
+-  it("counts matching rows across the twelve real stores without writing anything, and reports attempt-log as not-purgeable", async () => {
++  it("counts matching rows across the thirteen real stores without writing anything, and reports attempt-log as not-purgeable", async () => {
+     const root = tempDir();
+     const claimDbPath = join(root, "claim-ledger.sqlite3");
+     const eventDbPath = join(root, "event-ledger.sqlite3");
+@@ -102,6 +104,7 @@ describe("runPurge --dry-run (#5564, #6599)", () => {
+     const rankedCandidatesDbPath = join(root, "ranked-candidates.sqlite3");
+     const replaySnapshotDbPath = join(root, "replay-snapshot.sqlite3");
+     const denyHookSynthesisDbPath = join(root, "deny-hook-synthesis.sqlite3");
++    const worktreeAllocatorDbPath = join(root, "worktree-allocator.sqlite3");
+     const attemptLogDbPath = join(root, "attempt-log.sqlite3"); // never created — dry run must not touch it
+ 
+     const claimLedger = openClaimLedger(claimDbPath);
+@@ -209,6 +212,20 @@ describe("runPurge --dry-run (#5564, #6599)", () => {
+     ]);
+     denyHookSynthesis.close();
+ 
++    // worktree-allocator (#8320): a free slot with a stale repo_full_name (seeded directly, since normal
++    // operation never leaves one) counts; an active slot for the same repo -- a live, in-flight attempt's real
++    // worktree checkout -- must not.
++    const worktreeAllocator = openWorktreeAllocator({
++      dbPath: worktreeAllocatorDbPath,
++      worktreeBaseDir: join(root, "worktrees"),
++      maxConcurrency: 2,
++    });
++    worktreeAllocator.acquire("attempt-active", "acme/widgets");
++    worktreeAllocator.close();
++    const rawWorktreeDb = new DatabaseSync(worktreeAllocatorDbPath);
++    rawWorktreeDb.exec("UPDATE worktree_slots SET repo_full_name = 'acme/widgets' WHERE status = 'free'");
++    rawWorktreeDb.close();
++
+     const resolveDbPaths = {
+       "claim-ledger": () => claimDbPath,
+       "event-ledger": () => eventDbPath,
+@@ -222,6 +239,7 @@ describe("runPurge --dry-run (#5564, #6599)", () => {
+       "ranked-candidates": () => rankedCandidatesDbPath,
+       "replay-snapshot": () => replaySnapshotDbPath,
+       "deny-hook-synthesis": () => denyHookSynthesisDbPath,
++      "worktree-allocator": () => worktreeAllocatorDbPath,
+       "attempt-log": () => attemptLogDbPath,
+     };
+ 
+@@ -245,6 +263,8 @@ describe("runPurge --dry-run (#5564, #6599)", () => {
+         { store: "ranked-candidates", wouldPurge: 1 },
+         { store: "replay-snapshot", wouldPurge: 1 },
+         { store: "deny-hook-synthesis", wouldPurge: 1 },
++        // Only the free-stale slot counts; the active slot for the same repo must not.
++        { store: "worktree-allocator", wouldPurge: 1 },
+       ],
+       attemptLogNote: ATTEMPT_LOG_NOT_PURGEABLE_NOTE,
+       attemptLogTotalRows: 0,
+@@ -280,12 +300,13 @@ describe("runPurge --dry-run (#5564, #6599)", () => {
+       "ranked-candidates": () => join(root, "ranked-candidates.sqlite3"),
+       "replay-snapshot": () => join(root, "replay-snapshot.sqlite3"),
+       "deny-hook-synthesis": () => join(root, "deny-hook-synthesis.sqlite3"),
++      "worktree-allocator": () => join(root, "worktree-allocator.sqlite3"),
+       "attempt-log": () => join(root, "attempt-log.sqlite3"),
+     };
+     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+     expect(runPurge(["--repo", "acme/widgets", "--dry-run", "--json"], { resolveDbPaths })).toBe(0);
+     const result = JSON.parse(String(log.mock.calls[0]?.[0]));
+-    expect(result.stores).toHaveLength(12);
++    expect(result.stores).toHaveLength(13);
+     expect(result.stores.every((entry: { wouldPurge: number }) => entry.wouldPurge === 0)).toBe(true);
+     expect(result.attemptLogTotalRows).toBe(0);
+     for (const resolve of Object.values(resolveDbPaths)) {
+@@ -326,6 +347,7 @@ describe("runPurge --dry-run (#5564, #6599)", () => {
+       "ranked-candidates": () => join(root, "ranked-candidates.sqlite3"),
+       "replay-snapshot": () => join(root, "replay-snapshot.sqlite3"),
+       "deny-hook-synthesis": () => join(root, "deny-hook-synthesis.sqlite3"),
++      "worktree-allocator": () => join(root, "worktree-allocator.sqlite3"),
+       "attempt-log": () => attemptLogDbPath,
+     };
+     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+@@ -357,6 +379,7 @@ describe("runPurge --dry-run (#5564, #6599)", () => {
+       "ranked-candidates": () => join(root, "ranked-candidates.sqlite3"),
+       "replay-snapshot": () => join(root, "replay-snapshot.sqlite3"),
+       "deny-hook-synthesis": () => join(root, "deny-hook-synthesis.sqlite3"),
++      "worktree-allocator": () => join(root, "worktree-allocator.sqlite3"),
+       "attempt-log": () => join(root, "attempt-log.sqlite3"),
+     };
+     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+@@ -401,6 +424,7 @@ describe("runPurge --dry-run (#5564, #6599)", () => {
+       LOOPOVER_MINER_RANKED_CANDIDATES_DB: process.env.LOOPOVER_MINER_RANKED_CANDIDATES_DB,
+       LOOPOVER_MINER_REPLAY_SNAPSHOT_DB: process.env.LOOPOVER_MINER_REPLAY_SNAPSHOT_DB,
+       LOOPOVER_MINER_DENY_HOOK_SYNTHESIS_DB: process.env.LOOPOVER_MINER_DENY_HOOK_SYNTHESIS_DB,
++      LOOPOVER_MINER_WORKTREE_ALLOCATOR_DB: process.env.LOOPOVER_MINER_WORKTREE_ALLOCATOR_DB,
+       LOOPOVER_MINER_ATTEMPT_LOG_DB: process.env.LOOPOVER_MINER_ATTEMPT_LOG_DB,
+     };
+     process.env.LOOPOVER_MINER_CLAIM_LEDGER_DB = join(root, "claim-ledger.sqlite3");
+@@ -415,12 +439,13 @@ describe("runPurge --dry-run (#5564, #6599)", () => {
+     process.env.LOOPOVER_MINER_RANKED_CANDIDATES_DB = join(root, "ranked-candidates.sqlite3");
+     process.env.LOOPOVER_MINER_REPLAY_SNAPSHOT_DB = join(root, "replay-snapshot.sqlite3");
+     process.env.LOOPOVER_MINER_DENY_HOOK_SYNTHESIS_DB = join(root, "deny-hook-synthesis.sqlite3");
++    process.env.LOOPOVER_MINER_WORKTREE_ALLOCATOR_DB = join(root, "worktree-allocator.sqlite3");
+     process.env.LOOPOVER_MINER_ATTEMPT_LOG_DB = join(root, "attempt-log.sqlite3");
+     try {
+       const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+       expect(runPurge(["--repo", "acme/widgets", "--dry-run", "--json"])).toBe(0);
+       const result = JSON.parse(String(log.mock.calls[0]?.[0]));
+-      expect(result.stores).toHaveLength(12);
++      expect(result.stores).toHaveLength(13);
+       expect(result.stores.every((entry: { wouldPurge: number }) => entry.wouldPurge === 0)).toBe(true);
+       // Nothing was created — dry run against nonexistent default-path stores makes zero writes.
+       expect(existsSync(process.env.LOOPOVER_MINER_CLAIM_LEDGER_DB)).toBe(false);
+@@ -449,6 +474,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+     const runState = fakeStore(1);
+     const cache = fakeStore(1);
+     const governorState = fakeStore(4); // its purgeByRepo already sums both repo-scoped tables
++    const worktreeAllocator = fakeStore(1);
+     const options = {
+       openClaimLedger: () => claim,
+       initEventLedger: () => event,
+@@ -462,6 +488,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+       initRankedCandidatesStore: () => fakeStore(0),
+       openReplaySnapshotStore: () => fakeStore(0),
+       initDenyHookSynthesisStore: () => fakeStore(0),
++      openWorktreeAllocator: () => worktreeAllocator,
+     };
+ 
+     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+@@ -470,7 +497,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+     expect(summary).toMatchObject({
+       outcome: "purged",
+       repoFullName: "acme/widgets",
+-      totalPurged: 16,
++      totalPurged: 17,
+       stores: [
+         { store: "claim-ledger", purged: 2 },
+         { store: "event-ledger", purged: 1 },
+@@ -484,22 +511,23 @@ describe("runPurge (real, #5564, #6599)", () => {
+         { store: "ranked-candidates", purged: 0 },
+         { store: "replay-snapshot", purged: 0 },
+         { store: "deny-hook-synthesis", purged: 0 },
++        { store: "worktree-allocator", purged: 1 },
+         { store: "attempt-log", purged: null, note: ATTEMPT_LOG_NOT_PURGEABLE_NOTE },
+       ],
+     });
+     expect(typeof summary.purgedAt).toBe("string");
+-    for (const store of [claim, event, governor, prediction, portfolio, runState, cache, governorState]) {
++    for (const store of [claim, event, governor, prediction, portfolio, runState, cache, governorState, worktreeAllocator]) {
+       expect(store.purgeByRepo).toHaveBeenCalledWith("acme/widgets");
+     }
+     // Injected stores are caller-owned: runPurge must not close them.
+-    for (const store of [claim, event, governor, prediction, portfolio, runState, cache, governorState]) {
++    for (const store of [claim, event, governor, prediction, portfolio, runState, cache, governorState, worktreeAllocator]) {
+       expect(store.close).not.toHaveBeenCalled();
+     }
+ 
+     log.mockClear();
+     expect(runPurge(["--repo", "acme/widgets"], options as never)).toBe(0);
+     const text = String(log.mock.calls[0]?.[0]);
+-    expect(text).toContain("Purged 16 row(s) for acme/widgets");
++    expect(text).toContain("Purged 17 row(s) for acme/widgets");
+     expect(text).toContain("claim-ledger=2");
+     expect(text).toContain("portfolio-queue=4");
+     expect(text).toContain("run-state=1");
+@@ -528,6 +556,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+       initRankedCandidatesStore: () => fakeStore(0),
+       openReplaySnapshotStore: () => fakeStore(0),
+       initDenyHookSynthesisStore: () => fakeStore(0),
++      openWorktreeAllocator: () => fakeStore(0),
+     };
+ 
+     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+@@ -567,6 +596,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+       initRankedCandidatesStore: () => fakeStore(0),
+       openReplaySnapshotStore: () => fakeStore(0),
+       initDenyHookSynthesisStore: () => fakeStore(0),
++      openWorktreeAllocator: () => fakeStore(0),
+     };
+     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+     expect(runPurge(["--repo", "acme/widgets", "--json"], options as never)).toBe(2);
+@@ -590,6 +620,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+       initRankedCandidatesStore: () => fakeStore(0),
+       openReplaySnapshotStore: () => fakeStore(0),
+       initDenyHookSynthesisStore: () => fakeStore(0),
++      openWorktreeAllocator: () => fakeStore(0),
+     };
+     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+     expect(runPurge(["--repo", "acme/widgets", "--json"], options as never)).toBe(2);
+@@ -615,6 +646,8 @@ describe("runPurge (real, #5564, #6599)", () => {
+       LOOPOVER_MINER_RANKED_CANDIDATES_DB: process.env.LOOPOVER_MINER_RANKED_CANDIDATES_DB,
+       LOOPOVER_MINER_REPLAY_SNAPSHOT_DB: process.env.LOOPOVER_MINER_REPLAY_SNAPSHOT_DB,
+       LOOPOVER_MINER_DENY_HOOK_SYNTHESIS_DB: process.env.LOOPOVER_MINER_DENY_HOOK_SYNTHESIS_DB,
++      LOOPOVER_MINER_WORKTREE_ALLOCATOR_DB: process.env.LOOPOVER_MINER_WORKTREE_ALLOCATOR_DB,
++      LOOPOVER_MINER_WORKTREE_DIR: process.env.LOOPOVER_MINER_WORKTREE_DIR,
+     };
+     const claimDbPath = join(root, "claim-ledger.sqlite3");
+     const portfolioDbPath = join(root, "portfolio-queue.sqlite3");
+@@ -631,6 +664,10 @@ describe("runPurge (real, #5564, #6599)", () => {
+     process.env.LOOPOVER_MINER_RANKED_CANDIDATES_DB = join(root, "ranked-candidates.sqlite3");
+     process.env.LOOPOVER_MINER_REPLAY_SNAPSHOT_DB = join(root, "replay-snapshot.sqlite3");
+     process.env.LOOPOVER_MINER_DENY_HOOK_SYNTHESIS_DB = join(root, "deny-hook-synthesis.sqlite3");
++    process.env.LOOPOVER_MINER_WORKTREE_ALLOCATOR_DB = join(root, "worktree-allocator.sqlite3");
++    // openWorktreeAllocator() also needs a worktree base dir, unlike every other store here -- without this,
++    // the real opener would create real slot directories under the actual test-runner's home dir.
++    process.env.LOOPOVER_MINER_WORKTREE_DIR = join(root, "worktrees");
+     try {
+       // Seed real rows via the default store paths before purging through them.
+       const seededClaim = openClaimLedger(claimDbPath);
+@@ -701,6 +738,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+       "ranked-candidates": () => join(root, "ranked-candidates.sqlite3"),
+       "replay-snapshot": () => join(root, "replay-snapshot.sqlite3"),
+       "deny-hook-synthesis": () => join(root, "deny-hook-synthesis.sqlite3"),
++      "worktree-allocator": () => join(root, "worktree-allocator.sqlite3"),
+       "attempt-log": () => join(root, "attempt-log.sqlite3"),
+     };
+ 
+@@ -728,6 +766,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+       initRankedCandidatesStore: () => fakeStore(0),
+       openReplaySnapshotStore: () => fakeStore(0),
+       initDenyHookSynthesisStore: () => fakeStore(0),
++      openWorktreeAllocator: () => fakeStore(0),
+       } as never),
+     ).toBe(0);
+     const purged = JSON.parse(String(log.mock.calls[0]?.[0]));
+@@ -778,6 +817,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+       initRankedCandidatesStore: () => fakeStore(0),
+       openReplaySnapshotStore: () => fakeStore(0),
+       initDenyHookSynthesisStore: () => fakeStore(0),
++      openWorktreeAllocator: () => fakeStore(0),
+       } as never),
+     ).toBe(0);
+     const summary = JSON.parse(String(log.mock.calls[0]?.[0]));
+@@ -824,6 +864,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+       initRankedCandidatesStore: () => fakeStore(0),
+       openReplaySnapshotStore: () => fakeStore(0),
+       initDenyHookSynthesisStore: () => fakeStore(0),
++      openWorktreeAllocator: () => fakeStore(0),
+       } as never),
+     ).toBe(0);
+     const summary = JSON.parse(String(log.mock.calls[0]?.[0]));
+@@ -892,6 +933,7 @@ describe("runPurge (real, #5564, #6599)", () => {
+         initRankedCandidatesStore: () => rankedStore,
+         openReplaySnapshotStore: () => replayStore,
+         initDenyHookSynthesisStore: () => denyStore,
++        openWorktreeAllocator: () => fakeStore(0),
+       } as never),
+     ).toBe(0);
+     const summary = JSON.parse(String(log.mock.calls[0]?.[0]));
+diff --git a/test/unit/miner-store-maintenance.test.ts b/test/unit/miner-store-maintenance.test.ts
+index 1ed84ad18..f2726e2fd 100644
+--- a/test/unit/miner-store-maintenance.test.ts
++++ b/test/unit/miner-store-maintenance.test.ts
+@@ -8,6 +8,7 @@ import {
+   EVENT_LEDGER_RETENTION_SPEC,
+   LEDGER_RETENTION_DAYS_ENV,
+   LEDGER_RETENTION_MAX_ROWS_ENV,
++  WORKTREE_ALLOCATOR_PURGE_SPEC,
+   checkStoreIntegrity,
+   classifyIntegrityRows,
+   countStoreByRepo,
+@@ -299,4 +300,37 @@ describe("countStoreByRepo (#5564)", () => {
+     );
+     db.close();
+   });
++
++  // #8320: extraWhereSql ANDs an extra condition onto the repoColumn match, for a spec whose real purge (a
++  // custom purgeByRepo, never this file's generic purgeStoreByRepo) must not match every row a plain
++  // repoColumn = ? would -- e.g. WORKTREE_ALLOCATOR_PURGE_SPEC's "status = 'free'".
++  it("ANDs extraWhereSql onto the match when the spec declares one", () => {
++    const db = new DatabaseSync(":memory:");
++    db.exec(`
++      CREATE TABLE worktree_slots (
++        slot_index INTEGER PRIMARY KEY,
++        repo_full_name TEXT,
++        status TEXT NOT NULL
++      )
++    `);
++    db.exec(`
++      INSERT INTO worktree_slots (slot_index, repo_full_name, status) VALUES
++        (0, 'acme/widgets', 'free'),
++        (1, 'acme/widgets', 'active'),
++        (2, 'acme/gadgets', 'free')
++    `);
++    // Only the free row for the target repo satisfies both the repoColumn match AND extraWhereSql -- the
++    // active row for the same repo (repoColumn matches, extraWhereSql doesn't) is excluded.
++    expect(countStoreByRepo(db, WORKTREE_ALLOCATOR_PURGE_SPEC, "acme/widgets")).toBe(1);
++    // A repo with no free row at all (repoColumn wouldn't even match here) still returns 0, not a crash.
++    expect(countStoreByRepo(db, WORKTREE_ALLOCATOR_PURGE_SPEC, "acme/other")).toBe(0);
++    db.close();
++  });
++
++  it("omits extraWhereSql entirely when the spec doesn't declare one (existing specs unaffected)", () => {
++    const db = seedPurgeTable([{ repoFullName: "acme/widgets" }, { repoFullName: "acme/gadgets" }]);
++    expect(CLAIM_LEDGER_PURGE_SPEC.extraWhereSql).toBeUndefined();
++    expect(countStoreByRepo(db, CLAIM_LEDGER_PURGE_SPEC, "acme/widgets")).toBe(1);
++    db.close();
++  });
+ });
+diff --git a/test/unit/miner-worktree-allocator.test.ts b/test/unit/miner-worktree-allocator.test.ts
+index a9b1f627e..8c6d26763 100644
+--- a/test/unit/miner-worktree-allocator.test.ts
++++ b/test/unit/miner-worktree-allocator.test.ts
+@@ -179,4 +179,43 @@ describe("loopover-miner worktree allocator scaffolding (#4298)", () => {
+     closeAllCleanupResources(); // what installCliSignalHandlers invokes on SIGINT/SIGTERM
+     expect(cleanupResourceCount()).toBe(0);
+   });
++
++  describe("purgeByRepo (#8320)", () => {
++    it("clears a free slot's stale repo_full_name and counts it", () => {
++      const allocator = tempAllocator({ maxConcurrency: 1 });
++      // Normal operation never leaves a free slot with a non-null repo_full_name (release() already blanks
++      // it) -- seed one directly to exercise the defensive backstop the issue calls out.
++      const db = new DatabaseSync(allocator.dbPath);
++      db.exec("UPDATE worktree_slots SET repo_full_name = 'acme/widgets' WHERE slot_index = 0");
++      db.close();
++
++      expect(allocator.purgeByRepo("acme/widgets")).toBe(1);
++      const slot = allocator.listSlots()[0]!;
++      expect(slot.repoFullName).toBeNull();
++      expect(slot.status).toBe("free");
++    });
++
++    it("never touches an active slot for the target repo", () => {
++      const allocator = tempAllocator({ maxConcurrency: 1 });
++      const allocation = allocator.acquire("attempt-a", "acme/widgets");
++
++      expect(allocator.purgeByRepo("acme/widgets")).toBe(0);
++      const slot = allocator.listSlots()[0]!;
++      expect(slot.status).toBe("active");
++      expect(slot.repoFullName).toBe("acme/widgets");
++      expect(slot.attemptId).toBe(allocation.attemptId);
++    });
++
++    it("returns 0 when no slot matches the repo", () => {
++      const allocator = tempAllocator({ maxConcurrency: 1 });
++      allocator.acquire("attempt-a", "acme/widgets");
++      expect(allocator.purgeByRepo("acme/other")).toBe(0);
++    });
++
++    it("rejects an invalid repo full name, matching acquire's own guard", () => {
++      const allocator = tempAllocator({ maxConcurrency: 1 });
++      expect(() => allocator.purgeByRepo("bad")).toThrow("invalid_repo_full_name");
++      expect(() => allocator.purgeByRepo("../widgets")).toThrow("invalid_repo_full_name");
++    });
++  });
+ });

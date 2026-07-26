@@ -1,0 +1,254 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index ba06806..4317a7e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,14 @@ All notable changes to SparkDistill are documented here. The format follows
+   `teacher.format`. Empty or failed-validation trajectories are skipped (not coerced
+   into empty assistant turns), multi-turn episodes are preferred, and repair rows use
+   `prompt_meta.prompt` instead of the validator wrapper. Closes the approach in #213.
++- **Accepted-registry snapshot applies the same exportability filter as the mix**:
++  follow-up to the SparkProof publish-path export above — `mix_registry_datasets` now
++  skips unexportable (empty/failed) rows, but `export_registry_snapshot.collect_accepted_trajectories`
++  still accepted every non-duplicate row, so `accepted_registry_snapshot.jsonl` /
++  `accepted_task_ids.json` over-reported rows the canonical mix rejects and their dedup
++  state diverged (an unexportable row wrongly blocked a later good duplicate). The
++  snapshot builder now runs the same exporter and drops the rows the mix drops, so miners'
++  pre-generation dedup matches what actually enters the mix.
+ - **Claim binding uses signed NRAS ``eat_nonce``, not editable JSON** : `check_claim_binding`
+   / `check_attestation_integrity` require `eat_nonce` from JWKS-verified platform or
+   per-device JWTs (`REMOTE_GPU_CLAIMS`) to equal `claim_sha256(bundle)`. Miner-editable
+diff --git a/eval/export_registry_snapshot.py b/eval/export_registry_snapshot.py
+index 4cc6f37..d72ac46 100644
+--- a/eval/export_registry_snapshot.py
++++ b/eval/export_registry_snapshot.py
+@@ -21,6 +21,7 @@
+     DedupeMode,
+     _add_row_to_registry,
+     _classify_row,
++    _import_trajectory_exporter,
+     _make_dedupe_registry,
+     _should_skip,
+     load_trajectories_jsonl,
+@@ -53,11 +54,24 @@ def collect_accepted_trajectories(
+     dedupe: DedupeMode | str | None = None,
+     download_proof: Callable[[str, Path | None], Path] | None = None,
+     proof_cache: Path | None = None,
++    export_fn: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+ ) -> list[dict[str, Any]]:
+-    """Return trajectory rows whose fingerprints occupy the accepted registry mix state."""
++    """Return trajectory rows whose fingerprints occupy the accepted registry mix state.
++
++    Applies the SAME exportability filter as
++    ``eval.mix_registry.mix_registry_datasets``: rows SparkProof's publish exporter
++    drops (empty/failed episodes) never enter the canonical mix, so they must not
++    occupy the accepted snapshot / task-id index either. Otherwise a miner would
++    dedup against — and skip regenerating — a task whose only prior submission was a
++    dropped row the mix never actually filled, and the snapshot's dedup state would
++    diverge from the mix's (an unexportable row would wrongly block a later good
++    duplicate). ``export_fn`` defaults to SparkProof's exporter; tests inject a stub.
++    """
+     mode: DedupeMode = (dedupe or mining_dedupe_mode())  # type: ignore[assignment]
+     working_registry, fingerprint_row = _make_dedupe_registry(sparkproof_root)
+     working = working_registry.copy() if hasattr(working_registry, "copy") else working_registry
++    if export_fn is None:
++        export_fn = _import_trajectory_exporter(sparkproof_root)
+ 
+     accepted: list[dict[str, Any]] = []
+     for entry in registry_entries:
+@@ -66,6 +80,10 @@ def collect_accepted_trajectories(
+             verdict = _classify_row(trajectory, working, dedupe=mode, fingerprint_row=fingerprint_row)
+             if _should_skip(verdict, dedupe=mode):
+                 continue
++            if export_fn(trajectory) is None:
++                # Unexportable row: the mix drops it and does not record its
++                # fingerprint, so neither does the snapshot.
++                continue
+             accepted.append(trajectory)
+             _add_row_to_registry(working, trajectory, fingerprint_row)
+     return accepted
+@@ -79,6 +97,7 @@ def write_registry_snapshot(
+     sparkproof_root: Path | None = None,
+     dedupe: DedupeMode | str | None = None,
+     download_proof: Callable[[str, Path | None], Path] | None = None,
++    export_fn: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+ ) -> dict[str, Any]:
+     """Write SparkProof-compatible snapshot JSONL plus a lightweight task-id index."""
+     accepted = collect_accepted_trajectories(
+@@ -86,6 +105,7 @@ def write_registry_snapshot(
+         sparkproof_root=sparkproof_root,
+         dedupe=dedupe,
+         download_proof=download_proof,
++        export_fn=export_fn,
+     )
+     out_path.parent.mkdir(parents=True, exist_ok=True)
+     with out_path.open("w", encoding="utf-8", newline="\n") as handle:
+@@ -140,6 +160,7 @@ def verify_registry_snapshot_pins(
+     sparkproof_root: Path | None = None,
+     dedupe: DedupeMode | str | None = None,
+     download_proof: Callable[[str, Path | None], Path] | None = None,
++    export_fn: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
+ ) -> list[str]:
+     """Recompute the snapshot and confirm it matches mix_manifest pins."""
+     issues: list[str] = []
+@@ -171,6 +192,7 @@ def verify_registry_snapshot_pins(
+             sparkproof_root=sparkproof_root,
+             dedupe=dedupe,
+             download_proof=download_proof,
++            export_fn=export_fn,
+         )
+         if recomputed["sha256"] != expected_sha:
+             issues.append(
+diff --git a/tests/test_export_registry_snapshot.py b/tests/test_export_registry_snapshot.py
+index 78d21b8..79f45e2 100644
+--- a/tests/test_export_registry_snapshot.py
++++ b/tests/test_export_registry_snapshot.py
+@@ -1,7 +1,7 @@
+ import json
+-from pathlib import Path
+ 
+ from eval.export_registry_snapshot import (
++    _task_id_from_trajectory,
+     attach_snapshot_pins_to_manifest,
+     collect_accepted_trajectories,
+     verify_registry_snapshot_pins,
+@@ -10,6 +10,13 @@
+ from eval.mix_registry import load_trajectories_jsonl
+ 
+ 
++# Stub SparkProof publish exporter: keeps every row (returns it), so tests exercise the
++# dedup/order logic without a SparkProof checkout. Tests that need the unexportable path
++# pass their own stub returning None for the dropped rows.
++def _keep_all(trajectory):
++    return trajectory
++
++
+ def _traj(task_id: str, prompt: str, *, gpu_architecture: str = "blackwell") -> dict:
+     return {
+         "prompt": prompt,
+@@ -64,7 +71,7 @@ def fake_resolve(entry, proof_cache=None, download_proof=None):
+ 
+     monkeypatch.setattr("eval.export_registry_snapshot.resolve_proof_dir", fake_resolve)
+ 
+-    accepted = collect_accepted_trajectories(entries, dedupe="exact", sparkproof_root=None)
++    accepted = collect_accepted_trajectories(entries, dedupe="exact", sparkproof_root=None, export_fn=_keep_all)
+     task_ids = [((row.get("metadata") or {}).get("prompt_meta") or {}).get("task_id") for row in accepted]
+     assert task_ids == ["task_a", "task_shared", "task_b"]
+ 
+@@ -103,7 +110,7 @@ def fake_resolve(entry, proof_cache=None, download_proof=None):
+ 
+     monkeypatch.setattr("eval.export_registry_snapshot.resolve_proof_dir", fake_resolve)
+ 
+-    accepted = collect_accepted_trajectories(entries, dedupe="exact", sparkproof_root=None)
++    accepted = collect_accepted_trajectories(entries, dedupe="exact", sparkproof_root=None, export_fn=_keep_all)
+     task_ids = [((row.get("metadata") or {}).get("prompt_meta") or {}).get("task_id") for row in accepted]
+     assert task_ids == ["task_bw", "task_hp"]
+ 
+@@ -129,7 +136,7 @@ def test_write_registry_snapshot_writes_task_id_index(tmp_path, monkeypatch):
+ 
+     out = tmp_path / "snapshot.jsonl"
+     task_ids = tmp_path / "task_ids.json"
+-    report = write_registry_snapshot([entry], out_path=out, task_ids_path=task_ids, sparkproof_root=None)
++    report = write_registry_snapshot([entry], out_path=out, task_ids_path=task_ids, sparkproof_root=None, export_fn=_keep_all)
+     assert report["rows_total"] == 1
+     assert len(load_trajectories_jsonl(out)) == 1
+     payload = json.loads(task_ids.read_text())
+@@ -162,7 +169,7 @@ def test_write_registry_snapshot_bytes_are_lf_only(tmp_path, monkeypatch):
+     )
+ 
+     out = tmp_path / "snapshot.jsonl"
+-    write_registry_snapshot([entry], out_path=out, task_ids_path=tmp_path / "ids.json", sparkproof_root=None)
++    write_registry_snapshot([entry], out_path=out, task_ids_path=tmp_path / "ids.json", sparkproof_root=None, export_fn=_keep_all)
+ 
+     raw = out.read_bytes()
+     assert raw.endswith(b"\n")
+@@ -191,7 +198,7 @@ def test_snapshot_manifest_pins_and_verify(tmp_path, monkeypatch):
+     manifest_path = tmp_path / "mix_manifest.json"
+     manifest_path.write_text("{}\n")
+ 
+-    report = write_registry_snapshot([entry], out_path=out, task_ids_path=task_ids, sparkproof_root=None)
++    report = write_registry_snapshot([entry], out_path=out, task_ids_path=task_ids, sparkproof_root=None, export_fn=_keep_all)
+     manifest = attach_snapshot_pins_to_manifest(manifest_path, report)
+     assert manifest["accepted_registry_snapshot_sha256"] == report["sha256"]
+     assert verify_registry_snapshot_pins(
+@@ -200,6 +207,7 @@ def test_snapshot_manifest_pins_and_verify(tmp_path, monkeypatch):
+         snapshot_path=out,
+         task_ids_path=task_ids,
+         sparkproof_root=None,
++        export_fn=_keep_all,
+     ) == []
+ 
+     manifest["accepted_registry_snapshot_sha256"] = "f" * 64
+@@ -209,5 +217,73 @@ def test_snapshot_manifest_pins_and_verify(tmp_path, monkeypatch):
+         snapshot_path=out,
+         task_ids_path=task_ids,
+         sparkproof_root=None,
++        export_fn=_keep_all,
+     )
+     assert any("does not match mix_manifest pin" in issue for issue in issues)
++
++
++def _drop_task(*task_ids: str):
++    """Stub exporter that drops (returns None for) the given task_ids, like SparkProof
++    dropping empty/failed rows — mirrors mix_registry_datasets' unexportable filter."""
++    dropped = set(task_ids)
++
++    def export_fn(trajectory):
++        return None if _task_id_from_trajectory(trajectory) in dropped else trajectory
++
++    return export_fn
++
++
++def test_collect_accepted_trajectories_skips_unexportable_rows(tmp_path, monkeypatch):
++    # Rows the exporter drops (empty/failed) must not occupy the accepted snapshot,
++    # matching mix_registry_datasets — otherwise accepted_task_ids over-reports and
++    # miners skip regenerating tasks the mix never actually filled.
++    bundle = tmp_path / "a" / "proof"
++    bundle.mkdir(parents=True)
++    (bundle / "trajectories.jsonl").write_text(
++        json.dumps(_traj("task_a", "prompt A")) + "\n"
++        + json.dumps(_traj("task_bad", "prompt BAD")) + "\n"
++        + json.dumps(_traj("task_c", "prompt C")) + "\n"
++    )
++    entry = {
++        "miner": "alice",
++        "hf_url": "https://huggingface.co/datasets/org/a",
++        "trajectories_sha256": "a" * 64,
++        "rows_total": 3,
++        "dataset_version": "triton-distill-v0.2",
++        "gpu_architecture": "blackwell",
++    }
++    monkeypatch.setattr(
++        "eval.export_registry_snapshot.resolve_proof_dir",
++        lambda entry, proof_cache=None, download_proof=None: bundle,
++    )
++
++    accepted = collect_accepted_trajectories(
++        [entry], dedupe="exact", sparkproof_root=None, export_fn=_drop_task("task_bad")
++    )
++    assert [_task_id_from_trajectory(row) for row in accepted] == ["task_a", "task_c"]
++
++
++def test_unexportable_row_does_not_dedup_block_a_later_duplicate(tmp_path, monkeypatch):
++    # An unexportable row must not enter the dedup state: a later good row with the same
++    # prompt must still be accepted (the mix keeps it), or the snapshot would wrongly
++    # dedup it away and disagree with the canonical mix.
++    for name, task in (("a", "task_empty"), ("b", "task_real")):
++        d = tmp_path / name / "proof"
++        d.mkdir(parents=True)
++        (d / "trajectories.jsonl").write_text(json.dumps(_traj(task, "shared prompt")) + "\n")
++
++    entries = [
++        {"miner": "alice", "hf_url": "https://huggingface.co/datasets/org/a", "trajectories_sha256": "a" * 64,
++         "rows_total": 1, "dataset_version": "triton-distill-v0.2", "gpu_architecture": "blackwell"},
++        {"miner": "bob", "hf_url": "https://huggingface.co/datasets/org/b", "trajectories_sha256": "b" * 64,
++         "rows_total": 1, "dataset_version": "triton-distill-v0.2", "gpu_architecture": "blackwell"},
++    ]
++    monkeypatch.setattr(
++        "eval.export_registry_snapshot.resolve_proof_dir",
++        lambda entry, proof_cache=None, download_proof=None: tmp_path / entry["hf_url"].rsplit("/", 1)[-1] / "proof",
++    )
++
++    accepted = collect_accepted_trajectories(
++        entries, dedupe="exact", sparkproof_root=None, export_fn=_drop_task("task_empty")
++    )
++    assert [_task_id_from_trajectory(row) for row in accepted] == ["task_real"]

@@ -1,0 +1,437 @@
+diff --git a/dashboard/static/app.js b/dashboard/static/app.js
+index a70ee07d..8770d9c2 100644
+--- a/dashboard/static/app.js
++++ b/dashboard/static/app.js
+@@ -16,7 +16,6 @@ class ActiveLearningAI {
+         this.gwPendingSensors = new Set(); // sensor_ids with pending commands
+         this.videoSessions = {}; // session_id -> status
+         this.videoQueueState = null; // { queue, active, completed, queue_length }
+-        this.approvalTimers = {}; // trace_id -> timeoutId
+         this.approvalsSent = new Set(); // trace_ids already responded to
+         this.isHalted = false;
+ 
+@@ -1002,8 +1001,8 @@ class ActiveLearningAI {
+     showApprovalRequest(data) {
+         const traceId = data.trace_id || '?';
+ 
+-        // Deduplicate — skip if already showing this approval
+-        if (this.approvalsSent.has(traceId) || this.approvalTimers[traceId]) {
++        // Deduplicate — skip if we already answered this approval
++        if (this.approvalsSent.has(traceId)) {
+             return;
+         }
+ 
+@@ -1077,25 +1076,16 @@ class ActiveLearningAI {
+         container.appendChild(div);
+         container.scrollTop = container.scrollHeight;
+ 
+-        // Auto-expire after 30 seconds (fail-open: allow by default)
+-        this.approvalTimers[traceId] = setTimeout(() => {
+-            if (!this.approvalsSent.has(traceId)) {
+-                this.sendApprovalResponse(traceId, channel, true);
+-            }
+-        }, 30000);
++        // Do not auto-ALLOW unanswered prompts. DEFER is fail-closed: if the
++        // operator never answers (or NATS is partitioned), Meta-Programmer's
++        // DEFER_TTL_MS sweep treats the review as DENY. See docs/META-PROGRAMMER.md.
+     }
+ 
+     sendApprovalResponse(traceId, channel, approved) {
+-        // Prevent double-send (race between user click and auto-expire timer)
++        // Prevent double-send
+         if (this.approvalsSent.has(traceId)) return;
+         this.approvalsSent.add(traceId);
+ 
+-        // Clear auto-expire timer
+-        if (this.approvalTimers[traceId]) {
+-            clearTimeout(this.approvalTimers[traceId]);
+-            delete this.approvalTimers[traceId];
+-        }
+-
+         // Update UI
+         const actions = document.getElementById(`approval-actions-${traceId}`);
+         if (actions) {
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 8e592f81..f27f3e71 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -751,11 +751,24 @@ The Safety Supervisor and Moral Kernel work together but have distinct roles:
+ │  │  - Protected path → DENY (always)                            │    │
+ │  │  - Human safety concern → DEFER to Dashboard (human review)  │    │
+ │  │  - Normal operation → ALLOW                                  │    │
++│  │                                                               │    │
++│  │  DEFER is provisional: if human review does not answer       │    │
++│  │  before expires_at / DEFER_TTL_MS, consumers MUST treat it   │    │
++│  │  as DENY (fail-closed). A NATS partition that prevents the   │    │
++│  │  Dashboard from publishing approval.response is therefore   │    │
++│  │  safe — silence expires to DENY, never to ALLOW.             │    │
+ │  └─────────────────────────────────────────────────────────────┘    │
+ │                                                                       │
+ └─────────────────────────────────────────────────────────────────────┘
+ ```
+ 
++**DEFER → human review TTL (fail-closed):** Kernel stamps `expires_at` on
++`DEFER` decisions (`defer_ttl_ms`, default 5 minutes). Callers that stage work
++for human approval (notably Meta-Programmer `human_review/`) must reject the
++staged item when the TTL elapses with no `approval.response` — including when
++the Dashboard cannot reach NATS. See [META-PROGRAMMER.md](META-PROGRAMMER.md)
++§ Human-in-the-Loop.
++
+ **Key Distinctions:**
+ 
+ | Aspect | Safety Supervisor | Moral Kernel |
+@@ -843,7 +856,7 @@ class KernelDecisionType(Enum):
+     ALLOW = "ALLOW"
+     TRANSFORM = "TRANSFORM"
+     DENY = "DENY"
+-    DEFER = "DEFER"  # Routes to Dashboard for human review
++    DEFER = "DEFER"  # Provisional; unanswered TTL → DENY (fail-closed)
+ 
+ @dataclass
+ class Observation(Generic[T]):
+diff --git a/docs/META-PROGRAMMER.md b/docs/META-PROGRAMMER.md
+index 41bc9b79..c7a505e3 100644
+--- a/docs/META-PROGRAMMER.md
++++ b/docs/META-PROGRAMMER.md
+@@ -29,9 +29,10 @@ The **Meta-Programmer** is the system's self-evolution capability—an orchestra
+ >   **Phase 1.1–1.2**, not an enforced property today.
+ > - Only the first ~500 chars of generated code are pattern-scanned; full-artifact
+ >   AST taint analysis is **Phase 1.5**.
+-> - The multi-agent refactor pipeline, Stage-2 Test-Runner integration,
+->   post-deploy auto-rollback, and the 24h approval-timeout-as-DENY are **not yet
+->   built** (Phase 1.9 / 4.1).
++> - The multi-agent refactor pipeline and Stage-2 Test-Runner integration are
++>   **not yet built** (Phase 4.1). Post-deploy health-probe auto-rollback and
++>   **DEFER TTL → DENY** (fail-closed human-review expiry) are implemented
++>   (Phase 1.9 / E1.9.1–1.9.2); see [Human-in-the-Loop](#human-in-the-loop-dashboard).
+ > - The Coordinator task-execution path does **not** currently route through the
+ >   Kernel (Phase 1.6).
+ >
+@@ -317,6 +318,27 @@ When Kernel returns `DEFER`, the approval request is published to NATS and prese
+ 
+ The Dashboard subscribes to `approval.request` and publishes `approval.response.{id}` when the human decides.
+ 
++### DEFER TTL expiry (fail-closed DENY)
++
++A `DEFER` is **provisional**, not an open-ended hold. If no valid human
++`approval.response` arrives before the review TTL, the proposal is treated as
++**DENY** (CLAUDE.md §3 fail-closed). Silence under a NATS partition between the
++Dashboard and the bus is therefore safe: nothing deploys.
++
++| Property | Value |
++|----------|-------|
++| Default TTL | `DEFER_TTL_MS` (default **300000** ms / 5 min); Kernel stamps matching `expires_at` on the decision |
++| Expiry authority | Meta-Programmer background sweep (`_sweep_expired_reviews`) + late-response reject in `ApprovalConsumer` |
++| On expiry | Stage → `rejected/`; publish `knowledge.gap.result.{trace_id}` with `success=False` and reason `DEFER expired — no human approval (fail-closed)` |
++| Late approval after TTL / after sweep | Ignored (idempotent); does **not** revive a rejected item |
++| NATS partition (Dashboard cannot publish `approval.response`) | No response arrives → sweep DENYs at TTL — same outcome as explicit human deny |
++| Operator UI | Must **not** auto-ALLOW unanswered prompts; unanswered reviews fail closed via the server-side TTL |
++
++This path does **not** require the Kernel to republish a DENY message. The
++Kernel already refused to ALLOW; the Meta-Programmer is the consumer that owns
++the staged `human_review/` item and must fail closed when the human channel is
++unreachable or silent.
++
+ ---
+ 
+ ## Staging Flow
+@@ -347,6 +369,7 @@ The Dashboard subscribes to `approval.request` and publishes `approval.response.
+ 3. Kernel DEFER → `/staging/human_review/` → Dashboard approval
+ 4. Tests pass → `/staging/approved/`
+ 5. Deploy → `/data/plugins/` (live volume)
++6. Unanswered DEFER past `DEFER_TTL_MS` → `/staging/rejected/` (fail-closed DENY)
+ 
+ ---
+ 
+diff --git a/meta-programmer/pyproject.toml b/meta-programmer/pyproject.toml
+index 3d74c8c2..ecd46cca 100644
+--- a/meta-programmer/pyproject.toml
++++ b/meta-programmer/pyproject.toml
+@@ -21,6 +21,7 @@ classifiers = [
+ ]
+ 
+ dependencies = [
++    "activelearning-sdk",
+     "nats-py>=2.6.0",
+     "pydantic>=2.5.0",
+     "aiohttp>=3.9.0",
+@@ -45,6 +46,9 @@ where = ["src"]
+ [tool.pytest.ini_options]
+ asyncio_mode = "auto"
+ testpaths = ["tests"]
++# Ensure local `cd meta-programmer && pytest` resolves the package and the
++# sibling SDK without needing a PYTHONPATH export (CI still uses --with-editable).
++pythonpath = ["src", "../sdk/src"]
+ addopts = "-v --cov=meta_programmer --cov-report=term-missing"
+ 
+ [tool.black]
+@@ -64,3 +68,6 @@ python_version = "3.11"
+ strict = true
+ warn_return_any = true
+ warn_unused_configs = true
++
++[tool.uv.sources]
++activelearning-sdk = { path = "../sdk", editable = true }
+\ No newline at end of file
+diff --git a/meta-programmer/tests/test_defer_ttl_nats_partition.py b/meta-programmer/tests/test_defer_ttl_nats_partition.py
+new file mode 100644
+index 00000000..ffa9c9a1
+--- /dev/null
++++ b/meta-programmer/tests/test_defer_ttl_nats_partition.py
+@@ -0,0 +1,256 @@
++"""M1.17 — DEFER TTL expiry under a Dashboard↔NATS partition (fail-closed).
++
++Scenario: Kernel returned DEFER; Meta-Programmer staged the proposal in
++``human_review/`` and published ``approval.request``. A network partition
++prevents the Dashboard from publishing ``approval.response.{trace_id}`` before
++the review TTL elapses.
++
++Contract (CLAUDE.md §3 / docs/META-PROGRAMMER.md): silence MUST expire as
++DENY — staging → rejected, gap result ``success=False``. A late Approve after
++the partition heals must not revive the rejected item.
++
++Loads staging + approval_consumer via importlib (same CI-governance pattern as
++``test_approval_consumer.py``) and drives ``MetaProgrammerService._sweep_expired_reviews``
++on a ``__new__`` service so Docker/NATS are not required.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import importlib.util
++import json
++import os
++import sys
++import tempfile
++import types
++
++# ── module bootstrap (avoid meta_programmer/__init__.py → docker / nats) ─────
++
++_SRC = os.path.join(os.path.dirname(__file__), "..", "src", "meta_programmer")
++
++if "meta_programmer" not in sys.modules:
++    _fake_pkg = types.ModuleType("meta_programmer")
++    _fake_pkg.__path__ = [_SRC]
++    _fake_pkg.__package__ = "meta_programmer"
++    sys.modules["meta_programmer"] = _fake_pkg
++
++
++def _load(module_dotted_name: str, filename: str) -> types.ModuleType:
++    path = os.path.join(_SRC, filename)
++    spec = importlib.util.spec_from_file_location(module_dotted_name, path)
++    mod = importlib.util.module_from_spec(spec)
++    mod.__package__ = "meta_programmer"
++    sys.modules[module_dotted_name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++_staging_mod = _load("meta_programmer.staging", "staging.py")
++_consumer_mod = _load("meta_programmer.approval_consumer", "approval_consumer.py")
++
++StagingManager = _staging_mod.StagingManager
++ApprovalConsumer = _consumer_mod.ApprovalConsumer
++
++_DEFER_TTL_MS = 5_000  # short TTL for the test clock
++_NOW_MS = 1_000_000
++
++
++# ── helpers ──────────────────────────────────────────────────────────────────
++
++
++class _Logger:
++    def info(self, *a, **k):
++        pass
++
++    def warning(self, *a, **k):
++        pass
++
++    def error(self, *a, **k):
++        pass
++
++
++class _PartitionedBus:
++    """EventBus stand-in: approval responses never leave the Dashboard.
++
++    Publishing ``approval.response.*`` is a no-op sink (messages are dropped).
++    Gap-result publishes are recorded so the sweep's DENY can be asserted.
++    """
++
++    def __init__(self) -> None:
++        self.published: list[tuple[str, dict]] = []
++        self.dropped_approvals: list[tuple[str, dict]] = []
++
++    async def publish(self, subject: str, data: dict) -> None:
++        if subject.startswith("approval.response"):
++            # Partition: Dashboard → NATS path is down.
++            self.dropped_approvals.append((subject, data))
++            return
++        self.published.append((subject, data))
++
++
++def _staged_review(staging_root: str, trace_id: str, created_at: int) -> StagingManager:
++    sm = StagingManager(staging_root)
++    sm.initialize()
++    sm.stage_pending(trace_id, f"/data/plugins/{trace_id}.py", "x = 1\n")
++    meta_path = os.path.join(sm.pending_dir, trace_id, "metadata.json")
++    with open(meta_path) as f:
++        meta = json.load(f)
++    meta["created_at"] = created_at
++    with open(meta_path, "w") as f:
++        json.dump(meta, f)
++    sm.stage_human_review(trace_id)
++    return sm
++
++
++def _build_service(sm: StagingManager, bus: _PartitionedBus, defer_ttl_ms: int):
++    """Minimal MetaProgrammerService for ``_sweep_expired_reviews`` only."""
++    # Import service without pulling real docker: stub if missing.
++    if "docker" not in sys.modules:
++        docker = types.ModuleType("docker")
++        errors = types.ModuleType("docker.errors")
++
++        class _DockerError(Exception):
++            pass
++
++        errors.ImageNotFound = _DockerError
++        errors.DockerException = _DockerError
++        errors.APIError = _DockerError
++        models = types.ModuleType("docker.models")
++        containers = types.ModuleType("docker.models.containers")
++
++        class Container:
++            pass
++
++        containers.Container = Container
++        models.containers = containers
++        docker.errors = errors
++        docker.models = models
++        docker.from_env = lambda: object()
++        sys.modules["docker"] = docker
++        sys.modules["docker.errors"] = errors
++        sys.modules["docker.models"] = models
++        sys.modules["docker.models.containers"] = containers
++
++    from meta_programmer.service import MetaProgrammerService
++
++    svc = MetaProgrammerService.__new__(MetaProgrammerService)
++    svc.logger = _Logger()
++    svc._staging_manager = sm
++    svc.defer_ttl_ms = defer_ttl_ms
++    svc._reviews_expired = 0
++    svc.event_bus = bus
++
++    async def _publish_gap_result(trace_id, success, message, fail_closed=False):
++        await bus.publish(
++            f"knowledge.gap.result.{trace_id}",
++            {
++                "trace_id": trace_id,
++                "success": success,
++                "message": message,
++                "fail_closed": fail_closed,
++            },
++        )
++
++    svc._publish_gap_result = _publish_gap_result
++    return svc
++
++
++def _make_consumer(sm: StagingManager, bus: _PartitionedBus, defer_ttl_ms: int):
++    results: list = []
++
++    async def publish_gap(trace_id, success, message, fail_closed=False):
++        results.append(
++            {
++                "trace_id": trace_id,
++                "success": success,
++                "message": message,
++                "fail_closed": fail_closed,
++            }
++        )
++
++    async def noop_run_tests(**_kwargs):
++        return {"success": True, "error": None}
++
++    async def noop_deploy(*_a, **_k):
++        pass
++
++    consumer = ApprovalConsumer(
++        staging=sm,
++        defer_ttl_ms=defer_ttl_ms,
++        run_tests=noop_run_tests,
++        deploy=noop_deploy,
++        publish_gap_result=publish_gap,
++        log=_Logger(),
++    )
++    return consumer, results
++
++
++def _run(coro):
++    return asyncio.run(coro)
++
++
++# ── M1.17 partition test ─────────────────────────────────────────────────────
++
++
++def test_nats_partition_during_defer_window_expires_as_deny():
++    """Unanswered DEFER under partition → TTL sweep DENYs (fail-closed).
++
++    Timeline:
++      t0     Kernel DEFER; staged into human_review/; approval.request published
++      t0..T  Dashboard cannot publish approval.response (NATS partition)
++      t>=T   Meta-Programmer sweep rejects + publishes knowledge.gap.result deny
++      heal   Operator Approve arrives late → ignored; item stays rejected
++    """
++    with tempfile.TemporaryDirectory() as d:
++        created_at = _NOW_MS - _DEFER_TTL_MS - 1  # already past TTL when sweep runs
++        sm = _staged_review(d, "defer-partition-1", created_at=created_at)
++        bus = _PartitionedBus()
++        svc = _build_service(sm, bus, defer_ttl_ms=_DEFER_TTL_MS)
++
++        # Simulate Dashboard trying to Approve while partitioned — drops on the bus.
++        _run(
++            bus.publish(
++                "approval.response.defer-partition-1",
++                {"trace_id": "defer-partition-1", "approved": True},
++            )
++        )
++        assert bus.dropped_approvals, "partition must drop approval.response"
++        assert sm.get_metadata("defer-partition-1")["stage"] == "human_review"
++        assert not any(s.startswith("knowledge.gap.result") for s, _ in bus.published)
++
++        # TTL expires; sweep fail-closes without ever seeing an approval.
++        n = _run(svc._sweep_expired_reviews(_NOW_MS))
++        assert n == 1
++        assert svc._reviews_expired == 1
++
++        meta = sm.get_metadata("defer-partition-1")
++        assert meta["stage"] == "rejected"
++        assert "fail-closed" in meta.get("rejection_reason", "")
++        assert "DEFER expired" in meta.get("rejection_reason", "")
++
++        results = [data for subj, data in bus.published if "knowledge.gap.result" in subj]
++        assert len(results) == 1
++        assert results[0]["success"] is False
++        assert "DEFER expired" in results[0]["message"]
++        assert "fail-closed" in results[0]["message"]
++
++        # Partition heals: late Approve must not deploy / revive.
++        consumer, late_results = _make_consumer(sm, bus, defer_ttl_ms=_DEFER_TTL_MS)
++        _run(consumer.handle_approval_response({"trace_id": "defer-partition-1", "approved": True}))
++        assert late_results == []
++        assert sm.get_metadata("defer-partition-1")["stage"] == "rejected"
++
++
++def test_defer_within_ttl_not_swept_while_partitioned():
++    """Inside the DEFER window, partition alone must not reject the review."""
++    with tempfile.TemporaryDirectory() as d:
++        created_at = _NOW_MS - 100  # well within TTL
++        sm = _staged_review(d, "defer-fresh-1", created_at=created_at)
++        bus = _PartitionedBus()
++        svc = _build_service(sm, bus, defer_ttl_ms=_DEFER_TTL_MS)
++
++        n = _run(svc._sweep_expired_reviews(_NOW_MS))
++        assert n == 0
++        assert svc._reviews_expired == 0
++        assert sm.get_metadata("defer-fresh-1")["stage"] == "human_review"
++        assert not any("knowledge.gap.result" in s for s, _ in bus.published)

@@ -1,0 +1,94 @@
+diff --git a/tokio/src/runtime/scheduler/current_thread/mod.rs b/tokio/src/runtime/scheduler/current_thread/mod.rs
+index f0b072d577e..db8e273ebf9 100644
+--- a/tokio/src/runtime/scheduler/current_thread/mod.rs
++++ b/tokio/src/runtime/scheduler/current_thread/mod.rs
+@@ -385,8 +385,6 @@ impl Context {
+             core = c;
+         }
+ 
+-        // If `before_park` spawns a task (or otherwise schedules work for us), then we should not
+-        // park the thread.
+         if !self.has_pending_work(&core) {
+             // Park until the thread is signaled
+             core.metrics.about_to_park();
+@@ -396,6 +394,15 @@ impl Context {
+ 
+             core.metrics.unparked();
+             core.submit_metrics(handle);
++        } else {
++            // `before_park` scheduled work (e.g. an `on_thread_park` hook that woke the
++            // `block_on` future), so we don't block. We must still poll the driver once
++            // without blocking, or timer and I/O events would stall under a runtime driven
++            // by repeated short `block_on` calls. See
++            // <https://github.com/tokio-rs/tokio/issues/8212>.
++            core.submit_metrics(handle);
++
++            core = self.park_internal(core, handle, &mut driver, Some(Duration::from_millis(0)));
+         }
+ 
+         if let Some(f) = &handle.shared.config.after_unpark {
+diff --git a/tokio/tests/rt_common_before_park.rs b/tokio/tests/rt_common_before_park.rs
+index cb0dc152b3f..74a28163225 100644
+--- a/tokio/tests/rt_common_before_park.rs
++++ b/tokio/tests/rt_common_before_park.rs
+@@ -4,6 +4,7 @@
+ 
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::Arc;
++use std::time::Duration;
+ use tokio::runtime::Builder;
+ use tokio::sync::Notify;
+ 
+@@ -90,3 +91,52 @@ fn wake_from_other_thread_block_on() {
+ 
+     th.join().unwrap();
+ }
++
++// Regression test for #8212: a current-thread runtime driven by repeated short
++// `block_on` calls, where `on_thread_park` wakes the `block_on` future, must
++// still drive the time driver so a spawned timer keeps making progress. Before
++// the fix, `before_park` setting the `woken` flag caused `park` to skip the
++// driver entirely, so the timer never fired.
++#[test]
++fn before_park_does_not_stall_spawned_timer() {
++    let notify = Arc::new(Notify::new());
++    let task_done = Arc::new(AtomicBool::new(false));
++
++    let rt = Builder::new_current_thread()
++        .enable_all()
++        .on_thread_park({
++            let notify = notify.clone();
++            move || notify.notify_waiters()
++        })
++        .build()
++        .unwrap();
++
++    rt.spawn({
++        let task_done = task_done.clone();
++        async move {
++            tokio::time::sleep(Duration::from_millis(1)).await;
++            task_done.store(true, Ordering::SeqCst);
++        }
++    });
++
++    // A current-thread runtime only runs tasks while inside `block_on`, so drive it
++    // once to let the spawned task register its timer.
++    rt.block_on(tokio::task::yield_now());
++
++    // Drive the runtime in short bursts, the way an external event loop would. Each
++    // burst parks via `on_thread_park` (which wakes the `block_on` future); the fix
++    // keeps polling the driver so the spawned timer still fires. A regression stalls
++    // the timer, failing the assert below instead of hanging.
++    for _ in 0..100 {
++        if task_done.load(Ordering::SeqCst) {
++            break;
++        }
++        rt.block_on(notify.notified());
++        std::thread::sleep(Duration::from_millis(1));
++    }
++
++    assert!(
++        task_done.load(Ordering::SeqCst),
++        "spawned task's timer never fired (issue #8212)"
++    );
++}

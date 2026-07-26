@@ -1,0 +1,566 @@
+diff --git a/runtime/include/sparkinfer/inference_engine.h b/runtime/include/sparkinfer/inference_engine.h
+index 2c9b9607..a8a4bc5c 100644
+--- a/runtime/include/sparkinfer/inference_engine.h
++++ b/runtime/include/sparkinfer/inference_engine.h
+@@ -56,11 +56,12 @@ class ContinuousBatchEngine {
+     uint64_t submit_locked(Job job, const std::function<void(int)>& on_token);
+     Result wait_locked(uint64_t request_id);
+     void worker_loop();
+-    bool step_job(Job& job);
++    bool step_job(Job& job, bool chunked = false);
+ 
+     Qwen35Model* model_;
+     KVCacheManager* kv_;
+     Scheduler scheduler_;
++    SchedulePolicy policy_ = SchedulePolicy::CONTINUOUS_BATCHING;
+     std::thread worker_;
+     std::atomic<bool> running_{false};
+     mutable std::mutex mu_;
+diff --git a/runtime/include/sparkinfer/scheduler.h b/runtime/include/sparkinfer/scheduler.h
+index 4bae3264..577e0a2c 100644
+--- a/runtime/include/sparkinfer/scheduler.h
++++ b/runtime/include/sparkinfer/scheduler.h
+@@ -31,7 +31,8 @@ struct ScheduledSequence {
+     uint64_t seq_id = 0;
+     SeqPhase phase = SeqPhase::PREFILL;
+     int priority = 0;
+-    int tokens_in_phase = 0;  // prefill progress or decode tokens emitted
++    int tokens_in_phase = 0;     // prefill progress or decode tokens emitted
++    int prefill_remaining = 0;   // prompt tokens left (PREFILL only); 0 if unknown
+ };
+ 
+ struct ScheduleBatch {
+@@ -46,8 +47,10 @@ class Scheduler {
+                        int max_tokens_per_batch = 256);
+     ~Scheduler();
+ 
+-    // Pick the next request(s) to advance one step. Prefill jobs run to completion
+-    // before decode interleaving unless policy is CHUNKED_PREFILL.
++    // Pick the next request(s) to advance one step.
++    // CONTINUOUS_BATCHING / CHUNKED_PREFILL: vLLM V1 decode-first packing (up to
++    // max_tokens_per_batch), then at most one prefill in remaining budget.
++    // PRIORITY: exclusive prefill-first (no mix).
+     ScheduleBatch schedule(const std::vector<ScheduledSequence>& active) const;
+ 
+     // Legacy group API (kept for compatibility).
+diff --git a/runtime/src/inference_engine.cpp b/runtime/src/inference_engine.cpp
+index 82d568db..05143973 100644
+--- a/runtime/src/inference_engine.cpp
++++ b/runtime/src/inference_engine.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include <chrono>
+ #include <cstdio>
++#include <cstdlib>
+ 
+ namespace sparkinfer {
+ 
+@@ -16,18 +17,35 @@ bool prefill_samples_lmhead() {
+     return legacy != 0;
+ }
+ 
++// Match Qwen35Model::batched_prefill_enabled: dense hybrid (Qwythos) OR MoE hybrid
++// (Qwen3.6). The old dense_ffn-only gate forced MoE CB onto the token loop (~300 pp),
++// which is why scored Qwen3.6 CB mixed TTFT sat at ~17s on main.
+ bool batched_prefill_enabled(const Qwen35Config& cfg, bool gguf, int n_tokens) {
+     static int want_batched = -1, batched_maxctx = -1;
+     if (want_batched < 0) {
+         const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
+         want_batched = (e && e[0] == '0') ? 0 : 1;
+         const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
+-        batched_maxctx = mc ? atoi(mc) : 65536;
++        batched_maxctx = mc ? atoi(mc) : 131072;
+     }
+-    return want_batched && gguf && cfg.hybrid && cfg.dense_ffn && n_tokens > 0 &&
++    const bool ffn_ok = cfg.dense_ffn || cfg.n_experts > 0;
++    return want_batched && gguf && cfg.hybrid && ffn_ok && n_tokens > 0 &&
+            n_tokens <= batched_maxctx;
+ }
+ 
++// Chunked-prefill budget (vLLM-style): when decode requests are waiting, only
++// advance this many prefill tokens before yielding. 0 = unlimited (full prompt).
++int prefill_chunk_tokens() {
++    static int chunk = []{
++        const char* e = getenv("SPARKINFER_PREFILL_CHUNK_TOKENS");
++        // Default 512 — large enough for batched GEMM amortization, small enough
++        // that concurrent decode keeps receiving tokens every few ms.
++        int c = e ? atoi(e) : 512;
++        return c >= 0 ? c : 512;
++    }();
++    return chunk;
++}
++
+ }  // namespace
+ 
+ struct ContinuousBatchEngine::Job {
+@@ -47,7 +65,7 @@ struct ContinuousBatchEngine::Job {
+ 
+ ContinuousBatchEngine::ContinuousBatchEngine(Qwen35Model* model, KVCacheManager* kv,
+                                              int max_tokens_per_batch, SchedulePolicy policy)
+-    : model_(model), kv_(kv), scheduler_(policy, max_tokens_per_batch) {
++    : model_(model), kv_(kv), scheduler_(policy, max_tokens_per_batch), policy_(policy) {
+     running_ = true;
+     worker_ = std::thread([this] { worker_loop(); });
+ }
+@@ -137,7 +155,7 @@ ContinuousBatchEngine::Result ContinuousBatchEngine::wait_locked(uint64_t reques
+ 
+ void ContinuousBatchEngine::worker_loop() {
+     while (true) {
+-        Job* job = nullptr;
++        std::vector<uint64_t> prefill_ids, decode_ids;
+         {
+             std::unique_lock<std::mutex> lock(mu_);
+             if (!running_ && jobs_.empty()) return;
+@@ -154,20 +172,17 @@ void ContinuousBatchEngine::worker_loop() {
+                 s.tokens_in_phase = (kv.second->phase == SeqPhase::PREFILL)
+                                         ? kv.second->prefill_pos
+                                         : kv.second->decode_emitted;
++                s.prefill_remaining = (kv.second->phase == SeqPhase::PREFILL)
++                                          ? (int)kv.second->req.prompt.size() - kv.second->prefill_pos
++                                          : 0;
+                 active.push_back(s);
+             }
+ 
+             ScheduleBatch batch = scheduler_.schedule(active);
+-            uint64_t pick = 0;
+-            if (!batch.prefill_request_ids.empty()) pick = batch.prefill_request_ids.front();
+-            else if (!batch.decode_request_ids.empty()) pick = batch.decode_request_ids.front();
++            prefill_ids = batch.prefill_request_ids;
++            decode_ids = batch.decode_request_ids;
+ 
+-            if (pick) {
+-                auto it = jobs_.find(pick);
+-                if (it != jobs_.end() && !it->second->done) job = it->second.get();
+-            }
+-
+-            if (!job) {
++            if (prefill_ids.empty() && decode_ids.empty()) {
+                 if (!running_) {
+                     bool any = false;
+                     for (const auto& kv : jobs_)
+@@ -179,23 +194,49 @@ void ContinuousBatchEngine::worker_loop() {
+             }
+         }
+ 
+-        if (job) {
+-            const bool finished = step_job(*job);
+-            if (finished) cv_.notify_all();
++        // vLLM V1 iteration: advance every packed decode token first (ITPS), then
++        // one prefill chunk if scheduled. Re-enter the scheduler after the step.
++        bool any_finished = false;
++        const bool mix_decode = !decode_ids.empty();
++        for (uint64_t id : decode_ids) {
++            Job* job = nullptr;
++            {
++                std::lock_guard<std::mutex> lock(mu_);
++                auto it = jobs_.find(id);
++                if (it != jobs_.end() && !it->second->done) job = it->second.get();
++            }
++            if (job) any_finished = step_job(*job, /*chunked=*/false) || any_finished;
+         }
++        if (!prefill_ids.empty()) {
++            Job* job = nullptr;
++            {
++                std::lock_guard<std::mutex> lock(mu_);
++                auto it = jobs_.find(prefill_ids.front());
++                if (it != jobs_.end() && !it->second->done) job = it->second.get();
++            }
++            if (job) any_finished = step_job(*job, /*chunked=*/mix_decode ||
++                                             policy_ == SchedulePolicy::CHUNKED_PREFILL) || any_finished;
++        }
++        if (any_finished) cv_.notify_all();
+     }
+ }
+ 
+-bool ContinuousBatchEngine::step_job(Job& job) {
++bool ContinuousBatchEngine::step_job(Job& job, bool chunked) {
+     const Qwen35Config& cfg = model_->config();
+     model_->activate_session(job.seq_id);
+ 
+     if (job.phase == SeqPhase::PREFILL) {
+         const int n = (int)job.req.prompt.size();
++        const int chunk = prefill_chunk_tokens();
++        const int remain = n - job.prefill_pos;
++        // Batched GEMM prefill (Qwythos / Qwen3.6 hybrid) is ~100× faster than the
++        // token loop. Never demote it to token-loop "chunks" — that destroys ITPS under
++        // mixed load. True mid-prompt chunked batched prefill needs start_pos support
++        // in prefill_batched_run; until then, decode-first scheduling already advances
++        // waiting decodes once before this full batched pass runs.
+         if (job.prefill_pos == job.req.prefill_start && job.req.prefill_start == 0 &&
+-            batched_prefill_enabled(cfg, true, n - job.prefill_pos)) {
+-            const int chunk = n - job.prefill_pos;
+-            const int seed = model_->prefill_batched(job.req.prompt.data() + job.prefill_pos, chunk);
++            batched_prefill_enabled(cfg, true, remain)) {
++            const int seed = model_->prefill_batched(job.req.prompt.data() + job.prefill_pos, remain);
+             if (seed >= 0 && seed < cfg.vocab) {
+                 job.next_token = seed;
+                 job.prefill_pos = n;
+@@ -204,7 +245,12 @@ bool ContinuousBatchEngine::step_job(Job& job) {
+                 return false;
+             }
+         }
+-        if (job.prefill_pos < n) {
++        // Token-loop (or chunked) prefill: used when batched is unavailable (non-hybrid /
++        // disabled). Advance up to `limit` tokens then yield so decode can run.
++        int limit = remain;
++        if (chunked && chunk > 0 && remain > chunk) limit = chunk;
++        int advanced = 0;
++        while (advanced < limit && job.prefill_pos < n) {
+             const bool sample = prefill_samples_lmhead() || job.prefill_pos + 1 == n;
+             if (sample)
+                 job.next_token = model_->forward_token(job.req.prompt[(size_t)job.prefill_pos],
+@@ -212,16 +258,13 @@ bool ContinuousBatchEngine::step_job(Job& job) {
+             else
+                 model_->forward_token(job.req.prompt[(size_t)job.prefill_pos], job.prefill_pos, false);
+             job.prefill_pos++;
+-            if (job.prefill_pos >= n) {
+-                if (job.next_token < 0 && job.req.use_prefix_session)
+-                    job.next_token = model_->prefix_seed_token();
+-                job.phase = SeqPhase::DECODE;
+-            }
+-            return false;
++            advanced++;
++        }
++        if (job.prefill_pos >= n) {
++            if (job.next_token < 0 && job.req.use_prefix_session)
++                job.next_token = model_->prefix_seed_token();
++            job.phase = SeqPhase::DECODE;
+         }
+-        if (job.next_token < 0 && job.req.use_prefix_session)
+-            job.next_token = model_->prefix_seed_token();
+-        job.phase = SeqPhase::DECODE;
+         return false;
+     }
+ 
+diff --git a/runtime/src/models/qwen35_prefill.cpp b/runtime/src/models/qwen35_prefill.cpp
+index a78513af..ce3bc47b 100644
+--- a/runtime/src/models/qwen35_prefill.cpp
++++ b/runtime/src/models/qwen35_prefill.cpp
+@@ -168,6 +168,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
+     // unless SPARKINFER_PREFILL_I8_ATTN=0. GDN projections always stay bf16 above bf16_minctx.
+     const char* _pi8attn = getenv("SPARKINFER_PREFILL_I8_ATTN");
+     bool use_i8_attn = long_bf16 && (!_pi8attn || _pi8attn[0] != '0');
++    // Dense short-ctx: GDN recurrence amplifies per-row int8 activation error at the H3
++    // prefill_check size (Qwythos @512: top1 0.6875 < 0.80). Keep GDN on bf16 for N<=512 by
++    // default; FFN/full-attn stay on int8. Above 512, int8 GDN remains (CB @8k needs it).
++    // SPARKINFER_PREFILL_I8_GDN=1/0 forces on/off at every N (A/B).
++    const char* _pi8gdn = getenv("SPARKINFER_PREFILL_I8_GDN");
++    const bool use_i8_gdn = !moe && use_i8 && [&]{
++        if (_pi8gdn && _pi8gdn[0] == '1') return true;
++        if (_pi8gdn && _pi8gdn[0] == '0') return false;
++        return N > 512;
++    }();
+     // GDN projections (wqkv/wqkv_gate/ssm_out) at long ctx: run them on the fp8 (e4m3) tensor cores
+     // instead of bf16. int8 is off here because the near-1-decay recurrence amplifies per-row int8
+     // activation-quant error (128k top1 ~0.31); e4m3's floating range holds it to bf16-like fidelity
+@@ -482,6 +492,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
+         bool attn_fused = false;                       // post-attn residual folded into the proj?
+         if (w.linear_attn) {
+             // ---- Gated DeltaNet linear-attention layer ----
++            // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
++            const bool restore_i8_gdn = use_i8;
++            if (use_i8 && !use_i8_gdn) use_i8 = false;
+             gdn_qkv_z(xn, w);                                       // qkv + z gate (fp8: fused)
+             proj(xn, w.ssm_alpha, w.ssm_alpha_type, la, vh,    H);
+             proj(xn, w.ssm_beta,  w.ssm_beta_type,  lb, vh,    H);
+@@ -494,6 +507,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
+             kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh, c.linear_head_dim, eps, st);
+             attn_fused = proj_resid(lnrm, w.ssm_out, w.ssm_out_type, x, H, lvdim);
+             if (!attn_fused) proj(lnrm, w.ssm_out, w.ssm_out_type, ao, H, lvdim);
++            use_i8 = restore_i8_gdn;
+         } else {
+             // ---- full softmax-attention layer (q_has_gate, partial RoPE, int8 KV) ----
+             // Long-ctx: optionally keep Q/K/V/O on int8 (no GDN recurrence here).
+diff --git a/runtime/src/scheduler.cpp b/runtime/src/scheduler.cpp
+index ae7705cb..9237e752 100644
+--- a/runtime/src/scheduler.cpp
++++ b/runtime/src/scheduler.cpp
+@@ -1,13 +1,35 @@
+ // Scheduler — continuous-batching policy over in-flight requests.
+ // Host-only; decides which sequences run in the next step.
++//
++// vLLM V1-style iteration-level scheduling (CONTINUOUS_BATCHING / CHUNKED_PREFILL):
++//   1. Pack pending decode requests first (up to max_tokens_per_batch) — protects ITPS
++//   2. Fill remaining budget with at most one prefill
++// Large prefills (prefill_remaining > SPARKINFER_PREFILL_MIX_MAX, default 2048) are
++// NOT mixed with decode: sparkinfer's hybrid batched prefill is atomic (one GEMM pass),
++// so admitting an 8k prefill mid-decode creates a multi-hundred-ms ITL spike. Small
++// prefills may still mix. PRIORITY keeps exclusive prefill-first (no mix).
+ 
+ #include "sparkinfer/scheduler.h"
+ 
+ #include <unordered_map>
+ #include <algorithm>
++#include <cstdlib>
+ 
+ namespace sparkinfer {
+ 
++namespace {
++int prefill_mix_max_tokens() {
++    static int v = [] {
++        const char* e = getenv("SPARKINFER_PREFILL_MIX_MAX");
++        // 0 = always allow mix; default 2048 keeps TTFT-friendly short prompts mixed
++        // while deferring long atomic prefills until decode drains.
++        int x = e ? atoi(e) : 2048;
++        return x >= 0 ? x : 2048;
++    }();
++    return v;
++}
++}  // namespace
++
+ struct Scheduler::Impl {
+     SchedulePolicy policy;
+     int max_tokens_per_batch;
+@@ -31,21 +53,47 @@ ScheduleBatch Scheduler::schedule(const std::vector<ScheduledSequence>& active)
+                   return a->priority > b->priority;
+               });
+ 
+-    // Prefill-first: one prefill job at a time so TTFT stays predictable.
+-    for (const ScheduledSequence* s : ordered) {
+-        if (s->phase == SeqPhase::PREFILL) {
++    const bool mix = impl_->policy == SchedulePolicy::CHUNKED_PREFILL ||
++                     impl_->policy == SchedulePolicy::CONTINUOUS_BATCHING;
++    const int budget = impl_->max_tokens_per_batch > 0 ? impl_->max_tokens_per_batch : 1;
++
++    if (!mix) {
++        // PRIORITY: exclusive prefill-first (legacy serving behavior).
++        for (const ScheduledSequence* s : ordered) {
++            if (s->phase != SeqPhase::PREFILL) continue;
+             batch.prefill_request_ids.push_back(s->request_id);
+-            batch.total_tokens = 1;
++            batch.total_tokens += 1;
+             return batch;
+         }
++        for (const ScheduledSequence* s : ordered) {
++            if (s->phase != SeqPhase::DECODE) continue;
++            if ((int)batch.decode_request_ids.size() >= budget) break;
++            batch.decode_request_ids.push_back(s->request_id);
++            batch.total_tokens += 1;
++        }
++        return batch;
+     }
+ 
+-    // One decode request per step while the model forward path is batch=1.
++    // vLLM V1: decode-first, then admit one prefill into remaining budget.
+     for (const ScheduledSequence* s : ordered) {
+         if (s->phase != SeqPhase::DECODE) continue;
++        if ((int)batch.decode_request_ids.size() >= budget) break;
+         batch.decode_request_ids.push_back(s->request_id);
+-        batch.total_tokens = 1;
+-        break;
++        batch.total_tokens += 1;
++    }
++    if (batch.total_tokens < budget) {
++        const int mix_max = prefill_mix_max_tokens();
++        for (const ScheduledSequence* s : ordered) {
++            if (s->phase != SeqPhase::PREFILL) continue;
++            // Defer large atomic prefills while decode is in flight.
++            if (!batch.decode_request_ids.empty() && mix_max > 0 &&
++                s->prefill_remaining > mix_max) {
++                continue;
++            }
++            batch.prefill_request_ids.push_back(s->request_id);
++            batch.total_tokens += 1;
++            break;
++        }
+     }
+     return batch;
+ }
+diff --git a/runtime/tests/batch_engine_gpu_test.cpp b/runtime/tests/batch_engine_gpu_test.cpp
+index b37c307c..f9f0879b 100644
+--- a/runtime/tests/batch_engine_gpu_test.cpp
++++ b/runtime/tests/batch_engine_gpu_test.cpp
+@@ -8,6 +8,7 @@
+ #include <cuda_runtime.h>
+ #include <cstdio>
+ #include <cstdint>
++#include <thread>
+ #include <vector>
+ 
+ static void* rand_bf16(size_t n, float s) {
+@@ -135,13 +136,40 @@ int main() {
+             return 1;
+         }
+ 
++    // Concurrent admission: two threads complete() at once (iteration-level CB).
++    sparkinfer::ContinuousBatchEngine::Result rc, rd;
++    std::thread t1([&] {
++        sparkinfer::ContinuousBatchEngine::Request c;
++        c.prompt = {3, 7, 11};
++        c.max_new_tokens = 5;
++        rc = batch.complete(c);
++    });
++    std::thread t2([&] {
++        sparkinfer::ContinuousBatchEngine::Request d;
++        d.prompt = {4, 8, 12, 16, 20};
++        d.max_new_tokens = 5;
++        d.priority = 2;
++        rd = batch.complete(d);
++    });
++    t1.join();
++    t2.join();
++    if (!rc.error.empty() || !rd.error.empty()) {
++        printf("[FAIL] concurrent: %s | %s\n", rc.error.c_str(), rd.error.c_str());
++        return 1;
++    }
++    if ((int)rc.tokens.size() != 5 || (int)rd.tokens.size() != 5) {
++        printf("[FAIL] concurrent sizes: %zu %zu\n", rc.tokens.size(), rd.tokens.size());
++        return 1;
++    }
++
+     cudaError_t err = cudaGetLastError();
+     if (err != cudaSuccess) {
+         printf("[FAIL] cuda error: %s\n", cudaGetErrorString(err));
+         return 1;
+     }
+ 
+-    printf("[PASS] batch_engine_gpu_test: A=%zu tokens B=%zu tokens free_kv_blocks=%d\n",
+-           ra.tokens.size(), rb.tokens.size(), kv.num_free_blocks());
++    printf("[PASS] batch_engine_gpu_test: A=%zu B=%zu concurrent C/D=%zu/%zu free_kv=%d\n",
++           ra.tokens.size(), rb.tokens.size(), rc.tokens.size(), rd.tokens.size(),
++           kv.num_free_blocks());
+     return 0;
+ }
+diff --git a/runtime/tests/scheduler_cpu_test.cpp b/runtime/tests/scheduler_cpu_test.cpp
+index 23b6a957..93413c11 100644
+--- a/runtime/tests/scheduler_cpu_test.cpp
++++ b/runtime/tests/scheduler_cpu_test.cpp
+@@ -6,25 +6,91 @@
+ int main() {
+     using namespace sparkinfer;
+ 
+-    Scheduler sched(SchedulePolicy::CONTINUOUS_BATCHING, 4);
++    // CONTINUOUS_BATCHING (vLLM V1): decode-first, then one small prefill in remaining budget.
++    {
++        Scheduler sched(SchedulePolicy::CONTINUOUS_BATCHING, 4);
++        std::vector<ScheduledSequence> active;
++        active.push_back({1, 10, SeqPhase::DECODE, 5, 3, 0});
++        active.push_back({2, 11, SeqPhase::DECODE, 1, 1, 0});
++        active.push_back({3, 12, SeqPhase::PREFILL, 9, 0, 128});  // small → may mix
+ 
+-    std::vector<ScheduledSequence> active;
+-    active.push_back({1, 10, SeqPhase::DECODE, 5, 3});
+-    active.push_back({2, 11, SeqPhase::DECODE, 1, 1});
+-    active.push_back({3, 12, SeqPhase::PREFILL, 9, 0});
++        ScheduleBatch batch = sched.schedule(active);
++        assert(batch.decode_request_ids.size() == 2);
++        assert(batch.decode_request_ids[0] == 1);
++        assert(batch.decode_request_ids[1] == 2);
++        assert(batch.prefill_request_ids.size() == 1);
++        assert(batch.prefill_request_ids[0] == 3);
++        assert(batch.total_tokens == 3);
+ 
+-    ScheduleBatch batch = sched.schedule(active);
+-    assert(batch.prefill_request_ids.size() == 1);
+-    assert(batch.prefill_request_ids[0] == 3);
+-    assert(batch.decode_request_ids.empty());
++        for (auto& s : active) {
++            if (s.request_id == 3) {
++                s.phase = SeqPhase::DECODE;
++                s.prefill_remaining = 0;
++            }
++        }
++        batch = sched.schedule(active);
++        assert(batch.prefill_request_ids.empty());
++        assert(batch.decode_request_ids.size() == 3);
++        assert(batch.decode_request_ids[0] == 3);
++        assert(batch.total_tokens == 3);
++    }
++
++    // Large prefill is deferred while decode is in flight (avoids atomic-prefill ITL spikes).
++    {
++        Scheduler sched(SchedulePolicy::CONTINUOUS_BATCHING, 4);
++        std::vector<ScheduledSequence> active;
++        active.push_back({1, 10, SeqPhase::DECODE, 5, 3, 0});
++        active.push_back({3, 12, SeqPhase::PREFILL, 9, 0, 8192});
++        ScheduleBatch batch = sched.schedule(active);
++        assert(batch.decode_request_ids.size() == 1);
++        assert(batch.prefill_request_ids.empty());
++    }
++
++    // Large prefill runs once decode drains.
++    {
++        Scheduler sched(SchedulePolicy::CONTINUOUS_BATCHING, 4);
++        std::vector<ScheduledSequence> active;
++        active.push_back({3, 12, SeqPhase::PREFILL, 9, 0, 8192});
++        ScheduleBatch batch = sched.schedule(active);
++        assert(batch.prefill_request_ids.size() == 1);
++        assert(batch.decode_request_ids.empty());
++    }
++
++    // Decode fills the whole budget → prefill waits one step.
++    {
++        Scheduler sched(SchedulePolicy::CONTINUOUS_BATCHING, 2);
++        std::vector<ScheduledSequence> active;
++        active.push_back({1, 10, SeqPhase::DECODE, 5, 3, 0});
++        active.push_back({2, 11, SeqPhase::DECODE, 1, 1, 0});
++        active.push_back({3, 12, SeqPhase::PREFILL, 9, 0, 128});
++        ScheduleBatch batch = sched.schedule(active);
++        assert(batch.decode_request_ids.size() == 2);
++        assert(batch.prefill_request_ids.empty());
++    }
++
++    // PRIORITY: exclusive prefill (no mix).
++    {
++        Scheduler sched(SchedulePolicy::PRIORITY, 4);
++        std::vector<ScheduledSequence> active;
++        active.push_back({1, 10, SeqPhase::DECODE, 5, 3, 0});
++        active.push_back({3, 12, SeqPhase::PREFILL, 9, 0, 128});
++        ScheduleBatch batch = sched.schedule(active);
++        assert(batch.prefill_request_ids.size() == 1);
++        assert(batch.decode_request_ids.empty());
++    }
+ 
+-    for (auto& s : active) {
+-        if (s.request_id == 3) s.phase = SeqPhase::DECODE;
++    // Budget=1: pack at most one request total.
++    {
++        Scheduler sched(SchedulePolicy::CONTINUOUS_BATCHING, 1);
++        std::vector<ScheduledSequence> active;
++        active.push_back({1, 10, SeqPhase::DECODE, 5, 3, 0});
++        active.push_back({2, 11, SeqPhase::DECODE, 1, 1, 0});
++        active.push_back({3, 12, SeqPhase::PREFILL, 9, 0, 128});
++        ScheduleBatch batch = sched.schedule(active);
++        assert(batch.decode_request_ids.size() == 1);
++        assert(batch.decode_request_ids[0] == 1);
++        assert(batch.prefill_request_ids.empty());
+     }
+-    batch = sched.schedule(active);
+-    assert(batch.prefill_request_ids.empty());
+-    assert(batch.decode_request_ids.size() == 1);
+-    assert(batch.decode_request_ids[0] == 3);  // highest priority among decode jobs
+ 
+     printf("[PASS] scheduler_cpu_test\n");
+     return 0;
+diff --git a/server/README.md b/server/README.md
+index 1d0242e9..d87b89d9 100644
+--- a/server/README.md
++++ b/server/README.md
+@@ -84,7 +84,13 @@ curl ... -H 'Authorization: Bearer secret'
+ Each `/v1/chat/completions` call is submitted to `ContinuousBatchEngine`, which:
+ 
+ - Allocates a **per-request `seq_id`** with **right-sized KV** (`prompt + max_tokens + headroom`, not `max_seq`)
+-- Runs prefill then interleaves decode steps across concurrent requests via the runtime `Scheduler`
++- Runs **vLLM V1-style iteration-level scheduling**: each step packs pending decode
++  requests first (up to `SPARKINFER_BATCH_TOKENS`), then admits at most one prefill into
++  the remaining budget. Prefills larger than `SPARKINFER_PREFILL_MIX_MAX` wait until
++  decode drains (hybrid batched prefill is atomic — mixing an 8k pass mid-decode would
++  spike ITL by hundreds of ms)
++- Under `chunked` (or when decode is waiting under `continuous`), non-batched models
++  advance prefills in chunks of `SPARKINFER_PREFILL_CHUNK_TOKENS` before yielding
+ - Frees KV blocks when the request finishes (no cross-request KV leakage)
+ - Uses per-request hybrid Gated-DeltaNet recurrent buffers when the model is hybrid
+ 
+@@ -93,8 +99,10 @@ Shared prefix cache still works: when the chat prompt starts with configured pre
+ 
+ | Variable | Default | Purpose |
+ |----------|---------|---------|
+-| `SPARKINFER_BATCH_TOKENS` | `64` | Scheduler decode token budget per step |
+-| `SPARKINFER_SCHED_POLICY` | `continuous` | `continuous`, `chunked` (CHUNKED_PREFILL), or `priority` |
++| `SPARKINFER_BATCH_TOKENS` | `64` | Scheduler token budget per step (decode packing) |
++| `SPARKINFER_SCHED_POLICY` | `continuous` | `continuous` (pack+mix), `chunked` (CHUNKED_PREFILL), or `priority` (exclusive prefill) |
++| `SPARKINFER_PREFILL_CHUNK_TOKENS` | `512` | Token-loop prefill yield size when batched prefill is unavailable (`0` = unlimited). Hybrid models always use full batched GEMM prefill. |
++| `SPARKINFER_PREFILL_MIX_MAX` | `2048` | Max prompt tokens allowed to mix with decode in one step (`0` = always mix). Larger atomic prefills wait until decode drains to avoid ITL spikes. |
+ 
+ Prior requests cannot leak decode context into later ones (KV is freed after each completion).
+ 

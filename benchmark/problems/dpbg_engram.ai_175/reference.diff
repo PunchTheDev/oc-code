@@ -1,0 +1,236 @@
+diff --git a/sdk/src/activelearning/embeddings.py b/sdk/src/activelearning/embeddings.py
+index 3ee6264..ed46c4d 100644
+--- a/sdk/src/activelearning/embeddings.py
++++ b/sdk/src/activelearning/embeddings.py
+@@ -99,28 +99,9 @@ async def embed_text(self, text: str) -> list[float]:
+                     return self._zero_vector()
+ 
+                 result = await response.json()
+-                embedding = result.get("embedding")
+-                if not isinstance(embedding, list):
+-                    logger.error(
+-                        "Embedding backend returned invalid payload",
+-                        extra={"cache_key": cache_key[:8], "model": self.model},
+-                    )
+-                    return self._zero_vector()
+-                if len(embedding) != self.dimensions:
+-                    logger.error(
+-                        "Embedding dimension mismatch: expected %d, got %d",
+-                        self.dimensions,
+-                        len(embedding),
+-                        extra={"cache_key": cache_key[:8], "model": self.model},
+-                    )
+-                    return self._zero_vector()
+-                if not all(isinstance(v, (int, float)) for v in embedding):
+-                    logger.error(
+-                        "Embedding payload contains non-numeric components",
+-                        extra={"cache_key": cache_key[:8], "model": self.model},
+-                    )
+-                    return self._zero_vector()
+-                embedding = [float(v) for v in embedding]
++                embedding = self._parse_embedding(result.get("embedding"))
++                if is_zero_vector(embedding):
++                    return embedding
+ 
+         except Exception as e:
+             logger.error(
+@@ -134,19 +115,92 @@ async def embed_text(self, text: str) -> list[float]:
+         self._add_to_cache(cache_key, embedding)
+         return embedding
+ 
++    def _parse_embedding(self, embedding: object) -> list[float]:
++        """Validate and normalize a single embedding vector from Ollama."""
++        if not isinstance(embedding, list):
++            logger.error(
++                "Embedding backend returned invalid payload",
++                extra={"model": self.model},
++            )
++            return self._zero_vector()
++        if len(embedding) != self.dimensions:
++            logger.error(
++                "Embedding dimension mismatch: expected %d, got %d",
++                self.dimensions,
++                len(embedding),
++                extra={"model": self.model},
++            )
++            return self._zero_vector()
++        if not all(isinstance(v, (int, float)) for v in embedding):
++            logger.error(
++                "Embedding payload contains non-numeric components",
++                extra={"model": self.model},
++            )
++            return self._zero_vector()
++        return [float(v) for v in embedding]
++
++    async def _fetch_embeddings_batch(self, texts: list[str]) -> list[list[float]]:
++        """Fetch multiple embeddings via Ollama's /api/embed endpoint."""
++        session = await self._get_session()
++        async with session.post(
++            f"{self.ollama_host}/api/embed",
++            json={"model": self.model, "input": texts},
++            timeout=aiohttp.ClientTimeout(total=60),
++        ) as response:
++            if response.status != 200:
++                error_text = await response.text()
++                raise RuntimeError(
++                    f"Batch embedding backend returned HTTP {response.status}: {error_text}"
++                )
++            result = await response.json()
++            embeddings = result.get("embeddings")
++            if not isinstance(embeddings, list) or len(embeddings) != len(texts):
++                raise RuntimeError("Batch embedding backend returned invalid payload")
++            return [self._parse_embedding(embedding) for embedding in embeddings]
++
+     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+         """
+         Generate embeddings for multiple texts.
+ 
+-        Args:
+-            texts: List of texts to embed
+-
+-        Returns:
+-            List of embedding vectors
++        Cache hits are resolved first. Uncached texts are requested in a single
++        `/api/embed` call when possible, with sequential fallback on failure.
+         """
+-        # TODO: Ollama may support batch embeddings in the future
+-        # For now, we process sequentially with caching
+-        return [await self.embed_text(t) for t in texts]
++        if not texts:
++            return []
++
++        results: list[list[float] | None] = [None] * len(texts)
++        missing_indices: list[int] = []
++        missing_texts: list[str] = []
++
++        for index, text in enumerate(texts):
++            cache_key = self._cache_key(text)
++            if cache_key in self._cache:
++                logger.debug(f"Embedding cache hit for key {cache_key[:8]}...")
++                self._cache.move_to_end(cache_key)
++                results[index] = self._cache[cache_key]
++            else:
++                missing_indices.append(index)
++                missing_texts.append(text)
++
++        if missing_texts:
++            try:
++                fetched = await self._fetch_embeddings_batch(missing_texts)
++            except Exception as exc:
++                logger.warning(
++                    "Batch embedding failed, falling back to sequential: %s",
++                    exc,
++                    extra={"model": self.model, "count": len(missing_texts)},
++                )
++                fetched = [await self.embed_text(text) for text in missing_texts]
++
++            for index, text, embedding in zip(missing_indices, missing_texts, fetched):
++                results[index] = embedding
++                if not is_zero_vector(embedding):
++                    self._add_to_cache(self._cache_key(text), embedding)
++
++        return [
++            embedding if embedding is not None else self._zero_vector() for embedding in results
++        ]
+ 
+     def _zero_vector(self) -> list[float]:
+         """Sentinel vector returned when embedding generation fails."""
+diff --git a/sdk/tests/test_embeddings.py b/sdk/tests/test_embeddings.py
+index bd93dcc..68f4e26 100644
+--- a/sdk/tests/test_embeddings.py
++++ b/sdk/tests/test_embeddings.py
+@@ -152,3 +152,94 @@ async def test_embed_text_caches_successful_embedding():
+     assert first == [0.1, 0.2, 0.3]
+     assert second == first
+     assert service._get_session.await_count == 1
++
++
++@pytest.mark.asyncio
++async def test_embed_batch_empty_list():
++    service = EmbeddingService(dimensions=4)
++    assert await service.embed_batch([]) == []
++
++
++@pytest.mark.asyncio
++async def test_embed_batch_uses_cache_without_http():
++    service = EmbeddingService(dimensions=3)
++    service._cache[service._cache_key("cached")] = [0.1, 0.2, 0.3]
++    service._get_session = AsyncMock()
++
++    result = await service.embed_batch(["cached", "cached"])
++
++    assert result == [[0.1, 0.2, 0.3], [0.1, 0.2, 0.3]]
++    service._get_session.assert_not_awaited()
++
++
++@pytest.mark.asyncio
++async def test_embed_batch_fetches_uncached_texts_in_single_request():
++    service = EmbeddingService(dimensions=3)
++
++    mock_response = MagicMock()
++    mock_response.status = 200
++    mock_response.json = AsyncMock(return_value={"embeddings": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]})
++    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
++    mock_response.__aexit__ = AsyncMock(return_value=False)
++
++    mock_session = MagicMock()
++    mock_session.post = MagicMock(return_value=mock_response)
++    service._get_session = AsyncMock(return_value=mock_session)
++
++    result = await service.embed_batch(["alpha", "beta"])
++
++    assert result == [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
++    mock_session.post.assert_called_once()
++    assert mock_session.post.call_args.kwargs["json"]["input"] == ["alpha", "beta"]
++
++
++@pytest.mark.asyncio
++async def test_embed_batch_preserves_order_with_mixed_cache_hits():
++    service = EmbeddingService(dimensions=2)
++    service._cache[service._cache_key("cached")] = [1.0, 2.0]
++
++    mock_response = MagicMock()
++    mock_response.status = 200
++    mock_response.json = AsyncMock(return_value={"embeddings": [[0.3, 0.4]]})
++    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
++    mock_response.__aexit__ = AsyncMock(return_value=False)
++
++    mock_session = MagicMock()
++    mock_session.post = MagicMock(return_value=mock_response)
++    service._get_session = AsyncMock(return_value=mock_session)
++
++    result = await service.embed_batch(["cached", "fresh"])
++
++    assert result == [[1.0, 2.0], [0.3, 0.4]]
++    assert mock_session.post.call_args.kwargs["json"]["input"] == ["fresh"]
++
++
++@pytest.mark.asyncio
++async def test_embed_batch_falls_back_to_sequential_on_batch_failure():
++    service = EmbeddingService(dimensions=2)
++
++    single_response = MagicMock()
++    single_response.status = 200
++    single_response.json = AsyncMock(
++        side_effect=[
++            {"embedding": [0.1, 0.2]},
++            {"embedding": [0.3, 0.4]},
++        ]
++    )
++    single_response.__aenter__ = AsyncMock(return_value=single_response)
++    single_response.__aexit__ = AsyncMock(return_value=False)
++
++    batch_response = MagicMock()
++    batch_response.status = 500
++    batch_response.text = AsyncMock(return_value="batch failed")
++    batch_response.__aenter__ = AsyncMock(return_value=batch_response)
++    batch_response.__aexit__ = AsyncMock(return_value=False)
++
++    mock_session = MagicMock()
++    mock_session.post = MagicMock(side_effect=[batch_response, single_response, single_response])
++    service._get_session = AsyncMock(return_value=mock_session)
++
++    result = await service.embed_batch(["one", "two"])
++
++    assert result == [[0.1, 0.2], [0.3, 0.4]]
++    assert mock_session.post.call_count == 3

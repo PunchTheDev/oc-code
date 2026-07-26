@@ -1,0 +1,448 @@
+diff --git a/packages/loopover-miner/lib/calibration-cli.ts b/packages/loopover-miner/lib/calibration-cli.ts
+index 2341d3898..e40003c12 100644
+--- a/packages/loopover-miner/lib/calibration-cli.ts
++++ b/packages/loopover-miner/lib/calibration-cli.ts
+@@ -24,11 +24,12 @@ import type { LedgerEntry } from "./event-ledger.js";
+ import { MINER_PR_OUTCOME_EVENT } from "./pr-outcome.js";
+ import { initPredictionLedger, resolvePredictionLedgerDbPath } from "./prediction-ledger.js";
+ import type { PredictionLedgerEntry } from "./prediction-ledger.js";
+-import type { PredictedVerdictRecord, ObservedOutcomeRecord, CalibrationReport } from "./calibration-types.js";
++import type { PredictedVerdictRecord, ObservedOutcomeRecord, CalibrationReport, CalibrationRow } from "./calibration-types.js";
+ import { reportCliFailure, describeCliError } from "./cli-error.js";
++import { runHistoricalReplayCalibrationCycle, type CalibrationSnapshotPayload } from "./calibration-run.js";
+ 
+ const CALIBRATION_USAGE =
+-  "Usage: loopover-miner calibration [--json] | calibration backtest-threshold --candidate <x> [--json] | calibration apply-min-rank --candidate <x> --approve [--json] | calibration revert-min-rank --approve [--json]";
++  "Usage: loopover-miner calibration [--json] | calibration snapshot [--json] | calibration backtest-threshold --candidate <x> [--json] | calibration apply-min-rank --candidate <x> --approve [--json] | calibration revert-min-rank --approve [--json]";
+ 
+ export type CalibrationCliDeps = {
+   readFileSync?: typeof readFileSync;
+@@ -125,6 +126,93 @@ function renderReportText(report: CalibrationReport): void {
+   }
+ }
+ 
++/** Map one {@link CalibrationRow} onto the engine's {@link PrOutcomeCalibrationInput} shape (#8317) —
++ *  field-for-field; `hold` is always present on the row so it always forwards. */
++export function prOutcomeFromCalibrationRow(row: CalibrationRow): {
++  mergeConfirmed: number;
++  mergeFalse: number;
++  closeConfirmed: number;
++  closeFalse: number;
++  hold: number;
++} {
++  return {
++    mergeConfirmed: row.mergeConfirmed,
++    mergeFalse: row.mergeFalse,
++    closeConfirmed: row.closeConfirmed,
++    closeFalse: row.closeFalse,
++    hold: row.hold,
++  };
++}
++
++/** `calibration snapshot [--json]` (#8317): run the Phase 7 calibration runner once per project row from
++ *  {@link buildCalibrationReport}, persist a `calibration_snapshot` ledger event per project (with the AMS
++ *  backtest track record attached when any runs exist), and print the results. Mirrors
++ *  {@link runBacktestThreshold}'s open/run/persist/print/finally shape. Does NOT pass a Phase 7 config —
++ *  no `.loopover-ams.yml` calibration-section reader exists yet, so the engine defaults to loop-disabled
++ *  (honest, not a workaround). */
++function runCalibrationSnapshot(args: string[], env: Record<string, string | undefined>, deps: CalibrationCliDeps): number {
++  const json = args.includes("--json");
++  const unknown = args.find((token) => token !== "--json");
++  if (unknown) {
++    return reportCliFailure(json, `Unknown option: ${unknown}. ${CALIBRATION_USAGE}`, 1);
++  }
++
++  let predictionStore;
++  let eventLedger;
++  try {
++    predictionStore = initPredictionLedger(resolvePredictionLedgerDbPath(env));
++    eventLedger = initEventLedger(resolveEventLedgerDbPath(env));
++    const predictionRows = predictionStore.readPredictions();
++    const events = eventLedger.readEvents();
++    const report = buildCalibrationReport(toPredictionRecords(predictionRows), toOutcomeRecords(events));
++    const trackRecord = computeAmsBacktestTrackRecord(readAmsThresholdBacktestRuns(eventLedger));
++    // #8317: only attach a real history; an empty track record stays null so consumers can tell "no runs yet"
++    // from "runs exist with zero REGRESSED" without inventing a fabricated zero-run object at the CLI boundary.
++    const backtestTrackRecord = trackRecord.totalRuns > 0 ? trackRecord : null;
++
++    if (!report.hasSignal) {
++      const message = "calibration snapshot: no decided predictions yet (predictions need a realized merge/close outcome); nothing persisted.";
++      console.log(json ? JSON.stringify({ snapshots: [], reason: "no_decided_predictions" }) : message);
++      return 0;
++    }
++
++    const snapshots: Array<{ repoFullName: string; snapshot: CalibrationSnapshotPayload }> = [];
++    for (const row of report.rows) {
++      const cycle = runHistoricalReplayCalibrationCycle(
++        {
++          prOutcome: prOutcomeFromCalibrationRow(row),
++          repoFullName: row.project,
++          backtestTrackRecord,
++          ...(deps.nowMs !== undefined ? { now: new Date(deps.nowMs).toISOString() } : {}),
++        },
++        { eventLedger },
++      );
++      snapshots.push({ repoFullName: row.project, snapshot: cycle.snapshot });
++    }
++
++    if (json) {
++      console.log(JSON.stringify({ snapshots }, null, 2));
++    } else {
++      for (const entry of snapshots) {
++        const accuracy =
++          entry.snapshot.combinedAccuracy === null ? "n/a" : `${Math.round(entry.snapshot.combinedAccuracy * 100)}%`;
++        console.log(
++          `calibration snapshot ${entry.repoFullName}: enabled=${entry.snapshot.enabled} combined=${accuracy} ` +
++            `delta=${entry.snapshot.deltaFromBaseline === null ? "n/a" : entry.snapshot.deltaFromBaseline.toFixed(3)} ` +
++            `sources=${entry.snapshot.contributingSources.join(",") || "none"}`,
++        );
++      }
++      console.log(`calibration snapshot: persisted ${snapshots.length} project snapshot(s).`);
++    }
++    return 0;
++  } catch (error) {
++    return reportCliFailure(json, describeCliError(error));
++  } finally {
++    predictionStore?.close();
++    eventLedger?.close();
++  }
++}
++
+ /** `calibration backtest-threshold --candidate <x>` (#8184): advisory replay of a candidate min-rank skip
+  *  threshold against the taken-opportunity corpus. Prints the shared comparison renderer's report and
+  *  persists the run event. Exit is nonzero ONLY on operational error -- never on verdict (the #8138
+@@ -205,13 +293,14 @@ function runMinRankMutation(kind: "apply" | "revert", args: string[], env: Recor
+ }
+ 
+ /**
+- * Run `loopover-miner calibration [--json]` (or one of the #8184/#8187 subcommands -- see
++ * Run `loopover-miner calibration [--json]` (or one of the #8184/#8187/#8317 subcommands -- see
+  * CALIBRATION_USAGE). The bare form reads the prediction ledger + PR-outcome events, joins them into a
+  * calibration report, and prints it (a JSON dump under `--json`, else a per-project text summary) along
+  * with the corpus stats, the backtest track record (#8185), and any current backtest-cleared proposals
+  * (#8186). Returns the process exit code: 0 on success, 1 on an unknown option.
+  */
+ export function runCalibrationCli(args: string[] = [], env: Record<string, string | undefined> = process.env, deps: CalibrationCliDeps = {}): number {
++  if (args[0] === "snapshot") return runCalibrationSnapshot(args.slice(1), env, deps);
+   if (args[0] === "backtest-threshold") return runBacktestThreshold(args.slice(1), env, deps);
+   if (args[0] === "apply-min-rank") return runMinRankMutation("apply", args.slice(1), env, deps);
+   if (args[0] === "revert-min-rank") return runMinRankMutation("revert", args.slice(1), env, deps);
+diff --git a/packages/loopover-miner/lib/calibration-run.ts b/packages/loopover-miner/lib/calibration-run.ts
+index 400a5d2b7..b5353e19a 100644
+--- a/packages/loopover-miner/lib/calibration-run.ts
++++ b/packages/loopover-miner/lib/calibration-run.ts
+@@ -124,6 +124,8 @@ export interface RunCalibrationCycleInput {
+   now?: string | Date | null;
+   observedAt?: string | null;
+   repoFullName?: string;
++  /** #8317 / #8185: AMS backtest track record to embed on the persisted snapshot. Omit/null when none. */
++  backtestTrackRecord?: SnapshotMeta["backtestTrackRecord"];
+ }
+ 
+ export interface RunCalibrationCycleDeps extends ScoreCompositeOptions {
+@@ -373,6 +375,7 @@ export function runHistoricalReplayCalibrationCycle(
+     replayRunId: (built.historicalReplay as Record<string, unknown> | null)?.replayRunId as string | null ?? null,
+     observedAt: input.observedAt ?? ((built.historicalReplay as Record<string, unknown> | null)?.observedAt as string | null) ?? null,
+     sampleSize: built.sampleSize,
++    ...(input.backtestTrackRecord !== undefined ? { backtestTrackRecord: input.backtestTrackRecord } : {}),
+   });
+   const recorded = deps.eventLedger
+     ? recordCalibrationSnapshot(snapshot, { eventLedger: deps.eventLedger, repoFullName: input.repoFullName } as RecordCalibrationSnapshotOptions)
+diff --git a/test/unit/miner-calibration-cli.test.ts b/test/unit/miner-calibration-cli.test.ts
+index b6cee9431..0e561578f 100644
+--- a/test/unit/miner-calibration-cli.test.ts
++++ b/test/unit/miner-calibration-cli.test.ts
+@@ -2,7 +2,20 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+ import { tmpdir } from "node:os";
+ import { join } from "node:path";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+-import { runCalibrationCli, toAmsRealizedOutcomes } from "../../packages/loopover-miner/lib/calibration-cli.js";
++
++// Instrument the .ts sources under CI's scoped `--changed` run: after `build:miner`, literal `.js` imports
++// resolve to emitted artifacts and leave coverage.include's `.ts` entries at 0% patch (same as #7796).
++vi.mock("../../packages/loopover-miner/lib/calibration-run.js", async () => {
++  const mod = "../../packages/loopover-miner/lib/calibration-run.ts";
++  return import(mod);
++});
++
++const CALIBRATION_CLI_MODULE = "../../packages/loopover-miner/lib/calibration-cli.ts";
++const CALIBRATION_RUN_MODULE = "../../packages/loopover-miner/lib/calibration-run.ts";
++const calibrationRun = await import(CALIBRATION_RUN_MODULE);
++const { runCalibrationCli, toAmsRealizedOutcomes } = (await import(CALIBRATION_CLI_MODULE)) as typeof import("../../packages/loopover-miner/lib/calibration-cli.js");
++const { MINER_CALIBRATION_SNAPSHOT_EVENT } = calibrationRun;
++
+ import { initEventLedger, resolveEventLedgerDbPath } from "../../packages/loopover-miner/lib/event-ledger.js";
+ import {
+   initPredictionLedger,
+@@ -327,3 +340,218 @@ describe("calibration report sections (#8185/#8186)", () => {
+     expect(parsed.backtestProposals[0]?.candidateThreshold).toBe(0.2);
+   });
+ });
++
++// ── #8317: calibration snapshot wires the Phase 7 runner into a real CLI caller ─────────────────────────────
++
++function seedPredictionFor(
++  env: Record<string, string | undefined>,
++  repoFullName: string,
++  targetId: number,
++  conclusion: string,
++): void {
++  const store = initPredictionLedger(resolvePredictionLedgerDbPath(env));
++  store.appendPrediction({
++    repoFullName,
++    targetId,
++    conclusion,
++    pack: "oss",
++    readinessScore: 90,
++    blockerCodes: [],
++    warningCodes: [],
++    engineVersion: "1.0.0",
++  });
++  store.close();
++}
++
++function seedOutcomeFor(
++  env: Record<string, string | undefined>,
++  repoFullName: string,
++  payload: Record<string, unknown>,
++): void {
++  const ledger = initEventLedger(resolveEventLedgerDbPath(env));
++  ledger.appendEvent({ type: "pr_outcome", repoFullName, payload });
++  ledger.close();
++}
++
++describe("calibration snapshot (#8317)", () => {
++  it("persists one snapshot per project for a multi-project report (not one merged event)", () => {
++    const env = envForTempStores();
++    seedPredictionFor(env, "acme/widgets", 1, "merge");
++    seedOutcomeFor(env, "acme/widgets", { prNumber: 1, decision: "merged" });
++    seedPredictionFor(env, "acme/gadgets", 2, "merge");
++    seedOutcomeFor(env, "acme/gadgets", { prNumber: 2, decision: "merged" });
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++
++    expect(runCalibrationCli(["snapshot"], env)).toBe(0);
++    const output = log.mock.calls.map((c) => String(c[0])).join("\n");
++    expect(output).toContain("calibration snapshot acme/widgets:");
++    expect(output).toContain("calibration snapshot acme/gadgets:");
++    expect(output).toContain("persisted 2 project snapshot(s)");
++
++    const ledger = initEventLedger(resolveEventLedgerDbPath(env));
++    const snaps = ledger.readEvents().filter((e) => e.type === MINER_CALIBRATION_SNAPSHOT_EVENT);
++    ledger.close();
++    expect(snaps).toHaveLength(2);
++    expect(snaps.map((e) => e.repoFullName).sort()).toEqual(["acme/gadgets", "acme/widgets"]);
++  });
++
++  it("persists a single-project snapshot and embeds null backtestTrackRecord when no backtest runs exist", () => {
++    const env = envForTempStores();
++    seedPrediction(env, 42, "merge");
++    seedOutcomeEvent(env, { prNumber: 42, decision: "merged" });
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++
++    expect(runCalibrationCli(["snapshot", "--json"], env)).toBe(0);
++    const parsed = JSON.parse(String(log.mock.calls[0]?.[0])) as {
++      snapshots: Array<{ repoFullName: string; snapshot: { backtestTrackRecord: unknown } }>;
++    };
++    expect(parsed.snapshots).toHaveLength(1);
++    expect(parsed.snapshots[0]).toMatchObject({ repoFullName: "acme/widgets" });
++    expect(parsed.snapshots[0]?.snapshot.backtestTrackRecord).toBeNull();
++
++    const ledger = initEventLedger(resolveEventLedgerDbPath(env));
++    const snaps = ledger.readEvents().filter((e) => e.type === MINER_CALIBRATION_SNAPSHOT_EVENT);
++    ledger.close();
++    expect(snaps).toHaveLength(1);
++    expect(snaps[0]?.payload).toMatchObject({ backtestTrackRecord: null });
++  });
++
++  it("embeds a populated backtestTrackRecord when backtest runs exist", () => {
++    const env = envForTempStores();
++    seedTakenHistory(env);
++    seedPrediction(env, 42, "merge");
++    seedOutcomeEvent(env, { prNumber: 42, decision: "merged" });
++    expect(runCalibrationCli(["backtest-threshold", "--candidate", "0.2"], env)).toBe(0);
++
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++    expect(runCalibrationCli(["snapshot", "--json"], env)).toBe(0);
++    const parsed = JSON.parse(String(log.mock.calls[0]?.[0])) as {
++      snapshots: Array<{ snapshot: { backtestTrackRecord: { totalRuns: number; regressedRuns: number } | null } }>;
++    };
++    expect(parsed.snapshots[0]?.snapshot.backtestTrackRecord).toMatchObject({ totalRuns: 2, regressedRuns: 0 });
++  });
++
++  it("prints the no-signal message and persists NOTHING when the report has zero decided rows", () => {
++    const env = envForTempStores();
++    seedPrediction(env, 1, "merge"); // pending — no outcome
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++
++    expect(runCalibrationCli(["snapshot"], env)).toBe(0);
++    expect(log.mock.calls.map((c) => String(c[0])).join("\n")).toContain("no decided predictions yet");
++
++    log.mockClear();
++    expect(runCalibrationCli(["snapshot", "--json"], env)).toBe(0);
++    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual({
++      snapshots: [],
++      reason: "no_decided_predictions",
++    });
++
++    const ledger = initEventLedger(resolveEventLedgerDbPath(env));
++    expect(ledger.readEvents().filter((e) => e.type === MINER_CALIBRATION_SNAPSHOT_EVENT)).toHaveLength(0);
++    ledger.close();
++  });
++
++  it("rejects an unknown option on the snapshot subcommand", () => {
++    const err = vi.spyOn(console, "error").mockImplementation(() => {});
++    expect(runCalibrationCli(["snapshot", "--bogus"], envForTempStores())).toBe(1);
++    expect(String(err.mock.calls[0]?.[0])).toContain("Unknown option");
++  });
++
++  it("emits JSON when ledger open fails on snapshot with --json", () => {
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++    const err = vi.spyOn(console, "error").mockImplementation(() => {});
++    vi.spyOn(predictionLedger, "initPredictionLedger").mockImplementation(() => {
++      throw new Error("corrupt_prediction_ledger");
++    });
++    expect(runCalibrationCli(["snapshot", "--json"], envForTempStores())).toBe(2);
++    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toEqual({
++      ok: false,
++      error: "corrupt_prediction_ledger",
++    });
++    expect(err).not.toHaveBeenCalled();
++  });
++
++  it("forwards deps.nowMs into the Phase 7 cycle runner", () => {
++    const env = envForTempStores();
++    seedPrediction(env, 42, "merge");
++    seedOutcomeEvent(env, { prNumber: 42, decision: "merged" });
++    const cycleSpy = vi.spyOn(calibrationRun, "runHistoricalReplayCalibrationCycle");
++    const nowMs = Date.parse("2026-07-09T12:00:00.000Z");
++
++    expect(runCalibrationCli(["snapshot"], env, { nowMs })).toBe(0);
++    expect(cycleSpy).toHaveBeenCalledWith(
++      expect.objectContaining({ now: new Date(nowMs).toISOString() }),
++      expect.anything(),
++    );
++  });
++
++  it("renders n/a for null combinedAccuracy and deltaFromBaseline in text mode", () => {
++    const env = envForTempStores();
++    seedPrediction(env, 42, "merge");
++    seedOutcomeEvent(env, { prNumber: 42, decision: "merged" });
++    vi.spyOn(calibrationRun, "runHistoricalReplayCalibrationCycle").mockReturnValue({
++      result: {} as never,
++      snapshot: {
++        enabled: false,
++        combinedAccuracy: null,
++        baselineAccuracy: 0,
++        deltaFromBaseline: null,
++        autonomyIncreasePermitted: false,
++        replayHarnessHold: false,
++        replayHarnessStatus: "missing",
++        replayRunDue: false,
++        holdReasons: [],
++        contributingSources: [],
++        replayRunId: null,
++        observedAt: null,
++        replaySampleSize: 0,
++        backtestTrackRecord: null,
++      },
++      recorded: null,
++      historicalReplay: null,
++      compositeScore: null,
++      sampleSize: 0,
++      scores: [],
++    });
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++
++    expect(runCalibrationCli(["snapshot"], env)).toBe(0);
++    const output = log.mock.calls.map((c) => String(c[0])).join("\n");
++    expect(output).toContain("calibration snapshot acme/widgets: enabled=false combined=n/a delta=n/a");
++  });
++
++  it("renders numeric combinedAccuracy and deltaFromBaseline in text mode", () => {
++    const env = envForTempStores();
++    seedPrediction(env, 42, "merge");
++    seedOutcomeEvent(env, { prNumber: 42, decision: "merged" });
++    vi.spyOn(calibrationRun, "runHistoricalReplayCalibrationCycle").mockReturnValue({
++      result: {} as never,
++      snapshot: {
++        enabled: true,
++        combinedAccuracy: 0.856,
++        baselineAccuracy: 0.7,
++        deltaFromBaseline: 0.156,
++        autonomyIncreasePermitted: true,
++        replayHarnessHold: false,
++        replayHarnessStatus: "healthy",
++        replayRunDue: false,
++        holdReasons: [],
++        contributingSources: ["pr_outcome"],
++        replayRunId: null,
++        observedAt: null,
++        replaySampleSize: 0,
++        backtestTrackRecord: null,
++      },
++      recorded: null,
++      historicalReplay: null,
++      compositeScore: 0.856,
++      sampleSize: 1,
++      scores: [0.856],
++    });
++    const log = vi.spyOn(console, "log").mockImplementation(() => {});
++
++    expect(runCalibrationCli(["snapshot"], env)).toBe(0);
++    const output = log.mock.calls.map((c) => String(c[0])).join("\n");
++    expect(output).toContain("calibration snapshot acme/widgets: enabled=true combined=86% delta=0.156 sources=pr_outcome");
++  });
++});
+diff --git a/test/unit/miner-calibration-run.test.ts b/test/unit/miner-calibration-run.test.ts
+index e29e261ea..32b207030 100644
+--- a/test/unit/miner-calibration-run.test.ts
++++ b/test/unit/miner-calibration-run.test.ts
+@@ -4,7 +4,10 @@ import { describe, expect, it, vi } from "vitest";
+ // default (non-injected) combine branch runs against the real engine, exactly like miner-feasibility-cli.test.ts.
+ vi.mock("@loopover/engine", async () => import("../../packages/loopover-engine/src/index"));
+ 
+-import {
++// Load calibration-run.ts directly so scoped CI runs (`--changed` after `build:miner`) attribute patch coverage to
++// the .ts diff, not a 0%-hit phantom when literal `.js` imports resolve to emitted artifacts (#7796 / #8317).
++const CALIBRATION_RUN_MODULE = "../../packages/loopover-miner/lib/calibration-run.ts";
++const {
+   MINER_CALIBRATION_SNAPSHOT_EVENT,
+   buildHistoricalReplayCalibrationInput,
+   latestCalibrationSnapshot,
+@@ -14,7 +17,7 @@ import {
+   runHistoricalReplayCalibrationCycle,
+   scoreHistoricalReplayComposite,
+   snapshotPayloadFromResult,
+-} from "../../packages/loopover-miner/lib/calibration-run.js";
++} = (await import(CALIBRATION_RUN_MODULE)) as typeof import("../../packages/loopover-miner/lib/calibration-run.js");
+ import type { AppendEventInput, LedgerEntry } from "../../packages/loopover-miner/lib/event-ledger.js";
+ 
+ // A minimal injected event ledger (the DI shape record/read accept) — pure unit tests, no SQLite file. `_events` is
+@@ -397,6 +400,27 @@ describe("runHistoricalReplayCalibrationCycle (#4248)", () => {
+     expect(noReplay.snapshot.replayRunId).toBeNull();
+     expect(noReplay.sampleSize).toBe(0);
+   });
++
++  it("forwards backtestTrackRecord into the snapshot meta (#8317)", () => {
++    const ledger = mockLedger();
++    const record = { totalRuns: 4, regressedRuns: 1, regressedRate: 0.25 };
++    const withRecord = runHistoricalReplayCalibrationCycle(
++      { config: enabledConfig, prOutcome, repoFullName: "acme/widgets", backtestTrackRecord: record },
++      { eventLedger: ledger },
++    );
++    expect(withRecord.snapshot.backtestTrackRecord).toEqual(record);
++    expect(readCalibrationSnapshots(ledger)[0]?.backtestTrackRecord).toEqual(record);
++
++    const without = runHistoricalReplayCalibrationCycle({ config: enabledConfig, prOutcome });
++    expect(without.snapshot.backtestTrackRecord).toBeNull();
++
++    const explicitNull = runHistoricalReplayCalibrationCycle({
++      config: enabledConfig,
++      prOutcome,
++      backtestTrackRecord: null,
++    });
++    expect(explicitNull.snapshot.backtestTrackRecord).toBeNull();
++  });
+ });
+ 
+ describe("backtestTrackRecord snapshot section (#8185)", () => {

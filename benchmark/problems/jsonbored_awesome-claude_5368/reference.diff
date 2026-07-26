@@ -1,0 +1,394 @@
+diff --git a/packages/registry/src/submission-risk.js b/packages/registry/src/submission-risk.js
+index 914d70423..83b601394 100644
+--- a/packages/registry/src/submission-risk.js
++++ b/packages/registry/src/submission-risk.js
+@@ -31,6 +31,7 @@ const HEYCLAUDE_HOSTNAME = "heyclau.de";
+ 
+ const SAFETY_NOTE_REQUIRED_FLAGS = new Set([
+   "unsafe_install_pipeline",
++  "mutable_script_install_source",
+   "financial_or_identity_sensitive",
+   "external_write_capability",
+   "destructive_actions",
+@@ -644,6 +645,8 @@ const CAPABILITY_BUCKET_BY_FLAG = {
+   commercial_listing_route: "commercial_or_listing_route",
+   non_https_executable_source: "unsafe_install_or_secret",
+   unsafe_install_pipeline: "unsafe_install_or_secret",
++  mutable_script_install_source: "unsafe_install_or_secret",
++  affiliate_referral_url: "commercial_or_listing_route",
+   malicious_data_theft_capability: "abuse_or_malware",
+   malware_or_abuse_surface: "abuse_or_malware",
+   prohibited_content: "abuse_or_malware",
+@@ -898,6 +901,212 @@ function addSchemaSignals(report, validationReport) {
+   );
+ }
+ 
++// Ported from scripts/ci/validate-content-policy.mjs so the risk report
++// maintainers read matches what the CI gate blocks on. These helpers are pure
++// (no filesystem or network access). The CI script stays the source of truth;
++// changes there need mirroring here.
++const FULL_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/i;
++
++const LOCAL_SCRIPT_REFERENCE_PATTERN =
++  /(?:^|[\s`;&|])(?:(?:bash|sh|zsh|pwsh|powershell)\s+)?(?:\.{1,2}\/|[\w.-]+\/)?[\w./-]*(?:install|setup|start|bootstrap|init)[\w.-]*\.(?:sh|bash|zsh|ps1)\b/im;
++
++function isLikelyAffiliateUrl(value) {
++  const raw = normalizeText(value);
++  if (!raw) return false;
++
++  try {
++    const url = new URL(raw);
++    const affiliateParams = new Set([
++      "aff",
++      "affiliate",
++      "affiliate_id",
++      "irclickid",
++      "partner",
++      "partner_id",
++      "ref",
++      "referral",
++      "referral_code",
++      "tag",
++      "via",
++    ]);
++
++    for (const key of url.searchParams.keys()) {
++      const normalizedKey = key.toLowerCase();
++      if (
++        affiliateParams.has(normalizedKey) ||
++        normalizedKey.startsWith("utm_aff")
++      ) {
++        return true;
++      }
++    }
++
++    // Explicit affiliate path segments anywhere in the path.
++    if (/\/(referral|affiliate|partners?)(?:\/|$)/i.test(url.pathname)) {
++      return true;
++    }
++    // Bare `/ref` or `/refer` ONLY as the terminal path segment (affiliate
++    // shortlinks like example.com/ref). A `ref` segment with more after it is
++    // almost always a docs "reference" section (e.g. go.dev/ref/mod), not an
++    // affiliate link, so it is not flagged here - genuine affiliate links use a
++    // `ref=` query param (handled above) instead.
++    return /^\/(ref|refer)\/?$/i.test(url.pathname);
++  } catch {
++    return /\b(affiliate|referral|ref=|via=)\b/i.test(raw);
++  }
++}
++
++function githubSourceRef(value) {
++  const raw = normalizeText(value);
++  if (!raw) return null;
++  try {
++    const url = new URL(raw);
++    const parts = url.pathname.split("/").filter(Boolean);
++    if (url.protocol !== "https:") return null;
++    if (url.hostname.toLowerCase() === "raw.githubusercontent.com") {
++      if (parts.length < 4) return null;
++      return {
++        owner: parts[0].toLowerCase(),
++        repo: parts[1].replace(/\.git$/i, "").toLowerCase(),
++        ref: parts[2],
++        path: parts.slice(3).join("/"),
++      };
++    }
++    if (
++      url.hostname.toLowerCase() === "github.com" &&
++      parts.length >= 5 &&
++      (parts[2] === "blob" || parts[2] === "raw")
++    ) {
++      return {
++        owner: parts[0].toLowerCase(),
++        repo: parts[1].replace(/\.git$/i, "").toLowerCase(),
++        ref: parts[3],
++        path: parts.slice(4).join("/"),
++      };
++    }
++  } catch {
++    return null;
++  }
++  return null;
++}
++
++function githubRepoRefFromUrl(value) {
++  const raw = normalizeText(value);
++  if (!raw) return null;
++  try {
++    const url = new URL(raw);
++    if (
++      url.protocol !== "https:" ||
++      url.hostname.toLowerCase() !== "github.com"
++    ) {
++      return null;
++    }
++    const parts = url.pathname.split("/").filter(Boolean);
++    if (parts.length < 2) return null;
++    return {
++      owner: parts[0].toLowerCase(),
++      repo: parts[1].replace(/\.git$/i, "").toLowerCase(),
++    };
++  } catch {
++    return null;
++  }
++}
++
++function githubRepoKey(source) {
++  if (!source?.owner || !source?.repo) return "";
++  return `${source.owner}/${source.repo}`;
++}
++
++function collectGitCloneRepos(value) {
++  const text = normalizeText(value);
++  const repos = [];
++  const clonePattern =
++    /\bgit\s+clone\b[^\n;&|]*?(https:\/\/github\.com\/[^\s`'"<>]+|git@github\.com:[^\s`'"<>]+)/gi;
++  for (const match of text.matchAll(clonePattern)) {
++    const rawRepo = match[1].replace(
++      /^git@github\.com:/i,
++      "https://github.com/",
++    );
++    const repo = githubRepoRefFromUrl(rawRepo);
++    if (repo) repos.push(repo);
++  }
++  return repos;
++}
++
++function normalizeScriptPath(value) {
++  return normalizeText(value)
++    .replace(/^['"`]+|['"`]+$/g, "")
++    .replace(/^(?:\.\.?\/)+/, "")
++    .replace(/\/{2,}/g, "/")
++    .toLowerCase();
++}
++
++function isScriptPath(value) {
++  return /\.(?:sh|bash|zsh|ps1)$/i.test(normalizeText(value));
++}
++
++function collectLocalScriptInstallRefs(value) {
++  const text = normalizeText(value);
++  const scriptPattern =
++    /(?:^|[\s`;&|])(?:(?:bash|sh|zsh|pwsh|powershell)\s+)?((?:\.{1,2}\/|[\w.-]+\/)?[\w./-]*(?:install|setup|start|bootstrap|init)[\w.-]*\.(?:sh|bash|zsh|ps1))\b/gim;
++  return [...text.matchAll(scriptPattern)]
++    .map((match) => ({
++      path: normalizeScriptPath(match[1]),
++      index: match.index ?? 0,
++    }))
++    .filter((script) => script.path);
++}
++
++function checkoutCommitIndex(value, commit) {
++  const escapedCommit = commit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
++  const match = normalizeText(value).match(
++    new RegExp(
++      `\\bgit\\s+(?:checkout|switch\\s+--detach)\\s+(?:[^\\n;&|]*\\s)?${escapedCommit}\\b`,
++      "i",
++    ),
++  );
++  return match?.index ?? -1;
++}
++
++function referencesClonedLocalScriptInstall(value) {
++  const text = normalizeText(value);
++  return (
++    /\bgit\s+clone\b/i.test(text) && LOCAL_SCRIPT_REFERENCE_PATTERN.test(text)
++  );
++}
++
++function hasBoundImmutableGithubScriptEvidence(sourceUrls, installText) {
++  const clonedRepoKeys = new Set(
++    collectGitCloneRepos(installText).map(githubRepoKey),
++  );
++  if (!clonedRepoKeys.size) return false;
++  const executedScripts = collectLocalScriptInstallRefs(installText);
++  if (!executedScripts.length) return false;
++
++  return sourceUrls.some((value) => {
++    const source = githubSourceRef(value);
++    if (
++      !source ||
++      !FULL_COMMIT_SHA_PATTERN.test(source.ref) ||
++      !isScriptPath(source.path) ||
++      !clonedRepoKeys.has(githubRepoKey(source))
++    ) {
++      return false;
++    }
++
++    const checkoutIndex = checkoutCommitIndex(installText, source.ref);
++    if (checkoutIndex < 0) return false;
++    const scriptPath = normalizeScriptPath(source.path);
++    return executedScripts.some(
++      (script) => script.path === scriptPath && checkoutIndex < script.index,
++    );
++  });
++}
++
++function isMutableGithubSourceUrl(value) {
++  const source = githubSourceRef(value);
++  return Boolean(source && !FULL_COMMIT_SHA_PATTERN.test(source.ref));
++}
++
+ function addContentRiskSignals(report, fields, text) {
+   const installText = lower(
+     [
+@@ -922,6 +1131,37 @@ function addContentRiskSignals(report, fields, text) {
+     );
+   }
+ 
++  // The submitted source URLs addSourceSignals collected for this report, which
++  // both ported checks below classify (the CI script calls the same list
++  // `submittedSourceUrls`).
++  const submittedSourceUrls = report.sourceUrls || [];
++
++  if (submittedSourceUrls.some(isLikelyAffiliateUrl)) {
++    addFlag(
++      report,
++      "high",
++      "affiliate_referral_url",
++      "Contributor content contains affiliate or referral URL parameters",
++      submittedSourceUrls.filter(isLikelyAffiliateUrl).join(", "),
++    );
++  }
++
++  if (
++    referencesClonedLocalScriptInstall(installText) &&
++    !hasBoundImmutableGithubScriptEvidence(submittedSourceUrls, installText)
++  ) {
++    const mutableSources = submittedSourceUrls.filter(isMutableGithubSourceUrl);
++    addFlag(
++      report,
++      "critical",
++      "mutable_script_install_source",
++      "Install instructions run a cloned local installer script without immutable script source evidence",
++      mutableSources.length
++        ? `Mutable GitHub source refs: ${mutableSources.slice(0, 5).join(", ")}`
++        : "Add a raw GitHub URL pinned to a full commit SHA for the executed installer script, or replace the script execution with reviewed commands.",
++    );
++  }
++
+   if (
+     /\b(ghp_[a-z0-9_]{20,}|github_pat_[a-z0-9_]{40,}|sk-[a-z0-9]{20,}|akia[0-9a-z]{16}|xq_[a-f0-9]{40,})\b/i.test(
+       text,
+@@ -1397,6 +1637,10 @@ export function directContentRequestChangesReasons(report = {}) {
+       "Community PRs cannot request HeyClaude-hosted /downloads package URLs.",
+     commercial_listing_route:
+       "Commercial API relays, paid gateways, and pay-per-use proxy services belong in the tools/listing flow.",
++    affiliate_referral_url:
++      "Contributor content cannot include affiliate or referral URL parameters.",
++    mutable_script_install_source:
++      "Install instructions run a cloned local installer script without immutable script source evidence.",
+     non_https_executable_source:
+       "Install or usage instructions fetch executable content from a non-HTTPS URL.",
+     unsafe_install_pipeline:
+diff --git a/tests/submission-risk-invariants.test.ts b/tests/submission-risk-invariants.test.ts
+index 6cb73a69b..ba49fc338 100644
+--- a/tests/submission-risk-invariants.test.ts
++++ b/tests/submission-risk-invariants.test.ts
+@@ -528,3 +528,106 @@ describe("www.github.com source URL normalization", () => {
+     );
+   });
+ });
++
++describe("checks ported from validate-content-policy", () => {
++  // These two ran only in CI, so the risk report maintainers actually read
++  // could show "medium, 0 blocking flags" for a submission the gate blocks.
++  const SHA = "a".repeat(40);
++
++  function flagsFor(fields: Record<string, unknown>) {
++    const report = analyzeSubmissionDraftRisk({ title: "t", body: "b" }, {
++      fields,
++    } as never);
++    return {
++      ids: (report.reviewFlags || []).map((flag) => flag.id),
++      flags: report.reviewFlags || [],
++      tier: report.riskTier,
++    };
++  }
++
++  it("flags affiliate and referral source URLs as high", () => {
++    for (const url of [
++      "https://example.com/tool?ref=abc123",
++      "https://example.com/tool?utm_affiliate=x",
++      "https://example.com/referral/xyz",
++    ]) {
++      const { ids, flags } = flagsFor({ github_url: url });
++      expect(ids, url).toContain("affiliate_referral_url");
++      expect(
++        flags.find((flag) => flag.id === "affiliate_referral_url")?.severity,
++      ).toBe("high");
++    }
++  });
++
++  it("does not treat a docs reference path as an affiliate link", () => {
++    expect(
++      flagsFor({ github_url: "https://go.dev/ref/mod" }).ids,
++    ).not.toContain("affiliate_referral_url");
++    expect(
++      flagsFor({ github_url: "https://github.com/acme/tool" }).ids,
++    ).not.toContain("affiliate_referral_url");
++  });
++
++  it("flags a cloned installer script with no immutable source as critical", () => {
++    const { ids, flags, tier } = flagsFor({
++      github_url: "https://github.com/acme/tool",
++      install_command:
++        "git clone https://github.com/acme/tool && cd tool && ./install.sh",
++    });
++
++    expect(ids).toContain("mutable_script_install_source");
++    expect(
++      flags.find((flag) => flag.id === "mutable_script_install_source")
++        ?.severity,
++    ).toBe("critical");
++    expect(tier).toBe("critical");
++  });
++
++  it("accepts a cloned installer script pinned to a full commit SHA", () => {
++    const { ids } = flagsFor({
++      github_url: `https://raw.githubusercontent.com/acme/tool/${SHA}/install.sh`,
++      install_command: `git clone https://github.com/acme/tool && cd tool && git checkout ${SHA} && ./install.sh`,
++    });
++
++    expect(ids).not.toContain("mutable_script_install_source");
++  });
++
++  it("leaves submissions that trigger neither check unchanged", () => {
++    const { ids, tier } = flagsFor({
++      github_url: "https://github.com/acme/tool",
++      install_command: "npm install acme",
++    });
++
++    expect(ids).not.toContain("affiliate_referral_url");
++    expect(ids).not.toContain("mutable_script_install_source");
++    expect(tier).toBe("medium");
++  });
++
++  it("surfaces both flags as direct-PR request-changes reasons", () => {
++    const reasons = directContentRequestChangesReasons({
++      subject: {
++        type: "pull_request",
++        changedFileCount: 1,
++        contentFileCount: 1,
++      },
++      sourceType: "external_direct",
++      reviewFlags: [
++        { id: "affiliate_referral_url", severity: "high", summary: "" },
++        {
++          id: "mutable_script_install_source",
++          severity: "critical",
++          summary: "",
++        },
++      ],
++    });
++
++    expect(reasons.join(" | ")).toContain("affiliate_referral_url");
++    expect(reasons.join(" | ")).toContain("mutable_script_install_source");
++    // The critical flag must not also produce the generic catch-all reason.
++    expect(
++      reasons.filter((reason) =>
++        reason.includes("mutable_script_install_source"),
++      ),
++    ).toHaveLength(1);
++  });
++});

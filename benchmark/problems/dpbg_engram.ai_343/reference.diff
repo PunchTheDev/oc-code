@@ -1,0 +1,226 @@
+diff --git a/sdk/src/activelearning/__init__.py b/sdk/src/activelearning/__init__.py
+index 11e1b06..bc093b6 100644
+--- a/sdk/src/activelearning/__init__.py
++++ b/sdk/src/activelearning/__init__.py
+@@ -21,7 +21,7 @@
+     current_timestamp,
+     generate_trace_id,
+ )
+-from activelearning.database import Database, get_database
++from activelearning.database import Database, close_database, get_database
+ from activelearning.embeddings import (
+     EmbeddingService,
+     embed_batch,
+@@ -37,7 +37,7 @@
+     schema_for_subject,
+     validate_payload,
+ )
+-from activelearning.nats_client import EventBus, get_event_bus
++from activelearning.nats_client import EventBus, close_event_bus, get_event_bus
+ from activelearning.plugins import ActuatorPlugin, SensorPlugin, register_actuator, register_sensor
+ from activelearning.qdrant_store import QdrantHit, QdrantPoint, QdrantStore
+ from activelearning.signing import (
+@@ -78,9 +78,11 @@
+     # NATS client
+     "EventBus",
+     "get_event_bus",
++    "close_event_bus",
+     # Database
+     "Database",
+     "get_database",
++    "close_database",
+     # Embeddings
+     "EmbeddingService",
+     "get_embedding_service",
+diff --git a/sdk/src/activelearning/database.py b/sdk/src/activelearning/database.py
+index 8ef9c8b..c1466ba 100644
+--- a/sdk/src/activelearning/database.py
++++ b/sdk/src/activelearning/database.py
+@@ -261,15 +261,17 @@ async def get_database() -> Database:
+ 
+ 
+ async def close_database() -> None:
+-    """Close and reset the global database singleton, if open.
++    """Close and reset the global database singleton, if open (issue #248).
+ 
+-    Production services never call this — BaseService.stop() deliberately
++    Production services never call this — ``BaseService.stop()`` deliberately
+     leaves the singleton open and relies on process exit to reap it. But
+-    aiosqlite's connection worker runs on a non-daemon thread, so a test
+-    process that opens the singleton via get_database() (e.g. by driving a
+-    service through its real start()/stop() lifecycle) and never closes it
+-    will hang at interpreter shutdown waiting for that thread to join. Tests
+-    doing real end-to-end service lifecycles must call this in teardown.
++    ``aiosqlite``'s connection worker runs on a non-daemon thread, so a test
++    process that opens the singleton via ``get_database()`` (e.g. by driving a
++    service through its real ``start()``/``stop()`` lifecycle) and never
++    closes it will hang at interpreter shutdown waiting for that thread to
++    join — and the still-open singleton leaks into whatever test runs next in
++    the same pytest process, regardless of collection order. Tests that
++    exercise the real singleton must call this in teardown.
+     """
+     global _db
+     if _db is not None:
+diff --git a/sdk/src/activelearning/nats_client.py b/sdk/src/activelearning/nats_client.py
+index f778142..5d4cf07 100644
+--- a/sdk/src/activelearning/nats_client.py
++++ b/sdk/src/activelearning/nats_client.py
+@@ -1016,6 +1016,25 @@ async def get_event_bus() -> EventBus:
+     return _global_bus
+ 
+ 
++async def close_event_bus() -> None:
++    """Close and reset the global EventBus singleton, if open (issue #248).
++
++    Mirrors ``activelearning.database.close_database()``. Nothing in the
++    production runtime calls this — a real service's process exit reclaims
++    the connection. But a test that exercises ``get_event_bus()`` (or the
++    module-level ``publish()``/``subscribe()`` convenience functions above,
++    which route through it) and never closes it leaves a connected
++    ``EventBus`` sitting in this module's global for every subsequent test in
++    the same pytest process to inherit — regardless of collection order, and
++    potentially pointed at a broker a later test has already torn down. Tests
++    that exercise the real singleton must call this in teardown.
++    """
++    global _global_bus
++    if _global_bus is not None:
++        await _global_bus.close()
++        _global_bus = None
++
++
+ async def publish(subject: str, data: Any) -> None:
+     """Convenience function to publish via global bus."""
+     bus = await get_event_bus()
+diff --git a/sdk/tests/conftest.py b/sdk/tests/conftest.py
+index 48c81a8..df0160f 100644
+--- a/sdk/tests/conftest.py
++++ b/sdk/tests/conftest.py
+@@ -15,9 +15,30 @@
+ 
+ import pytest
+ 
++import activelearning.database as _database_module
++import activelearning.nats_client as _nats_client_module
+ from activelearning.nats_client import EventBus
+ 
+ 
++@pytest.fixture(autouse=True)
++async def _reset_global_singletons() -> AsyncGenerator[None, None]:
++    """Guarantee each test starts and ends with no live global singleton.
++
++    ``activelearning.database._db`` and ``activelearning.nats_client._global_bus``
++    are lazily-created module-level singletons with no built-in reset (issue
++    #248). A test that exercises either one for real — e.g. by driving a
++    ``BaseService`` subclass through its actual ``start()``/``stop()``
++    lifecycle instead of mocking ``get_database``/``get_event_bus`` — leaves it
++    connected for every later test in the same pytest process to inherit,
++    regardless of collection order. This autouse fixture closes and resets
++    both after every test in this suite so that class of leak cannot occur
++    here even if a future test forgets to clean up after itself.
++    """
++    yield
++    await _database_module.close_database()
++    await _nats_client_module.close_event_bus()
++
++
+ def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+         sock.settimeout(timeout)
+diff --git a/sdk/tests/test_global_singletons.py b/sdk/tests/test_global_singletons.py
+new file mode 100644
+index 0000000..a1bb078
+--- /dev/null
++++ b/sdk/tests/test_global_singletons.py
+@@ -0,0 +1,92 @@
++"""Regression coverage for the reset hooks added for issue #248.
++
++``activelearning.database._db`` and ``activelearning.nats_client._global_bus``
++are lazily-created module-level singletons. Before this issue, neither had a
++reset hook, so a test that exercised the real singleton (instead of mocking
++``get_database``/``get_event_bus``) leaked it to every later test in the same
++pytest process. ``close_database()``/``close_event_bus()`` close the
++underlying connection and reset the module global so the next
++``get_database()``/``get_event_bus()`` call creates a fresh instance.
++
++The autouse fixture in ``conftest.py`` already calls both after every test in
++this suite; these tests exercise the reset functions directly so their
++contract (idempotent no-op when nothing is open; genuinely fresh instance
++after reset) is pinned independently of that fixture.
++"""
++
++from __future__ import annotations
++
++import activelearning.database as database_module
++import activelearning.nats_client as nats_client_module
++from activelearning.database import close_database, get_database
++from activelearning.nats_client import close_event_bus, get_event_bus
++
++
++class TestDatabaseSingletonReset:
++    async def test_close_database_is_noop_when_never_created(self):
++        assert database_module._db is None
++        await close_database()  # must not raise
++        assert database_module._db is None
++
++    async def test_get_database_returns_same_instance_until_closed(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "singleton-test.db"))
++        try:
++            first = await get_database()
++            second = await get_database()
++            assert first is second
++        finally:
++            await close_database()
++
++    async def test_close_database_resets_module_global(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "singleton-test.db"))
++        await get_database()
++        assert database_module._db is not None
++
++        await close_database()
++
++        assert database_module._db is None
++
++    async def test_get_database_after_close_creates_fresh_instance(self, tmp_path, monkeypatch):
++        monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "singleton-test.db"))
++        first = await get_database()
++        await close_database()
++        try:
++            second = await get_database()
++            assert second is not first
++        finally:
++            await close_database()
++
++
++class TestEventBusSingletonReset:
++    async def test_close_event_bus_is_noop_when_never_created(self):
++        assert nats_client_module._global_bus is None
++        await close_event_bus()  # must not raise
++        assert nats_client_module._global_bus is None
++
++    async def test_get_event_bus_returns_same_instance_until_closed(self, nats_url, monkeypatch):
++        monkeypatch.setenv("NATS_URL", nats_url)
++        try:
++            first = await get_event_bus()
++            second = await get_event_bus()
++            assert first is second
++        finally:
++            await close_event_bus()
++
++    async def test_close_event_bus_resets_module_global(self, nats_url, monkeypatch):
++        monkeypatch.setenv("NATS_URL", nats_url)
++        await get_event_bus()
++        assert nats_client_module._global_bus is not None
++
++        await close_event_bus()
++
++        assert nats_client_module._global_bus is None
++
++    async def test_get_event_bus_after_close_creates_fresh_instance(self, nats_url, monkeypatch):
++        monkeypatch.setenv("NATS_URL", nats_url)
++        first = await get_event_bus()
++        await close_event_bus()
++        try:
++            second = await get_event_bus()
++            assert second is not first
++        finally:
++            await close_event_bus()

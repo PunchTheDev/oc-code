@@ -1,0 +1,249 @@
+diff --git a/packages/loopover-miner/lib/attempt-cli.ts b/packages/loopover-miner/lib/attempt-cli.ts
+index a896ec5bc..643af871f 100644
+--- a/packages/loopover-miner/lib/attempt-cli.ts
++++ b/packages/loopover-miner/lib/attempt-cli.ts
+@@ -20,7 +20,7 @@ import {
+   resolveCodingAgentModeFromConfig,
+   resolveFirstConfiguredCodingAgentDriverName,
+ } from "@loopover/engine";
+-import type { AttemptDbFork, AttemptDbForkConfig, CodingAgentExecutionMode, FeasibilityVerdict, LocalWriteActionSpec } from "@loopover/engine";
++import type { AttemptDbFork, AttemptDbForkConfig, CodingAgentExecutionMode, FeasibilityVerdict, LocalWriteActionSpec, SignalStore } from "@loopover/engine";
+ import { argsWantJson, describeCliError, reportCliFailure } from "./cli-error.js";
+ import { resolveAttemptDbForkConfig } from "./attempt-db-fork-config.js";
+ import { constructProductionCodingAgentDriver } from "./coding-agent-construction.js";
+@@ -33,8 +33,9 @@ import { resolveMinerGoalSpec } from "./miner-goal-spec.js";
+ import { resolveClaimConflict } from "./claim-conflict-resolver.js";
+ import type { ClaimConflictResult, resolveClaimConflict as ResolveClaimConflictFn } from "./claim-conflict-resolver.js";
+ import { parsePrNumberFromExecResult } from "./pr-number-parse.js";
+-import { initEventLedger } from "./event-ledger.js";
++import { appendEvent, initEventLedger, readEvents } from "./event-ledger.js";
+ import type { EventLedger } from "./event-ledger.js";
++import { createSignalTrackingStore } from "./signal-tracking-store.js";
+ import { initAttemptLog } from "./attempt-log.js";
+ import type { AttemptLog } from "./attempt-log.js";
+ import { initGovernorLedger } from "./governor-ledger.js";
+@@ -137,6 +138,7 @@ export type RunAttemptOptions = {
+   initEventLedger?: () => EventLedger;
+   initAttemptLog?: () => AttemptLog;
+   initGovernorLedger?: () => GovernorLedger;
++  initSignalTrackingStore?: () => SignalStore;
+   buildAttemptDeps?: typeof buildAttemptDeps;
+   resolveRejectionSignaled?: typeof ResolveRejectionSignaledFn;
+   fetchImpl?: SelfReviewContextFetch;
+@@ -299,6 +301,40 @@ export function buildAttemptDeps(
+  * runMinerAttempt for real. The worktree is cleaned up (or retained, per the real outcome) in `finally`.
+  * See this file's header for the documented gaps (real convergence history).
+  */
++// #8543: the default SignalStore, backed by the miner's own shared local event ledger -- identical to
++// discover-cli.ts's initDefaultSignalTrackingStore (same appendEvent/readEvents singleton).
++function initDefaultSignalTrackingStore(): SignalStore {
++  return createSignalTrackingStore({ appendEvent, readEvents });
++}
++
++// #8543: record one RuleFiredEvent per feasibility avoid/raise reason on the infeasible attempt path, in the
++// canonical signal_rule_fired shape. Best-effort discipline mirrored verbatim from discover-cli.ts's
++// recordEligibilityExclusionSignals: store-init failure and each individual write failure are swallowed so
++// the caller's console output, JSON result, and exit code are unaffected. targetKey is byte-identical to
++// that sibling's `${repoFullName}#issue-${issueNumber}` format.
++async function recordFeasibilityVerdictSignals(
++  verdict: { repoFullName: string; issueNumber: number; avoidReasons: readonly string[]; raiseReasons: readonly string[] },
++  options: Pick<RunAttemptOptions, "initSignalTrackingStore" | "nowMs">,
++): Promise<void> {
++  if (verdict.avoidReasons.length === 0 && verdict.raiseReasons.length === 0) return;
++  let store: SignalStore | null = null;
++  try {
++    store = (options.initSignalTrackingStore ?? initDefaultSignalTrackingStore)();
++  } catch {
++    store = null;
++  }
++  if (!store) return;
++  const occurredAt = new Date(options.nowMs ?? Date.now()).toISOString();
++  const targetKey = `${verdict.repoFullName}#issue-${verdict.issueNumber}`;
++  const fired = [
++    ...verdict.avoidReasons.map((reason) => ({ reason, outcome: "avoid" as const })),
++    ...verdict.raiseReasons.map((reason) => ({ reason, outcome: "raise" as const })),
++  ];
++  for (const entry of fired) {
++    await store.recordRuleFired({ ruleId: entry.reason, targetKey, outcome: entry.outcome, occurredAt }).catch(() => undefined);
++  }
++}
++
+ export async function runAttempt(args: string[], options: RunAttemptOptions = {}): Promise<number> {
+   const parsed = parseAttemptArgs(args);
+   if ("error" in parsed) {
+@@ -533,6 +569,21 @@ export async function runAttempt(args: string[], options: RunAttemptOptions = {}
+         repoFullName: parsed.repoFullName,
+         payload: { issueNumber: parsed.issueNumber, reason },
+       });
++      // #8543: capture the feasibility verdict's reasons as rule-fired signals so feasibility rules can be
++      // precision-scored the same way discovery's eligibility exclusions already are (#8107). Best-effort:
++      // never changes this branch's console output, JSON result, or exit code.
++      await recordFeasibilityVerdictSignals(
++        {
++          repoFullName: parsed.repoFullName,
++          issueNumber: parsed.issueNumber,
++          avoidReasons: codingTaskSpec.feasibility.avoidReasons,
++          raiseReasons: codingTaskSpec.feasibility.raiseReasons,
++        },
++        {
++          ...(options.initSignalTrackingStore ? { initSignalTrackingStore: options.initSignalTrackingStore } : {}),
++          ...(options.nowMs === undefined ? {} : { nowMs: options.nowMs }),
++        },
++      );
+       const infeasibleResult = {
+         outcome: "blocked_infeasible",
+         reason,
+diff --git a/test/unit/miner-attempt-cli.test.ts b/test/unit/miner-attempt-cli.test.ts
+index e7f3231cd..8cd1c9c15 100644
+--- a/test/unit/miner-attempt-cli.test.ts
++++ b/test/unit/miner-attempt-cli.test.ts
+@@ -16,6 +16,8 @@ import { closeDefaultWorktreeAllocator, openWorktreeAllocator } from "../../pack
+ import { closeDefaultPortfolioQueueStore } from "../../packages/loopover-miner/lib/portfolio-queue.js";
+ import { closeDefaultGovernorState } from "../../packages/loopover-miner/lib/governor-state.js";
+ import { buildAttemptDeps, parseAttemptArgs, runAttempt } from "../../packages/loopover-miner/lib/attempt-cli.js";
++import type { RunAttemptOptions } from "../../packages/loopover-miner/lib/attempt-cli.js";
++import type { RuleFiredEvent, SignalStore } from "../../packages/loopover-engine/src/calibration/signal-tracking.js";
+ import * as minerSentryModule from "../../packages/loopover-miner/lib/sentry.js";
+ import * as liveIssueSnapshotModule from "../../packages/loopover-miner/lib/live-issue-snapshot.js";
+ import * as githubTokenResolutionModule from "../../packages/loopover-miner/lib/github-token-resolution.js";
+@@ -1225,6 +1227,140 @@ describe("runAttempt (#5132)", () => {
+     expect(cleanupAttemptWorktreeSpy).toHaveBeenCalledWith(expect.any(String), expect.any(String), true);
+   });
+ 
++  // #8543: a fake SignalStore that records every recordRuleFired call, so the capture on the infeasible
++  // path can be asserted event-for-event. queryRuleHistory/recordHumanOverride are unused here.
++  function fakeSignalStore(overrides: { recordRuleFired?: (event: RuleFiredEvent) => Promise<void> } = {}) {
++    const fired: RuleFiredEvent[] = [];
++    const store = {
++      recordRuleFired: overrides.recordRuleFired ?? (async (event: RuleFiredEvent) => void fired.push(event)),
++      recordHumanOverride: async () => undefined,
++      queryRuleHistory: async () => ({ fired: [], overrides: [] }),
++    } as unknown as SignalStore;
++    return { store, fired };
++  }
++
++  const infeasibleArgs = ["acme/widgets", "7", "--miner-login", "alice", "--json"] as const;
++  function infeasibleOptions(extra: Partial<RunAttemptOptions>, feasibility: { avoidReasons: string[]; raiseReasons: string[] }) {
++    const { allocator, claimLedger, eventLedger, attemptLog, governorLedger } = tempLedgers();
++    return {
++      ledgers: { allocator, claimLedger, eventLedger, attemptLog, governorLedger },
++      options: {
++        env: { MINER_CODING_AGENT_PROVIDER: "noop" },
++        attemptId: "infeasible-attempt",
++        openWorktreeAllocator: () => allocator,
++        openClaimLedger: () => claimLedger,
++        initEventLedger: () => eventLedger,
++        initAttemptLog: () => attemptLog,
++        initGovernorLedger: () => governorLedger,
++        ...readyPipelineOptions({
++          buildCodingTaskSpec: () => ({
++            ready: false,
++            verdict: "raise",
++            feasibility: { verdict: "raise", ...feasibility, summary: "infeasible" },
++          }),
++          runMinerAttempt: vi.fn(),
++          cleanupAttemptWorktree: vi.fn().mockResolvedValue({ ok: true, removed: true }),
++        }),
++        ...extra,
++      } as RunAttemptOptions,
++    };
++  }
++
++  it("#8543: records one avoid/raise rule-fired signal per feasibility reason on the infeasible path", async () => {
++    vi.spyOn(console, "log").mockImplementation(() => undefined);
++    const { store, fired } = fakeSignalStore();
++    const { options } = infeasibleOptions(
++      { initSignalTrackingStore: () => store, nowMs: 1_700_000_000_000 },
++      { avoidReasons: ["claim_status_solved", "issue_quality_do_not_use"], raiseReasons: ["duplicate_cluster_high"] },
++    );
++
++    const exitCode = await runAttempt([...infeasibleArgs], options);
++
++    expect(exitCode).toBe(4);
++    expect(fired).toEqual([
++      { ruleId: "claim_status_solved", targetKey: "acme/widgets#issue-7", outcome: "avoid", occurredAt: "2023-11-14T22:13:20.000Z" },
++      { ruleId: "issue_quality_do_not_use", targetKey: "acme/widgets#issue-7", outcome: "avoid", occurredAt: "2023-11-14T22:13:20.000Z" },
++      { ruleId: "duplicate_cluster_high", targetKey: "acme/widgets#issue-7", outcome: "raise", occurredAt: "2023-11-14T22:13:20.000Z" },
++    ]);
++  });
++
++  it("#8543: records NOTHING when the coding-task-spec is ready (capture is scoped to the infeasible branch)", async () => {
++    const { allocator, claimLedger, eventLedger, attemptLog, governorLedger } = tempLedgers();
++    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
++    const { store, fired } = fakeSignalStore();
++    const worktreeResult = fakeWorktreeResult();
++    const runMinerAttemptSpy = vi.fn().mockResolvedValue({
++      outcome: "submitted",
++      spec: { command: "gh pr create", cwd: worktreeResult.worktreePath, timeoutMs: 1000 },
++      execResult: { code: 0 },
++      loopResult: fakeLoopResult({ outcome: "handoff", totalTurnsUsed: 3, totalCostUsd: 0.42, iterationsUsed: 2, finalMeterTotals: { tokens: 1234, turns: 3, wallClockMs: 500, costUsd: 0.42 } }),
++    });
++
++    const exitCode = await runAttempt(["acme/widgets", "7", "--miner-login", "alice", "--json"], {
++      env: { MINER_CODING_AGENT_PROVIDER: "noop" },
++      nowMs: 999,
++      attemptId: "ready-attempt",
++      openWorktreeAllocator: () => allocator,
++      openClaimLedger: () => claimLedger,
++      initEventLedger: () => eventLedger,
++      initAttemptLog: () => attemptLog,
++      initGovernorLedger: () => governorLedger,
++      initSignalTrackingStore: () => store,
++      ...readyPipelineOptions({ cleanupAttemptWorktree: vi.fn().mockResolvedValue({ ok: true, removed: true }), runMinerAttempt: runMinerAttemptSpy }),
++    });
++
++    // fakeCodingTaskSpec() is ready: true, so the attempt runs to a real submitted outcome and the
++    // feasibility capture -- gated on !codingTaskSpec.ready -- never fires.
++    expect(exitCode).toBe(0);
++    expect(fired).toEqual([]);
++  });
++
++  it("#8543: falls back to the default signal store (no seam) and to Date.now for the timestamp", async () => {
++    // No initSignalTrackingStore and no nowMs injected: exercises initDefaultSignalTrackingStore() and the
++    // `?? Date.now()` / `: {}` default arms. Best-effort discipline means the real default-ledger write is
++    // swallowed either way, so the only observable is the unchanged exit code.
++    vi.spyOn(console, "log").mockImplementation(() => undefined);
++    const { options } = infeasibleOptions({}, { avoidReasons: ["claim_status_solved"], raiseReasons: [] });
++    const exitCode = await runAttempt([...infeasibleArgs], options);
++    expect(exitCode).toBe(4);
++  });
++
++  it("#8543: records nothing when the verdict has no avoid or raise reasons (early return)", async () => {
++    vi.spyOn(console, "log").mockImplementation(() => undefined);
++    const { store, fired } = fakeSignalStore();
++    const { options } = infeasibleOptions({ initSignalTrackingStore: () => store }, { avoidReasons: [], raiseReasons: [] });
++    const exitCode = await runAttempt([...infeasibleArgs], options);
++    expect(exitCode).toBe(4);
++    expect(fired).toEqual([]);
++  });
++
++  it("#8543: a throwing initSignalTrackingStore does not change exit code, JSON result, or console output", async () => {
++    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
++    const { options } = infeasibleOptions(
++      { initSignalTrackingStore: () => { throw new Error("store init boom"); } },
++      { avoidReasons: ["claim_status_solved"], raiseReasons: [] },
++    );
++
++    const exitCode = await runAttempt([...infeasibleArgs], options);
++
++    expect(exitCode).toBe(4);
++    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toMatchObject({ outcome: "blocked_infeasible", reason: "infeasible_raise" });
++  });
++
++  it("#8543: a store whose recordRuleFired rejects is swallowed -- exit code and result unchanged", async () => {
++    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
++    const { store } = fakeSignalStore({ recordRuleFired: async () => { throw new Error("write boom"); } });
++    const { options } = infeasibleOptions(
++      { initSignalTrackingStore: () => store },
++      { avoidReasons: ["claim_status_solved"], raiseReasons: ["duplicate_cluster_high"] },
++    );
++
++    const exitCode = await runAttempt([...infeasibleArgs], options);
++
++    expect(exitCode).toBe(4);
++    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toMatchObject({ outcome: "blocked_infeasible" });
++  });
++
+   it("REGRESSION: infeasible WITHOUT --json prints the feasibility verdict on stderr and exits 4", async () => {
+     const { allocator, claimLedger, eventLedger, attemptLog, governorLedger } = tempLedgers();
+     const error = vi.spyOn(console, "error").mockImplementation(() => undefined);

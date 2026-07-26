@@ -1,0 +1,177 @@
+diff --git a/strategy/README.md b/strategy/README.md
+index 533a6f2..c765349 100644
+--- a/strategy/README.md
++++ b/strategy/README.md
+@@ -38,9 +38,10 @@ and swappable/updatable via a registry:
+ 
+ | transform | kind | best for |
+ |---|---|---|
+-| `rsvd`   | **data-dependent** range finder over A and B | general low-rank data (accurate) |
++| `rsvd`    | **data-dependent** range finder over A and B | general low-rank data (accurate) |
++| `nystrom` | **data-dependent** landmark columns of A/B + thin QR | low-rank data (cheaper basis than rsvd) |
+ 
+-`rsvd` is the **only** built-in transform. New transforms are the contribution
++`rsvd` and `nystrom` are the built-in transforms. New transforms are the contribution
+ surface — subclass `Transform` and register your own below.
+ 
+ Register your own (the updatable hook):
+diff --git a/strategy/tests/test_nystrom.py b/strategy/tests/test_nystrom.py
+new file mode 100644
+index 0000000..7ef9e0b
+--- /dev/null
++++ b/strategy/tests/test_nystrom.py
+@@ -0,0 +1,71 @@
++"""CPU-safe tests for the built-in ``nystrom`` transform.
++
++No GPU required — uses the smoke-test CPUBackend so these always run in the
++contributor CI path (`pytest strategy/tests`).
++"""
++from __future__ import annotations
++
++import os
++import sys
++
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
++
++from strategy.cpu_backend import CPUBackend
++from strategy.storage import generate
++from strategy.transforms import (
++    NystromTransform,
++    RandomizedSVDTransform,
++    available,
++    get_transform,
++)
++
++
++def test_nystrom_registered():
++    assert "nystrom" in available()
++    assert isinstance(get_transform("nystrom"), NystromTransform)
++
++
++def test_nystrom_requires_operands():
++    backend = CPUBackend(verbose=False)
++    t = NystromTransform(seed=0)
++    try:
++        t.basis(32, 8, backend, np.float32, A=None, B=None)
++        assert False, "expected ValueError when A/B missing"
++    except ValueError as e:
++        assert "nystrom" in str(e)
++
++
++def test_nystrom_basis_shape_orthonormal():
++    backend = CPUBackend(verbose=False)
++    n, m = 64, 16
++    A = generate(n, np.float32, False, None, seed=1, fill="lowrank", data_rank=4)
++    B = generate(n, np.float32, False, None, seed=2, fill="lowrank", data_rank=4)
++    Q = NystromTransform(seed=0).basis(n, m, backend, np.float32, A=A, B=B)
++    Qh = backend.to_host(Q).astype(np.float64)
++
++    assert Qh.shape == (n, m)
++    assert np.isfinite(Qh).all()
++    gram = Qh.T @ Qh
++    assert float(np.linalg.norm(gram - np.eye(m))) < 1e-5
++
++
++def test_nystrom_seed_deterministic():
++    backend = CPUBackend(verbose=False)
++    n, m = 48, 12
++    A = generate(n, np.float32, False, None, seed=3, fill="random")
++    B = generate(n, np.float32, False, None, seed=4, fill="random")
++    Q1 = backend.to_host(NystromTransform(seed=7).basis(n, m, backend, np.float32, A, B))
++    Q2 = backend.to_host(NystromTransform(seed=7).basis(n, m, backend, np.float32, A, B))
++    Q3 = backend.to_host(NystromTransform(seed=8).basis(n, m, backend, np.float32, A, B))
++    assert np.allclose(Q1, Q2)
++    assert not np.allclose(Q1, Q3)
++
++
++def test_nystrom_basis_flops_honest_and_cheaper_than_rsvd():
++    n, m = 12000, 1500
++    ny = NystromTransform().basis_flops(n, m)
++    assert ny == 2.0 * n * m * m
++    assert ny > 0.0
++    assert ny < RandomizedSVDTransform().basis_flops(n, m)
+diff --git a/strategy/transforms.py b/strategy/transforms.py
+index 7daa6cb..6b0d74a 100644
+--- a/strategy/transforms.py
++++ b/strategy/transforms.py
+@@ -4,9 +4,9 @@
+ subspace we compress into. The quality of the approximation is entirely
+ determined by how well Q captures the column/row spaces of A and B.
+ 
+-The only built-in transform is ``rsvd`` (a data-dependent randomized range
+-finder). Everything else is a contribution: subclass ``Transform`` and register
+-it.
++Built-in transforms: ``rsvd`` (data-dependent randomized range finder) and
++``nystrom`` (landmark column sampling for low-rank data). Everything else is a
++contribution: subclass ``Transform`` and register it.
+ 
+ Add your own (this is the updatable hook):
+ 
+@@ -102,6 +102,58 @@ def basis_flops(self, n, m):
+         return 2.0 * n * n * m + 2.0 * n * m * m
+ 
+ 
++class NystromTransform(Transform):
++    """Landmark / Nyström column sampling over A and B.
++
++    Splits the M-column budget across col(A), row(A), col(B), and row(B) —
++    the same four spaces ``rsvd`` sketches — but forms each block by gathering
++    random landmark columns (or rows-as-columns) instead of random projections.
++    On genuine low-rank couples the landmarks span those spaces once enough
++    columns are drawn, so the thin QR that follows is enough; basis cost is
++    essentially the QR (``~2 N M²``), not ``rsvd``'s ``~2 N² M`` sketches.
++    """
++
++    name = "nystrom"
++
++    def basis(self, n, m, backend, dtype, A=None, B=None):
++        if A is None or B is None:
++            raise ValueError("nystrom transform needs A and B")
++        if m < 1 or m > n:
++            raise ValueError(f"nystrom requires 1 <= m <= n; got m={m}, n={n}")
++
++        base, rem = divmod(m, 4)
++        widths = [base + (1 if i < rem else 0) for i in range(4)]
++        rng = np.random.default_rng(self.seed)
++
++        def landmark_cols(X, w):
++            # Gather w distinct columns of X into an (n, w) host block.
++            idx = rng.choice(n, size=w, replace=False)
++            return np.asarray(X[:, idx]).astype(dtype, copy=False)
++
++        def landmark_rows_as_cols(X, w):
++            # Rows of X as columns of Xᵀ — captures the row space.
++            idx = rng.choice(n, size=w, replace=False)
++            return np.asarray(X[idx, :]).T.astype(dtype, copy=False)
++
++        parts = []
++        if widths[0]:
++            parts.append(backend.to_device(landmark_cols(A, widths[0])))
++        if widths[1]:
++            parts.append(backend.to_device(landmark_rows_as_cols(A, widths[1])))
++        if widths[2]:
++            parts.append(backend.to_device(landmark_cols(B, widths[2])))
++        if widths[3]:
++            parts.append(backend.to_device(landmark_rows_as_cols(B, widths[3])))
++
++        Y = backend.xp.concatenate(parts, axis=1)  # (n, m)
++        return self._orthonormalize(Y, backend)
++
++    def basis_flops(self, n, m):
++        # Column/row gathers are memory traffic, not FLOPs. The mandatory cost
++        # is the thin QR of the (n, m) landmark stack (~2 n m²).
++        return 2.0 * n * m * m
++
++
+ _REGISTRY: dict[str, type[Transform]] = {}
+ 
+ 
+@@ -123,5 +175,5 @@ def available() -> list[str]:
+     return sorted(_REGISTRY)
+ 
+ 
+-for _cls in (RandomizedSVDTransform,):
++for _cls in (RandomizedSVDTransform, NystromTransform):
+     register_transform(_cls.name, _cls)

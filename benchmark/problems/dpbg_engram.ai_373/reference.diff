@@ -1,0 +1,493 @@
+diff --git a/.github/workflows/test.yml b/.github/workflows/test.yml
+index 982bfa7b..63257fce 100644
+--- a/.github/workflows/test.yml
++++ b/.github/workflows/test.yml
+@@ -76,7 +76,11 @@ jobs:
+         working-directory: neuromorphic
+         env:
+           ENGRAM_SKIP_MUJOCO_LOOP: "1"
+-        run: uv run --extra dev --with-editable ../sdk python -m pytest tests/test_cognitive_bridge_lifecycle.py tests/test_cognitive_action.py::TestCognitiveBridgeService -v -p no:anchorpy
++        # test_training_session_complete_hook.py also imports neuromorphic.service
++        # (which imports activelearning), so it needs the same --with-editable ../sdk
++        # as the cognitive-bridge tests — the general neuromorphic job below has no
++        # SDK dependency at all.
++        run: uv run --extra dev --with-editable ../sdk python -m pytest tests/test_cognitive_bridge_lifecycle.py tests/test_cognitive_action.py::TestCognitiveBridgeService tests/test_training_session_complete_hook.py -v -p no:anchorpy
+ 
+       - name: Run neuromorphic tests
+         working-directory: neuromorphic
+@@ -84,7 +88,7 @@ jobs:
+         # stepping aborts (SIGABRT) nondeterministically on headless runners.
+         env:
+           ENGRAM_SKIP_MUJOCO_LOOP: "1"
+-        run: uv run --extra dev python -m pytest tests/ -v -p no:anchorpy --ignore=tests/test_cognitive_bridge_lifecycle.py
++        run: uv run --extra dev python -m pytest tests/ -v -p no:anchorpy --ignore=tests/test_cognitive_bridge_lifecycle.py --ignore=tests/test_training_session_complete_hook.py
+ 
+   benchmark-regression:
+     name: Neuromorphic benchmark regression gate
+diff --git a/deploy/scripts/gen-creds.sh b/deploy/scripts/gen-creds.sh
+index 1061aa4b..f8748f44 100755
+--- a/deploy/scripts/gen-creds.sh
++++ b/deploy/scripts/gen-creds.sh
+@@ -118,7 +118,7 @@ SVC_SUB[external-api]="external.query,external.status,decision.>,_INBOX.>"
+ # in-process under neuromorphic/src/neuromorphic/actuators/), governance
+ # proposals, and the memory/beliefs/knowledge-gap side channels.
+ SVC_PUB[neuromorphic]="proposal.new,memory.store,neuromorphic.metrics,neuromorphic.concept.result,gateway.restart.request,beliefs.add_node,approval.request,knowledge.gap,safety.watchdog.status,policy.restrict.request,mujoco.body.state,motor.execute.>,motor.outcome.>,neuromod.teach.da,body.posture,observation.visual.body,observation.proprioceptive,observation.pain,teach.progress,actuator.heartbeat.>,outcome.>,_INBOX.>"
+-SVC_SUB[neuromorphic]="observation.>,neuromorphic.status,neuromorphic.drives.event,neuromorphic.teach,neuromorphic.train_bulk,neuromorphic.concept.probe,cognitive.response.validated,motor.outcome.>,neuromod.teach.da,body.posture,decision.>,approval.response.>,motor.guidance,actuator.heartbeat.>,_INBOX.>"
++SVC_SUB[neuromorphic]="observation.>,neuromorphic.status,neuromorphic.drives.event,neuromorphic.teach,neuromorphic.train_bulk,neuromorphic.concept.probe,cognitive.response.validated,motor.outcome.>,neuromod.teach.da,body.posture,decision.>,approval.response.>,motor.guidance,actuator.heartbeat.>,training.session.complete,_INBOX.>"
+ 
+ # dashboard — publish surface is the operator's hands (sensory-gateway
+ # commands, motor guidance, safety halt/resume); subscribe stays the one
+@@ -142,7 +142,7 @@ SVC_SUB[coordinator]="task.request,demo.start,demo.observation,demo.finish,coord
+ SVC_PUB[cognitive-bridge]="cognitive.response.validate,_INBOX.>"
+ SVC_SUB[cognitive-bridge]="cognitive.execute,cognitive.query,_INBOX.>"
+ 
+-SVC_PUB[sensory-gateway]="observation.>,sensory.gateway.status,video.training.status,device.unknown,_INBOX.>"
++SVC_PUB[sensory-gateway]="observation.>,sensory.gateway.status,video.training.status,training.session.complete,device.unknown,_INBOX.>"
+ SVC_SUB[sensory-gateway]="sensory.gateway.command,neuromorphic.metrics,device.driver.ready,_INBOX.>"
+ 
+ # meta-programmer — previously had NO entry here at all (a real gap, not
+diff --git a/docs/adr/0001-nats-authz.md b/docs/adr/0001-nats-authz.md
+index cf7edaa5..c6cc2116 100644
+--- a/docs/adr/0001-nats-authz.md
++++ b/docs/adr/0001-nats-authz.md
+@@ -341,6 +341,7 @@ prefix/token family; the allowlist entry uses the wildcard form.
+ | `sensory.gateway.command` | dashboard | gateway | Operator commands. |
+ | `sensory.gateway.status` | gateway | dashboard | |
+ | `video.training.status` | gateway | dashboard | |
++| `training.session.complete` | gateway | neuro | Published when the video-training queue drains after processing at least one video (issue #324); neuro runs an auto-benchmark against a fresh, checkpoint-restored network and saves results to the standard `neuromorphic/benchmarks/*.json` location. |
+ 
+ ### System / observability
+ 
+diff --git a/neuromorphic/src/neuromorphic/service.py b/neuromorphic/src/neuromorphic/service.py
+index 04fef268..8740ad60 100644
+--- a/neuromorphic/src/neuromorphic/service.py
++++ b/neuromorphic/src/neuromorphic/service.py
+@@ -8,6 +8,7 @@
+ import time
+ from collections import defaultdict
+ from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
+ from typing import TYPE_CHECKING, Any
+ 
+ from activelearning import BaseService
+@@ -16,6 +17,7 @@
+ from activelearning.subjects import Subjects
+ 
+ from neuromorphic.auditory_stm import AuditorySTM, AuditorySTMConfig
++from neuromorphic.benchmarks import BenchmarkSuite
+ from neuromorphic.config import NeuromorphicConfig
+ from neuromorphic.encoding import _resolve_modality
+ from neuromorphic.network import NeuromorphicNetwork
+@@ -29,6 +31,21 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _resolve_benchmark_dir() -> Path:
++    """Where to save auto-benchmark results (issue #324).
++
++    Honors ``ENGRAM_BENCHMARK_DIR`` — the same env var the dashboard's
++    Learning Evidence panel already checks (``resolve_benchmark_dirs()`` in
++    ``dashboard/src/dashboard/learning_evidence.py``) — so results are picked
++    up with no extra wiring. Falls back to the same ``neuromorphic/benchmarks``
++    directory the manual CLI (``python -m neuromorphic.benchmarks``) defaults to.
++    """
++    env_dir = os.environ.get("ENGRAM_BENCHMARK_DIR", "").strip()
++    if env_dir:
++        return Path(env_dir)
++    return Path(__file__).resolve().parents[2] / "benchmarks"
++
++
+ class _SleepGroupAdapter:
+     """Adapts a SynapseGroup to the interface sleep replay needs.
+ 
+@@ -75,6 +92,8 @@ def __init__(self):
+         self._drive_task: asyncio.Task | None = None
+         self._metrics_task: asyncio.Task | None = None
+         self._save_task: asyncio.Task | None = None
++        # Auto-benchmark run triggered by training.session.complete (issue #324)
++        self._benchmark_task: asyncio.Task | None = None
+ 
+         # Latest observation per modality — written by _handle_observation,
+         # atomically swapped by the simulation loop.  Replaces the old
+@@ -232,6 +251,14 @@ async def _setup(self) -> None:
+         await self.event_bus.subscribe(
+             "cognitive.response.validated", self._handle_cognitive_response
+         )
++        # Auto-benchmark after a long training session (issue #324): sensory-gateway
++        # publishes this when its video queue drains after processing at least one
++        # video. Runs against a fresh, checkpoint-restored network — never the live
++        # self._network, whose weights must not be perturbed by synthetic benchmark
++        # stimuli.
++        await self.event_bus.subscribe(
++            Subjects.TRAINING_SESSION_COMPLETE, self._handle_training_session_complete
++        )
+         # Motor feedback loop — subscribe to outcome signals from actuators,
+         # sensors (IMU, camera, joints), simulators, or human teachers.
+         if self._config.motor_feedback.enabled:
+@@ -270,7 +297,13 @@ async def _cleanup(self) -> None:
+         self._running = False
+ 
+         # Cancel background tasks
+-        for task in [self._sim_task, self._drive_task, self._metrics_task, self._save_task]:
++        for task in [
++            self._sim_task,
++            self._drive_task,
++            self._metrics_task,
++            self._save_task,
++            self._benchmark_task,
++        ]:
+             if task and not task.done():
+                 task.cancel()
+                 try:
+@@ -588,6 +621,60 @@ async def _handle_concept_probe(self, data: dict[str, Any]) -> None:
+ 
+         await self.event_bus.publish("neuromorphic.concept.result", result)
+ 
++    async def _handle_training_session_complete(self, data: dict[str, Any]) -> None:
++        """React to a completed training session (issue #324) by auto-running
++        the benchmark suite and saving results using the existing CLI convention.
++
++        Guards against overlapping runs — sensory-gateway only publishes this
++        once per queue-drain, but a defensive check keeps a stray duplicate
++        publish from spawning two benchmark runs against the same checkpoint
++        at once.
++        """
++        if self._benchmark_task is not None and not self._benchmark_task.done():
++            self.logger.info("Auto-benchmark already running — skipping duplicate trigger")
++            return
++        self._benchmark_task = asyncio.create_task(self._run_auto_benchmark(data))
++
++    async def _run_auto_benchmark(self, trigger: dict[str, Any]) -> None:
++        """Build a fresh, checkpoint-restored network and run BenchmarkSuite on it.
++
++        Never runs against ``self._network``: BenchmarkSuite's training reps
++        inject synthetic Gaussian-blob/MFCC patterns and drive real STDP
++        updates, which would contaminate the live network's actual trained
++        weights. A separate instance restored from the same checkpoint the
++        live service periodically saves to keeps this read-only with respect
++        to the real brain — the same thing a human running the CLI manually
++        right after training would get.
++        """
++        self.logger.info(
++            f"Training session complete ({trigger.get('videos_completed', '?')} videos) "
++            "— running auto-benchmark"
++        )
++        try:
++            config = NeuromorphicConfig.from_env()
++            network = NeuromorphicNetwork(config)
++            persistence = NeuromorphicPersistence(config.sqlite_path)
++            await persistence.open()
++            try:
++                if await persistence.has_saved_state():
++                    state = await persistence.load_state()
++                    if state:
++                        network.set_state(state)
++            finally:
++                await persistence.close()
++
++            suite = BenchmarkSuite(network)
++            n_patterns = int(os.environ.get("NEURO_AUTO_BENCHMARK_PATTERNS", "20"))
++            training_reps = int(os.environ.get("NEURO_AUTO_BENCHMARK_REPS", "10"))
++            results = await asyncio.to_thread(suite.run_all, n_patterns, training_reps)
++            results["trigger"] = trigger
++            path = suite.save_results(results, str(_resolve_benchmark_dir()))
++            self.logger.info(f"Auto-benchmark complete: {path}")
++        except asyncio.CancelledError:
++            raise
++        except Exception as e:
++            self.logger.error(f"Auto-benchmark failed: {e}", exc_info=True)
++
+     async def _handle_cognitive_response(self, data: dict[str, Any]) -> None:
+         """Re-inject Kernel-validated LLM response as sensory input with boosted gain.
+ 
+diff --git a/neuromorphic/tests/test_training_session_complete_hook.py b/neuromorphic/tests/test_training_session_complete_hook.py
+new file mode 100644
+index 00000000..b4ab44ce
+--- /dev/null
++++ b/neuromorphic/tests/test_training_session_complete_hook.py
+@@ -0,0 +1,145 @@
++"""Tests for the auto-benchmark hook triggered after training (issue #324).
++
++Imports ``neuromorphic.service``, which requires the ``activelearning`` SDK —
++CI runs this file with ``--with-editable ../sdk`` (like
++test_cognitive_bridge_lifecycle.py), not in the general ``tests/`` sweep.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++
++import pytest
++
++_SMALL_NEURO_ENV = {
++    "NEURO_BRAINSTEM_N": "20",
++    "NEURO_REFLEX_N": "15",
++    "NEURO_SENSORY_N": "60",
++    "NEURO_MOTOR_N": "40",
++    "NEURO_CEREBELLUM_N": "30",
++    "NEURO_ASSOCIATION_N": "60",
++    "NEURO_PREDICTIVE_N": "30",
++    "NEURO_WORKING_MEM_N": "20",
++    "NEURO_FEATURE_N": "0",
++    "NEURO_CONCEPT_N": "0",
++    "NEURO_DG_N": "0",
++    "NEURO_META_N": "0",
++    "NEURO_AUTO_BENCHMARK_PATTERNS": "2",
++    "NEURO_AUTO_BENCHMARK_REPS": "1",
++}
++
++
++def _set_small_env(monkeypatch) -> None:
++    for key, value in _SMALL_NEURO_ENV.items():
++        monkeypatch.setenv(key, value)
++
++
++class TestTrainingSessionCompleteHook:
++    @pytest.mark.asyncio
++    async def test_skips_when_already_running(self, monkeypatch):
++        _set_small_env(monkeypatch)
++        from neuromorphic.service import NeuromorphicService
++
++        svc = NeuromorphicService()
++
++        hang_event = asyncio.Event()
++
++        async def _hang():
++            await hang_event.wait()
++
++        original_task = asyncio.create_task(_hang())
++        svc._benchmark_task = original_task
++        try:
++            await svc._handle_training_session_complete({"videos_completed": 3})
++            # No new task spawned — the original in-flight task is untouched.
++            assert svc._benchmark_task is original_task
++        finally:
++            hang_event.set()
++            original_task.cancel()
++            try:
++                await original_task
++            except asyncio.CancelledError:
++                pass
++
++    @pytest.mark.asyncio
++    async def test_spawns_task_when_idle(self, monkeypatch, tmp_path):
++        _set_small_env(monkeypatch)
++        monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "neuro.db"))
++        monkeypatch.setenv("ENGRAM_BENCHMARK_DIR", str(tmp_path / "benchmarks"))
++
++        from neuromorphic.service import NeuromorphicService
++
++        svc = NeuromorphicService()
++        assert svc._benchmark_task is None
++
++        await svc._handle_training_session_complete({"videos_completed": 1})
++        assert svc._benchmark_task is not None
++        await svc._benchmark_task  # let it finish
++
++    @pytest.mark.asyncio
++    async def test_run_auto_benchmark_never_touches_live_network(self, monkeypatch, tmp_path):
++        """The auto-benchmark must build its own network, not self._network —
++        BenchmarkSuite's training reps drive real STDP updates that would
++        contaminate the live brain's actual trained weights."""
++        _set_small_env(monkeypatch)
++        monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "neuro.db"))
++        monkeypatch.setenv("ENGRAM_BENCHMARK_DIR", str(tmp_path / "benchmarks"))
++
++        from neuromorphic.service import NeuromorphicService
++
++        svc = NeuromorphicService()
++        assert svc._network is None
++
++        await svc._run_auto_benchmark({"videos_completed": 2})
++
++        assert svc._network is None  # never constructed/assigned by the hook
++
++    @pytest.mark.asyncio
++    async def test_run_auto_benchmark_saves_results_with_trigger_metadata(
++        self, monkeypatch, tmp_path
++    ):
++        _set_small_env(monkeypatch)
++        monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "neuro.db"))
++        benchmark_dir = tmp_path / "benchmarks"
++        monkeypatch.setenv("ENGRAM_BENCHMARK_DIR", str(benchmark_dir))
++
++        from neuromorphic.service import NeuromorphicService
++
++        svc = NeuromorphicService()
++        await svc._run_auto_benchmark({"videos_completed": 4})
++
++        saved = list(benchmark_dir.glob("*.json"))
++        assert len(saved) == 1
++        data = json.loads(saved[0].read_text())
++        assert data["trigger"] == {"videos_completed": 4}
++        assert "energy_efficiency" in data
++
++    @pytest.mark.asyncio
++    async def test_run_auto_benchmark_survives_missing_checkpoint(self, monkeypatch, tmp_path):
++        """No prior checkpoint (fresh install) must not crash the hook —
++        the benchmark just runs against a freshly-initialized network."""
++        _set_small_env(monkeypatch)
++        monkeypatch.setenv("SQLITE_PATH", str(tmp_path / "does-not-exist.db"))
++        monkeypatch.setenv("ENGRAM_BENCHMARK_DIR", str(tmp_path / "benchmarks"))
++
++        from neuromorphic.service import NeuromorphicService
++
++        svc = NeuromorphicService()
++        await svc._run_auto_benchmark({"videos_completed": 1})  # must not raise
++
++
++class TestResolveBenchmarkDir:
++    def test_honors_env_override(self, tmp_path, monkeypatch):
++        from neuromorphic.service import _resolve_benchmark_dir
++
++        monkeypatch.setenv("ENGRAM_BENCHMARK_DIR", str(tmp_path / "custom-benchmarks"))
++        assert _resolve_benchmark_dir() == tmp_path / "custom-benchmarks"
++
++    def test_falls_back_to_repo_convention(self, monkeypatch):
++        from neuromorphic.service import _resolve_benchmark_dir
++
++        monkeypatch.delenv("ENGRAM_BENCHMARK_DIR", raising=False)
++        resolved = _resolve_benchmark_dir()
++        assert resolved.name == "benchmarks"
++        assert resolved.parent.name == "neuromorphic"
+diff --git a/sdk/src/activelearning/subjects.py b/sdk/src/activelearning/subjects.py
+index eb16d1fd..9821f342 100644
+--- a/sdk/src/activelearning/subjects.py
++++ b/sdk/src/activelearning/subjects.py
+@@ -84,6 +84,11 @@ class Subjects:
+     # Dead-letter queue (issue #246) — poisoned messages land on dlq.<subject>
+     DLQ_WILDCARD = "dlq.>"
+ 
++    # Training session completion (issue #324) — sensory-gateway publishes this
++    # when its video-training queue drains after processing at least one
++    # video; neuromorphic subscribes and runs an auto-benchmark.
++    TRAINING_SESSION_COMPLETE = "training.session.complete"
++
+ 
+ def decision_subject(trace_id: str) -> str:
+     """Per-trace kernel decision subject."""
+diff --git a/sensory-gateway/gateway.py b/sensory-gateway/gateway.py
+index e3a9de3f..4db74b60 100644
+--- a/sensory-gateway/gateway.py
++++ b/sensory-gateway/gateway.py
+@@ -44,11 +44,13 @@
+ 
+ from activelearning.nats_client import EventBus  # noqa: E402
+ from activelearning.plugins import register_sensor  # noqa: E402
++from activelearning.subjects import Subjects  # noqa: E402
+ 
+ from aggregating_bus import AggregatingEventBus  # noqa: E402
+ from dataset_manifest import DatasetManifest  # noqa: E402
+ from discovery import KNOWN_DEVICE_TYPES, DiscoveredDevice, discover_all  # noqa: E402
+ from queue_state import QueueStateManager  # noqa: E402
++from training_signal import should_publish_training_complete  # noqa: E402
+ from video_quality import VideoQualityGate  # noqa: E402
+ 
+ logger = logging.getLogger("sensory-gateway")
+@@ -60,6 +62,7 @@
+ SUBJECT_NEURO_METRICS = "neuromorphic.metrics"
+ SUBJECT_DEVICE_UNKNOWN = "device.unknown"
+ SUBJECT_DRIVER_READY = "device.driver.ready"
++SUBJECT_TRAINING_SESSION_COMPLETE = Subjects.TRAINING_SESSION_COMPLETE
+ 
+ # Key plastic synapse groups that indicate learning from sensory input
+ _LEARNING_SYNAPSE_GROUPS = {
+@@ -367,6 +370,7 @@ async def run(args: argparse.Namespace) -> None:
+     _queue_runner_task: asyncio.Task | None = None
+     _queue_advance_event = asyncio.Event()
+     _queue_state = QueueStateManager()
++    _videos_completed_since_drain = 0  # issue #324: gates training.session.complete
+     _quality_gate = VideoQualityGate()
+     _manifest = DatasetManifest()
+     _manifest.start_run(f"run_{int(time.time())}")
+@@ -585,11 +589,24 @@ def _get_queue_status() -> dict:
+ 
+     async def _queue_runner():
+         """Main queue loop: play one video at a time, advance when target loops reached."""
+-        nonlocal _queue_active_id
++        nonlocal _queue_active_id, _videos_completed_since_drain
+         while True:
+             # Wait for something in the queue
+             while not video_queue:
+                 _queue_active_id = None
++                if should_publish_training_complete(_videos_completed_since_drain):
++                    logger.info(
++                        f"Training queue drained after {_videos_completed_since_drain} "
++                        "video(s) — publishing training.session.complete"
++                    )
++                    await bus.publish(
++                        SUBJECT_TRAINING_SESSION_COMPLETE,
++                        {
++                            "videos_completed": _videos_completed_since_drain,
++                            "timestamp": time.time(),
++                        },
++                    )
++                    _videos_completed_since_drain = 0
+                 await bus.publish(
+                     SUBJECT_VIDEO_STATUS,
+                     {
+@@ -761,6 +778,8 @@ async def _queue_runner():
+             # Remove from front of queue and advance
+             if video_queue and video_queue[0] == started.session_id:
+                 video_queue.pop(0)
++            if started.status == "completed":
++                _videos_completed_since_drain += 1
+             _queue_active_id = None
+             _save_queue_state()
+             await bus.publish(
+diff --git a/sensory-gateway/tests/test_training_signal.py b/sensory-gateway/tests/test_training_signal.py
+new file mode 100644
+index 00000000..315eaaae
+--- /dev/null
++++ b/sensory-gateway/tests/test_training_signal.py
+@@ -0,0 +1,28 @@
++"""Unit tests for the training-session-complete predicate (issue #324).
++
++Pure logic, zero dependencies — no cv2/activelearning stubbing needed.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++
++_GATEWAY_ROOT = os.path.join(os.path.dirname(__file__), "..")
++if _GATEWAY_ROOT not in sys.path:
++    sys.path.insert(0, _GATEWAY_ROOT)
++
++from training_signal import should_publish_training_complete  # noqa: E402
++
++
++class TestShouldPublishTrainingComplete:
++    def test_false_when_no_videos_completed(self):
++        """Startup with an already-empty queue must not fire the signal."""
++        assert should_publish_training_complete(0) is False
++
++    def test_true_after_at_least_one_video_completed(self):
++        assert should_publish_training_complete(1) is True
++        assert should_publish_training_complete(5) is True
++
++    def test_false_for_negative_counts_defensively(self):
++        assert should_publish_training_complete(-1) is False
+diff --git a/sensory-gateway/training_signal.py b/sensory-gateway/training_signal.py
+new file mode 100644
+index 00000000..dd98f4dd
+--- /dev/null
++++ b/sensory-gateway/training_signal.py
+@@ -0,0 +1,15 @@
++"""Pure predicate for the training-session-complete signal (issue #324).
++
++Split out from gateway.py so it can be unit tested without stubbing cv2,
++activelearning, and gateway.py's other heavy dependencies.
++"""
++
++from __future__ import annotations
++
++
++def should_publish_training_complete(videos_completed_since_drain: int) -> bool:
++    """True only when the queue has just drained after processing at least one
++    video — not on startup with an already-empty queue, and not on every
++    subsequent poll while the queue stays empty.
++    """
++    return videos_completed_since_drain > 0

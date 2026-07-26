@@ -1,0 +1,854 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e054a661..338bea00 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -7,6 +7,18 @@ All notable changes to vouch are documented here. Format follows
+ ## [Unreleased]
+ 
+ ### Added
++- `kb.list_skills` / `kb.get_skill` — agents can enumerate the Claude Code
++  slash-command and `SKILL.md` catalogue visible at `<kb_root>/.claude/` and
++  `~/.claude/` over MCP, then fetch the full body of one by name (project-local
++  entries override user-global on collision). Exposed across MCP (`kb_list_skills`
++  / `kb_get_skill`), JSONL, and the CLI (`vouch list-skills` / `vouch get-skill`).
++- `mcp.publish_skills` config flag (default `true`) — gates the skill catalogue
++  for "company-brain" deployments where the catalogue itself is sensitive. When
++  `false`, `kb.list_skills` returns an empty list and `kb.get_skill` errors with
++  `permission_denied`; the flag is read fresh on every call so flipping it hides
++  the catalogue without restarting the server, and is surfaced on
++  `kb.capabilities.mcp.publish_skills` so clients can detect the gate. An
++  existing KB with no `mcp:` block stays default-on (#235).
+ - `vouch console`: serve the vendored React web console straight from the
+   installed package — a same-origin `/proxy` bridge (loopback-guarded) to
+   `vouch serve --transport http` backends, reimplementing the vite dev-proxy
+diff --git a/schemas/capabilities.schema.json b/schemas/capabilities.schema.json
+index f795ed3d..118969f0 100644
+--- a/schemas/capabilities.schema.json
++++ b/schemas/capabilities.schema.json
+@@ -29,6 +29,12 @@
+       "title": "Level",
+       "type": "integer"
+     },
++    "mcp": {
++      "additionalProperties": true,
++      "description": "mcp surface flags mirrored from config.yaml `mcp:` block. `publish_skills` gates kb.list_skills / kb.get_skill.",
++      "title": "Mcp",
++      "type": "object"
++    },
+     "methods": {
+       "items": {
+         "type": "string"
+diff --git a/src/vouch/capabilities.py b/src/vouch/capabilities.py
+index 34c6245e..ea1a1dc7 100644
+--- a/src/vouch/capabilities.py
++++ b/src/vouch/capabilities.py
+@@ -94,6 +94,8 @@
+     "kb.detect_themes",
+     "kb.propose_theme",
+     "kb.compile",
++    "kb.list_skills",
++    "kb.get_skill",
+ ]
+ 
+ 
+@@ -118,7 +120,7 @@ def _load_host_compat() -> dict[str, dict[str, str]]:
+     return {"openclaw": {k: str(v) for k, v in compat.items()}}
+ 
+ 
+-def capabilities() -> Capabilities:
++def capabilities(*, publish_skills: bool = True) -> Capabilities:
+     retrieval = ["fts5", "substring"]
+     try:
+         from .embeddings import get_embedder
+@@ -140,5 +142,6 @@ def capabilities() -> Capabilities:
+             "config_path": "retrieval.scope",
+         },
+         context_engines=[describe_engine()],
++        mcp={"publish_skills": publish_skills},
+         host_compat=_load_host_compat(),
+     )
+diff --git a/src/vouch/cli.py b/src/vouch/cli.py
+index f61506cd..8016b9f8 100644
+--- a/src/vouch/cli.py
++++ b/src/vouch/cli.py
+@@ -39,6 +39,7 @@
+ from . import provenance as prov_mod
+ from . import recall as recall_mod
+ from . import sessions as sess_mod
++from . import skills as skills_mod
+ from . import stats as stats_mod
+ from . import sync as sync_mod
+ from . import synthesize as synth
+@@ -236,7 +237,48 @@ def discover(path: str) -> None:
+ @cli.command()
+ def capabilities() -> None:
+     """Emit the JSON capabilities descriptor (mirrors kb.capabilities)."""
+-    _emit_json(build_caps().model_dump(mode="json"))
++    # Stay usable outside a KB: fall back to the default-on flag if no
++    # .vouch/ is discoverable here.
++    try:
++        publish_skills = skills_mod.publish_skills_enabled(_load_store())
++    except Exception:
++        publish_skills = True
++    _emit_json(build_caps(publish_skills=publish_skills).model_dump(mode="json"))
++
++
++@cli.command("list-skills")
++@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of a table.")
++def list_skills(as_json: bool) -> None:
++    """List discoverable Claude Code skills / slash commands (mirrors kb.list_skills)."""
++    store = _load_store()
++    rows = skills_mod.list_skills(store)
++    if as_json:
++        _emit_json(rows)
++        return
++    if not rows:
++        # Either nothing installed, or mcp.publish_skills is false.
++        click.echo("no skills published")
++        return
++    for r in rows:
++        click.echo(f"{r['name']}  [{r['scope']}/{r['kind']}]  {r['description']}")
++
++
++@cli.command("get-skill")
++@click.argument("name")
++@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of the body.")
++def get_skill(name: str, as_json: bool) -> None:
++    """Print the full body of a named skill / slash command (mirrors kb.get_skill)."""
++    store = _load_store()
++    try:
++        result = skills_mod.get_skill(store, name)
++    except skills_mod.SkillsDisabledError as e:
++        raise click.ClickException(str(e)) from e
++    except KeyError as e:
++        raise click.ClickException(str(e)) from e
++    if as_json:
++        _emit_json(result)
++        return
++    click.echo(result["body"])
+ 
+ 
+ # --- status / health ------------------------------------------------------
+diff --git a/src/vouch/jsonl_server.py b/src/vouch/jsonl_server.py
+index 43a1472b..502b035c 100644
+--- a/src/vouch/jsonl_server.py
++++ b/src/vouch/jsonl_server.py
+@@ -35,6 +35,7 @@
+ from . import metrics as metrics_mod
+ from . import salience as salience_mod
+ from . import sessions as sess_mod
++from . import skills as skills_mod
+ from . import trust as trust_mod
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+@@ -89,7 +90,11 @@ def _agent() -> str:
+ 
+ 
+ def _h_capabilities(_: dict) -> dict:
+-    return build_caps().model_dump(mode="json")
++    try:
++        publish_skills = skills_mod.publish_skills_enabled(_store())
++    except Exception:
++        publish_skills = True
++    return build_caps(publish_skills=publish_skills).model_dump(mode="json")
+ 
+ 
+ def _h_status(_: dict) -> dict:
+@@ -721,6 +726,20 @@ def _h_embeddings_stats(_: dict) -> dict:
+     }
+ 
+ 
++def _h_list_skills(_: dict) -> list[dict]:
++    return skills_mod.list_skills(_store())
++
++
++def _h_get_skill(p: dict) -> dict:
++    name = p.get("name")
++    if not isinstance(name, str) or not name.strip():
++        raise ValueError("`name` is required")
++    try:
++        return skills_mod.get_skill(_store(), name)
++    except KeyError as e:
++        raise ValueError(str(e)) from e
++
++
+ def _h_why(p: dict) -> dict:
+     from . import provenance as prov
+ 
+@@ -866,6 +885,8 @@ def _h_propose_theme(p: dict) -> dict:
+     "kb.provenance_rebuild": _h_provenance_rebuild,
+     "kb.detect_themes": _h_detect_themes,
+     "kb.propose_theme": _h_propose_theme,
++    "kb.list_skills": _h_list_skills,
++    "kb.get_skill": _h_get_skill,
+ }
+ 
+ 
+@@ -886,6 +907,11 @@ def handle_request(envelope: dict) -> dict:
+             "ok": True,
+             "result": trust_mod.finish_kb_result(result),
+         }
++    except skills_mod.SkillsDisabledError as e:
++        return {
++            "id": req_id, "ok": False,
++            "error": {"code": "permission_denied", "message": str(e)},
++        }
+     except KeyError as e:
+         return {
+             "id": req_id, "ok": False,
+diff --git a/src/vouch/models.py b/src/vouch/models.py
+index bd6dd9df..7946f30f 100644
+--- a/src/vouch/models.py
++++ b/src/vouch/models.py
+@@ -496,6 +496,13 @@ class Capabilities(BaseModel):
+         default_factory=list,
+         description="OpenClaw context engines exposed (see openclaw.plugin.json)",
+     )
++    mcp: dict[str, Any] = Field(
++        default_factory=lambda: {"publish_skills": True},
++        description=(
++            "mcp surface flags mirrored from config.yaml `mcp:` block. "
++            "`publish_skills` gates kb.list_skills / kb.get_skill."
++        ),
++    )
+     host_compat: dict[str, Any] = Field(
+         default_factory=dict,
+         description=(
+diff --git a/src/vouch/server.py b/src/vouch/server.py
+index 067a5ad7..3806545b 100644
+--- a/src/vouch/server.py
++++ b/src/vouch/server.py
+@@ -26,6 +26,7 @@
+ from . import metrics as metrics_mod
+ from . import salience as salience_mod
+ from . import sessions as sess_mod
++from . import skills as skills_mod
+ from . import trust as trust_mod
+ from . import verify as verify_mod
+ from .capabilities import capabilities as build_caps
+@@ -78,7 +79,11 @@ def _agent() -> str:
+ @mcp.tool()
+ def kb_capabilities() -> dict[str, Any]:
+     """Return the protocol capabilities of this server."""
+-    return build_caps().model_dump(mode="json")
++    try:
++        publish_skills = skills_mod.publish_skills_enabled(_store())
++    except Exception:
++        publish_skills = True
++    return build_caps(publish_skills=publish_skills).model_dump(mode="json")
+ 
+ 
+ @mcp.tool()
+@@ -97,6 +102,38 @@ def kb_stats(*, days: int = 30) -> dict[str, Any]:
+     return collect_stats(_store(), since_days=since)
+ 
+ 
++@mcp.tool()
++def kb_list_skills() -> list[dict[str, Any]]:
++    """Enumerate every Claude Code skill / slash command visible to vouch.
++
++    Scans, in priority order:
++      1. ``<kb_root>/.claude/skills/<name>/SKILL.md`` — project-local skills
++      2. ``<kb_root>/.claude/commands/<name>.md``     — project-local commands
++      3. ``~/.claude/skills/<name>/SKILL.md``         — user-global skills
++      4. ``~/.claude/commands/<name>.md``             — user-global commands
++
++    Project entries override user ones with the same name. Returns
++    ``[{name, description, scope, kind, path}]``. Returns an empty list
++    when ``mcp.publish_skills`` is ``false`` in config.yaml.
++    """
++    return skills_mod.list_skills(_store())
++
++
++@mcp.tool()
++def kb_get_skill(name: str) -> dict[str, Any]:
++    """Return the full markdown body of a named skill / slash command.
++
++    Errors with ``permission_denied`` when ``mcp.publish_skills`` is
++    ``false``, and ``not_found`` when the name isn't in the catalogue.
++    """
++    try:
++        return skills_mod.get_skill(_store(), name)
++    except skills_mod.SkillsDisabledError as e:
++        raise PermissionError(str(e)) from e
++    except KeyError as e:
++        raise ValueError(str(e)) from e
++
++
+ @mcp.tool()
+ def kb_activity(
+     *,
+diff --git a/src/vouch/skills.py b/src/vouch/skills.py
+new file mode 100644
+index 00000000..c2590764
+--- /dev/null
++++ b/src/vouch/skills.py
+@@ -0,0 +1,239 @@
++"""Skill / slash-command discovery for agents.
++
++Lets an MCP-connected agent (Claude Code, Cursor, …) introspect what
++skills and slash commands are available in the current environment
++without having to read the filesystem itself. The agent calls
++``kb.list_skills`` to see what's installed, then ``kb.get_skill`` to
++pull the body of one it wants to run.
++
++Scanned locations, in priority order (later wins on name collision):
++
++1. ``<kb_root>/.claude/skills/<name>/SKILL.md`` — project-local skills
++2. ``<kb_root>/.claude/commands/<name>.md``     — project-local slash commands
++3. ``~/.claude/skills/<name>/SKILL.md``         — user-global skills
++4. ``~/.claude/commands/<name>.md``             — user-global slash commands
++
++Project-local skills override user-global ones with the same name so a
++KB can ship its own slash-command flavour that masks the user's default.
++
++A skill description is parsed from YAML frontmatter when present
++(``description:`` field, gbrain-style), otherwise from the first
++markdown paragraph after the first heading. Discovery silently skips
++unreadable files — the catalogue is best-effort.
++
++Publishing the catalogue over MCP is gated by ``mcp.publish_skills`` in
++``config.yaml`` (default ``true``). When flipped to ``false`` —
++"company-brain" mode where the slash-command catalogue is itself
++sensitive — ``list_skills`` returns an empty list and ``get_skill``
++raises :class:`SkillsDisabledError`, which the MCP / JSONL layer maps to
++a ``permission_denied`` error. The flag is read fresh on every call, so
++toggling it takes effect without restarting the server.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++import yaml
++
++from .storage import KBStore
++
++# Matches a YAML frontmatter block at the very top of a file.
++_FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)\Z", re.DOTALL)
++# After stripping frontmatter, find the first markdown heading.
++_FIRST_HEADING_RE = re.compile(r"^#+\s+(.*?)\s*$", re.MULTILINE)
++DESCRIPTION_PREVIEW_CHARS = 280
++
++
++class SkillsDisabledError(RuntimeError):
++    """Raised when the skill catalogue is requested while it's gated off.
++
++    Surfaced when ``mcp.publish_skills`` is ``false`` in ``config.yaml``.
++    The JSONL / MCP layer translates this into a ``permission_denied``
++    error rather than a generic failure.
++    """
++
++
++@dataclass(frozen=True)
++class SkillRecord:
++    name: str
++    description: str
++    scope: str  # "project" | "user"
++    kind: str   # "skill" | "command"
++    path: str   # absolute path on disk
++
++
++def _load_cfg(store: KBStore) -> dict[str, Any]:
++    """Read ``config.yaml`` defensively — a missing or malformed file is
++    treated as an empty config (default-on behaviour)."""
++    try:
++        loaded = yaml.safe_load((store.kb_dir / "config.yaml").read_text())
++    except Exception:
++        return {}
++    return loaded if isinstance(loaded, dict) else {}
++
++
++def publish_skills_enabled(store: KBStore) -> bool:
++    """Whether the skill catalogue may be published over MCP.
++
++    Controlled by ``mcp.publish_skills`` in ``config.yaml``. Defaults to
++    ``True`` so existing KBs with no ``mcp:`` block keep the catalogue.
++    Only an explicit ``false`` turns the gate off — any other value (or a
++    missing key) is treated as enabled.
++    """
++    mcp = _load_cfg(store).get("mcp")
++    if not isinstance(mcp, dict):
++        return True
++    return mcp.get("publish_skills", True) is not False
++
++
++def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:
++    """Split a markdown file into (frontmatter_dict, body)."""
++    m = _FRONTMATTER_RE.match(text)
++    if not m:
++        return {}, text
++    try:
++        meta = yaml.safe_load(m.group(1)) or {}
++        if not isinstance(meta, dict):
++            return {}, text
++    except yaml.YAMLError:
++        return {}, text
++    return meta, m.group(2)
++
++
++def _derive_description(meta: dict[str, Any], body: str) -> str:
++    """Prefer explicit ``description:`` frontmatter; fall back to the first
++    paragraph of body text after the first heading."""
++    desc = meta.get("description")
++    if isinstance(desc, str) and desc.strip():
++        flat = " ".join(desc.strip().split())
++        return flat[:DESCRIPTION_PREVIEW_CHARS]
++
++    # Drop the first heading line, then take the first non-empty paragraph.
++    stripped = _FIRST_HEADING_RE.sub("", body, count=1).strip()
++    paragraphs = [p.strip() for p in stripped.split("\n\n") if p.strip()]
++    if not paragraphs:
++        return ""
++    flat = " ".join(paragraphs[0].split())
++    if len(flat) <= DESCRIPTION_PREVIEW_CHARS:
++        return flat
++    return flat[: DESCRIPTION_PREVIEW_CHARS - 1] + "…"
++
++
++def _read_skill_file(
++    path: Path, *, scope: str, kind: str, fallback_name: str,
++) -> SkillRecord | None:
++    """Parse one skill file. Returns None if the file is unreadable."""
++    try:
++        text = path.read_text(encoding="utf-8")
++    except OSError:
++        return None
++    meta, body = _parse_frontmatter(text)
++    name = meta.get("name") if isinstance(meta.get("name"), str) else None
++    name = (name or fallback_name).strip()
++    description = _derive_description(meta, body)
++    return SkillRecord(
++        name=name,
++        description=description,
++        scope=scope,
++        kind=kind,
++        path=str(path),
++    )
++
++
++def _scan_dir(
++    base: Path, *, scope: str,
++) -> list[SkillRecord]:
++    """Walk one of the four catalogue roots and yield records."""
++    records: list[SkillRecord] = []
++    skills_root = base / "skills"
++    if skills_root.is_dir():
++        for sub in sorted(skills_root.iterdir()):
++            skill_md = sub / "SKILL.md"
++            if skill_md.is_file():
++                rec = _read_skill_file(
++                    skill_md, scope=scope, kind="skill", fallback_name=sub.name,
++                )
++                if rec is not None:
++                    records.append(rec)
++
++    commands_root = base / "commands"
++    if commands_root.is_dir():
++        for md in sorted(commands_root.glob("*.md")):
++            rec = _read_skill_file(
++                md, scope=scope, kind="command", fallback_name=md.stem,
++            )
++            if rec is not None:
++                records.append(rec)
++
++    return records
++
++
++def _catalogue(store: KBStore) -> dict[str, SkillRecord]:
++    """Build the merged catalogue. Project-local entries override user ones."""
++    # User-global first, then project — project overwrites on collision.
++    user_base = Path.home() / ".claude"
++    project_base = store.root / ".claude"
++
++    merged: dict[str, SkillRecord] = {}
++    for rec in _scan_dir(user_base, scope="user"):
++        merged[rec.name] = rec
++    for rec in _scan_dir(project_base, scope="project"):
++        merged[rec.name] = rec
++    return merged
++
++
++def list_skills(store: KBStore) -> list[dict[str, Any]]:
++    """Catalogue every discoverable skill / slash command.
++
++    Returns one row per skill: ``{name, description, scope, kind, path}``.
++    Sorted by name for stable output. Returns an empty list when
++    ``mcp.publish_skills`` is ``false`` — the catalogue is hidden without
++    erroring so a polling client just sees "nothing installed".
++    """
++    if not publish_skills_enabled(store):
++        return []
++    cat = _catalogue(store)
++    return [
++        {
++            "name": r.name,
++            "description": r.description,
++            "scope": r.scope,
++            "kind": r.kind,
++            "path": r.path,
++        }
++        for r in sorted(cat.values(), key=lambda r: r.name)
++    ]
++
++
++def get_skill(store: KBStore, name: str) -> dict[str, Any]:
++    """Return the full markdown body of a named skill.
++
++    Raises :class:`SkillsDisabledError` when ``mcp.publish_skills`` is
++    ``false`` (mapped to ``permission_denied`` by the transport), and
++    ``KeyError`` if the name isn't in the catalogue (mapped to a clean
++    ``not_found`` error).
++    """
++    if not publish_skills_enabled(store):
++        raise SkillsDisabledError(
++            "skill catalogue is disabled (mcp.publish_skills: false)"
++        )
++    cat = _catalogue(store)
++    rec = cat.get(name)
++    if rec is None:
++        raise KeyError(f"unknown skill: {name!r}")
++    try:
++        body = Path(rec.path).read_text(encoding="utf-8")
++    except OSError as e:
++        raise KeyError(f"could not read skill {name!r}: {e}") from e
++    return {
++        "name": rec.name,
++        "description": rec.description,
++        "scope": rec.scope,
++        "kind": rec.kind,
++        "path": rec.path,
++        "body": body,
++    }
+diff --git a/src/vouch/storage.py b/src/vouch/storage.py
+index bd8987b0..ed2c6079 100644
+--- a/src/vouch/storage.py
++++ b/src/vouch/storage.py
+@@ -113,6 +113,12 @@ def _starter_config() -> dict[str, Any]:
+                 "human review via vouch pending/show/approve",
+             ],
+         },
++        "mcp": {
++            # Publish the slash-command / SKILL.md catalogue over MCP via
++            # kb.list_skills / kb.get_skill. Flip to false for "company-brain"
++            # mode where the catalogue itself is sensitive.
++            "publish_skills": True,
++        },
+         # Extra page kinds beyond the built-in PageType enum. Each maps a kind
+         # name to {required_fields, frontmatter_schema, required_citations,
+         # extends}. See `vouch schema list` / docs for the shape. (issue #234)
+diff --git a/tests/test_skills.py b/tests/test_skills.py
+new file mode 100644
+index 00000000..cfb7c607
+--- /dev/null
++++ b/tests/test_skills.py
+@@ -0,0 +1,306 @@
++"""kb.list_skills / kb.get_skill — Claude Code skill discovery over MCP,
++plus the ``mcp.publish_skills`` gate (issue #235)."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++import yaml
++
++from vouch import capabilities as caps_mod
++from vouch import skills as skills_mod
++from vouch.storage import KBStore
++
++
++@pytest.fixture
++def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> KBStore:
++    # Point HOME at a clean dir so the test never picks up the real user's
++    # ~/.claude/ skills and isn't polluted by it.
++    home = tmp_path / "home"
++    home.mkdir()
++    monkeypatch.setenv("HOME", str(home))
++    s = KBStore.init(tmp_path / "kb")
++    return s
++
++
++def _write_skill(base: Path, name: str, *, body: str, frontmatter: bool = True) -> Path:
++    skill_dir = base / "skills" / name
++    skill_dir.mkdir(parents=True, exist_ok=True)
++    path = skill_dir / "SKILL.md"
++    text = body if not frontmatter else (
++        f"---\nname: {name}\ndescription: this is the {name} skill\n---\n\n{body}"
++    )
++    path.write_text(text, encoding="utf-8")
++    return path
++
++
++def _write_command(base: Path, name: str, *, body: str) -> Path:
++    cmd_dir = base / "commands"
++    cmd_dir.mkdir(parents=True, exist_ok=True)
++    path = cmd_dir / f"{name}.md"
++    path.write_text(body, encoding="utf-8")
++    return path
++
++
++def _set_publish_skills(store: KBStore, value: object) -> None:
++    """Rewrite config.yaml's mcp.publish_skills flag (or remove the block)."""
++    cfg = yaml.safe_load(store.config_path.read_text()) or {}
++    if value is None:
++        cfg.pop("mcp", None)
++    else:
++        cfg.setdefault("mcp", {})["publish_skills"] = value
++    store.config_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
++
++
++def test_list_skills_scans_project_local(store: KBStore) -> None:
++    _write_skill(store.root / ".claude", "vouch-recall", body="# vouch-recall\n\nCall kb.recall.")
++    rows = skills_mod.list_skills(store)
++    names = [r["name"] for r in rows]
++    assert "vouch-recall" in names
++    rec = next(r for r in rows if r["name"] == "vouch-recall")
++    assert rec["scope"] == "project"
++    assert rec["kind"] == "skill"
++    assert rec["description"] == "this is the vouch-recall skill"
++
++
++def test_list_skills_scans_user_global(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    home = Path(skills_mod.Path.home())
++    _write_skill(home / ".claude", "global-skill", body="# global-skill\n\nbody")
++    rows = skills_mod.list_skills(store)
++    rec = next(r for r in rows if r["name"] == "global-skill")
++    assert rec["scope"] == "user"
++
++
++def test_project_overrides_user_on_collision(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    home = Path(skills_mod.Path.home())
++    _write_skill(home / ".claude", "shared-name", body="# user version")
++    _write_skill(store.root / ".claude", "shared-name", body="# project version")
++    rows = skills_mod.list_skills(store)
++    rec = next(r for r in rows if r["name"] == "shared-name")
++    assert rec["scope"] == "project"
++
++
++def test_list_includes_slash_commands(store: KBStore) -> None:
++    _write_command(
++        store.root / ".claude", "vouch-status",
++        body="# vouch-status\n\nShow status.\n\nMore details follow.",
++    )
++    rows = skills_mod.list_skills(store)
++    rec = next(r for r in rows if r["name"] == "vouch-status")
++    assert rec["kind"] == "command"
++    # No frontmatter — description derived from first body paragraph after heading.
++    assert "Show status" in rec["description"]
++
++
++def test_get_skill_returns_full_body(store: KBStore) -> None:
++    body_text = (
++        "---\nname: vouch-recall\ndescription: the recall skill\n---\n\n"
++        "# vouch-recall\n\nFull body of the skill.\n"
++    )
++    skill_dir = store.root / ".claude" / "skills" / "vouch-recall"
++    skill_dir.mkdir(parents=True)
++    (skill_dir / "SKILL.md").write_text(body_text, encoding="utf-8")
++
++    result = skills_mod.get_skill(store, "vouch-recall")
++    assert result["name"] == "vouch-recall"
++    assert result["scope"] == "project"
++    assert "Full body of the skill" in result["body"]
++
++
++def test_get_skill_unknown_raises_keyerror(store: KBStore) -> None:
++    with pytest.raises(KeyError):
++        skills_mod.get_skill(store, "no-such-skill")
++
++
++def test_list_skills_empty_environment(store: KBStore) -> None:
++    """No .claude/ dirs in either project or fake HOME — returns []."""
++    assert skills_mod.list_skills(store) == []
++
++
++def test_unreadable_skill_does_not_break_listing(store: KBStore) -> None:
++    """Best-effort discovery — a broken file is skipped silently."""
++    skill_dir = store.root / ".claude" / "skills" / "good"
++    skill_dir.mkdir(parents=True)
++    (skill_dir / "SKILL.md").write_text("---\nname: good\n---\n\nbody", encoding="utf-8")
++    # A directory with no SKILL.md should be skipped, not raise.
++    (store.root / ".claude" / "skills" / "no-skill-md").mkdir()
++
++    rows = skills_mod.list_skills(store)
++    names = [r["name"] for r in rows]
++    assert "good" in names
++    assert "no-skill-md" not in names
++
++
++def test_description_from_frontmatter_takes_priority(store: KBStore) -> None:
++    body = (
++        "---\nname: hi\ndescription: from frontmatter\n---\n\n# hi\n\nFrom body."
++    )
++    skill_dir = store.root / ".claude" / "skills" / "hi"
++    skill_dir.mkdir(parents=True)
++    (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
++    rows = skills_mod.list_skills(store)
++    rec = next(r for r in rows if r["name"] == "hi")
++    assert rec["description"] == "from frontmatter"
++
++
++def test_description_falls_back_to_first_paragraph(store: KBStore) -> None:
++    body = "# header line\n\nThis is the first paragraph.\n\nSecond paragraph."
++    skill_dir = store.root / ".claude" / "skills" / "no-fm"
++    skill_dir.mkdir(parents=True)
++    (skill_dir / "SKILL.md").write_text(body, encoding="utf-8")
++    rows = skills_mod.list_skills(store)
++    rec = next(r for r in rows if r["name"] == "no-fm")
++    assert rec["description"] == "This is the first paragraph."
++
++
++# --- publish_skills gate (issue #235) -------------------------------------
++
++
++def test_starter_config_defaults_publish_skills_on(store: KBStore) -> None:
++    """A freshly init'd KB ships mcp.publish_skills: true."""
++    cfg = yaml.safe_load(store.config_path.read_text())
++    assert cfg["mcp"]["publish_skills"] is True
++    assert skills_mod.publish_skills_enabled(store) is True
++
++
++def test_missing_mcp_block_defaults_on(store: KBStore) -> None:
++    """An existing KB with no mcp: block sees the catalogue (default-on)."""
++    _set_publish_skills(store, None)
++    assert skills_mod.publish_skills_enabled(store) is True
++    _write_skill(store.root / ".claude", "visible", body="# visible")
++    assert any(r["name"] == "visible" for r in skills_mod.list_skills(store))
++
++
++def test_list_skills_hidden_when_disabled(store: KBStore) -> None:
++    _write_skill(store.root / ".claude", "secret", body="# secret")
++    # Visible by default...
++    assert any(r["name"] == "secret" for r in skills_mod.list_skills(store))
++    # ...hidden once the gate is flipped, with no restart.
++    _set_publish_skills(store, False)
++    assert skills_mod.publish_skills_enabled(store) is False
++    assert skills_mod.list_skills(store) == []
++
++
++def test_get_skill_denied_when_disabled(store: KBStore) -> None:
++    _write_skill(store.root / ".claude", "secret", body="# secret\n\nbody")
++    _set_publish_skills(store, False)
++    with pytest.raises(skills_mod.SkillsDisabledError):
++        skills_mod.get_skill(store, "secret")
++
++
++def test_toggle_takes_effect_without_restart(store: KBStore) -> None:
++    """The flag is read fresh on each call — same store object, no reload."""
++    _write_skill(store.root / ".claude", "toggle-me", body="# toggle-me")
++    assert skills_mod.list_skills(store)  # on
++    _set_publish_skills(store, False)
++    assert skills_mod.list_skills(store) == []  # off
++    _set_publish_skills(store, True)
++    assert skills_mod.list_skills(store)  # on again
++
++
++def test_capabilities_surfaces_publish_skills_flag() -> None:
++    caps_on = caps_mod.capabilities(publish_skills=True)
++    assert caps_on.mcp["publish_skills"] is True
++    caps_off = caps_mod.capabilities(publish_skills=False)
++    assert caps_off.mcp["publish_skills"] is False
++    # New methods are declared in the surface.
++    assert "kb.list_skills" in caps_on.methods
++    assert "kb.get_skill" in caps_on.methods
++    # Default is on so test_capabilities (no-arg call) stays green.
++    assert caps_mod.capabilities().mcp["publish_skills"] is True
++
++
++# --- jsonl wiring ---------------------------------------------------------
++
++
++def test_jsonl_list_skills_handler(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    _write_skill(store.root / ".claude", "wired", body="# wired")
++    monkeypatch.chdir(store.root)
++    from vouch import jsonl_server
++
++    out = jsonl_server.handle_request(
++        {"id": "r1", "method": "kb.list_skills", "params": {}},
++    )
++    assert out["ok"] is True
++    assert any(r["name"] == "wired" for r in out["result"])
++
++
++def test_jsonl_get_skill_handler(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    _write_skill(store.root / ".claude", "wired", body="# wired\n\nbody here")
++    monkeypatch.chdir(store.root)
++    from vouch import jsonl_server
++
++    out = jsonl_server.handle_request(
++        {"id": "r2", "method": "kb.get_skill", "params": {"name": "wired"}},
++    )
++    assert out["ok"] is True
++    assert "body here" in out["result"]["body"]
++
++
++def test_jsonl_get_skill_unknown_returns_clean_error(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.chdir(store.root)
++    from vouch import jsonl_server
++
++    out = jsonl_server.handle_request(
++        {"id": "r3", "method": "kb.get_skill", "params": {"name": "missing"}},
++    )
++    assert out["ok"] is False
++    assert "missing" in out["error"]["message"]
++
++
++def test_jsonl_list_skills_empty_when_disabled(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    _write_skill(store.root / ".claude", "wired", body="# wired")
++    _set_publish_skills(store, False)
++    monkeypatch.chdir(store.root)
++    from vouch import jsonl_server
++
++    out = jsonl_server.handle_request(
++        {"id": "r4", "method": "kb.list_skills", "params": {}},
++    )
++    assert out["ok"] is True
++    assert out["result"] == []
++
++
++def test_jsonl_get_skill_permission_denied_when_disabled(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    _write_skill(store.root / ".claude", "wired", body="# wired\n\nbody")
++    _set_publish_skills(store, False)
++    monkeypatch.chdir(store.root)
++    from vouch import jsonl_server
++
++    out = jsonl_server.handle_request(
++        {"id": "r5", "method": "kb.get_skill", "params": {"name": "wired"}},
++    )
++    assert out["ok"] is False
++    assert out["error"]["code"] == "permission_denied"
++
++
++def test_jsonl_capabilities_reflects_gate(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.chdir(store.root)
++    from vouch import jsonl_server
++
++    out = jsonl_server.handle_request(
++        {"id": "c1", "method": "kb.capabilities", "params": {}},
++    )
++    assert out["result"]["mcp"]["publish_skills"] is True
++    _set_publish_skills(store, False)
++    out = jsonl_server.handle_request(
++        {"id": "c2", "method": "kb.capabilities", "params": {}},
++    )
++    assert out["result"]["mcp"]["publish_skills"] is False

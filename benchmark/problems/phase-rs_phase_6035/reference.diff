@@ -1,0 +1,567 @@
+diff --git a/crates/engine/src/game/casting.rs b/crates/engine/src/game/casting.rs
+index 3cbce13bee..888fb78b66 100644
+--- a/crates/engine/src/game/casting.rs
++++ b/crates/engine/src/game/casting.rs
+@@ -1414,13 +1414,12 @@ fn requires_per_instance_keyword(keyword: &Keyword) -> bool {
+         return true;
+     }
+ 
+-    matches!(
+-        keyword,
+-        // CR 702.153b: each Casualty instance is paid and triggers separately.
+-        Keyword::Casualty(_)
+-            // CR 702.157b: each Squad instance is paid and triggers separately.
+-            | Keyword::Squad(_)
+-    )
++    // CR 113.2c: Casualty (CR 702.153b) / Squad (CR 702.157b) / Cascade
++    // (CR 702.85c) — the single authority for "the cast-time merge must preserve
++    // duplicate instances of this keyword" lives on `Keyword` so the quoted
++    // keyword-list parser (`parse_spells_have_quoted_keyword_list`) cannot diverge
++    // from this merge gate and over-claim a duplicate it would then silently drop.
++    keyword.cast_merge_preserves_instances()
+ }
+ 
+ fn merge_spell_keyword(keywords: &mut Vec<Keyword>, keyword: Keyword, preserve_instances: bool) {
+diff --git a/crates/engine/src/parser/oracle_static/shared.rs b/crates/engine/src/parser/oracle_static/shared.rs
+index 6b804af7e0..e457d2d9d3 100644
+--- a/crates/engine/src/parser/oracle_static/shared.rs
++++ b/crates/engine/src/parser/oracle_static/shared.rs
+@@ -894,6 +894,149 @@ pub(crate) fn parse_static_line_multi_ir(text: &str) -> Vec<StaticIr> {
+         .collect()
+ }
+ 
++/// CR 702.85c + CR 105.2: Parse a spell-cast keyword grant whose granted
++/// keyword(s) are QUOTED — "<subject> spells you cast [from <zone>] [with mana
++/// value N or greater] have \"<K0>[, <K1>...]\"" — into one `CastWithKeyword`
++/// static per listed keyword. Repeats are preserved (Zhulodok, Void Gorger's
++/// "Cascade, cascade" yields two `Cascade` grants; the runtime fires one Cascade
++/// trigger per granted keyword instance, CR 702.85a). The subject filter is
++/// parsed by the single authority [`super::keyword_grant::parse_spells_have_keyword`],
++/// re-invoked per keyword with a reconstructed unquoted grant so every subject
++/// qualifier (type, from-zone, mana-value) stays consistent with the
++/// single-keyword path. A leading color-quality prefix — which that handler
++/// cannot see once "spells" is consumed — is peeled here and folded into each
++/// grant's affected filter, keeping a "colorless spells" grant colorless-scoped.
++///
++/// Declines unless the grant is quoted AND every listed token is a keyword the
++/// single handler accepts, so quoted non-keyword grants (a granted triggered
++/// ability) and ordinary unquoted single-keyword grants fall through to their
++/// own handlers.
++fn parse_spells_have_quoted_keyword_list(text: &str) -> Option<Vec<StaticDefinition>> {
++    let lower = text.to_lowercase();
++
++    // Split "<subject>" from the quoted keyword list at the grant verb + opening
++    // quote. Requiring the opening quote scopes this handler to the quoted-grant
++    // class and leaves unquoted single-keyword grants to `parse_spells_have_keyword`.
++    // `scan_preceded` yields the post-match remainder (the keyword list), unlike
++    // `scan_split_at_phrase` which returns the slice still starting at the match.
++    // It scans at word boundaries and trims leading whitespace, so the grant-verb
++    // tags carry no leading space; `subject` is trimmed to drop the trailing one.
++    let (subject, _grant_verb, after_quote) = nom_primitives::scan_preceded(&lower, |i| {
++        alt((
++            tag::<_, _, OracleError<'_>>("have \""),
++            tag("has \""),
++            tag("gain \""),
++            tag("gains \""),
++        ))
++        .parse(i)
++    })?;
++    let subject = subject.trim();
++
++    // The keyword list runs up to the closing quote; consume the quote with a
++    // combinator, after which only an optional trailing period may follow.
++    let (after_close, inner) = take_until::<_, _, OracleError<'_>>("\"")
++        .parse(after_quote)
++        .ok()?;
++    let (residue, _) = tag::<_, _, OracleError<'_>>("\"").parse(after_close).ok()?;
++    if !residue.trim().trim_end_matches('.').trim().is_empty() {
++        return None;
++    }
++
++    // Split the quoted list into keyword names, validating each is a keyword
++    // (`parse_keyword_name`) so a quoted *ability* grant declines here.
++    let inner = inner.trim().trim_end_matches('.').trim();
++    let (list_rest, keyword_names) = separated_list1(
++        alt((
++            tag::<_, _, OracleError<'_>>(", and "),
++            tag(", "),
++            tag(" and "),
++        )),
++        nom_primitives::parse_keyword_name,
++    )
++    .parse(inner)
++    .ok()?;
++    if !list_rest.trim().is_empty() || keyword_names.is_empty() {
++        return None;
++    }
++
++    // Peel an optional leading color-quality qualifier (CR 105.2). The delegated
++    // subject parser only sees the text before "spells you cast", so a bare
++    // "colorless"/"monocolored"/"multicolored" prefix would otherwise be dropped.
++    let (subject_no_color, color_prop) = peel_color_quality_prefix(subject);
++
++    // Delegate the subject-filter parse per keyword by re-forming an unquoted
++    // single-keyword grant. Declines the whole line if any token isn't accepted.
++    let mut defs = Vec::with_capacity(keyword_names.len());
++    for name in keyword_names {
++        let reconstructed = format!("{subject_no_color} have {name}");
++        let tp = TextPair::new(&reconstructed, &reconstructed);
++        let mut def = super::keyword_grant::parse_spells_have_keyword(&tp, &reconstructed)?;
++        if let Some(prop) = color_prop.clone() {
++            if let Some(affected) = def.affected.take() {
++                def = def.affected(add_property(affected, prop));
++            }
++        }
++        // Preserve the full printed line as the static's description.
++        def = def.description(text.to_string());
++        defs.push(def);
++    }
++
++    // CR 113.2c: A quoted list may REPEAT a keyword ("Cascade, cascade" —
++    // CR 702.85c), but only for keywords whose duplicate cast-time instances the
++    // runtime actually preserves and consumes (`Keyword::cast_merge_preserves_
++    // instances` — the same authority `casting.rs::requires_per_instance_keyword`
++    // gates the merge on). A duplicate of any other keyword that reaches here (e.g.
++    // "Exalted, exalted" — Exalted is in KEYWORDS and functions separately by rule
++    // but its cast-grant count is unconsumed) would emit two grants that
++    // `merge_spell_keyword` coalesces by kind, silently under-counting. Decline the
++    // whole line rather than over-claim a grammar the runtime cannot realize.
++    let mut seen: Vec<&Keyword> = Vec::new();
++    for def in &defs {
++        let StaticMode::CastWithKeyword { keyword } = &def.mode else {
++            continue;
++        };
++        if seen.contains(&keyword) && !keyword.cast_merge_preserves_instances() {
++            return None;
++        }
++        seen.push(keyword);
++    }
++
++    Some(defs)
++}
++
++/// Peel a leading color-quality qualifier ("colorless"/"monocolored"/
++/// "multicolored") from a lowercase subject, returning the remainder and the
++/// matching `FilterProp::ColorCount` (CR 105.2). Mirrors the color-quality
++/// prefixes `oracle_target` recognizes before a type word.
++fn peel_color_quality_prefix(subject: &str) -> (&str, Option<FilterProp>) {
++    alt((
++        value(
++            FilterProp::ColorCount {
++                comparator: Comparator::EQ,
++                count: 0,
++            },
++            tag::<_, _, OracleError<'_>>("colorless "),
++        ),
++        value(
++            FilterProp::ColorCount {
++                comparator: Comparator::EQ,
++                count: 1,
++            },
++            tag("monocolored "),
++        ),
++        value(
++            FilterProp::ColorCount {
++                comparator: Comparator::GE,
++                count: 2,
++            },
++            tag("multicolored "),
++        ),
++    ))
++    .parse(subject)
++    .map(|(rest, prop)| (rest, Some(prop)))
++    .unwrap_or((subject, None))
++}
++
+ /// CR 611.3 + CR 613.1: Split a static line into its sentence segments, then
+ /// parse each as an independent continuous static. Returns `Some(defs)` only
+ /// when the line splits into 2+ segments and EVERY segment yields at least one
+@@ -1517,6 +1660,19 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
+         return defs;
+     }
+ 
++    // CR 702.85a + CR 702.85c + CR 613.1: "<subject> spells you cast [...] have
++    // "<K0>[, <K1>...]"" — a spell-cast keyword grant whose granted keyword(s)
++    // are QUOTED and may repeat (Zhulodok, Void Gorger: "... have 'Cascade,
++    // cascade.'"). The single unquoted keyword grant is owned by
++    // `parse_spells_have_keyword`; this sibling expands the quoted list into one
++    // `CastWithKeyword` static per listed keyword — repeats included, since
++    // granted-keyword multiplicity is meaningful (the runtime fires one Cascade
++    // trigger per granted instance). Mirrors the exiled-object / color-conditional
++    // grant handlers above (one static per listed keyword).
++    if let Some(defs) = parse_spells_have_quoted_keyword_list(&stripped) {
++        return defs;
++    }
++
+     if let Some(defs) = parse_multi_sentence_statics(&stripped) {
+         return defs;
+     }
+diff --git a/crates/engine/src/parser/oracle_static/tests.rs b/crates/engine/src/parser/oracle_static/tests.rs
+index dbad7c80b2..6914e9702f 100644
+--- a/crates/engine/src/parser/oracle_static/tests.rs
++++ b/crates/engine/src/parser/oracle_static/tests.rs
+@@ -11626,6 +11626,199 @@ fn static_grant_blitz_simple_form() {
+     );
+ }
+ 
++// CR 702.85a + CR 702.85c + issue #6005: Zhulodok, Void Gorger — a spell-cast
++// keyword grant whose granted keyword is QUOTED and REPEATED ("have 'Cascade,
++// cascade.'"). Before this handler the quoted grant was `Unimplemented` (the
++// card did nothing). It must emit ONE `CastWithKeyword { Cascade }` static per
++// listed keyword — two here — because the runtime fires one Cascade trigger per
++// granted keyword instance (CR 702.85c). The colorless / from-hand / mana-value
++// 7+ qualifiers must all survive in each grant's affected filter.
++#[test]
++fn parse_zhulodok_quoted_doubled_cascade_grant() {
++    let defs = parse_static_line_multi(
++        "Colorless spells you cast from your hand with mana value 7 or greater have \"Cascade, cascade.\"",
++    );
++    assert_eq!(
++        defs.len(),
++        2,
++        "\"Cascade, cascade\" grants two independent Cascade instances: {defs:?}"
++    );
++    for def in &defs {
++        assert_eq!(
++            def.mode,
++            StaticMode::CastWithKeyword {
++                keyword: Keyword::Cascade,
++            }
++        );
++        let Some(TargetFilter::Typed(tf)) = &def.affected else {
++            panic!("expected a Typed spell filter, got {:?}", def.affected);
++        };
++        assert!(tf.type_filters.contains(&TypeFilter::Card));
++        assert_eq!(tf.controller, Some(ControllerRef::You));
++        assert!(
++            tf.properties
++                .contains(&FilterProp::InZone { zone: Zone::Hand }),
++            "from-hand qualifier preserved: {:?}",
++            tf.properties
++        );
++        assert!(
++            tf.properties.iter().any(|p| matches!(
++                p,
++                FilterProp::Cmc {
++                    comparator: Comparator::GE,
++                    value: QuantityExpr::Fixed { value: 7 },
++                }
++            )),
++            "mana value 7+ qualifier preserved: {:?}",
++            tf.properties
++        );
++        assert!(
++            tf.properties.iter().any(|p| matches!(
++                p,
++                FilterProp::ColorCount {
++                    comparator: Comparator::EQ,
++                    count: 0,
++                }
++            )),
++            "colorless qualifier preserved (grant is not over-broad): {:?}",
++            tf.properties
++        );
++    }
++}
++
++// Building block: the quoted keyword-list grant is compositional — a distinct
++// two-keyword list yields one static per keyword, in listed order.
++#[test]
++fn parse_spells_quoted_multi_keyword_grant_is_per_keyword() {
++    let defs = parse_static_line_multi("Spells you cast have \"Flash, haste.\"");
++    let keywords: Vec<_> = defs
++        .iter()
++        .map(|d| match &d.mode {
++            StaticMode::CastWithKeyword { keyword } => keyword.clone(),
++            other => panic!("expected CastWithKeyword, got {other:?}"),
++        })
++        .collect();
++    assert_eq!(keywords, vec![Keyword::Flash, Keyword::Haste]);
++}
++
++// A quoted SINGLE keyword grant ("have 'Cascade.'") is the degenerate one-element
++// list — handled here too, since the unquoted single-keyword path cannot consume
++// the surrounding quotes.
++#[test]
++fn parse_spells_quoted_single_keyword_grant() {
++    let defs = parse_static_line_multi("Spells you cast have \"Cascade.\"");
++    assert_eq!(defs.len(), 1);
++    assert_eq!(
++        defs[0].mode,
++        StaticMode::CastWithKeyword {
++            keyword: Keyword::Cascade,
++        }
++    );
++}
++
++// Decline guard: a quoted grant whose content is a triggered ABILITY (not a
++// keyword list) must NOT be claimed here. A spell-cast trigger needs its own
++// runtime representation; it cannot be lowered to `CastWithKeyword`, so the
++// keyword-list parser must leave this unsupported shape unclaimed rather than
++// misrepresenting it as a keyword grant.
++#[test]
++fn parse_spells_quoted_ability_grant_declines() {
++    let defs =
++        parse_static_line_multi("Spells you cast have \"When you cast this spell, draw a card.\"");
++    assert!(
++        defs.is_empty(),
++        "a quoted non-keyword ability must be left unclaimed by the keyword-list parser: {defs:?}"
++    );
++}
++
++// Regression: the ordinary UNQUOTED single-keyword grant stays owned by
++// `parse_spells_have_keyword` and is unaffected by the quoted-list handler.
++#[test]
++fn parse_spells_unquoted_single_keyword_grant_unchanged() {
++    let defs = parse_static_line_multi("Spells you cast have cascade.");
++    assert_eq!(defs.len(), 1);
++    assert_eq!(
++        defs[0].mode,
++        StaticMode::CastWithKeyword {
++            keyword: Keyword::Cascade,
++        }
++    );
++}
++
++// CR 702.83a + CR 113.2c: the quoted-list handler must DECLINE a duplicate of a
++// keyword whose cast-time multiplicity the runtime does NOT preserve. Exalted is
++// the DISCRIMINATING case: it is admitted by `parse_keyword_name` (KEYWORDS), so
++// both tokens parse and the duplicate gate is actually reached, and it functions
++// separately by rule, yet its cast-grant count is never consumed, so it is
++// excluded from `Keyword::cast_merge_preserves_instances`. Without the gate this
++// line would lower to two `CastWithKeyword { Exalted }` statics that
++// `merge_spell_keyword` then coalesces by kind — an under-count. The paired
++// single-Exalted reach guard below proves the keyword genuinely parses here, so
++// this decline is the gate firing, not the list parse failing on an unknown token.
++// (Storm — the CR 702.40b example — is NOT in KEYWORDS, so it never reaches this
++// gate and could not exercise it.)
++#[test]
++fn parse_spells_quoted_duplicate_unpreserved_keyword_declines() {
++    let defs = parse_static_line_multi("Spells you cast have \"Exalted, exalted.\"");
++    assert!(
++        defs.is_empty(),
++        "a duplicate Exalted grant must be declined by the duplicate gate (Exalted \
++         multiplicity is not preserved at the cast merge), not silently deduped: {defs:?}"
++    );
++}
++
++// Reach guard that makes the decline above DISCRIMINATING: a SINGLE Exalted quoted
++// grant IS accepted (one `CastWithKeyword { Exalted }`). So both tokens of
++// "Exalted, exalted" reach the duplicate gate — the decline is the gate rejecting
++// an unpreserved duplicate, not the list parse bailing on an unknown keyword.
++#[test]
++fn parse_spells_quoted_single_unpreserved_keyword_reaches() {
++    let defs = parse_static_line_multi("Spells you cast have \"Exalted.\"");
++    assert_eq!(defs.len(), 1, "{defs:?}");
++    assert!(
++        matches!(
++            defs[0].mode,
++            StaticMode::CastWithKeyword {
++                keyword: Keyword::Exalted
++            }
++        ),
++        "{defs:?}"
++    );
++}
++
++// CR 702.85c: the Cascade duplicate the runtime DOES preserve stays claimed — two
++// `CastWithKeyword { Cascade }` statics (Zhulodok / Maelstrom Wanderer's
++// "Cascade, cascade"). The positive counterpart to the Exalted decline.
++#[test]
++fn parse_spells_quoted_duplicate_cascade_kept() {
++    let defs = parse_static_line_multi("Spells you cast have \"Cascade, cascade.\"");
++    assert_eq!(defs.len(), 2, "{defs:?}");
++    assert!(
++        defs.iter().all(|d| matches!(
++            d.mode,
++            StaticMode::CastWithKeyword {
++                keyword: Keyword::Cascade
++            }
++        )),
++        "{defs:?}"
++    );
++}
++
++// The parser's duplicate gate consults `cast_merge_preserves_instances`, which is
++// deliberately NARROWER than the semantic `instances_function_separately`: Exalted
++// (reachable in the quoted grammar) and Storm (not) both function separately by
++// rule but their cast-grant counts are not consumed, so both are excluded and any
++// duplicate grant that reaches the gate declines.
++#[test]
++fn cast_merge_preserves_instances_is_narrower_than_functions_separately() {
++    assert!(Keyword::Cascade.instances_function_separately());
++    assert!(Keyword::Cascade.cast_merge_preserves_instances());
++    assert!(Keyword::Exalted.instances_function_separately());
++    assert!(!Keyword::Exalted.cast_merge_preserves_instances());
++    assert!(Keyword::Storm.instances_function_separately());
++    assert!(!Keyword::Storm.cast_merge_preserves_instances());
++}
++
+ #[test]
+ fn static_grant_replicate_hatchery_sliver() {
+     // Issue #5323 — Hatchery Sliver: "Each Sliver spell you cast has replicate.
+diff --git a/crates/engine/src/types/keywords.rs b/crates/engine/src/types/keywords.rs
+index 16868610ad..dafd3add32 100644
+--- a/crates/engine/src/types/keywords.rs
++++ b/crates/engine/src/types/keywords.rs
+@@ -1725,6 +1725,37 @@ impl Keyword {
+             Keyword::Crew { .. } | Keyword::Enchant(_) | Keyword::Saddle(_)
+         )
+     }
++
++    /// CR 113.2c: The runtime-REALIZED subset of [`Self::instances_function_separately`]
++    /// for cast-time spell-keyword grants — keywords whose multiple instances the
++    /// cast-time merge (`casting.rs::merge_spell_keyword`) must PRESERVE rather than
++    /// coalesce by kind, because a downstream path actually consumes the surviving
++    /// count. This is the single authority shared by that merge gate
++    /// (`casting.rs::requires_per_instance_keyword`) and the quoted keyword-list
++    /// parser (`parse_spells_have_quoted_keyword_list`), so the two cannot diverge:
++    /// the parser must not emit a duplicate `CastWithKeyword` grant the merge would
++    /// silently drop.
++    ///
++    /// - Cascade (CR 702.85c): each granted instance triggers separately, counted
++    ///   via `effective_spell_keyword_instances` in `game/triggers.rs`.
++    /// - Casualty (CR 702.153b) / Squad (CR 702.157b): each instance is paid and
++    ///   triggers separately.
++    ///
++    /// Deliberately NARROWER than [`Self::instances_function_separately`]: Storm
++    /// (CR 702.40b), Myriad, Increment, Provoke, Exalted, and DoubleTeam function
++    /// separately by their own rules, but their cast-GRANT consumption still reads
++    /// the kind-deduped keyword list, so preserving duplicate grants would be inert.
++    /// When such a keyword IS admitted by the quoted-list grammar (of these, only
++    /// Exalted is in `parse_keyword_name`'s KEYWORDS today), the parser declines a
++    /// duplicate of it rather than lower it to a single silently-deduped grant.
++    /// Promote a keyword here only once its granted instance count is genuinely
++    /// consumed end-to-end (with a discriminating runtime regression).
++    pub fn cast_merge_preserves_instances(&self) -> bool {
++        matches!(
++            self,
++            Keyword::Cascade | Keyword::Casualty(_) | Keyword::Squad(_)
++        )
++    }
+ }
+ 
+ /// Capitalize the first character of a string (for type name normalization).
+diff --git a/crates/engine/tests/integration/main.rs b/crates/engine/tests/integration/main.rs
+index 56e2da839d..458be957fe 100644
+--- a/crates/engine/tests/integration/main.rs
++++ b/crates/engine/tests/integration/main.rs
+@@ -1005,3 +1005,4 @@ mod winding_way_reveal_partition_2931;
+ mod witchs_oven_food_tokens;
+ mod xantid_swarm_defending_player_cant_cast;
+ mod you_have_been_caught_stealing_any_damage;
++mod zhulodok_double_cascade;
+diff --git a/crates/engine/tests/integration/zhulodok_double_cascade.rs b/crates/engine/tests/integration/zhulodok_double_cascade.rs
+new file mode 100644
+index 0000000000..80dc3da5f1
+--- /dev/null
++++ b/crates/engine/tests/integration/zhulodok_double_cascade.rs
+@@ -0,0 +1,108 @@
++//! Regression for issue #6005: Zhulodok, Void Gorger grants "Cascade, cascade"
++//! to the colorless MV7+ spells you cast from hand, so such a spell must trigger
++//! cascade TWICE (CR 702.85c: each instance of cascade triggers separately).
++//!
++//! Before the fix the quoted, doubled keyword grant parsed to `Unimplemented`
++//! (the card did nothing); after the parser fix it emitted two
++//! `CastWithKeyword { Cascade }` statics, but the casting-time keyword merge
++//! folded the two granted Cascades back to one by kind, so only one cascade
++//! fired. This test pins the end-to-end behavior: two cascade triggers on the
++//! stack.
++//!
++//! https://github.com/phase-rs/phase/issues/6005
++
++use engine::game::scenario::{GameRunner, GameScenario, P0};
++use engine::types::ability::Effect;
++use engine::types::actions::GameAction;
++use engine::types::game_state::{CastPaymentMode, StackEntryKind};
++use engine::types::mana::{ManaCost, ManaType, ManaUnit};
++use engine::types::phase::Phase;
++use engine::types::zones::Zone;
++
++const ZHULODOK_ORACLE: &str = "Colorless spells you cast from your hand with mana value 7 or greater have \"Cascade, cascade.\"";
++
++fn add_mana(runner: &mut GameRunner, mana: &[ManaType]) {
++    let dummy = engine::types::identifiers::ObjectId(0);
++    let pool = &mut runner
++        .state_mut()
++        .players
++        .iter_mut()
++        .find(|p| p.id == P0)
++        .unwrap()
++        .mana_pool;
++    for m in mana {
++        pool.add(ManaUnit::new(*m, dummy, false, vec![]));
++    }
++}
++
++fn cascade_triggers_on_stack(state: &engine::types::game_state::GameState) -> usize {
++    state
++        .stack
++        .iter()
++        .filter(|entry| {
++            matches!(
++                &entry.kind,
++                StackEntryKind::TriggeredAbility { ability, .. }
++                    if matches!(ability.effect, Effect::Cascade)
++            )
++        })
++        .count()
++}
++
++#[test]
++fn zhulodok_grants_two_cascades_to_colorless_seven_drop_from_hand() {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    // A deep, mostly-land library so each of the two cascades can dig.
++    scenario.with_library_top(
++        P0,
++        &[
++            "Forest", "Forest", "Forest", "Forest", "Forest", "Forest", "Forest", "Forest",
++        ],
++    );
++    let zhulodok = scenario
++        .add_creature_from_oracle(P0, "Zhulodok, Void Gorger", 7, 3, ZHULODOK_ORACLE)
++        .id();
++
++    // A colorless (no colored mana), mana-value-7 creature spell in hand — the
++    // exact class Zhulodok's grant targets.
++    let seven_drop = scenario
++        .add_creature_to_hand(P0, "Colorless Behemoth", 5, 5)
++        .with_mana_cost(ManaCost::Cost {
++            shards: vec![],
++            generic: 7,
++        })
++        .id();
++
++    let mut runner = scenario.build();
++    assert_eq!(runner.state().objects[&zhulodok].zone, Zone::Battlefield);
++
++    add_mana(&mut runner, &[ManaType::Colorless; 7]);
++    runner
++        .act(GameAction::CastSpell {
++            object_id: seven_drop,
++            card_id: runner.state().objects[&seven_drop].card_id,
++            targets: vec![],
++            payment_mode: CastPaymentMode::Auto,
++        })
++        .expect("cast the colorless seven-drop");
++
++    for _ in 0..24 {
++        match &runner.state().waiting_for {
++            engine::types::game_state::WaitingFor::ManaPayment { .. } => {
++                runner.act(GameAction::PassPriority).expect("pay mana");
++            }
++            engine::types::game_state::WaitingFor::Priority { .. } => break,
++            other => panic!("unexpected cast prompt: {other:?}"),
++        }
++    }
++
++    // CR 702.85c: "Cascade, cascade" is two instances, each triggers separately.
++    assert_eq!(
++        cascade_triggers_on_stack(runner.state()),
++        2,
++        "Zhulodok's granted \"Cascade, cascade\" must put TWO cascade triggers on \
++         the stack, not one (stack={:?})",
++        runner.state().stack
++    );
++}

@@ -1,0 +1,196 @@
+diff --git a/src/graphql.ts b/src/graphql.ts
+index 1d343064e5..f516f24e76 100644
+--- a/src/graphql.ts
++++ b/src/graphql.ts
+@@ -60,6 +60,10 @@ import { loadReviewEnrichmentTargetsList } from "./review-enrichment-targets-mcp
+ // loadSubnetCandidatesList that MCP list_subnet_candidates already calls
+ // (#7899) -- not a reimplementation.
+ import { loadSubnetCandidatesList } from "./subnet-candidates-mcp.ts";
++// #7879: GraphQL parity for GET /api/v1/subnets/{netuid}/evidence, reusing
++// loadSubnetEvidenceList that MCP list_subnet_evidence already calls -- not a
++// reimplementation.
++import { loadSubnetEvidenceList } from "./subnet-evidence-mcp.ts";
+ import { loadReviewGapsList } from "./review-gaps-mcp.ts";
+ import { loadProfileCompletenessList } from "./profile-completeness-mcp.ts";
+ // #6984: GraphQL parity for GET /api/v1/adapters/{slug}, reusing loadAdapter that
+@@ -583,8 +587,8 @@ export const SDL = `
+     subnet_event_summary(netuid: Int!, window: String, limit: Int): SubnetEventSummary!
+     "One subnet's registry gap report — the reviewer-facing list of missing/incomplete surface coverage backing its curation state. Null when no gap report has been baked for the netuid (rather than a GraphQL error). Opaque JSON passed through verbatim, matching the get_subnet_gaps MCP/REST shape. Mirrors GET /api/v1/subnets/{netuid}/gaps."
+     subnet_gaps(netuid: Int!): JSON
+-    "One subnet's curation evidence record — the provenance trail (source URLs, checks, reviewer notes) behind its registry entry. Null when no evidence record has been baked for the netuid (rather than a GraphQL error). Opaque JSON passed through verbatim, matching the get_subnet_evidence MCP/REST shape. Mirrors GET /api/v1/subnets/{netuid}/evidence."
+-    subnet_evidence(netuid: Int!): JSON
++    "One subnet's curation evidence record — the provenance trail (source URLs, checks, reviewer notes) behind its registry entry. Search with q across subject, claim, source_url, and support_summary; sort with sort + order; project with fields; and page with limit (1-100) / cursor, exactly as REST does — an unsupported sort/limit/cursor is a GraphQL error, not a silently substituted default. The envelope carries the same pagination meta REST returns (total, returned, limit, cursor, next_cursor, sort, order) alongside the claims rows. Null when no evidence record has been baked for the netuid (rather than a GraphQL error). Mirrors GET /api/v1/subnets/{netuid}/evidence."
++    subnet_evidence(netuid: Int!, q: String, sort: String, order: String, fields: String, limit: Int, cursor: Int): JSON
+     "One subnet's unpromoted candidate-surface queue — the baked per-subnet /metagraph/candidates/{netuid}.json artifact the REST route and get_subnet_candidates MCP tool read. Filter with kind, provider, state, id, and confidence; sort with sort + order; and page with limit (1-100) / cursor, exactly as REST does — an unsupported filter/sort value is a GraphQL error, not a silently substituted default. The envelope carries the same pagination meta REST returns (total, returned, limit, cursor, next_cursor, sort, order) alongside the candidates rows. Null when no candidate artifact has been baked for the netuid (rather than a GraphQL error). Distinct from candidates(...) (the filterable network-wide candidate catalog). Mirrors GET /api/v1/subnets/{netuid}/candidates."
+     subnet_candidates(netuid: Int!, kind: String, provider: String, state: String, id: String, confidence: String, sort: String, order: String, fields: String, limit: Int, cursor: Int): JSON
+     "Per-subnet axon-removal activity over a 7d/30d window (distinct removers, AxonInfoRemoved count, and removals per remover); a subnet with no events in the window resolves to a schema-stable zeroed card, never null. Mirrors GET /api/v1/subnets/{netuid}/axon-removals."
+@@ -7050,15 +7054,39 @@ const rootValue = {
+     return loadArtifact(context, `/metagraph/review/gaps/${netuid}.json`);
+   },
+ 
+-  async subnet_evidence({ netuid }: Row, context: GqlContext) {
++  async subnet_evidence(args: Row, context: GqlContext) {
++    const { netuid } = args;
+     if (!Number.isInteger(netuid) || netuid < 0) {
+       throw new GraphQLError("netuid must be a non-negative integer.", {
+         extensions: { code: "BAD_USER_INPUT" },
+       });
+     }
+-    // Same baked evidence artifact the REST route + get_subnet_evidence MCP
+-    // tool read; null when no record has been baked for this netuid.
+-    return loadArtifact(context, `/metagraph/evidence/${netuid}.json`);
++    // #7879: reuse loadSubnetEvidenceList -- the same loader MCP
++    // list_subnet_evidence calls -- rather than reimplementing the
++    // search/sort/page pass here, so this field cannot drift from
++    // GET /api/v1/subnets/{netuid}/evidence. It reads the same baked
++    // per-subnet artifact and validates every sort/limit/cursor value against
++    // the REST allowlists, throwing on an unsupported one.
++    try {
++      return await loadSubnetEvidenceList(mcpCtx(context), args, {
++        readArtifact,
++      });
++    } catch (rawErr) {
++      const err = rawErr as Row;
++      // An unsupported sort/limit/cursor is BAD_USER_INPUT, matching every
++      // other field's "not a silently substituted default" convention.
++      if (err?.toolError && err.code === "invalid_params") {
++        throw new GraphQLError(err.message, {
++          extensions: { code: "BAD_USER_INPUT" },
++        });
++      }
++      // Any other loader miss (not baked / cold R2 / unavailable) stays null,
++      // preserving this field's documented cold-artifact contract --
++      // loadArtifact, which this resolver used before, swallowed those the
++      // same way.
++      if (err?.toolError) return null;
++      throw err;
++    }
+   },
+ 
+   async subnet_candidates(args: Row, context: GqlContext) {
+diff --git a/tests/graphql.test.ts b/tests/graphql.test.ts
+index 60f188207b..e8981d3df2 100644
+--- a/tests/graphql.test.ts
++++ b/tests/graphql.test.ts
+@@ -9,6 +9,7 @@ import {
+ } from "graphql";
+ import { describe, test, vi } from "vitest";
+ import * as subnetCandidatesMcp from "../src/subnet-candidates-mcp.ts";
++import * as subnetEvidenceMcp from "../src/subnet-evidence-mcp.ts";
+ import {
+   FIELD_COMPLEXITY,
+   GRAPHQL_MAX_BODY_BYTES,
+@@ -8986,6 +8987,113 @@ describe("graphql — subnet_gaps / subnet_evidence (#6980, baked review artifac
+     assert.equal(FIELD_COMPLEXITY.subnet_gaps, 5);
+     assert.equal(FIELD_COMPLEXITY.subnet_evidence, 5);
+   });
++
++  // #7879: q / sort / order / fields / limit / cursor parity, reusing the same
++  // loader MCP list_subnet_evidence calls.
++  const EVIDENCE_ENV = () =>
++    fixtureEnv({
++      "/metagraph/evidence/5.json": {
++        generated_at: "2026-07-01T00:00:00.000Z",
++        netuid: 5,
++        claims: [
++          {
++            subject: "alpha-api",
++            claim: "endpoint responds",
++            source_url: "https://alpha.example.com/openapi.json",
++            support_summary: "probe returned 200",
++            verified_at: "2026-06-01T00:00:00.000Z",
++          },
++          {
++            subject: "beta-docs",
++            claim: "documentation published",
++            source_url: "https://beta.example.com/docs",
++            support_summary: "manual review",
++            verified_at: "2026-06-02T00:00:00.000Z",
++          },
++          {
++            subject: "gamma-api",
++            claim: "schema validates",
++            source_url: "https://gamma.example.com/openapi.json",
++            support_summary: "openapi lint clean",
++            verified_at: "2026-06-03T00:00:00.000Z",
++          },
++        ],
++      },
++    });
++
++  test("subnet_evidence searches with q (#7879)", async () => {
++    const { status, body } = await gql(
++      '{ subnet_evidence(netuid: 5, q: "openapi") }',
++      EVIDENCE_ENV(),
++    );
++    assert.equal(status, 200);
++    assert.equal(body.errors, undefined);
++    const out = body.data.subnet_evidence;
++    assert.equal(out.returned, 2);
++    assert.deepEqual(out.claims.map((row: Row) => row.subject).sort(), [
++      "alpha-api",
++      "gamma-api",
++    ]);
++  });
++
++  test("subnet_evidence pages a q search and round-trips next_cursor (#7879)", async () => {
++    const first = await gql(
++      '{ subnet_evidence(netuid: 5, q: "openapi", sort: "subject", order: "asc", limit: 1) }',
++      EVIDENCE_ENV(),
++    );
++    assert.equal(first.body.errors, undefined);
++    const page1 = first.body.data.subnet_evidence;
++    assert.equal(page1.total, 2);
++    assert.equal(page1.returned, 1);
++    assert.equal(page1.claims[0].subject, "alpha-api");
++    assert.equal(page1.next_cursor, 1);
++
++    const second = await gql(
++      '{ subnet_evidence(netuid: 5, q: "openapi", sort: "subject", order: "asc", limit: 1, cursor: 1) }',
++      EVIDENCE_ENV(),
++    );
++    const page2 = second.body.data.subnet_evidence;
++    assert.equal(page2.claims[0].subject, "gamma-api");
++    assert.equal(page2.next_cursor, null);
++  });
++
++  test("subnet_evidence projects fields and rejects an unsupported sort (#7879)", async () => {
++    const projected = await gql(
++      '{ subnet_evidence(netuid: 5, q: "documentation", fields: "subject,claim") }',
++      EVIDENCE_ENV(),
++    );
++    assert.equal(projected.body.errors, undefined);
++    assert.deepEqual(projected.body.data.subnet_evidence.claims[0], {
++      subject: "beta-docs",
++      claim: "documentation published",
++    });
++
++    const badSort = await gql(
++      '{ subnet_evidence(netuid: 5, sort: "not_a_column") }',
++      EVIDENCE_ENV(),
++    );
++    assert.ok(badSort.body.errors, "expected a GraphQL error for sort");
++    assert.equal(badSort.body.errors[0].extensions.code, "BAD_USER_INPUT");
++  });
++
++  test("subnet_evidence propagates an unexpected loader failure (#7879)", async () => {
++    // Only the loader's own toolErrors map to null/BAD_USER_INPUT; anything
++    // else is a real fault and must surface rather than being masked as
++    // "no evidence baked".
++    const spy = vi
++      .spyOn(subnetEvidenceMcp, "loadSubnetEvidenceList")
++      .mockRejectedValue(new Error("loader exploded"));
++    try {
++      const { body } = await gql(
++        "{ subnet_evidence(netuid: 5) }",
++        EVIDENCE_ENV(),
++      );
++      assert.ok(body.errors, "expected the raw failure to surface");
++      assert.match(body.errors[0].message, /loader exploded/);
++    } finally {
++      spy.mockRestore();
++    }
++  });
+ });
+ 
+ describe("graphql — subnet_candidates (#7641, baked per-subnet candidate artifact)", () => {

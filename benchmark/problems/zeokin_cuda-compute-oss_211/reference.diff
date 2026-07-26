@@ -1,0 +1,208 @@
+diff --git a/strategy/subspace.py b/strategy/subspace.py
+index c9b6da1..f34c552 100644
+--- a/strategy/subspace.py
++++ b/strategy/subspace.py
+@@ -18,6 +18,7 @@
+ """
+ from __future__ import annotations
+ 
++import inspect
+ import math
+ 
+ import numpy as np
+@@ -200,12 +201,17 @@ def multiply_subspace(A, B, C, backend: Backend, cfg: Config) -> dict:
+         raise ValueError(f"rank_m must be in [1, n]; got {m} for n={n}")
+     cdt = cfg.compute_dtype
+ 
++    frac = cfg.vram_fraction
+     transform = get_transform(cfg.transform, cfg.transform_seed)
+-    Q = transform.basis(n, m, backend, cdt, A=A, B=B)     # (n, m) orthonormal
++    # Give the basis stage the same VRAM budget as compress/reconstruct. Pass frac
++    # only if the transform accepts it, so custom transforms with the older
++    # basis(...) signature keep working.
++    if "frac" in inspect.signature(transform.basis).parameters:
++        Q = transform.basis(n, m, backend, cdt, A=A, B=B, frac=frac)  # (n, m) orthonormal
++    else:
++        Q = transform.basis(n, m, backend, cdt, A=A, B=B)
+     if Q.shape != (n, m):
+         raise ValueError(f"transform returned basis {Q.shape}, expected {(n, m)}")
+-
+-    frac = cfg.vram_fraction
+     Atil = compress(A, Q, backend, cdt, frac)             # (m, m)
+     Btil = compress(B, Q, backend, cdt, frac)             # (m, m)
+     Ctil = backend.matmul(Atil, Btil)                     # (m, m)  -- cheap core
+diff --git a/strategy/tests/test_basis_vram_fraction.py b/strategy/tests/test_basis_vram_fraction.py
+new file mode 100644
+index 0000000..4c217bf
+--- /dev/null
++++ b/strategy/tests/test_basis_vram_fraction.py
+@@ -0,0 +1,98 @@
++"""CPU-only tests: rsvd basis threads the configured VRAM fraction (issue #210).
++
++rsvd.basis sized its sketch row-blocks against the hardcoded 0.3 default instead of
++Config.vram_fraction. These stub the streamed sketches to capture the `frac` they
++receive, so no GPU is needed.
++
++Run:  python strategy/tests/test_basis_vram_fraction.py
++"""
++import inspect
++import os
++import sys
++
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
++
++from strategy import subspace as sub
++from strategy.transforms import RandomizedSVDTransform, Transform
++
++
++class _XP:
++    concatenate = staticmethod(np.concatenate)
++
++    class linalg:
++        qr = staticmethod(np.linalg.qr)
++
++
++class _FakeBackend:
++    xp = _XP()
++
++    def to_device(self, x):
++        return np.asarray(x)
++
++
++def _capture_fracs(frac_kwarg="__omit__", n=8, m=4):
++    """Call rsvd.basis with stubbed sketches; return the list of frac values they saw."""
++    captured = []
++    orig_r, orig_l = sub.stream_gemm_right, sub.stream_gemm_left_t
++
++    def fake(X, Q, backend, dtype, frac=sub._DEFAULT_ROW_BLOCK_FRACTION):
++        captured.append(frac)
++        return np.zeros((X.shape[0], Q.shape[1]), dtype=dtype)
++
++    sub.stream_gemm_right = fake
++    sub.stream_gemm_left_t = fake
++    try:
++        A = np.eye(n, dtype=np.float32)
++        B = np.eye(n, dtype=np.float32)
++        t = RandomizedSVDTransform(seed=0)
++        kw = {} if frac_kwarg == "__omit__" else {"frac": frac_kwarg}
++        Q = t.basis(n, m, _FakeBackend(), np.float32, A=A, B=B, **kw)
++        assert Q.shape == (n, m)
++    finally:
++        sub.stream_gemm_right, sub.stream_gemm_left_t = orig_r, orig_l
++    return captured
++
++
++def test_rsvd_basis_threads_the_configured_fraction():
++    fracs = _capture_fracs(frac_kwarg=0.15)
++    assert fracs == [0.15, 0.15, 0.15, 0.15], fracs
++
++
++def test_rsvd_basis_defaults_to_streaming_default_when_none():
++    d = sub._DEFAULT_ROW_BLOCK_FRACTION
++    assert _capture_fracs(frac_kwarg=None) == [d, d, d, d]
++    assert _capture_fracs(frac_kwarg="__omit__") == [d, d, d, d]
++
++
++def test_basis_signatures_accept_frac():
++    # Base class + rsvd expose `frac` so multiply_subspace can thread it.
++    assert "frac" in inspect.signature(Transform.basis).parameters
++    assert "frac" in inspect.signature(RandomizedSVDTransform.basis).parameters
++
++
++def test_old_signature_transform_is_detected_by_the_guard():
++    # A custom transform without `frac` must be callable without it (the guard in
++    # multiply_subspace inspects the signature before passing frac).
++    class _Old(Transform):
++        name = "old"
++
++        def basis(self, n, m, backend, dtype, A=None, B=None):  # no frac
++            return backend.xp.linalg.qr(np.zeros((n, m), dtype=dtype))[0]
++
++    assert "frac" not in inspect.signature(_Old().basis).parameters
++
++
++if __name__ == "__main__":
++    fns = [v for kk, v in sorted(globals().items()) if kk.startswith("test_")]
++    failed = 0
++    for fn in fns:
++        try:
++            fn()
++            print(f"PASS  {fn.__name__}")
++        except AssertionError as e:
++            failed += 1
++            print(f"FAIL  {fn.__name__}: {e}")
++    print(f"\n{len(fns) - failed}/{len(fns)} passed")
++    sys.exit(1 if failed else 0)
+diff --git a/strategy/transforms.py b/strategy/transforms.py
+index 7daa6cb..688bb3f 100644
+--- a/strategy/transforms.py
++++ b/strategy/transforms.py
+@@ -14,9 +14,9 @@
+ 
+     class MyTransform(Transform):
+         name = "mine"
+-        def basis(self, n, m, backend, dtype, A=None, B=None):
++        def basis(self, n, m, backend, dtype, A=None, B=None, frac=None):
+             Q = ...            # (n, m) array on backend.xp, ORTHONORMAL columns
+-            return Q
++            return Q           # pass frac to any streamed stream_gemm_* helpers
+     register_transform("mine", MyTransform)
+ 
+ Then select it with Config(transform="mine") or --transform mine.
+@@ -37,7 +37,12 @@ class Transform:
+     def __init__(self, seed: int = 0):
+         self.seed = seed
+ 
+-    def basis(self, n: int, m: int, backend, dtype, A=None, B=None):
++    def basis(self, n: int, m: int, backend, dtype, A=None, B=None, frac=None):
++        """Return an (n, m) orthonormal basis. ``frac`` is the fraction of free
++        device memory a streamed row-block may use (``Config.vram_fraction`` when
++        driven by the strategy); forward it to any ``stream_gemm_*`` helpers so the
++        basis stage honours the same VRAM budget as compress/reconstruct. ``None``
++        means "use the streaming default"."""
+         raise NotImplementedError
+ 
+     def basis_flops(self, n: int, m: int) -> float:
+@@ -66,10 +71,20 @@ class RandomizedSVDTransform(Transform):
+ 
+     name = "rsvd"
+ 
+-    def basis(self, n, m, backend, dtype, A=None, B=None):
++    def basis(self, n, m, backend, dtype, A=None, B=None, frac=None):
+         if A is None or B is None:
+             raise ValueError("rsvd transform needs A and B")
+-        from .subspace import stream_gemm_right, stream_gemm_left_t
++        from .subspace import (
++            _DEFAULT_ROW_BLOCK_FRACTION,
++            stream_gemm_left_t,
++            stream_gemm_right,
++        )
++
++        # Honour the strategy's VRAM budget (Config.vram_fraction) for the sketch
++        # row-blocks, like compress/reconstruct do -- otherwise the basis stage
++        # silently uses the 0.3 default and can OOM at a low --vram-fraction.
++        if frac is None:
++            frac = _DEFAULT_ROW_BLOCK_FRACTION
+ 
+         xp = backend.xp
+         base, rem = divmod(m, 4)
+@@ -83,13 +98,13 @@ def omega(w):
+ 
+         parts = []
+         if widths[0]:
+-            parts.append(stream_gemm_right(A, omega(widths[0]), backend, dtype))
++            parts.append(stream_gemm_right(A, omega(widths[0]), backend, dtype, frac))
+         if widths[1]:
+-            parts.append(stream_gemm_left_t(A, omega(widths[1]), backend, dtype))
++            parts.append(stream_gemm_left_t(A, omega(widths[1]), backend, dtype, frac))
+         if widths[2]:
+-            parts.append(stream_gemm_right(B, omega(widths[2]), backend, dtype))
++            parts.append(stream_gemm_right(B, omega(widths[2]), backend, dtype, frac))
+         if widths[3]:
+-            parts.append(stream_gemm_left_t(B, omega(widths[3]), backend, dtype))
++            parts.append(stream_gemm_left_t(B, omega(widths[3]), backend, dtype, frac))
+ 
+         Y = xp.concatenate(parts, axis=1)      # (n, m)
+         return self._orthonormalize(Y, backend)  # (n, m) orthonormal columns

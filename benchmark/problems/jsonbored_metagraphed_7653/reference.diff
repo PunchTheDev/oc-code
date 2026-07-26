@@ -1,0 +1,155 @@
+diff --git a/src/graphql.mjs b/src/graphql.mjs
+index 05f797acf2..707c3e90a9 100644
+--- a/src/graphql.mjs
++++ b/src/graphql.mjs
+@@ -173,8 +173,10 @@ import {
+   mergeFreshness,
+   mergeRpcEndpoints,
+   overlayOverviewHealth,
++  loadSubnetReliability,
+   overlayCatalogDetail,
+   overlayCatalogIndex,
++  overlaySubnetHealth,
+   resolveLiveEconomics,
+   resolveLiveHealth,
+   subnetBadgeStatus,
+@@ -496,6 +498,8 @@ export const SDL = `
+     subnet_health_incidents(netuid: Int!, window: String): SubnetHealthIncidents!
+     "One subnet's per-surface latency percentiles (p50/p90/p95/p99) over a 7d/30d window (default 7d), computed live from the success-only health-probe history. The latency-distribution companion of subnet_health_incidents' availability view. A subnet with no probe history resolves to a schema-stable empty surfaces list, never null. Mirrors GET /api/v1/subnets/{netuid}/health/percentiles."
+     subnet_health_percentiles(netuid: Int!, window: String): SubnetHealthPercentiles!
++    "One subnet's current live operational-health card: the per-surface status/latency/last-ok rows from the latest ~15-minute cron probe (summarized into ok/degraded/failed/unknown counts) plus the cross-window reliability score. The at-a-glance base card completing the health family whose windowed views are subnet_health_trends/subnet_health_incidents/subnet_health_percentiles. A subnet with no live health data resolves to the same schema-stable unknown card (summary.status of unknown, empty surfaces), never null. Opaque JSON passed through verbatim, matching the get_subnet_health MCP/REST shape (the existing typed SubnetHealth is the flat health-list item, a different shape, so this base card is JSON like the sibling surfaces payloads). Mirrors GET /api/v1/subnets/{netuid}/health."
++    subnet_health(netuid: Int!): JSON
+     "One subnet's rolling 24h alpha trading volume from the StakeAdded/StakeRemoved trade stream: buy/sell volume in alpha and TAO, trade counts, net flow, a buy-vs-sell sentiment ratio, and volume-to-market-cap ratio. A subnet with no trades resolves to a schema-stable zeroed card, never null. Mirrors GET /api/v1/subnets/{netuid}/volume."
+     subnet_volume(netuid: Int!): SubnetVolume!
+     "The machine-readable AI-resources index: the copyable agent prompt (/agent.md), MCP server install metadata and tool listing, the Bittensor skill, llms.txt, OpenAPI, and links to the agent-facing APIs. Use it to bootstrap an agent integration before calling the catalog/search fields. Null when the index has not been baked in this environment (rather than a GraphQL error). Opaque JSON passed through verbatim, matching the get_agent_resources MCP/REST shape. Mirrors GET /api/v1/agent-resources."
+@@ -4245,6 +4249,7 @@ export const FIELD_COMPLEXITY = {
+   subnet_uptime: RELATIONSHIP_FIELD_COMPLEXITY,
+   subnet_health_incidents: RELATIONSHIP_FIELD_COMPLEXITY,
+   subnet_health_percentiles: RELATIONSHIP_FIELD_COMPLEXITY,
++  subnet_health: RELATIONSHIP_FIELD_COMPLEXITY,
+   agent_resources: RELATIONSHIP_FIELD_COMPLEXITY,
+   curation: RELATIONSHIP_FIELD_COMPLEXITY,
+   candidates: RELATIONSHIP_FIELD_COMPLEXITY,
+@@ -9503,6 +9508,41 @@ const rootValue = {
+     };
+   },
+ 
++  async subnet_health({ netuid }, context) {
++    // Same non-negative netuid gate the other per-subnet resolvers use --
++    // GraphQL Int coercion rejects non-integers at parse time; a negative
++    // netuid is a BAD_USER_INPUT error, not a silent card.
++    if (!Number.isInteger(netuid) || netuid < 0) {
++      throw new GraphQLError("netuid must be a non-negative integer.", {
++        extensions: { code: "BAD_USER_INPUT" },
++      });
++    }
++    // Same live composition REST's subnet-health route (workers/api.mjs's
++    // subnet-health overlay) and the get_subnet_health MCP tool share: the
++    // latest ~15-minute cron snapshot (resolveLiveHealth) overlaid per subnet
++    // (overlaySubnetHealth), plus the cross-window reliability summary
++    // (loadSubnetReliability). A subnet with no live rows overlays to null, so
++    // it resolves to the identical schema-stable "unknown" card the MCP tool
++    // returns on a cold store -- never a GraphQL error. Nothing is re-derived.
++    const [live, reliability] = await Promise.all([
++      resolveLiveHealth({ readHealthKv, env: context.env }),
++      loadSubnetReliability(),
++    ]);
++    const overlaid = overlaySubnetHealth(null, live, netuid);
++    if (overlaid) {
++      return { ...overlaid, reliability };
++    }
++    return {
++      schema_version: 1,
++      netuid,
++      summary: { status: "unknown", surface_count: 0 },
++      operational_observed_at: null,
++      health_source: "unavailable",
++      reliability,
++      surfaces: [],
++    };
++  },
++
+   async subnet_uptime({ netuid, window, min_samples: minSamples }, context) {
+     // Same 90d/1y window validation handleUptime / get_subnet_uptime use -- an
+     // unsupported window is a GraphQL BAD_USER_INPUT error, not a silent card.
+diff --git a/tests/graphql.test.mjs b/tests/graphql.test.mjs
+index 90336eb8c4..359851ef8a 100644
+--- a/tests/graphql.test.mjs
++++ b/tests/graphql.test.mjs
+@@ -14758,6 +14758,76 @@ describe("graphql — subnet_health_trends (#5883, Postgres-tier + D1-live fallb
+   });
+ });
+ 
++describe("graphql — subnet_health (#7640, live-cron overlay parity with REST + MCP)", () => {
++  const NETUID = 7;
++
++  test("subnet_health overlays the live per-surface card for the netuid", async () => {
++    const env = fixtureEnv(
++      {},
++      {
++        kv: {
++          [KV_HEALTH_CURRENT]: {
++            surfaces: [
++              {
++                surface_id: "7:subnet-api:x",
++                netuid: NETUID,
++                kind: "subnet-api",
++                provider: "x",
++                url: "https://x.example/api",
++                status: "ok",
++                classification: "live",
++                latency_ms: 120,
++                last_ok: "2026-06-13T00:00:00.000Z",
++                last_checked: "2026-06-13T00:05:00.000Z",
++              },
++            ],
++          },
++        },
++      },
++    );
++    const { status, body } = await gql(
++      `{ subnet_health(netuid: ${NETUID}) }`,
++      env,
++    );
++    assert.equal(status, 200);
++    const card = body.data.subnet_health;
++    assert.equal(card.netuid, NETUID);
++    assert.equal(card.surfaces.length, 1);
++    assert.equal(card.surfaces[0].status, "ok");
++    assert.equal(card.summary.surface_count, 1);
++    assert.equal(card.summary.status, "ok");
++    // loadSubnetReliability() returns null since D1 retirement -- the card still
++    // resolves, matching the get_subnet_health MCP tool's null-reliability path.
++    assert.equal(card.reliability, null);
++  });
++
++  test("subnet_health resolves the schema-stable unknown card when the live store is cold", async () => {
++    const { status, body } = await gql(
++      `{ subnet_health(netuid: ${NETUID}) }`,
++      emptyEnv,
++    );
++    assert.equal(status, 200);
++    assert.deepEqual(body.data.subnet_health, {
++      schema_version: 1,
++      netuid: NETUID,
++      summary: { status: "unknown", surface_count: 0 },
++      operational_observed_at: null,
++      health_source: "unavailable",
++      reliability: null,
++      surfaces: [],
++    });
++  });
++
++  test("subnet_health rejects a negative netuid with BAD_USER_INPUT", async () => {
++    const { body } = await gql("{ subnet_health(netuid: -1) }", emptyEnv);
++    assert.equal(body.errors[0].extensions.code, "BAD_USER_INPUT");
++  });
++
++  test("subnet_health is weighted as a fan-out field", () => {
++    assert.equal(FIELD_COMPLEXITY.subnet_health, 5);
++  });
++});
++
+ describe("graphql — subnet_uptime (#5885, Postgres-tier + D1-live fallback)", () => {
+   const NETUID = 7;
+ 

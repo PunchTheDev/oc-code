@@ -1,0 +1,255 @@
+diff --git a/sdk/src/activelearning/bus_metrics.py b/sdk/src/activelearning/bus_metrics.py
+index 242edd9..49d5aad 100644
+--- a/sdk/src/activelearning/bus_metrics.py
++++ b/sdk/src/activelearning/bus_metrics.py
+@@ -40,6 +40,7 @@ class EventBusMetrics:
+     subscribe_delivery: LatencyStats = field(default_factory=LatencyStats)
+     request: LatencyStats = field(default_factory=LatencyStats)
+     publish_jetstream_count: int = 0
++    resubscribe_failed_count: int = 0
+ 
+     def record_publish(self, latency_ms: float, *, jetstream: bool = False) -> None:
+         self.publish.record(latency_ms)
+@@ -52,6 +53,9 @@ def record_subscribe_delivery(self, latency_ms: float) -> None:
+     def record_request(self, latency_ms: float) -> None:
+         self.request.record(latency_ms)
+ 
++    def record_resubscribe_failed(self) -> None:
++        self.resubscribe_failed_count += 1
++
+     def snapshot(self, service_name: str) -> dict[str, Any]:
+         """JSON-serializable payload for eventbus.metrics.{service_name}."""
+         return {
+@@ -63,4 +67,5 @@ def snapshot(self, service_name: str) -> dict[str, Any]:
+             },
+             "subscribe": self.subscribe_delivery.to_dict(),
+             "request": self.request.to_dict(),
++            "resubscribe_failed_count": self.resubscribe_failed_count,
+         }
+diff --git a/sdk/src/activelearning/connection_logging.py b/sdk/src/activelearning/connection_logging.py
+index 34a8fcf..48b3900 100644
+--- a/sdk/src/activelearning/connection_logging.py
++++ b/sdk/src/activelearning/connection_logging.py
+@@ -21,6 +21,7 @@
+ TRANSITION_FORCE_RECONNECT_START = "force_reconnect_start"
+ TRANSITION_FORCE_RECONNECT_CLOSE_FAILED = "force_reconnect_close_failed"
+ TRANSITION_FORCE_RECONNECT_RESUBSCRIBE_FAILED = "force_reconnect_resubscribe_failed"
++TRANSITION_FORCE_RECONNECT_RESUBSCRIBE_RETRY = "force_reconnect_resubscribe_retry"
+ TRANSITION_FORCE_RECONNECT_COMPLETE = "force_reconnect_complete"
+ 
+ 
+diff --git a/sdk/src/activelearning/nats_client.py b/sdk/src/activelearning/nats_client.py
+index 1086f53..8461911 100644
+--- a/sdk/src/activelearning/nats_client.py
++++ b/sdk/src/activelearning/nats_client.py
+@@ -33,6 +33,7 @@
+     TRANSITION_FORCE_RECONNECT_CLOSE_FAILED,
+     TRANSITION_FORCE_RECONNECT_COMPLETE,
+     TRANSITION_FORCE_RECONNECT_RESUBSCRIBE_FAILED,
++    TRANSITION_FORCE_RECONNECT_RESUBSCRIBE_RETRY,
+     TRANSITION_FORCE_RECONNECT_START,
+     TRANSITION_RECONNECTED,
+     log_connection_event,
+@@ -962,33 +963,57 @@ async def force_reconnect(self) -> None:
+         # Create fresh connection (preserves nats_creds; also re-ensures the safety stream)
+         await self.connect()
+ 
+-        # Re-subscribe all handlers, preserving JS vs core distinction
++        # Re-subscribe all handlers, preserving JS vs core distinction.
++        # Each subject gets a few attempts before being marked failed -- a lone
++        # transient error (e.g. server still settling post-reconnect) shouldn't
++        # permanently deafen a service until the next full restart.
++        resubscribe_attempts = 3
++        resubscribe_retry_delay_s = 0.5
++        failed_subjects: list[str] = []
+         for subject, (handler, is_req) in saved_handlers.items():
+-            try:
+-                if subject in saved_js:
+-                    await self.js_subscribe(
+-                        subject,
+-                        handler,
+-                        durable=saved_js[subject],
+-                        poison_handler=saved_poison.get(subject),
+-                    )
+-                else:
+-                    await self.subscribe(subject, handler, is_request_handler=is_req)
+-            except Exception as e:
+-                log_connection_event(
+-                    TRANSITION_FORCE_RECONNECT_RESUBSCRIBE_FAILED,
+-                    client_name=self.name,
+-                    nats_url=self.nats_url,
+-                    subject=subject,
+-                    error=str(e),
+-                    level=logging.ERROR,
+-                )
++            for attempt in range(1, resubscribe_attempts + 1):
++                try:
++                    if subject in saved_js:
++                        await self.js_subscribe(
++                            subject,
++                            handler,
++                            durable=saved_js[subject],
++                            poison_handler=saved_poison.get(subject),
++                        )
++                    else:
++                        await self.subscribe(subject, handler, is_request_handler=is_req)
++                    break
++                except Exception as e:
++                    if attempt < resubscribe_attempts:
++                        log_connection_event(
++                            TRANSITION_FORCE_RECONNECT_RESUBSCRIBE_RETRY,
++                            client_name=self.name,
++                            nats_url=self.nats_url,
++                            subject=subject,
++                            attempt=attempt,
++                            error=str(e),
++                            level=logging.WARNING,
++                        )
++                        await asyncio.sleep(resubscribe_retry_delay_s)
++                    else:
++                        failed_subjects.append(subject)
++                        self._metrics.record_resubscribe_failed()
++                        log_connection_event(
++                            TRANSITION_FORCE_RECONNECT_RESUBSCRIBE_FAILED,
++                            client_name=self.name,
++                            nats_url=self.nats_url,
++                            subject=subject,
++                            attempts=resubscribe_attempts,
++                            error=str(e),
++                            level=logging.ERROR,
++                        )
+ 
+         log_connection_event(
+             TRANSITION_FORCE_RECONNECT_COMPLETE,
+             client_name=self.name,
+             nats_url=self.nats_url,
+             subscription_count=len(self._subscriptions),
++            failed_subjects=failed_subjects,
+         )
+ 
+     @property
+diff --git a/sdk/tests/test_bus_metrics.py b/sdk/tests/test_bus_metrics.py
+index 555ac1c..6ef6901 100644
+--- a/sdk/tests/test_bus_metrics.py
++++ b/sdk/tests/test_bus_metrics.py
+@@ -37,6 +37,18 @@ def test_snapshot_shape(self):
+         assert snap["request"]["count"] == 1
+         assert "timestamp_ms" in snap
+ 
++    def test_resubscribe_failed_count_starts_at_zero(self):
++        metrics = EventBusMetrics()
++        assert metrics.resubscribe_failed_count == 0
++        assert metrics.snapshot("kernel")["resubscribe_failed_count"] == 0
++
++    def test_record_resubscribe_failed_increments(self):
++        metrics = EventBusMetrics()
++        metrics.record_resubscribe_failed()
++        metrics.record_resubscribe_failed()
++        assert metrics.resubscribe_failed_count == 2
++        assert metrics.snapshot("kernel")["resubscribe_failed_count"] == 2
++
+ 
+ class TestEventBusInstrumentation:
+     @pytest.mark.asyncio
+diff --git a/sdk/tests/test_nats_client.py b/sdk/tests/test_nats_client.py
+index 8c18943..395d446 100644
+--- a/sdk/tests/test_nats_client.py
++++ b/sdk/tests/test_nats_client.py
+@@ -5,6 +5,8 @@
+ 
+ import pytest
+ 
++from activelearning import nats_client as nats_client_module
++from activelearning.connection_logging import TRANSITION_FORCE_RECONNECT_COMPLETE
+ from activelearning.core import current_timestamp, generate_trace_id
+ from activelearning.nats_client import EventBus
+ from activelearning.signing import DECISION_KEY_ENV, DECISION_KEY_SECONDARY_ENV, sign_decision
+@@ -68,6 +70,88 @@ async def handler(data: dict) -> None:
+     assert received[0]["after"] == "reconnect"
+ 
+ 
++@pytest.mark.asyncio
++async def test_force_reconnect_retries_transient_resubscribe_failure(
++    event_bus: EventBus, wait_for_message, monkeypatch
++):
++    """A subject that fails to resubscribe once should succeed on retry,
++    not be permanently dropped after a single transient error."""
++    subject = f"test.reconnect.retry.{uuid.uuid4().hex[:8]}"
++    received: list[dict] = []
++
++    async def handler(data: dict) -> None:
++        received.append(data)
++
++    await event_bus.subscribe(subject, handler)
++
++    original_subscribe = event_bus.subscribe
++    call_count = {"n": 0}
++
++    async def flaky_subscribe(subj, hdlr, **kwargs):
++        call_count["n"] += 1
++        if subj == subject and call_count["n"] == 1:
++            raise ConnectionError("simulated transient resubscribe failure")
++        return await original_subscribe(subj, hdlr, **kwargs)
++
++    monkeypatch.setattr(event_bus, "subscribe", flaky_subscribe)
++
++    await event_bus.force_reconnect()
++    assert event_bus.is_connected
++    assert subject in event_bus._handlers
++    assert event_bus._metrics.resubscribe_failed_count == 0
++
++    await event_bus.publish(subject, {"after": "retry"})
++    await wait_for_message(lambda: len(received) == 1)
++    assert received[0]["after"] == "retry"
++
++
++@pytest.mark.asyncio
++async def test_force_reconnect_marks_persistent_resubscribe_failure(
++    event_bus: EventBus, monkeypatch
++):
++    """A subject that keeps failing to resubscribe across all attempts should
++    be reported in the completion event and counted in metrics, instead of
++    disappearing silently with only a log line."""
++    good_subject = f"test.reconnect.ok.{uuid.uuid4().hex[:8]}"
++    bad_subject = f"test.reconnect.bad.{uuid.uuid4().hex[:8]}"
++
++    async def noop_handler(data: dict) -> None:
++        pass
++
++    await event_bus.subscribe(good_subject, noop_handler)
++    await event_bus.subscribe(bad_subject, noop_handler)
++
++    original_subscribe = event_bus.subscribe
++
++    async def selective_subscribe(subj, hdlr, **kwargs):
++        if subj == bad_subject:
++            raise ConnectionError("simulated persistent resubscribe failure")
++        return await original_subscribe(subj, hdlr, **kwargs)
++
++    original_log = nats_client_module.log_connection_event
++    completion_events: list[dict] = []
++
++    def capturing_log(transition, **fields):
++        payload = original_log(transition, **fields)
++        if transition == TRANSITION_FORCE_RECONNECT_COMPLETE:
++            completion_events.append(payload)
++        return payload
++
++    monkeypatch.setattr(event_bus, "subscribe", selective_subscribe)
++    monkeypatch.setattr(nats_client_module, "log_connection_event", capturing_log)
++
++    before_failed_count = event_bus._metrics.resubscribe_failed_count
++    await event_bus.force_reconnect()
++
++    assert event_bus.is_connected
++    assert good_subject in event_bus._handlers
++    assert bad_subject not in event_bus._handlers
++    assert event_bus._metrics.resubscribe_failed_count == before_failed_count + 1
++    assert completion_events
++    assert bad_subject in completion_events[-1]["failed_subjects"]
++    assert good_subject not in completion_events[-1]["failed_subjects"]
++
++
+ @pytest.mark.asyncio
+ async def test_wait_for_decision_rejects_unsigned_when_signing_enabled(
+     event_bus: EventBus,

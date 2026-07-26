@@ -1,0 +1,130 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 26fc2af9..a05d7679 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -350,6 +350,10 @@ All notable changes to vouch are documented here. Format follows
+   KB under `eval/fixture-kb/`, and an `eval` workflow gating retrieval changes
+   (#226).
+ ### Fixed
++- `build_context_pack` now evaluates the `require_citations` gate (and
++  `quality.uncited_items`) after the `max_chars` budget drops tail items, so
++  the pack is never failed for uncited claims the caller did not receive.
++  Fixes #174.
+ - `audit.log_event` now holds an exclusive cross-process lock around read-prev-hash → derive → append, closing a TOCTOU race where two concurrent writers observed the same `prev_hash` and forked the chain — `verify_chain` then reported "previous hash mismatch" at the second concurrent event forever, breaking the tamper-evidence guarantee from #244 under ordinary multi-writer usage (`vouch serve` + concurrent CLI, multiple agents on JSONL, scripted backgrounded approvals). Uses `fcntl.flock` on POSIX and `msvcrt.locking` on Windows against a sibling `audit.log.jsonl.lock` file so the audit log itself is never opened in a mode that could truncate it. Fixes #262.
+ - `parse_since` (the `--since` parser behind `vouch metrics`/`vouch audit`) now raises a clean `MetricsError` for a duration too large to represent (e.g. `--since 1000000000000d`), instead of letting an uncaught `OverflowError` traceback escape — restoring the documented "clean error, not a traceback" contract.
+ - `sync_apply` now loads the sync source exactly once and passes the same `_SyncSource` instance into `sync_check`, closing a TOCTOU window where a bundle replaced on disk between the two `_load_source` calls could cause the validation and write phases to operate on different snapshots. Also eliminates redundant directory walks (KB sources) and triple tarball opens (bundle sources). Fixes #217.
+diff --git a/src/vouch/context.py b/src/vouch/context.py
+index 64ec2e3e..71827be0 100644
+--- a/src/vouch/context.py
++++ b/src/vouch/context.py
+@@ -385,11 +385,6 @@ def build_context_pack(
+     budget_clipped = 0
+     budget_omitted = 0
+ 
+-    if require_citations:
+-        for it in items:
+-            if it.type == "claim" and not it.citations:
+-                uncited.append(it.id)
+-
+     if max_chars is not None:
+         total = sum(len(i.summary) for i in items)
+         if total > max_chars:
+@@ -403,6 +398,14 @@ def build_context_pack(
+                 items.pop()
+                 budget_omitted += 1
+ 
++    # Compute the citation gate over the items actually returned — after the
++    # max_chars budget has dropped tail items — so the gate never fails on (or
++    # reports in uncited_items) claims the consumer did not receive.
++    if require_citations:
++        uncited = [
++            it.id for it in items if it.type == "claim" and not it.citations
++        ]
++
+     if len(items) < min_items:
+         warnings.append(f"only {len(items)} items, minimum {min_items}")
+         failed.append("min_items")
+diff --git a/tests/test_context.py b/tests/test_context.py
+index 0c155665..b515829e 100644
+--- a/tests/test_context.py
++++ b/tests/test_context.py
+@@ -38,6 +38,79 @@ def test_context_pack_has_quality_metadata(store: KBStore) -> None:
+     assert pack["quality"]["ok"] is True
+ 
+ 
++def test_require_citations_only_considers_returned_items(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Regression for #174: uncited_items and the require_citations gate must
++    reference only claims still present after max_chars trimming."""
++    src = store.put_source(b"e")
++    for i in range(20):
++        store.put_claim(Claim(
++            id=f"c{i}",
++            text=f"padding claim number {i} with extra padding text",
++            evidence=[src.id],
++        ))
++    health.rebuild_index(store)
++
++    real_get_claim = store.get_claim
++
++    def get_claim_as_uncited(cid: str) -> Claim:
++        return real_get_claim(cid).model_copy(update={"evidence": []})
++
++    monkeypatch.setattr(store, "get_claim", get_claim_as_uncited)
++
++    pack = context.build_context_pack(
++        store, query="padding", max_chars=80, require_citations=True,
++    )
++    returned = {it["id"] for it in pack["items"]}
++    assert pack["quality"]["uncited_items"], "expected uncited claims to be flagged"
++    assert all(uid in returned for uid in pack["quality"]["uncited_items"])
++
++
++def test_require_citations_ok_when_budget_drops_all_uncited(
++    store: KBStore, monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Regression for #174: require_citations must not fail on uncited claims
++    the max_chars budget already removed from the returned pack."""
++    src = store.put_source(b"e")
++    for i in range(10):
++        store.put_claim(Claim(
++            id=f"cited{i}",
++            text=f"alpha cited claim {i}",
++            evidence=[src.id],
++        ))
++        store.put_claim(Claim(
++            id=f"uncited{i}",
++            text=f"beta uncited padding claim {i} with extra text",
++            evidence=[src.id],
++        ))
++    health.rebuild_index(store)
++
++    real_get_claim = store.get_claim
++    cited_ids = {f"cited{i}" for i in range(10)}
++
++    def get_claim_with_citation_state(cid: str) -> Claim:
++        claim = real_get_claim(cid)
++        if cid in cited_ids:
++            return claim
++        return claim.model_copy(update={"evidence": []})
++
++    monkeypatch.setattr(store, "get_claim", get_claim_with_citation_state)
++
++    pack = context.build_context_pack(
++        store,
++        query="alpha",
++        limit=10,
++        max_chars=120,
++        require_citations=True,
++    )
++    returned = {it["id"] for it in pack["items"]}
++    assert returned, pack
++    assert all(cid.startswith("cited") for cid in returned), pack
++    assert pack["quality"]["uncited_items"] == []
++    assert pack["quality"]["ok"] is True
++
++
+ def test_context_pack_max_chars_omits_items(store: KBStore) -> None:
+     src = store.put_source(b"e")
+     # Many short claims — total summary length > 100 chars.

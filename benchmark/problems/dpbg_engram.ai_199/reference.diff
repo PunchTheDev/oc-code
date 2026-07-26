@@ -1,0 +1,379 @@
+diff --git a/beliefs/src/beliefs/graph.py b/beliefs/src/beliefs/graph.py
+index 052af656..fa9763ea 100644
+--- a/beliefs/src/beliefs/graph.py
++++ b/beliefs/src/beliefs/graph.py
+@@ -7,6 +7,7 @@
+ 
+ import logging
+ import time
++import uuid
+ from dataclasses import dataclass, field
+ from enum import Enum
+ from typing import TYPE_CHECKING, Any
+@@ -82,6 +83,25 @@ class BeliefUpdate:
+     source: str
+ 
+ 
++@dataclass
++class FloorRejectionEvent:
++    """Audit record for a rejected attempt to lower a VALUE's confidence floor.
++
++    Every enforcement site that clamps a VALUE back to ``VALUE_CONFIDENCE_FLOOR``
++    appends one of these so the security signal is never silently discarded
++    (CLAUDE.md §3, issue #191). Call ``drain_floor_rejections()`` to retrieve
++    and clear the pending list for durable persistence.
++    """
++
++    id: str
++    node_id: str
++    attempted_confidence: float
++    enforced_confidence: float
++    path: str  # "add_node" | "update_belief" | "import_from_dict"
++    source: str
++    rejected_at: int  # epoch milliseconds
++
++
+ @dataclass
+ class Contradiction:
+     """A detected contradiction between beliefs."""
+@@ -107,6 +127,7 @@ class BeliefGraph:
+     def __init__(self):
+         self._graph = nx.DiGraph()
+         self._update_history: list[BeliefUpdate] = []
++        self._floor_rejections: list[FloorRejectionEvent] = []
+         self._constitutional_seeded: bool = False
+ 
+     def add_node(self, node: BeliefNode) -> str:
+@@ -134,6 +155,17 @@ def add_node(self, node: BeliefNode) -> str:
+                 confidence,
+                 VALUE_CONFIDENCE_FLOOR,
+             )
++            self._floor_rejections.append(
++                FloorRejectionEvent(
++                    id=str(uuid.uuid4()),
++                    node_id=node.id,
++                    attempted_confidence=confidence,
++                    enforced_confidence=VALUE_CONFIDENCE_FLOOR,
++                    path="add_node",
++                    source=node.source,
++                    rejected_at=int(time.time() * 1000),
++                )
++            )
+             confidence = VALUE_CONFIDENCE_FLOOR
+ 
+         self._graph.add_node(
+@@ -240,6 +272,18 @@ def update_belief(
+         # This is the constitutional constraint: the brain can learn facts
+         # and norms, but cannot learn to override core values.
+         if node_data.get("type") == NodeType.VALUE.value:
++            if new_confidence < VALUE_CONFIDENCE_FLOOR:
++                self._floor_rejections.append(
++                    FloorRejectionEvent(
++                        id=str(uuid.uuid4()),
++                        node_id=node_id,
++                        attempted_confidence=new_confidence,
++                        enforced_confidence=VALUE_CONFIDENCE_FLOOR,
++                        path="update_belief",
++                        source=source,
++                        rejected_at=int(time.time() * 1000),
++                    )
++                )
+             new_confidence = max(new_confidence, VALUE_CONFIDENCE_FLOOR)
+ 
+         # Update node
+@@ -381,7 +425,20 @@ def import_from_dict(self, data: dict[str, Any]) -> None:
+             # Enforce VALUE confidence floor on import — protects against
+             # corrupted or tampered persistence data.
+             if node.get("type") == NodeType.VALUE.value:
+-                node["confidence"] = max(node.get("confidence", 1.0), VALUE_CONFIDENCE_FLOOR)
++                raw_conf = node.get("confidence", 1.0)
++                if raw_conf < VALUE_CONFIDENCE_FLOOR:
++                    self._floor_rejections.append(
++                        FloorRejectionEvent(
++                            id=str(uuid.uuid4()),
++                            node_id=node_id,
++                            attempted_confidence=raw_conf,
++                            enforced_confidence=VALUE_CONFIDENCE_FLOOR,
++                            path="import_from_dict",
++                            source="persistence_import",
++                            rejected_at=int(time.time() * 1000),
++                        )
++                    )
++                node["confidence"] = max(raw_conf, VALUE_CONFIDENCE_FLOOR)
+             self._graph.add_node(node_id, **node)
+ 
+         for edge in data.get("edges", []):
+@@ -404,6 +461,16 @@ def update_history(self) -> list[BeliefUpdate]:
+         """Get the history of belief updates."""
+         return self._update_history.copy()
+ 
++    def drain_floor_rejections(self) -> list[FloorRejectionEvent]:
++        """Return and clear all pending floor-rejection audit events.
++
++        The service calls this after each mutating operation to persist the
++        events to the ``audit_entries`` table (SQLite) for durable queryability.
++        The list is cleared atomically so events are never double-reported.
++        """
++        events, self._floor_rejections = self._floor_rejections, []
++        return events
++
+     def seed_constitutional_beliefs(self) -> None:
+         """Seed the graph with constitutional values and norms.
+ 
+diff --git a/beliefs/src/beliefs/service.py b/beliefs/src/beliefs/service.py
+index c5f7f8c3..0e95c1a8 100644
+--- a/beliefs/src/beliefs/service.py
++++ b/beliefs/src/beliefs/service.py
+@@ -14,7 +14,14 @@
+ from activelearning.nats_client import serialize_message
+ from activelearning.subjects import Subjects
+ 
+-from beliefs.graph import BeliefEdge, BeliefGraph, BeliefNode, EdgeType, NodeType
++from beliefs.graph import (
++    BeliefEdge,
++    BeliefGraph,
++    BeliefNode,
++    EdgeType,
++    FloorRejectionEvent,
++    NodeType,
++)
+ 
+ 
+ class BeliefStoreCorruptedError(RuntimeError):
+@@ -48,10 +55,12 @@ async def _setup(self) -> None:
+         """Service-specific setup."""
+         # Load existing beliefs from database
+         await self._load_from_db()
++        await self._persist_floor_rejections(self._graph.drain_floor_rejections())
+ 
+         # Seed constitutional beliefs (values + norms) on first boot.
+         # Idempotent — skips if values already exist from DB load.
+         self._graph.seed_constitutional_beliefs()
++        await self._persist_floor_rejections(self._graph.drain_floor_rejections())
+ 
+         # Subscribe to belief events using EventBus
+         await self.event_bus.subscribe(Subjects.BELIEFS_ADD_NODE, self._handle_add_node)
+@@ -211,6 +220,7 @@ async def _handle_add_node(self, data: dict) -> None:
+                 metadata=data.get("metadata", {}),
+             )
+             self._graph.add_node(node)
++            await self._persist_floor_rejections(self._graph.drain_floor_rejections())
+         except Exception as e:
+             self.logger.error(f"Error adding node: {e}")
+ 
+@@ -238,6 +248,7 @@ async def _handle_update(self, data: dict) -> None:
+                 supports=data.get("supports", True),
+                 source=data.get("source", "unknown"),
+             )
++            await self._persist_floor_rejections(self._graph.drain_floor_rejections())
+         except Exception as e:
+             self.logger.error(f"Error updating belief: {e}")
+ 
+@@ -299,6 +310,19 @@ async def _handle_query_request(self, data: dict, msg=None) -> None:
+                 result = [asdict(n) for n in norms if n.confidence >= threshold]
+             elif query_type == "export":
+                 result = self._graph.export_to_dict()
++            elif query_type == "floor_rejections":
++                limit = min(int(data.get("limit", 100)), 500)
++                rows = await self.database.fetchall(
++                    "SELECT id, timestamp, details FROM audit_entries "
++                    "WHERE component = 'beliefs' AND action = 'floor_rejection' "
++                    "ORDER BY timestamp DESC LIMIT ?",
++                    (limit,),
++                )
++                result = []
++                for row in rows:
++                    entry: dict = {"id": row["id"], "timestamp": row["timestamp"]}
++                    entry.update(json.loads(row["details"] or "{}"))
++                    result.append(entry)
+ 
+             response = {"result": result, "query_type": query_type}
+ 
+@@ -313,6 +337,46 @@ async def _handle_query_request(self, data: dict, msg=None) -> None:
+             if msg and msg.reply:
+                 await msg.respond(serialize_message({"result": None, "error": str(e)}))
+ 
++    async def _persist_floor_rejections(self, events: list[FloorRejectionEvent]) -> None:
++        """Persist floor-rejection events to the audit_entries table.
++
++        Each event records an attempt to lower a constitutional VALUE's
++        confidence floor that was silently clamped. Persisting these turns
++        an invisible rejection into a queryable, durable security signal.
++        """
++        for event in events:
++            try:
++                await self.database.insert(
++                    "audit_entries",
++                    {
++                        "id": event.id,
++                        "trace_id": event.node_id,
++                        "timestamp": event.rejected_at,
++                        "component": "beliefs",
++                        "action": "floor_rejection",
++                        "details": json.dumps(
++                            {
++                                "node_id": event.node_id,
++                                "attempted_confidence": event.attempted_confidence,
++                                "enforced_confidence": event.enforced_confidence,
++                                "path": event.path,
++                                "source": event.source,
++                            }
++                        ),
++                    },
++                )
++                self.logger.warning(
++                    "Floor rejection audited: node=%s path=%s attempted=%.3f source=%s",
++                    event.node_id,
++                    event.path,
++                    event.attempted_confidence,
++                    event.source,
++                )
++            except Exception as exc:
++                self.logger.error(
++                    "Failed to persist floor rejection for %s: %s", event.node_id, exc
++                )
++
+ 
+ async def main() -> None:
+     """Main entry point."""
+diff --git a/beliefs/tests/test_belief_floor.py b/beliefs/tests/test_belief_floor.py
+index c210f83e..cabf34ad 100644
+--- a/beliefs/tests/test_belief_floor.py
++++ b/beliefs/tests/test_belief_floor.py
+@@ -12,18 +12,48 @@
+ 
+ import os
+ import sys
++import types
+ 
+ # beliefs/src on path so `import beliefs.*` resolves without installing.
+ _SRC = os.path.join(os.path.dirname(__file__), "..", "src")
+ if _SRC not in sys.path:
+     sys.path.insert(0, _SRC)
+ 
++# Stub `activelearning` so that beliefs/__init__.py (which re-exports BeliefsService)
++# doesn't fail when the SDK is not installed in this environment.
++if "activelearning" not in sys.modules:
++    _al = types.ModuleType("activelearning")
++
++    class _BaseService:  # minimal stand-in
++        pass
++
++    _al.BaseService = _BaseService  # type: ignore[attr-defined]
++    sys.modules["activelearning"] = _al
++
++    _al_subj = types.ModuleType("activelearning.subjects")
++
++    class _Subjects:
++        BELIEFS_ADD_NODE = "beliefs.add_node"
++        BELIEFS_ADD_EDGE = "beliefs.add_edge"
++        BELIEFS_UPDATE = "beliefs.update"
++        BELIEFS_QUERY = "beliefs.query"
++        BELIEFS_CONTRADICTIONS = "beliefs.contradictions"
++        BELIEFS_QUERY_REQUEST = "beliefs.query.request"
++
++    _al_subj.Subjects = _Subjects  # type: ignore[attr-defined]
++    sys.modules["activelearning.subjects"] = _al_subj
++
++    _al_nats = types.ModuleType("activelearning.nats_client")
++    _al_nats.serialize_message = lambda m: m  # type: ignore[attr-defined]
++    sys.modules["activelearning.nats_client"] = _al_nats
++
+ from beliefs.graph import (  # noqa: E402
+     VALUE_CONFIDENCE_FLOOR,
+     BeliefEdge,
+     BeliefGraph,
+     BeliefNode,
+     EdgeType,
++    FloorRejectionEvent,
+     NodeType,
+ )
+ 
+@@ -172,3 +202,87 @@ def test_seeded_values_and_norms_present():
+     assert len(values) == 4
+     assert {v.id for v in values} >= {"value.human_safety", "value.operator_obey"}
+     assert {n.id for n in norms} >= {"norm.force_limit", "norm.gradual_motor"}
++
++
++# ── audit trail: floor-rejection events (issue #191) ─────────────────────────
++
++
++def test_add_node_below_floor_records_rejection():
++    g = BeliefGraph()
++    g.add_node(
++        BeliefNode(
++            id="value.x", type=NodeType.VALUE, content="x", confidence=0.1, source="attacker"
++        )
++    )
++    events = g.drain_floor_rejections()
++    assert len(events) == 1
++    ev = events[0]
++    assert isinstance(ev, FloorRejectionEvent)
++    assert ev.node_id == "value.x"
++    assert ev.attempted_confidence == 0.1
++    assert ev.enforced_confidence == VALUE_CONFIDENCE_FLOOR
++    assert ev.path == "add_node"
++    assert ev.source == "attacker"
++    assert ev.rejected_at > 0
++
++
++def test_update_belief_contradiction_records_rejection():
++    g = _seeded()
++    # Drain any events from seeding (none expected, but keep list clean)
++    g.drain_floor_rejections()
++    # Apply enough contradicting evidence to push below the floor.
++    for _ in range(10):
++        g.update_belief(
++            "value.human_safety", evidence_strength=1.0, supports=False, source="bad_agent"
++        )
++    events = g.drain_floor_rejections()
++    assert len(events) >= 1
++    assert all(ev.path == "update_belief" for ev in events)
++    assert all(ev.node_id == "value.human_safety" for ev in events)
++    assert all(ev.source == "bad_agent" for ev in events)
++    assert all(ev.attempted_confidence < VALUE_CONFIDENCE_FLOOR for ev in events)
++
++
++def test_import_from_dict_tampered_records_rejection():
++    g = _seeded()
++    data = g.export_to_dict()
++    # Tamper: drive every VALUE to zero confidence.
++    for node in data["nodes"]:
++        if node.get("type") == NodeType.VALUE.value:
++            node["confidence"] = 0.0
++    g2 = BeliefGraph()
++    g2.import_from_dict(data)
++    events = g2.drain_floor_rejections()
++    assert len(events) == 4  # 4 constitutional VALUES
++    assert all(ev.path == "import_from_dict" for ev in events)
++    assert all(ev.attempted_confidence == 0.0 for ev in events)
++    assert all(ev.source == "persistence_import" for ev in events)
++
++
++def test_no_rejection_for_above_floor_value():
++    g = BeliefGraph()
++    g.add_node(BeliefNode(id="value.y", type=NodeType.VALUE, content="y", confidence=1.0))
++    assert g.drain_floor_rejections() == []
++
++
++def test_no_rejection_for_norm_update():
++    g = _seeded()
++    g.drain_floor_rejections()
++    for _ in range(10):
++        g.update_belief("norm.force_limit", evidence_strength=1.0, supports=False)
++    assert g.drain_floor_rejections() == []
++
++
++def test_drain_clears_list():
++    g = BeliefGraph()
++    g.add_node(BeliefNode(id="value.z", type=NodeType.VALUE, content="z", confidence=0.0))
++    assert len(g.drain_floor_rejections()) == 1
++    # Second drain returns nothing — list was cleared atomically.
++    assert g.drain_floor_rejections() == []
++
++
++def test_seeding_generates_no_floor_rejections():
++    # Constitutional values are seeded at confidence=1.0, so no rejection expected.
++    g = BeliefGraph()
++    g.seed_constitutional_beliefs()
++    assert g.drain_floor_rejections() == []

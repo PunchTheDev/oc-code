@@ -1,0 +1,617 @@
+diff --git a/dashboard/src/dashboard/nats_stream.py b/dashboard/src/dashboard/nats_stream.py
+index f7919a30..96bbdfd1 100644
+--- a/dashboard/src/dashboard/nats_stream.py
++++ b/dashboard/src/dashboard/nats_stream.py
+@@ -35,6 +35,8 @@
+     }
+ )
+ EVENTBUS_METRICS_PREFIX = "eventbus.metrics."
++# Dead-letter queue (issue #246) — poisoned messages land on dlq.<subject>.
++DLQ_SUBJECT_PREFIX = "dlq."
+ 
+ 
+ class NatsStreamManager:
+@@ -182,6 +184,7 @@ async def connect(self) -> None:
+             await nc.subscribe("observation.visual.body", cb=self._handle_visual_body)
+             await nc.subscribe("safety.halt.status", cb=self._handle_safe_halt_status)
+             await nc.subscribe("eventbus.metrics.>", cb=self._handle_bus_metrics)
++            await nc.subscribe("dlq.>", cb=self._handle_dlq_message)
+         except Exception as e:
+             self.logger.warning(f"NATS failed (non-fatal): {e}")
+             self._connected = False
+@@ -195,6 +198,7 @@ async def _handle_msg(self, msg):
+             msg.subject in DEDICATED_SUBJECTS
+             or msg.subject.startswith("heartbeat.")
+             or msg.subject.startswith(EVENTBUS_METRICS_PREFIX)
++            or msg.subject.startswith(DLQ_SUBJECT_PREFIX)
+         ):
+             return
+ 
+@@ -271,6 +275,20 @@ async def _handle_bus_metrics(self, msg):
+         except Exception as e:
+             self.logger.debug("Failed to handle bus metrics: %s", e)
+ 
++    async def _handle_dlq_message(self, msg):
++        """Surface a dead-lettered message (issue #246) — previously nothing
++        consumed dlq.<subject>, so operators had zero visibility into it."""
++        try:
++            data = json.loads(msg.data.decode())
++        except Exception:
++            data = {"raw": msg.data.decode(errors="replace")[:500]}
++        if not isinstance(data, dict):
++            data = {"payload": data}
++        record = {**data, "dlq_subject": msg.subject, "observed_at": now_iso()}
++        self._state.record_dlq_message(record)
++        self.logger.error("Dead-lettered message observed on %s: %s", msg.subject, record)
++        await self._broadcast({"type": "dlq_update", "data": self._state.dlq_summary()})
++
+     async def _handle_heartbeat(self, msg):
+         try:
+             data = json.loads(msg.data.decode())
+diff --git a/dashboard/src/dashboard/routers/stream.py b/dashboard/src/dashboard/routers/stream.py
+index 6ffcf00f..8b16eec2 100644
+--- a/dashboard/src/dashboard/routers/stream.py
++++ b/dashboard/src/dashboard/routers/stream.py
+@@ -64,6 +64,7 @@ async def websocket_endpoint(websocket: WebSocket):
+                         "bus_metrics": state.bus_metrics_list(
+                             include_dashboard=nats.local_bus_metrics_snapshot(),
+                         ),
++                        "dlq": state.dlq_summary(),
+                     },
+                 }
+             )
+diff --git a/dashboard/src/dashboard/routers/system.py b/dashboard/src/dashboard/routers/system.py
+index 850f1513..6379f8df 100644
+--- a/dashboard/src/dashboard/routers/system.py
++++ b/dashboard/src/dashboard/routers/system.py
+@@ -115,4 +115,10 @@ async def get_learning_evidence(limit: int = 50):
+         payload["timestamp"] = now_iso()
+         return payload
+ 
++    # ── Dead-letter queue ─────────────────────────────────────────────────
++    @router.get("/api/dlq")
++    async def get_dlq():
++        """Dead-letter counts/content (issue #246) — dlq.<subject> visibility."""
++        return {**state.dlq_summary(), "timestamp": now_iso()}
++
+     return router
+diff --git a/dashboard/src/dashboard/state.py b/dashboard/src/dashboard/state.py
+index 539acf79..e00c0583 100644
+--- a/dashboard/src/dashboard/state.py
++++ b/dashboard/src/dashboard/state.py
+@@ -22,6 +22,7 @@
+ MAX_INSIGHTS = 100
+ MAX_DENY_ESCALATIONS = 50
+ MAX_PROBE_RESULTS = 200
++MAX_DLQ_MESSAGES = 200
+ 
+ 
+ class ConnectionManager:
+@@ -95,6 +96,11 @@ def __init__(self):
+         self.concept_probe_results: list[dict] = []
+         self.bus_metrics_by_service: dict[str, dict] = {}
+ 
++        # Dead-letter queue visibility (issue #246) — dlq.<subject> was
++        # published to but nothing observed it; this tracks what arrives.
++        self.dlq_messages: deque = deque(maxlen=MAX_DLQ_MESSAGES)
++        self.dlq_counts_by_subject: dict[str, int] = {}
++
+     def bus_metrics_list(self, *, include_dashboard: dict | None = None) -> list[dict]:
+         """Sorted per-service EventBus metric snapshots for the UI."""
+         merged = dict(self.bus_metrics_by_service)
+@@ -115,6 +121,21 @@ def append_chat(self, role: str, content: str) -> None:
+         if len(self.chat_history) > MAX_CHAT_HISTORY:
+             self.chat_history[:] = self.chat_history[-MAX_CHAT_HISTORY:]
+ 
++    # ── dead-letter queue ─────────────────────────────────────────────────
++    def record_dlq_message(self, data: dict) -> None:
++        """Store a dead-lettered message and bump its per-subject count."""
++        self.dlq_messages.append(data)
++        subject = data.get("original_subject") or "unknown"
++        self.dlq_counts_by_subject[subject] = self.dlq_counts_by_subject.get(subject, 0) + 1
++
++    def dlq_summary(self) -> dict:
++        """Counts-by-subject plus the most recent dead letters, for the panel/API."""
++        return {
++            "total": sum(self.dlq_counts_by_subject.values()),
++            "by_subject": dict(self.dlq_counts_by_subject),
++            "recent": list(self.dlq_messages)[-50:],
++        }
++
+     # ── concept probe results ─────────────────────────────────────────────
+     def add_probe_result(self, data: dict) -> None:
+         """Store a concept-probe result, capped at ``MAX_PROBE_RESULTS``."""
+diff --git a/dashboard/static/app.js b/dashboard/static/app.js
+index a70ee07d..22f16c94 100644
+--- a/dashboard/static/app.js
++++ b/dashboard/static/app.js
+@@ -142,6 +142,7 @@ class ActiveLearningAI {
+                 if (msg.data.halt_state) this.updateHaltUI(msg.data.halt_state);
+                 if (msg.data.kernel_decision_rates) this.renderKernelDecisionRates(msg.data.kernel_decision_rates);
+                 if (msg.data.bus_metrics) this.renderBusMetrics(msg.data.bus_metrics);
++                if (msg.data.dlq) this.renderDlq(msg.data.dlq);
+                 break;
+             case 'safe_halt_status':
+                 this.updateHaltUI(msg.data);
+@@ -160,6 +161,9 @@ class ActiveLearningAI {
+             case 'bus_metrics_update':
+                 this.renderBusMetrics(msg.data);
+                 break;
++            case 'dlq_update':
++                this.renderDlq(msg.data);
++                break;
+             case 'message':
+                 this.appendNATSMessage(msg.data);
+                 break;
+@@ -917,6 +921,31 @@ class ActiveLearningAI {
+         }).join('');
+     }
+ 
++    renderDlq(dlq) {
++        const totalEl = document.getElementById('dlq-total');
++        if (totalEl) totalEl.textContent = (dlq && dlq.total) || 0;
++        const el = document.getElementById('dlq-list');
++        if (!el) return;
++        const bySubject = (dlq && dlq.by_subject) || {};
++        const subjects = Object.keys(bySubject);
++        if (!subjects.length) {
++            el.innerHTML = '<div class="sys-loading">No dead letters observed</div>';
++            return;
++        }
++        subjects.sort((a, b) => bySubject[b] - bySubject[a]);
++        const recentBySubject = {};
++        ((dlq && dlq.recent) || []).forEach(r => { recentBySubject[r.original_subject] = r; });
++        el.innerHTML = subjects.map(subject => {
++            const last = recentBySubject[subject];
++            return `
++            <div class="dlq-item">
++                <div class="dlq-subject">${this.esc(subject)}</div>
++                <div class="dlq-row"><span>Count</span><span class="val">${bySubject[subject]}</span></div>
++                ${last ? `<div class="dlq-row"><span>Reason</span><span class="val">${this.esc(String(last.reason || '?'))}</span></div>` : ''}
++            </div>`;
++        }).join('');
++    }
++
+     // ─── Top Stats ───────────────────────────────────────────────────
+ 
+     updateTopStats(data) {
+diff --git a/dashboard/static/index.html b/dashboard/static/index.html
+index 4a7dd425..3755a077 100644
+--- a/dashboard/static/index.html
++++ b/dashboard/static/index.html
+@@ -437,6 +437,14 @@ <h2><span class="panel-icon">📊</span> Bus Health</h2>
+                 </div>
+             </section>
+ 
++            <!-- Dead Letters -->
++            <section class="panel">
++                <h2><span class="panel-icon">☠️</span> Dead Letters <span class="dlq-total" id="dlq-total">0</span></h2>
++                <div class="dlq-list" id="dlq-list">
++                    <div class="sys-loading">No dead letters observed</div>
++                </div>
++            </section>
++
+             <!-- Containers -->
+             <section class="panel">
+                 <h2><span class="panel-icon">🐳</span> Containers</h2>
+diff --git a/dashboard/static/style.css b/dashboard/static/style.css
+index 33cfa1ce..e5aa636c 100644
+--- a/dashboard/static/style.css
++++ b/dashboard/static/style.css
+@@ -652,6 +652,20 @@ html, body {
+ .bus-name { font-weight: 600; color: var(--green, #6fcf97); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+ .bus-row { display: flex; justify-content: space-between; color: var(--text-2); }
+ .bus-row .val { color: var(--text-1); font-weight: 500; }
++.dlq-total {
++    font-size: 10px; font-weight: 700; color: var(--red);
++    background: rgba(244,68,68,0.12); border: 1px solid rgba(244,68,68,0.3);
++    border-radius: 8px; padding: 1px 7px; margin-left: 4px;
++}
++.dlq-list { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
++.dlq-item {
++    display: flex; flex-direction: column; gap: 2px;
++    padding: 6px 7px; background: var(--bg-3); border-radius: var(--radius-sm); font-size: 10px;
++    border-left: 2px solid var(--red);
++}
++.dlq-subject { font-weight: 600; color: var(--red); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.dlq-row { display: flex; justify-content: space-between; color: var(--text-2); }
++.dlq-row .val { color: var(--text-1); font-weight: 500; }
+ .ctn-item {
+     display: flex; flex-direction: column; gap: 2px;
+     padding: 6px 7px; background: var(--bg-3); border-radius: var(--radius-sm); font-size: 10px;
+diff --git a/dashboard/tests/test_nats_stream.py b/dashboard/tests/test_nats_stream.py
+index 041c26fd..0c3ae8fb 100644
+--- a/dashboard/tests/test_nats_stream.py
++++ b/dashboard/tests/test_nats_stream.py
+@@ -223,3 +223,27 @@ def test_eventbus_metrics_subject_skipped_by_wildcard_handler():
+     asyncio.run(mgr._handle_msg(_FakeMsg("eventbus.metrics.kernel", {"service": "kernel"})))
+     assert len(state.message_buffer) == 0
+     assert ws.sent == []
++
++
++def test_handle_dlq_message_stores_and_broadcasts():
++    mgr, state, ws = _manager()
++    payload = {
++        "original_subject": "proposal.new",
++        "reason": "max_deliver_exhausted(5): always fails",
++        "num_delivered": 5,
++        "payload": "{}",
++    }
++    asyncio.run(mgr._handle_dlq_message(_FakeMsg("dlq.proposal.new", payload)))
++
++    summary = state.dlq_summary()
++    assert summary["total"] == 1
++    assert summary["by_subject"] == {"proposal.new": 1}
++    assert ws.sent[-1]["type"] == "dlq_update"
++    assert ws.sent[-1]["data"]["total"] == 1
++
++
++def test_dlq_subject_skipped_by_wildcard_handler():
++    mgr, state, ws = _manager()
++    asyncio.run(mgr._handle_msg(_FakeMsg("dlq.proposal.new", {"original_subject": "proposal.new"})))
++    assert len(state.message_buffer) == 0
++    assert ws.sent == []
+diff --git a/dashboard/tests/test_routers.py b/dashboard/tests/test_routers.py
+index 253d467b..84840ae6 100644
+--- a/dashboard/tests/test_routers.py
++++ b/dashboard/tests/test_routers.py
+@@ -109,6 +109,19 @@ def test_system_router_health_and_endpoints():
+     assert client.get("/dashboard").json() == {"status": "ok"}
+ 
+ 
++def test_system_router_dlq_endpoint():
++    ctx, _, _, _ = _ctx()
++    client = _client(build_system_router(ctx, static_dir="/nonexistent"))
++
++    assert client.get("/api/dlq").json()["total"] == 0
++
++    ctx.state.record_dlq_message({"original_subject": "proposal.new", "reason": "boom"})
++    body = client.get("/api/dlq").json()
++    assert body["total"] == 1
++    assert body["by_subject"] == {"proposal.new": 1}
++    assert "timestamp" in body
++
++
+ # ── introspection router ───────────────────────────────────────────────────
+ 
+ 
+diff --git a/dashboard/tests/test_state.py b/dashboard/tests/test_state.py
+index 80ee0fba..f8fc626d 100644
+--- a/dashboard/tests/test_state.py
++++ b/dashboard/tests/test_state.py
+@@ -109,3 +109,31 @@ def test_record_video_session_prunes_oldest_finished_when_full():
+     assert len(state.video_sessions) == MAX_VIDEO_SESSIONS
+     assert "new" in state.video_sessions
+     assert "done0" not in state.video_sessions  # oldest finished pruned
++
++
++def test_record_dlq_message_counts_by_subject():
++    state = DashboardState()
++    state.record_dlq_message({"original_subject": "proposal.new", "reason": "boom"})
++    state.record_dlq_message({"original_subject": "proposal.new", "reason": "boom2"})
++    state.record_dlq_message({"original_subject": "code.proposal", "reason": "bad payload"})
++
++    summary = state.dlq_summary()
++    assert summary["total"] == 3
++    assert summary["by_subject"] == {"proposal.new": 2, "code.proposal": 1}
++    assert len(summary["recent"]) == 3
++
++
++def test_record_dlq_message_missing_subject_falls_back_to_unknown():
++    state = DashboardState()
++    state.record_dlq_message({"reason": "boom"})
++    assert state.dlq_summary()["by_subject"] == {"unknown": 1}
++
++
++def test_dlq_summary_recent_capped_at_50():
++    state = DashboardState()
++    for i in range(60):
++        state.record_dlq_message({"original_subject": "proposal.new", "reason": str(i)})
++    summary = state.dlq_summary()
++    assert summary["total"] == 60
++    assert len(summary["recent"]) == 50
++    assert summary["recent"][-1]["reason"] == "59"
+diff --git a/deploy/scripts/gen-creds.sh b/deploy/scripts/gen-creds.sh
+index 3a09b2fa..1061aa4b 100755
+--- a/deploy/scripts/gen-creds.sh
++++ b/deploy/scripts/gen-creds.sh
+@@ -89,7 +89,7 @@ declare -A SVC_PUB SVC_SUB
+ # cognitive.response.validated (ADR 0001 §3); everything else here is a
+ # broadcast notification or a request (beliefs.query.request) it issues.
+ SVC_PUB[kernel]="decision.>,code.decision.>,policy.restrict,policy.restrict.status,policy.rollback.status,policy.update.status,policy.profile.status,cognitive.response.validated,cognitive.response.rejected,cognitive.execute,speech.execute,planner.mode,safety.halt.status,safety.deny_escalation,kernel.heartbeat,kernel.decision_rates,beliefs.query.request,_INBOX.>"
+-SVC_SUB[kernel]="proposal.new,code.proposal,kernel.status,policy.load_profile,policy.restrict.request,policy.rollback,policy.update,cognitive.response.validate,safety.halt,safety.resume,_INBOX.>"
++SVC_SUB[kernel]="proposal.new,code.proposal,kernel.status,policy.load_profile,policy.restrict.request,policy.rollback,policy.update,cognitive.response.validate,safety.halt,safety.resume,dlq.>,_INBOX.>"
+ 
+ # safety-supervisor — request-reply risk analysis; safety.analysis.*.<trace>
+ # is a real fallback publish path (safety_supervisor/service.py) used when
+diff --git a/docs/adr/0001-nats-authz.md b/docs/adr/0001-nats-authz.md
+index bc6bce77..cf7edaa5 100644
+--- a/docs/adr/0001-nats-authz.md
++++ b/docs/adr/0001-nats-authz.md
+@@ -350,6 +350,7 @@ prefix/token family; the allowlist entry uses the wildcard form.
+ | `system.health` | all services | dashboard | Liveness. |
+ | `heartbeat.*` | all services | dashboard | Per-service heartbeat (`heartbeat.<service>`). |
+ | `eventbus.metrics.>` | all services, dashboard | dashboard | Periodic EventBus publish/subscribe/request latency snapshots (`eventbus.metrics.<service>`). |
++| `dlq.>` | kernel (via `_route_to_poison`) | kernel, dashboard | Dead-letter envelope for a message that exhausted redelivery or failed validation (`dlq.<original_subject>`, issue #246). Kernel's `start_dlq_monitor()` consumes and alerts; the dashboard surfaces counts/content in the Dead Letters panel. |
+ 
+ > The dashboard additionally holds a single broad **subscribe-only** grant on
+ > `>` to drive the live UI. It conveys **no** publish rights. This is the one
+diff --git a/kernel/src/kernel/service.py b/kernel/src/kernel/service.py
+index b4b9fddd..b877f75e 100644
+--- a/kernel/src/kernel/service.py
++++ b/kernel/src/kernel/service.py
+@@ -224,6 +224,9 @@ async def _setup(self) -> None:
+         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+         # JetStream consumer lag monitor (M2.1, issue #224).
+         self._lag_monitor_task = asyncio.create_task(self.event_bus.run_lag_monitor())
++        # Dead-letter monitor (issue #246): observe and alert on poisoned messages
++        # instead of letting them accumulate silently on dlq.<subject>.
++        await self.event_bus.start_dlq_monitor()
+ 
+     async def _cleanup(self) -> None:
+         """Service-specific cleanup."""
+diff --git a/sdk/src/activelearning/dlq_monitor.py b/sdk/src/activelearning/dlq_monitor.py
+new file mode 100644
+index 00000000..6ee3554c
+--- /dev/null
++++ b/sdk/src/activelearning/dlq_monitor.py
+@@ -0,0 +1,69 @@
++"""Dead-letter queue consumption and alerting (issue #246).
++
++``EventBus._route_to_poison`` republishes exhausted/unprocessable messages to
++``dlq.<subject>`` (see ``nats_client.poison_subject``), but until this module
++nothing subscribed to that namespace — dead letters accumulated silently and
++invisibly. ``parse_dlq_envelope``/``emit_dlq_alert`` turn a raw DLQ envelope
++into a structured, operator-facing alert; ``EventBus.start_dlq_monitor()``
++(in ``nats_client.py``) wires them to a ``dlq.>`` wildcard subscription.
++"""
++
++from __future__ import annotations
++
++import json
++import logging
++from dataclasses import dataclass
++from typing import Any
++
++logger = logging.getLogger(__name__)
++
++DLQ_ALERT_EVENT = "dlq.dead_letter"
++
++
++@dataclass(frozen=True)
++class DlqRecord:
++    """A parsed dead-letter envelope, ready to log, persist, or broadcast."""
++
++    dlq_subject: str
++    original_subject: str
++    reason: str
++    num_delivered: int
++    payload: str
++
++
++def parse_dlq_envelope(dlq_subject: str, data: dict[str, Any]) -> DlqRecord:
++    """Build a DlqRecord from the envelope ``_route_to_poison`` publishes.
++
++    Tolerant of missing/malformed fields — a malformed envelope must never
++    crash the monitor, since that would silently drop dead-letter visibility
++    right where the fix is supposed to restore it.
++    """
++    try:
++        num_delivered = int(data.get("num_delivered", 0) or 0)
++    except (TypeError, ValueError):
++        num_delivered = 0
++    return DlqRecord(
++        dlq_subject=dlq_subject,
++        original_subject=str(data.get("original_subject", "unknown")),
++        reason=str(data.get("reason", "unknown")),
++        num_delivered=num_delivered,
++        payload=str(data.get("payload", "")),
++    )
++
++
++def emit_dlq_alert(record: DlqRecord, *, monitor: str) -> dict[str, Any]:
++    """Emit a structured operator-facing dead-letter alert (JSON log + return payload)."""
++    payload: dict[str, Any] = {
++        "event": DLQ_ALERT_EVENT,
++        "dlq_subject": record.dlq_subject,
++        "original_subject": record.original_subject,
++        "reason": record.reason,
++        "num_delivered": record.num_delivered,
++        "monitor": monitor,
++        "message": (
++            f"Dead-lettered message on {record.original_subject!r} "
++            f"(reason={record.reason!r}, delivered={record.num_delivered}x)"
++        ),
++    }
++    logger.error("%s", json.dumps(payload, default=str))
++    return payload
+diff --git a/sdk/src/activelearning/nats_client.py b/sdk/src/activelearning/nats_client.py
+index 0ca86fb1..14f65704 100644
+--- a/sdk/src/activelearning/nats_client.py
++++ b/sdk/src/activelearning/nats_client.py
+@@ -45,6 +45,7 @@
+     should_monitor_consumer,
+ )
+ from activelearning.core import current_timestamp
++from activelearning.dlq_monitor import emit_dlq_alert, parse_dlq_envelope
+ from activelearning.messages import (
+     KernelDecisionMessage,
+     MessageValidationError,
+@@ -343,6 +344,17 @@ async def run_lag_monitor(
+             except Exception as e:
+                 logger.warning("JetStream lag monitor error: %s", e)
+ 
++    async def _handle_dlq_message(self, data: dict[str, Any]) -> None:
++        """Alert on a dead-lettered message (issue #246): observe, never re-drop."""
++        original_subject = str(data.get("original_subject", "unknown"))
++        record = parse_dlq_envelope(poison_subject(original_subject), data)
++        emit_dlq_alert(record, monitor=self.name)
++
++    async def start_dlq_monitor(self) -> None:
++        """Subscribe to the dead-letter wildcard so poisoned messages are observed
++        and alerted on (issue #246) instead of accumulating silently forever."""
++        await self.subscribe(Subjects.DLQ_WILDCARD, self._handle_dlq_message)
++
+     @staticmethod
+     def _is_safety_critical(subject: str) -> bool:
+         """Return True when this subject must use JetStream persistence."""
+diff --git a/sdk/src/activelearning/subjects.py b/sdk/src/activelearning/subjects.py
+index da2e6c3a..3024e273 100644
+--- a/sdk/src/activelearning/subjects.py
++++ b/sdk/src/activelearning/subjects.py
+@@ -75,6 +75,9 @@ class Subjects:
+     # Kernel watchdog (E1.9.3)
+     KERNEL_HEARTBEAT = "kernel.heartbeat"
+ 
++    # Dead-letter queue (issue #246) — poisoned messages land on dlq.<subject>
++    DLQ_WILDCARD = "dlq.>"
++
+ 
+ def decision_subject(trace_id: str) -> str:
+     """Per-trace kernel decision subject."""
+diff --git a/sdk/tests/test_dlq_monitor.py b/sdk/tests/test_dlq_monitor.py
+new file mode 100644
+index 00000000..e24e308f
+--- /dev/null
++++ b/sdk/tests/test_dlq_monitor.py
+@@ -0,0 +1,140 @@
++"""Tests for dead-letter queue consumption and alerting (issue #246)."""
++
++from __future__ import annotations
++
++import json
++import logging
++
++import pytest
++
++from activelearning.dlq_monitor import (
++    DLQ_ALERT_EVENT,
++    DlqRecord,
++    emit_dlq_alert,
++    parse_dlq_envelope,
++)
++from activelearning.nats_client import EventBus, Subjects, poison_subject
++
++
++class TestParseDlqEnvelope:
++    def test_parses_full_envelope(self) -> None:
++        data = {
++            "original_subject": "decision.abc123",
++            "reason": "max_deliver_exhausted(5): boom",
++            "num_delivered": 5,
++            "payload": '{"trace_id": "abc123"}',
++        }
++        record = parse_dlq_envelope("dlq.decision.abc123", data)
++        assert record == DlqRecord(
++            dlq_subject="dlq.decision.abc123",
++            original_subject="decision.abc123",
++            reason="max_deliver_exhausted(5): boom",
++            num_delivered=5,
++            payload='{"trace_id": "abc123"}',
++        )
++
++    def test_tolerates_missing_fields(self) -> None:
++        record = parse_dlq_envelope("dlq.proposal.new", {})
++        assert record.original_subject == "unknown"
++        assert record.reason == "unknown"
++        assert record.num_delivered == 0
++        assert record.payload == ""
++
++    def test_tolerates_malformed_num_delivered(self) -> None:
++        record = parse_dlq_envelope("dlq.proposal.new", {"num_delivered": "not-a-number"})
++        assert record.num_delivered == 0
++
++
++class TestEmitDlqAlert:
++    def test_emits_structured_json_error_log(self, caplog: pytest.LogCaptureFixture) -> None:
++        record = DlqRecord(
++            dlq_subject="dlq.code.proposal",
++            original_subject="code.proposal",
++            reason="validation_error: bad payload",
++            num_delivered=1,
++            payload="{}",
++        )
++        with caplog.at_level(logging.ERROR):
++            payload = emit_dlq_alert(record, monitor="kernel")
++
++        assert payload["event"] == DLQ_ALERT_EVENT
++        assert payload["original_subject"] == "code.proposal"
++        assert payload["monitor"] == "kernel"
++        assert len(caplog.records) == 1
++        assert json.loads(caplog.records[0].message) == payload
++
++
++class TestEventBusDlqMonitor:
++    @pytest.mark.asyncio
++    async def test_handle_dlq_message_emits_alert(self, caplog: pytest.LogCaptureFixture) -> None:
++        bus = EventBus(name="kernel")
++        envelope = {
++            "original_subject": "proposal.new",
++            "reason": "max_deliver_exhausted(5): always fails",
++            "num_delivered": 5,
++            "payload": '{"trace_id": "poison-1"}',
++        }
++        with caplog.at_level(logging.ERROR):
++            await bus._handle_dlq_message(envelope)
++
++        alerts = [r for r in caplog.records if r.name == "activelearning.dlq_monitor"]
++        assert len(alerts) == 1
++        payload = json.loads(alerts[0].message)
++        assert payload["dlq_subject"] == poison_subject("proposal.new")
++        assert payload["original_subject"] == "proposal.new"
++        assert payload["num_delivered"] == 5
++        assert payload["monitor"] == "kernel"
++
++    @pytest.mark.asyncio
++    async def test_start_dlq_monitor_subscribes_to_wildcard(self) -> None:
++        bus = EventBus(name="kernel")
++        subscribed: list[tuple] = []
++
++        async def fake_subscribe(subject, handler, **kwargs):
++            subscribed.append((subject, handler))
++
++        bus.subscribe = fake_subscribe  # type: ignore[method-assign]
++        await bus.start_dlq_monitor()
++
++        assert len(subscribed) == 1
++        assert subscribed[0][0] == Subjects.DLQ_WILDCARD
++        assert subscribed[0][1] == bus._handle_dlq_message
++
++
++@pytest.mark.asyncio
++async def test_route_to_poison_is_observable_via_dlq_monitor(
++    event_bus: EventBus, wait_for_message, caplog: pytest.LogCaptureFixture
++) -> None:
++    """End-to-end: a message poisoned by js_subscribe is consumed and alerted
++    on by start_dlq_monitor() — the exact gap issue #246 reports."""
++    import uuid
++
++    subject = f"decision.{uuid.uuid4().hex}"
++    # NATS requires max_deliver > len(backoff); mirrors test_poison_after_max_deliver.
++    max_deliver = 3
++    attempts: list[int] = []
++
++    async def handler(_data: dict) -> None:
++        attempts.append(1)
++        raise RuntimeError("always fails")
++
++    def alerts() -> list[logging.LogRecord]:
++        return [r for r in caplog.records if r.name == "activelearning.dlq_monitor"]
++
++    with caplog.at_level(logging.ERROR, logger="activelearning.dlq_monitor"):
++        await event_bus.start_dlq_monitor()
++        await event_bus.js_subscribe(
++            subject,
++            handler,
++            durable=f"d-{uuid.uuid4().hex[:8]}",
++            max_deliver=max_deliver,
++            backoff=[0.3, 0.3],
++        )
++        await event_bus.publish(subject, {"trace_id": "e2e-poison", "type": "ALLOW"})
++
++        await wait_for_message(lambda: len(alerts()) >= 1, timeout=8.0)
++
++    assert len(attempts) == max_deliver
++    payload = json.loads(alerts()[0].message)
++    assert payload["original_subject"] == subject
++    assert payload["num_delivered"] == max_deliver
