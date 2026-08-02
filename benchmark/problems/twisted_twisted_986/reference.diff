@@ -1,0 +1,385 @@
+diff --git a/.github/workflows/test.yaml b/.github/workflows/test.yaml
+index 3318cb668fe..e7003eec644 100644
+--- a/.github/workflows/test.yaml
++++ b/.github/workflows/test.yaml
+@@ -194,7 +194,7 @@ jobs:
+           # as there are test with specific code branches for pypy.
+           - python-version: 'pypy3.11-v7.3.23'
+             tox-env: 'nodeps-withcov-posix'
+-            trial-target: '-- twisted.test.test_compat twisted.test.test_defer twisted.internet.test.test_socket twisted.trial.test.test_tests'
++            trial-target: '-- twisted.test.test_compat twisted.test.test_defer twisted.internet.test.test_socket twisted.internet.test.test_tcp twisted.trial.test.test_tests'
+             job-name: 'with-coverage'
+ 
+           # We run the full test suite with the GI reactor against an X virtual
+diff --git a/src/twisted/internet/tcp.py b/src/twisted/internet/tcp.py
+index e66c797724b..d9e7bb22c32 100644
+--- a/src/twisted/internet/tcp.py
++++ b/src/twisted/internet/tcp.py
+@@ -102,7 +102,7 @@ class _TLSServerMixin:  # type: ignore[no-redef]
+ from errno import errorcode
+ 
+ # Twisted Imports
+-from twisted.internet import abstract, address, base, error, fdesc, main
++from twisted.internet import abstract, address, base, defer, error, fdesc, main
+ from twisted.internet.error import CannotListenError
+ from twisted.internet.protocol import Protocol
+ from twisted.internet.task import deferLater
+@@ -452,9 +452,11 @@ def resolveAddress(self):
+         if self._requiresResolution:
+             d = self.reactor.resolve(self.addr[0])
+             d.addCallback(lambda n: (n,) + self.addr[1:])
+-            d.addCallbacks(self._setRealAddress, self.failIfNotConnected)
+         else:
+-            self._setRealAddress(self.addr)
++            d = defer.succeed(self.addr)
++
++        d.addCallback(self._setRealAddress)
++        d.addErrback(self.failIfNotConnected)
+ 
+     def _setRealAddress(self, address):
+         """
+@@ -493,6 +495,7 @@ def failIfNotConnected(self, err):
+             pass
+         else:
+             self._collectSocketDetails()
++
+         self.connector.connectionFailed(failure.Failure(err))
+         del self.connector
+ 
+@@ -654,7 +657,7 @@ def _connectDone(self):
+             self.protocol.makeConnection(self)
+ 
+ 
+-_NUMERIC_ONLY = socket.AI_NUMERICHOST | _AI_NUMERICSERV
++_NUMERIC_ONLY = socket.AI_NUMERICHOST | socket.AI_NUMERICSERV
+ 
+ 
+ def _resolveIPv6(ip, port):
+@@ -678,7 +681,22 @@ def _resolveIPv6(ip, port):
+     @raise socket.gaierror: if either the IP or port is not numeric as it
+         should be.
+     """
+-    return socket.getaddrinfo(ip, port, 0, 0, 0, _NUMERIC_ONLY)[0][4]
++    usedPort = port
++    if isinstance(port, int):
++        # On Linux and macOS `getaddrinfo` raises an exception on negative port number,
++        # while Windows accept it as long as it is an int.
++        # We pass a valid port to resolve the which is later overwritten.
++        usedPort = 1
++
++    result = socket.getaddrinfo(ip, usedPort, 0, 0, 0, _NUMERIC_ONLY)[0][4]
++    # On Windows and Linux `getaddrinfo` will also "resolve" invalid port numbers,
++    # and covert them into a valid one.
++    # Example 123456 is resolved as 57920, or -1 to 65535.
++    #
++    # We want to preserve the initial port number,
++    # so that later in possible error report we can report the original port number.
++    result = (result[0], port, result[2], result[3])
++    return result
+ 
+ 
+ class _BaseTCPClient:
+diff --git a/src/twisted/internet/test/test_tcp.py b/src/twisted/internet/test/test_tcp.py
+index 34ffcdcf532..2b27318737e 100644
+--- a/src/twisted/internet/test/test_tcp.py
++++ b/src/twisted/internet/test/test_tcp.py
+@@ -45,6 +45,7 @@
+     ConnectionRefusedError,
+     DNSLookupError,
+     NoProtocol,
++    ServiceNameUnknownError,
+     UserError,
+ )
+ from twisted.internet.interfaces import (
+@@ -64,6 +65,7 @@
+ )
+ from twisted.internet.protocol import ClientFactory, Factory, Protocol, ServerFactory
+ from twisted.internet.tcp import (
++    _NUMERIC_ONLY,
+     Connection,
+     Port,
+     Server,
+@@ -97,6 +99,7 @@
+ )
+ from twisted.logger import Logger
+ from twisted.python import log
++from twisted.python.compat import _PYPY
+ from twisted.python.failure import Failure
+ from twisted.python.modules import walkModules
+ from twisted.python.runtime import platform
+@@ -136,7 +139,16 @@
+ 
+     getLinkLocalIPv6Addresses = _win32ifaces.win32GetLinkLocalIPv6Addresses
+ 
++    try:
++        from twisted.internet.iocpreactor.reactor import IOCPReactor
++    except ImportError:  # pragma: no cover
++        # On our CI, we always have iocp-support package available.
++        # This is here for the case in which someone runs the tests on
++        # Windows, without the package installed.
++        IOCPReactor = None  # type: ignore[misc,assignment]
++
+     SKIP_EMFILE = True
++
+ else:
+     try:
+         from twisted.internet.test import _posixifaces
+@@ -145,6 +157,9 @@
+     else:
+         getLinkLocalIPv6Addresses = _posixifaces.posixGetLinkLocalIPv6Addresses
+ 
++    # Outside of Windows we don't have an IOCP reactor.
++    IOCPReactor = None  # type: ignore[misc,assignment]
++
+     SKIP_EMFILE = False
+ 
+ 
+@@ -691,6 +706,189 @@ def whenRun():
+             raise SkipTest("Reactor does not support ITLSTransport")
+         self.assertEqual(BrokenContextFactory.message, str(results[0]))
+ 
++    def test_connectPortUnderflow(self):
++        """
++        When trying to connect using a port outside of the 1-65535 range the
++        error is raised as an errback.
++        """
++
++        def test(message):
++            self.assertConnectPortError(-1, message)
++
++        if self.addressClass == IPv4Address:
++            if _PYPY:
++                test(("port must be 0-65535.",))
++            elif self.reactorFactory is IOCPReactor:
++                # Windows IOCP reactor.
++                test(("can't convert negative value to unsigned short",))
++            else:
++                test(("connect_ex(): port must be 0-65535.",))
++        else:
++            # For IPv6 the getaddrinfo() API is used at low-level.
++            if self.reactorFactory is IOCPReactor:
++                # Windows IOCP reactor.
++                test(("can't convert negative value to unsigned short",))
++            elif platform.isWindows():
++                # Windows select reactor.
++                test(("connect_ex(): port must be 0-65535.",))
++            elif platform.isMacOSX():
++                test((8, "nodename nor servname provided, or not known"))
++            else:
++                test((-8, "Servname not supported for ai_socktype"))
++
++    def test_connectPortOverflow(self):
++        """
++        When trying to connect using a port outside of the 1-65535 range the
++        error is raised as an errback.
++        """
++
++        def test(message):
++            self.assertConnectPortError(65536, message)
++
++        if _PYPY:
++            test(("port must be 0-65535.",))
++        elif platform.isMacOSX() and self.addressClass == IPv6Address:
++            test((8, "nodename nor servname provided, or not known"))
++        elif platform.isWindows():
++            if self.reactorFactory is IOCPReactor:
++                # Windows IOCP reactor.
++                test(("value too large to convert to unsigned short",))
++            else:
++                # Windows select reactor.
++                test(("connect_ex(): port must be 0-65535.",))
++        else:
++            test(("connect_ex(): port must be 0-65535.",))
++
++    def test_connectPortZero(self):
++        """
++        An error is raised as errback when trying to listed on the
++        reserved port C{0}.
++        """
++
++        def test(message):
++            self.assertConnectPortError(0, message)
++
++        if platform.isMacOSX():
++            test(("Can't assign requested address",))
++        elif platform.isWindows():
++            if self.reactorFactory is IOCPReactor:
++                # Windows IOCP reactor.
++                test(("WSAEADDRNOTAVAIL",))
++            else:
++                # Windows select reactor.
++                test(("The requested address is not valid in its context.",))
++        else:
++            test(("Connection refused",))
++
++    def test_connectPortNotNumeric(self):
++        """
++        When trying to connect with an endpoint using a port which can not be
++        resolved to a service an errback is raised.
++        """
++        self.assertConnectPortError("invalid", ("service/proto not found ('invalid')",))
++
++    def test_getaddrinfo_negative_port(self):
++        """
++        When a negative port number is used,
++        L{socket.getaddrinfo} raises an exception on Linux and macOS,
++        while returning a result on Windows.
++
++        This is an assumption used in the implementation of L{twisted.internet.tcp._resolveIPv6}.
++        """
++
++        def resolve_negative_port():
++            """
++            Here to share the exact call between Windows and other OSes.
++            """
++            return socket.getaddrinfo("127.0.0.1", -1, 0, 0, 0, _NUMERIC_ONLY)
++
++        if platform.isWindows():
++            result = resolve_negative_port()
++            firstResolve = result[0]
++            addressResolve = firstResolve[4]
++            portResolve = addressResolve[1]
++            self.assertEqual(65535, portResolve)
++            return
++
++        with self.assertRaises(socket.gaierror):
++            resolve_negative_port()
++
++    def test_getaddrinfo_overflow_port(self):
++        """
++        When a invalid big port number is used,
++        L{socket.getaddrinfo} raises an exception macOS,
++        while returning a result on Linux and Windows.
++
++        This is an assumption used in the implementation of L{twisted.internet.tcp._resolveIPv6}.
++        """
++
++        def resolve_overflow_port():
++            """
++            Here to share the exact call between Windows and other OSes.
++            """
++            return socket.getaddrinfo("127.0.0.1", 123456, 0, 0, 0, _NUMERIC_ONLY)
++
++        if platform.isWindows() or platform.isLinux():
++            result = resolve_overflow_port()
++            firstResolve = result[0]
++            addressResolve = firstResolve[4]
++            portResolve = addressResolve[1]
++            self.assertEqual(57920, portResolve)
++            return
++
++        with self.assertRaises(socket.gaierror):
++            resolve_overflow_port()
++
++    # This is used to count the number of calls in a single test run.
++    # It is defined as a class member but used as an instance member.
++    assertConnectPortErrorCalls = 0
++
++    def assertConnectPortError(self, port, message):
++        """
++        Check that trying to connect to C{port} will raise an errback.
++
++        @param port: Port number for which to try a client connection.
++        @type  port: C{int}
++
++        @param message: String representation of the expected error.
++        @type  message: C{str}
++
++        @raise AssertionError: when called multiple time from the same test.
++        """
++
++        def resetCallCount():
++            self.assertConnectPortErrorCalls = 0
++
++        if self.assertConnectPortErrorCalls != 0:  # pragma: no cover
++            # This is never called during normal tests.
++            # This is here to make sure the assertion is not misused.
++            raise AssertionError("This assertion can only be called once per test.")
++        else:
++            self.assertConnectPortErrorCalls = 1
++        self.addCleanup(resetCallCount)
++
++        reactor = self.buildReactor()
++        results = []
++
++        # Connect with invalid port number.
++        fakeServerAddress = self.addressClass("TCP", self.interface, port)
++        endpoint = self.endpoints.client(reactor, fakeServerAddress)
++        connectDeferred = endpoint.connect(Factory.forProtocol(Protocol))
++
++        def whenRun():
++            """
++            Accumulate any errors and stop the reactor.
++            """
++            connectDeferred.addErrback(lambda failure: results.append(failure))
++            connectDeferred.addBoth(lambda ign: reactor.stop())
++
++        needsRunningReactor(reactor, whenRun)
++
++        self.runReactor(reactor)
++
++        errors = [failure.value.args for failure in results]
++        self.assertEqual([message], errors)
++
+ 
+ class TCP4ClientTestsBuilder(TCPClientTestsBase):
+     """
+@@ -842,6 +1040,27 @@ def reconnectFailed(ignored):
+         clientFactory.reason.trap(ConnectionRefusedError)
+         self.assertEqual(protocolMadeAndClosed, [(1, 1)])
+ 
++    def test_invalidServiceName(self):
++        """
++        When connection is done with an invalid service name as port,
++        L{ServiceNameUnknownError} is raised.
++        """
++        reactor = self.buildReactor()
++
++        error = self.assertRaises(
++            ServiceNameUnknownError,
++            reactor.connectTCP,
++            self.interface,
++            "invalid-port",
++            MyClientFactory(),
++        )
++
++        self.assertEqual(
++            "Service name given as port is unknown: "
++            "service/proto not found ('invalid-port').",
++            str(error),
++        )
++
+ 
+ class TCP4ConnectorTestsBuilder(TCPConnectorTestsBuilder):
+     interface = "127.0.0.1"
+@@ -2943,6 +3162,22 @@ def test_resolveIPv6(self):
+         # number are a little better specified.
+         self.assertEqual(result[:2], ("::1", 2))
+ 
++    def test_resolveIPv6OverflowPort(self):
++        """
++        L{_resolveIPv6} preserves the requested port number, even when it is
++        not valid.
++        """
++        result = _resolveIPv6("::1", 123456)
++        self.assertEqual(result[:2], ("::1", 123456))
++
++    def test_resolveIPv6UnderflowPort(self):
++        """
++        L{_resolveIPv6} preserves the requested port number, even when it a
++        negative number.
++        """
++        result = _resolveIPv6("::1", -1)
++        self.assertEqual(result[:2], ("::1", -1))
++
+ 
+ class BuffersLogsTests(SynchronousTestCase):
+     """
+diff --git a/src/twisted/newsfragments/7798.bugfix b/src/twisted/newsfragments/7798.bugfix
+new file mode 100644
+index 00000000000..81f3db829a8
+--- /dev/null
++++ b/src/twisted/newsfragments/7798.bugfix
+@@ -0,0 +1 @@
++Initiating a TCP connection with an address literals and a port outside of the 1-65535 range in twisted.internet.tcp.BaseClient and twisted.internet.iocpreactor.tcp.Client now triggers an errback instead of an unhandled error. This change might also fix other unhandled errors occurred while connecting using address literals.
+\ No newline at end of file
