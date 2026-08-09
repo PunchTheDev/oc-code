@@ -1,0 +1,182 @@
+diff --git a/internal/transport/http2_client.go b/internal/transport/http2_client.go
+index 0990df425741..856af2cdf2be 100644
+--- a/internal/transport/http2_client.go
++++ b/internal/transport/http2_client.go
+@@ -648,6 +648,9 @@ func (t *http2Client) createHeaderFields(ctx context.Context, callHdr *CallHdr)
+ 		if isReservedHeader(k) {
+ 			continue
+ 		}
++		if err := imetadata.ValidatePair(k, vv...); err != nil {
++			return nil, status.Error(codes.Internal, err.Error())
++		}
+ 		for _, v := range vv {
+ 			headerFields = append(headerFields, hpack.HeaderField{Name: k, Value: encodeMetadataHeader(k, v)})
+ 		}
+diff --git a/stream.go b/stream.go
+index 51aff85dfba0..0edb50e6c9e7 100644
+--- a/stream.go
++++ b/stream.go
+@@ -543,6 +543,9 @@ func (a *csAttempt) newStream() error {
+ 	// maintained in it are local to the attempt. When the attempt has to be
+ 	// retried, a new instance of csAttempt will be created.
+ 	if a.pickResult.Metadata != nil {
++		if err := imetadata.Validate(a.pickResult.Metadata); err != nil {
++			return status.Error(codes.Internal, err.Error())
++		}
+ 		// We currently do not have a function it the metadata package which
+ 		// merges given metadata with existing metadata in a context. Existing
+ 		// function `AppendToOutgoingContext()` takes a variadic argument of key
+diff --git a/test/balancer_test.go b/test/balancer_test.go
+index ef0348d410f2..2131b0f5bd37 100644
+--- a/test/balancer_test.go
++++ b/test/balancer_test.go
+@@ -24,6 +24,7 @@ import (
+ 	"fmt"
+ 	"net"
+ 	"reflect"
++	"strings"
+ 	"testing"
+ 	"time"
+ 
+@@ -918,6 +919,141 @@ func (s) TestMetadataInPickResult(t *testing.T) {
+ 	}
+ }
+ 
++type invalidMetadataCCWrapper struct {
++	balancer.ClientConn
++}
++
++func (t *invalidMetadataCCWrapper) UpdateState(state balancer.State) {
++	state.Picker = &invalidMetadataPicker{picker: state.Picker}
++	t.ClientConn.UpdateState(state)
++}
++
++type invalidMetadataPicker struct {
++	picker balancer.Picker
++}
++
++func (imp *invalidMetadataPicker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
++	res, err := imp.picker.Pick(info)
++	if err != nil {
++		return balancer.PickResult{}, err
++	}
++	res.Metadata = metadata.MD{"bad key": {"value"}}
++	return res, nil
++}
++
++func (s) TestInvalidMetadataInPickResult(t *testing.T) {
++	ss := &stubserver.StubServer{EmptyCallF: func(context.Context, *testpb.Empty) (*testpb.Empty, error) {
++		return &testpb.Empty{}, nil
++	}}
++	if err := ss.StartServer(); err != nil {
++		t.Fatalf("Starting test backend: %v", err)
++	}
++	defer ss.Stop()
++
++	stub.Register(t.Name(), stub.BalancerFuncs{
++		Init: func(bd *stub.BalancerData) {
++			cc := &invalidMetadataCCWrapper{ClientConn: bd.ClientConn}
++			bd.ChildBalancer = balancer.Get(pickfirst.Name).Build(cc, bd.BuildOptions)
++		},
++		Close: func(bd *stub.BalancerData) {
++			bd.ChildBalancer.Close()
++		},
++		UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
++			return bd.ChildBalancer.UpdateClientConnState(ccs)
++		},
++	})
++
++	r := manual.NewBuilderWithScheme("whatever")
++	r.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: ss.Address}}})
++	cc, err := grpc.NewClient(r.Scheme()+":///test.server",
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
++		grpc.WithResolvers(r),
++		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, t.Name())),
++	)
++	if err != nil {
++		t.Fatalf("grpc.NewClient(): %v", err)
++	}
++	defer cc.Close()
++
++	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
++	defer cancel()
++	wantErr := `header key "bad key" contains illegal characters not in [0-9a-z-_.]`
++	if _, err := testgrpc.NewTestServiceClient(cc).EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.Internal || !strings.Contains(err.Error(), wantErr) {
++		t.Fatalf("EmptyCall() error = %v, want code %v and message containing %q", err, codes.Internal, wantErr)
++	}
++}
++
++func (s) TestAddressMetadataValidation(t *testing.T) {
++	tests := []struct {
++		name    string
++		md      metadata.MD
++		wantErr string
++	}{
++		{
++			name: "valid",
++			md:   metadata.Pairs("valid-key", "value"),
++		},
++		{
++			name:    "invalid key",
++			md:      metadata.Pairs("bad key", "value"),
++			wantErr: `header key "bad key" contains illegal characters not in [0-9a-z-_.]`,
++		},
++		{
++			name:    "invalid value",
++			md:      metadata.Pairs("valid-key", "bad\x01value"),
++			wantErr: `header key "valid-key" contains value with non-printable ASCII characters`,
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			testAddressMetadataValidation(t, test.md, test.wantErr)
++		})
++	}
++}
++
++func testAddressMetadataValidation(t *testing.T, addrMD metadata.MD, wantErr string) {
++	ss := &stubserver.StubServer{EmptyCallF: func(ctx context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
++		if wantErr != "" {
++			return nil, status.Error(codes.Internal, "EmptyCall reached backend with invalid address metadata")
++		}
++		md, _ := metadata.FromIncomingContext(ctx)
++		if got := md.Get("valid-key"); !cmp.Equal(got, []string{"value"}) {
++			return nil, status.Errorf(codes.Internal, "metadata.Get(\"valid-key\") = %v, want [value]", got)
++		}
++		return &testpb.Empty{}, nil
++	}}
++	if err := ss.StartServer(); err != nil {
++		t.Fatalf("Starting test backend: %v", err)
++	}
++	defer ss.Stop()
++
++	r := manual.NewBuilderWithScheme("whatever")
++	addr := imetadata.Set(resolver.Address{Addr: ss.Address}, addrMD)
++	r.InitialState(resolver.State{Addresses: []resolver.Address{addr}})
++	cc, err := grpc.NewClient(r.Scheme()+":///test.server",
++		grpc.WithTransportCredentials(insecure.NewCredentials()),
++		grpc.WithResolvers(r),
++	)
++	if err != nil {
++		t.Fatalf("grpc.NewClient(): %v", err)
++	}
++	defer cc.Close()
++
++	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
++	defer cancel()
++	_, err = testgrpc.NewTestServiceClient(cc).EmptyCall(ctx, &testpb.Empty{})
++	if wantErr == "" {
++		if err != nil {
++			t.Fatalf("EmptyCall() error = %v, want nil", err)
++		}
++		return
++	}
++	if status.Code(err) != codes.Internal || !strings.Contains(err.Error(), wantErr) {
++		t.Fatalf("EmptyCall() error = %v, want code %v and message containing %q", err, codes.Internal, wantErr)
++	}
++}
++
+ // TestSubConnShutdown confirms that the Shutdown method on subconns and
+ // RemoveSubConn method on ClientConn properly initiates subconn shutdown.
+ func (s) TestSubConnShutdown(t *testing.T) {
