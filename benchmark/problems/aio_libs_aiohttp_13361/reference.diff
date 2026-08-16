@@ -1,0 +1,131 @@
+diff --git a/CHANGES/13356.bugfix.rst b/CHANGES/13356.bugfix.rst
+new file mode 100644
+index 00000000000..a9617231118
+--- /dev/null
++++ b/CHANGES/13356.bugfix.rst
+@@ -0,0 +1,4 @@
++Fixed requests pipelined behind a request whose upgrade the handler declined
++going unanswered once there were more of them than the per-connection queue
++holds. With the pure-Python parser the same requests were also served more
++than once -- by :user:`rodrigobnogueira`.
+diff --git a/aiohttp/http_parser.py b/aiohttp/http_parser.py
+index 424d80a60b4..0badf84aa93 100644
+--- a/aiohttp/http_parser.py
++++ b/aiohttp/http_parser.py
+@@ -371,6 +371,8 @@ def feed_data(
+                     # any preceding body is consumed before the next request
+                     # line. Resumes via feed_data(b"") when the queue drains.
+                     self._tail = data[start_pos:]
++                    # The remainder now lives in self._tail only. Don't return it.
++                    data = EMPTY
+                     break
+                 pos = data.find(SEP, start_pos)
+                 # consume \r\n
+diff --git a/aiohttp/web_protocol.py b/aiohttp/web_protocol.py
+index f1b384434e0..0fa9c26ac62 100644
+--- a/aiohttp/web_protocol.py
++++ b/aiohttp/web_protocol.py
+@@ -774,6 +774,12 @@ async def finish_response(
+                 for msg, payload in messages:
+                     self._request_count += 1
+                     self._messages.append((msg, payload))
++                # Pause the transport, like in data_received().
++                if (
++                    not self._msg_queue_paused
++                    and len(self._messages) >= self._max_msg_queue_size
++                ):
++                    self._pause_msg_queue_reading()
+                 # This shouldn't be possible. If a future refactor results in this
+                 # failing, then the code may need to be updated to set the waiter.
+                 assert self._waiter is None
+diff --git a/tests/test_http_parser.py b/tests/test_http_parser.py
+index f55ce149e68..c40d8ae3865 100644
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -190,6 +190,24 @@ def test_max_msg_queue_size_caps_emitted_messages(
+     assert not upgraded
+ 
+ 
++async def test_max_msg_queue_size_keeps_tail_to_itself(
++    request_cls: type[HttpRequestParser],
++    protocol: BaseProtocol,
++) -> None:
++    """The remainder is buffered for the next feed, so it must not be returned.
++
++    Handing it back as well gives the caller a second copy of bytes the parser
++    is already holding, and both copies get parsed.
++    """
++    loop = asyncio.get_running_loop()
++    parser = _build_request_parser(request_cls, protocol, loop, 4)
++
++    messages, _upgraded, tail = parser.feed_data(_PIPELINED_GET * 10)
++
++    assert len(messages) == 4
++    assert tail == b""
++
++
+ def test_max_msg_queue_size_resumes_after_consume(
+     request_cls: type[HttpRequestParser],
+     protocol: BaseProtocol,
+diff --git a/tests/test_web_functional.py b/tests/test_web_functional.py
+index d126347aaf0..4298eb70a7d 100644
+--- a/tests/test_web_functional.py
++++ b/tests/test_web_functional.py
+@@ -1845,6 +1845,57 @@ def raw_get(path: str) -> bytes:
+     assert len(handled) == pipelined_requests + 1
+ 
+ 
++async def test_http1_pipelined_behind_declined_upgrade_served_once(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """Requests pipelined behind a declined upgrade are each served once.
++
++    The bytes following an upgrade request are buffered whole, then re-fed once
++    the handler answers it normally. More of them than the queue holds must
++    still be served, and none of them twice.
++    """
++    pipelined_requests = MAX_MSG_QUEUE_SIZE + 8
++    handled: list[str] = []
++    all_handled = asyncio.Event()
++
++    async def handler(request: web.Request) -> web.Response:
++        handled.append(request.path)
++        if len(handled) == pipelined_requests + 1:
++            all_handled.set()
++        return web.Response()
++
++    app = web.Application()
++    app.router.add_get("/{tail:.*}", handler)
++    server = await aiohttp_server(app)
++
++    def raw_get(path: str) -> bytes:
++        return (
++            f"GET {path} HTTP/1.1\r\nHost: localhost\r\n"
++            "Connection: keep-alive\r\n\r\n"
++        ).encode("ascii")
++
++    # An upgrade the handler answers normally, then the pipeline, in one write.
++    upgrade = (
++        b"GET /upgrade HTTP/1.1\r\nHost: localhost\r\n"
++        b"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
++    )
++
++    reader, writer = await asyncio.open_connection(server.host, server.port)
++    try:
++        writer.write(
++            upgrade + b"".join(raw_get(f"/r{i}") for i in range(pipelined_requests))
++        )
++        await writer.drain()
++        await asyncio.wait_for(all_handled.wait(), 10)
++    finally:
++        writer.close()
++        with suppress(ConnectionResetError, BrokenPipeError):
++            await writer.wait_closed()
++
++    assert len(handled) == pipelined_requests + 1
++    assert len(set(handled)) == len(handled)
++
++
+ async def test_declined_websocket_upgrade_reads_body(
+     aiohttp_server: AiohttpServer,
+ ) -> None:

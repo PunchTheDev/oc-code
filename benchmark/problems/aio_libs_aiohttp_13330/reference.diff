@@ -1,0 +1,282 @@
+diff --git a/CHANGES/13329.bugfix.rst b/CHANGES/13329.bugfix.rst
+new file mode 100644
+index 00000000000..ace88018edc
+--- /dev/null
++++ b/CHANGES/13329.bugfix.rst
+@@ -0,0 +1,2 @@
++Fixed internally retried requests sending a truncated body when the request
++data was a file object -- by :user:`aiolibsbot`.
+diff --git a/CHANGES/13330.bugfix.rst b/CHANGES/13330.bugfix.rst
+new file mode 120000
+index 00000000000..e12343bfca7
+--- /dev/null
++++ b/CHANGES/13330.bugfix.rst
+@@ -0,0 +1 @@
++13329.bugfix.rst
+\ No newline at end of file
+diff --git a/aiohttp/client.py b/aiohttp/client.py
+index 9e634a66290..9739cc46019 100644
+--- a/aiohttp/client.py
++++ b/aiohttp/client.py
+@@ -733,10 +733,18 @@ async def _request(
+                     ):
+                         raise
+                     except (ClientOSError, ServerDisconnectedError):
+-                        if retry_persistent_connection:
+-                            retry_persistent_connection = False
+-                            continue
+-                        raise
++                        if not retry_persistent_connection:
++                            raise
++                        retry_persistent_connection = False
++                        if data is not None:
++                            # Rebuilding from `data` would resend only the unread
++                            # remainder of a file object; reuse the payload, which
++                            # rewinds itself once the cancelled writer has settled.
++                            await req._close()
++                            if req._body.consumed:
++                                raise
++                            data = req._body
++                        continue
+                     except ClientError:
+                         raise
+                     except OSError as exc:
+diff --git a/aiohttp/multipart.py b/aiohttp/multipart.py
+index e767d077f9d..bb217643426 100644
+--- a/aiohttp/multipart.py
++++ b/aiohttp/multipart.py
+@@ -663,6 +663,10 @@ async def as_bytes(self, encoding: str = "utf-8", errors: str = "strict") -> byt
+ 
+     async def write(self, writer: AbstractStreamWriter) -> None:
+         field = self._value
++        # Reading the part drains the underlying stream irreversibly, so mark the
++        # payload consumed up front: even an interrupted write leaves nothing that
++        # a retry or redirect could replay.
++        self._consumed = True
+         while chunk := await field.read_chunk(size=DEFAULT_CHUNK_SIZE):
+             async for d in field.decode_iter(chunk):
+                 await writer.write(d)
+@@ -944,6 +948,11 @@ def __exit__(
+     ) -> None:
+         pass
+ 
++    @property
++    def consumed(self) -> bool:
++        """Whether the writer or any of its parts can no longer be replayed."""
++        return self._consumed or any(part.consumed for part, _, _ in self._parts)
++
+     def __iter__(self) -> Iterator[_Part]:
+         return iter(self._parts)
+ 
+diff --git a/aiohttp/payload.py b/aiohttp/payload.py
+index 671e3f5e170..64cfacd2a40 100644
+--- a/aiohttp/payload.py
++++ b/aiohttp/payload.py
+@@ -1049,6 +1049,10 @@ async def write_with_length(
+ 
+         # Stream from the iterator
+         remaining_bytes = content_length
++        # Nothing is cached, so advancing the iterator is irreversible: mark the
++        # payload consumed up front so an interrupted write cannot be replayed
++        # from a partially drained iterator.
++        self._consumed = True
+ 
+         try:
+             while True:
+@@ -1066,7 +1070,6 @@ async def write_with_length(
+         except StopAsyncIteration:
+             # Iterator is exhausted
+             self._iter = None
+-            self._consumed = True  # Mark as consumed when streamed without caching
+ 
+     def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
+         """Decode the payload content as a string if cached chunks are available."""
+diff --git a/tests/test_client_functional.py b/tests/test_client_functional.py
+index e8d3cbe7515..f0dbaa5da5b 100644
+--- a/tests/test_client_functional.py
++++ b/tests/test_client_functional.py
+@@ -5895,6 +5895,74 @@ async def handler(request: web.Request) -> web.Response:
+         await asyncio.to_thread(f.close)
+ 
+ 
++async def test_file_upload_retry_persistent_connection(
++    aiohttp_client: AiohttpClient, tmp_path: pathlib.Path
++) -> None:
++    """A retried request must resend the whole file, not the unread remainder."""
++    received_bodies: list[bytes] = []
++    num_requests = 0
++
++    async def handler(request: web.Request) -> web.Response:
++        nonlocal num_requests
++        num_requests += 1
++        if num_requests == 1:
++            assert request.transport is not None
++            request.transport.close()
++            return web.Response()
++
++        received_bodies.append(await request.read())
++        return web.Response()
++
++    app = web.Application()
++    app.router.add_put("/upload", handler)
++
++    client = await aiohttp_client(app)
++    client.session._retry_connection = True
++
++    test_file = tmp_path / "test_retry_upload.txt"
++    content = b"This is test file content for a retried upload."
++    await asyncio.to_thread(test_file.write_bytes, content)
++
++    f = await asyncio.to_thread(open, test_file, "rb")
++    try:
++        async with client.put("/upload", data=f) as resp:
++            assert resp.status == 200
++    finally:
++        await asyncio.to_thread(f.close)
++
++    assert num_requests == 2
++    assert received_bodies == [content]
++
++
++async def test_upload_retry_persistent_connection_unseekable_body(
++    aiohttp_client: AiohttpClient,
++) -> None:
++    """An unreplayable body must not be silently resent truncated on retry."""
++    num_requests = 0
++
++    async def handler(request: web.Request) -> web.Response:
++        nonlocal num_requests
++        num_requests += 1
++        assert request.transport is not None
++        request.transport.close()
++        return web.Response()
++
++    app = web.Application()
++    app.router.add_put("/upload", handler)
++
++    client = await aiohttp_client(app)
++    client.session._retry_connection = True
++
++    async def gen() -> AsyncIterator[bytes]:
++        yield b"chunk1"
++        yield b"chunk2"
++
++    with pytest.raises((aiohttp.ServerDisconnectedError, aiohttp.ClientOSError)):
++        await client.put("/upload", data=gen())
++
++    assert num_requests == 1
++
++
+ async def test_stream_reader_total_raw_bytes(aiohttp_client: AiohttpClient) -> None:
+     """Test whether StreamReader.total_raw_bytes returns the number of bytes downloaded"""
+     source_data = b"@dKal^pH>1h|YW1:c2J$" * 4096
+diff --git a/tests/test_multipart.py b/tests/test_multipart.py
+index 43452741942..fe7903d48c9 100644
+--- a/tests/test_multipart.py
++++ b/tests/test_multipart.py
+@@ -4,6 +4,7 @@
+ import json
+ import pathlib
+ import sys
++from collections.abc import AsyncIterator
+ from types import TracebackType
+ from unittest import mock
+ 
+@@ -1835,3 +1836,59 @@ async def test_multipart_writer_close_with_exceptions() -> None:
+     await writer.close()
+     assert part1.close.call_count == 1
+     assert part2.close.call_count == 1
++
++
++async def test_multipart_writer_consumed_follows_parts() -> None:
++    """A writer holding an unreplayable part must report itself as consumed."""
++
++    async def gen() -> AsyncIterator[bytes]:
++        yield b"chunk1"
++        yield b"chunk2"
++
++    writer = aiohttp.MultipartWriter()
++    writer.append(b"replayable")
++    assert writer.consumed is False
++
++    part = writer.append(gen())
++    assert writer.consumed is False
++
++    stream = mock.Mock()
++    stream.write = mock.AsyncMock()
++    await part.write_with_length(stream, None)
++
++    assert part.consumed is True
++    assert writer.consumed is True
++
++
++async def test_body_part_reader_payload_consumed_after_write() -> None:
++    """A drained body part reader must report itself as consumed."""
++    with Stream(b"Hello, world!\r\n--:--") as stream:
++        body_part = aiohttp.BodyPartReader(
++            BOUNDARY, HeadersDictProxy(CIMultiDict()), stream
++        )
++        payload = BodyPartReaderPayload(body_part)
++        assert payload.consumed is False
++
++        writer = mock.Mock()
++        writer.write = mock.AsyncMock()
++        await payload.write(writer)
++
++        assert payload.consumed is True
++
++
++async def test_multipart_writer_consumed_follows_body_part_reader() -> None:
++    """A writer holding a drained body part reader must report itself consumed."""
++    with Stream(b"Hello, world!\r\n--:--") as stream:
++        body_part = aiohttp.BodyPartReader(
++            BOUNDARY, HeadersDictProxy(CIMultiDict()), stream
++        )
++        writer = aiohttp.MultipartWriter()
++        part = writer.append(body_part)
++        assert writer.consumed is False
++
++        out = mock.Mock()
++        out.write = mock.AsyncMock()
++        await part.write_with_length(out, None)
++
++        assert part.consumed is True
++        assert writer.consumed is True
+diff --git a/tests/test_payload.py b/tests/test_payload.py
+index 973d97939ba..7f9399c681a 100644
+--- a/tests/test_payload.py
++++ b/tests/test_payload.py
+@@ -964,6 +964,33 @@ async def gen() -> AsyncIterator[bytes]:
+     assert writer2.get_written_bytes() == b""
+ 
+ 
++async def test_async_iterable_payload_consumed_on_interrupted_write() -> None:
++    """An interrupted write must still mark an uncached payload as consumed."""
++
++    async def gen() -> AsyncIterator[bytes]:
++        yield b"chunk1"
++        yield b"chunk2"
++
++    class FailingWriter(MockStreamWriter):
++        async def write(
++            self,
++            chunk: Union[bytes, bytearray, "memoryview[int]", "memoryview[bytes]"],
++        ) -> None:
++            if self.written:
++                raise ConnectionResetError("connection lost")
++            await super().write(chunk)
++
++    p = payload.AsyncIterablePayload(gen())
++    writer = FailingWriter()
++
++    with pytest.raises(ConnectionResetError):
++        await p.write_with_length(writer, None)
++
++    # The iterator was partially drained, so the payload cannot be replayed.
++    assert writer.get_written_bytes() == b"chunk1"
++    assert p.consumed is True
++
++
+ async def test_bytes_io_payload_close_does_not_close_io() -> None:
+     """Test that BytesIOPayload close() does not close the underlying BytesIO."""
+     bytes_io = io.BytesIO(b"data")

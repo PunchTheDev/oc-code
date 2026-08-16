@@ -1,0 +1,1832 @@
+import {
+  type AsyncComponentInternalOptions,
+  type ComponentInternalInstance,
+  type ComponentInternalOptions,
+  type ComponentObjectPropsOptions,
+  type ComponentPropsOptions,
+  EffectScope,
+  type EmitFn,
+  type EmitsOptions,
+  type EmitsToProps,
+  ErrorCodes,
+  type ExtractPropTypes,
+  type GenericAppContext,
+  type GenericComponentInstance,
+  type LifecycleHook,
+  NULL_DYNAMIC_COMPONENT,
+  type NormalizedPropsOptions,
+  type ObjectEmitsOptions,
+  type SchedulerJob,
+  SchedulerJobFlags,
+  type ShallowUnwrapRef,
+  type SuspenseBoundary,
+  callWithErrorHandling,
+  currentInstance,
+  endMeasure,
+  expose,
+  getComponentName,
+  getFunctionalFallthrough,
+  invalidateMount,
+  isAsyncWrapper,
+  isKeepAlive,
+  markAsyncBoundary,
+  nextUid,
+  popWarningContext,
+  pushWarningContext,
+  queuePostRenderEffect,
+  registerHMR,
+  resolveComponent,
+  restoreCurrentInstance,
+  setCurrentInstance,
+  setCurrentRenderingInstance,
+  startMeasure,
+  unregisterHMR,
+  warn,
+  warnExtraneousAttributes,
+} from '@vue/runtime-dom'
+import { type Block, findBlockBoundary, insert, isBlock, remove } from './block'
+import {
+  type ShallowRef,
+  markRaw,
+  onScopeDispose,
+  proxyRefs,
+  setActiveSub,
+  toRaw,
+  unref,
+} from '@vue/reactivity'
+import {
+  EMPTY_OBJ,
+  NOOP,
+  type Prettify,
+  ShapeFlags,
+  hasOwn,
+  invokeArrayFns,
+  isArray,
+  isFunction,
+  isPromise,
+  isString,
+} from '@vue/shared'
+import {
+  type DynamicPropsSource,
+  type RawProps,
+  getKeysFromRawProps,
+  getPropsProxyHandlers,
+  hasFallthroughAttrs,
+  normalizePropsOptions,
+  resolveDynamicProps,
+  setupPropsValidation,
+  snapshotRawProps,
+} from './componentProps'
+import { type RenderEffect, renderEffect } from './renderEffect'
+import { emit, normalizeEmitsOptions } from './componentEmits'
+import { setDynamicProps } from './dom/prop'
+import {
+  type LooseRawSlots,
+  type RawSlots,
+  type StaticSlots,
+  dynamicSlotsProxyHandlers,
+  getSlot,
+  inOnceSlot,
+  normalizeRawSlots,
+  setCurrentSlotOwner,
+  withOnceSlot,
+} from './componentSlots'
+import { hmrReload, hmrRerender } from './hmr'
+import {
+  type HydrationCursor,
+  adoptTemplate,
+  advanceHydrationNode,
+  currentHydrationNode,
+  enterHydrationBoundary,
+  enterHydrationCursor,
+  exitHydrationCursor,
+  isComment,
+  isHydrating,
+  locateEndAnchor,
+  markHydrationAnchor,
+  nextLogicalSibling,
+  setCurrentHydrationNode,
+  withDeferredHydrationBoundary,
+} from './dom/hydration'
+import { createComment, createElement, createTextNode } from './dom/node'
+import {
+  isTeleportEnabled,
+  isTeleportFragment,
+  isVaporTeleport,
+} from './teleport'
+import type { KeepAliveInstance } from './components/KeepAlive'
+import {
+  type VaporKeepAliveContext,
+  getKeepAliveContext,
+  isKeepAliveEnabled,
+} from './keepAlive'
+import {
+  insertionAnchor,
+  insertionParent,
+  resetInsertionState,
+} from './insertionState'
+import type {
+  DefineVaporComponent,
+  VaporRenderResult,
+} from './apiDefineComponent'
+import { DynamicFragment, isDynamicFragment, isFragment } from './fragment'
+import { SLOT } from './fragmentFlags'
+import { resolvePendingSlotContent } from './dom/hydrateFragment'
+import type { VaporElement } from './apiDefineCustomElement'
+import {
+  currentUnmountSuspense,
+  isSuspenseEnabled,
+  parentSuspense,
+  setCurrentUnmountSuspense,
+  setParentSuspense,
+} from './suspense'
+import { isInteropEnabled } from './vdomInteropState'
+import {
+  getCurrentScopeId,
+  setComponentScopeId,
+  setScopeId,
+  trackComponentScopeId,
+} from './scopeId'
+import { isTransitionEnabled, isVaporTransition } from './transition'
+
+export { currentInstance } from '@vue/runtime-dom'
+
+export type VaporComponent =
+  | FunctionalVaporComponent<any>
+  | VaporComponentOptions
+  | DefineVaporComponent
+
+export type FunctionalVaporComponent<
+  Props = {},
+  Emits extends EmitsOptions = {},
+  Slots extends StaticSlots = StaticSlots,
+  Exposed extends Record<string, any> = Record<string, any>,
+> = ((
+  props: Props & EmitsToProps<Emits>,
+  ctx: {
+    emit: EmitFn<Emits>
+    slots: Slots
+    attrs: Record<string, any>
+    expose: (exposed: Exposed) => void
+  },
+) => VaporRenderResult) &
+  Omit<
+    VaporComponentOptions<ComponentPropsOptions<Props>, Emits, string, Slots>,
+    'setup'
+  > & {
+    displayName?: string
+  } & SharedInternalOptions
+
+export interface VaporComponentOptions<
+  Props = {},
+  Emits extends EmitsOptions = {},
+  RuntimeEmitsKeys extends string = string,
+  Slots extends StaticSlots = StaticSlots,
+  Exposed extends Record<string, any> = Record<string, any>,
+  TypeBlock extends Block = Block,
+  InferredProps = ComponentObjectPropsOptions extends Props
+    ? {}
+    : ExtractPropTypes<Props>,
+>
+  extends
+    ComponentInternalOptions,
+    AsyncComponentInternalOptions<
+      VaporComponentOptions,
+      VaporComponentInstance
+    >,
+    SharedInternalOptions {
+  inheritAttrs?: boolean
+  props?: Props
+  emits?: Emits | RuntimeEmitsKeys[]
+  slots?: Slots
+  setup?: (
+    props: Readonly<InferredProps>,
+    ctx: {
+      emit: EmitFn<Emits>
+      slots: Slots
+      attrs: Record<string, any>
+      expose: <T extends Record<string, any> = Exposed>(exposed: T) => void
+    },
+  ) => TypeBlock | Exposed | Promise<Exposed> | void
+  render?(
+    ctx: Block extends Exposed
+      ? Record<string, any>
+      : ShallowUnwrapRef<Exposed>,
+    props: Readonly<InferredProps>,
+    emit: EmitFn<Emits>,
+    attrs: any,
+    slots: Slots,
+  ): VaporRenderResult<TypeBlock> | void
+
+  name?: string
+  vapor?: boolean
+  components?: Record<string, VaporComponent>
+}
+
+interface SharedInternalOptions {
+  /**
+   * Cached normalized props options.
+   * In vapor mode there are no mixins so normalized options can be cached
+   * directly on the component
+   */
+  __propsOptions?: NormalizedPropsOptions
+  /**
+   * Cached normalized props proxy handlers.
+   */
+  __propsHandlers?: [ProxyHandler<any> | null, ProxyHandler<any>]
+  /**
+   * Cached normalized emits options.
+   */
+  __emitsOptions?: ObjectEmitsOptions
+}
+
+// In TypeScript, it is actually impossible to have a record type with only
+// specific properties that have a different type from the indexed type.
+// This makes our rawProps / rawSlots shape difficult to satisfy when calling
+// `createComponent` - luckily this is not user-facing, so we use intentionally
+// wider types to make `createComponent` ergonomic in tests and internal call sites.
+export type LooseRawProps = Record<string, unknown> & {
+  $?: DynamicPropsSource[]
+}
+
+export function createComponent(
+  component: VaporComponent,
+  rawProps?: LooseRawProps | null,
+  rawSlots?: LooseRawSlots | null,
+  isSingleRoot?: boolean,
+  once?: boolean,
+  appContext: GenericAppContext = (currentInstance &&
+    currentInstance.appContext) ||
+    emptyContext,
+  managedMount = false,
+  ce?: (instance: VaporComponentInstance) => void,
+): VaporComponentInstance {
+  // A component created while rendering a v-once slot should receive frozen
+  // parent inputs, but its own render effects should still be live.
+  const wasInOnceSlot = inOnceSlot
+  if (wasInOnceSlot) once = true
+
+  const _insertionParent = insertionParent
+  const _insertionAnchor = insertionAnchor
+  let hydrationClose: Node | null = null
+  let hydrationCursor: HydrationCursor | null = null
+  let exitHydrationBoundary: (() => void) | undefined
+  let deferHydrationBoundary = false
+  const finalizeHydrationBoundary = () => {
+    exitHydrationBoundary && exitHydrationBoundary()
+    if (hydrationClose && currentHydrationNode === hydrationClose) {
+      advanceHydrationNode(hydrationClose)
+    }
+  }
+  if (isHydrating) {
+    resolvePendingSlotContent()
+    hydrationCursor = enterHydrationCursor()
+    if (component.__multiRoot && isComment(currentHydrationNode!, '[')) {
+      hydrationClose = locateEndAnchor(currentHydrationNode!)
+      exitHydrationBoundary = enterHydrationBoundary(
+        hydrationClose && markHydrationAnchor(hydrationClose),
+      )
+      setCurrentHydrationNode(currentHydrationNode!.nextSibling)
+    }
+  } else {
+    resetInsertionState()
+  }
+
+  let prevSuspense: SuspenseBoundary | null = null
+  let hasParentSuspense = false
+  try {
+    if (
+      __FEATURE_SUSPENSE__ &&
+      isSuspenseEnabled &&
+      currentInstance &&
+      currentInstance.suspense
+    ) {
+      prevSuspense = setParentSuspense(currentInstance.suspense)
+      hasParentSuspense = true
+    }
+
+    if (
+      (isSingleRoot ||
+        // transition has attrs fallthrough
+        (isTransitionEnabled
+          ? currentInstance && isVaporTransition(currentInstance!.type)
+          : false)) &&
+      component.inheritAttrs !== false &&
+      isVaporComponent(currentInstance) &&
+      currentInstance.hasFallthrough
+    ) {
+      // check if we are the single root of the parent
+      // if yes, inject parent attrs as dynamic props source
+      const attrs = currentInstance.attrs
+      if (rawProps && rawProps !== EMPTY_OBJ) {
+        ;((rawProps as RawProps).$ || ((rawProps as RawProps).$ = [])).push(
+          () => attrs,
+        )
+      } else {
+        rawProps = { $: [() => attrs] } as RawProps
+      }
+    }
+
+    let keepAliveCtx: VaporKeepAliveContext | null = null
+    // keep-alive
+    if (
+      isKeepAliveEnabled &&
+      currentInstance &&
+      currentInstance.vapor &&
+      isKeepAlive(currentInstance)
+    ) {
+      const ctx = (currentInstance as KeepAliveInstance).ctx
+      keepAliveCtx = ctx
+      const cached = ctx.getCachedComponent(component)
+      // @ts-expect-error
+      if (cached) return cached
+    }
+
+    // vdom interop enabled and component is not an explicit vapor component
+    if (isInteropEnabled && appContext.vdom && !component.__vapor) {
+      const frag = appContext.vdom.mount(
+        component as any,
+        currentInstance as any,
+        rawProps,
+        normalizeRawSlots(rawSlots),
+        once,
+      )
+      if (!isHydrating) {
+        if (_insertionParent) {
+          insert(frag, _insertionParent, _insertionAnchor, parentSuspense)
+        }
+      } else {
+        frag.hydrate()
+      }
+      return frag
+    }
+
+    // teleport
+    if (isTeleportEnabled && isVaporTeleport(component)) {
+      // the teleport's main-view end anchor adopts the template `<!>`
+      // placeholder when anchored via insertion state
+      const frag = component.process(
+        rawProps!,
+        normalizeRawSlots(rawSlots),
+        _insertionAnchor,
+      )
+      if (_insertionParent) {
+        // Teleports mounted via insertion state are not part of the returned
+        // block tree, so scope disposal must tear down their target-side state.
+        onScopeDispose(() => frag.disposeTarget(), true)
+      } else {
+        // Give normal block removal (and Transition leave preparation) the
+        // current stack before falling back to target-side cleanup.
+        onScopeDispose(() => frag.scheduleTargetDispose(), true)
+      }
+      if (!isHydrating) {
+        if (_insertionParent) {
+          insert(frag, _insertionParent, _insertionAnchor, parentSuspense)
+        }
+      } else {
+        frag.hydrate()
+      }
+
+      return frag as any
+    }
+
+    if (keepAliveCtx) {
+      // The cached component keeps its detached scope active, so commit only
+      // its direct inputs through the KeepAlive branch scope. Descendants read
+      // from the same committed inputs and need no additional isolation.
+      // v-once snapshots raw props in the instance constructor, so it does not
+      // need a live commit effect after creation.
+      if (rawProps && !once) {
+        rawProps = keepAliveCtx.isolatePropSources(rawProps as RawProps)
+      }
+
+      // Static slots are fixed function entries. Only `$` contains live slot
+      // descriptor sources that useSlots() can re-resolve while cached; slot
+      // function execution retains its existing closure semantics.
+      if (rawSlots && (rawSlots as RawSlots).$) {
+        rawSlots = keepAliveCtx.isolateSlotSources(rawSlots as RawSlots)
+      }
+    }
+
+    const instance = new VaporComponentInstance(
+      component,
+      rawProps as RawProps,
+      rawSlots,
+      appContext,
+      once,
+      ce,
+    )
+
+    // Async wrappers are skipped here: their DynamicFragment resolves the outer
+    // KeepAlive context from the wrapper's parent chain during setup.
+    if (isKeepAliveEnabled && !isAsyncWrapper(instance)) {
+      keepAliveCtx ||= getKeepAliveContext(currentInstance)
+      if (keepAliveCtx) keepAliveCtx.processShapeFlag(instance)
+    }
+
+    // reset currentSlotOwner to null to avoid affecting the child components
+    const prevSlotOwner = setCurrentSlotOwner(null)
+    let hasWarningContext = false
+    let hasInitMeasure = false
+    try {
+      // HMR
+      if (__DEV__) {
+        registerHMR(instance)
+        instance.isSingleRoot = isSingleRoot
+        instance.hmrRerender = hmrRerender.bind(null, instance)
+        instance.hmrReload = hmrReload.bind(null, instance)
+
+        pushWarningContext(instance)
+        hasWarningContext = true
+        startMeasure(instance, `init`)
+        hasInitMeasure = true
+
+        // cache normalized options for dev only emit check
+        instance.propsOptions = normalizePropsOptions(component)
+        instance.emitsOptions = normalizeEmitsOptions(component)
+      }
+
+      // hydrating async component
+      if (
+        isHydrating &&
+        isAsyncWrapper(instance) &&
+        component.__asyncHydrate &&
+        !component.__asyncResolved
+      ) {
+        const setup = () => setupComponent(instance, component)
+        component.__asyncHydrate(
+          currentHydrationNode as Element,
+          instance,
+          // Async hydration re-enters setup later, so preserve the component
+          // boundary rule above when the delayed setup actually runs.
+          wasInOnceSlot ? () => withOnceSlot(setup, false) : setup,
+        )
+      } else {
+        if (wasInOnceSlot) {
+          withOnceSlot(() => setupComponent(instance, component), false)
+        } else {
+          setupComponent(instance, component)
+        }
+
+        if (
+          isHydrating &&
+          __FEATURE_SUSPENSE__ &&
+          isSuspenseEnabled &&
+          instance.suspense &&
+          instance.asyncDep
+        ) {
+          // Async setup cannot create `block` yet. Capture the adopted SSR
+          // range for pending move/removal before hydration advances past it.
+          const pendingBlock: Node[] = []
+          let node = hydrationCursor!.start!
+          const hydrationNext = nextLogicalSibling(node)
+          do {
+            pendingBlock.push(node)
+            node = node.nextSibling!
+          } while (node !== hydrationNext)
+          instance.pendingBlock =
+            pendingBlock.length === 1 ? pendingBlock[0] : pendingBlock
+          advanceHydrationNode(pendingBlock[pendingBlock.length - 1])
+        }
+      }
+    } finally {
+      if (__DEV__) {
+        if (hasWarningContext) {
+          popWarningContext()
+        }
+        if (hasInitMeasure) {
+          endMeasure(instance, 'init')
+        }
+      }
+      setCurrentSlotOwner(prevSlotOwner)
+      if (__FEATURE_SUSPENSE__ && isSuspenseEnabled && hasParentSuspense) {
+        setParentSuspense(prevSuspense)
+        hasParentSuspense = false
+      }
+    }
+    onScopeDispose(
+      () =>
+        __FEATURE_SUSPENSE__ &&
+        isInteropEnabled &&
+        currentUnmountSuspense !== undefined
+          ? unmountComponent(instance, undefined, currentUnmountSuspense)
+          : unmountComponent(instance),
+      true,
+    )
+
+    if (!managedMount && (_insertionParent || isHydrating)) {
+      mountComponent(instance, _insertionParent!, _insertionAnchor)
+    }
+
+    if (
+      __FEATURE_SUSPENSE__ &&
+      isSuspenseEnabled &&
+      isHydrating &&
+      hydrationClose &&
+      instance.suspense &&
+      instance.asyncDep &&
+      !instance.asyncResolved &&
+      instance.restoreAsyncContext
+    ) {
+      deferHydrationBoundary = true
+      instance.deferredHydrationBoundary = () => {
+        if (
+          instance.block &&
+          hydrationClose &&
+          findBlockBoundary(instance.block).nextNode ===
+            hydrationClose.nextSibling
+        ) {
+          setCurrentHydrationNode(hydrationClose)
+        }
+        finalizeHydrationBoundary()
+      }
+      exitHydrationCursor(hydrationCursor)
+    }
+
+    return instance
+  } finally {
+    if (hasParentSuspense) {
+      setParentSuspense(prevSuspense)
+    }
+    if (isHydrating && !deferHydrationBoundary) {
+      // Boundary cleanup still needs the component-local cursor. Only after
+      // that do we restore the outer cursor's resume point.
+      finalizeHydrationBoundary()
+      exitHydrationCursor(hydrationCursor)
+    }
+  }
+}
+
+export function setupComponent(
+  instance: VaporComponentInstance,
+  component: VaporComponent,
+): void {
+  const prevInstance = setCurrentInstance(instance)
+  const prevSub = setActiveSub()
+
+  if (__DEV__) {
+    setupPropsValidation(instance)
+  }
+
+  const setupFn = isFunction(component) ? component : component.setup
+  const setupResult = setupFn
+    ? callWithErrorHandling(setupFn, instance, ErrorCodes.SETUP_FUNCTION, [
+        instance.props,
+        instance,
+      ]) || EMPTY_OBJ
+    : EMPTY_OBJ
+
+  const isAsyncSetup = isPromise(setupResult)
+
+  if ((isAsyncSetup || instance.sp) && !isAsyncWrapper(instance)) {
+    // async setup / serverPrefetch, mark as async boundary for useId()
+    markAsyncBoundary(instance)
+  }
+
+  if (isAsyncSetup) {
+    if (__FEATURE_SUSPENSE__) {
+      // async setup returned Promise.
+      // bail here and wait for re-entry.
+      instance.asyncDep = setupResult
+      if (__DEV__ && !instance.suspense) {
+        const name = getComponentName(component) ?? 'Anonymous'
+        warn(
+          `Component <${name}>: setup function returned a promise, but no ` +
+            `<Suspense> boundary was found in the parent component tree. ` +
+            `A component with async setup() must be nested in a <Suspense> ` +
+            `in order to be rendered.`,
+        )
+      }
+    } else if (__DEV__) {
+      warn(
+        `setup() returned a Promise, but the version of Vue you are using ` +
+          `does not support it yet.`,
+      )
+    }
+  } else {
+    handleSetupResult(setupResult, component, instance)
+  }
+
+  setActiveSub(prevSub)
+  restoreCurrentInstance(prevInstance)
+}
+
+export let isApplyingFallthroughProps = false
+
+export function shouldUseFunctionalFallthrough(
+  component: VaporComponent,
+): boolean {
+  return (
+    isFunction(component) &&
+    !(isTransitionEnabled && isVaporTransition(component))
+  )
+}
+
+export function applyFallthroughProps(
+  el: Element,
+  attrs: Record<string, any>,
+): void {
+  isApplyingFallthroughProps = true
+  try {
+    setDynamicProps(el, [attrs])
+  } finally {
+    isApplyingFallthroughProps = false
+  }
+}
+
+/**
+ * dev only
+ */
+function createDevSetupStateProxy(
+  setupState: Record<string, any>,
+): Record<string, any> {
+  return new Proxy(setupState, {
+    get(target, key: string | symbol, receiver) {
+      if (
+        isString(key) &&
+        !key.startsWith('__v') &&
+        !hasOwn(toRaw(setupState), key)
+      ) {
+        warn(
+          `Property ${JSON.stringify(key)} was accessed during render ` +
+            `but is not defined on instance.`,
+        )
+      }
+
+      return Reflect.get(target, key, receiver)
+    },
+  })
+}
+
+function callRender(
+  render: NonNullable<VaporComponentOptions['render']>,
+  instance: VaporComponentInstance,
+  setupState: Record<string, any>,
+) {
+  return callWithErrorHandling(render, instance, ErrorCodes.RENDER_FUNCTION, [
+    setupState,
+    instance.props,
+    instance.emit,
+    instance.attrs,
+    instance.slots,
+  ])
+}
+
+/**
+ * dev only
+ */
+export function devRender(instance: VaporComponentInstance): void {
+  const prev = setCurrentRenderingInstance(
+    instance as unknown as ComponentInternalInstance,
+  )
+  try {
+    instance.block =
+      (instance.type.render
+        ? callRender(instance.type.render, instance, instance.setupState!)
+        : callWithErrorHandling(
+            isFunction(instance.type) ? instance.type : instance.type.setup!,
+            instance,
+            ErrorCodes.SETUP_FUNCTION,
+            [
+              instance.props,
+              {
+                slots: instance.slots,
+                attrs: instance.attrs,
+                emit: instance.emit,
+                expose: instance.expose,
+              },
+            ],
+          )) || []
+  } finally {
+    setCurrentRenderingInstance(prev)
+  }
+}
+
+export const emptyContext: GenericAppContext = {
+  app: null as any,
+  config: {},
+  provides: /*@__PURE__*/ Object.create(null),
+}
+
+export class VaporComponentInstance<
+  Props extends Record<string, any> = {},
+  Emits extends EmitsOptions = {},
+  Slots extends StaticSlots = StaticSlots,
+  Exposed extends Record<string, any> = Record<string, any>,
+  TypeBlock extends Block = Block,
+  TypeRefs extends Record<string, any> = Record<string, any>,
+> implements GenericComponentInstance {
+  vapor: true
+  uid: number
+  type: VaporComponent
+  root: GenericComponentInstance | null
+  parent: GenericComponentInstance | null
+  appContext: GenericAppContext
+
+  block: TypeBlock
+  // VDOM can identify adopted SSR DOM with a placeholder VNode. Vapor adopts
+  // raw nodes, so storing them in `block` would make logical consumers treat
+  // them as rendered output. Keep temporary hydration ownership separate.
+  pendingBlock?: Node | Node[]
+  scope: EffectScope
+
+  rawProps: RawProps
+  rawSlots: RawSlots
+
+  props: Readonly<Props>
+  attrs: Record<string, any>
+  propsDefaults: Record<string, any> | null
+
+  slots: Slots
+
+  scopeId?: string | null
+
+  // to hold vnode props / slots in vdom interop mode
+  rawPropsRef?: ShallowRef<any>
+  rawSlotsRef?: ShallowRef<any>
+
+  emit: EmitFn<Emits>
+  emitted: Record<string, boolean> | null
+
+  expose: (<T extends Record<string, any> = Exposed>(exposed: T) => void) &
+    // compatible with vdom components
+    string[]
+  exposed: Exposed | null
+  exposeProxy: Prettify<ShallowUnwrapRef<Exposed>> | null
+
+  // for useTemplateRef()
+  refs: TypeRefs
+  // for provide / inject
+  provides: Record<string, any>
+  // for useId
+  ids: [string, number, number]
+  // for suspense
+  suspense: SuspenseBoundary | null
+  suspenseId: number
+  asyncDep: Promise<any> | null
+  asyncResolved: boolean
+  asyncDepRegistered?: boolean
+  restoreAsyncContext?: () => void | (() => void)
+  deferredHydrationBoundary?: () => void
+
+  hasFallthrough: boolean
+
+  // for keep-alive
+  shapeFlag?: number
+  $key?: any
+  // Share deferred updates across async roots on the KeepAlive component-root
+  // chain so A(pending) -> B -> A renders only the final branch, matching VDOM.
+  deferredKeepAliveUpdates?: DeferredKeepAliveUpdates
+
+  // for v-once: caches props/attrs values to ensure they remain frozen
+  // even when the component re-renders due to local state changes
+  oncePropsCache?: Record<string | symbol, any>
+  isOnce: boolean
+
+  // lifecycle hooks
+  isMounted: boolean
+  isUnmounted: boolean
+  isDeactivated: boolean
+  isUpdating: boolean
+
+  bc?: LifecycleHook // LifecycleHooks.BEFORE_CREATE
+  c?: LifecycleHook // LifecycleHooks.CREATED
+  bm?: LifecycleHook // LifecycleHooks.BEFORE_MOUNT
+  m?: LifecycleHook // LifecycleHooks.MOUNTED
+  bu?: LifecycleHook // LifecycleHooks.BEFORE_UPDATE
+  u?: LifecycleHook // LifecycleHooks.UPDATED
+  um?: LifecycleHook // LifecycleHooks.BEFORE_UNMOUNT
+  bum?: LifecycleHook // LifecycleHooks.UNMOUNTED
+  da?: LifecycleHook // LifecycleHooks.DEACTIVATED
+  a?: LifecycleHook // LifecycleHooks.ACTIVATED
+  rtg?: LifecycleHook // LifecycleHooks.RENDER_TRACKED
+  rtc?: LifecycleHook // LifecycleHooks.RENDER_TRIGGERED
+  ec?: LifecycleHook // LifecycleHooks.ERROR_CAPTURED
+  sp?: LifecycleHook<() => Promise<unknown>> // LifecycleHooks.SERVER_PREFETCH
+
+  // renderEffect creation counter for scheduler ordering.
+  effectCount = 0
+
+  // dev only
+  setupState?: Block extends Exposed
+    ? Record<string, any>
+    : ShallowUnwrapRef<Exposed>
+  devtoolsRawSetupState?: any
+  hmrRerender?: () => void
+  hmrReload?: (newComp: VaporComponent) => void
+  propsOptions?: NormalizedPropsOptions
+  emitsOptions?: ObjectEmitsOptions | null
+  isSingleRoot?: boolean
+  // for HMR rerender
+  renderEffects?: RenderEffect[]
+
+  /**
+   * dev only flag to track whether $attrs was used during render.
+   * If $attrs was used during render then the warning for failed attrs
+   * fallthrough can be suppressed.
+   */
+  accessedAttrs: boolean = false
+
+  // type only
+  /**
+   * @deprecated only used for JSX to detect props types.
+   */
+  // @ts-expect-error
+  $props: Props
+
+  constructor(
+    comp: VaporComponent,
+    rawProps?: RawProps | null,
+    rawSlots?: LooseRawSlots | null,
+    appContext?: GenericAppContext,
+    once?: boolean,
+    ce?: (instance: VaporComponentInstance) => void,
+  ) {
+    this.vapor = true
+    this.uid = nextUid()
+    this.type = comp
+    this.parent = currentInstance
+
+    if (currentInstance) {
+      this.root = currentInstance.root
+      this.appContext = currentInstance.appContext
+      this.provides = currentInstance.provides
+      this.ids = currentInstance.ids
+    } else {
+      this.root = this
+      this.appContext = appContext || emptyContext
+      this.provides = Object.create(this.appContext.provides)
+      this.ids = ['', 0, 0]
+    }
+
+    this.block = null! // to be set
+    this.scope = new EffectScope(true)
+    this.isOnce = !!once
+
+    this.emit = emit.bind(null, this) as EmitFn<Emits>
+    this.expose = expose.bind(null, this) as any
+    this.refs = EMPTY_OBJ as TypeRefs
+    this.emitted = this.exposed = this.exposeProxy = this.propsDefaults = null
+
+    // suspense related
+    this.suspense = null
+    this.suspenseId = 0
+    if (__FEATURE_SUSPENSE__ && isSuspenseEnabled) {
+      this.suspense = parentSuspense
+      this.suspenseId = parentSuspense ? parentSuspense.pendingId : 0
+    }
+    this.asyncDep = null
+    this.asyncResolved = false
+
+    this.isMounted =
+      this.isUnmounted =
+      this.isUpdating =
+      this.isDeactivated =
+        false
+
+    // init props
+    // Snapshot raw parent inputs before creating proxies so delayed reads from
+    // v-once children cannot observe later parent updates.
+    this.rawProps =
+      this.isOnce && rawProps
+        ? snapshotRawProps(rawProps)
+        : rawProps || EMPTY_OBJ
+    this.hasFallthrough = hasFallthroughAttrs(comp, this.rawProps)
+    if (rawProps || comp.props) {
+      const [propsHandlers, attrsHandlers] = getPropsProxyHandlers(comp)
+      this.attrs = new Proxy(this, attrsHandlers)
+      this.props = (
+        comp.props
+          ? new Proxy(this, propsHandlers!)
+          : isFunction(comp)
+            ? this.attrs
+            : EMPTY_OBJ
+      ) as Props
+    } else {
+      this.props = this.attrs = EMPTY_OBJ as Props
+    }
+
+    // init slots
+    const normalizedRawSlots = normalizeRawSlots(rawSlots)
+    this.rawSlots = normalizedRawSlots || EMPTY_OBJ
+    this.slots = (
+      normalizedRawSlots
+        ? new Proxy(normalizedRawSlots, dynamicSlotsProxyHandlers)
+        : EMPTY_OBJ
+    ) as Slots
+
+    this.scopeId = getCurrentScopeId()
+
+    // apply custom element special handling
+    if (ce) {
+      ce(this)
+    }
+
+    if (__DEV__) {
+      // in dev, mark attrs accessed if optional props (attrs === props)
+      if (this.props === this.attrs) {
+        this.accessedAttrs = true
+      } else {
+        const attrs = this.attrs
+        const instance = this
+        this.attrs = new Proxy(attrs, {
+          get(target, key, receiver) {
+            instance.accessedAttrs = true
+            return Reflect.get(target, key, receiver)
+          },
+        })
+      }
+    }
+  }
+
+  /**
+   * Expose `getKeysFromRawProps` on the instance so it can be used in code
+   * paths where it's needed, e.g. `useModel`
+   */
+  rawKeys(): string[] {
+    return getKeysFromRawProps(this.rawProps)
+  }
+}
+
+export function isVaporComponent(
+  value: unknown,
+): value is VaporComponentInstance {
+  return value instanceof VaporComponentInstance
+}
+
+/**
+ * Resolve an asset component by name before passing it to the fallback helper;
+ * a string passed directly to `createComponentWithFallback` is plain element
+ * fallback, not a component name.
+ */
+export function createAssetComponent(
+  name: string,
+  rawProps?: LooseRawProps | null,
+  rawSlots?: LooseRawSlots | null,
+  isSingleRoot?: boolean,
+  once?: boolean,
+  maybeSelfReference?: boolean,
+  appContext?: GenericAppContext,
+): HTMLElement | VaporComponentInstance {
+  return createComponentWithFallback(
+    resolveComponent(name, maybeSelfReference) as VaporComponent | string,
+    rawProps,
+    rawSlots,
+    isSingleRoot,
+    once,
+    appContext,
+  )
+}
+
+/**
+ * Used when a component cannot be resolved at compile time
+ * and needs rely on runtime resolution - where it might fallback to a plain
+ * element if the resolution fails.
+ */
+export function createComponentWithFallback(
+  comp: VaporComponent | typeof NULL_DYNAMIC_COMPONENT | string,
+  rawProps?: LooseRawProps | null,
+  rawSlots?: LooseRawSlots | null,
+  isSingleRoot?: boolean,
+  once?: boolean,
+  appContext?: GenericAppContext,
+): HTMLElement | VaporComponentInstance {
+  if (comp === NULL_DYNAMIC_COMPONENT) {
+    if (isHydrating && currentHydrationNode) {
+      if (isReusableNullComponentAnchor(currentHydrationNode)) {
+        const node = currentHydrationNode
+        if (isComment(node, '')) {
+          advanceHydrationNode(node)
+        }
+        return node as any as HTMLElement
+      }
+
+      const nextAnchor = nextLogicalSibling(currentHydrationNode)
+      if (nextAnchor && isReusableNullComponentAnchor(nextAnchor)) {
+        // Keep the cursor on the stale SSR node before `nextAnchor` so the
+        // owning DynamicFragment can trim that range on hydrate exit and then
+        // advance past the reused null-branch anchor in one place.
+        return nextAnchor as any as HTMLElement
+      }
+    }
+    return (__DEV__
+      ? createComment('ndc')
+      : createTextNode('')) as any as HTMLElement
+  }
+
+  if (!isString(comp)) {
+    return createComponent(
+      comp,
+      rawProps,
+      rawSlots,
+      isSingleRoot,
+      once,
+      appContext,
+    )
+  }
+
+  return createPlainElement(comp, rawProps, rawSlots, isSingleRoot, once)
+}
+
+function isReusableNullComponentAnchor(node: Node): boolean {
+  return (
+    isComment(node, '') ||
+    isComment(node, 'dynamic-component') ||
+    isComment(node, 'async component') ||
+    isComment(node, 'keyed')
+  )
+}
+
+export function createPlainElement(
+  comp: string,
+  rawProps?: LooseRawProps | null,
+  rawSlots?: LooseRawSlots | null,
+  isSingleRoot?: boolean,
+  once?: boolean,
+): HTMLElement {
+  rawSlots = normalizeRawSlots(rawSlots)
+  const _insertionParent = insertionParent
+  const _insertionAnchor = insertionAnchor
+  let hydrationCursor: HydrationCursor | null = null
+  if (isHydrating) {
+    resolvePendingSlotContent()
+    hydrationCursor = enterHydrationCursor()
+  } else {
+    resetInsertionState()
+  }
+
+  const defaultSlot = rawSlots && getSlot(rawSlots as RawSlots, 'default')
+  const hasDynamicSlots = !!rawSlots && !!rawSlots.$
+  const adoptHydrationChildren = !!defaultSlot
+  const hydrationTemplate =
+    hasDynamicSlots && !defaultSlot ? `<${comp}><!></${comp}>` : `<${comp}/>`
+  const el = isHydrating
+    ? (adoptTemplate(
+        currentHydrationNode!,
+        hydrationTemplate,
+        adoptHydrationChildren,
+      ) as HTMLElement)
+    : createElement(comp)
+
+  // mark single root
+  ;(el as any).$root = isSingleRoot
+
+  if (!isHydrating) {
+    const scopeId = getCurrentScopeId()
+    if (scopeId) setScopeId(el, [scopeId])
+  }
+
+  if (rawProps) {
+    const setFn = () =>
+      setDynamicProps(el, [resolveDynamicProps(rawProps as RawProps)])
+    if (once) setFn()
+    else renderEffect(setFn)
+  }
+
+  if (rawSlots) {
+    let nextNode: Node | null = null
+    if (isHydrating) {
+      nextNode = nextLogicalSibling(el)
+      let child = el.firstChild
+      if (rawSlots.$ && !child) {
+        // SSR may omit default-slot nodes for dynamic native children.
+        // Seed a local anchor so the inner fragment can locate and reuse it.
+        child = el.appendChild(
+          markHydrationAnchor(__DEV__ ? createComment('') : createTextNode()),
+        )
+      }
+      setCurrentHydrationNode(child)
+    }
+    if (rawSlots.$) {
+      // Dynamic element children don't own an SSR slot-range anchor, so flag
+      // this as a native-children fragment. Hydration keys off `nativeChildren`
+      // (not the label) to inject/reuse its own anchor instead of trying to
+      // reuse SlotFragment-style anchors. The hydrating label stays empty so
+      // the runtime anchor renders as `<!---->`.
+      const frag = new DynamicFragment(
+        isHydrating ? '' : __DEV__ ? 'slot' : undefined,
+      )
+      frag.nativeChildren = true
+      renderEffect(() => frag.update(getSlot(rawSlots as RawSlots, 'default')))
+      if (!isHydrating) insert(frag, el)
+    } else {
+      const slot = getSlot(rawSlots as RawSlots, 'default')
+      if (slot) {
+        const block = slot()
+        if (!isHydrating) insert(block, el)
+      }
+    }
+    if (isHydrating) {
+      setCurrentHydrationNode(nextNode)
+    }
+  }
+
+  if (!isHydrating) {
+    if (_insertionParent) insert(el, _insertionParent, _insertionAnchor)
+  } else {
+    exitHydrationCursor(hydrationCursor)
+  }
+
+  return el
+}
+
+export function mountComponent(
+  instance: VaporComponentInstance,
+  parent: ParentNode,
+  anchor?: Node | null,
+): void {
+  if (
+    __FEATURE_SUSPENSE__ &&
+    isSuspenseEnabled &&
+    instance.suspense &&
+    instance.asyncDep &&
+    !instance.asyncResolved
+  ) {
+    // Moving a still-pending instance, such as a keyed reorder or KeepAlive
+    // re-entry, retries `mountComponent`. `insert` relocates its already-mounted
+    // DOM without registering the async dependency again.
+    if (instance.asyncDepRegistered) {
+      if (instance.pendingBlock) {
+        insert(instance.pendingBlock, parent, anchor)
+      } else if (instance.block) {
+        insert(instance.block, parent, anchor)
+      }
+      if (
+        isKeepAliveEnabled &&
+        instance.shapeFlag! & ShapeFlags.COMPONENT_KEPT_ALIVE
+      ) {
+        // A cached pending instance still needs its initial mount after setup
+        // resolves. Restore only its active state; KeepAlive activation requires
+        // a mounted block.
+        instance.isDeactivated = false
+      }
+      return
+    }
+
+    const suspense = instance.suspense
+    const deferred = isKeepAliveEnabled && deferKeepAliveRenderEffects(instance)
+    const hydrating = isHydrating
+    if (!hydrating) {
+      // Keep a placeholder in the DOM while async setup is pending so
+      // sibling insertion and moves use the component's current position.
+      instance.block = createComment('')
+      insert(instance.block, parent, anchor)
+    }
+
+    instance.asyncDepRegistered = true
+    const component = instance.type
+    let asyncSetupFinished = false
+    const finishAsyncSetup = (setupResult: any): void => {
+      if (asyncSetupFinished) return
+      asyncSetupFinished = true
+      instance.asyncResolved = true
+      // Restore hydrating mode for the final mount so stale-generation
+      // recovery does not fall back to fresh DOM insertion.
+      const reset =
+        instance.restoreAsyncContext && instance.restoreAsyncContext()
+      // handleSetupResult may invoke the render function, which creates
+      // render effects that must be owned by this instance and its scope.
+      const handleResult = () => {
+        const prevInstance = setCurrentInstance(instance)
+        const prevSub = setActiveSub()
+        try {
+          handleSetupResult(setupResult, component, instance)
+        } finally {
+          setActiveSub(prevSub)
+          restoreCurrentInstance(prevInstance)
+        }
+      }
+      try {
+        const pendingBlock = hydrating ? instance.pendingBlock! : instance.block
+        // Use the pending DOM's live boundary because it may have moved while
+        // setup was suspended.
+        const { parentNode, nextNode } = findBlockBoundary(pendingBlock)
+        if (hydrating) {
+          withDeferredHydrationBoundary(() => {
+            handleResult()
+            mountComponent(instance, parentNode as ParentNode, nextNode)
+            if (instance.deferredHydrationBoundary) {
+              instance.deferredHydrationBoundary()
+            }
+          })
+        } else {
+          handleResult()
+          mountComponent(instance, parentNode as ParentNode, nextNode)
+          remove(pendingBlock, parentNode as ParentNode)
+        }
+      } finally {
+        if (hydrating) {
+          instance.pendingBlock = undefined
+          instance.deferredHydrationBoundary = undefined
+        }
+        instance.restoreAsyncContext = undefined
+        if (reset) reset()
+      }
+    }
+
+    suspense.registerDep(instance, setupResult => {
+      if (deferred) {
+        if (deferred.pendingRoot === instance) {
+          deferred.pendingRoot = undefined
+        }
+        // Reserve one flush for the whole async root chain, gated on the
+        // nearest boundary like VDOM's deferred retry. If the boundary
+        // discards that generation, the marked flush moves to the ordinary
+        // post queue so the surviving Vapor owners cannot stay dirty forever.
+        if (!deferred.flushQueued) {
+          deferred.flushQueued = true
+          queuePostRenderEffect(deferred.flushJob, undefined, deferred.suspense)
+        }
+      }
+      finishAsyncSetup(setupResult)
+    })
+
+    if (deferred) {
+      const state = deferred
+      // Suspense skips the callback above for unmounted roots or stale
+      // generations. If the replacement generation is already gone, complete
+      // a surviving instance before replaying deferred owner updates. The
+      // normal callback runs first and makes this a no-op.
+      instance.asyncDep!.catch(NOOP).then(setupResult => {
+        if (asyncSetupFinished) return
+        // A foreign pending generation cannot own this surviving instance's
+        // mount hooks because discarding it would discard those hooks too.
+        if (
+          !instance.isUnmounted &&
+          !suspense.isUnmounted &&
+          !suspense.pendingBranch
+        ) {
+          finishAsyncSetup(setupResult)
+        }
+        if (!state.flushQueued && state.pendingRoot === instance) {
+          settleDeferredKeepAliveUpdates(state)
+        }
+      })
+    }
+    return
+  }
+
+  // A pending async component may be cached before its initial mount.
+  if (
+    isKeepAliveEnabled &&
+    instance.shapeFlag! & ShapeFlags.COMPONENT_KEPT_ALIVE &&
+    instance.isMounted
+  ) {
+    ;(instance.parent as KeepAliveInstance)!.ctx.activate(
+      instance,
+      parent,
+      anchor,
+    )
+    return
+  }
+
+  // custom element style injection
+  const { root, type } = instance as GenericComponentInstance
+  if (root && root.ce && (root.ce as VaporElement)._hasShadowRoot()) {
+    root.ce!._injectChildStyle(
+      type,
+      instance.parent ? instance.parent.type : undefined,
+    )
+  }
+
+  if (__DEV__) {
+    startMeasure(instance, `mount`)
+  }
+  if (instance.bm) invokeArrayFns(instance.bm)
+  if (!isHydrating) {
+    // pass the owning suspense so enter transitions are skipped while
+    // mounting into a pending suspense's hidden container (vdom parity);
+    // the enter runs when the resolved branch is moved into the real tree.
+    insert(instance.block, parent, anchor, instance.suspense)
+    setComponentScopeId(instance)
+  } else {
+    // Hydrated roots already have SSR scope attrs. Track dynamic roots so
+    // client-only branch switches keep inherited scope ids.
+    trackComponentScopeId(instance)
+  }
+  if (instance.m) {
+    queuePostRenderEffect(instance.m!, undefined, instance.suspense)
+  }
+  if (
+    isKeepAliveEnabled &&
+    instance.shapeFlag! & ShapeFlags.COMPONENT_SHOULD_KEEP_ALIVE &&
+    instance.a
+  ) {
+    queuePostRenderEffect(instance.a!, undefined, instance.suspense)
+  }
+  instance.isMounted = true
+  if (__DEV__) {
+    endMeasure(instance, `mount`)
+  }
+}
+
+export function unmountComponent(
+  instance: VaporComponentInstance,
+  parentNode?: ParentNode,
+  parentSuspense: SuspenseBoundary | null = instance.suspense,
+): void {
+  if (
+    __FEATURE_SUSPENSE__ &&
+    isSuspenseEnabled &&
+    isInteropEnabled &&
+    currentUnmountSuspense !== parentSuspense
+  ) {
+    unmountComponentWithParentSuspense(instance, parentNode, parentSuspense)
+    return
+  }
+
+  // Skip unmount for kept-alive components - deactivate if called from remove()
+  if (
+    isKeepAliveEnabled &&
+    instance.shapeFlag! & ShapeFlags.COMPONENT_SHOULD_KEEP_ALIVE &&
+    instance.parent &&
+    instance.parent.vapor &&
+    (instance.parent as KeepAliveInstance).ctx
+  ) {
+    if (parentNode) {
+      ;(instance.parent as KeepAliveInstance)!.ctx.deactivate(
+        instance,
+        parentSuspense,
+      )
+    }
+    return
+  }
+
+  const pendingAsyncSetup =
+    __FEATURE_SUSPENSE__ && !!instance.asyncDep && !instance.asyncResolved
+
+  if (
+    !instance.isUnmounted &&
+    (instance.isMounted ||
+      // An async setup component can be unmounted before it finishes mounting.
+      // It still needs normal unmount cleanup and must be marked unmounted so
+      // a later async resolution is ignored.
+      pendingAsyncSetup)
+  ) {
+    if (__DEV__) {
+      unregisterHMR(instance)
+    }
+    invalidateMount(instance.m)
+    invalidateMount(instance.a)
+    if (instance.bum) {
+      invokeArrayFns(instance.bum)
+    }
+
+    instance.scope.stop()
+
+    if (instance.um) {
+      queuePostRenderEffect(instance.um!, undefined, parentSuspense)
+    }
+    instance.isUnmounted = true
+  }
+
+  if (__FEATURE_SUSPENSE__ && isSuspenseEnabled && pendingAsyncSetup) {
+    if (instance.pendingBlock) {
+      // Without parentNode this is state-only teardown. Leave the DOM intact
+      // for its enclosing owner, and retain the descriptor in case a
+      // subsequent Vapor block removal needs it.
+      if (parentNode) {
+        const pendingBlock = instance.pendingBlock
+        const { parentNode: blockParent } = findBlockBoundary(pendingBlock)
+        if (blockParent) {
+          remove(pendingBlock, blockParent as ParentNode)
+        }
+        instance.pendingBlock = undefined
+      }
+    } else if (instance.block instanceof Comment) {
+      // CSR placeholders are component-owned, so always detach them from their
+      // live parent even when VDOM owns an enclosing removal.
+      const blockParent = instance.block.parentNode
+      if (blockParent) {
+        remove(instance.block, blockParent)
+      }
+    }
+  } else if (parentNode) {
+    if (instance.block) remove(instance.block, parentNode)
+  }
+  if (pendingAsyncSetup) {
+    instance.restoreAsyncContext = undefined
+    instance.deferredHydrationBoundary = undefined
+  }
+}
+
+function unmountComponentWithParentSuspense(
+  instance: VaporComponentInstance,
+  parentNode: ParentNode | undefined,
+  parentSuspense: SuspenseBoundary | null,
+): void {
+  const prev = setCurrentUnmountSuspense(parentSuspense)
+  try {
+    unmountComponent(instance, parentNode, parentSuspense)
+  } finally {
+    setCurrentUnmountSuspense(prev)
+  }
+}
+
+export function getExposed(
+  instance: GenericComponentInstance,
+): Record<string, any> | undefined {
+  if (instance.exposed) {
+    return (
+      instance.exposeProxy ||
+      (instance.exposeProxy = new Proxy(markRaw(instance.exposed), {
+        get: (target, key) => unref(target[key as any]),
+      }))
+    )
+  }
+}
+
+export function getRootElement(
+  block: Block,
+  onDynamicFragment?: (frag: DynamicFragment) => void,
+  recurse: boolean = true,
+): Element | undefined {
+  if (block instanceof Element) {
+    return block
+  }
+
+  if (recurse && isVaporComponent(block)) {
+    return getRootElement(block.block, onDynamicFragment, recurse)
+  }
+
+  if (isFragment(block) && !(isTeleportEnabled && isTeleportFragment(block))) {
+    if (isDynamicFragment(block) && onDynamicFragment) {
+      onDynamicFragment(block)
+    }
+    const { nodes } = block
+    if (nodes instanceof Element && (nodes as any).$root) {
+      return nodes
+    }
+    return getRootElement(nodes, onDynamicFragment, recurse)
+  }
+
+  // The root node contains comments. It is necessary to filter out
+  // the comment nodes and return a single root node.
+  // align with vdom behavior
+  if (isArray(block)) {
+    let singleRoot: Element | undefined
+    let hasComment = false
+    for (const b of block) {
+      if (b instanceof Comment) {
+        hasComment = true
+        continue
+      }
+      const thisRoot = getRootElement(b, onDynamicFragment, recurse)
+      // only return root if there is exactly one eligible root in the array
+      if (!thisRoot || singleRoot) {
+        return
+      }
+      singleRoot = thisRoot
+    }
+    return hasComment ? singleRoot : undefined
+  }
+}
+
+function handleSetupResult(
+  setupResult: any,
+  component: VaporComponent,
+  instance: VaporComponentInstance,
+) {
+  if (__DEV__) {
+    pushWarningContext(instance)
+  }
+
+  if (!isBlock(setupResult)) {
+    if (isFunction(component)) {
+      if (__DEV__) {
+        warn(`Functional vapor component must return a block directly.`)
+      }
+      instance.block = []
+    } else if (!component.render) {
+      if (__DEV__) {
+        warn(
+          `Vapor component setup() returned non-block value, and has no render function.`,
+        )
+      }
+      // setup either threw or returned a non-block value: fall back to an
+      // empty block so mount / unmount can proceed and the error can
+      // propagate to parent error boundaries
+      instance.block = []
+    } else {
+      if (__DEV__ || __FEATURE_PROD_DEVTOOLS__) {
+        instance.devtoolsRawSetupState = setupResult
+      }
+      if (__DEV__) {
+        instance.setupState = createDevSetupStateProxy(proxyRefs(setupResult))
+        devRender(instance)
+      } else {
+        // component has a render function but no setup function
+        // (typically components with only a template and no state)
+        instance.block =
+          callRender(component.render, instance, setupResult) || []
+      }
+    }
+  } else {
+    instance.block = setupResult as Block
+  }
+
+  // single root, inherit attrs
+  if (
+    instance.hasFallthrough &&
+    component.inheritAttrs !== false &&
+    Object.keys(instance.attrs).length
+  ) {
+    const getFallthroughAttrs = shouldUseFunctionalFallthrough(component)
+      ? () => getFunctionalFallthrough(instance.attrs)
+      : () => instance.attrs
+    // attach attrs to the root element, or to root dynamic fragments so they
+    // can be (re-)applied during each branch update
+    applyFallthroughAttrs(instance.block, instance, getFallthroughAttrs)
+  }
+
+  if (__DEV__) {
+    popWarningContext()
+  }
+}
+
+// Attach fallthrough attrs to the single root element. When the root is a
+// dynamic fragment (e.g. v-if), the attrs are (re-)applied on each branch
+// update via its insert hook. Slots and teleports warn instead of receiving
+// the attrs, consistent with VDOM behavior.
+function applyFallthroughAttrs(
+  block: Block,
+  instance: VaporComponentInstance,
+  getFallthroughAttrs: () => Record<string, any> | undefined,
+  scope?: EffectScope,
+): void {
+  let hasSlotFragment = false
+  let dynamicFragments: DynamicFragment[] | undefined
+  const root = getRootElement(
+    block,
+    frag => {
+      if (frag.__vf & SLOT) {
+        hasSlotFragment = true
+      } else {
+        ;(dynamicFragments ||= []).push(frag)
+      }
+    },
+    false,
+  )
+
+  const dynamicRoot = root ? undefined : getSingleDynamicRootChain(block)
+  const fragmentsToRegister = root
+    ? dynamicFragments
+    : dynamicRoot && dynamicRoot.fragments
+  if (fragmentsToRegister) {
+    for (const frag of fragmentsToRegister) {
+      // slot fragments warn instead of inheriting attrs, skip them
+      if (!(frag.__vf & SLOT)) {
+        // Nested dynamic fragments need their own fallthrough hook.
+        registerDynamicFragmentFallthroughAttrs(
+          frag,
+          instance,
+          getFallthroughAttrs,
+        )
+      }
+    }
+  }
+
+  if (root && !hasSlotFragment) {
+    const applyEffect = () =>
+      renderEffect(() => {
+        const attrs = getFallthroughAttrs()
+        if (attrs) applyFallthroughProps(root, attrs)
+      })
+    // ensure the render effect is cleaned up when the branch scope is stopped
+    scope ? scope.run(applyEffect) : applyEffect()
+  } else if (__DEV__) {
+    const accessedAttrs = instance.accessedAttrs
+    const fallthroughAttrs = getFallthroughAttrs()
+    if (
+      fallthroughAttrs &&
+      Object.keys(fallthroughAttrs).length &&
+      (hasSlotFragment ||
+        (dynamicRoot && dynamicRoot.hasNonSingleRoot) ||
+        (isTeleportEnabled && containsTeleportFragment(block)) ||
+        (!accessedAttrs &&
+          (block instanceof Text || (isArray(block) && block.length))))
+    ) {
+      warnExtraneousAttributes(instance.attrs)
+    }
+  }
+}
+
+interface DynamicRootChain {
+  fragments: DynamicFragment[]
+  hasNonSingleRoot: boolean
+}
+
+// Resolve the chain of dynamic fragments leading to a single root candidate.
+// Used when getRootElement finds no element root, so fallthrough attrs are
+// registered only for true single-root components rather than for any dynamic
+// fragment seen during traversal. Dynamic root branches that are currently
+// non-single-root still keep the outer fragment hook for future branch updates,
+// but report hasNonSingleRoot so the current render can warn.
+function getSingleDynamicRootChain(block: Block): DynamicRootChain | undefined {
+  if (isDynamicFragment(block)) {
+    const { nodes } = block
+    const nested = getSingleDynamicRootChain(nodes)
+    return {
+      fragments: nested ? [block, ...nested.fragments] : [block],
+      hasNonSingleRoot: nested
+        ? nested.hasNonSingleRoot
+        : isArray(nodes) && nodes.some(child => !(child instanceof Comment)),
+    }
+  }
+
+  if (isFragment(block) && !(isTeleportEnabled && isTeleportFragment(block))) {
+    return getSingleDynamicRootChain(block.nodes)
+  }
+
+  if (isArray(block)) {
+    let singleRoot: DynamicRootChain | undefined
+    let hasComment = false
+    for (const child of block) {
+      if (child instanceof Comment) {
+        hasComment = true
+        continue
+      }
+      const childRoot = getSingleDynamicRootChain(child)
+      if (!childRoot || singleRoot) {
+        return
+      }
+      singleRoot = childRoot
+    }
+    return hasComment ? singleRoot : undefined
+  }
+}
+
+function containsTeleportFragment(block: Block): boolean {
+  if (isTeleportFragment(block)) return true
+  if (isArray(block)) {
+    return block.some(
+      child => !(child instanceof Comment) && containsTeleportFragment(child),
+    )
+  }
+  return isFragment(block) && containsTeleportFragment(block.nodes)
+}
+
+function registerDynamicFragmentFallthroughAttrs(
+  frag: DynamicFragment,
+  instance: VaporComponentInstance,
+  getFallthroughAttrs: () => Record<string, any> | undefined,
+): void {
+  // avoid registering duplicate hooks
+  if (frag.hasFallthroughAttrs) return
+
+  frag.hasFallthroughAttrs = true
+  ;(frag.onBeforeInsert ||= []).push(nodes =>
+    applyFallthroughAttrs(nodes, instance, getFallthroughAttrs, frag.scope!),
+  )
+}
+
+export interface DeferredKeepAliveUpdates {
+  effects: SchedulerJob[]
+  owners: VaporComponentInstance[]
+  suspense: SuspenseBoundary
+  pendingId: number
+  pendingRoot?: VaporComponentInstance
+  flushQueued: boolean
+  flushJob: SchedulerJob
+}
+
+/**
+ * A deferred state stays live while its async root is pending or its flush is
+ * queued for the same Suspense generation. The flush is requeued if that
+ * generation is discarded, so `flushQueued` cannot strand buffered updates.
+ */
+export function isDeferredKeepAliveStateLive(
+  state: DeferredKeepAliveUpdates,
+): boolean {
+  const suspense = state.suspense
+  if (suspense.isUnmounted || state.pendingId !== suspense.pendingId) {
+    return false
+  }
+  if (state.flushQueued) return true
+  const root = state.pendingRoot
+  return !!root && !root.isUnmounted
+}
+
+export function settleDeferredKeepAliveUpdates(
+  state: DeferredKeepAliveUpdates,
+  currentJob?: SchedulerJob,
+): void {
+  const { effects, owners } = state
+  // Idempotent: a settle hook and a stale-detecting render effect may both
+  // settle the same state.
+  state.effects = []
+  state.owners = []
+  state.pendingRoot = undefined
+  for (let i = 0; i < owners.length; i++) {
+    if (owners[i].deferredKeepAliveUpdates === state) {
+      owners[i].deferredKeepAliveUpdates = undefined
+    }
+  }
+  // Replay buffered updates so owner effects captured before the state went
+  // stale are not lost. The detecting job joins the batch so the whole set
+  // runs in scheduler order - an outer removal must still precede a buffered
+  // inner update; stopped jobs no-op on their dirty check.
+  if (currentJob && !effects.includes(currentJob)) {
+    effects.push(currentJob)
+  }
+  if (effects.length > 1) {
+    effects.sort((a, b) => a.order! - b.order!)
+  }
+  for (let i = 0; i < effects.length; i++) {
+    const job = effects[i]
+    callWithErrorHandling(
+      job,
+      job.i,
+      job.i ? ErrorCodes.COMPONENT_UPDATE : ErrorCodes.SCHEDULER,
+    )
+  }
+}
+
+function deferKeepAliveRenderEffects(
+  instance: VaporComponentInstance,
+): DeferredKeepAliveUpdates | undefined {
+  const suspense = instance.suspense!
+  const owners: VaporComponentInstance[] = []
+  let keepAlive: VaporComponentInstance | undefined
+  if (isHydrating) {
+    // Ancestor blocks are not committed during hydration. Preserve the direct
+    // KeepAlive-owner path; wrapper roots cannot be proven here.
+    const owner = instance.parent
+    if (
+      owner &&
+      owner.vapor &&
+      isKeepAlive(owner) &&
+      owner.suspense === suspense
+    ) {
+      keepAlive = owner as VaporComponentInstance
+      owners.push(keepAlive)
+    }
+  } else {
+    let child: Block = instance
+    let owner = instance.parent
+    while (owner && owner.vapor && owner.suspense === suspense) {
+      const vaporOwner = owner as VaporComponentInstance
+      let root = vaporOwner.block
+      // Dynamic component and v-if roots use fragments in Vapor where VDOM
+      // exposes the active component directly as `subTree.component`.
+      while (isDynamicFragment(root) && !(root.__vf & SLOT)) {
+        root = root.nodes
+      }
+      if (root !== child) return
+
+      owners.push(vaporOwner)
+      if (isKeepAlive(owner)) {
+        // Use the outermost KeepAlive so nested async roots share one state,
+        // matching VDOM's component-root update.
+        keepAlive = vaporOwner
+      }
+
+      child = vaporOwner
+      owner = vaporOwner.parent
+    }
+  }
+
+  if (!keepAlive) return
+
+  let deferred = keepAlive.deferredKeepAliveUpdates
+  if (
+    !deferred ||
+    deferred.suspense !== suspense ||
+    deferred.pendingId !== instance.suspenseId
+  ) {
+    // Runs when the boundary resolves (or on the resolving tick when it
+    // has no pending branch), ahead of setup-created Suspense effects.
+    const flushJob: SchedulerJob = () => {
+      state.flushQueued = false
+      // A resolved root may synchronously mount another pending async root.
+      if (keepAlive.deferredKeepAliveUpdates !== state || state.pendingRoot) {
+        return
+      }
+      settleDeferredKeepAliveUpdates(state)
+    }
+    flushJob.flags = SchedulerJobFlags.REQUEUE_ON_SUSPENSE_DISCARD
+    const state: DeferredKeepAliveUpdates = {
+      effects: [],
+      owners: [],
+      suspense,
+      pendingId: instance.suspenseId,
+      pendingRoot: instance,
+      flushQueued: false,
+      flushJob,
+    }
+    // Owner effects settle a stale state before mounting a new root. Nested
+    // roots from an accepted continuation share this generation and reuse it.
+    deferred = state
+  } else {
+    deferred.pendingRoot = instance
+  }
+
+  for (let i = 0; i < owners.length; i++) {
+    const owner = owners[i]
+    if (owner.deferredKeepAliveUpdates !== deferred) {
+      owner.deferredKeepAliveUpdates = deferred
+      deferred.owners.push(owner)
+    }
+  }
+  return deferred
+}

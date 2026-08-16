@@ -1,0 +1,1211 @@
+import { ErrorCodes, NodeTypes } from '@vue/compiler-dom'
+import {
+  VaporDynamicComponentFlags,
+  VaporSlotFlags,
+  VaporVForFlags,
+} from '@vue/shared'
+import {
+  IRNodeTypes,
+  IRSlotType,
+  compile as compileVapor,
+  transformChildren,
+  transformComment,
+  transformElement,
+  transformSlotOutlet,
+  transformText,
+  transformVBind,
+  transformVFor,
+  transformVIf,
+  transformVOn,
+  transformVSlot,
+} from '../../src'
+import { makeCompile } from './_utils'
+
+const dynamicSlotRootFlag = `${VaporDynamicComponentFlags.SLOT_ROOT} /* SLOT_ROOT */`
+const slotNonStableFlag = `_: ${VaporSlotFlags.NON_STABLE} /* NON_STABLE */`
+const slotRootFlag = `${VaporSlotFlags.SLOT_ROOT} /* SLOT_ROOT */`
+const inheritedFallbackSlotRootFlag = `${VaporSlotFlags.SLOT_ROOT | VaporSlotFlags.INHERIT_FALLBACK} /* SLOT_ROOT, INHERIT_FALLBACK */`
+const sharedFallbackSlotRootFlag = `${VaporSlotFlags.SLOT_ROOT | VaporSlotFlags.SHARED_FALLBACK} /* SLOT_ROOT, SHARED_FALLBACK */`
+const keyedSlotRootCallRE =
+  /const (n\d+) = _createKeyedFragment\([\s\S]*?\n\s*}, true\)\n\s*return \1/
+
+const compileWithSlots = makeCompile({
+  nodeTransforms: [
+    transformText,
+    transformVIf,
+    transformVFor,
+    transformSlotOutlet,
+    transformElement,
+    transformVSlot,
+    transformComment,
+    transformChildren,
+  ],
+  directiveTransforms: {
+    bind: transformVBind,
+    on: transformVOn,
+  },
+})
+
+describe('compiler: transform slot', () => {
+  test('implicit default slot', () => {
+    const { ir, code } = compileWithSlots(`<Comp><div/></Comp>`)
+    expect(code).toMatchSnapshot()
+    expect(code).not.toContain(slotNonStableFlag)
+
+    expect([...ir.template.keys()]).toEqual(['<div>'])
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      id: 1,
+      tag: 'Comp',
+      props: [[]],
+      slots: [
+        {
+          slotType: IRSlotType.STATIC,
+          slots: {
+            default: {
+              type: IRNodeTypes.BLOCK,
+              dynamic: {
+                children: [{ template: 0 }],
+              },
+            },
+          },
+        },
+      ],
+    })
+    expect(ir.block.returns).toEqual([1])
+    expect(ir.block.dynamic).toMatchObject({
+      children: [{ id: 1 }],
+    })
+  })
+
+  test('default slot with v-if directive', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp><template # v-if="show"></template></Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+    expect(code).toContain(`$: [`)
+
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      id: 1,
+      tag: 'Comp',
+      props: [[]],
+      slots: [
+        {
+          slotType: IRSlotType.CONDITIONAL,
+        },
+      ],
+    })
+    expect(ir.block.returns).toEqual([1])
+    expect(ir.block.dynamic).toMatchObject({
+      children: [{ id: 1 }],
+    })
+    expect(code).contains(`name: "default",`)
+  })
+
+  test('default slot with v-for directive', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp><template # v-for="item in list">{{ item }}</template></Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+    expect(code).toContain(`$: [`)
+
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      id: 2,
+      tag: 'Comp',
+      props: [[]],
+      slots: [
+        {
+          slotType: IRSlotType.LOOP,
+          name: {
+            type: NodeTypes.SIMPLE_EXPRESSION,
+            content: 'default',
+            isStatic: true,
+          },
+          fn: { type: IRNodeTypes.BLOCK },
+          loop: {
+            source: { content: 'list' },
+            value: { content: 'item' },
+            index: undefined,
+          },
+        },
+      ],
+    })
+    expect(ir.block.returns).toEqual([2])
+    expect(ir.block.dynamic).toMatchObject({
+      children: [{ id: 2 }],
+    })
+    expect(code).contains(`name: "default",`)
+  })
+
+  test('on-component default slot', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp v-slot="{ foo }">{{ foo + bar }}</Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+
+    expect(code).contains(
+      `_createAssetComponent("Comp", null, (_slotProps0) =>`,
+    )
+    expect(code).contains(`_slotProps0.foo + _ctx.bar`)
+
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      tag: 'Comp',
+      props: [[]],
+      slots: [
+        {
+          slotType: IRSlotType.STATIC,
+          slots: {
+            default: {
+              type: IRNodeTypes.BLOCK,
+              props: {
+                type: NodeTypes.SIMPLE_EXPRESSION,
+                content: '{ foo }',
+                ast: {
+                  type: 'ArrowFunctionExpression',
+                  params: [{ type: 'ObjectPattern' }],
+                },
+              },
+            },
+          },
+        },
+      ],
+    })
+  })
+
+  test('on component named slot', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp v-slot:named="{ foo }">{{ foo + bar }}</Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+
+    expect(code).contains(`"named": (_slotProps0) =>`)
+    expect(code).contains(`_slotProps0.foo + _ctx.bar`)
+
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      tag: 'Comp',
+      slots: [
+        {
+          slotType: IRSlotType.STATIC,
+          slots: {
+            named: {
+              type: IRNodeTypes.BLOCK,
+              props: {
+                type: NodeTypes.SIMPLE_EXPRESSION,
+                content: '{ foo }',
+              },
+            },
+          },
+        },
+      ],
+    })
+  })
+
+  test('on component dynamically named slot', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp v-slot:[named]="{ foo }">{{ foo + bar }}</Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+
+    expect(code).contains(`fn: (_slotProps0) =>`)
+    expect(code).contains(`_slotProps0.foo + _ctx.bar`)
+
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      tag: 'Comp',
+      slots: [
+        {
+          name: {
+            type: NodeTypes.SIMPLE_EXPRESSION,
+            content: 'named',
+            isStatic: false,
+          },
+          fn: {
+            type: IRNodeTypes.BLOCK,
+            props: {
+              type: NodeTypes.SIMPLE_EXPRESSION,
+              content: '{ foo }',
+            },
+          },
+        },
+      ],
+    })
+  })
+
+  test('nested component should not inherit parent slots', () => {
+    const { code } = compileWithSlots(`
+      <Foo>
+        <template #header></template>
+        <Bar />
+      </Foo>
+    `)
+    expect(code).toMatchSnapshot()
+  })
+
+  test('slot prop alias uses original key', () => {
+    const { code } = compileWithSlots(
+      `<Comp><template #default="{ msg: msg1 }">{{ msg1 }}</template></Comp>`,
+    )
+
+    expect(code).toMatchSnapshot()
+    expect(code).contains(
+      `_createAssetComponent("Comp", null, (_slotProps0) =>`,
+    )
+    expect(code).contains(`_slotProps0.msg`)
+  })
+
+  test('slot prop nested destructuring', () => {
+    const { code } = compileWithSlots(
+      `<Comp><template #default="{ foo: { bar: baz } }">{{ baz }}</template></Comp>`,
+    )
+
+    expect(code).toMatchSnapshot()
+    expect(code).contains(
+      `_createAssetComponent("Comp", null, (_slotProps0) =>`,
+    )
+    expect(code).contains(`_slotProps0.foo.bar`)
+  })
+
+  test('slot prop computed key destructuring', () => {
+    const { code } = compileWithSlots(
+      `<Comp><template #default="{ [key]: val }">{{ val }}</template></Comp>`,
+    )
+
+    expect(code).toMatchSnapshot()
+    expect(code).contains(
+      `_createAssetComponent("Comp", null, (_slotProps0) =>`,
+    )
+    expect(code).contains(`_slotProps0[_ctx.key]`)
+  })
+
+  test('slot prop rest destructuring', () => {
+    const { code } = compileWithSlots(
+      `<Comp><template #default="{ foo, ...rest }">{{ rest.bar }}</template></Comp>`,
+    )
+
+    expect(code).toMatchSnapshot()
+    expect(code).contains(
+      `_createAssetComponent("Comp", null, (_slotProps0) =>`,
+    )
+    expect(code).contains(`_getRestElement(_slotProps0`)
+  })
+
+  test('slot prop array rest destructuring', () => {
+    const { code } = compileWithSlots(
+      `<Comp><template #default="{ arr: [first, ...rest] }">{{ rest[0] }}</template></Comp>`,
+    )
+
+    expect(code).toMatchSnapshot()
+    expect(code).contains(
+      `_createAssetComponent("Comp", null, (_slotProps0) =>`,
+    )
+    expect(code).contains(`_slotProps0.arr.slice(1)`)
+  })
+
+  test('slot prop default value', () => {
+    const { code } = compileWithSlots(
+      `<Comp><template #default="{ foo = 1 }">{{ foo }}</template></Comp>`,
+    )
+
+    expect(code).toMatchSnapshot()
+    expect(code).contains(
+      `_createAssetComponent("Comp", null, (_slotProps0) =>`,
+    )
+    expect(code).contains(`_getDefaultValue(_slotProps0.foo, () => (1))`)
+  })
+
+  test('slot prop nested default value', () => {
+    const { code } = compileWithSlots(
+      `<Comp><template #default="{ foo: [bar = 1], baz: { qux = 2 } }">{{ bar + qux }}</template></Comp>`,
+    )
+
+    expect(code).toMatchSnapshot()
+    expect(code).contains(
+      `_createAssetComponent("Comp", null, (_slotProps0) =>`,
+    )
+    expect(code).contains(`_getDefaultValue(_slotProps0.foo[0], () => (1))`)
+    expect(code).contains(`_getDefaultValue(_slotProps0.baz.qux, () => (2))`)
+  })
+
+  test('slot prop rest with computed keys preserved', () => {
+    const { code } = compileWithSlots(
+      `<Comp><template #default="{ foo, [key]: val, ...rest }">{{ foo + rest.other }}</template></Comp>`,
+    )
+
+    expect(code).toMatchSnapshot()
+    expect(code).contains(
+      `_createAssetComponent("Comp", null, (_slotProps0) =>`,
+    )
+    expect(code).contains(`_getRestElement(_slotProps0, ["foo", _ctx.key])`)
+  })
+
+  test('named slots w/ implicit default slot', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp>
+        <template #one>foo</template>bar<span/>
+      </Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+
+    expect([...ir.template.keys()]).toEqual(['foo', 'bar', '<span>'])
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      id: 4,
+      tag: 'Comp',
+      props: [[]],
+      slots: [
+        {
+          slotType: IRSlotType.STATIC,
+          slots: {
+            one: {
+              type: IRNodeTypes.BLOCK,
+              dynamic: {
+                children: [{ template: 0 }],
+              },
+            },
+            default: {
+              type: IRNodeTypes.BLOCK,
+              dynamic: {
+                children: [{}, { template: 1 }, { template: 2 }],
+              },
+            },
+          },
+        },
+      ],
+    })
+  })
+
+  test('nested slots scoping', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp>
+        <template #default="{ foo }">
+          <Inner v-slot="{ bar }">
+            {{ foo + bar + baz }}
+          </Inner>
+          {{ foo + bar + baz }}
+        </template>
+      </Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+
+    expect(code).contains(
+      `_createAssetComponent("Comp", null, (_slotProps0) =>`,
+    )
+    expect(code).contains(
+      `_createComponentWithFallback(_component_Inner, null, (_slotProps1) =>`,
+    )
+    expect(code).contains(`_slotProps0.foo + _slotProps1.bar + _ctx.baz`)
+    expect(code).contains(`_slotProps0.foo + _ctx.bar + _ctx.baz`)
+
+    const outerOp = ir.block.dynamic.children[0].operation
+    expect(outerOp).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      tag: 'Comp',
+      props: [[]],
+      slots: [
+        {
+          slotType: IRSlotType.STATIC,
+          slots: {
+            default: {
+              type: IRNodeTypes.BLOCK,
+              props: {
+                type: NodeTypes.SIMPLE_EXPRESSION,
+                content: '{ foo }',
+              },
+            },
+          },
+        },
+      ],
+    })
+    expect(
+      (outerOp as any).slots[0].slots.default.dynamic.children[0].operation,
+    ).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      tag: 'Inner',
+      slots: [
+        {
+          slotType: IRSlotType.STATIC,
+          slots: {
+            default: {
+              type: IRNodeTypes.BLOCK,
+              props: {
+                type: NodeTypes.SIMPLE_EXPRESSION,
+                content: '{ bar }',
+              },
+            },
+          },
+        },
+      ],
+    })
+  })
+
+  test('dynamic slots name', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp>
+        <template #[name]>foo</template>
+      </Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      tag: 'Comp',
+      slots: [
+        {
+          name: {
+            type: NodeTypes.SIMPLE_EXPRESSION,
+            content: 'name',
+            isStatic: false,
+          },
+          fn: { type: IRNodeTypes.BLOCK },
+        },
+      ],
+    })
+  })
+
+  test('dynamic slots name w/ v-for', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp>
+        <template v-for="item in list" #[item]="{ bar }">{{ bar }}</template>
+      </Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+
+    expect(code).contains(`fn: (_slotProps0) =>`)
+    expect(code).contains(`_setText(n0, _toDisplayString(_slotProps0.bar))`)
+
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      tag: 'Comp',
+      slots: [
+        {
+          name: {
+            type: NodeTypes.SIMPLE_EXPRESSION,
+            content: 'item',
+            isStatic: false,
+          },
+          fn: { type: IRNodeTypes.BLOCK },
+          loop: {
+            source: { content: 'list' },
+            value: { content: 'item' },
+            index: undefined,
+          },
+        },
+      ],
+    })
+  })
+
+  test('dynamic slots name w/ v-for and provide absent key', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp>
+        <template v-for="(,,index) in list" #[index]>foo</template>
+      </Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      tag: 'Comp',
+      slots: [
+        {
+          name: {
+            type: NodeTypes.SIMPLE_EXPRESSION,
+            content: 'index',
+            isStatic: false,
+          },
+          fn: { type: IRNodeTypes.BLOCK },
+          loop: {
+            source: { content: 'list' },
+            value: undefined,
+            index: {
+              type: NodeTypes.SIMPLE_EXPRESSION,
+            },
+          },
+        },
+      ],
+    })
+  })
+
+  test('dynamic slots name w/ v-if / v-else[-if]', () => {
+    const { ir, code } = compileWithSlots(
+      `<Comp>
+        <template v-if="condition" #condition>condition slot</template>
+        <template v-else-if="anotherCondition" #condition="{ foo, bar }">another condition</template>
+        <template v-else #condition>else condition</template>
+      </Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+
+    expect(code).contains(`fn: (_slotProps0) =>`)
+
+    expect(ir.block.dynamic.children[0].operation).toMatchObject({
+      type: IRNodeTypes.CREATE_COMPONENT_NODE,
+      tag: 'Comp',
+      slots: [
+        {
+          slotType: IRSlotType.CONDITIONAL,
+          condition: { content: 'condition' },
+          positive: {
+            slotType: IRSlotType.DYNAMIC,
+          },
+          negative: {
+            slotType: IRSlotType.CONDITIONAL,
+            condition: { content: 'anotherCondition' },
+            positive: {
+              slotType: IRSlotType.DYNAMIC,
+            },
+            negative: { slotType: IRSlotType.DYNAMIC },
+          },
+        },
+      ],
+    })
+  })
+
+  test('slot v-else missing adjacent v-if should report compiler error', () => {
+    const cases = [
+      `<Comp><template #foo v-else>foo</template></Comp>`,
+      `<Comp><template #foo v-else-if="ok">foo</template></Comp>`,
+    ]
+
+    for (const source of cases) {
+      const onError = vi.fn()
+      expect(() => compileWithSlots(source, { onError })).not.toThrow()
+      expect(onError).toHaveBeenCalledTimes(1)
+      expect(onError.mock.calls[0][0]).toMatchObject({
+        code: ErrorCodes.X_V_ELSE_NO_ADJACENT_IF,
+      })
+    }
+  })
+
+  test('slot + v-if / v-else[-if] should not cause error', () => {
+    const { code } = compileWithSlots(
+      `<div>
+        <slot name="foo"></slot>
+        <Foo v-if="true"></Foo>
+        <Bar v-else />
+      </div>`,
+    )
+    expect(code).toMatchSnapshot()
+  })
+
+  test('quote slot name', () => {
+    const { code } = compileWithSlots(
+      `<Comp><template #nav-bar-title-before></template></Comp>`,
+    )
+    expect(code).toMatchSnapshot()
+    expect(code).contains(`"nav-bar-title-before"`)
+  })
+
+  describe('slot fast path', () => {
+    test('comment-only default slot is non-stable', () => {
+      const { code } = compileWithSlots(
+        `<Comp><template #default><!--foo--></template></Comp>`,
+      )
+
+      expect(code).toContain(slotNonStableFlag)
+    })
+
+    test('component root is stable', () => {
+      const { code } = compileWithSlots(`<A><B/></A>`)
+
+      expect(code).toMatchSnapshot()
+      expect(code).not.toContain(slotNonStableFlag)
+    })
+
+    test('stable root sibling keeps slot content stable', () => {
+      const { code } = compileWithSlots(
+        `<Comp><span/><div v-if="show"/></Comp>`,
+      )
+
+      expect(code).not.toContain(slotNonStableFlag)
+      expect(code).not.toContain('SLOT_ROOT')
+    })
+
+    test('static component root sibling keeps slot content stable', () => {
+      const { code } = compileWithSlots(
+        `<Comp><Foo/><component :is="view"/></Comp>`,
+      )
+
+      expect(code).not.toContain(slotNonStableFlag)
+      expect(code).not.toContain(`null, null, ${dynamicSlotRootFlag})`)
+    })
+
+    test('root v-if slot content is non-stable', () => {
+      const { code } = compileWithSlots(`<Comp><span v-if="show"/></Comp>`)
+
+      expect(code).toMatchSnapshot()
+      expect(code).toContain(slotNonStableFlag)
+    })
+
+    test('root v-for slot content is non-stable', () => {
+      const { code } = compileWithSlots(
+        `<Comp><span v-for="item in list"/></Comp>`,
+      )
+
+      expect(code).toMatchSnapshot()
+      expect(code).toContain(slotNonStableFlag)
+    })
+
+    test('all dynamic root slot content is non-stable', () => {
+      const { code } = compileWithSlots(
+        `<Comp><div v-if="a"/><p v-if="b"/></Comp>`,
+      )
+
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toContain('SLOT_ROOT')
+    })
+
+    test('root v-for with root v-if slot content is non-stable', () => {
+      const { code } = compileWithSlots(
+        `<Comp><div v-for="item in list"/><p v-if="ok"/></Comp>`,
+      )
+
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toContain(
+        `, undefined, ${
+          VaporVForFlags.IS_SINGLE_NODE | VaporVForFlags.SLOT_ROOT
+        } /* IS_SINGLE_NODE, SLOT_ROOT */)`,
+      )
+      expect(code).toContain('SLOT_ROOT')
+    })
+
+    test('comment with dynamic root slot content is non-stable', () => {
+      const { code } = compileWithSlots(
+        `<Comp><!--foo--><div v-if="show"/></Comp>`,
+      )
+
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toContain('SLOT_ROOT')
+    })
+
+    test('runtime dynamic component root is non-stable', () => {
+      // Keep VDOM parity for <Comp><component :is="view" /></Comp>:
+      // fallback renders when view is null, unlike <Comp><Foo /></Comp> where
+      // the static component vnode is valid even if Foo renders empty output.
+      const { code } = compileWithSlots(`<Comp><component :is="view"/></Comp>`)
+
+      expect(code).toMatchSnapshot()
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toContain(`null, null, ${dynamicSlotRootFlag})`)
+    })
+
+    test('non-root v-if under stable template root is stable', () => {
+      const { code } = compileWithSlots(
+        `<Comp><div><span v-if="show"/></div></Comp>`,
+      )
+
+      expect(code).toMatchSnapshot()
+      expect(code).not.toContain(slotNonStableFlag)
+    })
+
+    test('ordinary slot outlet fallback does not track parent content', () => {
+      const { code } = compileWithSlots(`<slot><span v-if="show"/></slot>`)
+
+      expect(code).not.toContain('SLOT_ROOT')
+    })
+
+    test('forwarded root slot outlet fallback tracks root validity', () => {
+      const { code } = compileWithSlots(
+        `<Comp><slot><span v-if="show"/></slot></Comp>`,
+      )
+
+      expect(code).toMatchSnapshot()
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toContain('SLOT_ROOT')
+    })
+  })
+
+  describe('forwarded slots', () => {
+    test('<slot> tag only', () => {
+      const { code } = compileWithSlots(`<Comp><slot/></Comp>`)
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toContain(
+        `_createSlot("default", null, null, ${inheritedFallbackSlotRootFlag})`,
+      )
+      expect(code).toMatchSnapshot()
+    })
+
+    test('root slot outlet with stable sibling does not notify parent', () => {
+      const { code } = compileWithSlots(`<Comp><slot/><span/></Comp>`)
+
+      expect(code).not.toContain('SLOT_ROOT')
+      expect(code).not.toContain('INHERIT_FALLBACK')
+      expect(code).not.toContain(slotNonStableFlag)
+    })
+
+    test('multiple dynamic slot roots share the enclosing fallback decision', () => {
+      const { code } = compileWithSlots(
+        `<Comp><slot name="a"/><slot name="b"/></Comp>`,
+      )
+
+      expect(code.match(/SHARED_FALLBACK/g)).toHaveLength(2)
+      expect(code).toContain(sharedFallbackSlotRootFlag)
+    })
+
+    test('slot root shares fallback with a dynamic sibling', () => {
+      const { code } = compileWithSlots(`<Comp><slot/><span v-if="ok"/></Comp>`)
+
+      expect(code).toContain(sharedFallbackSlotRootFlag)
+    })
+
+    test('v-once slot root shares fallback without update tracking', () => {
+      const { code } = compileVapor(
+        `<Comp><slot v-once name="a"/><slot name="b"/></Comp>`,
+      )
+
+      expect(code.match(/SHARED_FALLBACK/g)).toHaveLength(2)
+      expect(code).toContain('ONCE, SHARED_FALLBACK')
+      expect(code).not.toContain('ONCE, SLOT_ROOT')
+    })
+
+    test('v-once unique slot root inherits fallback without update tracking', () => {
+      const { code } = compileVapor(`<Comp><slot v-once /></Comp>`)
+
+      expect(code).toContain('ONCE, INHERIT_FALLBACK')
+      expect(code).not.toContain('ONCE, SLOT_ROOT')
+    })
+
+    test.each([
+      [
+        'v-if branch',
+        `<Comp><template v-if="ok"><slot/><span/></template></Comp>`,
+      ],
+      [
+        'v-for item',
+        `<Comp><template v-for="item in items"><slot/><span/></template></Comp>`,
+      ],
+    ])(
+      'root slot outlet with stable sibling in %s does not notify parent',
+      (_, source) => {
+        const { code } = compileWithSlots(source)
+
+        expect(code).toContain('SLOT_ROOT')
+        expect(code).not.toContain(
+          `_createSlot("default", null, null, ${slotRootFlag})`,
+        )
+        expect(code).not.toContain('INHERIT_FALLBACK')
+      },
+    )
+
+    test('root slot outlet with stable sibling in forwarded fallback does not notify parent', () => {
+      const { code } = compileWithSlots(
+        `<Comp><slot><slot/><span/></slot></Comp>`,
+      )
+
+      expect(code).toMatch(/const n\d+ = _createSlot\(\)/)
+    })
+
+    test('root slot outlet with dynamic key tracks the keyed fragment and outlet', () => {
+      const { code } = compileVapor(`<Comp><slot :key="key" /></Comp>`, {
+        prefixIdentifiers: true,
+      })
+
+      expect(code).toContain(
+        `_createSlot("default", null, null, ${inheritedFallbackSlotRootFlag})`,
+      )
+      expect(code).toMatch(keyedSlotRootCallRE)
+    })
+
+    test('keyed slot block with stable sibling does not track slot boundary', () => {
+      const { code } = compileVapor(
+        `<Comp><template :key="key"><slot /><span /></template></Comp>`,
+        { prefixIdentifiers: true },
+      )
+
+      expect(code).toContain('_createKeyedFragment(')
+      expect(code).not.toContain('SLOT_ROOT')
+      expect(code).not.toMatch(keyedSlotRootCallRE)
+    })
+
+    test('<slot> tag w/ v-if', () => {
+      const { code } = compileWithSlots(`<Comp><slot v-if="ok"/></Comp>`)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('<slot> tag w/ v-for', () => {
+      const { code } = compileWithSlots(`<Comp><slot v-for="a in b"/></Comp>`)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('<slot> tag w/ template', () => {
+      const { code } = compileWithSlots(
+        `<Comp><template #default><slot/></template></Comp>`,
+      )
+      expect(code).toMatchSnapshot()
+    })
+
+    test('<slot w/ nested component>', () => {
+      const { code } = compileWithSlots(`<Comp><Comp><slot/></Comp></Comp>`)
+      expect(code).toMatchSnapshot()
+    })
+  })
+
+  describe('errors', () => {
+    test('error on extraneous children w/ named default slot', () => {
+      const onError = vi.fn()
+      const source = `<Comp><template #default>foo</template>bar</Comp>`
+      compileWithSlots(source, { onError })
+      const index = source.indexOf('bar')
+      expect(onError.mock.calls[0][0]).toMatchObject({
+        code: ErrorCodes.X_V_SLOT_EXTRANEOUS_DEFAULT_SLOT_CHILDREN,
+        loc: {
+          start: {
+            offset: index,
+            line: 1,
+            column: index + 1,
+          },
+          end: {
+            offset: index + 3,
+            line: 1,
+            column: index + 4,
+          },
+        },
+      })
+    })
+
+    test('ignore comments when checking extraneous default slot children', () => {
+      const onError = vi.fn()
+      const source = `<Comp><template #default>foo</template><!--  --></Comp>`
+      compileWithSlots(source, { onError })
+      expect(onError).not.toHaveBeenCalled()
+    })
+
+    test('comment-only children should still generate implicit default slot', () => {
+      const { ir, code } = compileWithSlots(`<Comp><!--foo--></Comp>`)
+
+      expect(code).toContain(`<!--foo-->`)
+      expect(code).toContain(slotNonStableFlag)
+      expect(ir.block.dynamic.children[0].operation).toMatchObject({
+        type: IRNodeTypes.CREATE_COMPONENT_NODE,
+        slots: [
+          {
+            slotType: IRSlotType.STATIC,
+            slots: {
+              default: {
+                type: IRNodeTypes.BLOCK,
+              },
+            },
+          },
+        ],
+      })
+    })
+
+    test('comments should be excluded from mixed implicit default slot content', () => {
+      const { code } = compileWithSlots(
+        `<Comp><template #one>foo</template><!--bar--><span/></Comp>`,
+      )
+
+      expect(code).not.toContain(`<!--bar-->`)
+    })
+
+    test('error on duplicated slot names', () => {
+      const onError = vi.fn()
+      const source = `<Comp><template #foo></template><template #foo></template></Comp>`
+      compileWithSlots(source, { onError })
+      const index = source.lastIndexOf('#foo')
+      expect(onError.mock.calls[0][0]).toMatchObject({
+        code: ErrorCodes.X_V_SLOT_DUPLICATE_SLOT_NAMES,
+        loc: {
+          start: {
+            offset: index,
+            line: 1,
+            column: index + 1,
+          },
+          end: {
+            offset: index + 4,
+            line: 1,
+            column: index + 5,
+          },
+        },
+      })
+    })
+
+    test('error on invalid mixed slot usage', () => {
+      const onError = vi.fn()
+      const source = `<Comp v-slot="foo"><template #foo></template></Comp>`
+      compileWithSlots(source, { onError })
+      const index = source.lastIndexOf('v-slot="foo"')
+      expect(onError.mock.calls[0][0]).toMatchObject({
+        code: ErrorCodes.X_V_SLOT_MIXED_SLOT_USAGE,
+        loc: {
+          start: {
+            offset: index,
+            line: 1,
+            column: index + 1,
+          },
+          end: {
+            offset: index + 12,
+            line: 1,
+            column: index + 13,
+          },
+        },
+      })
+    })
+
+    test('error on v-slot usage on plain elements', () => {
+      const onError = vi.fn()
+      const source = `<div v-slot/>`
+      compileWithSlots(source, { onError })
+      const index = source.indexOf('v-slot')
+      expect(onError.mock.calls[0][0]).toMatchObject({
+        code: ErrorCodes.X_V_SLOT_MISPLACED,
+        loc: {
+          start: {
+            offset: index,
+            line: 1,
+            column: index + 1,
+          },
+          end: {
+            offset: index + 6,
+            line: 1,
+            column: index + 7,
+          },
+        },
+      })
+    })
+  })
+
+  describe(`with whitespace: 'preserve'`, () => {
+    test('named default slot + implicit whitespace content', () => {
+      const source = `
+      <Comp>
+        <template #header> Header </template>
+        <template #default> Default </template>
+      </Comp>
+      `
+      const { code } = compileWithSlots(source, {
+        whitespace: 'preserve',
+      })
+
+      expect(
+        `Extraneous children found when component already has explicitly named default slot.`,
+      ).not.toHaveBeenWarned()
+      expect(code).toMatchSnapshot()
+    })
+
+    test('implicit default slot', () => {
+      const source = `
+      <Comp>
+        <template #header> Header </template>
+        <p/>
+      </Comp>
+      `
+      const { code } = compileWithSlots(source, {
+        whitespace: 'preserve',
+      })
+
+      expect(
+        `Extraneous children found when component already has explicitly named default slot.`,
+      ).not.toHaveBeenWarned()
+      expect(code).toMatchSnapshot()
+    })
+
+    test('should not generate whitespace only default slot', () => {
+      const source = `
+      <Comp>
+        <template #header> Header </template>
+        <template #footer> Footer </template>
+      </Comp>
+      `
+      const { code, ir } = compileWithSlots(source, {
+        whitespace: 'preserve',
+      })
+
+      const slots = (ir.block.dynamic.children[0].operation as any).slots[0]
+        .slots
+      // should be: header, footer (no default)
+      expect(Object.keys(slots).length).toBe(2)
+      expect(!!slots['default']).toBe(false)
+
+      expect(code).toMatchSnapshot()
+    })
+  })
+
+  describe('slot owner context', () => {
+    test('slot with only static elements is stable', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template #default>
+            <div>static content</div>
+          </template>
+        </Comp>
+      `)
+      expect(code).not.toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with component is stable', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template #default>
+            <ChildComp />
+          </template>
+        </Comp>
+      `)
+      expect(code).not.toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with slot outlet is non-stable', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template #default>
+            <slot />
+          </template>
+        </Comp>
+      `)
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('dynamic slot source with slot outlet keeps dynamic slot function', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template v-for="(_, name) in slots" #[name]>
+            <slot :name="name" />
+          </template>
+        </Comp>
+      `)
+      expect(code).toContain(`$: [
+      () => (_createForSlots`)
+      expect(code).toContain(`fn: () =>`)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with component inside v-if is non-stable', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template #default>
+            <div v-if="show">
+              <ChildComp />
+            </div>
+          </template>
+        </Comp>
+      `)
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with component inside v-for is non-stable', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template #default>
+            <div v-for="item in items">
+              <ChildComp />
+            </div>
+          </template>
+        </Comp>
+      `)
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with nested v-if containing component is non-stable', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template #default>
+            <div v-if="a">
+              <span v-if="b">
+                <ChildComp />
+              </span>
+            </div>
+          </template>
+        </Comp>
+      `)
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with only text interpolation is stable', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template #default>
+            {{ message }}
+          </template>
+        </Comp>
+      `)
+      expect(code).not.toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with v-if but no component is non-stable', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template #default>
+            <div v-if="show">content</div>
+            <span v-else>fallback</span>
+          </template>
+        </Comp>
+      `)
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with v-for but no component is non-stable', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template #default>
+            <div v-for="item in items">{{ item }}</div>
+          </template>
+        </Comp>
+      `)
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with dynamic root and stable sibling is stable', () => {
+      const { code } = compileWithSlots(`
+        <Comp>
+          <template #default>
+            <span v-for="item in items">{{ item }}</span>
+            <i>tail</i>
+          </template>
+        </Comp>
+      `)
+      expect(code).not.toContain(slotNonStableFlag)
+      expect(code).not.toContain(
+        `, undefined, ${
+          VaporVForFlags.IS_SINGLE_NODE | VaporVForFlags.SLOT_ROOT
+        } /* IS_SINGLE_NODE, SLOT_ROOT */)`,
+      )
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with custom element is stable', () => {
+      const { code } = compileWithSlots(
+        `
+        <Comp>
+          <template #default>
+            <my-element></my-element>
+          </template>
+        </Comp>
+      `,
+        {
+          isCustomElement: tag => tag.startsWith('my-'),
+        },
+      )
+      expect(code).not.toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+
+    test('slot with custom element inside v-if is non-stable', () => {
+      const { code } = compileWithSlots(
+        `
+        <Comp>
+          <template #default>
+            <div v-if="show">
+              <my-element></my-element>
+            </div>
+          </template>
+        </Comp>
+      `,
+        {
+          isCustomElement: tag => tag.startsWith('my-'),
+        },
+      )
+      expect(code).toContain(slotNonStableFlag)
+      expect(code).toMatchSnapshot()
+    })
+  })
+})

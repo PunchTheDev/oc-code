@@ -1,0 +1,393 @@
+diff --git a/changelog/2781.feature.rst b/changelog/2781.feature.rst
+new file mode 100644
+index 00000000000..d3a30efc20d
+--- /dev/null
++++ b/changelog/2781.feature.rst
+@@ -0,0 +1 @@
++When :confval:`strict_markers` is enabled, marker names used in :option:`-m` expressions are now validated against registered markers.
+diff --git a/doc/en/reference/reference.rst b/doc/en/reference/reference.rst
+index 2627824624e..362d5c917e2 100644
+--- a/doc/en/reference/reference.rst
++++ b/doc/en/reference/reference.rst
+@@ -2479,6 +2479,9 @@ passed multiple times. The expected format is ``name=value``. For example::
+ 
+     If set to ``true``, markers not registered in the ``markers`` section of the configuration file will raise errors.
+ 
++    This applies both to markers applied to tests (e.g. ``@pytest.mark.slow``) and to marker
++    names used in :option:`-m` expressions.
++
+     .. tab:: toml
+ 
+         .. code-block:: toml
+diff --git a/src/_pytest/config/__init__.py b/src/_pytest/config/__init__.py
+index c1a80ed163e..7a7573de050 100644
+--- a/src/_pytest/config/__init__.py
++++ b/src/_pytest/config/__init__.py
+@@ -36,6 +36,7 @@
+ from typing import final
+ from typing import IO
+ from typing import Literal
++from typing import NamedTuple
+ from typing import TextIO
+ from typing import TYPE_CHECKING
+ import warnings
+@@ -1044,6 +1045,17 @@ def __len__(self) -> int:
+         return len(self._config._inicfg)
+ 
+ 
++class RegisteredMarker(NamedTuple):
++    """A marker registered in the configuration."""
++
++    #: The marker name (e.g., ``skipif``).
++    name: str
++    #: The full marker signature (e.g., ``skipif(condition)``).
++    signature: str
++    #: The marker description.
++    description: str
++
++
+ @final
+ class Config:
+     """Access to configuration values, pluginmanager and plugin hooks.
+@@ -1788,6 +1800,18 @@ def getini(self, name: str) -> Any:
+         self._inicache[canonical_name] = val = self._getini(canonical_name)
+         return val
+ 
++    def _iter_registered_markers(self) -> Iterator[RegisteredMarker]:
++        """Iterate over all markers registered in the configuration."""
++        for line in self.getini("markers"):
++            # Example lines: "skipif(condition): skip the given test if..."
++            # or "hypothesis: tests which use Hypothesis", so to get the
++            # marker name we split on both `:` and `(`.
++            parts = line.split(":", 1)
++            signature = parts[0]
++            description = parts[1].strip() if len(parts) == 2 else ""
++            name = signature.split("(")[0].strip()
++            yield RegisteredMarker(name, signature, description)
++
+     # Meant for easy monkeypatching by legacypath plugin.
+     # Can be inlined back (with no cover removed) once legacypath is gone.
+     def _getini_unknown_type(self, name: str, type: str, value: object):
+diff --git a/src/_pytest/mark/__init__.py b/src/_pytest/mark/__init__.py
+index 5b6ae8aa83d..73354506df3 100644
+--- a/src/_pytest/mark/__init__.py
++++ b/src/_pytest/mark/__init__.py
+@@ -140,12 +140,9 @@ def pytest_cmdline_main(config: Config) -> int | ExitCode | None:
+     if config.option.markers:
+         config._do_configure()
+         tw = _pytest.config.create_terminal_writer(config)
+-        for line in config.getini("markers"):
+-            parts = line.split(":", 1)
+-            name = parts[0]
+-            rest = parts[1] if len(parts) == 2 else ""
+-            tw.write(f"@pytest.mark.{name}:", bold=True)
+-            tw.line(rest)
++        for marker in config._iter_registered_markers():
++            tw.write(f"@pytest.mark.{marker.signature}:", bold=True)
++            tw.line(f" {marker.description}" if marker.description else "")
+             tw.line()
+         config._ensure_unconfigure()
+         return 0
+@@ -264,6 +261,8 @@ def deselect_by_mark(items: list[Item], config: Config) -> None:
+         return
+ 
+     expr = _parse_expression(matchexpr, "Wrong expression passed to '-m'")
++    _validate_marker_names(expr, config)
++
+     remaining: list[Item] = []
+     deselected: list[Item] = []
+     for item in items:
+@@ -276,6 +275,28 @@ def deselect_by_mark(items: list[Item], config: Config) -> None:
+         items[:] = remaining
+ 
+ 
++def _validate_marker_names(expr: Expression, config: Config) -> None:
++    """Validate that all marker names in the expression are registered.
++
++    Only validates when strict_markers is enabled.
++    """
++    strict_markers = config.getini("strict_markers")
++    if strict_markers is None:
++        strict_markers = config.getini("strict")
++    if not strict_markers:
++        return
++
++    registered_markers = {m.name for m in config._iter_registered_markers()}
++
++    unknown_markers = expr.idents() - registered_markers
++    if unknown_markers:
++        unknown_str = ", ".join(sorted(unknown_markers))
++        raise UsageError(
++            f"Unknown marker(s) in '-m' expression: {unknown_str}. "
++            "Use 'pytest --markers' to see available markers."
++        )
++
++
+ def _parse_expression(expr: str, exc_message: str) -> Expression:
+     try:
+         return Expression.compile(expr)
+diff --git a/src/_pytest/mark/expression.py b/src/_pytest/mark/expression.py
+index 4b4a68d8a74..65a77620226 100644
+--- a/src/_pytest/mark/expression.py
++++ b/src/_pytest/mark/expression.py
+@@ -70,10 +70,11 @@ class Token:
+ 
+ 
+ class Scanner:
+-    __slots__ = ("current", "input", "tokens")
++    __slots__ = ("current", "idents", "input", "tokens")
+ 
+     def __init__(self, input: str) -> None:
+         self.input = input
++        self.idents: set[str] = set()
+         self.tokens = self.lex(input)
+         self.current = next(self.tokens)
+ 
+@@ -163,13 +164,13 @@ def reject(self, expected: Sequence[TokenType]) -> NoReturn:
+ IDENT_PREFIX = "$"
+ 
+ 
+-def expression(s: Scanner) -> ast.Expression:
++def expression(s: Scanner) -> tuple[ast.Expression, frozenset[str]]:
+     if s.accept(TokenType.EOF):
+         ret: ast.expr = ast.Constant(False)
+     else:
+         ret = expr(s)
+         s.accept(TokenType.EOF, reject=True)
+-    return ast.fix_missing_locations(ast.Expression(ret))
++    return ast.fix_missing_locations(ast.Expression(ret)), frozenset(s.idents)
+ 
+ 
+ def expr(s: Scanner) -> ast.expr:
+@@ -197,6 +198,7 @@ def not_expr(s: Scanner) -> ast.expr:
+         return ret
+     ident = s.accept(TokenType.IDENT)
+     if ident:
++        s.idents.add(ident.value)
+         name = ast.Name(IDENT_PREFIX + ident.value, ast.Load())
+         if s.accept(TokenType.LPAREN):
+             ret = ast.Call(func=name, args=[], keywords=all_kwargs(s))
+@@ -314,12 +316,16 @@ class Expression:
+     The expression can be evaluated against different matchers.
+     """
+ 
+-    __slots__ = ("_code", "input")
++    __slots__ = ("_code", "_idents", "input")
+ 
+-    def __init__(self, input: str, code: types.CodeType) -> None:
++    def __init__(
++        self, input: str, code: types.CodeType, idents: frozenset[str]
++    ) -> None:
+         #: The original input line, as a string.
+         self.input: Final = input
+         self._code: Final = code
++        #: All identifiers which appear in the expression.
++        self._idents: Final = idents
+ 
+     @classmethod
+     def compile(cls, input: str) -> Expression:
+@@ -329,13 +335,17 @@ def compile(cls, input: str) -> Expression:
+ 
+         :raises SyntaxError: If the expression is malformed.
+         """
+-        astexpr = expression(Scanner(input))
++        astexpr, idents = expression(Scanner(input))
+         code = compile(
+             astexpr,
+             filename="<pytest match expression>",
+             mode="eval",
+         )
+-        return Expression(input, code)
++        return Expression(input, code, idents)
++
++    def idents(self) -> frozenset[str]:
++        """Return the set of all identifiers which appear in the expression."""
++        return self._idents
+ 
+     def evaluate(self, matcher: ExpressionMatcher) -> bool:
+         """Evaluate the match expression.
+diff --git a/src/_pytest/mark/structures.py b/src/_pytest/mark/structures.py
+index 18057f0b0ff..635cf9d479e 100644
+--- a/src/_pytest/mark/structures.py
++++ b/src/_pytest/mark/structures.py
+@@ -604,12 +604,9 @@ def __getattr__(self, name: str) -> MarkDecorator:
+             # name is in the set we definitely know it, but a mark may be known and
+             # not in the set.  We therefore start by updating the set!
+             if name not in self._markers:
+-                for line in self._config.getini("markers"):
+-                    # example lines: "skipif(condition): skip the given test if..."
+-                    # or "hypothesis: tests which use Hypothesis", so to get the
+-                    # marker name we split on both `:` and `(`.
+-                    marker = line.split(":")[0].split("(")[0].strip()
+-                    self._markers.add(marker)
++                self._markers.update(
++                    m.name for m in self._config._iter_registered_markers()
++                )
+ 
+             # If the name is not in the set of known marks after updating,
+             # then it really is time to issue a warning or an error.
+diff --git a/testing/test_mark.py b/testing/test_mark.py
+index c70376e7015..2e105dfe40a 100644
+--- a/testing/test_mark.py
++++ b/testing/test_mark.py
+@@ -1,12 +1,19 @@
+ # mypy: allow-untyped-defs
+ from __future__ import annotations
+ 
++from collections.abc import Iterator
+ import os
+ import sys
++from typing import cast
+ from unittest import mock
+ 
++from _pytest.config import Config
+ from _pytest.config import ExitCode
++from _pytest.config import RegisteredMarker
++from _pytest.config import UsageError
++from _pytest.mark import _validate_marker_names
+ from _pytest.mark import MarkGenerator
++from _pytest.mark.expression import Expression
+ from _pytest.mark.structures import _EmptyParameterSetMark
+ from _pytest.mark.structures import EMPTY_PARAMETERSET_OPTION
+ from _pytest.nodes import Collector
+@@ -219,6 +226,114 @@ def test_hello():
+     )
+ 
+ 
++class TestValidateMarkerNames:
++    """Tests for _validate_marker_names (issue #2781)."""
++
++    class FakeConfig:
++        def __init__(
++            self,
++            markers: list[str],
++            strict_markers: bool | None = None,
++            strict: bool = False,
++        ) -> None:
++            self._ini: dict[str, list[str] | bool | None] = {
++                "markers": markers,
++                "strict_markers": strict_markers,
++                "strict": strict,
++            }
++
++        def getini(self, name: str) -> list[str] | bool | None:
++            return self._ini[name]
++
++        def _iter_registered_markers(self) -> Iterator[RegisteredMarker]:
++            yield from Config._iter_registered_markers(cast(Config, self))
++
++    def _make_config(
++        self,
++        strict_markers: bool | None = None,
++        strict: bool = False,
++    ) -> Config:
++        return cast(
++            Config,
++            self.FakeConfig(
++                markers=["registered: a registered marker"],
++                strict_markers=strict_markers,
++                strict=strict,
++            ),
++        )
++
++    def test_unknown_marker_with_strict_markers(self) -> None:
++        expr = Expression.compile("unknown_marker")
++
++        with pytest.raises(UsageError, match=r"Unknown marker.*unknown_marker"):
++            _validate_marker_names(expr, self._make_config(strict_markers=True))
++
++    def test_unknown_marker_with_strict(self) -> None:
++        expr = Expression.compile("unknown_marker")
++
++        with pytest.raises(UsageError, match=r"Unknown marker.*unknown_marker"):
++            _validate_marker_names(expr, self._make_config(strict=True))
++
++    def test_registered_marker_passes(self) -> None:
++        expr = Expression.compile("registered")
++
++        _validate_marker_names(expr, self._make_config(strict_markers=True))
++
++    def test_no_validation_without_strict(self) -> None:
++        expr = Expression.compile("any_marker")
++
++        _validate_marker_names(expr, self._make_config())
++
++
++@pytest.fixture
++def markexpr_pytester(pytester: Pytester) -> Pytester:
++    pytester.makeini(
++        """
++        [pytest]
++        markers =
++            registered: a registered marker
++        """
++    )
++    pytester.makepyfile(
++        """
++        import pytest
++
++        @pytest.mark.registered
++        def test_registered():
++            pass
++
++        def test_plain():
++            pass
++        """
++    )
++    return pytester
++
++
++@pytest.mark.parametrize("option", ["--strict-markers", "--strict"])
++def test_strict_prohibits_unregistered_markers_in_markexpr(
++    markexpr_pytester: Pytester, option: str
++) -> None:
++    result = markexpr_pytester.runpytest(option, "-m", "registered or unregisteredmark")
++    assert result.ret == ExitCode.USAGE_ERROR
++    result.stderr.fnmatch_lines(
++        ["*Unknown marker(s) in '-m' expression: unregisteredmark*"]
++    )
++
++
++def test_strict_allows_registered_markers_in_markexpr(
++    markexpr_pytester: Pytester,
++) -> None:
++    result = markexpr_pytester.runpytest("--strict-markers", "-m", "registered")
++    result.assert_outcomes(passed=1, deselected=1)
++
++
++def test_unregistered_markers_in_markexpr_allowed_without_strict(
++    markexpr_pytester: Pytester,
++) -> None:
++    result = markexpr_pytester.runpytest("-m", "unregisteredmark")
++    result.assert_outcomes(deselected=2)
++
++
+ @pytest.mark.parametrize(
+     ("expr", "expected_passed"),
+     [
+diff --git a/testing/test_mark_expression.py b/testing/test_mark_expression.py
+index 3a606bac17c..ac9c882e61e 100644
+--- a/testing/test_mark_expression.py
++++ b/testing/test_mark_expression.py
+@@ -336,3 +336,21 @@ def test_str_keyword_expressions(
+     expr: str, expected: bool, mark_matcher: MarkMatcher
+ ) -> None:
+     assert evaluate(expr, mark_matcher) is expected
++
++
++@pytest.mark.parametrize(
++    ("expr", "expected_idents"),
++    (
++        ("", frozenset()),
++        ("foo", frozenset(["foo"])),
++        ("foo and bar", frozenset(["foo", "bar"])),
++        ("foo or bar", frozenset(["foo", "bar"])),
++        ("not foo", frozenset(["foo"])),
++        ("(foo and bar) or baz", frozenset(["foo", "bar", "baz"])),
++        ("foo and foo", frozenset(["foo"])),  # Duplicates are deduplicated.
++        ("mark(a=1)", frozenset(["mark"])),  # Only marker name, not kwargs.
++    ),
++)
++def test_expression_idents(expr: str, expected_idents: frozenset[str]) -> None:
++    """Test that Expression.idents() returns the identifiers in the expression."""
++    assert Expression.compile(expr).idents() == expected_idents
