@@ -1,0 +1,261 @@
+diff --git a/.changeset/resolve-suspense-setquerydata.md b/.changeset/resolve-suspense-setquerydata.md
+new file mode 100644
+index 00000000000..6cf4f2334d7
+--- /dev/null
++++ b/.changeset/resolve-suspense-setquerydata.md
+@@ -0,0 +1,5 @@
++---
++"@tanstack/query-core": patch
++---
++
++Resolve suspense when query data is set programmatically via setQueryData or streamedQuery. Previously, fetchOptimistic returned only the fetch promise, which left the Suspense boundary stuck until the queryFn completed — even when data already existed in the cache. The fix uses Promise.race with a cache subscriber to release suspense as soon as data becomes available.
+diff --git a/packages/query-core/src/__tests__/queryObserver.test.tsx b/packages/query-core/src/__tests__/queryObserver.test.tsx
+index 557ef79614d..fc10b3ea7fa 100644
+--- a/packages/query-core/src/__tests__/queryObserver.test.tsx
++++ b/packages/query-core/src/__tests__/queryObserver.test.tsx
+@@ -1519,6 +1519,41 @@ describe('queryObserver', () => {
+     expect(result.data).toBe('data')
+   })
+ 
++  it('should resolve fetchOptimistic with cached data while the fetch continues', async () => {
++    const key = queryKey()
++
++    const queryFn = () => sleep(100).then(() => 'fetched')
++
++    const observer = new QueryObserver(queryClient, {
++      queryKey: key,
++      queryFn,
++    })
++
++    const promise = observer.fetchOptimistic({
++      queryKey: key,
++      queryFn,
++    })
++
++    await vi.advanceTimersByTimeAsync(10)
++
++    queryClient.setQueryData(key, 'cached')
++
++    const result = await promise
++
++    expect(result).toMatchObject({
++      data: 'cached',
++      status: 'success',
++      fetchStatus: 'fetching',
++    })
++
++    expect(queryClient.getQueryState(key)?.fetchStatus).toBe('fetching')
++
++    await vi.advanceTimersByTimeAsync(100)
++
++    expect(queryClient.getQueryData(key)).toBe('fetched')
++    expect(queryClient.getQueryState(key)?.fetchStatus).toBe('idle')
++  })
++
+   it('should track error prop when throwOnError is true', async () => {
+     const key = queryKey()
+     const results: Array<QueryObserverResult> = []
+diff --git a/packages/query-core/src/queryObserver.ts b/packages/query-core/src/queryObserver.ts
+index 954c969d548..c34409b2934 100644
+--- a/packages/query-core/src/queryObserver.ts
++++ b/packages/query-core/src/queryObserver.ts
+@@ -317,7 +317,42 @@ export class QueryObserver<
+       .getQueryCache()
+       .build(this.#client, defaultedOptions)
+ 
+-    return query.fetch().then(() => this.createResult(query, defaultedOptions))
++    let unsubscribe = () => {}
++    let resolveEarly:
++      | ((result: QueryObserverResult<TData, TError>) => void)
++      | undefined
++
++    const cachePromise = new Promise<QueryObserverResult<TData, TError>>(
++      (resolve) => {
++        resolveEarly = resolve
++        unsubscribe = this.#client.getQueryCache().subscribe((event) => {
++          if (
++            event.type === 'updated' &&
++            event.query.queryHash === query.queryHash &&
++            query.state.data !== undefined
++          ) {
++            unsubscribe()
++            resolve(this.createResult(query, defaultedOptions))
++          }
++        })
++      },
++    )
++
++    return Promise.race([
++      query
++        .fetch()
++        .then(() => {
++          const result = this.createResult(query, defaultedOptions)
++          // Settle the subscriber promise so both branches always settle.
++          // This value is ignored by Promise.race since the fetch branch already won.
++          resolveEarly?.(result)
++          return result
++        })
++        .finally(() => {
++          unsubscribe()
++        }),
++      cachePromise,
++    ])
+   }
+ 
+   protected fetch(
+diff --git a/packages/react-query/src/__tests__/useSuspenseQuery.test.tsx b/packages/react-query/src/__tests__/useSuspenseQuery.test.tsx
+index 4a7df3a2a62..da3f47dc540 100644
+--- a/packages/react-query/src/__tests__/useSuspenseQuery.test.tsx
++++ b/packages/react-query/src/__tests__/useSuspenseQuery.test.tsx
+@@ -7,6 +7,7 @@ import {
+   QueryCache,
+   QueryClient,
+   QueryErrorResetBoundary,
++  experimental_streamedQuery,
+   skipToken,
+   useQueryErrorResetBoundary,
+   useSuspenseInfiniteQuery,
+@@ -997,4 +998,143 @@ describe('useSuspenseQuery', () => {
+     consoleErrorSpy.mockRestore()
+     process.env.NODE_ENV = envCopy
+   })
++
++  it('should release suspense when setQueryData is called while fetch is in-flight', async () => {
++    const key = queryKey()
++
++    function Content() {
++      const { data } = useSuspenseQuery({
++        queryKey: key,
++        queryFn: () => sleep(10000).then(() => 'fetched'),
++      })
++      return <div>data: {data}</div>
++    }
++
++    function Page() {
++      return (
++        <div>
++          <button onClick={() => queryClient.setQueryData(key, 'manual data')}>
++            set data
++          </button>
++          <React.Suspense fallback="loading">
++            <Content />
++          </React.Suspense>
++        </div>
++      )
++    }
++
++    const rendered = renderWithClient(queryClient, <Page />)
++
++    expect(rendered.getByText('loading')).toBeInTheDocument()
++
++    fireEvent.click(rendered.getByText('set data'))
++    await act(() => vi.advanceTimersByTimeAsync(0))
++
++    expect(rendered.getByText('data: manual data')).toBeInTheDocument()
++  })
++
++  it('should release suspense when streamedQuery receives first chunk', async () => {
++    const key = queryKey()
++
++    async function* numberGenerator() {
++      await sleep(10)
++      yield 'chunk1'
++      await sleep(10)
++      yield 'chunk2'
++    }
++
++    function Page() {
++      const { data } = useSuspenseQuery({
++        queryKey: key,
++        queryFn: experimental_streamedQuery({
++          streamFn: () => numberGenerator(),
++        }),
++      })
++      return <div>data: {data}</div>
++    }
++
++    const streamedClient = new QueryClient({
++      queryCache,
++      defaultOptions: {
++        queries: {
++          experimental_prefetchInRender: true,
++        },
++      },
++    })
++
++    const rendered = renderWithClient(
++      streamedClient,
++      <React.Suspense fallback="loading">
++        <Page />
++      </React.Suspense>,
++    )
++
++    expect(rendered.getByText('loading')).toBeInTheDocument()
++
++    await act(() => vi.advanceTimersByTimeAsync(10))
++
++    expect(rendered.getByText('data: chunk1')).toBeInTheDocument()
++  })
++
++  it('should release suspense when setQueryData is called before component mounts', async () => {
++    const key = queryKey()
++    queryClient.setQueryData(key, 'preloaded')
++
++    function Page() {
++      const { data } = useSuspenseQuery({
++        queryKey: key,
++        queryFn: () => sleep(10000).then(() => 'fetched'),
++      })
++      return <div>data: {data}</div>
++    }
++
++    const rendered = renderWithClient(
++      queryClient,
++      <React.Suspense fallback="loading">
++        <Page />
++      </React.Suspense>,
++    )
++
++    await act(() => vi.advanceTimersByTimeAsync(0))
++
++    expect(rendered.getByText('data: preloaded')).toBeInTheDocument()
++  })
++
++  it('should NOT release suspense when setQueryData is called with undefined', async () => {
++    const key = queryKey()
++
++    function Content() {
++      const { data } = useSuspenseQuery({
++        queryKey: key,
++        queryFn: () => sleep(10000).then(() => 'fetched'),
++      })
++      return <div>data: {data}</div>
++    }
++
++    function Page() {
++      return (
++        <div>
++          <button
++            onClick={() => queryClient.setQueryData(key, undefined as any)}
++          >
++            set undefined
++          </button>
++          <React.Suspense fallback="loading">
++            <Content />
++          </React.Suspense>
++        </div>
++      )
++    }
++
++    const rendered = renderWithClient(queryClient, <Page />)
++
++    expect(rendered.getByText('loading')).toBeInTheDocument()
++
++    fireEvent.click(rendered.getByText('set undefined'))
++    await act(() => vi.advanceTimersByTimeAsync(0))
++
++    // Suspense should NOT release — setQueryData(undefined) doesn't satisfy
++    // the query.state.data !== undefined guard in fetchOptimistic
++    expect(rendered.getByText('loading')).toBeInTheDocument()
++  })
+ })

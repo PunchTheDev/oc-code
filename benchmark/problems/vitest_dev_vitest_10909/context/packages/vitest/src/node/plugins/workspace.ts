@@ -1,0 +1,64 @@
+import type * as vite from 'vite'
+import type { UserConfig as ViteConfig, Plugin as VitePlugin } from 'vite'
+import type { PluginHarness } from '../config/pluginHarness'
+import type { ResolvedConfig, TestProjectInlineConfiguration } from '../types/config'
+import { API_TOKEN_FILE } from '../config/apiToken'
+import { ViteConfigPlugin } from './config'
+import { CoverageTransform } from './coverageTransform'
+import { CSSEnablerPlugin } from './cssEnabler'
+import { MetaEnvReplacerPlugin } from './metaEnvReplacer'
+import { MocksPlugins } from './mocks'
+import { NormalizeURLPlugin } from './normalizeURL'
+import { SsrRunnerFixerPlugin } from './ssrRunnerFixer'
+import { VitestProjectResolver } from './vitestResolver'
+
+interface WorkspaceOptions extends TestProjectInlineConfiguration {
+  root?: string
+}
+
+export function WorkspaceVitestPlugin(
+  harness: PluginHarness,
+  globalViteConfig: vite.ResolvedConfig,
+  globalConfig: ResolvedConfig,
+  options: WorkspaceOptions,
+): VitePlugin[] {
+  return [
+    {
+      name: 'vitest:project',
+      enforce: 'post',
+      options() {
+        this.meta.watchMode = false
+      },
+      config(viteConfig) {
+        const testConfig = viteConfig.test || {}
+        const root = options.root || testConfig.root || viteConfig.root
+
+        const config: ViteConfig = {
+          base: '/',
+          root,
+          server: {
+            open: false,
+            fs: {
+              allow: globalViteConfig.server.fs.allow,
+              deny: [API_TOKEN_FILE],
+            },
+          },
+        }
+
+        return config
+      },
+      configResolved(config) {
+        // project servers never watch; the top-level server owns the watcher
+        config.server.watch = null
+      },
+    },
+    SsrRunnerFixerPlugin(harness),
+    MetaEnvReplacerPlugin(),
+    ...CSSEnablerPlugin(),
+    CoverageTransform(harness),
+    ...ViteConfigPlugin(harness),
+    ...MocksPlugins(),
+    VitestProjectResolver(harness),
+    NormalizeURLPlugin(),
+  ]
+}

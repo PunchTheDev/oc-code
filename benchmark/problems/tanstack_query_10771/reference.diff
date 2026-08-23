@@ -1,0 +1,468 @@
+diff --git a/.changeset/fix-broadcast-client-unhandled-rejection.md b/.changeset/fix-broadcast-client-unhandled-rejection.md
+new file mode 100644
+index 00000000000..2b0396d7e1f
+--- /dev/null
++++ b/.changeset/fix-broadcast-client-unhandled-rejection.md
+@@ -0,0 +1,5 @@
++---
++"@tanstack/query-broadcast-client-experimental": patch
++---
++
++Fix unhandled `DataCloneError` rejections in `broadcastQueryClient` when `postMessage` fails due to non-cloneable query data (e.g. `ReadableStream`, `Response`, Vue reactive proxies). Adds an optional `onBroadcastError` callback to handle errors explicitly; falls back to `console.warn` in development when not provided.
+diff --git a/docs/framework/react/plugins/broadcastQueryClient.md b/docs/framework/react/plugins/broadcastQueryClient.md
+index 46b0306c924..d67b3422a21 100644
+--- a/docs/framework/react/plugins/broadcastQueryClient.md
++++ b/docs/framework/react/plugins/broadcastQueryClient.md
+@@ -49,6 +49,26 @@ interface BroadcastQueryClientOptions {
+   broadcastChannel?: string
+   /** Options for the BroadcastChannel API */
+   options?: BroadcastChannelOptions
++  /**
++   * Called when a query event fails to broadcast to other tabs — most
++   * commonly because the query's data, error, or key contains a value the
++   * structured-clone algorithm cannot serialize (e.g. `ReadableStream`,
++   * `File`, functions, Vue `reactive` proxies).
++   *
++   * If omitted, a `console.warn` is emitted in development so failures
++   * are never entirely silent. May return a `Promise`; any rejection is
++   * caught internally.
++   */
++  onBroadcastError?: (
++    error: unknown,
++    event: BroadcastErrorEvent,
++  ) => void | Promise<void>
++}
++
++interface BroadcastErrorEvent {
++  type: 'updated' | 'removed' | 'added'
++  queryHash: string
++  queryKey: QueryKey
+ }
+ ```
+ 
+@@ -59,3 +79,25 @@ The default options are:
+   broadcastChannel = 'tanstack-query',
+ }
+ ```
++
++## Handling broadcast errors
++
++If your cache can hold values that are not structured-cloneable — such as `ReadableStream` (from `Response.body`, streaming APIs, or AI SDKs), `File`, functions, or framework proxies like Vue `reactive` — the underlying `BroadcastChannel.postMessage` call will reject for that query. Cross-tab sync is skipped for that query; the rest of the cache continues to broadcast normally.
++
++By default, a `console.warn` is emitted in development so failures are never silent. Provide `onBroadcastError` to route failures to your own error tracker:
++
++```tsx
++import * as Sentry from '@sentry/browser'
++import { broadcastQueryClient } from '@tanstack/query-broadcast-client-experimental'
++
++broadcastQueryClient({
++  queryClient,
++  broadcastChannel: 'my-app',
++  onBroadcastError: (error, event) => {
++    Sentry.captureException(error, {
++      tags: { broadcastEvent: event.type },
++      extra: { queryHash: event.queryHash, queryKey: event.queryKey },
++    })
++  },
++})
++```
+diff --git a/packages/query-broadcast-client-experimental/src/__tests__/index.test.ts b/packages/query-broadcast-client-experimental/src/__tests__/index.test.ts
+index 6e09d8a86e2..1e9ae1a3464 100644
+--- a/packages/query-broadcast-client-experimental/src/__tests__/index.test.ts
++++ b/packages/query-broadcast-client-experimental/src/__tests__/index.test.ts
+@@ -1,8 +1,24 @@
+ import { QueryClient } from '@tanstack/query-core'
+-import { beforeEach, describe, expect, it } from 'vitest'
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+ import { broadcastQueryClient } from '..'
++import type { BroadcastErrorEvent } from '..'
+ import type { QueryCache } from '@tanstack/query-core'
+ 
++const mockPostMessage = vi.fn().mockResolvedValue(undefined)
++const mockClose = vi.fn()
++
++vi.mock('broadcast-channel', async (importOriginal) => {
++  const actual = await importOriginal()
++  return {
++    ...(actual as object),
++    BroadcastChannel: class MockBroadcastChannel {
++      onmessage = null
++      postMessage = mockPostMessage
++      close = mockClose
++    },
++  }
++})
++
+ describe('broadcastQueryClient', () => {
+   let queryClient: QueryClient
+   let queryCache: QueryCache
+@@ -10,6 +26,8 @@ describe('broadcastQueryClient', () => {
+   beforeEach(() => {
+     queryClient = new QueryClient()
+     queryCache = queryClient.getQueryCache()
++    mockPostMessage.mockResolvedValue(undefined)
++    mockClose.mockReset()
+   })
+ 
+   it('should subscribe to the query cache', () => {
+@@ -28,4 +46,223 @@ describe('broadcastQueryClient', () => {
+     unsubscribe()
+     expect(queryCache.hasListeners()).toBe(false)
+   })
++
++  describe('postMessage error handling', () => {
++    let originalEnv: string | undefined
++
++    beforeEach(() => {
++      originalEnv = process.env['NODE_ENV']
++    })
++
++    afterEach(() => {
++      process.env['NODE_ENV'] = originalEnv
++    })
++
++    it('should not cause an unhandled rejection when onBroadcastError itself throws', async () => {
++      const cloneError = new DOMException('DataCloneError', 'DataCloneError')
++      mockPostMessage.mockRejectedValueOnce(cloneError)
++
++      const unhandledRejections: Array<unknown> = []
++      const onUnhandledRejection = (reason: unknown) => {
++        unhandledRejections.push(reason)
++      }
++      process.on('unhandledRejection', onUnhandledRejection)
++
++      try {
++        const onBroadcastError = vi.fn().mockImplementation(() => {
++          throw new Error('boom')
++        })
++
++        broadcastQueryClient({
++          queryClient,
++          broadcastChannel: 'test_channel',
++          onBroadcastError,
++        })
++
++        queryClient.setQueryData(['test'], { value: 1 })
++
++        await new Promise((r) => setTimeout(r, 0))
++
++        expect(onBroadcastError).toHaveBeenCalledWith(
++          cloneError,
++          expect.objectContaining<BroadcastErrorEvent>({
++            type: 'added',
++            queryHash: expect.any(String) as string,
++            queryKey: ['test'],
++          }),
++        )
++        expect(unhandledRejections).toHaveLength(0)
++      } finally {
++        process.off('unhandledRejection', onUnhandledRejection)
++      }
++    })
++
++    it('should warn in dev when onBroadcastError itself throws', async () => {
++      process.env['NODE_ENV'] = 'development'
++      const cloneError = new DOMException('DataCloneError', 'DataCloneError')
++      const callbackError = new Error('boom')
++      mockPostMessage.mockRejectedValueOnce(cloneError)
++
++      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
++
++      try {
++        broadcastQueryClient({
++          queryClient,
++          broadcastChannel: 'test_channel',
++          onBroadcastError: () => {
++            throw callbackError
++          },
++        })
++
++        queryClient.setQueryData(['test'], { value: 1 })
++
++        await new Promise((r) => setTimeout(r, 0))
++
++        expect(warnSpy).toHaveBeenCalledWith(
++          expect.stringContaining('onBroadcastError threw while handling'),
++          callbackError,
++        )
++      } finally {
++        warnSpy.mockRestore()
++      }
++    })
++
++    it('should not cause an unhandled rejection when async onBroadcastError rejects', async () => {
++      const cloneError = new DOMException('DataCloneError', 'DataCloneError')
++      mockPostMessage.mockRejectedValueOnce(cloneError)
++
++      const unhandledRejections: Array<unknown> = []
++      const onUnhandledRejection = (reason: unknown) => {
++        unhandledRejections.push(reason)
++      }
++      process.on('unhandledRejection', onUnhandledRejection)
++
++      try {
++        const onBroadcastError = vi
++          .fn()
++          .mockRejectedValueOnce(new Error('async boom'))
++
++        broadcastQueryClient({
++          queryClient,
++          broadcastChannel: 'test_channel',
++          onBroadcastError,
++        })
++
++        queryClient.setQueryData(['test'], { value: 1 })
++
++        await new Promise((r) => setTimeout(r, 10))
++
++        expect(onBroadcastError).toHaveBeenCalledWith(
++          cloneError,
++          expect.objectContaining<BroadcastErrorEvent>({
++            type: 'added',
++            queryHash: expect.any(String) as string,
++            queryKey: ['test'],
++          }),
++        )
++        expect(unhandledRejections).toHaveLength(0)
++      } finally {
++        process.off('unhandledRejection', onUnhandledRejection)
++      }
++    })
++
++    it('should warn in dev when async onBroadcastError rejects', async () => {
++      process.env['NODE_ENV'] = 'development'
++      const cloneError = new DOMException('DataCloneError', 'DataCloneError')
++      const asyncError = new Error('async boom')
++      mockPostMessage.mockRejectedValueOnce(cloneError)
++
++      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
++
++      try {
++        broadcastQueryClient({
++          queryClient,
++          broadcastChannel: 'test_channel',
++          onBroadcastError: () => Promise.reject(asyncError),
++        })
++
++        queryClient.setQueryData(['test'], { value: 1 })
++
++        await new Promise((r) => setTimeout(r, 10))
++
++        expect(warnSpy).toHaveBeenCalledWith(
++          expect.stringContaining('onBroadcastError threw while handling'),
++          asyncError,
++        )
++      } finally {
++        warnSpy.mockRestore()
++      }
++    })
++
++    it('should call onBroadcastError when postMessage fails', async () => {
++      const cloneError = new DOMException('DataCloneError', 'DataCloneError')
++      mockPostMessage.mockRejectedValueOnce(cloneError)
++
++      const onBroadcastError = vi.fn()
++      broadcastQueryClient({
++        queryClient,
++        broadcastChannel: 'test_channel',
++        onBroadcastError,
++      })
++
++      queryClient.setQueryData(['test'], { value: 1 })
++
++      await new Promise((r) => setTimeout(r, 0))
++      expect(onBroadcastError).toHaveBeenCalledWith(
++        cloneError,
++        expect.objectContaining<BroadcastErrorEvent>({
++          type: 'added',
++          queryHash: expect.any(String) as string,
++          queryKey: ['test'],
++        }),
++      )
++    })
++
++    it('should warn in dev when postMessage fails and onBroadcastError is not provided', async () => {
++      process.env['NODE_ENV'] = 'development'
++      const cloneError = new DOMException('DataCloneError', 'DataCloneError')
++      mockPostMessage.mockRejectedValueOnce(cloneError)
++
++      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
++
++      try {
++        broadcastQueryClient({
++          queryClient,
++          broadcastChannel: 'test_channel',
++        })
++
++        queryClient.setQueryData(['test'], { value: 1 })
++
++        await new Promise((r) => setTimeout(r, 0))
++        expect(warnSpy).toHaveBeenCalledWith(
++          expect.stringContaining('cross-tab sync for this query was skipped'),
++          cloneError,
++        )
++      } finally {
++        warnSpy.mockRestore()
++      }
++    })
++
++    it('should not warn in production when postMessage fails', async () => {
++      process.env['NODE_ENV'] = 'production'
++      const cloneError = new DOMException('DataCloneError', 'DataCloneError')
++      mockPostMessage.mockRejectedValueOnce(cloneError)
++
++      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
++
++      try {
++        broadcastQueryClient({
++          queryClient,
++          broadcastChannel: 'test_channel',
++        })
++
++        queryClient.setQueryData(['test'], { value: 1 })
++
++        await new Promise((r) => setTimeout(r, 0))
++        expect(warnSpy).not.toHaveBeenCalled()
++      } finally {
++        warnSpy.mockRestore()
++      }
++    })
++  })
+ })
+diff --git a/packages/query-broadcast-client-experimental/src/index.ts b/packages/query-broadcast-client-experimental/src/index.ts
+index e102b3c0b01..4626446bd57 100644
+--- a/packages/query-broadcast-client-experimental/src/index.ts
++++ b/packages/query-broadcast-client-experimental/src/index.ts
+@@ -1,17 +1,56 @@
+ import { BroadcastChannel } from 'broadcast-channel'
+ import type { BroadcastChannelOptions } from 'broadcast-channel'
+-import type { QueryClient } from '@tanstack/query-core'
++import type { QueryClient, QueryKey } from '@tanstack/query-core'
++
++/**
++ * Metadata describing a broadcast that failed to be delivered to other tabs.
++ * Passed to {@link BroadcastQueryClientOptions.onBroadcastError} so callers
++ * can correlate failures with the originating query.
++ */
++export interface BroadcastErrorEvent {
++  type: 'updated' | 'removed' | 'added'
++  queryHash: string
++  queryKey: QueryKey
++}
++
++type BroadcastMessage =
++  | { type: 'updated'; queryHash: string; queryKey: QueryKey; state: unknown }
++  | { type: 'removed'; queryHash: string; queryKey: QueryKey }
++  | { type: 'added'; queryHash: string; queryKey: QueryKey; state: unknown }
+ 
+ interface BroadcastQueryClientOptions {
++  /** The QueryClient to sync. */
+   queryClient: QueryClient
++  /**
++   * Unique channel name used to communicate between tabs and windows.
++   * @default 'tanstack-query'
++   */
+   broadcastChannel?: string
++  /** Options forwarded to the underlying `BroadcastChannel`. */
+   options?: BroadcastChannelOptions
++  /**
++   * Called when a query event fails to broadcast to other tabs — most
++   * commonly because the query's `state.data`, `state.error`, or `queryKey`
++   * contains a value the structured-clone algorithm cannot serialize
++   * (e.g. `ReadableStream`, `File`, functions, Vue `reactive` proxies).
++   *
++   * Provide this to route failures to an error tracker. If omitted, a
++   * `console.warn` is emitted in development so failures are never silent.
++   *
++   * May return a `Promise`; any rejection is caught internally so it cannot
++   * cause a secondary unhandled rejection.
++   */
++  onBroadcastError?: (
++    error: unknown,
++    event: BroadcastErrorEvent,
++  ) => void | Promise<void>
+ }
+ 
+ export function broadcastQueryClient({
+   queryClient,
+   broadcastChannel = 'tanstack-query',
+   options,
++  onBroadcastError,
+ }: BroadcastQueryClientOptions): () => void {
+   let transaction = false
+   const tx = (cb: () => void) => {
+@@ -27,7 +66,42 @@ export function broadcastQueryClient({
+ 
+   const queryCache = queryClient.getQueryCache()
+ 
+-  const unsubscribe = queryClient.getQueryCache().subscribe((queryEvent) => {
++  const safePost = (message: BroadcastMessage): void => {
++    channel.postMessage(message).catch((error: unknown) => {
++      const event: BroadcastErrorEvent = {
++        type: message.type,
++        queryHash: message.queryHash,
++        queryKey: message.queryKey,
++      }
++
++      if (onBroadcastError) {
++        const warnCallbackError = (callbackError: unknown) => {
++          if (process.env.NODE_ENV !== 'production') {
++            console.warn(
++              `[broadcastQueryClient] onBroadcastError threw while handling "${event.type}" for query ${event.queryHash}.`,
++              callbackError,
++            )
++          }
++        }
++        let result: void | Promise<void>
++        try {
++          result = onBroadcastError(error, event)
++        } catch (callbackError) {
++          warnCallbackError(callbackError)
++          return
++        }
++        result?.catch(warnCallbackError)
++      } else if (process.env.NODE_ENV !== 'production') {
++        console.warn(
++          `[broadcastQueryClient] Failed to broadcast "${event.type}" event for query ${event.queryHash}. ` +
++            'The query value could not be structured-cloned; cross-tab sync for this query was skipped.',
++          error,
++        )
++      }
++    })
++  }
++
++  const unsubscribe = queryCache.subscribe((queryEvent) => {
+     if (transaction) {
+       return
+     }
+@@ -37,7 +111,7 @@ export function broadcastQueryClient({
+     } = queryEvent
+ 
+     if (queryEvent.type === 'updated' && queryEvent.action.type === 'success') {
+-      channel.postMessage({
++      safePost({
+         type: 'updated',
+         queryHash,
+         queryKey,
+@@ -46,7 +120,7 @@ export function broadcastQueryClient({
+     }
+ 
+     if (queryEvent.type === 'removed' && observers.length > 0) {
+-      channel.postMessage({
++      safePost({
+         type: 'removed',
+         queryHash,
+         queryKey,
+@@ -54,10 +128,11 @@ export function broadcastQueryClient({
+     }
+ 
+     if (queryEvent.type === 'added') {
+-      channel.postMessage({
++      safePost({
+         type: 'added',
+         queryHash,
+         queryKey,
++        state,
+       })
+     }
+   })

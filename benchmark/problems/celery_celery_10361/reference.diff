@@ -1,0 +1,248 @@
+diff --git a/celery/concurrency/eventlet.py b/celery/concurrency/eventlet.py
+index af529b4660..432b29a42a 100644
+--- a/celery/concurrency/eventlet.py
++++ b/celery/concurrency/eventlet.py
+@@ -136,13 +136,18 @@ def on_apply(self, target, args=None, kwargs=None, callback=None,
+ 
+     def grow(self, n=1):
+         limit = self.limit + n
+-        self._pool.resize(limit)
+         self.limit = limit
++        self._pool.size = limit
++        # GreenPool.resize adjusts the semaphore counter directly without
++        # notifying greenthreads already blocked in GreenPool.spawn.
++        for _ in range(n):
++            self._pool.sem.release()
+ 
+     def shrink(self, n=1):
+         limit = self.limit - n
+-        self._pool.resize(limit)
++        self._pool.sem.counter -= n
+         self.limit = limit
++        self._pool.size = limit
+ 
+     def terminate_job(self, pid, signal=None):
+         if pid in self._pool_map.keys():
+diff --git a/celery/concurrency/gevent.py b/celery/concurrency/gevent.py
+index fd58e91be8..d3c8007088 100644
+--- a/celery/concurrency/gevent.py
++++ b/celery/concurrency/gevent.py
+@@ -126,12 +126,18 @@ def on_apply(self, target, args=None, kwargs=None, callback=None,
+         return greenlet
+ 
+     def grow(self, n=1):
+-        self._pool._semaphore.counter += n
+-        self._pool.size += n
++        self.limit += n
++        self._pool.size = self.limit
++        # Pool.spawn blocks on the semaphore when the pool is full.
++        # Release slots so autoscale wakes any task submissions waiting
++        # for capacity instead of waiting for a running greenlet to finish.
++        for _ in range(n):
++            self._pool._semaphore.release()
+ 
+     def shrink(self, n=1):
+         self._pool._semaphore.counter -= n
+-        self._pool.size -= n
++        self.limit -= n
++        self._pool.size = self.limit
+ 
+     def terminate_job(self, pid, signal=None):
+         import gevent
+@@ -142,7 +148,7 @@ def terminate_job(self, pid, signal=None):
+ 
+     @property
+     def num_processes(self):
+-        return len(self._pool)
++        return self.limit
+ 
+     @staticmethod
+     def _make_killable_target(target):
+diff --git a/t/unit/concurrency/test_eventlet.py b/t/unit/concurrency/test_eventlet.py
+index a044d4ae67..5a000880b9 100644
+--- a/t/unit/concurrency/test_eventlet.py
++++ b/t/unit/concurrency/test_eventlet.py
+@@ -114,16 +114,42 @@ def test_apply_target(self, base):
+     def test_grow(self):
+         x = TaskPool(10)
+         x._pool = Mock(name='_pool')
++        x._pool.sem.release = Mock()
+         x.grow(2)
+         assert x.limit == 12
+-        x._pool.resize.assert_called_with(12)
++        assert x._pool.size == 12
++        assert x._pool.sem.release.call_count == 2
+ 
+     def test_shrink(self):
+         x = TaskPool(10)
+         x._pool = Mock(name='_pool')
++        x._pool.sem.counter = 8
++        x._pool.size = 10
+         x.shrink(2)
+         assert x.limit == 8
+-        x._pool.resize.assert_called_with(8)
++        assert x._pool.size == 8
++        assert x._pool.sem.counter == 6
++
++    def test_num_processes_reports_capacity_for_autoscale(self):
++        x = TaskPool(5)
++        x._pool = Mock(name='_pool')
++        x._pool.running.return_value = 1
++
++        assert x.num_processes == 5
++
++    def test_autoscaler_scales_from_capacity_not_running_greenlets(self):
++        from celery.worker import autoscale
++
++        x = TaskPool(3)
++        x._pool = Mock(name='_pool')
++        x.grow = Mock()
++        scaler = autoscale.Autoscaler(x, 10, 3, worker=Mock())
++        reserved = [Mock() for _ in range(5)]
++
++        with patch('celery.worker.autoscale.state.reserved_requests', reserved):
++            assert scaler._maybe_scale()
++
++        x.grow.assert_called_once_with(2)
+ 
+     def test_get_info(self):
+         x = TaskPool(10)
+@@ -163,3 +189,42 @@ def test_cleanup_after_job_finish(self):
+         testMap = {'1': None}
+         TaskPool._cleanup_after_job_finish(None, testMap, '1')
+         assert len(testMap) == 0
++
++
++class test_TaskPool_eventlet:
++
++    def test_grow_wakes_spawn_waiter(self):
++        import eventlet
++
++        pool = TaskPool(1)
++        pool.on_start()
++        first_started = eventlet.Event()
++        release_first = eventlet.Event()
++        second_started = eventlet.Event()
++        waiter = None
++
++        def first():
++            first_started.send(True)
++            release_first.wait()
++
++        def second():
++            second_started.send(True)
++
++        try:
++            pool._pool.spawn(first)
++            with eventlet.Timeout(1):
++                first_started.wait()
++
++            waiter = eventlet.spawn(pool._pool.spawn, second)
++            eventlet.sleep(0)
++            assert not second_started.ready()
++
++            pool.grow()
++
++            with eventlet.Timeout(1):
++                second_started.wait()
++        finally:
++            release_first.send(True)
++            pool._pool.waitall()
++            if waiter is not None:
++                waiter.wait()
+diff --git a/t/unit/concurrency/test_gevent.py b/t/unit/concurrency/test_gevent.py
+index 7382520e71..cf86a24527 100644
+--- a/t/unit/concurrency/test_gevent.py
++++ b/t/unit/concurrency/test_gevent.py
+@@ -1,4 +1,4 @@
+-from unittest.mock import Mock
++from unittest.mock import Mock, patch
+ 
+ from celery.concurrency.gevent import TaskPool, Timer, apply_timeout
+ 
+@@ -62,7 +62,7 @@ def setup_method(self):
+         self.Pool = self.patching('gevent.pool.Pool')
+ 
+     def test_pool(self):
+-        x = TaskPool()
++        x = TaskPool(1)
+         x.on_start()
+         x.on_stop()
+         x.on_apply(Mock())
+@@ -70,18 +70,71 @@ def test_pool(self):
+         x.on_stop()
+ 
+         x._pool = Mock()
+-        x._pool._semaphore.counter = 1
++        semaphore = x._pool._semaphore
++        semaphore.counter = 1
++
++        def release():
++            semaphore.counter += 1
++
++        semaphore.release = Mock(side_effect=release)
+         x._pool.size = 1
+         x.grow()
+         assert x._pool.size == 2
+-        assert x._pool._semaphore.counter == 2
++        assert x.limit == 2
++        semaphore.release.assert_called_once_with()
+         x.shrink()
+-        assert x._pool.size, 1
+-        assert x._pool._semaphore.counter == 1
++        assert x._pool.size == 1
++        assert semaphore.counter == 1
++        assert x.limit == 1
+ 
+-        x._pool = [4, 5, 6]
++        x.limit = 3
+         assert x.num_processes == 3
+ 
++    def test_grow_updates_capacity_and_notifies_waiters(self):
++        x = TaskPool(1)
++        x._pool = Mock()
++        x._pool._semaphore.release = Mock()
++        x._pool.size = 1
++
++        x.grow(4)
++
++        assert x.limit == 5
++        assert x._pool.size == 5
++        assert x._pool._semaphore.release.call_count == 4
++
++    def test_shrink_updates_capacity(self):
++        x = TaskPool(5)
++        x._pool = Mock()
++        x._pool._semaphore.counter = 4
++        x._pool.size = 5
++
++        x.shrink(3)
++
++        assert x.limit == 2
++        assert x._pool.size == 2
++        assert x._pool._semaphore.counter == 1
++
++    def test_num_processes_reports_capacity_for_autoscale(self):
++        x = TaskPool(5)
++        x._pool = [object()]
++
++        assert len(x._pool) == 1
++        assert x.num_processes == 5
++
++    def test_autoscaler_scales_from_capacity_not_running_greenlets(self):
++        from celery.worker import autoscale
++
++        x = TaskPool(3)
++        x._pool = [object()]
++        x.grow = Mock()
++        scaler = autoscale.Autoscaler(x, 10, 3, worker=Mock())
++        reserved = [Mock() for _ in range(5)]
++
++        with patch('celery.worker.autoscale.state.reserved_requests', reserved):
++            assert scaler._maybe_scale()
++
++        x.grow.assert_called_once_with(2)
++
+     def test_terminate_job(self):
+         func = Mock()
+         pool = TaskPool(10)

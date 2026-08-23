@@ -1,0 +1,374 @@
+diff --git a/celery/worker/consumer/events.py b/celery/worker/consumer/events.py
+index 5868f99298..f8853d5aa8 100644
+--- a/celery/worker/consumer/events.py
++++ b/celery/worker/consumer/events.py
+@@ -35,8 +35,9 @@ def __init__(self, c,
+     def start(self, c):
+         # flush events sent while connection was down.
+         prev = self._close(c)
++        conn = c.connection_for_write(heartbeat=c.amqheartbeat)
+         dis = c.event_dispatcher = c.app.events.Dispatcher(
+-            c.connection_for_write(),
++            conn,
+             hostname=c.hostname,
+             enabled=self.send_events,
+             groups=self.groups,
+@@ -45,6 +46,9 @@ def start(self, c):
+             buffer_group=['task'] if c.hub else None,
+             on_send_buffered=c.on_send_event_buffered if c.hub else None,
+         )
++        # register for reads so broker heartbeats are consumed.
++        if c.hub and c.amqheartbeat and conn.supports_heartbeats:
++            conn.transport.register_with_event_loop(conn.connection, c.hub)
+         if prev:
+             dis.extend_buffer(prev)
+             dis.flush()
+diff --git a/celery/worker/loops.py b/celery/worker/loops.py
+index 9e15f208df..c0c71dd8a8 100644
+--- a/celery/worker/loops.py
++++ b/celery/worker/loops.py
+@@ -57,6 +57,10 @@ def asynloop(obj, connection, consumer, blueprint, hub, qos,
+     on_task_received = obj.create_task_handler()
+ 
+     heartbeat_error = _enable_amqheartbeats(hub.timer, connection, rate=hbrate)
++    dispatcher_heartbeat_error = [None]
++    if obj.event_dispatcher:
++        dispatcher_heartbeat_error = _enable_amqheartbeats(
++            hub.timer, obj.event_dispatcher.connection, rate=hbrate)
+ 
+     consumer.on_message = on_task_received
+     obj.controller.register_with_event_loop(hub)
+@@ -86,6 +90,8 @@ def asynloop(obj, connection, consumer, blueprint, hub, qos,
+             state.maybe_shutdown()
+             if heartbeat_error[0] is not None:
+                 raise heartbeat_error[0]
++            if dispatcher_heartbeat_error[0] is not None:
++                raise dispatcher_heartbeat_error[0]
+ 
+             # We only update QoS when there's no more messages to read.
+             # This groups together qos calls, and makes sure that remote
+@@ -137,8 +143,13 @@ def synloop(obj, connection, consumer, blueprint, hub, qos,
+     on_task_received = obj.create_task_handler()
+     perform_pending_operations = obj.perform_pending_operations
+     heartbeat_error = [None]
+-    if getattr(obj.pool, 'is_green', False):
++    dispatcher_heartbeat_error = [None]
++    is_green = getattr(obj.pool, 'is_green', False)
++    if is_green:
+         heartbeat_error = _enable_amqheartbeats(obj.timer, connection, rate=hbrate)
++        if obj.event_dispatcher:
++            dispatcher_heartbeat_error = _enable_amqheartbeats(
++                obj.timer, obj.event_dispatcher.connection, rate=hbrate)
+     consumer.on_message = on_task_received
+     consumer.consume()
+ 
+@@ -150,6 +161,8 @@ def _loop_cycle():
+         """
+         if heartbeat_error[0] is not None:
+             raise heartbeat_error[0]
++        if dispatcher_heartbeat_error[0] is not None:
++            raise dispatcher_heartbeat_error[0]
+         if qos.prev != qos.value:
+             qos.update()
+         try:
+@@ -160,6 +173,15 @@ def _loop_cycle():
+         except OSError:
+             if blueprint.state == RUN:
+                 raise
++        # drain this connection so broker heartbeats are consumed.
++        if is_green and obj.amqheartbeat and obj.event_dispatcher:
++            connection_ = obj.event_dispatcher.connection
++            if connection_ and connection_.supports_heartbeats:
++                try:
++                    _quick_drain(obj.event_dispatcher.connection)
++                except OSError:
++                    if blueprint.state == RUN:
++                        raise
+ 
+     try:
+         while blueprint.state == RUN and obj.connection:
+diff --git a/t/smoke/tests/test_worker_heartbeats.py b/t/smoke/tests/test_worker_heartbeats.py
+new file mode 100644
+index 0000000000..eb0ef1f564
+--- /dev/null
++++ b/t/smoke/tests/test_worker_heartbeats.py
+@@ -0,0 +1,79 @@
++from __future__ import annotations
++
++import pytest
++from pytest_celery import CeleryBrokerCluster, CeleryTestSetup, RabbitMQTestBroker
++from tenacity import retry, stop_after_attempt, wait_fixed
++
++from celery import Celery
++
++HEARTBEAT = 10
++
++
++# gets the connection status from the rabbitmq side.
++def list_connections(broker: RabbitMQTestBroker) -> dict[str, int]:
++    _, output = broker.container.exec_run(["rabbitmqctl", "list_connections", "name", "timeout", "--quiet"])
++    connections = {}
++    for line in output.decode().splitlines():
++        name, _, timeout = line.rpartition("\t")
++        if timeout == "timeout":
++            continue
++        connections[name] = int(timeout)
++    return connections
++
++
++@pytest.fixture
++def celery_broker_cluster(celery_rabbitmq_broker: RabbitMQTestBroker) -> CeleryBrokerCluster:
++    cluster = CeleryBrokerCluster(celery_rabbitmq_broker)
++    yield cluster
++    cluster.teardown()
++
++
++@pytest.fixture
++def celery_backend_cluster() -> None:
++    return None
++
++
++@pytest.fixture
++def default_worker_app(default_worker_app: Celery) -> Celery:
++    app = default_worker_app
++    app.conf.broker_heartbeat = HEARTBEAT
++    return app
++
++
++class test_worker_heartbeats:
++
++    # asserts the main connection and the event dispatcher connection
++    # get heartbeat working; there is a third connection which has no
++    # heartbeat for now.
++    def test_dead_worker_connections_are_closed(self, celery_setup: CeleryTestSetup):
++        broker = celery_setup.broker
++
++        @retry(stop=stop_after_attempt(30), wait=wait_fixed(1), reraise=True)
++        def worker_connections() -> dict[str, int]:
++            connections = list_connections(broker)
++            assert len(connections) == 3
++            return connections
++
++        connections = worker_connections()
++        with_heartbeat = {
++            name for name, timeout in connections.items()
++            if timeout == HEARTBEAT
++        }
++        no_heartbeat = {
++            name for name, timeout in connections.items()
++            if timeout == 0
++        }
++        assert len(with_heartbeat) == 2
++        assert len(no_heartbeat) == 1
++
++        # both the main connection and the event dispatcher connection
++        # will go away with the heartbeat.
++        celery_setup.worker.container.kill(signal="SIGSTOP")
++        try:
++            @retry(stop=stop_after_attempt(HEARTBEAT * 5), wait=wait_fixed(1), reraise=True)
++            def assert_only_the_no_heartbeat_connection_is_left():
++                assert set(list_connections(broker)) == no_heartbeat
++
++            assert_only_the_no_heartbeat_connection_is_left()
++        finally:
++            celery_setup.worker.container.kill(signal="SIGCONT")
+diff --git a/t/unit/worker/test_consumer.py b/t/unit/worker/test_consumer.py
+index 3ef441d6e0..2de38d377a 100644
+--- a/t/unit/worker/test_consumer.py
++++ b/t/unit/worker/test_consumer.py
+@@ -18,6 +18,7 @@
+ from celery.worker.consumer.agent import Agent
+ from celery.worker.consumer.consumer import (CANCEL_TASKS_BY_DEFAULT, CLOSE, COLLECT_SOCKET_TIMEOUT, TERMINATE,
+                                              Consumer)
++from celery.worker.consumer.events import Events
+ from celery.worker.consumer.gossip import Gossip
+ from celery.worker.consumer.heart import Heart
+ from celery.worker.consumer.mingle import Mingle
+@@ -1218,6 +1219,30 @@ def test_start_heartbeat_interval(self):
+             c.heart.start.assert_called_with()
+ 
+ 
++class test_Events:
++
++    def test_start_dispatcher_connection_heartbeat_and_hub(self):
++        c = Mock()
++        Events(c).start(c)
++        c.connection_for_write.assert_called_once_with(heartbeat=c.amqheartbeat)
++        conn = c.connection_for_write.return_value
++        conn.transport.register_with_event_loop.assert_called_once_with(conn.connection, c.hub)
++
++    def test_start_without_hub_does_not_register(self):
++        c = Mock()
++        c.hub = None
++        Events(c).start(c)
++        conn = c.connection_for_write.return_value
++        conn.transport.register_with_event_loop.assert_not_called()
++
++    def test_start_without_heartbeat_does_not_register(self):
++        c = Mock()
++        c.amqheartbeat = 0
++        Events(c).start(c)
++        conn = c.connection_for_write.return_value
++        conn.transport.register_with_event_loop.assert_not_called()
++
++
+ class test_Tasks:
+ 
+     def setup_method(self):
+diff --git a/t/unit/worker/test_loops.py b/t/unit/worker/test_loops.py
+index 3e65fa339f..ac9b80f1ca 100644
+--- a/t/unit/worker/test_loops.py
++++ b/t/unit/worker/test_loops.py
+@@ -59,6 +59,7 @@ def __init__(self, app, heartbeat=None, on_task_message=None,
+         )
+         self.consumer.callbacks = []
+         self.obj.strategies = {}
++        self.obj.event_dispatcher = None
+         self.connection.connection_errors = (socket.error,)
+         if transport_driver_type:
+             self.connection.transport.driver_type = transport_driver_type
+@@ -162,6 +163,27 @@ def test_setup_heartbeat(self):
+         assert last_call_args[0] == 10 / 2.0
+         assert last_call_args[2] == (2.0,)
+ 
++    def test_setup_dispatcher_heartbeat(self):
++        x = X(self.app, heartbeat=10)
++        x.hub.timer.call_repeatedly = Mock(name='x.hub.call_repeatedly()')
++        x.obj.event_dispatcher = Mock(name='event_dispatcher')
++        x.obj.event_dispatcher.connection.get_heartbeat_interval.return_value = 20
++        x.blueprint.state = CLOSE
++        asynloop(*x.args)
++
++        assert x.hub.timer.call_repeatedly.call_count == 2
++        last_call_args, _ = x.hub.timer.call_repeatedly.call_args
++
++        assert last_call_args[0] == 20 / 2.0
++        assert last_call_args[2] == (2.0,)
++
++    def test_no_dispatcher_skips_dispatcher_heartbeat(self):
++        x = X(self.app, heartbeat=10)
++        x.hub.timer.call_repeatedly = Mock(name='x.hub.call_repeatedly()')
++        x.blueprint.state = CLOSE
++        asynloop(*x.args)
++        assert x.hub.timer.call_repeatedly.call_count == 1
++
+     def task_context(self, sig, **kwargs):
+         x, on_task = get_task_callback(self.app, **kwargs)
+         message = self.task_message_from_sig(self.app, sig)
+@@ -442,6 +464,22 @@ def call_repeatedly(rate, fn, args):
+         with pytest.raises(RuntimeError):
+             asynloop(*x.args)
+ 
++    def test_dispatcher_heartbeat_error(self):
++        x = X(self.app, heartbeat=10)
++        x.obj.event_dispatcher = Mock(name='event_dispatcher')
++        dispatcher_connection = x.obj.event_dispatcher.connection
++        dispatcher_connection.get_heartbeat_interval.return_value = 20
++        dispatcher_connection.heartbeat_check = Mock(
++            side_effect=RuntimeError('Dispatcher heartbeat error')
++        )
++
++        def call_repeatedly(rate, fn, args):
++            fn(*args)
++
++        x.hub.timer.call_repeatedly = call_repeatedly
++        with pytest.raises(RuntimeError):
++            asynloop(*x.args)
++
+     def test_no_heartbeat_support(self):
+         x = X(self.app)
+         x.connection.supports_heartbeats = False
+@@ -648,6 +686,81 @@ def call_repeatedly(rate, fn, args):
+         with pytest.raises(RuntimeError):
+             synloop(*x.args)
+ 
++    def test_setup_dispatcher_heartbeat(self):
++        x = X(self.app, heartbeat=10)
++        x.obj.pool.is_green = True
++        x.obj.timer.call_repeatedly = Mock(
++            name='x.obj.timer.call_repeatedly()'
++        )
++        x.obj.event_dispatcher = Mock(name='event_dispatcher')
++        x.obj.event_dispatcher.connection.get_heartbeat_interval.return_value = 20
++
++        def drain_events(timeout):
++            x.blueprint.state = CLOSE
++        x.connection.drain_events.side_effect = drain_events
++        synloop(*x.args)
++
++        assert x.obj.timer.call_repeatedly.call_count == 2
++        last_call_args, _ = x.obj.timer.call_repeatedly.call_args
++        assert last_call_args[0] == 20 / 2.0
++        x.obj.event_dispatcher.connection.drain_events.assert_called_once_with(timeout=0.1)
++
++    def test_dispatcher_heartbeat_error(self):
++        x = X(self.app, heartbeat=10)
++        x.obj.pool.is_green = True
++        x.obj.event_dispatcher = Mock(name='event_dispatcher')
++        dispatcher_connection = x.obj.event_dispatcher.connection
++        dispatcher_connection.get_heartbeat_interval.return_value = 20
++        dispatcher_connection.heartbeat_check = Mock(
++            name='heartbeat_check',
++            side_effect=RuntimeError('Dispatcher heartbeat error')
++        )
++
++        def call_repeatedly(rate, fn, args):
++            fn(*args)
++
++        x.obj.timer.call_repeatedly = call_repeatedly
++        with pytest.raises(RuntimeError):
++            synloop(*x.args)
++
++    def test_dispatcher_drain_error_when_running(self):
++        x = X(self.app, heartbeat=10)
++        x.obj.pool.is_green = True
++        x.obj.event_dispatcher = Mock(name='event_dispatcher')
++        x.obj.event_dispatcher.connection.get_heartbeat_interval.return_value = 20
++        x.obj.event_dispatcher.connection.drain_events.side_effect = (
++            socket.error(errno.ECONNRESET, 'reset')
++        )
++        with pytest.raises(socket.error):
++            synloop(*x.args)
++
++    def test_dispatcher_drain_error_ignored_when_closed(self):
++        x = X(self.app, heartbeat=10)
++        x.obj.pool.is_green = True
++        x.obj.event_dispatcher = Mock(name='event_dispatcher')
++        x.obj.event_dispatcher.connection.get_heartbeat_interval.return_value = 20
++        x.obj.event_dispatcher.connection.drain_events.side_effect = (
++            socket.error(errno.ECONNRESET, 'reset')
++        )
++
++        def drain_events(timeout):
++            x.blueprint.state = CLOSE
++        x.connection.drain_events.side_effect = drain_events
++        synloop(*x.args)
++        x.obj.event_dispatcher.connection.drain_events.assert_called_once()
++
++    def test_no_dispatcher_drain_without_heartbeat_support(self):
++        x = X(self.app, heartbeat=10)
++        x.obj.pool.is_green = True
++        x.obj.event_dispatcher = Mock(name='event_dispatcher')
++        x.obj.event_dispatcher.connection.supports_heartbeats = False
++
++        def drain_events(timeout):
++            x.blueprint.state = CLOSE
++        x.connection.drain_events.side_effect = drain_events
++        synloop(*x.args)
++        x.obj.event_dispatcher.connection.drain_events.assert_not_called()
++
+     def test_no_heartbeat_support(self):
+         x = X(self.app)
+         x.connection.supports_heartbeats = False
+diff --git a/t/unit/worker/test_worker.py b/t/unit/worker/test_worker.py
+index 87aeca7010..8f817910ce 100644
+--- a/t/unit/worker/test_worker.py
++++ b/t/unit/worker/test_worker.py
+@@ -49,6 +49,7 @@ def mock_event_dispatcher():
+     evd = Mock(name='event_dispatcher')
+     evd.groups = ['worker']
+     evd._outbound_buffer = deque()
++    evd.connection.get_heartbeat_interval.return_value = 0
+     return evd
+ 
+ 

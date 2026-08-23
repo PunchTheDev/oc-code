@@ -1,0 +1,291 @@
+diff --git a/packages/browser-playwright/src/playwright.ts b/packages/browser-playwright/src/playwright.ts
+index 338a65678139..036fa320e58e 100644
+--- a/packages/browser-playwright/src/playwright.ts
++++ b/packages/browser-playwright/src/playwright.ts
+@@ -621,6 +621,14 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
+     await this._throwIfClosing(page)
+     this.pages.set(sessionId, page)
+ 
++    // fail the run immediately with an attributed error; otherwise the crash
++    // is only visible as a websocket disconnect, if the browser closes it at all
++    page.on('crash', () => {
++      debug?.('[%s][%s] the page crashed', sessionId, this.browserName)
++      const session = this.project.vitest._browserSessions.getSession(sessionId)
++      session?.fail(new Error(`The ${this.browserName} page crashed while running tests. This can happen if the browser ran out of memory.`))
++    })
++
+     if (process.env.VITEST_PW_DEBUG) {
+       page.on('requestfailed', (request) => {
+         console.error(
+diff --git a/packages/browser/src/node/rpc.ts b/packages/browser/src/node/rpc.ts
+index 00bf5abc89e4..24712ef21f1d 100644
+--- a/packages/browser/src/node/rpc.ts
++++ b/packages/browser/src/node/rpc.ts
+@@ -2,7 +2,7 @@ import type { MockerRegistry } from '@vitest/mocker'
+ import type { IncomingMessage } from 'node:http'
+ import type { Duplex } from 'node:stream'
+ import type { TestError } from 'vitest'
+-import type { BrowserCommandContext, ResolveSnapshotPathHandlerContext, TestProject } from 'vitest/node'
++import type { BrowserCommandContext, ResolveSnapshotPathHandlerContext, TestProject, Vitest } from 'vitest/node'
+ import type { WebSocket } from 'ws'
+ import type { WebSocketBrowserEvents, WebSocketBrowserHandlers } from '../types'
+ import type { ParentBrowserProject } from './projectParent'
+@@ -22,6 +22,26 @@ const debug = createDebugger('vitest:browser:api')
+ 
+ const BROWSER_API_PATH = '/__vitest_browser_api__'
+ 
++const DEFAULT_HEARTBEAT_INTERVAL = 15_000
++const HEARTBEAT_MAX_MISSED = 2
++let warnedInvalidHeartbeatInterval = false
++
++function resolveHeartbeatInterval(vitest: Vitest): number {
++  const rawInterval = process.env.VITEST_BROWSER_HEARTBEAT_INTERVAL
++  if (!rawInterval) {
++    return DEFAULT_HEARTBEAT_INTERVAL
++  }
++  const interval = Number(rawInterval)
++  if (Number.isNaN(interval)) {
++    if (!warnedInvalidHeartbeatInterval) {
++      warnedInvalidHeartbeatInterval = true
++      vitest.logger.warn(`VITEST_BROWSER_HEARTBEAT_INTERVAL is expected to be a number, received "${rawInterval}". Using the default interval of ${DEFAULT_HEARTBEAT_INTERVAL}ms instead.`)
++    }
++    return DEFAULT_HEARTBEAT_INTERVAL
++  }
++  return interval
++}
++
+ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMockerRegistry: MockerRegistry): void {
+   const vite = globalServer.vite
+   const vitest = globalServer.vitest
+@@ -94,8 +114,36 @@ export function setupBrowserRpc(globalServer: ParentBrowserProject, defaultMocke
+ 
+       debug?.('[%s] Browser API connected to %s', rpcId, type)
+ 
++      // if the browser stops answering pings, terminate the socket so the
++      // "close" handler below rejects pending calls (like `createTesters`)
++      // instead of the run hanging forever; timeouts that live in the browser
++      // (`testTimeout`, iframe ack) cannot fire once its process is frozen
++      const heartbeatInterval = resolveHeartbeatInterval(vitest)
++      let missedPongs = 0
++      ws.on('pong', () => {
++        missedPongs = 0
++      })
++      const heartbeat = heartbeatInterval > 0
++        ? setInterval(() => {
++            if (ws.readyState !== ws.OPEN) {
++              return
++            }
++            if (missedPongs >= HEARTBEAT_MAX_MISSED) {
++              debug?.('[%s] %s did not respond to %s heartbeat pings, terminating the connection', rpcId, type, missedPongs)
++              rpc.$close(
++                new Error(`[vitest] The browser ${type} did not respond to a heartbeat ping for ${missedPongs * heartbeatInterval}ms. The browser process might be frozen or killed. Closing the connection.`),
++              )
++              ws.terminate()
++              return
++            }
++            missedPongs++
++            ws.ping()
++          }, heartbeatInterval).unref()
++        : undefined
++
+       ws.on('close', () => {
+         debug?.('[%s] Browser API disconnected from %s', rpcId, type)
++        clearInterval(heartbeat)
+         offCancel()
+         clients.delete(rpcId)
+         globalServer.removeCDPHandler(rpcId)
+diff --git a/packages/vitest/src/node/pools/browser.ts b/packages/vitest/src/node/pools/browser.ts
+index 6c40cc91d898..72fac8011d34 100644
+--- a/packages/vitest/src/node/pools/browser.ts
++++ b/packages/vitest/src/node/pools/browser.ts
+@@ -18,6 +18,8 @@ import { detectCodeBlock } from '../../utils/test-helpers'
+ 
+ const debug = createDebugger('vitest:browser:pool')
+ 
++const PROVIDER_CLOSE_TIMEOUT = 10_000
++
+ export function createBrowserPool(vitest: Vitest): ProcessPool {
+   const providers = new Set<BrowserProvider>()
+ 
+@@ -164,7 +166,22 @@ export function createBrowserPool(vitest: Vitest): ProcessPool {
+   return {
+     name: 'browser',
+     async close() {
+-      await Promise.all(Array.from(providers, provider => provider.close()))
++      // a frozen or crashed browser never answers the close message;
++      // don't wait for it forever, the browser process is killed
++      // when this process exits anyway
++      await Promise.all(Array.from(providers, (provider) => {
++        let timer: ReturnType<typeof setTimeout>
++        return Promise.race([
++          Promise.resolve(provider.close()).finally(() => clearTimeout(timer)),
++          new Promise<void>((resolve) => {
++            timer = setTimeout(() => {
++              vitest.logger.warn(`The browser did not close within ${PROVIDER_CLOSE_TIMEOUT}ms. The browser process will be killed when the process exits.`)
++              resolve()
++            }, PROVIDER_CLOSE_TIMEOUT)
++            timer.unref()
++          }),
++        ])
++      }))
+       vitest._browserSessions.sessionIds.clear()
+       providers.clear()
+       vitest.projects.forEach((project) => {
+diff --git a/test/browser/specs/bail-out.test.ts b/test/browser/specs/bail-out.test.ts
+index 9594353385a1..291dc6b4ce91 100644
+--- a/test/browser/specs/bail-out.test.ts
++++ b/test/browser/specs/bail-out.test.ts
+@@ -7,7 +7,11 @@ test('fails gracefully when browser crashes', async () => {
+     reporters: [['verbose', { isTTY: false }]],
+   })
+ 
+-  expect(stderr).toContain('Browser connection was closed while running tests. Was the page closed unexpectedly?')
++  // the crash is reported over CDP and as a websocket disconnect;
++  // whichever arrives first fails the run
++  expect(stderr).toMatch(
++    /page crashed while running tests|Browser connection was closed while running tests/,
++  )
+ })
+ 
+ test('vitest bails out when the iframe is no longer accessible', async () => {
+diff --git a/test/browser/specs/heartbeat.test.ts b/test/browser/specs/heartbeat.test.ts
+new file mode 100644
+index 000000000000..1923b80516a4
+--- /dev/null
++++ b/test/browser/specs/heartbeat.test.ts
+@@ -0,0 +1,135 @@
++import { execSync } from 'node:child_process'
++import { expect, onTestFinished, test } from 'vitest'
++import { instances, provider, runInlineBrowserTests } from './utils'
++
++// walk the process tree because the provider does not expose the browser pid
++function findDescendantBrowserProcesses(): number[] {
++  const output = execSync('ps -eo pid=,ppid=,args=', { encoding: 'utf-8' })
++  const childrenByParent = new Map<number, number[]>()
++  const argsByPid = new Map<number, string>()
++  for (const line of output.split('\n')) {
++    const [pidRaw, ppidRaw, ...args] = line.trim().split(/\s+/)
++    const pid = Number(pidRaw)
++    const ppid = Number(ppidRaw)
++    if (!Number.isInteger(pid) || !Number.isInteger(ppid)) {
++      continue
++    }
++    const children = childrenByParent.get(ppid) ?? []
++    children.push(pid)
++    childrenByParent.set(ppid, children)
++    argsByPid.set(pid, args.join(' '))
++  }
++  const browserPids: number[] = []
++  const queue = [process.pid]
++  while (queue.length) {
++    const pid = queue.shift()!
++    for (const child of childrenByParent.get(pid) ?? []) {
++      queue.push(child)
++      if (/headless[ _]shell|chromium|chrome/i.test(argsByPid.get(child) ?? '')) {
++        browserPids.push(child)
++      }
++    }
++  }
++  return browserPids
++}
++
++function signalAll(pids: number[], signal: NodeJS.Signals) {
++  for (const pid of pids) {
++    try {
++      process.kill(pid, signal)
++    }
++    catch {
++      // the process is already gone
++    }
++  }
++}
++
++// SIGSTOP freezes the browser without closing its websocket, standing in for
++// any browser death that leaves the socket open (vitest-dev/vitest#10791);
++// requires a locally launched playwright browser and POSIX signals
++test.runIf(
++  provider.name === 'playwright'
++  && process.platform !== 'win32'
++  && !process.env.BROWSER_WS_ENDPOINT,
++)('fails instead of hanging when the browser stops responding mid-run', { timeout: 60_000 }, async () => {
++  process.env.VITEST_BROWSER_HEARTBEAT_INTERVAL = '1000'
++  let frozenPids: number[] = []
++  onTestFinished(() => {
++    delete process.env.VITEST_BROWSER_HEARTBEAT_INTERVAL
++    signalAll(frozenPids, 'SIGCONT')
++  })
++
++  const { ctx, fs } = await runInlineBrowserTests(
++    {
++      'basic.test.ts': `
++        import { test } from 'vitest'
++
++        test('first', () => {})
++
++        test('never finishes', async () => {
++          await new Promise(resolve => setTimeout(resolve, 60_000))
++        })
++      `,
++    },
++    {
++      reporters: [
++        {
++          onTestCaseResult() {
++            if (!frozenPids.length) {
++              frozenPids = findDescendantBrowserProcesses()
++              expect(frozenPids.length).toBeGreaterThan(0)
++              signalAll(frozenPids, 'SIGSTOP')
++            }
++          },
++          // unfreeze before `startVitest` closes the provider, so the
++          // browser can answer the close message
++          onTestRunEnd() {
++            signalAll(frozenPids, 'SIGCONT')
++          },
++        },
++      ],
++      browser: {
++        instances: [instances[0]],
++      },
++    },
++  )
++
++  const unhandledErrors = ctx!.state.getUnhandledErrors() as Error[]
++  const messages = unhandledErrors.map((error) => {
++    const cause = error.cause as Error | undefined
++    return cause ? `${error.message} ${cause.message}` : error.message
++  })
++  expect(messages).toContainEqual(
++    `Failed to run the test ${fs.resolveFile('basic.test.ts')}. `
++    + `[vitest] The browser orchestrator did not respond to a heartbeat ping for 2000ms. `
++    + `The browser process might be frozen or killed. Closing the connection.`,
++  )
++})
++
++test('warns when VITEST_BROWSER_HEARTBEAT_INTERVAL is not a number and uses the default', async () => {
++  process.env.VITEST_BROWSER_HEARTBEAT_INTERVAL = 'not-a-number'
++  onTestFinished(() => {
++    delete process.env.VITEST_BROWSER_HEARTBEAT_INTERVAL
++  })
++
++  const { ctx, stderr } = await runInlineBrowserTests(
++    {
++      'basic.test.ts': `
++        import { test } from 'vitest'
++
++        test('works', () => {})
++      `,
++    },
++    {
++      browser: {
++        instances: [instances[0]],
++      },
++    },
++  )
++
++  expect(stderr).toContain(
++    'VITEST_BROWSER_HEARTBEAT_INTERVAL is expected to be a number, received "not-a-number". '
++    + 'Using the default interval of 15000ms instead.',
++  )
++  expect(ctx!.state.getUnhandledErrors()).toEqual([])
++})
