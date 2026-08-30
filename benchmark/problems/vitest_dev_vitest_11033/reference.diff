@@ -1,0 +1,542 @@
+diff --git a/packages/mocker/src/node/hoistMocks.ts b/packages/mocker/src/node/hoistMocks.ts
+index 1d9930c65a92..ac981e5eb2e0 100644
+--- a/packages/mocker/src/node/hoistMocks.ts
++++ b/packages/mocker/src/node/hoistMocks.ts
+@@ -1,11 +1,14 @@
+ import type {
++  ArrowFunctionExpression,
+   AwaitExpression,
+   CallExpression,
+   ExportDefaultDeclaration,
+   ExportNamedDeclaration,
+   Expression,
++  FunctionExpression,
+   Identifier,
+   ImportDeclaration,
++  SpreadElement,
+   VariableDeclaration,
+ } from 'estree'
+ import type { Rollup } from 'vite'
+@@ -16,7 +19,16 @@ import MagicString from 'magic-string'
+ import { relative } from 'pathe'
+ import { esmWalker } from './esmWalker'
+ 
++export interface StaticMockCall {
++  method: string
++  specifier: string
++  hasFactory: boolean
++  /** the factory uses `importOriginal`/`importActual` */
++  factoryLoadsOriginal: boolean
++}
++
+ export interface HoistMocksOptions {
++  onStaticMock?: (call: StaticMockCall) => void
+   /**
+    * List of modules that should always be imported before compiler hints.
+    * @default 'vitest'
+@@ -340,6 +352,22 @@ export function hoistMocks(
+               `Cannot export the result of "${method}". Remove export declaration because "${method}" doesn\'t return anything.`,
+             )
+           }
++          if (options.onStaticMock) {
++            const specifier = getStaticSpecifier(node.arguments[0])
++            if (specifier != null) {
++              // anything but an inline function may still load the original
++              const factory = node.arguments[1]?.type === 'ArrowFunctionExpression' || node.arguments[1]?.type === 'FunctionExpression'
++                ? node.arguments[1] as Positioned<ArrowFunctionExpression | FunctionExpression>
++                : undefined
++              options.onStaticMock({
++                method: methodName,
++                specifier,
++                hasFactory: factory != null,
++                factoryLoadsOriginal: factory != null
++                  && (factory.params.length > 0 || code.slice(factory.start, factory.end).includes('importActual')),
++              })
++            }
++          }
+           // rewrite vi.mock(import('..')) into vi.mock('..')
+           if (
+             node.type === 'CallExpression'
+@@ -610,3 +638,18 @@ function createIndexLocationsMap(source: string): Map<number, { line: number; co
+   }
+   return map
+ }
++
++function getStaticSpecifier(node: Expression | SpreadElement | undefined): string | undefined {
++  if (node?.type === 'AwaitExpression') {
++    node = node.argument
++  }
++  if (node?.type === 'ImportExpression') {
++    node = node.source
++  }
++  if (node?.type === 'Literal' && typeof node.value === 'string') {
++    return node.value
++  }
++  if (node?.type === 'TemplateLiteral' && node.expressions.length === 0) {
++    return node.quasis[0].value.cooked ?? undefined
++  }
++}
+diff --git a/packages/mocker/src/node/hoistMocksPlugin.ts b/packages/mocker/src/node/hoistMocksPlugin.ts
+index 001577acfcf5..86cd701ba5fc 100644
+--- a/packages/mocker/src/node/hoistMocksPlugin.ts
++++ b/packages/mocker/src/node/hoistMocksPlugin.ts
+@@ -1,6 +1,6 @@
+ import type { SourceMap } from 'magic-string'
+ import type { Plugin, Rollup } from 'vite'
+-import type { HoistMocksOptions } from './hoistMocks'
++import type { HoistMocksOptions, StaticMockCall } from './hoistMocks'
+ import { createFilter } from 'vite'
+ import { cleanUrl } from '../utils'
+ import { hoistMocks } from './hoistMocks'
+@@ -46,6 +46,7 @@ export function hoistMocksPlugin(options: HoistMocksPluginOptions = {}): Plugin
+       if (!filter(id)) {
+         return
+       }
++      const staticMocks: StaticMockCall[] = []
+       const s = hoistMocks(code, id, this.parse, {
+         regexpHoistable,
+         hoistableMockMethodNames,
+@@ -55,12 +56,19 @@ export function hoistMocksPlugin(options: HoistMocksPluginOptions = {}): Plugin
+         root,
+         getMap: () => this.getCombinedSourcemap(),
+         ...options,
++        onStaticMock(call) {
++          staticMocks.push(call)
++          options.onStaticMock?.(call)
++        },
+       })
+-      if (s) {
+-        return {
+-          code: s.toString(),
+-          map: s.generateMap({ hires: 'boundary', source: cleanUrl(id) }),
+-        }
++      // vite keeps `meta` across re-transforms, so always reset it
++      if (!s) {
++        return { meta: { vitestStaticMocks: null } }
++      }
++      return {
++        code: s.toString(),
++        map: s.generateMap({ hires: 'boundary', source: cleanUrl(id) }),
++        meta: { vitestStaticMocks: staticMocks },
+       }
+     },
+   }
+diff --git a/packages/mocker/src/node/index.ts b/packages/mocker/src/node/index.ts
+index f81d9db87739..78d66a22d951 100644
+--- a/packages/mocker/src/node/index.ts
++++ b/packages/mocker/src/node/index.ts
+@@ -3,6 +3,7 @@ export { automockModule } from './automock'
+ export type { AutomockPluginOptions } from './automockPlugin'
+ export { automockPlugin } from './automockPlugin'
+ export { dynamicImportPlugin } from './dynamicImportPlugin'
++export type { HoistMocksOptions, StaticMockCall } from './hoistMocks'
+ export { hoistMockAndResolve as hoistMocks, hoistMocksPlugin } from './hoistMocksPlugin'
+ export type { HoistMocksPluginOptions, HoistMocksResult } from './hoistMocksPlugin'
+ export { interceptorPlugin } from './interceptorPlugin'
+diff --git a/packages/vitest/src/node/cache/fsModuleCache.ts b/packages/vitest/src/node/cache/fsModuleCache.ts
+index dd377ed10088..96bb4c9aaeb2 100644
+--- a/packages/vitest/src/node/cache/fsModuleCache.ts
++++ b/packages/vitest/src/node/cache/fsModuleCache.ts
+@@ -1,4 +1,5 @@
+-import type { DevEnvironment } from 'vite'
++import type { StaticMockCall } from '@vitest/mocker/node'
++import type { DevEnvironment, TransformResult } from 'vite'
+ import type { ModuleType, VitestFetchResult } from '../../types/general'
+ import type { Vitest } from '../core'
+ import type { ResolvedConfig } from '../types/config'
+@@ -38,7 +39,7 @@ export class FileSystemModuleCache {
+   private rootCache: string
+   private metadataFilePath: string
+ 
+-  private version = '1.0.0-beta.6'
++  private version = '1.0.0-beta.7'
+   private fsCacheRoots = new WeakMap<ResolvedConfig, string>()
+   private fsEnvironmentHashMap = new WeakMap<DevEnvironment, string>()
+   private fsCacheKeyGenerators = new Set<CacheKeyIdGenerator>()
+@@ -136,12 +137,16 @@ export class FileSystemModuleCache {
+       importedUrls: meta.importedUrls,
+       mappings: meta.mappings,
+       moduleType: meta.moduleType,
++      deps: meta.deps,
++      dynamicDeps: meta.dynamicDeps,
++      staticMocks: meta.staticMocks,
+     }
+   }
+ 
+   async saveCachedModule(
+     cachedFilePath: string,
+     fetchResult: VitestFetchResult,
++    transformResult: TransformResult | null,
+     importedUrls: string[] = [],
+     mappings: boolean = false,
+   ): Promise<void> {
+@@ -153,6 +158,9 @@ export class FileSystemModuleCache {
+         importedUrls,
+         mappings,
+         moduleType: fetchResult.moduleType,
++        deps: transformResult?.deps,
++        dynamicDeps: transformResult?.dynamicDeps,
++        staticMocks: transformResult?.__vitestStaticMocks,
+       } satisfies Omit<CachedInlineModuleMeta, 'code'>
+       debugFs?.(`${c.yellow('[write]')} ${fetchResult.id} is cached in ${cachedFilePath}`)
+       await atomicWriteFile(cachedFilePath, `${fetchResult.code}${cacheComment}${this.toBase64(result)}`)
+@@ -406,6 +414,9 @@ export interface CachedInlineModuleMeta {
+   mappings: boolean
+   importedUrls: string[]
+   moduleType?: ModuleType
++  deps?: string[]
++  dynamicDeps?: string[]
++  staticMocks?: StaticMockCall[] | null
+ }
+ 
+ /**
+diff --git a/packages/vitest/src/node/environments/fetchModule.ts b/packages/vitest/src/node/environments/fetchModule.ts
+index 6a3462ea1fdd..26e180171a87 100644
+--- a/packages/vitest/src/node/environments/fetchModule.ts
++++ b/packages/vitest/src/node/environments/fetchModule.ts
+@@ -1,4 +1,5 @@
+ import type { Span } from '@opentelemetry/api'
++import type { StaticMockCall } from '@vitest/mocker/node'
+ import type { DevEnvironment, EnvironmentModuleNode, Rollup, TransformResult } from 'vite'
+ import type { FetchFunctionOptions, FetchResult } from 'vite/module-runner'
+ import type { FetchCachedFileSystemResult, ModuleType, VitestFetchResult } from '../../types/general'
+@@ -122,7 +123,7 @@ class ModuleFetcher {
+       }
+ 
+       const tmpFile = join(tmpDir, hash('sha1', result.id, 'hex'))
+-      return this.cacheResult(result, tmpFile).then((result) => {
++      return this.cacheResult(result, tmpFile, transformResult).then((result) => {
+         if (transformResult) {
+           transformResult.__vitestTmp = tmpFile
+         }
+@@ -148,7 +149,13 @@ class ModuleFetcher {
+     const map = moduleGraphModule.transformResult?.map
+     const mappings = map && !('version' in map) && map.mappings === ''
+ 
+-    const cachedResult = await this.cacheResult(result, cachePath, importedUrls, !!mappings)
++    const cachedResult = await this.cacheResult(
++      result,
++      cachePath,
++      moduleGraphModule.transformResult,
++      importedUrls,
++      !!mappings,
++    )
+     // remember where the code is stored on disk so that repeat fetches and the
+     // `fetchWarmModules` snapshot can point at it in this session already, not
+     // only after the cache is read back in the next one
+@@ -287,8 +294,11 @@ class ModuleFetcher {
+       code: cachedModule.code,
+       map,
+       ssr: true,
++      deps: cachedModule.deps,
++      dynamicDeps: cachedModule.dynamicDeps,
+       __vitestTmp: cachePath,
+       __vitestModuleType: moduleType,
++      __vitestStaticMocks: cachedModule.staticMocks,
+     }
+ 
+     // we populate the module graph to make the watch mode work because it relies on importers
+@@ -339,6 +349,10 @@ class ModuleFetcher {
+     if ('code' in result) {
+       result.moduleType = await this.cachedModuleType(result.file, result.code, moduleGraphModule.transformResult)
+     }
++    const transformResult = moduleGraphModule.transformResult
++    if (transformResult && moduleGraphModule.id) {
++      transformResult.__vitestStaticMocks ??= environment.pluginContainer.getModuleInfo(moduleGraphModule.id)?.meta?.vitestStaticMocks ?? null
++    }
+     return result
+   }
+ 
+@@ -374,6 +388,7 @@ class ModuleFetcher {
+   private async cacheResult(
+     result: FetchResult,
+     cachePath: string,
++    transformResult: TransformResult | null,
+     importedUrls: string[] = [],
+     mappings = false,
+   ): Promise<FetchResult | FetchCachedFileSystemResult> {
+@@ -386,7 +401,7 @@ class ModuleFetcher {
+     }
+ 
+     const savePromise = this.fsCache
+-      .saveCachedModule(cachePath, result, importedUrls, mappings)
++      .saveCachedModule(cachePath, result, transformResult, importedUrls, mappings)
+       .then(() => returnResult)
+       .catch((error) => {
+         debugFs?.(`failed to cache ${cachePath}, serving it inline: ${error}`)
+@@ -588,5 +603,7 @@ declare module 'vite' {
+     // `experimental.fsModuleCache` store or the forks pool's tmp copies
+     __vitestTmp?: string
+     __vitestModuleType?: ModuleType
++    // set by the hoistMocks plugin; null when the file was not hoisted
++    __vitestStaticMocks?: StaticMockCall[] | null
+   }
+ }
+diff --git a/packages/vitest/src/node/pools/rpc.ts b/packages/vitest/src/node/pools/rpc.ts
+index 671d37e12b2d..c92fac3ef6c9 100644
+--- a/packages/vitest/src/node/pools/rpc.ts
++++ b/packages/vitest/src/node/pools/rpc.ts
+@@ -1,3 +1,4 @@
++import type { StaticMockCall } from '@vitest/mocker/node'
+ import type { DevEnvironment, EnvironmentModuleNode, FetchResult } from 'vite'
+ import type { FetchFunctionOptions } from 'vite/module-runner'
+ import type { FetchCachedFileSystemResult } from '../../types/general'
+@@ -137,10 +138,10 @@ export function createMethodsRPC(project: TestProject, methodsOptions: MethodsOp
+           continue
+         }
+         // the transformed code is already stored on disk either by the forks
+-        // pool (`cacheFs`) or by `experimental.fsModuleCache` — the worker can
++        // pool (`cacheFs`) or by `fsModuleCache` — the worker can
+         // read the file itself instead of fetching each module separately.
+         // invalidated modules lose `transformResult` and drop out automatically
+-        const tmp = transformResult.__vitestTmp ?? (transformResult as { _vitest_tmp?: string })._vitest_tmp
++        const tmp = transformResult.__vitestTmp
+         if (typeof tmp !== 'string') {
+           continue
+         }
+@@ -151,10 +152,6 @@ export function createMethodsRPC(project: TestProject, methodsOptions: MethodsOp
+           tmp,
+           url: node.url,
+           invalidate: false,
+-          // the fetch that stored this module on disk also memoized its module
+-          // type on the transform result (only when `injectCjsGlobals` is
+-          // disabled); reuse it so the evaluator injects the CJS globals for the
+-          // same modules it would on the direct-fetch path, no re-detection here
+           moduleType: transformResult.__vitestModuleType,
+         }
+         warm[node.url] = entry
+@@ -175,20 +172,79 @@ export function createMethodsRPC(project: TestProject, methodsOptions: MethodsOp
+     async prewarmModuleGraph(environmentName, files) {
+       const environment = getEnvironment(environmentName)
+       const moduleGraph = environment.moduleGraph
+-      const seen = new Set<string>()
+ 
+-      async function walkNode(node: EnvironmentModuleNode): Promise<void> {
++      function getStaticMocks(node: EnvironmentModuleNode): StaticMockCall[] | null | undefined {
++        return node.transformResult?.__vitestStaticMocks
++          ?? environment.pluginContainer.getModuleInfo(node.id!)?.meta?.vitestStaticMocks
++      }
++
++      // modules the root replaces with an inline factory are never requested
++      async function resolveMockedIds(root: EnvironmentModuleNode): Promise<Set<string>> {
++        const ids = new Set<string>()
++        const mocks = getStaticMocks(root)?.filter(
++          mock => mock.method === 'mock' && mock.hasFactory && !mock.factoryLoadsOriginal,
++        )
++        if (mocks?.length) {
++          await Promise.all(mocks.map(async (mock) => {
++            const resolved = await environment.pluginContainer.resolveId(mock.specifier, root.id ?? undefined).catch(() => null)
++            if (resolved) {
++              ids.add(resolved.id)
++            }
++          }))
++        }
++        return ids
++      }
++
++      // `import()` targets load on demand; a hoisted file's imports are all
++      // rewritten to `import()`, so none of them count
++      function getDynamicOnlyIds(node: EnvironmentModuleNode): Set<string> | undefined {
++        const result = node.transformResult
++        if (!result?.dynamicDeps?.length || getStaticMocks(node)) {
++          return undefined
++        }
++        const staticDeps = new Set(result.deps)
++        const dynamicOnly = new Set(result.dynamicDeps.filter(dep => !staticDeps.has(dep)))
++        if (!dynamicOnly.size) {
++          return undefined
++        }
++        const ids = new Set<string>()
++        for (const child of node.importedModules) {
++          if (child.id != null && dynamicOnly.has(child.url)) {
++            ids.add(child.id)
++          }
++        }
++        return ids
++      }
++
++      async function load(url: string, importer: string | undefined): Promise<EnvironmentModuleNode | undefined> {
++        try {
++          const fetchResult = await fetchModule(url, importer, environment, undefined, undefined, false)
++          if ('id' in fetchResult) {
++            return moduleGraph.getModuleById(fetchResult.id)
++          }
++        }
++        catch {
++          // the worker's own fetch will surface the error with the proper import context
++        }
++        return undefined
++      }
++
++      async function walkNode(node: EnvironmentModuleNode, skip: Set<string>): Promise<void> {
++        const dynamicOnly = getDynamicOnlyIds(node)
+         const children: Promise<void>[] = []
+         for (const child of node.importedModules) {
+-          if (child.url == null || seen.has(child.url)) {
++          if (child.id == null || skip.has(child.id) || dynamicOnly?.has(child.id)) {
+             continue
+           }
++          skip.add(child.id)
+           if (child.transformResult) {
+-            seen.add(child.url)
+-            children.push(walkNode(child))
++            children.push(walkNode(child, skip))
+           }
+           else {
+-            children.push(fetchNode(child.url, node.id ?? undefined))
++            children.push(
++              load(child.url, node.id ?? undefined)
++                .then(loaded => loaded && walkNode(loaded, skip)),
++            )
+           }
+         }
+         if (children.length) {
+@@ -196,44 +252,27 @@ export function createMethodsRPC(project: TestProject, methodsOptions: MethodsOp
+         }
+       }
+ 
+-      async function fetchNode(url: string, importer: string | undefined): Promise<void> {
+-        if (seen.has(url)) {
+-          return
+-        }
+-        seen.add(url)
+-        try {
+-          await fetchModule(url, importer, environment, undefined, undefined, false)
+-        }
+-        catch {
+-          // the worker's own fetch will surface the error with the proper
+-          // import context
+-          return
+-        }
+-        let node: EnvironmentModuleNode | undefined
+-        try {
+-          node = await moduleGraph.getModuleByUrl(url) ?? moduleGraph.getModuleById(url) ?? undefined
+-        }
+-        catch {
+-          node = moduleGraph.getModuleById(url) ?? undefined
+-        }
+-        if (node) {
+-          await walkNode(node)
++      async function walkRoot(root: EnvironmentModuleNode): Promise<void> {
++        const skip = await resolveMockedIds(root)
++        skip.add(root.id!)
++        await walkNode(root, skip)
++      }
++
++      async function loadRoot(url: string): Promise<void> {
++        const root = await load(url, undefined)
++        if (root) {
++          await walkRoot(root)
+         }
+       }
+ 
+       await Promise.all([...files, ...project.config.setupFiles].map(async (file) => {
+         const nodes = moduleGraph.getModulesByFile(file)
+-        if (nodes && nodes.size) {
+-          await Promise.all(Array.from(nodes, (node) => {
+-            if (node.transformResult) {
+-              seen.add(node.url)
+-              return walkNode(node)
+-            }
+-            return fetchNode(node.url, undefined)
+-          }))
++        if (nodes?.size) {
++          await Promise.all(Array.from(nodes, node =>
++            node.transformResult ? walkRoot(node) : loadRoot(node.url)))
+         }
+         else {
+-          await fetchNode(file, undefined)
++          await loadRoot(file)
+         }
+       }))
+     },
+diff --git a/test/e2e/test/vm-threads.test.ts b/test/e2e/test/vm-threads.test.ts
+index b9ff981f6461..7b4f68547f52 100644
+--- a/test/e2e/test/vm-threads.test.ts
++++ b/test/e2e/test/vm-threads.test.ts
+@@ -1,6 +1,8 @@
++import { relative, resolve } from 'pathe'
+ import { expect, test } from 'vitest'
++import { createMethodsRPC, createVitest } from 'vitest/node'
+ 
+-import { createFile, resolvePath, runInlineTests, runVitest, runVitestCli } from '../../test-utils'
++import { createFile, resolvePath, runInlineTests, runVitest, runVitestCli, useFS } from '../../test-utils'
+ 
+ test('importing files in restricted fs works correctly', async () => {
+   createFile(
+@@ -573,3 +575,75 @@ test.for([
+     expect(exitCode).toBe(0)
+   },
+ )
++
++test('prewarm skips factory-mocked and dynamically imported subtrees', async () => {
++  const leaves = (dir: string) => Object.fromEntries(
++    Array.from({ length: 5 }, (_, i) => [`${dir}/leaf${i}.js`, `export const v${i} = ${i}`]),
++  )
++  const barrel = Array.from({ length: 5 }, (_, i) => `export * from './leaf${i}.js'`).join('\n')
++  const root = resolvePath(import.meta.url, '../fixtures/vm-prewarm')
++  const cacheDir = resolve(root, 'cache')
++  useFS(root, {
++    ...leaves('used'),
++    ...leaves('mocked'),
++    ...leaves('spied'),
++    ...leaves('lazy'),
++    ...leaves('setup-only'),
++    'used/index.js': barrel,
++    'mocked/index.js': barrel,
++    'mocked/other.js': `export * from './index.js'`,
++    'spied/index.js': barrel,
++    'lazy/index.js': barrel,
++    'setup-only/index.js': barrel,
++    'setup.js': `import './setup-only/index.js'`,
++    'consumer.js': `
++      export * as used from './used/index.js'
++      export * as mocked from './mocked/index.js'
++      export * as other from './mocked/other.js'
++      export * as spied from './spied/index.js'
++      export const lazy = () => import('./lazy/index.js')
++    `,
++    'consumer.test.js': `
++      import { test, vi } from 'vitest'
++      import * as consumer from './consumer.js'
++
++      vi.mock('./mocked/index.js', () => ({ a: 1 }))
++      vi.mock(\`./mocked/other.js\`, () => ({ b: 1 }))
++      vi.mock('./spied/index.js', { spy: true })
++      vi.mock('./setup-only/index.js', () => ({ c: 1 }))
++
++      test('stub', () => consumer)
++    `,
++  })
++
++  async function prewarmed(prepare: 'fetch' | 'transformRequest'): Promise<string[]> {
++    const ctx = await createVitest('test', { root, watch: false, setupFiles: ['./setup.js'], fsModuleCache: true, fsModuleCachePath: cacheDir, reporters: [] })
++    try {
++      const project = ctx.getRootProject()
++      const rpc = createMethodsRPC(project)
++      const testFile = resolve(root, 'consumer.test.js')
++      // workers fetch the test file first; preParse transforms it directly
++      if (prepare === 'fetch') {
++        await rpc.fetch(testFile, undefined, 'ssr')
++      }
++      else {
++        await project.vite.environments.ssr.transformRequest(testFile)
++      }
++      await rpc.prewarmModuleGraph('ssr', [testFile])
++      return [...project.vite.environments.ssr.moduleGraph.idToModuleMap.values()]
++        .filter(mod => mod.transformResult && mod.id?.startsWith(root) && mod.id !== testFile)
++        .map(mod => relative(root, mod.id!))
++        .sort()
++    }
++    finally {
++      await ctx.close()
++    }
++  }
++
++  const subtree = (dir: string) => [`${dir}/index.js`, ...Array.from({ length: 5 }, (_, i) => `${dir}/leaf${i}.js`)]
++  const expected = ['consumer.js', ...subtree('setup-only'), 'setup.js', ...subtree('spied'), ...subtree('used')]
++  expect(await prewarmed('fetch')).toEqual(expected)
++  // fs module cache hit
++  expect(await prewarmed('fetch')).toEqual(expected)
++  expect(await prewarmed('transformRequest')).toEqual(expected)
++})

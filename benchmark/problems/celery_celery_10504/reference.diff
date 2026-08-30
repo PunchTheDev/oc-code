@@ -1,0 +1,772 @@
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index 93b68e1bbe5..a61a1b4af9e 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -15,6 +15,9 @@
+ from weakref import WeakValueDictionary
+ 
+ from billiard.einfo import ExceptionInfo
++from kombu.compression import compress, decompress
++from kombu.compression import encoders as compression_encoders
++from kombu.compression import get_encoder as get_compression_encoder
+ from kombu.serialization import dumps, loads, prepare_accept_content
+ from kombu.serialization import registry as serializer_registry
+ from kombu.utils.encoding import bytes_to_str, ensure_bytes
+@@ -38,6 +41,21 @@
+ 
+ EXCEPTION_ABLE_CODECS = frozenset({'pickle'})
+ 
++#: Marker prepended to compressed result payloads.
++#:
++#: Unlike a task message, a stored result has nowhere to keep the
++#: ``compression`` header that Kombu uses to tell a consumer how a body was
++#: compressed, because backends store the payload as a single opaque value.
++#: The compression type therefore travels in-band, in front of the compressed
++#: body: ``MAGIC + content-type + b'\0' + body``.
++#:
++#: The leading NUL byte cannot start the output of any serializer Celery
++#: ships with (JSON and YAML are text, pickle starts with an opcode, and
++#: msgpack encodes a mapping with a byte in the ``0x80``-``0xdf`` range), so a
++#: payload written before compression was turned on is never mistaken for a
++#: compressed one.
++COMPRESSED_PAYLOAD_MAGIC = b'\x00celery-compressed\x00'
++
+ logger = get_logger(__name__)
+ 
+ MESSAGE_BUFFER_MAX = 8192
+@@ -60,6 +78,53 @@
+ Result backends that supports chords: Redis, Database, Memcached, and more.
+ """
+ 
++E_UNKNOWN_COMPRESSION = """\
++Unknown compression method {0!r} configured in result_compression.
++Available methods are: {1}.
++"""
++
++W_COMPRESSION_UNSUPPORTED = """\
++The {0} result backend cannot store compressed payloads, so the
++result_compression setting is ignored and results are stored uncompressed.
++"""
++
++
++def compress_payload(payload, compression):
++    """Compress an encoded result payload.
++
++    The returned payload describes its own compression method, so
++    :func:`decompress_payload` can undo this without being told which
++    method was used.
++
++    Arguments:
++        payload (AnyStr): An encoded result payload.
++        compression (str): Name of a method in the Kombu compression
++            registry, for example ``'gzip'``.
++    """
++    body, content_type = compress(payload, compression)
++    return b''.join([
++        COMPRESSED_PAYLOAD_MAGIC, content_type.encode('utf-8'), b'\x00', body,
++    ])
++
++
++def decompress_payload(payload):
++    """Decompress a payload written by :func:`compress_payload`.
++
++    Payloads that don't carry the marker are returned as they are, so
++    results stored before compression was enabled are still readable, and
++    payloads that do carry it are decompressed even when the reader has no
++    compression of its own configured.
++    """
++    if isinstance(payload, memoryview):
++        payload = payload.tobytes()
++    if not isinstance(payload, (bytes, bytearray)):
++        return payload
++    if not payload.startswith(COMPRESSED_PAYLOAD_MAGIC):
++        return payload
++    content_type, _, body = payload[
++        len(COMPRESSED_PAYLOAD_MAGIC):].partition(b'\x00')
++    return decompress(body, content_type.decode('utf-8'))
++
+ 
+ def unpickle_backend(cls, args, kwargs):
+     """Return an unpickled backend."""
+@@ -129,6 +194,13 @@ class Backend:
+     #: Set to true if the backend is persistent by default.
+     persistent = True
+ 
++    #: If true the backend can store a result payload that has been
++    #: compressed, which means storing and returning arbitrary bytes
++    #: unchanged.  Backends that put the payload inside a JSON document, or
++    #: that decode it to text on the way out, can't, and the
++    #: :setting:`result_compression` setting is ignored for them.
++    supports_result_compression = False
++
+     retry_policy = {
+         'max_retries': 20,
+         'interval_start': 0,
+@@ -145,6 +217,8 @@ def __init__(self, app,
+         (self.content_type,
+          self.content_encoding,
+          self.encoder) = serializer_registry._encoders[self.serializer]
++        self.compression = self.prepare_compression(
++            conf.get('result_compression'))
+         cmax = max_cached_results or conf.result_cache_max
+         self._cache = _nulldict() if cmax == -1 else LRUCache(limit=cmax)
+ 
+@@ -534,6 +608,8 @@ def prepare_value(self, result):
+ 
+     def encode(self, data):
+         _, _, payload = self._encode(data)
++        if self.compression:
++            payload = compress_payload(payload, self.compression)
+         return payload
+ 
+     def _encode(self, data):
+@@ -551,11 +627,39 @@ def decode(self, payload):
+         if payload is None:
+             return payload
+         payload = payload or str(payload)
++        # Driven by the payload itself rather than by ``self.compression`` so
++        # that a result stays readable after the setting is turned off again,
++        # and so that a reader that never had it turned on can still read a
++        # result written by a worker that did.
++        payload = decompress_payload(payload)
+         return loads(payload,
+                      content_type=self.content_type,
+                      content_encoding=self.content_encoding,
+                      accept=self.accept)
+ 
++    def prepare_compression(self, compression):
++        """Return the compression method to encode results with.
++
++        Returns :const:`None` when results should be stored uncompressed,
++        either because nothing was configured or because this backend can't
++        hold a compressed payload.
++        """
++        if not compression:
++            return None
++        if not self.supports_result_compression:
++            warnings.warn(
++                W_COMPRESSION_UNSUPPORTED.format(type(self).__name__),
++                UserWarning,
++            )
++            return None
++        try:
++            get_compression_encoder(compression)
++        except KeyError as e:
++            raise ImproperlyConfigured(E_UNKNOWN_COMPRESSION.format(
++                compression,
++                ', '.join(sorted(compression_encoders())))) from e
++        return compression
++
+     def prepare_expires(self, value, type=None):
+         if value is None:
+             value = self.app.conf.result_expires
+diff --git a/celery/backends/cassandra.py b/celery/backends/cassandra.py
+index 4ca071d2d03..2e1141113ae 100644
+--- a/celery/backends/cassandra.py
++++ b/celery/backends/cassandra.py
+@@ -1,6 +1,8 @@
+ """Apache Cassandra result store backend using the DataStax driver."""
+ import threading
+ 
++from kombu.utils.encoding import ensure_bytes
++
+ from celery import states
+ from celery.exceptions import ImproperlyConfigured
+ from celery.utils.log import get_logger
+@@ -65,7 +67,10 @@
+ 
+ 
+ def buf_t(x):
+-    return bytes(x, 'utf8')
++    # The payload is str for serializers that produce text and bytes for the
++    # binary ones, and always bytes once result_compression is set, so pass
++    # bytes through rather than assuming str.
++    return ensure_bytes(x)
+ 
+ 
+ class CassandraBackend(BaseBackend):
+@@ -85,6 +90,9 @@ class CassandraBackend(BaseBackend):
+ 
+     supports_autoexpire = True      # autoexpire supported via entry_ttl
+ 
++    # The result, traceback and children columns are all blobs.
++    supports_result_compression = True
++
+     def __init__(self, servers=None, keyspace=None, table=None, entry_ttl=None,
+                  port=None, bundle_path=None, **kwargs):
+         super().__init__(**kwargs)
+diff --git a/celery/backends/dynamodb.py b/celery/backends/dynamodb.py
+index 0423a468014..c6b3e50706d 100644
+--- a/celery/backends/dynamodb.py
++++ b/celery/backends/dynamodb.py
+@@ -55,6 +55,9 @@ class DynamoDBBackend(KeyValueStoreBackend):
+     # DynamoDB supports Time to Live as an auto-expiry mechanism.
+     supports_autoexpire = True
+ 
++    # The result attribute is stored as a DynamoDB binary attribute.
++    supports_result_compression = True
++
+     _key_field = DynamoDBAttribute(name='id', data_type='S')
+     # Each record has either a value field or count field
+     _value_field = DynamoDBAttribute(name='result', data_type='B')
+diff --git a/celery/backends/filesystem.py b/celery/backends/filesystem.py
+index 1a624f3be62..3ea6caf0c0f 100644
+--- a/celery/backends/filesystem.py
++++ b/celery/backends/filesystem.py
+@@ -33,6 +33,9 @@ class FilesystemBackend(KeyValueStoreBackend):
+         encoding (str): encoding used on the file-system
+     """
+ 
++    # Result files are opened in binary mode in both directions.
++    supports_result_compression = True
++
+     def __init__(self, url=None, open=open, unlink=os.unlink, sep=os.sep,
+                  encoding=default_encoding, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+diff --git a/celery/backends/gcs.py b/celery/backends/gcs.py
+index 8609a84dec4..5a5d1be84a2 100644
+--- a/celery/backends/gcs.py
++++ b/celery/backends/gcs.py
+@@ -167,6 +167,9 @@ class GCSBackend(GCSBackendBase):
+     implements_incr = True
+     supports_native_join = True
+ 
++    # Blobs are uploaded from and downloaded to bytes.
++    supports_result_compression = True
++
+     # Firestore parameters
+     _collection_name = 'celery'
+     _field_count = 'chord_count'
+diff --git a/celery/backends/mongodb.py b/celery/backends/mongodb.py
+index 474c58ffaa7..613e6a35528 100644
+--- a/celery/backends/mongodb.py
++++ b/celery/backends/mongodb.py
+@@ -54,6 +54,9 @@ class MongoBackend(BaseBackend):
+ 
+     supports_autoexpire = False
+ 
++    # Bytes round-trip through BSON as a binary field.
++    supports_result_compression = True
++
+     _connection = None
+ 
+     def __init__(self, app=None, **kwargs):
+diff --git a/celery/backends/redis.py b/celery/backends/redis.py
+index 768f48d91c3..58dc7cfb758 100644
+--- a/celery/backends/redis.py
++++ b/celery/backends/redis.py
+@@ -220,6 +220,8 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
+ 
+     supports_autoexpire = True
+     supports_native_join = True
++    # Results are stored as opaque strings, which Redis keeps byte for byte.
++    supports_result_compression = True
+ 
+     #: Maximal length of string value in Redis.
+     #: 512 MB - https://redis.io/topics/data-types
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index 9f34706df42..4e3ddc0f74b 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -155,7 +155,7 @@ For a complete Django example, see :ref:`django-first-steps`.
+ ``CELERY_REDIS_BACKEND_CREDENTIAL_PROVIDER`` :setting:`redis_backend_credential_provider`
+ ``CELERY_RESULT_BACKEND``                  :setting:`result_backend`
+ ``CELERY_MAX_CACHED_RESULTS``              :setting:`result_cache_max`
+-``CELERY_MESSAGE_COMPRESSION``             :setting:`result_compression`
++``CELERY_RESULT_COMPRESSION``              :setting:`result_compression`
+ ``CELERY_RESULT_EXCHANGE``                 :setting:`result_exchange`
+ ``CELERY_RESULT_EXCHANGE_TYPE``            :setting:`result_exchange_type`
+ ``CELERY_RESULT_EXPIRES``                  :setting:`result_expires`
+@@ -173,7 +173,7 @@ For a complete Django example, see :ref:`django-first-steps`.
+ ``CELERY_ACKS_ON_FAILURE_OR_TIMEOUT``      :setting:`task_acks_on_failure_or_timeout`
+ ``CELERY_TASK_ALWAYS_EAGER``               :setting:`task_always_eager`
+ ``CELERY_ANNOTATIONS``                     :setting:`task_annotations`
+-``CELERY_COMPRESSION``                     :setting:`task_compression`
++``CELERY_MESSAGE_COMPRESSION``             :setting:`task_compression`
+ ``CELERY_CREATE_MISSING_QUEUES``           :setting:`task_create_missing_queues`
+ ``CELERY_CREATE_MISSING_QUEUE_TYPE``       :setting:`task_create_missing_queue_type`
+ ``CELERY_CREATE_MISSING_QUEUE_EXCHANGE_TYPE`` :setting:`task_create_missing_queue_exchange_type`
+@@ -948,9 +948,31 @@ serialization formats.
+ 
+ Default: No compression.
+ 
++.. versionchanged:: 5.7
++
++    This setting is now applied to stored results. It was accepted but never
++    used before 5.7, so results were always stored uncompressed. Every worker
++    and client that reads results has to be on 5.7 or later before you turn
++    it on. An unknown compression method now raises
++    :exc:`~celery.exceptions.ImproperlyConfigured` instead of being ignored.
++
+ Optional compression method used for task results.
+ Supports the same options as the :setting:`task_compression` setting.
+ 
++A compressed result is stored as binary data, so this setting is only
++honoured by backends that can hold a payload of arbitrary bytes and hand it
++back unchanged. Those are the Redis, MongoDB, Cassandra, DynamoDB,
++Google Cloud Storage and file-system backends. On any other backend the
++setting is ignored, a warning is emitted when the backend is created, and
++results are stored uncompressed.
++
++Each compressed result records which method compressed it, so a worker or
++client reads a compressed result correctly whether or not it has this
++setting turned on itself, and results written before the setting was turned
++on stay readable. Older versions of Celery don't know how to read a
++compressed result at all, so when you roll this out, upgrade every worker
++and client first and turn the setting on afterwards.
++
+ .. setting:: result_extended
+ 
+ ``result_extended``
+diff --git a/t/unit/backends/test_base.py b/t/unit/backends/test_base.py
+index b7f811df83d..ed43a7d17d2 100644
+--- a/t/unit/backends/test_base.py
++++ b/t/unit/backends/test_base.py
+@@ -11,9 +11,11 @@
+ import celery
+ from celery import chord, group, signature, states, uuid
+ from celery.app.task import Context, Task
+-from celery.backends.base import (BaseBackend, DisabledBackend, KeyValueStoreBackend, _create_chord_error_with_cause,
+-                                  _create_fake_task_request, _nulldict)
+-from celery.exceptions import BackendGetMetaError, BackendStoreError, ChordError, SecurityError, TimeoutError
++from celery.backends.base import (COMPRESSED_PAYLOAD_MAGIC, BaseBackend, DisabledBackend, KeyValueStoreBackend,
++                                  _create_chord_error_with_cause, _create_fake_task_request, _nulldict,
++                                  compress_payload, decompress_payload)
++from celery.exceptions import (BackendGetMetaError, BackendStoreError, ChordError, ImproperlyConfigured,
++                               SecurityError, TimeoutError)
+ from celery.result import GroupResult, result_from_tuple
+ from celery.utils import serialization
+ from celery.utils.functional import pass1
+@@ -377,6 +379,10 @@ def delete(self, key):
+         self.db.pop(key, None)
+ 
+ 
++class CompressingKVBackend(KVBackend):
++    supports_result_compression = True
++
++
+ class DictBackend(BaseBackend):
+ 
+     def __init__(self, *args, **kwargs):
+@@ -1526,6 +1532,136 @@ def test_task_result_exists_after_forget(self):
+         assert self.b.task_result_exists(tid) is False
+ 
+ 
++class test_result_compression:
++
++    def setup_method(self):
++        self.app.conf.result_serializer = 'json'
++        self.app.conf.accept_content = ['json']
++
++    def backend(self, compression=None, cls=CompressingKVBackend):
++        self.app.conf.result_compression = compression
++        return cls(app=self.app)
++
++    def test_compression_is_off_by_default(self):
++        b = self.backend()
++        assert b.compression is None
++        payload = b.encode({'foo': 'bar'})
++        assert payload == '{"foo": "bar"}'
++        assert b.decode(payload) == {'foo': 'bar'}
++
++    @pytest.mark.parametrize('compression', ['gzip', 'zlib', 'bzip2'])
++    def test_encode_compresses_and_decode_round_trips(self, compression):
++        b = self.backend(compression)
++        assert b.compression == compression
++        payload = b.encode({'foo': 'bar'})
++        assert isinstance(payload, bytes)
++        assert payload.startswith(COMPRESSED_PAYLOAD_MAGIC)
++        assert b.decode(payload) == {'foo': 'bar'}
++
++    def test_compressed_payload_is_smaller(self):
++        data = {'result': ['a repetitive value'] * 200}
++        assert len(self.backend('gzip').encode(data)) < len(
++            self.backend().encode(data))
++
++    def test_decode_reads_an_uncompressed_payload(self):
++        payload = self.backend().encode({'foo': 'bar'})
++        b = self.backend('gzip')
++        assert b.decode(payload) == {'foo': 'bar'}
++        assert b.decode(ensure_bytes(payload)) == {'foo': 'bar'}
++
++    def test_decode_reads_a_compressed_payload_with_compression_off(self):
++        payload = self.backend('gzip').encode({'foo': 'bar'})
++        assert self.backend().decode(payload) == {'foo': 'bar'}
++
++    def test_stores_compressed_and_reads_back_older_results(self):
++        old = self.backend()
++        old.store_result('legacy', {'foo': 'bar'}, states.SUCCESS)
++        # a real backend hands the stored payload back as bytes
++        stored = {key: ensure_bytes(value) for key, value in old.db.items()}
++
++        b = self.backend('gzip')
++        b.db = stored
++        b.store_result('current', {'foo': 'baz'}, states.SUCCESS)
++
++        assert stored[b.get_key_for_task('legacy')].startswith(b'{')
++        assert stored[b.get_key_for_task('current')].startswith(
++            COMPRESSED_PAYLOAD_MAGIC)
++        assert b.get_result('legacy') == {'foo': 'bar'}
++        assert b.get_result('current') == {'foo': 'baz'}
++
++    def test_exception_result_round_trips(self):
++        b = self.backend('gzip')
++        b.store_result('errored', KeyError('boom'), states.FAILURE)
++        assert isinstance(b.get_result('errored'), KeyError)
++
++    def test_ignored_when_the_backend_cannot_store_bytes(self):
++        with pytest.warns(UserWarning,
++                          match='cannot store compressed payloads'):
++            b = self.backend('gzip', cls=KVBackend)
++        assert b.compression is None
++        assert b.encode({'foo': 'bar'}) == '{"foo": "bar"}'
++
++    def test_unknown_compression_method_is_rejected(self):
++        with pytest.raises(ImproperlyConfigured,
++                           match='Unknown compression method'):
++            self.backend('no-such-compression')
++
++    def test_decompress_payload_leaves_other_types_alone(self):
++        assert decompress_payload('{"foo": "bar"}') == '{"foo": "bar"}'
++        assert decompress_payload(42) == 42
++
++    def test_decompress_payload_accepts_a_memoryview(self):
++        payload = compress_payload(b'{"foo": "bar"}', 'gzip')
++        assert decompress_payload(memoryview(payload)) == b'{"foo": "bar"}'
++
++
++class test_result_compression_binary_serializer:
++    """Compression on top of a serializer that already produces bytes.
++
++    Kombu's ``dumps`` returns bytes for pickle and msgpack, so ``encode``
++    compresses bytes rather than str, and the value stored has no valid text
++    encoding at all. This is the boundary the Cassandra write path broke on.
++    """
++
++    def backend(self, serializer, compression='gzip'):
++        self.app.conf.result_serializer = serializer
++        self.app.conf.accept_content = [serializer]
++        self.app.conf.result_compression = compression
++        return CompressingKVBackend(app=self.app)
++
++    @pytest.mark.parametrize('serializer', ['pickle', 'msgpack'])
++    def test_store_and_get_binary_result(self, serializer):
++        pytest.importorskip(serializer)
++        b = self.backend(serializer)
++        # The premise of this class: the payload is bytes before compression
++        # touches it, not only after.
++        assert isinstance(b._encode({'foo': 'bar'})[2], bytes)
++
++        # The value has no valid text encoding, so anything decoding the
++        # payload to str on the way through raises rather than quietly
++        # changing it.
++        result = {'value': b'\x00\x01\x02\xff', 'text': 'a value ' * 40}
++        b.store_result('binary', result, states.SUCCESS)
++
++        stored = ensure_bytes(b.db[b.get_key_for_task('binary')])
++        assert stored.startswith(COMPRESSED_PAYLOAD_MAGIC)
++        assert b.get_result('binary') == result
++
++    @pytest.mark.parametrize('serializer', ['pickle', 'msgpack'])
++    def test_uncompressed_binary_payload_is_not_read_as_compressed(
++            self, serializer):
++        # The marker starts with NUL, which neither serializer can start its
++        # own output with, so a payload written before compression was turned
++        # on is not mistaken for a compressed one.
++        pytest.importorskip(serializer)
++        plain = self.backend(serializer, compression=None)
++        payload = plain.encode({'value': b'\x00\x01\x02\xff'})
++        assert isinstance(payload, bytes)
++        assert not payload.startswith(COMPRESSED_PAYLOAD_MAGIC)
++        assert self.backend(serializer).decode(payload) == {
++            'value': b'\x00\x01\x02\xff'}
++
++
+ class test_KeyValueStoreBackend_interface:
+ 
+     def test_get(self):
+diff --git a/t/unit/backends/test_cassandra.py b/t/unit/backends/test_cassandra.py
+index b51b51d056c..a99bbadd94d 100644
+--- a/t/unit/backends/test_cassandra.py
++++ b/t/unit/backends/test_cassandra.py
+@@ -5,6 +5,7 @@
+ import pytest
+ 
+ from celery import states
++from celery.backends.base import COMPRESSED_PAYLOAD_MAGIC
+ from celery.exceptions import ImproperlyConfigured
+ from celery.utils.objects import Bunch
+ 
+@@ -16,6 +17,28 @@
+ ]
+ 
+ 
++class FakeCassandraTable:
++    """Stand-in for ``Session.execute`` that keeps the rows it is given.
++
++    The real driver hands a blob column back as ``bytes``, so the values a
++    write puts in are the values a read takes out, which is what makes a
++    store-then-retrieve assertion meaningful here.
++    """
++
++    def __init__(self):
++        self.rows = {}
++
++    def __call__(self, statement, parameters=None):
++        if parameters is not None and len(parameters) > 1:
++            task_id, status, result, date_done, traceback, children = \
++                parameters
++            self.rows[task_id] = (
++                status, result, date_done, traceback, children)
++            return Mock(name='write-result')
++        task_id, = parameters
++        return Mock(one=Mock(return_value=self.rows.get(task_id)))
++
++
+ class test_CassandraBackend:
+ 
+     def setup_method(self):
+@@ -144,6 +167,75 @@ def test_store_result(self, module):
+         session.execute = Mock()
+         x._store_result('task_id', 'result', states.SUCCESS)
+ 
++    @pytest.mark.patched_module(*CASSANDRA_MODULES)
++    def test_store_result_compressed(self, module):
++        # encode() returns bytes once result_compression is set, and the
++        # result, traceback and children columns are blobs, so the write path
++        # has to accept bytes as well as str.
++        from celery.backends import cassandra as mod
++        mod.cassandra = Mock()
++
++        self.app.conf.result_compression = 'gzip'
++        x = mod.CassandraBackend(app=self.app)
++        session = x._session = Mock()
++        session.execute = Mock()
++        x._store_result('task_id', 'result', states.SUCCESS)
++
++        params = session.execute.call_args[0][1]
++        # result, traceback and children; index 3 is the date_done timestamp.
++        assert all(isinstance(params[i], bytes) for i in (2, 4, 5))
++        assert x.decode(params[2]) == 'result'
++
++    @pytest.mark.patched_module(*CASSANDRA_MODULES)
++    @pytest.mark.parametrize('serializer', ['json', 'pickle'])
++    def test_store_and_get_result_compressed(self, module, serializer):
++        # Round trip across the backend boundary rather than through encode()
++        # on its own: the row the write path hands the driver is the row the
++        # read path is given back, so anything the backend does to the bytes
++        # on the way in has to survive the way out.
++        from celery.backends import cassandra as mod
++        mod.cassandra = Mock()
++
++        self.app.conf.result_serializer = serializer
++        self.app.conf.accept_content = [serializer]
++        self.app.conf.result_compression = 'gzip'
++        x = mod.CassandraBackend(app=self.app)
++        x._session = Mock()
++        x._session.execute = FakeCassandraTable()
++
++        result = {'value': 'a repetitive value ' * 40}
++        x._store_result('task_id', result, states.SUCCESS)
++
++        stored = x._session.execute.rows['task_id'][1]
++        assert isinstance(stored, bytes)
++        assert stored.startswith(COMPRESSED_PAYLOAD_MAGIC)
++
++        meta = x._get_task_meta_for('task_id')
++        assert meta['status'] == states.SUCCESS
++        assert meta['result'] == result
++
++    @pytest.mark.patched_module(*CASSANDRA_MODULES)
++    def test_get_result_written_before_compression(self, module):
++        # A worker with compression off writes str for a text serializer, and
++        # the reader has to keep taking that once compression is turned on.
++        from celery.backends import cassandra as mod
++        mod.cassandra = Mock()
++
++        table = FakeCassandraTable()
++        writer = mod.CassandraBackend(app=self.app)
++        writer._session = Mock()
++        writer._session.execute = table
++        writer._store_result('task_id', {'foo': 'bar'}, states.SUCCESS)
++        assert isinstance(table.rows['task_id'][1], bytes)
++        assert not table.rows['task_id'][1].startswith(
++            COMPRESSED_PAYLOAD_MAGIC)
++
++        self.app.conf.result_compression = 'gzip'
++        reader = mod.CassandraBackend(app=self.app)
++        reader._session = Mock()
++        reader._session.execute = table
++        assert reader._get_task_meta_for('task_id')['result'] == {'foo': 'bar'}
++
+     def test_timeouting_cluster(self):
+         # Tests behavior when Cluster.connect raises
+         # cassandra.OperationTimedOut.
+diff --git a/t/unit/backends/test_filesystem.py b/t/unit/backends/test_filesystem.py
+index 7f66a6aeae3..c169dc3ff2f 100644
+--- a/t/unit/backends/test_filesystem.py
++++ b/t/unit/backends/test_filesystem.py
+@@ -10,6 +10,7 @@
+ import t.skip
+ from celery import states, uuid
+ from celery.backends import filesystem
++from celery.backends.base import COMPRESSED_PAYLOAD_MAGIC
+ from celery.backends.filesystem import FilesystemBackend
+ from celery.exceptions import ImproperlyConfigured
+ 
+@@ -74,6 +75,70 @@ def test_correct_result(self):
+         tb.mark_as_done(tid, data)
+         assert tb.get_result(tid) == data
+ 
++    def test_compressed_result_is_written_compressed(self):
++        data = {'foo': 'bar' * 100}
++
++        self.app.conf.result_compression = 'gzip'
++        tb = FilesystemBackend(app=self.app, url=self.url)
++        assert tb.compression == 'gzip'
++        tid = uuid()
++        tb.mark_as_done(tid, data)
++
++        stored = tb.get(tb.get_key_for_task(tid))
++        assert stored.startswith(COMPRESSED_PAYLOAD_MAGIC)
++        assert tb.get_result(tid) == data
++
++    def test_result_written_before_compression_is_still_readable(self):
++        data = {'foo': 'bar'}
++        tid = uuid()
++        FilesystemBackend(app=self.app, url=self.url).mark_as_done(tid, data)
++
++        self.app.conf.result_compression = 'gzip'
++        tb = FilesystemBackend(app=self.app, url=self.url)
++        assert tb.get_result(tid) == data
++
++    def test_compressed_binary_serializer_result_round_trips(self):
++        # pickle's payload is bytes before compression as well as after it,
++        # and the value here has no valid text encoding, so nothing on the
++        # way to disk and back can treat the payload as a string.
++        data = {'value': b'\x00\x01\x02\xff', 'text': 'a value ' * 40}
++        self.app.conf.result_serializer = 'pickle'
++        self.app.conf.accept_content = ['pickle']
++        self.app.conf.result_compression = 'gzip'
++
++        tb = FilesystemBackend(app=self.app, url=self.url)
++        tid = uuid()
++        tb.mark_as_done(tid, data)
++
++        with open(os.path.join(self.directory,
++                               tb.get_key_for_task(tid).decode()), 'rb') as f:
++            on_disk = f.read()
++        assert on_disk.startswith(COMPRESSED_PAYLOAD_MAGIC)
++        assert tb.get_result(tid) == data
++
++    def test_binary_serializer_result_is_not_read_as_compressed(self):
++        # A pickle payload written with compression off must not be mistaken
++        # for a compressed one by a reader that has compression on.
++        data = {'value': b'\x00\x01\x02\xff'}
++        self.app.conf.result_serializer = 'pickle'
++        self.app.conf.accept_content = ['pickle']
++        tid = uuid()
++        FilesystemBackend(app=self.app, url=self.url).mark_as_done(tid, data)
++
++        self.app.conf.result_compression = 'gzip'
++        tb = FilesystemBackend(app=self.app, url=self.url)
++        assert tb.get_result(tid) == data
++
++    def test_compressed_result_is_readable_with_compression_off(self):
++        data = {'foo': 'bar'}
++        tid = uuid()
++        self.app.conf.result_compression = 'gzip'
++        FilesystemBackend(app=self.app, url=self.url).mark_as_done(tid, data)
++
++        self.app.conf.result_compression = None
++        tb = FilesystemBackend(app=self.app, url=self.url)
++        assert tb.get_result(tid) == data
++
+     def test_get_many(self):
+         data = {uuid(): 'foo', uuid(): 'bar', uuid(): 'baz'}
+ 
+diff --git a/t/unit/backends/test_redis.py b/t/unit/backends/test_redis.py
+index d9890cf893d..bb0ba31c02e 100644
+--- a/t/unit/backends/test_redis.py
++++ b/t/unit/backends/test_redis.py
+@@ -15,7 +15,10 @@
+     exceptions = None
+     CredentialProvider = None
+ 
++from kombu.utils.encoding import ensure_bytes
++
+ from celery import signature, states, uuid
++from celery.backends.base import COMPRESSED_PAYLOAD_MAGIC
+ from celery.canvas import Signature
+ from celery.contrib.testing.mocks import ContextMock
+ from celery.exceptions import BackendStoreError, ChordError, ImproperlyConfigured
+@@ -1335,6 +1338,69 @@ def test_driver_info_fallback_redis_version_unknown(self):
+                     redis.__version__ = original_version
+ 
+ 
++class test_RedisBackend_result_compression(basetest_RedisBackend):
++    """Round trips across the backend boundary, not through encode() alone.
++
++    ``store_result`` and ``get_result`` go through the backend's own set and
++    get, so a payload that the backend altered on the way in or out would
++    show up here even though the encoding tests in ``test_base`` pass.
++    """
++
++    def stored(self, tid):
++        return self.b.client.keyspace[self.b.get_key_for_task(tid)]
++
++    def backend(self, compression='gzip', serializer='json'):
++        self.app.conf.result_serializer = serializer
++        self.app.conf.accept_content = [serializer]
++        self.app.conf.result_compression = compression
++        self.b = self.Backend(app=self.app)
++        return self.b
++
++    def test_store_and_get_compressed_result(self):
++        b = self.backend()
++        assert b.compression == 'gzip'
++        tid = uuid()
++        result = {'value': 'a repetitive value ' * 40}
++        b.store_result(tid, result, states.SUCCESS)
++
++        assert self.stored(tid).startswith(COMPRESSED_PAYLOAD_MAGIC)
++        assert b.get_state(tid) == states.SUCCESS
++        assert b.get_result(tid) == result
++
++    def test_compressed_result_is_smaller_on_the_wire(self):
++        result = {'value': 'a repetitive value ' * 40}
++        tid = uuid()
++        self.backend(compression=None).store_result(tid, result, states.SUCCESS)
++        plain = len(self.stored(tid))
++        self.backend().store_result(tid, result, states.SUCCESS)
++        assert len(self.stored(tid)) < plain
++
++    def test_store_and_get_compressed_binary_serializer_result(self):
++        # kombu's dumps returns bytes for pickle, so the payload is bytes
++        # before compression as well as after it. That is the combination
++        # that a write path assuming str breaks on.
++        b = self.backend(serializer='pickle')
++        tid = uuid()
++        result = {'value': b'\x00\x01\x02\xff', 'text': 'a value ' * 40}
++        b.store_result(tid, result, states.SUCCESS)
++
++        assert self.stored(tid).startswith(COMPRESSED_PAYLOAD_MAGIC)
++        assert b.get_result(tid) == result
++
++    def test_get_result_written_before_compression(self):
++        tid = uuid()
++        self.backend(compression=None).store_result(tid, {'foo': 'bar'},
++                                                    states.SUCCESS)
++        key = self.b.get_key_for_task(tid)
++        # A real Redis hands the payload back as bytes whatever went in.
++        written = ensure_bytes(self.stored(tid))
++        assert not written.startswith(COMPRESSED_PAYLOAD_MAGIC)
++
++        b = self.backend()
++        b.client.keyspace[key] = written
++        assert b.get_result(tid) == {'foo': 'bar'}
++
++
+ class test_RedisBackend_chords_simple(basetest_RedisBackend):
+     @pytest.fixture(scope="class", autouse=True)
+     def simple_header_result(self):

@@ -1,0 +1,1485 @@
+import {EventEmitter} from 'node:events';
+import {PassThrough as PassThroughStream} from 'node:stream';
+import type {Socket} from 'node:net';
+import http from 'node:http';
+import https from 'node:https';
+import test from 'ava';
+import is from '@sindresorhus/is';
+import type {Handler} from 'express';
+import getStream from 'get-stream';
+import {pEvent} from 'p-event';
+import got, {HTTPError, RequestError, TimeoutError} from '../source/index.js';
+import type Request from '../source/core/index.js';
+import withServer from './helpers/with-server.js';
+
+const retryAfterOn413 = 2;
+const socketTimeout = 300;
+
+const handler413: Handler = (_request, response) => {
+	response.writeHead(413, {
+		'Retry-After': retryAfterOn413,
+	});
+	response.end();
+};
+
+const createSocketTimeoutStream = (url: string): http.ClientRequest => {
+	if (url.includes('https:')) {
+		return https.request(url, {
+			timeout: 1,
+		});
+	}
+
+	return http.request(url, {
+		timeout: socketTimeout,
+	});
+};
+
+type RequestEndErrorScenario = 'request-error-first' | 'end-callback-only';
+
+const createRequestWithEndError = (scenario: RequestEndErrorScenario): http.ClientRequest => {
+	const request = new EventEmitter() as http.ClientRequest;
+	(request as any).end = (callback: (error: Error) => void) => {
+		const connectionError = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:80'), {code: 'ECONNREFUSED'});
+
+		queueMicrotask(() => {
+			if (scenario === 'request-error-first') {
+				request.emit('error', connectionError);
+			}
+
+			callback(connectionError);
+		});
+	};
+
+	(request as any).destroyed = false;
+	(request as any).destroy = () => {
+		(request as any).destroyed = true;
+		return request;
+	};
+
+	(request as any).writable = true;
+	(request as any).writableEnded = false;
+
+	return request;
+};
+
+test('works on timeout', withServer, async (t, server, got) => {
+	let knocks = 0;
+	server.get('/', (_request, response) => {
+		response.end('who`s there?');
+	});
+
+	t.is((await got({
+		timeout: {
+			socket: socketTimeout,
+		},
+		request(...arguments_: [
+			string | URL | http.RequestOptions,
+			(http.RequestOptions | ((response: http.IncomingMessage) => void))?,
+			((response: http.IncomingMessage) => void)?,
+		]) {
+			if (knocks === 1) {
+				// @ts-expect-error Overload error
+				return http.request(...arguments_);
+			}
+
+			knocks++;
+			return createSocketTimeoutStream(server.url);
+		},
+	})).body, 'who`s there?');
+});
+
+test('retry function gets iteration count', withServer, async (t, server, got) => {
+	let knocks = 0;
+	server.get('/', (_request, response) => {
+		if (knocks++ === 1) {
+			response.end('who`s there?');
+			return;
+		}
+
+		response.statusCode = 500;
+		response.end();
+	});
+
+	await got({
+		retry: {
+			calculateDelay({attemptCount}) {
+				t.true(is.number(attemptCount));
+				return attemptCount < 2 ? 1 : 0;
+			},
+		},
+	});
+});
+
+test('setting to `0` disables retrying', async t => {
+	let capturedAttemptCount: number | undefined;
+
+	await t.throwsAsync(got('https://example.com', {
+		timeout: {socket: socketTimeout},
+		retry: {
+			calculateDelay({attemptCount}) {
+				capturedAttemptCount = attemptCount;
+				return 0;
+			},
+		},
+		request: () => createSocketTimeoutStream('https://example.com'),
+	}), {
+		instanceOf: TimeoutError,
+		message: `Timeout awaiting 'socket' for ${socketTimeout}ms`,
+	});
+
+	t.is(capturedAttemptCount, 1);
+});
+
+test('custom retries', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 500;
+		response.end();
+	});
+
+	let hasTried = false;
+	const error = await t.throwsAsync<HTTPError>(got({
+		throwHttpErrors: true,
+		retry: {
+			calculateDelay({attemptCount}) {
+				if (attemptCount === 1) {
+					hasTried = true;
+					return 1;
+				}
+
+				return 0;
+			},
+			methods: [
+				'GET',
+			],
+			statusCodes: [
+				500,
+			],
+		},
+	}));
+	t.is(error?.response.statusCode, 500);
+	t.true(hasTried);
+});
+
+test('custom retries async', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 500;
+		response.end();
+	});
+
+	let hasTried = false;
+	const error = await t.throwsAsync<HTTPError>(got({
+		throwHttpErrors: true,
+		retry: {
+			async calculateDelay({attemptCount}) {
+				await new Promise(resolve => {
+					setTimeout(resolve, 1000);
+				});
+
+				if (attemptCount === 1) {
+					hasTried = true;
+					return 1;
+				}
+
+				return 0;
+			},
+			methods: [
+				'GET',
+			],
+			statusCodes: [
+				500,
+			],
+		},
+	}));
+	t.is(error?.response.statusCode, 500);
+	t.true(hasTried);
+});
+
+test('custom error codes', async t => {
+	const errorCode = 'OH_SNAP';
+	let capturedErrorCode: string | undefined;
+
+	const error = await t.throwsAsync<Error & {code: typeof errorCode}>(got('https://example.com', {
+		request() {
+			const emitter = new EventEmitter() as http.ClientRequest;
+			(emitter as any).end = () => {};
+			(emitter as any).destroy = () => {};
+			(emitter as any).writable = true;
+			(emitter as any).writableEnded = false;
+
+			const error = new Error('Snap!');
+			(error as Error & {code: typeof errorCode}).code = errorCode;
+			setTimeout(() => {
+				emitter.emit('error', error);
+			});
+
+			return emitter;
+		},
+		retry: {
+			calculateDelay({error}) {
+				capturedErrorCode = error.code;
+				return 0;
+			},
+			methods: [
+				'GET',
+			],
+			errorCodes: [
+				errorCode,
+			],
+		},
+	}));
+
+	t.is(capturedErrorCode, errorCode);
+	t.is(error?.code, errorCode);
+});
+
+test('retries when ClientRequest emits a connection error before its end callback receives it', async t => {
+	let attemptCount = 0;
+	let beforeRetryCount = 0;
+	let beforeErrorCount = 0;
+
+	const error = await t.throwsAsync(got('http://localhost', {
+		request() {
+			attemptCount++;
+			return createRequestWithEndError('request-error-first');
+		},
+		retry: {
+			limit: 2,
+			backoffLimit: 1,
+			noise: 0,
+		},
+		hooks: {
+			beforeRetry: [error => {
+				beforeRetryCount++;
+				t.is(error.code, 'ECONNREFUSED');
+			}],
+			beforeError: [error => {
+				beforeErrorCount++;
+				return error;
+			}],
+		},
+	}), {
+		instanceOf: RequestError,
+	});
+
+	t.is(attemptCount, 3);
+	t.is(beforeRetryCount, 2);
+	t.is(beforeErrorCount, 1);
+	t.is(error?.code, 'ECONNREFUSED');
+	t.is(error?.request?.retryCount, 2);
+});
+
+test('recovers when retrying after a request end error', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.end('ok');
+	});
+
+	let attemptCount = 0;
+	const response = await got({
+		request(url, options) {
+			attemptCount++;
+
+			if (attemptCount === 1) {
+				return createRequestWithEndError('end-callback-only');
+			}
+
+			return http.request(url, options);
+		},
+		retry: {
+			limit: 1,
+			backoffLimit: 1,
+			noise: 0,
+		},
+	});
+
+	t.is(response.body, 'ok');
+	t.is(response.retryCount, 1);
+	t.is(attemptCount, 2);
+});
+
+test('end callback errors do not finish the stream before retrying', async t => {
+	const stream = got.stream('http://localhost', {
+		request: () => createRequestWithEndError('end-callback-only'),
+		retry: {
+			limit: 1,
+			backoffLimit: 1,
+			noise: 0,
+		},
+	});
+	let finishCount = 0;
+	stream.on('finish', () => {
+		finishCount++;
+	});
+
+	await pEvent(stream, 'retry');
+
+	t.is(finishCount, 0);
+	t.false(stream.writableFinished);
+});
+
+test('respects 413 Retry-After', withServer, async (t, server, got) => {
+	let lastTried413access = Date.now();
+	server.get('/', (_request, response) => {
+		response.writeHead(413, {
+			'Retry-After': retryAfterOn413,
+		});
+		response.end((Date.now() - lastTried413access).toString());
+
+		lastTried413access = Date.now();
+	});
+
+	const {statusCode, body} = await got({
+		throwHttpErrors: false,
+		retry: {
+			limit: 1,
+		},
+	});
+	t.is(statusCode, 413);
+	t.true(Number(body) >= retryAfterOn413 * 1000);
+});
+
+test('respects 413 Retry-After with RFC-1123 timestamp', withServer, async (t, server, got) => {
+	let lastTried413TimestampAccess: string;
+	server.get('/', (_request, response) => {
+		const date = (new Date(Date.now() + (retryAfterOn413 * 1000))).toUTCString();
+
+		response.writeHead(413, {
+			'Retry-After': date,
+		});
+		response.end(lastTried413TimestampAccess);
+		lastTried413TimestampAccess = date;
+	});
+
+	const {statusCode, body} = await got({
+		throwHttpErrors: false,
+		retry: {
+			limit: 1,
+		},
+	});
+	t.is(statusCode, 413);
+	t.true(Date.now() >= Date.parse(body));
+});
+
+test('doesn\'t retry on 413 with empty statusCodes and methods', withServer, async (t, server, got) => {
+	server.get('/', handler413);
+
+	const {statusCode, retryCount} = await got({
+		throwHttpErrors: false,
+		retry: {
+			limit: 1,
+			statusCodes: [],
+			methods: [],
+		},
+	});
+	t.is(statusCode, 413);
+	t.is(retryCount, 0);
+});
+
+test('doesn\'t retry on 413 with empty methods', withServer, async (t, server, got) => {
+	server.get('/', handler413);
+
+	const {statusCode, retryCount} = await got({
+		throwHttpErrors: false,
+		retry: {
+			limit: 1,
+			statusCodes: [413],
+			methods: [],
+		},
+	});
+	t.is(statusCode, 413);
+	t.is(retryCount, 0);
+});
+
+test('doesn\'t retry on 413 without Retry-After header', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 413;
+		response.end();
+	});
+
+	const {retryCount} = await got({
+		throwHttpErrors: false,
+	});
+	t.is(retryCount, 0);
+});
+
+test('retries on 503 without Retry-After header', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 503;
+		response.end();
+	});
+
+	const {retryCount} = await got({
+		throwHttpErrors: false,
+		retry: {
+			limit: 1,
+		},
+	});
+	t.is(retryCount, 1);
+});
+
+test('doesn\'t retry on streams', withServer, async (t, server, got) => {
+	server.get('/', () => {});
+
+	// @ts-expect-error Error tests
+	const stream = got.stream({
+		timeout: {
+			request: 1,
+		},
+		retry: {
+			calculateDelay() {
+				t.fail('Retries on streams');
+			},
+		},
+	});
+	await t.throwsAsync(pEvent(stream, 'response'));
+});
+
+test('doesn\'t retry if Retry-After header is greater than maxRetryAfter', withServer, async (t, server, got) => {
+	server.get('/', handler413);
+
+	const {retryCount} = await got({
+		retry: {maxRetryAfter: 1000},
+		throwHttpErrors: false,
+	});
+	t.is(retryCount, 0);
+});
+
+test('doesn\'t retry when set to 0', withServer, async (t, server, got) => {
+	server.get('/', handler413);
+
+	const {statusCode, retryCount} = await got({
+		throwHttpErrors: false,
+		retry: {
+			limit: 0,
+		},
+	});
+	t.is(statusCode, 413);
+	t.is(retryCount, 0);
+});
+
+test('works when defaults.options.retry is a number', withServer, async (t, server, got) => {
+	server.get('/', handler413);
+
+	const instance = got.extend({
+		retry: {
+			limit: 2,
+		},
+	});
+
+	const {retryCount} = await instance({
+		throwHttpErrors: false,
+	});
+	t.is(retryCount, 2);
+});
+
+test('retry function can throw', withServer, async (t, server, got) => {
+	server.get('/', handler413);
+
+	const error = 'Simple error';
+	await t.throwsAsync(got({
+		retry: {
+			calculateDelay() {
+				throw new Error(error);
+			},
+		},
+	}), {message: error});
+});
+
+test('does not retry on POST', withServer, async (t, server, got) => {
+	server.post('/', () => {});
+
+	let retried = false;
+
+	await t.throwsAsync(got.post({
+		timeout: {
+			request: 200,
+		},
+		hooks: {
+			beforeRetry: [
+				() => {
+					retried = true;
+				},
+			],
+		},
+	}), {instanceOf: TimeoutError});
+
+	t.false(retried, 'Retries on POST requests');
+});
+
+test('retries QUERY with JSON body by default', withServer, async (t, server, got) => {
+	const attempts: Array<{method: string; body: string; contentType: string | undefined}> = [];
+	const payload = {
+		query: true,
+	};
+
+	server.all('/', async (request, response) => {
+		const body = await getStream(request);
+		attempts.push({
+			method: request.method,
+			body,
+			contentType: request.headers['content-type'],
+		});
+
+		if (attempts.length === 1) {
+			response.statusCode = 500;
+			response.end();
+			return;
+		}
+
+		response.end(body);
+	});
+
+	const {body, retryCount} = await got.query({
+		json: payload,
+		retry: {
+			limit: 1,
+		},
+	});
+
+	t.is(retryCount, 1);
+	t.deepEqual(JSON.parse(body), payload);
+	t.deepEqual(attempts, [
+		{
+			method: 'QUERY',
+			body: '{"query":true}',
+			contentType: 'application/json',
+		},
+		{
+			method: 'QUERY',
+			body: '{"query":true}',
+			contentType: 'application/json',
+		},
+	]);
+});
+
+test('does not break on redirect', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 500;
+		response.end();
+	});
+
+	let tries = 0;
+	server.get('/redirect', (_request, response) => {
+		tries++;
+
+		response.writeHead(302, {
+			location: '/',
+		});
+		response.end();
+	});
+
+	await t.throwsAsync(got('redirect'), {message: /^Request failed with status code 500 \(Internal Server Error\): GET http:\/\/localhost:\d+\/$/v});
+	t.is(tries, 1);
+});
+
+test('does not destroy the socket on HTTP error', withServer, async (t, server, got) => {
+	let returnServerError = true;
+
+	server.get('/', (_request, response) => {
+		if (returnServerError) {
+			response.statusCode = 500;
+			returnServerError = false;
+		}
+
+		response.end();
+	});
+
+	const sockets: Socket[] = [];
+
+	const agent = new http.Agent({
+		keepAlive: true,
+	});
+
+	await got('', {
+		agent: {
+			http: agent,
+		},
+	}).on('request', request => {
+		sockets.push(request.socket!);
+	});
+
+	t.is(sockets.length, 2);
+	t.is(sockets[0], sockets[1]);
+
+	agent.destroy();
+});
+
+test('can retry a Got stream', withServer, async (t, server, got) => {
+	let returnServerError = true;
+
+	server.get('/', (_request, response) => {
+		if (returnServerError) {
+			response.statusCode = 500;
+			response.end('not ok');
+
+			returnServerError = false;
+			return;
+		}
+
+		response.end('ok');
+	});
+
+	let globalRetryCount = 0;
+
+	const responseStreamPromise = new Promise<PassThroughStream>((resolve, reject) => {
+		let writeStream: PassThroughStream;
+
+		const function_ = (retryStream?: Request) => {
+			const stream = retryStream ?? got.stream('');
+
+			globalRetryCount = stream.retryCount;
+
+			if (writeStream) {
+				writeStream.destroy();
+			}
+
+			writeStream = new PassThroughStream();
+
+			stream.pipe(writeStream);
+
+			stream.once('retry', (_retryCount, _error, createRetryStream) => {
+				function_(createRetryStream());
+			});
+
+			stream.once('error', reject);
+			stream.once('end', () => {
+				resolve(writeStream);
+			});
+		};
+
+		function_();
+	});
+
+	const responseStream = await responseStreamPromise;
+	const data = await getStream(responseStream);
+
+	t.is(data, 'ok');
+	t.is(globalRetryCount, 1);
+});
+
+test('can retry a Got stream with allowAbsoluteUrls false', withServer, async (t, server, got) => {
+	let returnServerError = true;
+
+	server.get('/', (_request, response) => {
+		if (returnServerError) {
+			response.statusCode = 500;
+			response.end('not ok');
+
+			returnServerError = false;
+			return;
+		}
+
+		response.end('ok');
+	});
+
+	const responseStreamPromise = new Promise<PassThroughStream>((resolve, reject) => {
+		let writeStream: PassThroughStream;
+
+		const function_ = (retryStream?: Request) => {
+			const stream = retryStream ?? got.stream('', {allowAbsoluteUrls: false});
+
+			if (writeStream) {
+				writeStream.destroy();
+			}
+
+			writeStream = new PassThroughStream();
+			stream.pipe(writeStream);
+
+			stream.once('retry', (_retryCount, _error, createRetryStream) => {
+				function_(createRetryStream());
+			});
+
+			stream.once('error', reject);
+			stream.once('end', () => {
+				resolve(writeStream);
+			});
+		};
+
+		function_();
+	});
+
+	const responseStream = await responseStreamPromise;
+	const data = await getStream(responseStream);
+
+	t.is(data, 'ok');
+});
+
+test('`allowAbsoluteUrls: false` rejects an absolute URL passed to a Got stream retry', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 500;
+		response.end('not ok');
+	});
+
+	const error = await new Promise<Error>(resolve => {
+		const stream = got.stream('', {allowAbsoluteUrls: false});
+		stream.resume();
+		stream.once('error', () => {});
+		stream.once('retry', (_retryCount, _error, createRetryStream) => {
+			const retryStream = createRetryStream({url: `${server.url}/other`});
+			retryStream.once('error', resolve);
+			retryStream.resume();
+		});
+	});
+
+	t.is(error.message, 'The `url` option must be relative when `allowAbsoluteUrls` is false and `prefixUrl` is set');
+});
+
+test('throws when cannot retry a Got stream', withServer, async (t, server, got) => {
+	server.get('/', (_request, response) => {
+		response.statusCode = 500;
+		response.end('not ok');
+	});
+
+	let globalRetryCount = 0;
+
+	const streamPromise = new Promise<PassThroughStream>((resolve, reject) => {
+		const function_ = (retryStream?: Request) => {
+			const stream = retryStream ?? got.stream('');
+
+			globalRetryCount = stream.retryCount;
+
+			stream.resume();
+			stream.once('retry', (_retryCount, _error, createRetryStream) => {
+				function_(createRetryStream());
+			});
+
+			stream.once('data', () => {
+				stream.destroy(new Error('data event has been emitted'));
+			});
+
+			stream.once('error', reject);
+			stream.once('end', resolve);
+		};
+
+		function_();
+	});
+
+	const error = await t.throwsAsync<HTTPError>(streamPromise, {
+		instanceOf: HTTPError,
+	});
+
+	t.is(error?.response.statusCode, 500);
+	t.is(error?.response.body, 'not ok');
+	t.is(globalRetryCount, 2);
+});
+
+test('can attach only one retry listener to a stream', withServer, async (t, _server, got) => {
+	const stream = got.stream('');
+
+	t.notThrows(() => {
+		stream.on('retry', () => {});
+	});
+
+	t.throws(() => {
+		stream.on('retry', () => {});
+	}, {
+		message: 'A retry listener has been attached already.',
+	});
+
+	stream.destroy();
+});
+
+test('createRetryStream accepts options', withServer, async (t, server, got) => {
+	let returnServerError = true;
+	let receivedCustomHeader = false;
+
+	server.get('/', (request, response) => {
+		if (request.headers['x-custom-header'] === 'custom-value') {
+			receivedCustomHeader = true;
+		}
+
+		if (returnServerError) {
+			response.statusCode = 500;
+			response.end('not ok');
+			returnServerError = false;
+			return;
+		}
+
+		response.end('ok');
+	});
+
+	const responseStreamPromise = new Promise<PassThroughStream>((resolve, reject) => {
+		let writeStream: PassThroughStream;
+
+		const function_ = (retryStream?: Request) => {
+			const stream = retryStream ?? got.stream('');
+
+			if (writeStream) {
+				writeStream.destroy();
+			}
+
+			writeStream = new PassThroughStream();
+
+			stream.pipe(writeStream);
+
+			stream.once('retry', (_retryCount, _error, createRetryStream) => {
+				// Pass custom options on retry
+				function_(createRetryStream({
+					headers: {
+						'x-custom-header': 'custom-value',
+					},
+				}));
+			});
+
+			stream.once('error', reject);
+			stream.once('end', () => {
+				resolve(writeStream);
+			});
+		};
+
+		function_();
+	});
+
+	const responseStream = await responseStreamPromise;
+	const data = await getStream(responseStream);
+
+	t.is(data, 'ok');
+	t.true(receivedCustomHeader);
+});
+
+test('createRetryStream re-copies piped headers on retry', withServer, async (t, server, got) => {
+	let returnServerError = true;
+
+	server.put('/', (request, response) => {
+		if (returnServerError) {
+			returnServerError = false;
+			response.statusCode = 500;
+			response.end('not ok');
+			return;
+		}
+
+		response.end(JSON.stringify(request.headers));
+	});
+
+	const responseStreamPromise = new Promise<PassThroughStream>((resolve, reject) => {
+		let writeStream: PassThroughStream;
+		let attempt = 0;
+
+		const function_ = (retryStream?: Request) => {
+			attempt++;
+			const stream = retryStream ?? got.stream.put('', {copyPipedHeaders: true});
+
+			if (writeStream) {
+				writeStream.destroy();
+			}
+
+			writeStream = new PassThroughStream();
+			const sourceStream = new PassThroughStream() as PassThroughStream & {headers: Record<string, string>};
+			sourceStream.headers = {
+				'x-custom-header': attempt === 1 ? 'first-value' : 'second-value',
+			};
+
+			sourceStream.pipe(stream);
+			sourceStream.end('request body');
+			stream.pipe(writeStream);
+
+			stream.once('retry', (_retryCount, _error, createRetryStream) => {
+				function_(createRetryStream());
+			});
+
+			stream.once('error', reject);
+			stream.once('end', () => {
+				if (stream.retryCount === 1) {
+					resolve(writeStream);
+				}
+			});
+		};
+
+		function_();
+	});
+
+	const responseStream = await responseStreamPromise;
+	const headers = JSON.parse(await getStream(responseStream)) as Record<string, string>;
+
+	t.is(headers['x-custom-header'], 'second-value');
+});
+
+test('createRetryStream preserves explicit header omissions after undefined header pruning', withServer, async (t, server, got) => {
+	let returnServerError = true;
+
+	server.put('/', (request, response) => {
+		if (returnServerError) {
+			returnServerError = false;
+			response.statusCode = 500;
+			response.end('not ok');
+			return;
+		}
+
+		response.end(JSON.stringify(request.headers));
+	});
+
+	const responseStreamPromise = new Promise<PassThroughStream>((resolve, reject) => {
+		let writeStream: PassThroughStream;
+
+		const function_ = (retryStream?: Request) => {
+			const stream = retryStream ?? got.stream.put('', {
+				copyPipedHeaders: true,
+				headers: {
+					authorization: undefined,
+				},
+			});
+
+			if (writeStream) {
+				writeStream.destroy();
+			}
+
+			writeStream = new PassThroughStream();
+			const sourceStream = new PassThroughStream() as PassThroughStream & {headers: Record<string, string>};
+			sourceStream.headers = {
+				authorization: 'Bearer piped-token',
+			};
+
+			sourceStream.pipe(stream);
+			sourceStream.end('request body');
+			stream.pipe(writeStream);
+
+			stream.once('retry', (_retryCount, _error, createRetryStream) => {
+				function_(createRetryStream());
+			});
+
+			stream.once('error', reject);
+			stream.once('end', () => {
+				if (stream.retryCount === 1) {
+					resolve(writeStream);
+				}
+			});
+		};
+
+		function_();
+	});
+
+	const responseStream = await responseStreamPromise;
+	const headers = JSON.parse(await getStream(responseStream)) as Record<string, string | undefined>;
+
+	t.is(headers.authorization, undefined);
+});
+
+test('createRetryStream re-copies piped headers after internal header additions on previous attempt', withServer, async (t, server, got) => {
+	let returnServerError = true;
+	let attempt = 0;
+
+	server.put('/', (request, response) => {
+		if (returnServerError) {
+			returnServerError = false;
+			response.statusCode = 500;
+			response.end('not ok');
+			return;
+		}
+
+		response.end(JSON.stringify(request.headers));
+	});
+
+	const responseStreamPromise = new Promise<PassThroughStream>((resolve, reject) => {
+		let writeStream: PassThroughStream;
+
+		const function_ = (retryStream?: Request) => {
+			attempt++;
+			const stream = retryStream ?? got.stream.put('', {copyPipedHeaders: true});
+
+			if (writeStream) {
+				writeStream.destroy();
+			}
+
+			writeStream = new PassThroughStream();
+			const sourceStream = new PassThroughStream() as PassThroughStream & {headers: Record<string, string>};
+			sourceStream.headers = attempt === 1
+				? {}
+				: {'accept-encoding': 'identity'};
+
+			sourceStream.pipe(stream);
+			sourceStream.end('request body');
+			stream.pipe(writeStream);
+
+			stream.once('retry', (_retryCount, _error, createRetryStream) => {
+				function_(createRetryStream());
+			});
+
+			stream.once('error', reject);
+			stream.once('end', () => {
+				if (stream.retryCount === 1) {
+					resolve(writeStream);
+				}
+			});
+		};
+
+		function_();
+	});
+
+	const responseStream = await responseStreamPromise;
+	const headers = JSON.parse(await getStream(responseStream)) as Record<string, string>;
+
+	t.is(headers['accept-encoding'], 'identity');
+});
+
+test('createRetryStream preserves header omission from direct header mutation', withServer, async (t, server, got) => {
+	let returnServerError = true;
+
+	server.put('/', (request, response) => {
+		if (returnServerError) {
+			returnServerError = false;
+			response.statusCode = 500;
+			response.end('not ok');
+			return;
+		}
+
+		response.end(JSON.stringify(request.headers));
+	});
+
+	const responseStreamPromise = new Promise<PassThroughStream>((resolve, reject) => {
+		let writeStream: PassThroughStream;
+
+		const function_ = (retryStream?: Request) => {
+			const stream = retryStream ?? got.stream.put('', {copyPipedHeaders: true});
+			stream.options.headers.authorization = undefined;
+
+			if (writeStream) {
+				writeStream.destroy();
+			}
+
+			writeStream = new PassThroughStream();
+			const sourceStream = new PassThroughStream() as PassThroughStream & {headers: Record<string, string>};
+			sourceStream.headers = {
+				authorization: 'Bearer piped-token',
+			};
+
+			sourceStream.pipe(stream);
+			sourceStream.end('request body');
+			stream.pipe(writeStream);
+
+			stream.once('retry', (_retryCount, _error, createRetryStream) => {
+				function_(createRetryStream());
+			});
+
+			stream.once('error', reject);
+			stream.once('end', () => {
+				if (stream.retryCount === 1) {
+					resolve(writeStream);
+				}
+			});
+		};
+
+		function_();
+	});
+
+	const responseStream = await responseStreamPromise;
+	const headers = JSON.parse(await getStream(responseStream)) as Record<string, string | undefined>;
+
+	t.is(headers.authorization, undefined);
+});
+
+test('createRetryStream preserves mixed-case header omission from direct header mutation', withServer, async (t, server, got) => {
+	let returnServerError = true;
+
+	server.put('/', (request, response) => {
+		if (returnServerError) {
+			returnServerError = false;
+			response.statusCode = 500;
+			response.end('not ok');
+			return;
+		}
+
+		response.end(JSON.stringify(request.headers));
+	});
+
+	const responseStreamPromise = new Promise<PassThroughStream>((resolve, reject) => {
+		let writeStream: PassThroughStream;
+
+		const function_ = (retryStream?: Request) => {
+			const stream = retryStream ?? got.stream.put('', {copyPipedHeaders: true});
+			stream.options.headers.Authorization = undefined;
+
+			if (writeStream) {
+				writeStream.destroy();
+			}
+
+			writeStream = new PassThroughStream();
+			const sourceStream = new PassThroughStream() as PassThroughStream & {headers: Record<string, string>};
+			sourceStream.headers = {
+				authorization: 'Bearer piped-token',
+			};
+
+			sourceStream.pipe(stream);
+			sourceStream.end('request body');
+			stream.pipe(writeStream);
+
+			stream.once('retry', (_retryCount, _error, createRetryStream) => {
+				function_(createRetryStream());
+			});
+
+			stream.once('error', reject);
+			stream.once('end', () => {
+				if (stream.retryCount === 1) {
+					resolve(writeStream);
+				}
+			});
+		};
+
+		function_();
+	});
+
+	const responseStream = await responseStreamPromise;
+	const headers = JSON.parse(await getStream(responseStream)) as Record<string, string | undefined>;
+
+	t.is(headers.authorization, undefined);
+});
+
+test('createRetryStream keeps username/password authorization precedence over piped authorization', withServer, async (t, server, got) => {
+	let returnServerError = true;
+	let attempt = 0;
+
+	server.put('/', (request, response) => {
+		if (returnServerError) {
+			returnServerError = false;
+			response.statusCode = 500;
+			response.end('not ok');
+			return;
+		}
+
+		response.end(JSON.stringify(request.headers));
+	});
+
+	const responseStreamPromise = new Promise<PassThroughStream>((resolve, reject) => {
+		let writeStream: PassThroughStream;
+
+		const function_ = (retryStream?: Request) => {
+			attempt++;
+			const stream = retryStream ?? got.stream.put('', {
+				copyPipedHeaders: true,
+				username: 'foo',
+				password: 'bar',
+			});
+
+			if (writeStream) {
+				writeStream.destroy();
+			}
+
+			writeStream = new PassThroughStream();
+			const sourceStream = new PassThroughStream() as PassThroughStream & {headers: Record<string, string>};
+			sourceStream.headers = attempt === 1
+				? {}
+				: {authorization: 'Bearer retry-token'};
+
+			sourceStream.pipe(stream);
+			sourceStream.end('request body');
+			stream.pipe(writeStream);
+
+			stream.once('retry', (_retryCount, _error, createRetryStream) => {
+				function_(createRetryStream());
+			});
+
+			stream.once('error', reject);
+			stream.once('end', () => {
+				if (stream.retryCount === 1) {
+					resolve(writeStream);
+				}
+			});
+		};
+
+		function_();
+	});
+
+	const responseStream = await responseStreamPromise;
+	const headers = JSON.parse(await getStream(responseStream)) as Record<string, string>;
+
+	t.is(headers.authorization, 'Basic Zm9vOmJhcg==');
+});
+
+test('promise does not retry when body is a stream', withServer, async (t, server, got) => {
+	server.post('/', (_request, response) => {
+		response.statusCode = 500;
+		response.end('not ok');
+	});
+
+	const body = new PassThroughStream();
+	body.end('hello');
+
+	const response = await got.post({
+		retry: {
+			methods: ['POST'],
+		},
+		body,
+		throwHttpErrors: false,
+	});
+
+	t.is(response.retryCount, 0);
+});
+
+test('reuses request options on retry', withServer, async (t, server, got) => {
+	let first = true;
+	server.get('/', (request, response) => {
+		if (first) {
+			first = false;
+			return;
+		}
+
+		response.end(JSON.stringify(request.headers));
+	});
+
+	const {body, retryCount} = await got('', {timeout: {request: 1000}, responseType: 'json'});
+	t.is(retryCount, 1);
+	t.is((body as any).accept, 'application/json');
+});
+
+test('respects backoffLimit', withServer, async (t, server, got) => {
+	let requestCount = 0;
+	const computedValues: number[] = [];
+
+	server.get('/', (_request, response) => {
+		requestCount++;
+
+		if (requestCount === 3) {
+			response.end();
+		} else {
+			response.statusCode = 408;
+			response.end();
+		}
+	});
+
+	const {retryCount} = await got('', {
+		retry: {
+			backoffLimit: 10,
+			noise: 0,
+			calculateDelay({computedValue}) {
+				computedValues.push(computedValue);
+				return computedValue;
+			},
+		},
+	});
+
+	t.is(retryCount, 2);
+	t.is(requestCount, 3);
+	t.deepEqual(computedValues, [10, 10]);
+});
+
+test('enforceRetryRules respects statusCodes with custom calculateDelay', withServer, async (t, server, got) => {
+	let requestCount = 0;
+	server.get('/', (_request, response) => {
+		requestCount++;
+		// Return 500 on first request, 429 on second, 200 on third
+		if (requestCount === 1) {
+			response.statusCode = 500;
+		} else if (requestCount === 2) {
+			response.statusCode = 429;
+		}
+
+		response.end();
+	});
+
+	const {statusCode, retryCount} = await got({
+		throwHttpErrors: false,
+		retry: {
+			limit: 5,
+			statusCodes: [429], // Should only retry on 429
+			enforceRetryRules: true,
+			calculateDelay({attemptCount}) {
+				// Custom delay but should still respect statusCodes
+				return attemptCount * 100;
+			},
+		},
+	});
+
+	// Should not retry on 500 (not in statusCodes list)
+	t.is(statusCode, 500);
+	t.is(retryCount, 0);
+});
+
+test('enforces retry rules by default with custom calculateDelay', withServer, async (t, server, got) => {
+	let requestCount = 0;
+	server.get('/', (_request, response) => {
+		requestCount++;
+		if (requestCount === 1) {
+			response.statusCode = 500;
+		} else if (requestCount === 2) {
+			response.statusCode = 429;
+		}
+
+		response.end();
+	});
+
+	const {statusCode, retryCount} = await got({
+		throwHttpErrors: false,
+		retry: {
+			limit: 5,
+			statusCodes: [429],
+			calculateDelay({attemptCount}) {
+				return attemptCount * 100;
+			},
+		},
+	});
+
+	t.is(statusCode, 500);
+	t.is(retryCount, 0);
+});
+
+test('enforceRetryRules respects limit with custom calculateDelay', withServer, async (t, server, got) => {
+	let requestCount = 0;
+	server.get('/', (_request, response) => {
+		requestCount++;
+		response.statusCode = 500;
+		response.end();
+	});
+
+	const {retryCount} = await got({
+		throwHttpErrors: false,
+		retry: {
+			limit: 2,
+			enforceRetryRules: true,
+			calculateDelay({attemptCount}) {
+				// With enforceRetryRules, limit is enforced automatically
+				return attemptCount * 100;
+			},
+		},
+	});
+
+	// Should stop at limit even with custom calculateDelay
+	t.is(retryCount, 2);
+	t.is(requestCount, 3); // Initial request + 2 retries
+});
+
+test('retries on stream errors like EPIPE when configured', async t => {
+	let attemptCount = 0;
+	let retryCount = 0;
+
+	const error = await t.throwsAsync<Error & {code: string}>(got.post('https://example.com', {
+		retry: {
+			limit: 2,
+			methods: ['POST'],
+			errorCodes: ['EPIPE'],
+		},
+		hooks: {
+			beforeRetry: [
+				() => {
+					retryCount++;
+				},
+			],
+		},
+		request() {
+			attemptCount++;
+
+			const emitter = new EventEmitter() as http.ClientRequest;
+			(emitter as any).end = (callback: any) => {
+				// Simulate EPIPE error from Node.js during write/end
+				// This mimics what happens when a socket is torn down (e.g., AWS Lambda pause)
+				const error = new Error('write EPIPE');
+				(error as NodeJS.ErrnoException).code = 'EPIPE';
+
+				if (callback) {
+					setTimeout(() => {
+						callback(error);
+					}, 10);
+				}
+			};
+
+			emitter.destroyed = false;
+
+			(emitter as any).destroy = () => {
+				emitter.destroyed = true;
+			};
+
+			(emitter as any).write = () => true;
+
+			(emitter as any).writable = true;
+			(emitter as any).writableEnded = false;
+
+			return emitter;
+		},
+	}), {code: 'EPIPE'});
+
+	// Should retry twice (limit: 2) for a total of 3 attempts
+	t.is(attemptCount, 3);
+	t.is(retryCount, 2);
+	t.is(error?.code, 'EPIPE');
+});
+
+test('does not retry on stream errors when not in errorCodes', async t => {
+	let attemptCount = 0;
+
+	const error = await t.throwsAsync<Error & {code: string}>(got('https://example.com', {
+		retry: {
+			limit: 2,
+			errorCodes: [], // Empty list means no errors should be retried
+		},
+		request() {
+			attemptCount++;
+
+			const emitter = new EventEmitter() as http.ClientRequest;
+			(emitter as any).end = (callback: any) => {
+				const error = new Error('write ETEST');
+				(error as NodeJS.ErrnoException).code = 'ETEST';
+
+				if (callback) {
+					setTimeout(() => {
+						callback(error);
+					}, 10);
+				}
+			};
+
+			emitter.destroyed = false;
+
+			(emitter as any).destroy = () => {
+				emitter.destroyed = true;
+			};
+
+			(emitter as any).write = () => true;
+
+			(emitter as any).writable = true;
+			(emitter as any).writableEnded = false;
+
+			return emitter;
+		},
+	}), {code: 'ETEST'});
+
+	// Should NOT retry since errorCodes is empty
+	t.is(attemptCount, 1);
+	t.is(error?.code, 'ETEST');
+});
+
+test('does not retry after promise settles (issue #1489)', async t => {
+	let retryTriggered = false;
+
+	const response = await got('https://example.com', {
+		retry: {limit: 2, errorCodes: ['ECONNRESET']},
+		hooks: {
+			beforeRetry: [() => {
+				retryTriggered = true;
+			}],
+		},
+		request() {
+			const emitter = new EventEmitter() as http.ClientRequest;
+			(emitter as any).end = () => {};
+			emitter.destroyed = false;
+			(emitter as any).destroy = () => {
+				emitter.destroyed = true;
+			};
+
+			(emitter as any).write = () => true;
+			(emitter as any).writable = true;
+			(emitter as any).writableEnded = false;
+
+			setTimeout(() => {
+				const incomingMessage = new PassThroughStream() as unknown as http.IncomingMessage;
+				incomingMessage.statusCode = 200;
+				incomingMessage.headers = {};
+
+				emitter.emit('response', incomingMessage);
+
+				setImmediate(() => {
+					// @ts-expect-error PassThrough method
+					incomingMessage.end('ok');
+				});
+
+				// Late error after response - should NOT trigger retry
+				setTimeout(() => {
+					const error = new Error('read ECONNRESET');
+					(error as NodeJS.ErrnoException).code = 'ECONNRESET';
+					emitter.emit('error', error);
+				}, 10);
+			});
+
+			return emitter;
+		},
+		throwHttpErrors: false,
+	});
+
+	t.is(response.statusCode, 200);
+	t.false(retryTriggered);
+});

@@ -1,0 +1,820 @@
+import { NOOP } from '@vue/shared'
+import {
+  setDynamicProp as _setDynamicProp,
+  setAttr,
+  setClass,
+  setClassName,
+  setDynamicProps,
+  setElementText,
+  setHtml,
+  setProp,
+  setText,
+  setValue,
+} from '../../src/dom/prop'
+import { setStyle } from '../../src/dom/prop'
+import {
+  VaporComponentInstance,
+  applyFallthroughProps,
+  isApplyingFallthroughProps,
+} from '../../src/component'
+import {
+  effectScope,
+  nextTick,
+  ref,
+  restoreCurrentInstance,
+  setCurrentInstance,
+  svgNS,
+  xlinkNS,
+} from '@vue/runtime-dom'
+import { renderEffect } from '../../src'
+
+let removeComponentInstance = NOOP
+beforeEach(() => {
+  const instance = new VaporComponentInstance({}, {}, null)
+  const prev = setCurrentInstance(instance)
+  removeComponentInstance = () => restoreCurrentInstance(prev)
+})
+afterEach(() => {
+  removeComponentInstance()
+})
+
+describe('patchProp', () => {
+  describe('setClass', () => {
+    test('should set class', () => {
+      const el = document.createElement('div')
+      setClass(el, 'foo')
+      expect(el.className).toBe('foo')
+      setClass(el, ['bar', 'baz'])
+      expect(el.className).toBe('bar baz')
+      setClass(el, { a: true, b: false })
+      expect(el.className).toBe('a')
+    })
+
+    test('should set class with flags', () => {
+      const el = document.createElement('div')
+
+      setClassName(el, 1, ['danger'])
+      expect(el.className).toBe('danger')
+
+      setClassName(el, 0, ['danger'])
+      expect(el.className).toBe('')
+
+      const string = document.createElement('div')
+      setClassName(string, 1, 'danger')
+      expect(string.className).toBe('danger')
+
+      setClassName(el, 1, [' danger'])
+      expect(el.className).toBe('danger')
+
+      const multi = document.createElement('div')
+      setClassName(multi, 3, [' danger', ' active'])
+      expect(multi.className).toBe('danger active')
+
+      setClassName(el, 3, [' danger', ' active'], 'base')
+      expect(el.className).toBe('base danger active')
+
+      const stringWithBase = document.createElement('div')
+      setClassName(stringWithBase, 1, ' danger', 'base')
+      expect(stringWithBase.className).toBe('base danger')
+
+      setClassName(el, 1, ['danger'], '', 'tail')
+      expect(el.className).toBe('danger tail')
+
+      setClassName(el, 0, ['danger'], '', 'tail')
+      expect(el.className).toBe('tail')
+    })
+
+    test('should refresh after generic class writes', () => {
+      const el = document.createElement('div')
+      setClassName(el, 1, ['danger'])
+      expect(el.className).toBe('danger')
+
+      setClass(el, 'fallthrough')
+      expect(el.className).toBe('fallthrough')
+
+      setClassName(el, 1, ['danger'])
+      expect(el.className).toBe('danger')
+    })
+
+    test('should support the max className flag bit', () => {
+      const el = document.createElement('div')
+      const classes = Array.from({ length: 31 }, (_, i) => ` c${i}`)
+
+      setClassName(el, 0x7fffffff, classes, 'base')
+      expect(el.className).toBe(
+        `base ${Array.from({ length: 31 }, (_, i) => `c${i}`).join(' ')}`,
+      )
+    })
+
+    test('should set root class with flags incrementally', () => {
+      const el = document.createElement('div')
+      el.className = 'fallthrough'
+      ;(el as any).$root = true
+
+      setClassName(el, 1, [' danger'], 'base')
+      expect(el.className).toBe('fallthrough base danger')
+
+      setClassName(el, 0, [' danger'], 'base')
+      expect(el.className).toBe('fallthrough base')
+
+      setClassName(el, 1, ['danger'], '', 'tail')
+      expect(el.className).toBe('fallthrough danger tail')
+
+      setClassName(el, 0, ['danger'], '', 'tail')
+      expect(el.className).toBe('fallthrough tail')
+    })
+  })
+
+  describe('setStyle', () => {
+    test('should set style', () => {
+      const el = document.createElement('div')
+      setStyle(el, 'color: red')
+      expect(el.style.cssText).toBe('color: red;')
+    })
+
+    test('should work with camelCase', () => {
+      const el = document.createElement('div')
+      setStyle(el, { fontSize: '12px' })
+      expect(el.style.cssText).toBe('font-size: 12px;')
+    })
+
+    test('shoud set style with object and array property', () => {
+      const el = document.createElement('div')
+      setStyle(el, { color: 'red' })
+      expect(el.style.cssText).toBe('color: red;')
+      setStyle(el, [{ color: 'blue' }, { fontSize: '12px' }])
+      expect(el.style.cssText).toBe('color: blue; font-size: 12px;')
+    })
+
+    test('should remove if falsy value', () => {
+      const el = document.createElement('div')
+      setStyle(el, { color: undefined, borderRadius: null })
+      expect(el.style.cssText).toBe('')
+      setStyle(el, { color: 'red' })
+      expect(el.style.cssText).toBe('color: red;')
+      setStyle(el, { color: undefined, borderRadius: null })
+      expect(el.style.cssText).toBe('')
+    })
+
+    test('should work with !important', () => {
+      const el = document.createElement('div')
+      setStyle(el, { color: 'red !important' })
+      expect(el.style.cssText).toBe('color: red !important;')
+    })
+
+    test('should work with camelCase and !important', () => {
+      const el = document.createElement('div')
+      setStyle(el, { fontSize: '12px !important' })
+      expect(el.style.cssText).toBe('font-size: 12px !important;')
+    })
+
+    test('should work with multiple entries', () => {
+      const el = document.createElement('div')
+      setStyle(el, { color: 'red', marginRight: '10px' })
+      expect(el.style.getPropertyValue('color')).toBe('red')
+      expect(el.style.getPropertyValue('margin-right')).toBe('10px')
+    })
+
+    test('should patch with falsy style value', () => {
+      const el = document.createElement('div')
+      setStyle(el, { width: '100px' })
+      expect(el.style.cssText).toBe('width: 100px;')
+      setStyle(el, { width: 0 })
+      expect(el.style.cssText).toBe('width: 0px;')
+    })
+
+    test('should remove style attribute on falsy value', () => {
+      const el = document.createElement('div')
+      setStyle(el, { width: '100px' })
+      expect(el.style.cssText).toBe('width: 100px;')
+      setStyle(el, { width: undefined })
+      expect(el.style.cssText).toBe('')
+
+      setStyle(el, { width: '100px' })
+      expect(el.style.cssText).toBe('width: 100px;')
+      setStyle(el, null)
+      expect(el.hasAttribute('style')).toBe(false)
+      expect(el.style.cssText).toBe('')
+    })
+
+    test('should warn for trailing semicolons', () => {
+      const el = document.createElement('div')
+      setStyle(el, { color: 'red;' })
+      expect(
+        `Unexpected semicolon at the end of 'color' style value: 'red;'`,
+      ).toHaveBeenWarned()
+
+      setStyle(el, { '--custom': '100; ' })
+      expect(
+        `Unexpected semicolon at the end of '--custom' style value: '100; '`,
+      ).toHaveBeenWarned()
+    })
+
+    test('should not warn for trailing semicolons', () => {
+      const el = document.createElement('div')
+      setStyle(el, { '--custom': '100\\;' })
+      expect(el.style.getPropertyValue('--custom')).toBe('100\\;')
+    })
+
+    test('should work with shorthand properties', () => {
+      const el = document.createElement('div')
+      setStyle(el, {
+        borderBottom: '1px solid red',
+        border: '1px solid green',
+      })
+      expect(el.style.border).toBe('1px solid green')
+      expect(el.style.borderBottom).toBe('1px solid green')
+    })
+
+    // JSDOM doesn't support custom properties on style object so we have to
+    // mock it here.
+    function mockElementWithStyle() {
+      const store: any = {}
+      return {
+        style: {
+          display: '',
+          WebkitTransition: '',
+          setProperty(key: string, val: string) {
+            store[key] = val
+          },
+          getPropertyValue(key: string) {
+            return store[key]
+          },
+        },
+      }
+    }
+
+    test('should work with css custom properties', () => {
+      const el = mockElementWithStyle()
+      setStyle(el as any, { '--theme': 'red' })
+      expect(el.style.getPropertyValue('--theme')).toBe('red')
+    })
+
+    test('should auto vendor prefixing', () => {
+      const el = mockElementWithStyle()
+      setStyle(el as any, { transition: 'all 1s' })
+      expect(el.style.WebkitTransition).toBe('all 1s')
+    })
+
+    test('should work with multiple values', () => {
+      const el = mockElementWithStyle()
+      setStyle(el as any, {
+        display: ['-webkit-box', '-ms-flexbox', 'flex'],
+      })
+      expect(el.style.display).toBe('flex')
+    })
+  })
+
+  describe('setClassIncremental', () => {
+    test('should set class', () => {
+      const el = document.createElement('div')
+      // mark as root
+      ;(el as any).$root = true
+      setClass(el, 'foo')
+      expect(el.className).toBe('foo')
+
+      // Should replace previous class set by setClass
+      setClass(el, 'bar')
+      expect(el.className).toBe('bar')
+    })
+
+    test('should coexist with existing classes', () => {
+      const el = document.createElement('div')
+      el.className = 'existing'
+      ;(el as any).$root = true
+
+      setClass(el, 'foo')
+      expect(el.className).toBe('existing foo')
+
+      setClass(el, 'bar')
+      expect(el.className).toBe('existing bar')
+
+      setClass(el, '')
+      expect(el.className).toBe('existing')
+    })
+
+    test('should handle multiple classes', () => {
+      const el = document.createElement('div')
+      ;(el as any).$root = true
+
+      setClass(el, 'foo bar')
+      expect(el.className).toBe('foo bar')
+
+      setClass(el, 'baz')
+      expect(el.className).toBe('baz')
+    })
+  })
+
+  describe('setStyleIncremental', () => {
+    test('should set style', () => {
+      const el = document.createElement('div')
+      ;(el as any).$root = true
+      setStyle(el, 'color: red')
+      expect(el.style.cssText).toBe('color: red;')
+
+      setStyle(el, 'font-size: 12px')
+      expect(el.style.cssText).toBe('font-size: 12px;')
+    })
+
+    test('should coexist with existing styles', () => {
+      const el = document.createElement('div')
+      el.style.display = 'block'
+      ;(el as any).$root = true
+
+      setStyle(el, 'color: red')
+      expect(el.style.display).toBe('block')
+      expect(el.style.color).toBe('red')
+
+      setStyle(el, 'font-size: 12px')
+      expect(el.style.display).toBe('block')
+      expect(el.style.fontSize).toBe('12px')
+      expect(el.style.color).toBe('')
+    })
+
+    test('should set style with object', () => {
+      const el = document.createElement('div')
+      ;(el as any).$root = true
+      setStyle(el, { color: 'red' })
+      expect(el.style.cssText).toBe('color: red;')
+
+      setStyle(el, { fontSize: '12px' })
+      expect(el.style.cssText).toBe('font-size: 12px;')
+    })
+
+    test('should remove style', () => {
+      const el = document.createElement('div')
+      ;(el as any).$root = true
+      setStyle(el, 'color: red')
+      expect(el.style.cssText).toBe('color: red;')
+
+      setStyle(el, '')
+      expect(el.style.cssText).toBe('')
+    })
+  })
+
+  describe('setAttr', () => {
+    test('should set attribute', () => {
+      const el = document.createElement('div')
+      setAttr(el, 'id', 'foo')
+      expect(el.getAttribute('id')).toBe('foo')
+      setAttr(el, 'name', 'bar')
+      expect(el.getAttribute('name')).toBe('bar')
+    })
+
+    test('should remove attribute', () => {
+      const el = document.createElement('div')
+      setAttr(el, 'id', 'foo')
+      setAttr(el, 'data', 'bar')
+      expect(el.getAttribute('id')).toBe('foo')
+      expect(el.getAttribute('data')).toBe('bar')
+      setAttr(el, 'id', null)
+      expect(el.getAttribute('id')).toBeNull()
+      setAttr(el, 'data', undefined)
+      expect(el.getAttribute('data')).toBeNull()
+    })
+
+    test('should set boolean attribute to string', () => {
+      const el = document.createElement('div')
+      setAttr(el, 'disabled', true)
+      expect(el.getAttribute('disabled')).toBe('true')
+      setAttr(el, 'disabled', false)
+      expect(el.getAttribute('disabled')).toBe('false')
+    })
+
+    test('should set special boolean attribute', () => {
+      const el = document.createElement('input')
+      setAttr(el, 'readonly', true)
+      expect(el.getAttribute('readonly')).toBe('')
+      setAttr(el, 'readonly', false)
+      expect(el.getAttribute('readonly')).toBe(null)
+      setAttr(el, 'readonly', '')
+      expect(el.getAttribute('readonly')).toBe('')
+      setAttr(el, 'readonly', 0)
+      expect(el.getAttribute('readonly')).toBe(null)
+      setAttr(el, 'readonly', '0')
+      expect(el.getAttribute('readonly')).toBe('')
+      setAttr(el, 'readonly', undefined)
+      expect(el.getAttribute('readonly')).toBe(null)
+    })
+
+    test('should set symbol attribute values', () => {
+      const el = document.createElement('div')
+      const symbol = Symbol('foo')
+      setAttr(el, 'data-foo', symbol)
+      expect(el.getAttribute('data-foo')).toBe(symbol.toString())
+    })
+  })
+
+  describe('setValue', () => {
+    test('should set value prop', () => {
+      const el = document.createElement('input')
+      setValue(el, 'foo')
+      expect(el.value).toBe('foo')
+      setValue(el, null)
+      expect(el.value).toBe('')
+      expect(el.getAttribute('value')).toBe(null)
+      const obj = {}
+      setValue(el, obj)
+      expect(el.value).toBe(obj.toString())
+      expect((el as any)._value).toBe(obj)
+
+      const option = document.createElement('option')
+      setElementText(option, 'foo')
+      expect(option.value).toBe('foo')
+      expect(option.getAttribute('value')).toBe(null)
+
+      setValue(option, 'bar')
+      expect(option.textContent).toBe('foo')
+      expect(option.value).toBe('bar')
+      expect(option.getAttribute('value')).toBe('bar')
+    })
+  })
+
+  describe('setDOMProp', () => {
+    test('should be boolean prop', () => {
+      const el = document.createElement('select')
+      // In vapor static attrs are part of the template and this never happens
+      // setDOMProp(el, 'multiple', '')
+      // expect(el.multiple).toBe(true)
+      setProp(el, 'multiple', null)
+      expect(el.multiple).toBe(false)
+      setProp(el, 'multiple', true)
+      expect(el.multiple).toBe(true)
+      setProp(el, 'multiple', 0)
+      expect(el.multiple).toBe(false)
+      setProp(el, 'multiple', '0')
+      expect(el.multiple).toBe(true)
+      setProp(el, 'multiple', false)
+      expect(el.multiple).toBe(false)
+      setProp(el, 'multiple', 1)
+      expect(el.multiple).toBe(true)
+      setProp(el, 'multiple', undefined)
+      expect(el.multiple).toBe(false)
+    })
+
+    test('should remove attribute when value is falsy', () => {
+      const el = document.createElement('div')
+      el.setAttribute('id', '')
+      setProp(el, 'id', null)
+      expect(el.hasAttribute('id')).toBe(false)
+
+      el.setAttribute('id', '')
+      setProp(el, 'id', undefined)
+      expect(el.hasAttribute('id')).toBe(false)
+
+      setProp(el, 'id', '')
+      expect(el.hasAttribute('id')).toBe(false)
+
+      const img = document.createElement('img')
+      setProp(img, 'width', 0)
+      expect(img.hasAttribute('width')).toBe(false) // skipped
+
+      setProp(img, 'width', null)
+      expect(img.hasAttribute('width')).toBe(false)
+      setProp(img, 'width', 1)
+      expect(img.hasAttribute('width')).toBe(true)
+
+      setProp(img, 'width', undefined)
+      expect(img.hasAttribute('width')).toBe(false)
+      setProp(img, 'width', 1)
+      expect(img.hasAttribute('width')).toBe(true)
+    })
+
+    test('should warn when set prop error', () => {
+      const el = document.createElement('div')
+      Object.defineProperty(el, 'someProp', {
+        set() {
+          throw new TypeError('Invalid type')
+        },
+      })
+      setProp(el, 'someProp', 'foo')
+
+      expect(
+        `Failed setting prop "someProp" on <div>: value foo is invalid.`,
+      ).toHaveBeenWarnedLast()
+    })
+
+    test('checkbox with indeterminate', () => {
+      const el = document.createElement('input')
+      el.type = 'checkbox'
+      setProp(el, 'indeterminate', true)
+      expect(el.indeterminate).toBe(true)
+      setProp(el, 'indeterminate', false)
+      expect(el.indeterminate).toBe(false)
+      setProp(el, 'indeterminate', '')
+      expect(el.indeterminate).toBe(true)
+    })
+  })
+
+  describe('setDynamicProp', () => {
+    const element = document.createElement('div')
+    function setDynamicProp(
+      key: string,
+      value: any,
+      el = element.cloneNode(true) as HTMLElement,
+      isSVG: boolean = false,
+    ) {
+      _setDynamicProp(el, key, value, isSVG)
+      return el
+    }
+
+    test('should be able to set id', () => {
+      let res = setDynamicProp('id', 'bar')
+      expect(res.id).toBe('bar')
+    })
+
+    test('should be able to set class', () => {
+      let res = setDynamicProp('class', 'foo')
+      expect(res.className).toBe('foo')
+    })
+
+    test('should be able to set style', () => {
+      let res = setDynamicProp('style', 'color: red')
+      expect(res.style.cssText).toBe('color: red;')
+    })
+
+    test('should be able to set .prop', () => {
+      let res = setDynamicProp('.foo', 'bar')
+      expect((res as any)['foo']).toBe('bar')
+      expect(res.getAttribute('foo')).toBeNull()
+    })
+
+    test('should be able to set ^attr', () => {
+      let res = setDynamicProp('^foo', 'bar')
+      expect(res.getAttribute('foo')).toBe('bar')
+      expect((res as any)['foo']).toBeUndefined()
+    })
+
+    test('should be able to set ^attr to symbol values', () => {
+      const symbol = Symbol('foo')
+      const res = setDynamicProp('^foo', symbol)
+      expect(res.getAttribute('foo')).toBe(symbol.toString())
+    })
+
+    test('should be able to set boolean prop', () => {
+      let res = setDynamicProp(
+        'disabled',
+        true,
+        document.createElement('button'),
+      )
+      expect(res.getAttribute('disabled')).toBe('')
+      setDynamicProp('disabled', false, res)
+      expect(res.getAttribute('disabled')).toBeNull()
+    })
+
+    // The function shouldSetAsProp has complete tests elsewhere,
+    // so here we only do a simple test.
+    test('should be able to set innerHTML and textContent', () => {
+      let res = setDynamicProp('innerHTML', '<p>bar</p>')
+      expect(res.innerHTML).toBe('<p>bar</p>')
+      res = setDynamicProp('textContent', 'foo')
+      expect(res.textContent).toBe('foo')
+    })
+
+    test('set class w/ SVG', () => {
+      const el = document.createElementNS(svgNS, 'svg') as any
+      setDynamicProp('class', 'foo', el, true)
+      expect(el.getAttribute('class')).toBe('foo')
+    })
+
+    test('set class incremental w/ SVG', () => {
+      const el = document.createElementNS(svgNS, 'svg') as any
+      el.setAttribute('class', 'bar')
+      el.$root = true
+      setDynamicProp('class', 'foo', el, true)
+      expect(el.getAttribute('class')).toBe('bar foo')
+    })
+
+    test('set xlink attributes w/ SVG', () => {
+      const el = document.createElementNS(
+        'http://www.w3.org/2000/svg',
+        'use',
+      ) as any
+      setDynamicProp('xlink:href', 'a', el, true)
+      expect(el.getAttributeNS(xlinkNS, 'href')).toBe('a')
+      setDynamicProp('xlink:href', null, el, true)
+      expect(el.getAttributeNS(xlinkNS, 'href')).toBe(null)
+    })
+
+    test('set textContent attributes w/ SVG', () => {
+      const el = document.createElementNS(
+        'http://www.w3.org/2000/svg',
+        'use',
+      ) as any
+      setDynamicProp('textContent', 'foo', el, true)
+      expect(el.attributes.length).toBe(0)
+      expect(el.innerHTML).toBe('foo')
+    })
+  })
+
+  describe('setDynamicProps', () => {
+    test('basic set dynamic props', () => {
+      const el = document.createElement('div')
+      setDynamicProps(el, [{ foo: 'val' }, { bar: 'val' }])
+      expect(el.getAttribute('foo')).toBe('val')
+      expect(el.getAttribute('bar')).toBe('val')
+    })
+
+    test('should merge props', () => {
+      const el = document.createElement('div')
+      setDynamicProps(el, [{ foo: 'val' }, { foo: 'newVal' }])
+      expect(el.getAttribute('foo')).toBe('newVal')
+    })
+
+    test('should reset old props', () => {
+      const el = document.createElement('div')
+      setDynamicProps(el, [{ foo: 'val' }])
+      expect(el.attributes.length).toBe(1)
+      expect(el.getAttribute('foo')).toBe('val')
+
+      setDynamicProps(el, [{ bar: 'val' }])
+      expect(el.attributes.length).toBe(1)
+      expect(el.getAttribute('bar')).toBe('val')
+      expect(el.getAttribute('foo')).toBeNull()
+    })
+
+    test('should treat nullish dynamic props as empty props', () => {
+      const el = document.createElement('div')
+
+      setDynamicProps(el, [null])
+      setDynamicProps(el, [undefined])
+
+      setDynamicProps(el, [{ foo: 'val' }])
+      expect(el.getAttribute('foo')).toBe('val')
+
+      setDynamicProps(el, [null])
+      expect(el.getAttribute('foo')).toBeNull()
+
+      setDynamicProps(el, [{ bar: 'val' }])
+      expect(el.getAttribute('bar')).toBe('val')
+
+      setDynamicProps(el, [undefined])
+      expect(el.getAttribute('bar')).toBeNull()
+    })
+
+    test('should reset old modifier props', () => {
+      const el = document.createElement('div')
+
+      setDynamicProps(el, [{ ['.foo']: 'val' }])
+      expect((el as any).foo).toBe('val')
+
+      setDynamicProps(el, [{ ['.bar']: 'val' }])
+      expect((el as any).bar).toBe('val')
+      expect((el as any).foo).toBe('')
+
+      setDynamicProps(el, [{ ['^foo']: 'val' }])
+      expect(el.attributes.length).toBe(1)
+      expect(el.getAttribute('foo')).toBe('val')
+
+      setDynamicProps(el, [{ ['^bar']: 'val' }])
+      expect(el.attributes.length).toBe(1)
+      expect(el.getAttribute('bar')).toBe('val')
+      expect(el.getAttribute('foo')).toBeNull()
+    })
+
+    test('should skip unchanged primitive dynamic props', () => {
+      const el = document.createElement('div')
+      let directSetCount = 0
+      let fallthroughSetCount = 0
+
+      Object.defineProperty(el, 'foo', {
+        set() {
+          directSetCount++
+        },
+      })
+      Object.defineProperty(el, 'bar', {
+        set() {
+          fallthroughSetCount++
+        },
+      })
+
+      setDynamicProps(el, [{ ['.foo']: 'val' }])
+      setDynamicProps(el, [{ ['.foo']: 'val' }])
+      expect(directSetCount).toBe(1)
+
+      setDynamicProps(el, [{ ['.foo']: 'next' }])
+      expect(directSetCount).toBe(2)
+
+      applyFallthroughProps(el, { ['.bar']: 'fallthrough' })
+      applyFallthroughProps(el, { ['.bar']: 'fallthrough' })
+      expect(fallthroughSetCount).toBe(1)
+
+      applyFallthroughProps(el, { ['.bar']: 'next' })
+      expect(fallthroughSetCount).toBe(2)
+    })
+
+    test('should clean dynamic event props on effect update and stop', async () => {
+      const el = document.createElement('button')
+      const active = ref(true)
+      const handler = vi.fn()
+      const scope = effectScope()
+      scope.run(() => {
+        renderEffect(() => {
+          setDynamicProps(el, [active.value ? { onClick: handler } : {}])
+        })
+      })
+
+      el.click()
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      active.value = false
+      await nextTick()
+      el.click()
+      expect(handler).toHaveBeenCalledTimes(1)
+
+      active.value = true
+      await nextTick()
+      el.click()
+      expect(handler).toHaveBeenCalledTimes(2)
+
+      scope.stop()
+      el.click()
+      expect(handler).toHaveBeenCalledTimes(2)
+    })
+
+    test('should parse dynamic event option modifiers like vdom', () => {
+      const el = document.createElement('button')
+      const handler = vi.fn()
+      const scope = effectScope()
+      scope.run(() => {
+        renderEffect(() => {
+          setDynamicProps(el, [{ onClickOnceCapture: handler }])
+        })
+      })
+
+      el.dispatchEvent(new Event('click'))
+      el.dispatchEvent(new Event('click'))
+
+      expect(handler).toHaveBeenCalledTimes(1)
+      scope.stop()
+    })
+
+    test('should parse dynamic event names like vdom', () => {
+      const el = document.createElement('button')
+      const handler = vi.fn()
+      const scope = effectScope()
+      scope.run(() => {
+        renderEffect(() => {
+          setDynamicProps(el, [{ onMyEventOnce: handler }])
+        })
+      })
+
+      el.dispatchEvent(new Event('my-event'))
+      el.dispatchEvent(new Event('my-event'))
+
+      expect(handler).toHaveBeenCalledTimes(1)
+      scope.stop()
+    })
+
+    test('should restore fallthrough state when dynamic props throw', () => {
+      const el = document.createElement('div')
+      const attrs: Record<string, any> = {}
+
+      Object.defineProperty(attrs, 'foo', {
+        enumerable: true,
+        get() {
+          throw new Error('fallthrough boom')
+        },
+      })
+
+      expect(() => applyFallthroughProps(el, attrs)).toThrow('fallthrough boom')
+      expect(isApplyingFallthroughProps).toBe(false)
+    })
+  })
+
+  describe('setText', () => {
+    test('should set nodeValue', () => {
+      const el = document.createTextNode('foo')
+      setText(el, '')
+      expect(el.textContent).toBe('')
+      setText(el, 'foo')
+      expect(el.textContent).toBe('foo')
+      setText(el, 'bar')
+      expect(el.textContent).toBe('bar')
+    })
+  })
+
+  describe('setElementText', () => {
+    test('should set textContent w/ toDisplayString', () => {
+      const el = document.createElement('div')
+      setElementText(el, null)
+      expect(el.textContent).toBe('')
+      setElementText(el, { a: 1 })
+      expect(el.textContent).toBe(JSON.stringify({ a: 1 }, null, 2))
+      setElementText(el, ref('bar'))
+      expect(el.textContent).toBe('bar')
+    })
+  })
+
+  describe('setHtml', () => {
+    test('should set innerHTML', () => {
+      const el = document.createElement('div')
+      setHtml(el, null)
+      expect(el.innerHTML).toBe('')
+      setHtml(el, '<p>foo</p>')
+      expect(el.innerHTML).toBe('<p>foo</p>')
+      setHtml(el, '<p>bar</p>')
+      expect(el.innerHTML).toBe('<p>bar</p>')
+    })
+  })
+})

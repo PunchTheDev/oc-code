@@ -1,0 +1,304 @@
+diff --git a/client/client.go b/client/client.go
+index ee94ab38832..730d4b3f0e2 100644
+--- a/client/client.go
++++ b/client/client.go
+@@ -63,6 +63,7 @@ type Client struct {
+ 	referer              string
+ 	userRequestHooks     []RequestHook
+ 	builtinRequestHooks  []RequestHook
++	finalRequestHooks    []RequestHook
+ 	userResponseHooks    []ResponseHook
+ 	builtinResponseHooks []ResponseHook
+ 
+@@ -160,6 +161,24 @@ func (c *Client) AddRequestHook(h ...RequestHook) *Client {
+ 	return c
+ }
+ 
++// FinalRequestHook returns a copy of the user-defined final request hooks.
++func (c *Client) FinalRequestHook() []RequestHook {
++	c.mu.RLock()
++	defer c.mu.RUnlock()
++
++	return slices.Clone(c.finalRequestHooks)
++}
++
++// AddFinalRequestHook registers hooks for the point after request serialization
++// and immediately before transport execution.
++func (c *Client) AddFinalRequestHook(h ...RequestHook) *Client {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	c.finalRequestHooks = append(c.finalRequestHooks, h...)
++	return c
++}
++
+ // ResponseHook returns a copy of the user-defined response hooks.
+ func (c *Client) ResponseHook() []ResponseHook {
+ 	c.mu.RLock()
+@@ -968,6 +987,7 @@ func newClient(transport httpClientTransport) *Client {
+ 
+ 		userRequestHooks:     []RequestHook{},
+ 		builtinRequestHooks:  []RequestHook{parserRequestURL, parserRequestHeader, parserRequestBody},
++		finalRequestHooks:    []RequestHook{},
+ 		userResponseHooks:    []ResponseHook{},
+ 		builtinResponseHooks: []ResponseHook{parserResponseCookie, logger},
+ 		jsonMarshal:          json.Marshal,
+diff --git a/client/client_test.go b/client/client_test.go
+index 2034329e09d..c3d90afcaa7 100644
+--- a/client/client_test.go
++++ b/client/client_test.go
+@@ -283,6 +283,16 @@ func Test_Client_Add_Hook(t *testing.T) {
+ 		require.Len(t, client.RequestHook(), 3)
+ 	})
+ 
++	t.Run("add final request hooks", func(t *testing.T) {
++		t.Parallel()
++
++		client := New().AddFinalRequestHook(func(_ *Client, _ *Request) error {
++			return nil
++		})
++
++		require.Len(t, client.FinalRequestHook(), 1)
++	})
++
+ 	t.Run("add response hooks", func(t *testing.T) {
+ 		t.Parallel()
+ 		client := New().AddResponseHook(func(_ *Client, _ *Response, _ *Request) error {
+diff --git a/client/core.go b/client/core.go
+index ad08f74f865..ff656b08c19 100644
+--- a/client/core.go
++++ b/client/core.go
+@@ -142,6 +142,7 @@ func (c *core) execFunc() (*Response, error) {
+ func (c *core) preHooks() error {
+ 	c.client.mu.RLock()
+ 	userHooks := slices.Clone(c.client.userRequestHooks)
++	finalHooks := slices.Clone(c.client.finalRequestHooks)
+ 	c.client.mu.RUnlock()
+ 
+ 	for _, f := range userHooks {
+@@ -150,6 +151,22 @@ func (c *core) preHooks() error {
+ 		}
+ 	}
+ 
++	if err := c.runBuiltinRequestHooks(); err != nil {
++		return err
++	}
++
++	for _, f := range finalHooks {
++		if err := f(c.client, c.req); err != nil {
++			return err
++		}
++	}
++
++	return nil
++}
++
++// runBuiltinRequestHooks serializes the request under the client lock, as the
++// built-in hooks read client-level state while they fill in RawRequest.
++func (c *core) runBuiltinRequestHooks() error {
+ 	c.client.mu.Lock()
+ 	defer c.client.mu.Unlock()
+ 
+diff --git a/client/core_test.go b/client/core_test.go
+index 803d1018cd4..51e410e3ebe 100644
+--- a/client/core_test.go
++++ b/client/core_test.go
+@@ -448,6 +448,95 @@ func Test_PreHooks_AllowsUserHookClientConfigMutation(t *testing.T) {
+ 	require.Contains(t, string(core.req.RawRequest.Header.Cookie("session")), "abc")
+ }
+ 
++func Test_PreHooks_FinalRequestHookSeesSerializedRequest(t *testing.T) {
++	t.Parallel()
++
++	client := New()
++	client.AddFinalRequestHook(func(_ *Client, req *Request) error {
++		require.Equal(t, "POST", string(req.RawRequest.Header.Method()))
++		require.Equal(t, "application/json", string(req.RawRequest.Header.ContentType()))
++		require.JSONEq(t, `{"name":"fiber"}`, string(req.RawRequest.Body()))
++		req.RawRequest.Header.Set("X-Signature", "signed")
++		return nil
++	})
++
++	core := newCore()
++	core.client = client
++	core.req = AcquireRequest()
++	defer ReleaseRequest(core.req)
++	core.req.SetMethod("POST").SetURL("http://example.com").SetJSON(map[string]string{"name": "fiber"})
++
++	require.NoError(t, core.preHooks())
++	require.Equal(t, "signed", string(core.req.RawRequest.Header.Peek("X-Signature")))
++}
++
++func Test_PreHooks_ReturnsFinalRequestHookError(t *testing.T) {
++	t.Parallel()
++
++	client := New()
++	wantErr := errors.New("final request hook failed")
++	client.AddFinalRequestHook(func(_ *Client, _ *Request) error { return wantErr })
++
++	core := newCore()
++	core.client = client
++	core.req = AcquireRequest()
++	defer ReleaseRequest(core.req)
++	core.req.SetURL("http://example.com")
++
++	require.ErrorIs(t, core.preHooks(), wantErr)
++}
++
++func Test_PreHooks_ReleasesClientLockWhenBuiltinHookPanics(t *testing.T) {
++	t.Parallel()
++
++	client := New()
++	callCount := 0
++	client.builtinRequestHooks = []RequestHook{func(_ *Client, _ *Request) error {
++		callCount++
++		if callCount == 1 {
++			panic("built-in request hook panic")
++		}
++		return nil
++	}}
++
++	firstCore := newCore()
++	firstCore.client = client
++	firstCore.req = AcquireRequest()
++	defer ReleaseRequest(firstCore.req)
++
++	require.PanicsWithValue(t, "built-in request hook panic", func() {
++		require.NoError(t, firstCore.preHooks())
++	})
++
++	secondCore := newCore()
++	secondCore.client = client
++	secondCore.req = AcquireRequest()
++	defer ReleaseRequest(secondCore.req)
++
++	require.NoError(t, secondCore.preHooks())
++	require.Equal(t, 2, callCount)
++}
++
++func Test_PreHooks_RunsFinalRequestHooksOutsideClientLock(t *testing.T) {
++	t.Parallel()
++
++	client := New()
++	hookCount := 0
++	client.AddFinalRequestHook(func(c *Client, _ *Request) error {
++		hookCount = len(c.FinalRequestHook())
++		return nil
++	})
++
++	core := newCore()
++	core.client = client
++	core.req = AcquireRequest()
++	defer ReleaseRequest(core.req)
++	core.req.SetURL("http://example.com")
++
++	require.NoError(t, core.preHooks())
++	require.Equal(t, 1, hookCount)
++}
++
+ // Test_AfterHooks_ReturnsUserHookError verifies a failing user response hook
+ // aborts afterHooks and its error is propagated.
+ func Test_AfterHooks_ReturnsUserHookError(t *testing.T) {
+diff --git a/docs/client/hooks.md b/docs/client/hooks.md
+index ec499520d70..fe1b5f759e4 100644
+--- a/docs/client/hooks.md
++++ b/docs/client/hooks.md
+@@ -138,6 +138,44 @@ exit status 2
+ 
+ </details>
+ 
++### Final Request Hooks
++
++Hooks added with `AddRequestHook` run before Fiber's built-in hooks, so they can
++configure high-level request fields such as URL parameters, headers, and body.
++Hooks added with `AddFinalRequestHook` run after the built-in hooks and
++immediately before the request is sent, when `RawRequest` holds the resolved
++URL, the merged headers and cookies, and the serialized body. This is the place
++for request signing:
++
++```go
++cc.AddFinalRequestHook(func(_ *client.Client, req *client.Request) error {
++    raw := req.RawRequest
++    if raw.IsBodyStream() {
++        return errors.New("cannot sign a streamed body")
++    }
++
++    signature := sign(raw.URI().RequestURI(), raw.URI().Host(), raw.Body())
++    raw.Header.Set("X-Signature", signature)
++    return nil
++})
++```
++
++:::caution
++fasthttp writes the request line, `Host` and `Content-Length` when it sends the
++request, which is after this hook. Take the target and the host from
++`RawRequest.URI()`: `Header.Header()` still carries the absolute URL without its
++query string, and `Header.Host()` is empty.
++
++The hook runs once per call, not once per attempt: retries resend the request it
++signed, and a redirect is followed below it, carrying a signature bound to the
++previous URL. Sign with a nonce or a timestamp only when retries are off.
++
++Hence the `IsBodyStream` guard above. Reading `RawRequest.Body()` drains a body
++stream into memory, and a stream that fails mid-read leaves fasthttp's error
++text in the body: that text is then sent as the payload, signed as if it were
++genuine, while `Send` reports no error. Buffer such a body before attaching it.
++:::
++
+ ## Response Hooks
+ 
+ **Response hooks** are functions executed after the HTTP response is received. They follow the signature:
+@@ -253,7 +291,9 @@ exit status 2
+ 
+ ## Hook Execution Order
+ 
+-Hooks run in FIFO order (first in, first out), so they're executed in the order you add them. Keep this in mind when adding multiple hooks, as the order can affect the outcome.
++Each hook group runs in FIFO order. The complete request pipeline is regular
++request hooks, built-in request hooks, final request hooks, transport, built-in
++response hooks, and regular response hooks.
+ 
+ **Example:**
+ 
+diff --git a/docs/client/rest.md b/docs/client/rest.md
+index e8084e800a4..b124d549588 100644
+--- a/docs/client/rest.md
++++ b/docs/client/rest.md
+@@ -243,6 +243,26 @@ Adds one or more user-defined request hooks.
+ func (c *Client) AddRequestHook(h ...RequestHook) *Client
+ ```
+ 
++### FinalRequestHook
++
++Returns final request hooks. These run after Fiber has serialized the URL,
++headers, and body, immediately before the transport sends the request.
++
++```go title="Signature"
++func (c *Client) FinalRequestHook() []RequestHook
++```
++
++### AddFinalRequestHook
++
++Adds final request hooks. Use these when request signing or authentication must
++inspect the serialized request body together with the merged headers. See
++[Final Request Hooks](./hooks.md#final-request-hooks) for what is already set at
++that point and what fasthttp adds afterward.
++
++```go title="Signature"
++func (c *Client) AddFinalRequestHook(h ...RequestHook) *Client
++```
++
+ ### AddResponseHook
+ 
+ Adds one or more user-defined response hooks.
+diff --git a/docs/whats_new.md b/docs/whats_new.md
+index 06bee800ef9..80059c5225a 100644
+--- a/docs/whats_new.md
++++ b/docs/whats_new.md
+@@ -2806,6 +2806,7 @@ jar.Set(uri, c)
+ | Feature | v3 API |
+ |---------|--------|
+ | Request Hooks | `c.AddRequestHook(fn)` |
++| Final Request Hooks | `c.AddFinalRequestHook(fn)` |
+ | Response Hooks | `c.AddResponseHook(fn)` |
+ | Proxy | `c.SetProxyURL(url)` |
+ | Context | `req.SetContext(ctx)` |
