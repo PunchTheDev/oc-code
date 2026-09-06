@@ -1,0 +1,778 @@
+diff --git a/changelog/14445.bugfix.rst b/changelog/14445.bugfix.rst
+new file mode 100644
+index 00000000000..68b37754b08
+--- /dev/null
++++ b/changelog/14445.bugfix.rst
+@@ -0,0 +1,3 @@
++Assertion rewriting no longer evaluates walrus operator (``:=``) expressions more than once, which reported results the test never computed when the expression had side effects.
++
++An operand evaluated before a later walrus is now reported with the value it actually saw, so ``assert value != identity(value := value.lower())`` keeps Python's left-to-right order.
+diff --git a/src/_pytest/assertion/rewrite.py b/src/_pytest/assertion/rewrite.py
+index 3f44ce72fb4..27953336c5c 100644
+--- a/src/_pytest/assertion/rewrite.py
++++ b/src/_pytest/assertion/rewrite.py
+@@ -3,7 +3,6 @@
+ from __future__ import annotations
+ 
+ import ast
+-from collections import defaultdict
+ from collections.abc import Callable
+ from collections.abc import Iterable
+ from collections.abc import Iterator
+@@ -57,10 +56,6 @@
+     from _pytest.assertion import AssertionState
+ 
+ 
+-class Sentinel:
+-    pass
+-
+-
+ assertstate_key = StashKey["AssertionState"]()
+ 
+ # pytest caches rewritten pycs in pycache dirs
+@@ -68,9 +63,6 @@ class Sentinel:
+ PYC_EXT = ".py" + ((__debug__ and "c") or "o")
+ PYC_TAIL = "." + PYTEST_TAG + PYC_EXT
+ 
+-# Special marker that denotes we have just left a scope definition
+-_SCOPE_END_MARKER = Sentinel()
+-
+ 
+ class AssertionRewritingHook(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+     """PEP302/PEP451 import hook which rewrites asserts."""
+@@ -538,6 +530,16 @@ def traverse_node(node: ast.AST) -> Iterator[ast.AST]:
+         yield from traverse_node(child)
+ 
+ 
++def _walrus_targets(nodes: Iterable[ast.expr]) -> set[str]:
++    """Return the names any walrus operator in *nodes* rebinds."""
++    return {
++        sub.target.id
++        for node in nodes
++        for sub in ast.walk(node)
++        if isinstance(sub, ast.NamedExpr)
++    }
++
++
+ @functools.lru_cache(maxsize=1)
+ def _get_assertion_exprs(src: bytes) -> dict[int, str]:
+     """Return a mapping from {lineno: "assertion test expression"}."""
+@@ -642,14 +644,8 @@ class AssertionRewriter(ast.NodeVisitor):
+        .push_format_context() and .pop_format_context() which allows
+        to build another %-formatted string while already building one.
+ 
+-    :scope: A tuple containing the current scope used for variables_overwrite.
+-
+-    :variables_overwrite: A dict filled with references to variables
+-       that change value within an assert. This happens when a variable is
+-       reassigned with the walrus operator
+-
+-    This state, except the variables_overwrite,  is reset on every new assert
+-    statement visited and used by the other visitors.
++    This state is reset on every new assert statement visited and used by
++    the other visitors.
+     """
+ 
+     def __init__(
+@@ -665,10 +661,6 @@ def __init__(
+         else:
+             self.enable_assertion_pass_hook = False
+         self.source = source
+-        self.scope: tuple[ast.AST, ...] = ()
+-        self.variables_overwrite: defaultdict[tuple[ast.AST, ...], dict[str, str]] = (
+-            defaultdict(dict)
+-        )
+ 
+     def run(self, mod: ast.Module) -> None:
+         """Find all assert statements in *mod* and rewrite them."""
+@@ -718,16 +710,9 @@ def run(self, mod: ast.Module) -> None:
+         mod.body[pos:pos] = imports
+ 
+         # Collect asserts.
+-        self.scope = (mod,)
+-        nodes: list[ast.AST | Sentinel] = [mod]
++        nodes: list[ast.AST] = [mod]
+         while nodes:
+             node = nodes.pop()
+-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+-                self.scope = (*self.scope, node)
+-                nodes.append(_SCOPE_END_MARKER)
+-            if node == _SCOPE_END_MARKER:
+-                self.scope = self.scope[:-1]
+-                continue
+             assert isinstance(node, ast.AST)
+             for name, field in ast.iter_fields(node):
+                 if isinstance(field, list):
+@@ -954,15 +939,16 @@ def visit_Assert(self, assert_: ast.Assert) -> list[ast.stmt]:
+         return self.statements
+ 
+     def visit_NamedExpr(self, name: ast.NamedExpr) -> tuple[ast.NamedExpr, str]:
+-        # This method handles the 'walrus operator' repr of the target
+-        # name if it's a local variable or _should_repr_global_name()
+-        # thinks it's acceptable.
++        # Return the NamedExpr as-is so it evaluates in its natural position
++        # (preserving left-to-right evaluation order in function calls, etc.).
++        # For the explanation, reference the target variable.
+         locs = ast.Call(self.builtin("locals"), [], [])
+         target_id = name.target.id
++        target_name = ast.Name(target_id, ast.Load())
+         inlocs = ast.Compare(ast.Constant(target_id), [ast.In()], [locs])
+-        dorepr = self.helper("_should_repr_global_name", name)
++        dorepr = self.helper("_should_repr_global_name", target_name)
+         test = ast.BoolOp(ast.Or(), [inlocs, dorepr])
+-        expr = ast.IfExp(test, self.display(name), ast.Constant(target_id))
++        expr = ast.IfExp(test, self.display(target_name), ast.Constant(target_id))
+         return name, self.explanation_param(expr)
+ 
+     def visit_Name(self, name: ast.Name) -> tuple[ast.Name, str]:
+@@ -975,6 +961,27 @@ def visit_Name(self, name: ast.Name) -> tuple[ast.Name, str]:
+         expr = ast.IfExp(test, self.display(name), ast.Constant(name.id))
+         return name, self.explanation_param(expr)
+ 
++    def visit_operand(
++        self, operand: ast.expr, later: Sequence[ast.expr]
++    ) -> tuple[ast.expr, str]:
++        """Visit an operand, freezing it against walrus operators in *later*.
++
++        Operands are rewritten into statements that run in source order, but
++        a plain name is left as a bare load evaluated at the very end, when
++        the enclosing expression is assembled.  A walrus operator in a later
++        operand rebinds that name in between, so both the value used and the
++        value reported would be the post-walrus one -- Python evaluates the
++        earlier operand first.  Copy the value into a temporary instead.
++        """
++        specifiers = set(self.explanation_specifiers)
++        res, expl = self.visit(operand)
++        if isinstance(res, ast.Name) and res.id in _walrus_targets(later):
++            snapshot = self.assign(res)
++            for key in set(self.explanation_specifiers) - specifiers:
++                self.explanation_specifiers[key] = self.display(snapshot)
++            res = snapshot
++        return res, expl
++
+     def visit_BoolOp(self, boolop: ast.BoolOp) -> tuple[ast.Name, str]:
+         res_var = self.variable()
+         expl_list = self.assign(ast.List([], ast.Load()))
+@@ -983,32 +990,43 @@ def visit_BoolOp(self, boolop: ast.BoolOp) -> tuple[ast.Name, str]:
+         body = save = self.statements
+         fail_save = self.expl_stmts
+         levels = len(boolop.values) - 1
++        later_walrus_targets = [
++            _walrus_targets(boolop.values[idx + 1 :])
++            for idx in range(len(boolop.values))
++        ]
+         self.push_format_context()
+-        # Process each operand, short-circuiting if needed.
++        # Process each operand, short-circuiting as needed.
+         for i, v in enumerate(boolop.values):
+             if i:
+                 fail_inner: list[ast.stmt] = []
+                 # cond is set in a prior loop iteration below
+                 self.expl_stmts.append(ast.If(cond, fail_inner, []))  # noqa: F821
+                 self.expl_stmts = fail_inner
+-                match v:
+-                    # Check if the left operand is an ast.NamedExpr and the value has already been visited
+-                    case ast.Compare(
+-                        left=ast.NamedExpr(target=ast.Name(id=target_id))
+-                    ) if target_id in [
+-                        e.id for e in boolop.values[:i] if hasattr(e, "id")
+-                    ]:
+-                        pytest_temp = self.variable()
+-                        self.variables_overwrite[self.scope][target_id] = v.left  # type:ignore[assignment]
+-                        # mypy's false positive, we're checking that the 'target' attribute exists.
+-                        v.left.target.id = pytest_temp  # type:ignore[attr-defined]
+             self.push_format_context()
+             res, expl = self.visit(v)
+             body.append(ast.Assign([ast.Name(res_var, ast.Store())], res))
++            # Snapshot when the raw ``res`` node would be unsafe to reuse
++            # as a condition or explanation reference:
++            #  - NamedExpr (non-last): reusing the node re-evaluates the
++            #    walrus expression including any side effects.
++            #  - Name whose variable a later walrus overwrites: the
++            #    explanation would show the post-walrus value.
++            needs_snapshot = (isinstance(v, ast.NamedExpr) and i < levels) or (
++                isinstance(v, ast.Name) and v.id in later_walrus_targets[i]
++            )
++            if needs_snapshot:
++                snapshot = self.assign(ast.Name(res_var, ast.Load()))
++                res = snapshot
++                for key in self.stack[-1]:
++                    self.stack[-1][key] = self.display(snapshot)
+             expl_format = self.pop_format_context(ast.Constant(expl))
+             call = ast.Call(app, [expl_format], [])
+             self.expl_stmts.append(ast.Expr(call))
+             if i < levels:
++                # Short-circuit: and → continue if truthy; or → if falsy.
++                # ``res`` is a stable reference (Name vars are only
++                # snapshotted when a later walrus would corrupt them;
++                # calls/compares return @py_assert vars from assign()).
+                 cond: ast.expr = res
+                 if is_or:
+                     cond = ast.UnaryOp(ast.Not(), cond)
+@@ -1029,7 +1047,7 @@ def visit_UnaryOp(self, unary: ast.UnaryOp) -> tuple[ast.Name, str]:
+ 
+     def visit_BinOp(self, binop: ast.BinOp) -> tuple[ast.Name, str]:
+         symbol = BINOP_MAP[binop.op.__class__]
+-        left_expr, left_expl = self.visit(binop.left)
++        left_expr, left_expl = self.visit_operand(binop.left, [binop.right])
+         right_expr, right_expl = self.visit(binop.right)
+         explanation = f"({left_expl} {symbol} {right_expl})"
+         res = self.assign(
+@@ -1038,25 +1056,19 @@ def visit_BinOp(self, binop: ast.BinOp) -> tuple[ast.Name, str]:
+         return res, explanation
+ 
+     def visit_Call(self, call: ast.Call) -> tuple[ast.Name, str]:
+-        new_func, func_expl = self.visit(call.func)
++        # The callee and every argument are evaluated left to right, so each of
++        # them has to be frozen against walrus operators in what follows.
++        operands = [*call.args, *(keyword.value for keyword in call.keywords)]
++        new_func, func_expl = self.visit_operand(call.func, operands)
+         arg_expls = []
+         new_args = []
+         new_kwargs = []
+-        for arg in call.args:
+-            if isinstance(arg, ast.Name) and arg.id in self.variables_overwrite.get(
+-                self.scope, {}
+-            ):
+-                arg = self.variables_overwrite[self.scope][arg.id]  # type:ignore[assignment]
+-            res, expl = self.visit(arg)
++        for i, arg in enumerate(call.args):
++            res, expl = self.visit_operand(arg, operands[i + 1 :])
+             arg_expls.append(expl)
+             new_args.append(res)
+-        for keyword in call.keywords:
+-            match keyword.value:
+-                case ast.Name(id=id) if id in self.variables_overwrite.get(
+-                    self.scope, {}
+-                ):
+-                    keyword.value = self.variables_overwrite[self.scope][id]  # type:ignore[assignment]
+-            res, expl = self.visit(keyword.value)
++        for i, keyword in enumerate(call.keywords, start=len(call.args)):
++            res, expl = self.visit_operand(keyword.value, operands[i + 1 :])
+             new_kwargs.append(ast.keyword(keyword.arg, res))
+             if keyword.arg:
+                 arg_expls.append(keyword.arg + "=" + expl)
+@@ -1090,17 +1102,11 @@ def visit_Attribute(self, attr: ast.Attribute) -> tuple[ast.Name, str]:
+ 
+     def visit_Compare(self, comp: ast.Compare) -> tuple[ast.expr, str]:
+         self.push_format_context()
+-        # We first check if we have overwritten a variable in the previous assert
+-        match comp.left:
+-            case ast.Name(id=name_id) if name_id in self.variables_overwrite.get(
+-                self.scope, {}
+-            ):
+-                comp.left = self.variables_overwrite[self.scope][name_id]  # type: ignore[assignment]
+-            case ast.NamedExpr(target=ast.Name(id=target_id)):
+-                self.variables_overwrite[self.scope][target_id] = comp.left  # type: ignore[assignment]
+-        left_res, left_expl = self.visit(comp.left)
++        left_res, left_expl = self.visit_operand(comp.left, comp.comparators)
+         if isinstance(comp.left, ast.Compare | ast.BoolOp):
+             left_expl = f"({left_expl})"
++        if isinstance(left_res, ast.NamedExpr):
++            left_res = self.assign(left_res)
+         res_variables = [self.variable() for i in range(len(comp.ops))]
+         load_names: list[ast.expr] = [ast.Name(v, ast.Load()) for v in res_variables]
+         store_names = [ast.Name(v, ast.Store()) for v in res_variables]
+@@ -1109,17 +1115,13 @@ def visit_Compare(self, comp: ast.Compare) -> tuple[ast.expr, str]:
+         syms: list[ast.expr] = []
+         results = [left_res]
+         for i, op, next_operand in it:
+-            match (next_operand, left_res):
+-                case (
+-                    ast.NamedExpr(target=ast.Name(id=target_id)),
+-                    ast.Name(id=name_id),
+-                ) if target_id == name_id:
+-                    next_operand.target.id = self.variable()
+-                    self.variables_overwrite[self.scope][name_id] = next_operand  # type: ignore[assignment]
+-
+-            next_res, next_expl = self.visit(next_operand)
++            next_res, next_expl = self.visit_operand(
++                next_operand, comp.comparators[i + 1 :]
++            )
+             if isinstance(next_operand, ast.Compare | ast.BoolOp):
+                 next_expl = f"({next_expl})"
++            if isinstance(next_res, ast.NamedExpr):
++                next_res = self.assign(next_res)
+             results.append(next_res)
+             sym = BINOP_MAP[op.__class__]
+             syms.append(ast.Constant(sym))
+diff --git a/testing/test_assertrewrite.py b/testing/test_assertrewrite.py
+index ef038383ed1..c9736f8fa48 100644
+--- a/testing/test_assertrewrite.py
++++ b/testing/test_assertrewrite.py
+@@ -1637,190 +1637,29 @@ def test_simple_failure():
+         result.stdout.fnmatch_lines(["*E*assert (1 + 1) == 3"])
+ 
+ 
+-class TestAssertionRewriteWalrusOperator:
+-    """See #10743"""
+-
+-    def test_assertion_walrus_operator(self, pytester: Pytester) -> None:
+-        pytester.makepyfile(
+-            """
+-            def my_func(before, after):
+-                return before == after
+-
+-            def change_value(value):
+-                return value.lower()
+-
+-            def test_walrus_conversion():
+-                a = "Hello"
+-                assert not my_func(a, a := change_value(a))
+-                assert a == "hello"
+-        """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 0
+-
+-    def test_assertion_walrus_operator_dont_rewrite(self, pytester: Pytester) -> None:
+-        pytester.makepyfile(
+-            """
+-            'PYTEST_DONT_REWRITE'
+-            def my_func(before, after):
+-                return before == after
+-
+-            def change_value(value):
+-                return value.lower()
+-
+-            def test_walrus_conversion_dont_rewrite():
+-                a = "Hello"
+-                assert not my_func(a, a := change_value(a))
+-                assert a == "hello"
+-        """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 0
+-
+-    def test_assertion_inline_walrus_operator(self, pytester: Pytester) -> None:
+-        pytester.makepyfile(
+-            """
+-            def my_func(before, after):
+-                return before == after
+-
+-            def test_walrus_conversion_inline():
+-                a = "Hello"
+-                assert not my_func(a, a := a.lower())
+-                assert a == "hello"
+-        """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 0
+-
+-    def test_assertion_inline_walrus_operator_reverse(self, pytester: Pytester) -> None:
+-        pytester.makepyfile(
+-            """
+-            def my_func(before, after):
+-                return before == after
+-
+-            def test_walrus_conversion_reverse():
+-                a = "Hello"
+-                assert my_func(a := a.lower(), a)
+-                assert a == 'hello'
+-        """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 0
+-
+-    def test_assertion_walrus_no_variable_name_conflict(
+-        self, pytester: Pytester
+-    ) -> None:
+-        pytester.makepyfile(
+-            """
+-            def test_walrus_conversion_no_conflict():
+-                a = "Hello"
+-                assert a == (b := a.lower())
+-        """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 1
+-        result.stdout.fnmatch_lines(["*AssertionError: assert 'Hello' == 'hello'"])
+-
+-    def test_assertion_walrus_operator_true_assertion_and_changes_variable_value(
+-        self, pytester: Pytester
+-    ) -> None:
+-        pytester.makepyfile(
+-            """
+-            def test_walrus_conversion_succeed():
+-                a = "Hello"
+-                assert a != (a := a.lower())
+-                assert a == 'hello'
+-        """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 0
+-
+-    def test_assertion_walrus_operator_fail_assertion(self, pytester: Pytester) -> None:
+-        pytester.makepyfile(
+-            """
+-            def test_walrus_conversion_fails():
+-                a = "Hello"
+-                assert a == (a := a.lower())
+-        """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 1
+-        result.stdout.fnmatch_lines(["*AssertionError: assert 'Hello' == 'hello'"])
+-
+-    def test_assertion_walrus_operator_boolean_composite(
+-        self, pytester: Pytester
+-    ) -> None:
+-        pytester.makepyfile(
+-            """
+-            def test_walrus_operator_change_boolean_value():
+-                a = True
+-                assert a and True and ((a := False) is False) and (a is False) and ((a := None) is None)
+-                assert a is None
+-        """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 0
+-
+-    def test_assertion_walrus_operator_compare_boolean_fails(
+-        self, pytester: Pytester
+-    ) -> None:
+-        pytester.makepyfile(
+-            """
+-            def test_walrus_operator_change_boolean_value():
+-                a = True
+-                assert not (a and ((a := False) is False))
+-        """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 1
+-        result.stdout.fnmatch_lines(["*assert not (True and False is False)"])
++def test_walrus_rebinding_does_not_outlive_its_statement(
++    pytester: Pytester,
++) -> None:
++    """A walrus target must not be rebound by a later, unrelated assertion.
+ 
+-    def test_assertion_walrus_operator_boolean_none_fails(
+-        self, pytester: Pytester
+-    ) -> None:
+-        pytester.makepyfile(
+-            """
+-            def test_walrus_operator_change_boolean_value():
+-                a = True
+-                assert not (a and ((a := None) is None))
++    The rest of #10743's suite moved to the coverage matrix, which runs
++    in-process.  This one stays here because it needs two tests in one module
++    to say anything: the rewriter may keep no state that survives a statement,
++    let alone a test.  The matrix cannot express that.
++    """
++    pytester.makepyfile(
+         """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 1
+-        result.stdout.fnmatch_lines(["*assert not (True and None is None)"])
++        def test_walrus_operator_change_value():
++            a = True
++            assert (a := None) is None
+ 
+-    def test_assertion_walrus_operator_value_changes_cleared_after_each_test(
+-        self, pytester: Pytester
+-    ) -> None:
+-        pytester.makepyfile(
+-            """
+-            def test_walrus_operator_change_value():
+-                a = True
+-                assert (a := None) is None
+-
+-            def test_walrus_operator_not_override_value():
+-                a = True
+-                assert a is True
+-        """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 0
+-
+-    def test_assertion_namedexpr_compare_left_overwrite(
+-        self, pytester: Pytester
+-    ) -> None:
+-        pytester.makepyfile(
+-            """
+-            def test_namedexpr_compare_left_overwrite():
+-                a = "Hello"
+-                b = "World"
+-                c = "Test"
+-                assert (a := b) == c and (a := "Test") == "Test"
+-            """
+-        )
+-        result = pytester.runpytest()
+-        assert result.ret == 1
+-        result.stdout.fnmatch_lines(["*assert ('World' == 'Test'*"])
++        def test_walrus_operator_not_override_value():
++            a = True
++            assert a is True
++    """
++    )
++    result = pytester.runpytest()
++    assert result.ret == 0
+ 
+ 
+ class TestIssue11028:
+@@ -1931,6 +1770,49 @@ def test_2():
+         assert result.ret == 0
+ 
+ 
++class TestIssue14445:
++    """Regression tests for #14445: walrus operator double evaluation."""
++
++    def test_walrus_no_double_eval_basic(self, pytester: Pytester) -> None:
++        """Walrus captures the value at assignment time, not re-evaluated later."""
++        pytester.makepyfile(
++            """
++            class Counter:
++                def __init__(self):
++                    self.value = 0
++                def increment(self):
++                    self.value += 1
++
++            def test_walrus_in_assertion_basic():
++                c = Counter()
++                assert (before := c.value) == 0
++                c.increment()
++                assert before != (after := c.value)
++        """
++        )
++        result = pytester.runpytest()
++        assert result.ret == 0
++
++    def test_walrus_no_double_eval_running_counter(self, pytester: Pytester) -> None:
++        """Walrus increments fire exactly once per assert statement."""
++        pytester.makepyfile(
++            """
++            def test_walrus_running_counter():
++                count = 0
++                items = []
++                items.append("a")
++                assert (count := count + 1) == len(items)
++                items.append("b")
++                assert (count := count + 1) == len(items)
++                items.append("c")
++                assert (count := count + 1) == len(items)
++                assert count == 3
++        """
++        )
++        result = pytester.runpytest()
++        assert result.ret == 0
++
++
+ @pytest.mark.skipif(
+     sys.maxsize <= (2**31 - 1), reason="Causes OverflowError on 32bit systems"
+ )
+diff --git a/testing/test_assertrewrite_coverage.py b/testing/test_assertrewrite_coverage.py
+index 3bc16d2917a..43a3f668f73 100644
+--- a/testing/test_assertrewrite_coverage.py
++++ b/testing/test_assertrewrite_coverage.py
+@@ -674,6 +674,41 @@ def check():
+                 assert (y := x * 2) == 100
+             """)
+ 
++    def test_walrus_in_boolop_reports_each_operand(self) -> None:
++        """Two walrus assignments to one name: each operand shows what it saw."""
++        assert_introspects(
++            """
++            def check():
++                def side_effect():
++                    return True
++                assert (x := side_effect()) and (x := False)
++            """,
++            must_contain=["assert (True and False)"],
++        )
++
++    def test_walrus_in_boolop_reports_assigned_value(self) -> None:
++        assert_introspects(
++            """
++            def check():
++                a = True
++                assert not (a and ((a := False) is False))
++            """,
++            must_contain=["assert not (True and False is False)"],
++        )
++
++    def test_walrus_in_boolop_reports_left_operand(self) -> None:
++        """A comparator walrus must not overwrite the left operand's report."""
++        assert_introspects(
++            """
++            def check():
++                a = "Hello"
++                b = "World"
++                c = "Test"
++                assert (a := b) == c and (a := "Test") == "Test"
++            """,
++            must_contain=["assert ('World' == 'Test'"],
++        )
++
+ 
+ # ---------------------------------------------------------------------------
+ # Single-evaluation tests: ensure no expression is evaluated multiple times
+@@ -763,6 +798,33 @@ def __getitem__(self, key):
+                 assert d["a"] == 100
+             """)
+ 
++    def test_walrus_in_compare_evaluated_once(self) -> None:
++        assert_single_evaluation("""
++            def check():
++                def side_effect():
++                    counter[0] += 1
++                    return 42
++                assert (x := side_effect()) == 100
++            """)
++
++    def test_walrus_in_boolean_evaluated_once(self) -> None:
++        assert_single_evaluation("""
++            def check():
++                def side_effect():
++                    counter[0] += 1
++                    return 42
++                assert (x := side_effect()) and False
++            """)
++
++    def test_walrus_in_chained_compare_evaluated_once(self) -> None:
++        assert_single_evaluation("""
++            def check():
++                def side_effect():
++                    counter[0] += 1
++                    return 5
++                assert 1 < (x := side_effect()) < 3
++            """)
++
+     def test_method_call_evaluated_once(self) -> None:
+         assert_single_evaluation("""
+             def check():
+@@ -836,6 +898,97 @@ class TestEvaluationOrder:
+     given it.
+     """
+ 
++    def test_compare_left_operand_precedes_walrus(self) -> None:
++        assert_evaluation_order("""
++            def check():
++                def identity(v):
++                    return v
++                value = "Hello"
++                try:
++                    assert value != identity(value := value.lower())
++                except AssertionError:
++                    return "raised", value
++                return "passed", value
++            """)
++
++    def test_compare_reports_left_operand(self) -> None:
++        assert_introspects(
++            """
++            def check():
++                def identity(v):
++                    return v
++                value = 2
++                assert value == identity(value := 3)
++            """,
++            must_contain=["assert 2 == 3"],
++        )
++
++    def test_call_earlier_argument_precedes_walrus(self) -> None:
++        assert_evaluation_order("""
++            def check():
++                def identity(v):
++                    return v
++                def collect(*values):
++                    return values
++                value = "Hello"
++                try:
++                    assert collect(value, identity(value := value.lower())) == ("Hello", "hello")
++                except AssertionError:
++                    return "raised", value
++                return "passed", value
++            """)
++
++    def test_call_later_argument_sees_walrus_value(self) -> None:
++        """The mirror of the case above: a later operand sees the new value."""
++        assert_evaluation_order("""
++            def check():
++                def collect(*values):
++                    return values
++                value = "Hello"
++                try:
++                    assert collect(value := value.lower(), value) == ("hello", "hello")
++                except AssertionError:
++                    return "raised", value
++                return "passed", value
++            """)
++
++    def test_boolop_chain_rebinds_in_order(self) -> None:
++        assert_evaluation_order("""
++            def check():
++                a = True
++                try:
++                    assert a and True and ((a := False) is False) and (a is False) and ((a := None) is None)
++                except AssertionError:
++                    return "raised", a
++                return "passed", a
++            """)
++
++    def test_binop_left_operand_precedes_walrus(self) -> None:
++        assert_evaluation_order("""
++            def check():
++                def identity(v):
++                    return v
++                value = 1
++                try:
++                    assert value + identity(value := 5) == 6
++                except AssertionError:
++                    return "raised", value
++                return "passed", value
++            """)
++
++    def test_chained_compare_operands_in_order(self) -> None:
++        assert_evaluation_order("""
++            def check():
++                def identity(v):
++                    return v
++                value = 1
++                try:
++                    assert value < identity(value := 5) < 9
++                except AssertionError:
++                    return "raised", value
++                return "passed", value
++            """)
++
+     def test_container_literal_operand_in_order(self) -> None:
+         """Guard: ``generic_visit`` hoists container literals into a temporary."""
+         assert_evaluation_order("""
+@@ -914,6 +1067,36 @@ def take(self, value):
+                 return "passed", obj
+             """)
+ 
++    def test_keyword_argument_precedes_walrus(self) -> None:
++        assert_evaluation_order("""
++            def check():
++                def identity(v):
++                    return v
++                def collect(**kwargs):
++                    return kwargs
++                value = 1
++                try:
++                    assert collect(a=value, b=identity(value := 2)) == {"a": 1, "b": 2}
++                except AssertionError:
++                    return "raised", value
++                return "passed", value
++            """)
++
++    def test_double_star_argument_precedes_walrus(self) -> None:
++        assert_evaluation_order("""
++            def check():
++                def identity(v):
++                    return v
++                def collect(**kwargs):
++                    return kwargs
++                mapping = {"a": 1}
++                try:
++                    assert collect(**mapping, b=identity(mapping := {"a": 9})) == {"a": 1, "b": {"a": 9}}
++                except AssertionError:
++                    return "raised", mapping
++                return "passed", mapping
++            """)
++
+     def test_ifexp_branches_in_order(self) -> None:
+         """Guard: the condition is evaluated before the selected branch."""
+         assert_evaluation_order("""
