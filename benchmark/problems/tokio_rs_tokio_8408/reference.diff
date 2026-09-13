@@ -1,0 +1,238 @@
+diff --git a/tokio/src/runtime/blocking/mod.rs b/tokio/src/runtime/blocking/mod.rs
+index b0e42264dd0..0e6fa204004 100644
+--- a/tokio/src/runtime/blocking/mod.rs
++++ b/tokio/src/runtime/blocking/mod.rs
+@@ -23,6 +23,10 @@ pub(crate) use task::BlockingTask;
+ 
+ use crate::runtime::Builder;
+ 
+-pub(crate) fn create_blocking_pool(builder: &Builder, thread_cap: usize) -> BlockingPool {
+-    BlockingPool::new(builder, thread_cap)
++pub(crate) fn create_blocking_pool(
++    builder: &Builder,
++    thread_cap: usize,
++    scheduler_threads: usize,
++) -> BlockingPool {
++    BlockingPool::new(builder, thread_cap, scheduler_threads)
+ }
+diff --git a/tokio/src/runtime/blocking/pool.rs b/tokio/src/runtime/blocking/pool.rs
+index eb18dc6e57e..7a54eff9139 100644
+--- a/tokio/src/runtime/blocking/pool.rs
++++ b/tokio/src/runtime/blocking/pool.rs
+@@ -93,6 +93,9 @@ struct Inner {
+     // Maximum number of threads.
+     thread_cap: usize,
+ 
++    // Number of runtime scheduler workers counted in `num_threads`.
++    scheduler_threads: usize,
++
+     // Customizable wait timeout.
+     keep_alive: Duration,
+ 
+@@ -272,7 +275,11 @@ cfg_fs! {
+ // ===== impl BlockingPool =====
+ 
+ impl BlockingPool {
+-    pub(crate) fn new(builder: &Builder, thread_cap: usize) -> BlockingPool {
++    pub(crate) fn new(
++        builder: &Builder,
++        thread_cap: usize,
++        scheduler_threads: usize,
++    ) -> BlockingPool {
+         let (shutdown_tx, shutdown_rx) = shutdown::channel();
+         let keep_alive = builder.keep_alive.unwrap_or(KEEP_ALIVE);
+ 
+@@ -299,6 +306,7 @@ impl BlockingPool {
+                     after_start: builder.after_start.clone(),
+                     before_stop: builder.before_stop.clone(),
+                     thread_cap,
++                    scheduler_threads,
+                     keep_alive,
+                     metrics: SpawnerMetrics::default(),
+                 }),
+@@ -452,6 +460,13 @@ impl Spawner {
+         (handle, spawned)
+     }
+ 
++    pub(crate) fn num_blocking_threads(&self) -> usize {
++        self.inner
++            .metrics
++            .num_threads()
++            .saturating_sub(self.inner.scheduler_threads)
++    }
++
+     fn spawn_task(&self, task: Task, rt: &Handle) -> Result<(), SpawnError> {
+         // The `on_no_idle` closure runs under the same lock as the queue
+         // push, exactly like the pre-refactor code that called
+@@ -480,7 +495,7 @@ impl Spawner {
+                         }
+                         Err(ref e)
+                             if is_temporary_os_thread_error(e)
+-                                && self.inner.metrics.num_threads() > 0 =>
++                                && self.num_blocking_threads() > 0 =>
+                         {
+                             // OS temporarily failed to spawn a new thread.
+                             // The task will be picked up eventually by a currently
+@@ -523,10 +538,6 @@ impl Spawner {
+ 
+ cfg_unstable_metrics! {
+     impl Spawner {
+-        pub(crate) fn num_threads(&self) -> usize {
+-            self.inner.metrics.num_threads()
+-        }
+-
+         pub(crate) fn num_idle_threads(&self) -> usize {
+             self.inner.metrics.num_idle_threads()
+         }
+diff --git a/tokio/src/runtime/builder.rs b/tokio/src/runtime/builder.rs
+index 3bab9a4993c..76ced643e06 100644
+--- a/tokio/src/runtime/builder.rs
++++ b/tokio/src/runtime/builder.rs
+@@ -1759,7 +1759,7 @@ impl Builder {
+         let (driver, driver_handle) = driver::Driver::new(cfg)?;
+ 
+         // Blocking pool
+-        let blocking_pool = blocking::create_blocking_pool(self, self.max_blocking_threads);
++        let blocking_pool = blocking::create_blocking_pool(self, self.max_blocking_threads, 0);
+         let blocking_spawner = blocking_pool.spawner().clone();
+ 
+         // Generate a rng seed for this runtime.
+@@ -2129,7 +2129,7 @@ cfg_rt_multi_thread! {
+ 
+             // Create the blocking pool
+             let blocking_pool =
+-                blocking::create_blocking_pool(self, self.max_blocking_threads + worker_threads);
++                blocking::create_blocking_pool(self, self.max_blocking_threads + worker_threads, worker_threads);
+             let blocking_spawner = blocking_pool.spawner().clone();
+ 
+             // Generate a rng seed for this runtime.
+diff --git a/tokio/src/runtime/scheduler/current_thread/mod.rs b/tokio/src/runtime/scheduler/current_thread/mod.rs
+index 4766ba47bb3..b083e025043 100644
+--- a/tokio/src/runtime/scheduler/current_thread/mod.rs
++++ b/tokio/src/runtime/scheduler/current_thread/mod.rs
+@@ -662,7 +662,7 @@ cfg_unstable_metrics! {
+         }
+ 
+         pub(crate) fn num_blocking_threads(&self) -> usize {
+-            self.blocking_spawner.num_threads()
++            self.blocking_spawner.num_blocking_threads()
+         }
+ 
+         pub(crate) fn num_idle_blocking_threads(&self) -> usize {
+diff --git a/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs b/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs
+index 985495c7561..c1f452f8184 100644
+--- a/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs
++++ b/tokio/src/runtime/scheduler/multi_thread/handle/metrics.rs
+@@ -30,10 +30,7 @@ impl Handle {
+         }
+ 
+         pub(crate) fn num_blocking_threads(&self) -> usize {
+-            // workers are currently spawned using spawn_blocking
+-            self.blocking_spawner
+-                .num_threads()
+-                .saturating_sub(self.num_workers())
++            self.blocking_spawner.num_blocking_threads()
+         }
+ 
+         pub(crate) fn num_idle_blocking_threads(&self) -> usize {
+diff --git a/tokio/tests/rt_blocking_thread_exhaust.rs b/tokio/tests/rt_blocking_thread_exhaust.rs
+new file mode 100644
+index 00000000000..8c27ffabd7b
+--- /dev/null
++++ b/tokio/tests/rt_blocking_thread_exhaust.rs
+@@ -0,0 +1,95 @@
++#![warn(rust_2018_idioms)]
++#![cfg(all(
++    target_os = "linux",
++    feature = "full",
++    not(miri),
++    not(tokio_no_tuning_tests),
++    panic = "unwind",
++))]
++
++use std::panic::{self, AssertUnwindSafe};
++use std::sync::mpsc;
++use std::time::Duration;
++
++use tokio::runtime::Builder;
++use tokio::time::timeout;
++
++#[test]
++fn spawn_blocking_with_only_scheduler_workers() {
++    // Regression test for https://github.com/tokio-rs/tokio/issues/8406.
++    //
++    // On a multi-threaded runtime, the only pool threads present before the
++    // first `spawn_blocking` are the scheduler workers themselves. If the OS
++    // then refuses to create a new thread, the pool used to swallow the error
++    // assuming a busy thread would pick up the task, but scheduler workers
++    // never drain the blocking queue, so the task was orphaned forever.
++    //
++    // Pin the per-user process thread limit to the current thread count so
++    // that creating a new pool thread fails; `spawn_blocking` must panic
++    // with "OS can't spawn worker thread" instead of hanging.
++
++    let (started_tx, started_rx) = mpsc::sync_channel(4);
++    let rt = Builder::new_multi_thread()
++        .worker_threads(4)
++        .on_thread_start(move || {
++            started_tx.send(()).unwrap();
++        })
++        .enable_all()
++        .build()
++        .unwrap();
++
++    for _ in 0..4 {
++        started_rx.recv().unwrap();
++    }
++
++    let threads = std::fs::read_dir("/proc/self/task").unwrap().count();
++    let lim = libc::rlimit {
++        rlim_cur: threads as libc::rlim_t,
++        rlim_max: threads as libc::rlim_t,
++    };
++    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &lim) }, 0);
++
++    // If the limit is not enforced for this process (e.g. when running as root
++    // or in a container), skip rather than fail.
++    match std::thread::Builder::new()
++        .name("probe".into())
++        .spawn(|| {})
++    {
++        Ok(h) => {
++            let _ = h.join();
++            eprintln!("skip: setrlimit did not prevent thread creation");
++            return;
++        }
++        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
++        Err(e) => panic!("unexpected thread-spawn error: {e}"),
++    }
++
++    let res = panic::catch_unwind(AssertUnwindSafe(|| {
++        rt.block_on(async {
++            timeout(
++                Duration::from_secs(5),
++                tokio::task::spawn_blocking(|| 42u32),
++            )
++            .await
++        })
++    }));
++
++    // The fixed code panics synchronously when no real pool thread can be
++    // created; the bug let the task hang, which the timeout turns into
++    // `Ok(Err(_))`.
++    let panic_err = match res {
++        Err(panic_err) => panic_err,
++        Ok(Err(_)) => panic!("spawn_blocking timed out"),
++        Ok(Ok(_)) => panic!("spawn_blocking unexpectedly succeeded"),
++    };
++
++    let msg = panic_err
++        .downcast_ref::<&str>()
++        .copied()
++        .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
++        .unwrap_or("");
++    assert!(
++        msg.contains("OS can't spawn worker thread"),
++        "unexpected panic: {msg}"
++    );
++}

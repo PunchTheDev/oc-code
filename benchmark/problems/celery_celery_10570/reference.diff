@@ -1,0 +1,868 @@
+diff --git a/celery/apps/worker.py b/celery/apps/worker.py
+index 80cdc464093..8cfbeda8295 100644
+--- a/celery/apps/worker.py
++++ b/celery/apps/worker.py
+@@ -15,6 +15,7 @@
+ 
+ from billiard.common import REMAP_SIGTERM
+ from billiard.process import current_process
++from kombu.common import ignore_errors
+ from kombu.utils.encoding import safe_str
+ 
+ from celery import VERSION_BANNER, _original_os_write, platforms, signals
+@@ -26,8 +27,10 @@
+ from celery.utils.imports import qualname
+ from celery.utils.log import get_logger, in_sighandler, set_in_sighandler
+ from celery.utils.text import pluralize
++from celery.utils.threads import bound_open_broker_sockets
+ from celery.utils.time import humanize_seconds
+ from celery.worker import WorkController
++from celery.worker.worker import SHUTDOWN_SOCKET_TIMEOUT
+ 
+ __all__ = ('Worker',)
+ 
+@@ -444,9 +447,18 @@ def on_cold_shutdown(worker: Worker):
+     # Initiate soft shutdown process (if enabled and tasks are running)
+     worker.wait_for_soft_shutdown()
+ 
+-    # Stop consuming new tasks to prevents requeued messages from being immediately redelivered
++    # Bound the broker socket before cancel(): on amqp that is a basic_cancel
++    # waiting for a reply a silent broker never sends (Issue 975).
++    # terminate() bounds again for cold paths that skip this handler; warm
++    # shutdown is deliberately left unbounded, see WorkController._shutdown.
++    connection = getattr(worker.consumer, 'connection', None)
++    if connection is not None:
++        bound_open_broker_sockets(connection, SHUTDOWN_SOCKET_TIMEOUT)
++
++    # Stop consuming new tasks to prevents requeued messages from being immediately redelivered.
++    # A bounded socket makes cancel() raise on a silent peer; that must not abort the shutdown.
+     if worker.consumer.task_consumer:
+-        worker.consumer.task_consumer.cancel()
++        ignore_errors(worker.consumer, worker.consumer.task_consumer.cancel)
+ 
+     # Cancel all unacked requests and allow the worker to terminate naturally
+     worker.consumer.cancel_active_requests()
+diff --git a/celery/utils/threads.py b/celery/utils/threads.py
+index 3fede0fa293..eadd7dbec24 100644
+--- a/celery/utils/threads.py
++++ b/celery/utils/threads.py
+@@ -27,7 +27,7 @@
+ 
+ __all__ = (
+     'bgThread', 'Local', 'LocalStack', 'LocalManager',
+-    'get_ident', 'default_socket_timeout',
++    'get_ident', 'default_socket_timeout', 'bound_open_broker_sockets',
+ )
+ 
+ USE_FAST_LOCALS = os.environ.get('USE_FAST_LOCALS')
+@@ -35,11 +35,65 @@
+ 
+ @contextmanager
+ def default_socket_timeout(timeout):
+-    """Context temporarily setting the default socket timeout."""
++    """Context temporarily setting the default socket timeout.
++
++    Note:
++        Only affects sockets created afterwards.  To bound a connection
++        that is already open, use :func:`bound_open_broker_sockets`.
++    """
+     prev = socket.getdefaulttimeout()
+     socket.setdefaulttimeout(timeout)
+-    yield
+-    socket.setdefaulttimeout(prev)
++    try:
++        yield
++    finally:
++        socket.setdefaulttimeout(prev)
++
++
++def _open_broker_sockets(connection):
++    """Yield the sockets a broker connection already has open."""
++    # Virtual transports (redis, SQS, ...) keep a client per channel.
++    try:
++        channels = list(getattr(connection.transport, 'channels', None) or ())
++    except Exception:  # pylint: disable=broad-except
++        channels = ()
++    for channel in channels:
++        # Cached attributes only: the ``client`` property would dial the
++        # broker we already know is unresponsive.
++        cached = getattr(channel, '__dict__', {})
++        for name in ('client', 'subclient'):
++            sock = getattr(
++                getattr(cached.get(name), 'connection', None), '_sock', None)
++            if sock is not None:
++                yield sock
++    # py-amqp: one socket on the transport.  Read the private attributes,
++    # as the ``connection`` and ``transport`` properties reconnect when unset.
++    sock = getattr(
++        getattr(connection._connection, '_transport', None), 'sock', None)
++    if sock is not None:
++        yield sock
++
++
++def bound_open_broker_sockets(connection, timeout):
++    """Apply ``timeout`` to broker sockets that are already connected.
++
++    :func:`socket.setdefaulttimeout` only affects sockets created
++    afterwards, so neither it nor ``Connection.collect(socket_timeout=...)``
++    can bound a read on a socket that is already open.  Teardown issues
++    exactly such reads (the redis transport drains a pending ``BRPOP`` in
++    ``Channel.close()``, py-amqp waits for a ``basic_cancel`` reply), and
++    against a peer that went silent without RST they never return.
++
++    See Issue #9705 (reconnect) and Issue #975 (shutdown).  Best effort:
++    never raises, as both callers are teardown paths.
++    """
++    try:
++        for sock in _open_broker_sockets(connection):
++            try:
++                sock.settimeout(timeout)
++            except Exception:  # pylint: disable=broad-except
++                pass
++    except Exception:  # pylint: disable=broad-except
++        pass
+ 
+ 
+ class bgThread(threading.Thread):
+diff --git a/celery/worker/consumer/consumer.py b/celery/worker/consumer/consumer.py
+index 1aceec2b210..df800e31ce4 100644
+--- a/celery/worker/consumer/consumer.py
++++ b/celery/worker/consumer/consumer.py
+@@ -30,6 +30,7 @@
+ from celery.utils.nodenames import gethostname
+ from celery.utils.objects import Bunch
+ from celery.utils.text import truncate
++from celery.utils.threads import bound_open_broker_sockets
+ from celery.utils.time import humanize_seconds, rate
+ from celery.worker import loops
+ from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, successful_requests,
+@@ -418,12 +419,10 @@ def on_connection_error_before_connected(self, exc):
+ 
+     def on_connection_error_after_connected(self, exc):
+         warn(CONNECTION_RETRY, exc_info=True)
++        # Bound the sockets that are already open before cleanup reads from
++        # them; collect()'s socket_timeout only applies to new sockets.
++        bound_open_broker_sockets(self.connection, COLLECT_SOCKET_TIMEOUT)
+         try:
+-            # Pass an explicit socket_timeout so that cleanup I/O on a
+-            # broken connection (e.g. _brpop_read during Channel.close)
+-            # cannot block indefinitely.  The default of None would set
+-            # the global socket timeout to blocking-forever, which can
+-            # cause the worker to hang here and never reach the reconnect.
+             self.connection.collect(socket_timeout=COLLECT_SOCKET_TIMEOUT)
+         except Exception:  # pylint: disable=broad-except
+             pass
+diff --git a/celery/worker/worker.py b/celery/worker/worker.py
+index 2444012310f..15891e43ab7 100644
+--- a/celery/worker/worker.py
++++ b/celery/worker/worker.py
+@@ -31,7 +31,7 @@
+ from celery.utils.log import worker_logger as logger
+ from celery.utils.nodenames import default_nodename, worker_direct
+ from celery.utils.text import str_to_list
+-from celery.utils.threads import default_socket_timeout
++from celery.utils.threads import bound_open_broker_sockets, default_socket_timeout
+ 
+ from . import state
+ 
+@@ -254,6 +254,13 @@ def stop(self, in_sighandler=False, exitcode=None):
+     def terminate(self, in_sighandler=False):
+         """Not so graceful shutdown of the worker server (Cold shutdown)."""
+         if self.blueprint.state != TERMINATE:
++            # Every cold path lands here, with or without on_cold_shutdown
++            # (WorkerTerminate raised by the consumer, embedded callers), so
++            # bound the broker socket before teardown reads from it.
++            consumer = getattr(self, 'consumer', None)
++            connection = getattr(consumer, 'connection', None)
++            if connection is not None:
++                bound_open_broker_sockets(connection, SHUTDOWN_SOCKET_TIMEOUT)
+             self.signal_consumer_close()
+             if not in_sighandler or self.pool.signal_safe:
+                 self._shutdown(warm=False)
+@@ -262,6 +269,12 @@ def _shutdown(self, warm=True):
+         # if blueprint does not exist it means that we had an
+         # error before the bootsteps could be initialized.
+         if self.blueprint is not None:
++            # Not bounding the broker socket here: a warm shutdown still has
++            # acks to flush, and capping those writes on a slow broker would
++            # lose acks and redeliver tasks.  A silent broker can still wedge
++            # a warm shutdown; the escape hatch is a cold shutdown, bounded in
++            # terminate() and on_cold_shutdown, or the redis ``socket_timeout``
++            # transport option.
+             with default_socket_timeout(SHUTDOWN_SOCKET_TIMEOUT):  # Issue 975
+                 self.blueprint.stop(self, terminate=not warm)
+                 self.blueprint.join()
+diff --git a/t/integration/test_connection_recovery.py b/t/integration/test_connection_recovery.py
+index 2e8f893c751..81624e1f888 100644
+--- a/t/integration/test_connection_recovery.py
++++ b/t/integration/test_connection_recovery.py
+@@ -1,45 +1,247 @@
+-"""Integration tests for broker-connection recovery (GH-9705).
++"""Teardown of a half-open broker connection must be bounded.
+ 
+-Exercises the two fixes that prevent the worker from hanging indefinitely
+-after a broker connection loss:
++Two long-standing hangs share one cause: a read issued on a socket that is
++already open, against a peer that has gone silent without sending RST - a
++suspended VM, or a firewall dropping the flow.
+ 
+-1. ``on_connection_error_after_connected()`` now closes the broken
+-   connection after calling ``collect()``, so the stale socket is
+-   released before ``blueprint.restart()`` begins the reconnect cycle.
++* GH-9705 (reconnect): ``on_connection_error_after_connected()`` wedged
++  because the redis transport drains a pending ``BRPOP`` in
++  ``Channel.close()``, so the reconnect was never reached.
++* celery#975 (shutdown): ``_shutdown()`` wedged waiting for a reply during
++  connection close.
+ 
+-2. ``on_connection_error_after_connected()`` now passes an explicit
+-   ``socket_timeout`` to ``collect()`` so that cleanup I/O on a dead
+-   connection cannot block forever.
++Neither ``socket.setdefaulttimeout()`` nor kombu's
++``Connection.collect(socket_timeout=...)`` can bound those reads - both only
++affect sockets created *afterwards*.
++
++Reproducing this needs a peer that goes *silent*: killing the broker is not
++enough, because the peer then sends FIN/RST and the read returns immediately.
++So a proxy sits between the worker and the broker and simply stops relaying
++while holding both sockets open.
+ """
+-from celery.worker.consumer.connection import Connection
++import socket
++import threading
++import time
++from unittest.mock import Mock
++from urllib.parse import urlparse
++
++import pytest
++from kombu import Connection, Consumer, Queue
++from kombu.common import ignore_errors
++
++from celery.utils.threads import bound_open_broker_sockets
+ from celery.worker.consumer.consumer import COLLECT_SOCKET_TIMEOUT
++from celery.worker.consumer.consumer import Consumer as WorkerConsumer
++from celery.worker.worker import SHUTDOWN_SOCKET_TIMEOUT
++
++from .conftest import TEST_BROKER
++
++#: Teardown must finish within its own bound; allow generous slack for slow
++#: CI, while still failing fast if it blocks forever.
++CLEANUP_DEADLINE = COLLECT_SOCKET_TIMEOUT * 4
++SHUTDOWN_DEADLINE = SHUTDOWN_SOCKET_TIMEOUT * 4
++
++#: Long BRPOP, so the broker cannot answer during the test and the reply
++#: cannot already be sitting in the socket buffer when we go silent.
++POLLING_INTERVAL = 60
++
++#: Exactly ``redis``: the proxy relays plaintext TCP, so it cannot stand in
++#: for ``rediss`` (TLS) or ``redis+socket`` (unix socket), both of which would
++#: otherwise satisfy a ``startswith('redis')`` check.
++pytestmark = pytest.mark.skipif(
++    urlparse(TEST_BROKER).scheme != 'redis',
++    reason='half-open cleanup path needs a plaintext TCP redis broker',
++)
++
++
++class BlackholeProxy:
++    """TCP proxy that can go silent without tearing the connection down."""
++
++    def __init__(self, upstream):
++        self.upstream = upstream
++        self._silent = threading.Event()
++        self._closed = threading.Event()
++        self._socks = []
++        self._threads = []
++        self._server = socket.socket()
++        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++        self._server.bind(('127.0.0.1', 0))
++        self._server.listen(16)
++        self.port = self._server.getsockname()[1]
++        self._spawn(self._accept_loop)
++
++    def _spawn(self, target, *args):
++        thread = threading.Thread(target=target, args=args, daemon=True)
++        self._threads.append(thread)
++        thread.start()
++
++    def _accept_loop(self):
++        while not self._closed.is_set():
++            try:
++                client, _ = self._server.accept()
++                server = socket.create_connection(self.upstream)
++            except OSError:
++                return
++            self._socks += [client, server]
++            for src, dst in ((client, server), (server, client)):
++                self._spawn(self._pump, src, dst)
++
++    def _pump(self, src, dst):
++        src.settimeout(0.2)
++        while not self._closed.is_set():
++            if self._silent.is_set():
++                time.sleep(0.1)     # hold the socket open, relay nothing
++                continue
++            try:
++                data = src.recv(65536)
++            except TimeoutError:
++                continue
++            except OSError:
++                return
++            if not data:
++                return
++            try:
++                dst.sendall(data)
++            except OSError:
++                return
++
++    def blackhole(self):
++        """Go silent: no more bytes either way, but no FIN and no RST."""
++        self._silent.set()
++
++    def close(self):
++        """Stop relaying, close every socket and join the threads."""
++        self._closed.set()
++        for sock in [self._server, *self._socks]:
++            sock.close()
++        for thread in self._threads:
++            thread.join(timeout=2)
++
++
++def _proxied_broker_url(port):
++    """TEST_BROKER with only the host:port swapped for the proxy's.
++
++    Credentials, db index and query params have to survive, or the test dials
++    an authed broker with no password, or exercises the wrong db.
++    """
++    url = urlparse(TEST_BROKER)
++    userinfo = ''
++    if url.username or url.password:
++        userinfo = f'{url.username or ""}:{url.password or ""}@'
++    return url._replace(netloc=f'{userinfo}127.0.0.1:{port}').geturl()
++
++
++@pytest.fixture
++def blackhole_proxy():
++    url = urlparse(TEST_BROKER)
++    proxy = BlackholeProxy((url.hostname or 'localhost', url.port or 6379))
++    yield proxy
++    proxy.close()
++
++
++def _consumer_with_connection(app, connection):
++    pool = Mock(name='pool')
++    # A real int: the handler computes max_prefetch_count as
++    # ``pool.num_processes * prefetch_multiplier``, and a bare Mock makes that
++    # raise TypeError, so the rest of the handler would never run.
++    pool.num_processes = 2
++    consumer = WorkerConsumer(
++        on_task_request=Mock(), init_callback=Mock(), pool=pool, app=app,
++        timer=Mock(), controller=Mock(), hub=None,
++    )
++    consumer.blueprint = Mock(name='blueprint')
++    consumer.connection = connection
++    consumer.conninfo = connection
++    return consumer
++
++
++@pytest.fixture
++def half_open_connection(blackhole_proxy):
++    """A connected broker connection with a BRPOP outstanding, gone silent."""
++    connection = Connection(
++        _proxied_broker_url(blackhole_proxy.port),
++        transport_options={'polling_interval': POLLING_INTERVAL},
++    )
++    connection.connect()
++
++    consumer = Consumer(connection, queues=[Queue('t_gh9705')],
++                        accept=['json'], callbacks=[lambda b, m: m.ack()])
++    consumer.consume()
++
++    # Arm the BRPOP that teardown will later try to drain.
++    try:
++        connection.drain_events(timeout=1.0)
++    except Exception:
++        pass
++    assert consumer.channel._in_poll, 'BRPOP was not armed, test is inconclusive'
++
++    blackhole_proxy.blackhole()
++    yield connection
++
++    # Teardown against a silenced peer is expected to raise, and a test that
++    # failed may leave the connection wedged: drop it either way so its
++    # sockets and poller fd do not outlive the test.
++    connection._closed = True
++    for channel in list(getattr(connection.transport, 'channels', None) or ()):
++        client = channel.__dict__.get('client')
++        conn = getattr(client, 'connection', None)
++        if conn is not None:
++            ignore_errors(connection, conn.disconnect)
++
++
++def _run_bounded(target, deadline, what, expected=()):
++    """Run ``target`` off-thread and assert it finishes within ``deadline``.
++
++    Teardown against a silent peer is *expected* to surface a timeout once the
++    socket is bounded, so those are tolerated via ``expected``.  Anything else
++    is re-raised: swallowing every exception would let the target crash
++    instantly and still look "bounded".
++    """
++    done = threading.Event()
++    raised = []
++
++    def run():
++        try:
++            target()
++        except BaseException as exc:  # re-raised below
++            raised.append(exc)
++        finally:
++            done.set()
++
++    threading.Thread(target=run, daemon=True).start()
++    assert done.wait(deadline), (
++        f'{what} still blocked after {deadline}s on a half-open connection; '
++        f'the worker would hang here forever'
++    )
++    if raised and not isinstance(raised[0], expected):
++        raise AssertionError(
++            f'{what} returned quickly only because it crashed: '
++            f'{type(raised[0]).__name__}: {raised[0]}'
++        ) from raised[0]
+ 
+ 
+-class test_connection_recovery:
+-    """Integration tests for GH-9705: worker hang after broker connection loss."""
++def test_reconnect_cleanup_is_bounded(celery_session_app, half_open_connection):
++    """GH-9705: the error handler must not wedge before blueprint.restart()."""
++    consumer = _consumer_with_connection(celery_session_app,
++                                         half_open_connection)
+ 
+-    def test_close_connection_clears_connection(self, celery_session_app):
+-        """Connection.close_connection() must close c.connection and set it to None.
++    _run_bounded(
++        lambda: consumer.on_connection_error_after_connected(OSError('gone')),
++        CLEANUP_DEADLINE, 'on_connection_error_after_connected()')
+ 
+-        Before the fix, the broken socket was silently leaked across every
+-        reconnect cycle because StartStopStep.stop() was a no-op (it guards
+-        on self.obj, which is always None for the Connection bootstep).
+-        """
+-        conn = celery_session_app.connection()
+-        conn.connect()
++    assert consumer.connection is None, (
++        'the broken connection must be released before blueprint.restart()')
+ 
+-        consumer = type('Consumer', (), {'connection': conn})()
+-        step = Connection.__new__(Connection)
+-        step.close_connection(consumer)
+ 
+-        assert consumer.connection is None
++def test_cold_shutdown_teardown_is_bounded(half_open_connection):
++    """celery#975: a cold shutdown must not wedge closing the connection.
+ 
+-    def test_collect_socket_timeout_is_set(self):
+-        """COLLECT_SOCKET_TIMEOUT must be a positive number.
++    ``on_cold_shutdown`` bounds the socket, then cancels the consumer and
++    closes the connection, which for redis runs the same ``Channel.close()``
++    drain.  Warm shutdown deliberately does *not* bound (it still has acks to
++    flush); that guarantee is pinned in ``t/unit/worker/test_worker.py``.
++    """
++    bound_open_broker_sockets(half_open_connection, SHUTDOWN_SOCKET_TIMEOUT)
+ 
+-        Without the fix, collect(socket_timeout=None) sets the global
+-        socket timeout to blocking-forever, causing the worker to hang
+-        in _brpop_read() on a dead connection.
+-        """
+-        assert isinstance(COLLECT_SOCKET_TIMEOUT, (int, float))
+-        assert COLLECT_SOCKET_TIMEOUT > 0
++    _run_bounded(lambda: half_open_connection.close(),
++                 SHUTDOWN_DEADLINE, 'Connection.close()')
+diff --git a/t/smoke/tests/test_consumer.py b/t/smoke/tests/test_consumer.py
+index be3e85604c1..bd1f1e14f8a 100644
+--- a/t/smoke/tests/test_consumer.py
++++ b/t/smoke/tests/test_consumer.py
+@@ -145,33 +145,3 @@ def test_worker_consume_tasks_after_redis_broker_restart(
+             .get(timeout=RESULT_TIMEOUT)
+             == [None] * count
+         )
+-
+-    def test_worker_does_not_hang_on_broker_connection_loss(
+-        self,
+-        celery_setup: CeleryTestSetup,
+-    ):
+-        """Verify the worker reconnects without hanging after broker dies.
+-
+-        Regression test for GH-9705: collect() on a dead connection could
+-        block indefinitely.  The fix passes an explicit socket_timeout to
+-        collect() and closes the broken connection in the error handler
+-        before blueprint.restart() begins the reconnect cycle.
+-        """
+-        queue = celery_setup.worker.worker_queue
+-
+-        # 1. Verify the worker is healthy.
+-        assert noop.s().apply_async(queue=queue).get(timeout=RESULT_TIMEOUT) is None
+-
+-        # 2. Kill the broker to trigger on_connection_error_after_connected.
+-        celery_setup.broker.kill()
+-        celery_setup.worker.wait_for_log(
+-            "Connection to broker lost",
+-            timeout=RESULT_TIMEOUT,
+-        )
+-
+-        # 3. Restart the broker immediately. Before the fix the worker
+-        #    would hang in collect() and never reach the reconnect step.
+-        celery_setup.broker.restart()
+-
+-        # 4. Confirm the worker reconnects and can process tasks.
+-        assert noop.s().apply_async(queue=queue).get(timeout=RESULT_TIMEOUT) is None
+diff --git a/t/unit/utils/test_threads.py b/t/unit/utils/test_threads.py
+index f31083be5f6..e03393d34fe 100644
+--- a/t/unit/utils/test_threads.py
++++ b/t/unit/utils/test_threads.py
+@@ -1,11 +1,153 @@
++import socket
++from types import SimpleNamespace
+ from unittest.mock import patch
+ 
+ import pytest
+ 
+-from celery.utils.threads import Local, LocalManager, _FastLocalStack, _LocalStack, bgThread
++from celery.utils.threads import (Local, LocalManager, _FastLocalStack, _LocalStack, bgThread,
++                                  bound_open_broker_sockets, default_socket_timeout)
+ from t.unit import conftest
+ 
+ 
++class test_default_socket_timeout:
++
++    @pytest.fixture(autouse=True)
++    def _restore_default_timeout(self):
++        prev = socket.getdefaulttimeout()
++        socket.setdefaulttimeout(None)
++        yield
++        socket.setdefaulttimeout(prev)
++
++    def test_sets_and_restores_timeout(self):
++        with default_socket_timeout(5.0):
++            assert socket.getdefaulttimeout() == 5.0
++        assert socket.getdefaulttimeout() is None
++
++    def test_restores_timeout_when_body_raises(self):
++        # Without try/finally the timeout leaks out of the block and every
++        # socket created later in the process is silently bounded by it.
++        with pytest.raises(ValueError):
++            with default_socket_timeout(5.0):
++                raise ValueError('boom')
++        assert socket.getdefaulttimeout() is None
++
++
++class test_bound_open_broker_sockets:
++    """Bounding sockets that are already connected (GH-9705, celery#975)."""
++
++    def _sock(self):
++        sock, peer = socket.socketpair()
++        self._open.extend((sock, peer))
++        return sock
++
++    @pytest.fixture(autouse=True)
++    def _close_sockets(self):
++        self._open = []
++        yield
++        for sock in self._open:
++            sock.close()
++
++    def test_bounds_virtual_transport_sockets(self):
++        # redis and the other virtual transports keep a redis-py style
++        # client per channel, read from during Channel.close().
++        client, sub = self._sock(), self._sock()
++        channel = SimpleNamespace(
++            client=SimpleNamespace(connection=SimpleNamespace(_sock=client)),
++            subclient=SimpleNamespace(connection=SimpleNamespace(_sock=sub)),
++        )
++        connection = SimpleNamespace(
++            transport=SimpleNamespace(channels=[channel]), _connection=None)
++
++        bound_open_broker_sockets(connection, 7.5)
++
++        assert client.gettimeout() == 7.5
++        assert sub.gettimeout() == 7.5
++
++    def test_bounds_amqp_transport_socket(self):
++        # py-amqp keeps one socket on the connection's transport; this is the
++        # read that hangs in basic_cancel during shutdown (celery#975).
++        sock = self._sock()
++        connection = SimpleNamespace(
++            transport=SimpleNamespace(channels=None),
++            _connection=SimpleNamespace(_transport=SimpleNamespace(sock=sock)),
++        )
++
++        bound_open_broker_sockets(connection, 3.0)
++
++        assert sock.gettimeout() == 3.0
++
++    def test_never_touches_the_reconnecting_connection_property(self):
++        # kombu's public ``Connection.connection`` property calls
++        # _ensure_connection(), which would dial the dead broker and block -
++        # worse than the bug being fixed.  Only ``_connection`` is safe.
++        class Connection:
++            transport = SimpleNamespace(channels=None)
++            _connection = None
++
++            @property
++            def connection(self):
++                raise AssertionError('must not reconnect to a dead broker')
++
++        bound_open_broker_sockets(Connection(), 5.0)
++
++    def test_never_touches_the_reconnecting_amqp_transport_property(self):
++        # py-amqp's ``Connection.transport`` property calls self.connect()
++        # when _transport is None, and _transport IS None after
++        # amqp's _on_close_ok() -> collect(), which is exactly the
++        # server-initiated close that lands us here.  Reading it would dial
++        # the broker we are abandoning.
++        class AmqpConnection:
++            _transport = None
++
++            @property
++            def transport(self):
++                raise AssertionError('must not reconnect to a dead broker')
++
++        bound_open_broker_sockets(
++            SimpleNamespace(transport=SimpleNamespace(channels=None),
++                            _connection=AmqpConnection()), 5.0)
++
++    def test_does_not_open_a_new_client(self):
++        # The broker is already known to be unresponsive; going through the
++        # ``client`` property would dial it again and block.
++        class ExplodingChannel:
++            @property
++            def client(self):
++                raise AssertionError('must not open a new connection')
++
++        bound_open_broker_sockets(
++            SimpleNamespace(
++                transport=SimpleNamespace(channels=[ExplodingChannel()]),
++                _connection=None),
++            5.0)
++
++    def test_ignores_connection_without_sockets(self):
++        bound_open_broker_sockets(
++            SimpleNamespace(transport=SimpleNamespace(channels=None),
++                            _connection=None), 5.0)
++
++    def test_survives_unusable_connection(self):
++        # Best effort: teardown must carry on to close() regardless.
++        class Unusable:
++            @property
++            def transport(self):
++                raise OSError('connection is gone')
++
++        bound_open_broker_sockets(Unusable(), 5.0)
++
++    def test_survives_closed_socket(self):
++        sock, peer = socket.socketpair()
++        sock.close()
++        peer.close()
++        connection = SimpleNamespace(
++            transport=SimpleNamespace(channels=[SimpleNamespace(
++                client=SimpleNamespace(
++                    connection=SimpleNamespace(_sock=sock)))]),
++            _connection=None)
++
++        bound_open_broker_sockets(connection, 5.0)
++
++
+ class test_bgThread:
+ 
+     def test_crash(self):
+diff --git a/t/unit/worker/test_consumer.py b/t/unit/worker/test_consumer.py
+index fcbcf66a628..7fe405f1dad 100644
+--- a/t/unit/worker/test_consumer.py
++++ b/t/unit/worker/test_consumer.py
+@@ -2,6 +2,7 @@
+ import logging
+ import socket
+ from collections import deque
++from types import SimpleNamespace
+ from unittest.mock import MagicMock, Mock, call, patch
+ 
+ import pytest
+@@ -495,6 +496,35 @@ def test_collects_with_socket_timeout_on_connection_error(self):
+         old_conn.close.assert_called_once()
+         assert c.connection is None
+ 
++    def test_bounds_already_open_sockets_before_collect(self):
++        # ``collect(socket_timeout=...)`` only sets the *default* timeout,
++        # which applies to sockets created afterwards.  It cannot bound a
++        # socket that is already open, so cleanup reads on a half-open
++        # connection (e.g. draining a pending BRPOP in the redis transport's
++        # ``Channel.close()``) block forever.  See GH-9705.
++        sock, peer = socket.socketpair()
++        try:
++            # Do not assume the process default; an earlier test may have
++            # changed it.
++            sock.settimeout(None)
++            c = self.get_consumer()
++            c.connection.transport.channels = [
++                SimpleNamespace(client=SimpleNamespace(
++                    connection=SimpleNamespace(_sock=sock))),
++            ]
++            # Record the timeout as seen by collect(), so this also proves the
++            # bound is applied *before* the cleanup reads from the socket.
++            seen = {}
++            c.connection.collect.side_effect = (
++                lambda **kw: seen.update(timeout=sock.gettimeout()))
++
++            c.on_connection_error_after_connected(Mock())
++
++            assert seen['timeout'] == COLLECT_SOCKET_TIMEOUT
++        finally:
++            sock.close()
++            peer.close()
++
+     def test_register_with_event_loop(self):
+         c = self.get_consumer()
+         c.register_with_event_loop(Mock(name='loop'))
+diff --git a/t/unit/worker/test_worker.py b/t/unit/worker/test_worker.py
+index 8f817910ce6..b1170540316 100644
+--- a/t/unit/worker/test_worker.py
++++ b/t/unit/worker/test_worker.py
+@@ -789,6 +789,140 @@ def test_shutdown_no_blueprint(self):
+         self.worker.blueprint = None
+         self.worker._shutdown()
+ 
++    def test_warm_shutdown_does_not_cap_the_broker_socket(self):
++        # A warm shutdown runs against a healthy broker and still has acks to
++        # flush.  Capping those writes would turn a slow broker into lost acks
++        # and redelivered - so twice-executed - tasks, which is worse than the
++        # hang it would prevent.  Bounding belongs in on_cold_shutdown, where
++        # the caller has already asked to stop now.
++        sock, peer = socket.socketpair()
++        try:
++            sock.settimeout(None)
++            connection = Mock(name='connection')
++            connection.transport.channels = None
++            connection._connection._transport.sock = sock
++            self.worker.consumer = Mock(name='consumer')
++            self.worker.consumer.connection = connection
++
++            seen = {}
++            self.worker.blueprint = Mock(name='blueprint')
++            self.worker.blueprint.stop.side_effect = (
++                lambda *a, **kw: seen.update(timeout=sock.gettimeout()))
++
++            self.worker._shutdown()
++
++            assert seen['timeout'] is None, (
++                'warm shutdown must leave the broker socket unbounded so '
++                'in-flight acks can still be flushed'
++            )
++        finally:
++            sock.close()
++            peer.close()
++
++    def test_cold_shutdown_bounds_open_broker_sockets(self):
++        # Issue 975 has an earlier entry point than _shutdown(): the cold
++        # shutdown handler cancels the task consumer itself, and for amqp that
++        # is a basic_cancel which waits for a reply.  Reaching it means
++        # _shutdown() never runs, so the bound has to be applied here too.
++        from celery.apps.worker import on_cold_shutdown
++        # Import the module the same way on_cold_shutdown does, so the flags
++        # restored below are the ones it actually mutates.
++        from celery.worker import state as worker_state
++
++        sock, peer = socket.socketpair()
++        # on_cold_shutdown sets the global shutdown flags; leaving them set
++        # trips the sanity_no_shutdown_flags_set fixture for every test that
++        # runs after this one.
++        prev_flags = (worker_state.should_stop, worker_state.should_terminate)
++        try:
++            sock.settimeout(None)
++
++            connection = Mock(name='connection')
++            connection.transport.channels = None
++            connection._connection._transport.sock = sock
++
++            worker = Mock(name='worker')
++            worker.consumer.connection = connection
++            seen = {}
++            worker.consumer.task_consumer.cancel.side_effect = (
++                lambda *a, **kw: seen.update(timeout=sock.gettimeout()))
++
++            with patch('celery.apps.worker.install_worker_term_hard_handler'), \
++                    patch('celery.apps.worker.safe_say'):
++                on_cold_shutdown(worker)
++
++            assert seen['timeout'] == worker_module.SHUTDOWN_SOCKET_TIMEOUT
++        finally:
++            worker_state.should_stop, worker_state.should_terminate = prev_flags
++            sock.close()
++            peer.close()
++
++    def test_cold_shutdown_survives_cancel_timeout(self):
++        # With the socket bounded, cancel() raises on a silent peer instead
++        # of hanging.  The handler must still cancel active requests and set
++        # the terminate flag, or the worker never shuts down.
++        from celery.apps.worker import on_cold_shutdown
++        from celery.worker import state as worker_state
++
++        prev_flags = (worker_state.should_stop, worker_state.should_terminate)
++        try:
++            worker = Mock(name='worker')
++            worker.consumer.connection = None
++            worker.consumer.connection_errors = (OSError,)
++            worker.consumer.channel_errors = ()
++            worker.consumer.task_consumer.cancel.side_effect = (
++                socket.timeout('timed out'))
++
++            with patch('celery.apps.worker.install_worker_term_hard_handler'), \
++                    patch('celery.apps.worker.safe_say'):
++                on_cold_shutdown(worker)
++
++            worker.consumer.cancel_active_requests.assert_called_once_with()
++            assert worker_state.should_terminate is True
++        finally:
++            worker_state.should_stop, worker_state.should_terminate = prev_flags
++
++    def test_terminate_without_consumer(self):
++        # terminate() must tolerate a worker whose consumer was never
++        # created, as signal_consumer_close() already does.
++        self.worker.__dict__.pop('consumer', None)
++        self.worker.blueprint = Mock(name='blueprint')
++        self.worker.blueprint.state = RUN
++        self.worker.terminate()
++        self.worker.blueprint.stop.assert_called_once()
++
++    def test_terminate_bounds_open_broker_sockets(self):
++        # Cold paths that never run on_cold_shutdown (WorkerTerminate raised
++        # by the consumer, embedded callers) all land in terminate().
++        sock, peer = socket.socketpair()
++        try:
++            sock.settimeout(None)
++            connection = Mock(name='connection')
++            connection.transport.channels = None
++            connection._connection._transport.sock = sock
++            self.worker.consumer = Mock(name='consumer')
++            self.worker.consumer.connection = connection
++
++            seen = {}
++            self.worker.blueprint = Mock(name='blueprint')
++            self.worker.blueprint.state = RUN
++            self.worker.blueprint.stop.side_effect = (
++                lambda *a, **kw: seen.update(timeout=sock.gettimeout()))
++
++            self.worker.terminate()
++
++            assert seen['timeout'] == worker_module.SHUTDOWN_SOCKET_TIMEOUT
++        finally:
++            sock.close()
++            peer.close()
++
++    def test_shutdown_without_consumer_connection(self):
++        # Shutdown can run before the consumer ever connected.
++        self.worker.consumer = None
++        self.worker.blueprint = Mock(name='blueprint')
++        self.worker._shutdown()
++        self.worker.blueprint.stop.assert_called_once()
++
+     @patch('celery.worker.worker.create_pidlock')
+     def test_use_pidfile(self, create_pidlock):
+         create_pidlock.return_value = Mock()

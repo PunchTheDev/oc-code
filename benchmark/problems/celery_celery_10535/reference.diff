@@ -1,0 +1,869 @@
+diff --git a/celery/app/control.py b/celery/app/control.py
+index fb1565a4f8..6eac1b4229 100644
+--- a/celery/app/control.py
++++ b/celery/app/control.py
+@@ -340,7 +340,7 @@ def active_queues(self):
+         return self._request('active_queues')
+ 
+     def query_task(self, *ids):
+-        """Return detail of tasks currently executed by workers.
++        """Return details of tasks currently scheduled, reserved or executed by workers.
+ 
+         Arguments:
+             *ids (str): IDs of tasks to be queried.
+diff --git a/celery/worker/consumer/consumer.py b/celery/worker/consumer/consumer.py
+index df800e31ce..dc2e67b67f 100644
+--- a/celery/worker/consumer/consumer.py
++++ b/celery/worker/consumer/consumer.py
+@@ -33,8 +33,8 @@
+ from celery.utils.threads import bound_open_broker_sockets
+ from celery.utils.time import humanize_seconds, rate
+ from celery.worker import loops
+-from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, successful_requests,
+-                                 task_reserved)
++from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, scheduled_requests,
++                                 successful_requests, task_reserved)
+ 
+ __all__ = ('Consumer', 'Evloop', 'dump_body')
+ 
+@@ -542,6 +542,30 @@ def on_close(self):
+                 requests.pop(r.id, None)
+         reserved_requests.clear()
+         reserved_requests.update(tuple(active_requests))
++        # Scheduled (ETA/countdown) requests never became reserved, so they
++        # aren't covered by the cleanup above. Cancel their pending timer
++        # entries (through self.timer.cancel(), not entry.cancel()
++        # directly, since e.g. the Eventlet timer relies on that to catch
++        # GreenletExit) so the callback can't fire after we've torn down
++        # this connection (the synloop error path doesn't clear the timer
++        # the way asynloop's hub.reset()/hub.timer.clear() does), then drop
++        # our copies since the broker may redeliver these tasks to another
++        # worker on reconnect.
++        for r in tuple(scheduled_requests):
++            entry = r._eta_timer_entry
++            if entry is not None and self.timer is not None:
++                try:
++                    self.timer.cancel(entry)
++                except Exception as exc:  # pylint: disable=broad-except
++                    logger.exception(
++                        'Error cancelling ETA timer entry: %r', exc)
++            # A request can be in both sets: with a threaded timer an ETA
++            # already in the past fires immediately, so task_reserved() may
++            # have run before the strategy registered the request as
++            # scheduled.  Never drop one that's reserved/running.
++            if r not in active_requests and r not in reserved_requests:
++                requests.pop(r.id, None)
++        scheduled_requests.clear()
+         if self.pool and self.pool.flush:
+             self.pool.flush()
+ 
+diff --git a/celery/worker/control.py b/celery/worker/control.py
+index 1ccb3b178b..8b43b1db1a 100644
+--- a/celery/worker/control.py
++++ b/celery/worker/control.py
+@@ -123,11 +123,14 @@ def _find_requests_by_id(ids,
+ 
+ def _state_of_task(request,
+                    is_active=worker_state.active_requests.__contains__,
+-                   is_reserved=worker_state.reserved_requests.__contains__):
++                   is_reserved=worker_state.reserved_requests.__contains__,
++                   is_scheduled=worker_state.scheduled_requests.__contains__):
+     if is_active(request):
+         return 'active'
+     elif is_reserved(request):
+         return 'reserved'
++    elif is_scheduled(request):
++        return 'scheduled'
+     return 'ready'
+ 
+ 
+diff --git a/celery/worker/request.py b/celery/worker/request.py
+index 3ce6ad140f..6546102a86 100644
+--- a/celery/worker/request.py
++++ b/celery/worker/request.py
+@@ -77,6 +77,12 @@ class Request:
+     _apply_result = None
+     _tzlocal = None
+ 
++    #: Timer entry for this request's pending ETA/countdown callback, set by
++    #: :mod:`celery.worker.strategy` when the request is scheduled so that
++    #: :meth:`celery.worker.consumer.Consumer.on_close` can cancel it on
++    #: connection loss.  ``None`` for requests without an ETA.
++    _eta_timer_entry = None
++
+     if not IS_PYPY:  # pragma: no cover
+         __slots__ = (
+             '_app', '_type', 'name', 'id', '_root_id', '_parent_id',
+diff --git a/celery/worker/state.py b/celery/worker/state.py
+index 5da761d6f7..2cce5f988a 100644
+--- a/celery/worker/state.py
++++ b/celery/worker/state.py
+@@ -20,8 +20,9 @@
+ 
+ __all__ = (
+     'SOFTWARE_INFO', 'reserved_requests', 'active_requests',
+-    'total_count', 'revoked', 'task_reserved', 'maybe_shutdown',
+-    'task_accepted', 'task_ready', 'Persistent',
++    'scheduled_requests', 'total_count', 'revoked', 'task_reserved',
++    'task_scheduled', 'maybe_shutdown', 'task_accepted', 'task_ready',
++    'Persistent',
+ )
+ 
+ 
+@@ -83,6 +84,18 @@ def _float_env(name: str, default: float) -> float:
+ #: set of currently active :class:`~celery.worker.request.Request`'s.
+ active_requests = weakref.WeakSet()
+ 
++#: set of :class:`~celery.worker.request.Request`'s scheduled for an
++#: ETA/countdown and not yet handed over to the pool.
++#:
++#: A request is discarded from here by :func:`task_reserved` once its
++#: ETA/countdown has elapsed.  Note that for a rate-limited task the ETA
++#: firing only moves the request into its token bucket
++#: (``Consumer._limit_post_eta``); it stays in this set until a token frees
++#: up and ``Consumer._limit_move_to_pool`` reserves it, so such a request
++#: keeps reporting ``scheduled`` after its ETA has passed even though
++#: ``inspect scheduled`` no longer lists it.
++scheduled_requests = weakref.WeakSet()
++
+ #: A limited set of successful :class:`~celery.worker.request.Request`'s.
+ successful_requests = LimitedSet(maxlen=SUCCESSFUL_MAX,
+                                  expires=SUCCESSFUL_EXPIRES)
+@@ -107,6 +120,7 @@ def reset_state():
+     requests.clear()
+     reserved_requests.clear()
+     active_requests.clear()
++    scheduled_requests.clear()
+     successful_requests.clear()
+     total_count.clear()
+     all_total_count[:] = [0]
+@@ -124,10 +138,38 @@ def maybe_shutdown():
+ 
+ def task_reserved(request,
+                   add_request=requests.__setitem__,
+-                  add_reserved_request=reserved_requests.add):
++                  add_reserved_request=reserved_requests.add,
++                  discard_scheduled_request=scheduled_requests.discard):
+     """Update global state when a task has been reserved."""
+     add_request(request.id, request)
+     add_reserved_request(request)
++    discard_scheduled_request(request)
++
++
++def task_scheduled(request,
++                   add_request=requests.__setitem__,
++                   add_scheduled_request=scheduled_requests.add,
++                   all_reserved_requests=reserved_requests,
++                   all_active_requests=active_requests):
++    """Update global state when a task has been scheduled for an ETA/countdown.
++
++    Unlike :func:`task_reserved`, this doesn't add the request to
++    ``reserved_requests``: the request isn't waiting for a worker pool slot
++    yet, it's only registered so that it can be found (e.g. by the
++    ``query_task`` remote control command) before its ETA/countdown elapses.
++
++    This is a no-op for a request that already moved on to being reserved or
++    active: with a threaded timer (:class:`celery.utils.timer2.Timer`, used by
++    the non-eventloop pools) an ETA that's already in the past fires on the
++    timer thread right away, so ``apply_eta_task()`` -> :func:`task_reserved`
++    can run before the strategy gets here.  Adding the request back to
++    ``scheduled_requests`` then would misreport its state and let
++    ``Consumer.on_close()`` drop a still-running task from ``requests``.
++    """
++    if request in all_reserved_requests or request in all_active_requests:
++        return
++    add_request(request.id, request)
++    add_scheduled_request(request)
+ 
+ 
+ def task_accepted(request,
+@@ -148,7 +190,8 @@ def task_ready(request,
+                successful=False,
+                remove_request=requests.pop,
+                discard_active_request=active_requests.discard,
+-               discard_reserved_request=reserved_requests.discard):
++               discard_reserved_request=reserved_requests.discard,
++               discard_scheduled_request=scheduled_requests.discard):
+     """Update global state when a task is ready."""
+     if successful:
+         successful_requests.add(request.id)
+@@ -156,6 +199,7 @@ def task_ready(request,
+     remove_request(request.id, None)
+     discard_active_request(request)
+     discard_reserved_request(request)
++    discard_scheduled_request(request)
+ 
+ 
+ C_BENCH = os.environ.get('C_BENCH') or os.environ.get('CELERY_BENCH')
+diff --git a/celery/worker/strategy.py b/celery/worker/strategy.py
+index 6a1c6225b4..7f56e0f5c2 100644
+--- a/celery/worker/strategy.py
++++ b/celery/worker/strategy.py
+@@ -12,7 +12,7 @@
+ from celery.utils.time import timezone
+ 
+ from .request import create_request_cls
+-from .state import task_reserved
++from .state import task_reserved, task_scheduled
+ 
+ __all__ = ('default',)
+ 
+@@ -192,12 +192,21 @@ def task_message_handler(message, body, ack, reject, callbacks,
+ 
+         if eta and bucket:
+             consumer.qos.increment_eventually()
+-            return call_at(eta, limit_post_eta, (req, bucket, 1),
+-                           priority=6)
++            req._eta_timer_entry = call_at(
++                eta, limit_post_eta, (req, bucket, 1), priority=6)
++            # Only make the request visible to on_close()/query_task() once
++            # its timer entry is attached, so a concurrent on_close() (e.g.
++            # celery.utils.timer2.Timer runs on its own thread for
++            # non-eventloop pools) can't observe it half-registered, drop
++            # its bookkeeping, and leave the entry with nothing to cancel it.
++            task_scheduled(req)
++            return
+ 
+         if eta:
+             consumer.qos.increment_eventually()
+-            call_at(eta, apply_eta_task, (req,), priority=6)
++            req._eta_timer_entry = call_at(
++                eta, apply_eta_task, (req,), priority=6)
++            task_scheduled(req)
+             return task_message_handler
+         if bucket:
+             return limit_task(req, bucket, 1)
+diff --git a/docs/userguide/monitoring.rst b/docs/userguide/monitoring.rst
+index 3cba351e22..4ebc31c8f2 100644
+--- a/docs/userguide/monitoring.rst
++++ b/docs/userguide/monitoring.rst
+@@ -145,8 +145,12 @@ Commands
+ 
+ * **inspect query_task**: Show information about task(s) by id.
+ 
+-    Any worker having a task in this set of ids reserved/active will respond
+-    with status and information.
++    Any worker having a task in this set of ids that is scheduled, reserved, or active
++    will respond with status and information.
++
++    .. versionchanged:: 5.7
++        Scheduled tasks (with an ETA/countdown that hasn't elapsed yet) are
++        now included; previously only reserved/active tasks were found.
+ 
+     .. code-block:: console
+ 
+diff --git a/t/smoke/tests/test_query_task.py b/t/smoke/tests/test_query_task.py
+new file mode 100644
+index 0000000000..a2295faa6e
+--- /dev/null
++++ b/t/smoke/tests/test_query_task.py
+@@ -0,0 +1,66 @@
++import time
++
++from pytest_celery import RESULT_TIMEOUT, CeleryTestSetup
++
++from t.smoke.tasks import add
++
++
++def _wait_until(predicate, timeout=RESULT_TIMEOUT, interval=0.5):
++    deadline = time.monotonic() + timeout
++    result = predicate()
++    while not result and time.monotonic() < deadline:
++        time.sleep(interval)
++        result = predicate()
++    return result
++
++
++class test_query_task:
++    """Smoke test for #5321.
++
++    Schedule a task with a countdown against a real, containerized worker
++    and confirm ``inspect().query_task()`` finds it while it's still
++    waiting on its ETA -- not only once it starts running, as it did
++    before the fix.
++
++    The countdown needs enough headroom over the control-command round
++    trip (broker + worker scheduling delay, which can be significant
++    under CI load) that the task is still reliably waiting on its ETA
++    when we check -- otherwise it can already be done and gone from
++    worker state by the time we look, which isn't something a polling
++    loop can recover from. Both checks below are done in the same poll
++    iteration so they can't race each other across the same deadline.
++    """
++
++    def test_query_task_finds_task_scheduled_with_countdown(self, celery_setup: CeleryTestSetup):
++        hostname = celery_setup.worker.hostname()
++        result = add.s(2, 2).apply_async(
++            countdown=10, queue=celery_setup.worker.worker_queue)
++        task_id = result.id
++        # A single destination makes kombu wait only for that one reply
++        # instead of the full default timeout, so this stays fast.
++        inspect = celery_setup.app.control.inspect([hostname])
++
++        def is_scheduled():
++            queried = inspect.query_task(task_id) or {}
++            if task_id not in queried.get(hostname, {}):
++                return False
++            state, _info = queried[hostname][task_id]
++            if state != 'scheduled':
++                return False
++
++            # sanity check: it's also visible via inspect().scheduled(),
++            # exactly as described in the issue. Checked in the same poll
++            # iteration as the query_task() result above so it can't race
++            # past the ETA on its own.
++            scheduled = inspect.scheduled() or {}
++            return any(
++                entry.get('request', {}).get('id') == task_id
++                for entry in scheduled.get(hostname, [])
++            )
++
++        assert _wait_until(is_scheduled), (
++            "query_task()/scheduled() never found the task while it was "
++            "waiting on its countdown"
++        )
++
++        assert result.get(timeout=RESULT_TIMEOUT) == 4
+diff --git a/t/unit/worker/test_consumer.py b/t/unit/worker/test_consumer.py
+index 7fe405f1da..0574afc270 100644
+--- a/t/unit/worker/test_consumer.py
++++ b/t/unit/worker/test_consumer.py
+@@ -27,6 +27,39 @@
+ from celery.worker.state import active_requests, successful_requests
+ 
+ 
++class FakeOnCloseRequest:
++    """Minimal stand-in for a Request in the ``on_close()`` tests."""
++
++    def __init__(self, id, entry=None):
++        self.id = id
++        self.name = 'test.task'
++        self._eta_timer_entry = entry
++
++
++@pytest.fixture
++def on_close_ctx():
++    """``(state, Consumer, consumer)`` with clean global worker state.
++
++    ``Consumer.on_close`` is called unbound on a mocked consumer so the
++    global-state bookkeeping can be asserted without standing up a real
++    connection, pool or timer.
++    """
++    from celery.worker import state
++
++    consumer = Mock()
++    consumer.controller = Mock()
++    consumer.controller.semaphore = Mock()
++    consumer.task_buckets = {}
++    consumer.pool = Mock()
++    consumer.pool.flush = Mock()
++
++    state.reset_state()
++    try:
++        yield state, Consumer, consumer
++    finally:
++        state.reset_state()
++
++
+ class ConsumerTestCase:
+     def get_consumer(self, no_hub=False, **kwargs):
+         consumer = Consumer(
+@@ -542,48 +575,84 @@ def test_on_close_clears_semaphore_and_reqs(self):
+             c.pool = None
+             c.on_close()
+ 
+-    def test_on_close_purges_orphan_reservations_from_requests_dict(self):
+-        """Regression: ``on_close()`` must remove ``state.requests[id]``
+-        entries for Requests that were reserved but never accepted (e.g.
+-        ETA tasks queued in ``reserved_requests`` at the moment of a
+-        connection loss). PR #7771 attempted this but iterated
+-        ``reserved_requests`` (Request objects) and tested membership in
+-        ``requests`` (a ``dict[str, Request]``), so ``Request in requests``
+-        was always False and nothing was ever deleted.
++    def test_on_close_purges_orphan_reservations_from_requests_dict(self, on_close_ctx):
++        """A Request reserved but never accepted must be dropped from
++        ``state.requests`` (regression for the broken loop in PR #7771,
++        which compared Request objects against a dict keyed by id).
+         """
+-        from celery.worker import state
+-        from celery.worker.consumer.consumer import Consumer
++        state, Consumer, consumer = on_close_ctx
++        orphan = FakeOnCloseRequest('orphan-1')
++        state.requests[orphan.id] = orphan
++        state.reserved_requests.add(orphan)
+ 
+-        class FakeRequest:
+-            def __init__(self, id):
+-                self.id = id
++        Consumer.on_close(consumer)
+ 
+-        consumer = Mock()
+-        consumer.controller = Mock()
+-        consumer.controller.semaphore = Mock()
+-        consumer.task_buckets = {}
+-        consumer.pool = Mock()
+-        consumer.pool.flush = Mock()
++        assert orphan.id not in state.requests
+ 
+-        state.reset_state()
+-        try:
+-            # Orphan reservation: present in ``requests`` and
+-            # ``reserved_requests`` but never moved to ``active_requests``.
+-            orphan = FakeRequest('orphan-1')
+-            state.requests[orphan.id] = orphan
+-            state.reserved_requests.add(orphan)
++    def test_on_close_purges_scheduled_requests_from_requests_dict(self, on_close_ctx):
++        """Scheduled (ETA/countdown) Requests never reach
++        ``reserved_requests``, so they need their own cleanup or they leak
++        in ``state.requests`` after a connection loss.
++        """
++        state, Consumer, consumer = on_close_ctx
++        scheduled = FakeOnCloseRequest('scheduled-1')
++        state.task_scheduled(scheduled)
+ 
+-            Consumer.on_close(consumer)
++        Consumer.on_close(consumer)
+ 
+-            assert orphan.id not in state.requests, (
+-                "on_close() did not purge an orphan reserved-but-not-"
+-                "accepted Request from state.requests; this is the leak "
+-                "PR #7771 tried to fix but its loop variable ('request_id') "
+-                "actually held Request objects, so the membership check "
+-                "never matched."
+-            )
+-        finally:
+-            state.reset_state()
++        assert scheduled.id not in state.requests
++        assert scheduled not in state.scheduled_requests
++
++    def test_on_close_cancels_pending_timer_entry_for_scheduled_requests(self, on_close_ctx):
++        """The ETA timer entry must be cancelled too, otherwise the stale
++        callback can still fire on transports whose loop doesn't clear the
++        timer on error (synloop) and re-add the request via
++        ``task_reserved()``.
++
++        Cancellation goes through ``self.timer.cancel(entry)`` rather than
++        ``entry.cancel()``: the Eventlet timer's entries are greenlets and
++        ``Timer.cancel()`` is what swallows the ``GreenletExit`` that
++        cancelling one can raise.
++        """
++        state, Consumer, consumer = on_close_ctx
++        scheduled = FakeOnCloseRequest('scheduled-1', entry=Mock())
++        state.task_scheduled(scheduled)
++
++        Consumer.on_close(consumer)
++
++        consumer.timer.cancel.assert_called_once_with(
++            scheduled._eta_timer_entry)
++        scheduled._eta_timer_entry.cancel.assert_not_called()
++
++    def test_on_close_logs_and_continues_if_timer_cancel_raises(self, on_close_ctx):
++        """A failing cancellation must not abort the rest of the cleanup."""
++        state, Consumer, consumer = on_close_ctx
++        consumer.timer.cancel.side_effect = RuntimeError('boom')
++        scheduled = FakeOnCloseRequest('scheduled-1', entry=Mock())
++        state.task_scheduled(scheduled)
++
++        Consumer.on_close(consumer)
++
++        assert scheduled.id not in state.requests
++        assert scheduled not in state.scheduled_requests
++
++    def test_on_close_keeps_running_task_that_is_also_scheduled(self, on_close_ctx):
++        """A request can be in both sets: with a threaded timer an ETA
++        already in the past fires straight away, so the request can be
++        reserved/active before the strategy registers it as scheduled.
++        Popping it unconditionally would hide a running task from
++        ``inspect``/``revoke``.
++        """
++        state, Consumer, consumer = on_close_ctx
++        running = FakeOnCloseRequest('running-1', entry=Mock())
++        state.task_accepted(running)
++        state.scheduled_requests.add(running)
++
++        Consumer.on_close(consumer)
++
++        assert state.requests.get(running.id) is running
++        assert running in state.active_requests
++        assert running not in state.scheduled_requests
+ 
+     def test_connect_error_handler(self):
+         self.app._connection = _amqp_connection()
+diff --git a/t/unit/worker/test_control.py b/t/unit/worker/test_control.py
+index d4dd750cf7..5fac2c39ec 100644
+--- a/t/unit/worker/test_control.py
++++ b/t/unit/worker/test_control.py
+@@ -991,6 +991,28 @@ def test_query_task(self):
+         finally:
+             worker_state.reserved_requests.clear()
+ 
++    def test_query_task_scheduled(self):
++        # Regression test for #5321: a task with an ETA/countdown that
++        # hasn't fired yet must still be found by `query_task`.
++        consumer = Consumer(self.app)
++        consumer.controller = _WC(app=self.app)
++        consumer.controller.consumer = consumer
++        panel = self.create_panel(consumer=consumer)
++        panel.app = self.app
++        req1 = Request(
++            self.TaskMessage(self.mytask.name, args=(2, 2)),
++            app=self.app,
++        )
++        worker_state.task_scheduled(req1)
++        try:
++            ret = panel.handle('query_task', {'ids': {req1.id}})
++            assert req1.id in ret
++            assert ret[req1.id][0] == 'scheduled'
++            assert req1 not in worker_state.reserved_requests
++        finally:
++            worker_state.requests.pop(req1.id, None)
++            worker_state.scheduled_requests.discard(req1)
++
+     @patch('celery.Celery.backend', new=PropertyMock(name='backend'))
+     def test_revoke_backend_status_update(self):
+         state = self.create_state()
+diff --git a/t/unit/worker/test_eta_query_task.py b/t/unit/worker/test_eta_query_task.py
+new file mode 100644
+index 0000000000..7897a80273
+--- /dev/null
++++ b/t/unit/worker/test_eta_query_task.py
+@@ -0,0 +1,178 @@
++"""End-to-end tests for the ETA/countdown fix for #5321.
++
++These tests exercise :mod:`celery.worker.strategy`,
++:mod:`celery.worker.state`, :mod:`celery.worker.control` and
++:mod:`celery.worker.consumer.consumer` together, the way a real worker
++would use them, instead of asserting on each module in isolation. They
++verify that a task scheduled with an ETA/countdown is visible to
++``inspect query_task`` throughout its whole lifecycle: while it's
++waiting on its timer, once it's handed off to the pool, after it
++completes, and if the connection is lost while it's still pending.
++"""
++import socket
++from collections import defaultdict
++from unittest.mock import Mock
++
++import pytest
++
++from celery.exceptions import TaskRevokedError
++from celery.utils.functional import maybe_list
++from celery.worker import WorkController as _WC
++from celery.worker import consumer as consumer_module
++from celery.worker import control
++from celery.worker import state as worker_state
++from celery.worker.strategy import default as default_strategy
++
++hostname = socket.gethostname()
++
++
++class _RealConsumer(consumer_module.Consumer):
++    """A consumer with a real ``apply_eta_task``/``on_close``, but a
++    stubbed-out timer/pool/broker so the strategy and control-command
++    plumbing can be driven synchronously in a test.
++    """
++
++    def __init__(self, app):
++        self.app = app
++        self.hostname = hostname
++        self.connection_errors = ()
++        self.timer = Mock()
++        self.event_dispatcher = Mock(enabled=False)
++        self.controller = _WC(app=app)
++        self.controller.consumer = self
++        self.controller.semaphore = Mock()
++        # NOTE: ``_WC.state`` is the shared ``celery.worker.state`` module
++        # (a class attribute), so it must never be reassigned here -- doing
++        # so would replace the real global ``revoked`` LimitedSet for the
++        # whole test session. It already starts out empty.
++        self.task_consumer = Mock()
++        self.task_buckets = defaultdict(lambda: None)
++        self.qos = Mock()
++        self.on_task_request = Mock()
++        self.disable_rate_limits = True
++        self.pool = Mock()
++        self.hub = None
++
++
++class test_query_task_eta_lifecycle:
++
++    def setup_method(self):
++        worker_state.reset_state()
++
++        @self.app.task(shared=False)
++        def add(x, y):
++            return x + y
++
++        self.add = add
++        self.consumer = _RealConsumer(self.app)
++        self.panel = self.app.control.mailbox.Node(
++            hostname=hostname,
++            state=Mock(),
++            handlers=control.Panel.data,
++        )
++
++    def teardown_method(self):
++        worker_state.reset_state()
++
++    def _schedule(self, countdown=10):
++        strategy = default_strategy(self.add, self.app, self.consumer)
++        message = self.task_message_from_sig(
++            self.app, self.add.s(2, 2).set(countdown=countdown),
++        )
++        body = message.payload if not message.headers.get('id') else None
++        strategy(message, body, message.ack, message.reject, [])
++        # the strategy hands the scheduled request + callback off to the
++        # (mocked) timer instead of running it inline.
++        assert self.consumer.timer.call_at.called
++        return self.consumer.timer.call_at.call_args[0][2][0]
++
++    def _query(self, req):
++        ret = self.panel.handle('query_task', {'ids': maybe_list(req.id)})
++        return ret.get(req.id)
++
++    def test_scheduled_task_is_visible_before_eta_elapses(self):
++        req = self._schedule()
++
++        result = self._query(req)
++
++        assert result is not None
++        assert result[0] == 'scheduled'
++        assert req not in worker_state.reserved_requests
++        assert req not in worker_state.active_requests
++
++    def test_task_transitions_to_reserved_when_eta_fires(self):
++        req = self._schedule()
++        assert self._query(req)[0] == 'scheduled'
++
++        # simulate the timer firing, as celery.worker.loops does.
++        self.consumer.apply_eta_task(req)
++
++        result = self._query(req)
++        assert result is not None
++        assert result[0] == 'reserved'
++        assert req in worker_state.reserved_requests
++        assert req not in worker_state.scheduled_requests
++        self.consumer.on_task_request.assert_called_once_with(req)
++
++    def test_task_disappears_once_ready(self):
++        req = self._schedule()
++        self.consumer.apply_eta_task(req)
++        assert self._query(req)[0] == 'reserved'
++
++        worker_state.task_ready(req)
++
++        assert self._query(req) is None
++        assert req.id not in worker_state.requests
++        assert req not in worker_state.scheduled_requests
++        assert req not in worker_state.reserved_requests
++
++    def test_connection_loss_keeps_task_that_already_started(self):
++        """A request can be in ``scheduled_requests`` *and* already
++        reserved/active: with a threaded timer an ETA in the past fires on
++        the timer thread before the strategy gets to ``task_scheduled()``.
++        ``on_close()`` must not drop such a request from ``state.requests``,
++        or a running task becomes invisible to inspect/revoke.
++        """
++        req = self._schedule()
++        self.consumer.apply_eta_task(req)
++        # the strategy thread catches up only now.
++        worker_state.task_scheduled(req)
++        assert req not in worker_state.scheduled_requests
++
++        # ...and even if something did put it back in both sets:
++        worker_state.task_accepted(req)
++        worker_state.scheduled_requests.add(req)
++
++        self.consumer.on_close()
++
++        assert worker_state.requests.get(req.id) is req
++        assert self._query(req)[0] == 'active'
++
++    def test_revoke_terminate_reaches_pending_eta_task(self):
++        """Behavior change: scheduled requests now live in
++        ``state.requests``, so ``revoke(terminate=True)`` finds them through
++        ``_find_requests_by_id()`` before their ETA elapses. Termination is
++        deferred (the task hasn't started), and the request refuses to run
++        once the timer does fire.
++        """
++        req = self._schedule()
++        assert self._query(req)[0] == 'scheduled'
++
++        self.panel.handle('revoke', {'task_id': req.id, 'terminate': True})
++
++        assert req.id in worker_state.revoked
++        # nothing to kill yet, so terminate is deferred until the ack.
++        assert req._terminate_on_ack is not None
++        with pytest.raises(TaskRevokedError):
++            req.execute_using_pool(self.consumer.pool)
++
++    def test_connection_loss_purges_pending_eta_task(self):
++        req = self._schedule()
++        assert self._query(req)[0] == 'scheduled'
++
++        # broker connection drops before the ETA elapses.
++        self.consumer.on_close()
++
++        assert self._query(req) is None
++        assert req.id not in worker_state.requests
++        assert req not in worker_state.scheduled_requests
+diff --git a/t/unit/worker/test_state.py b/t/unit/worker/test_state.py
+index 7a2ce93520..e89af81500 100644
+--- a/t/unit/worker/test_state.py
++++ b/t/unit/worker/test_state.py
+@@ -17,10 +17,7 @@
+ @pytest.fixture
+ def reset_state():
+     yield
+-    state.active_requests.clear()
+-    state.revoked.clear()
+-    state.revoked_stamps.clear()
+-    state.total_count.clear()
++    state.reset_state()
+ 
+ 
+ class MockShelve(dict):
+@@ -192,14 +189,87 @@ def test_ready(self, requests=[SimpleReq('foo'),
+             state.task_ready(request)
+         assert len(state.active_requests) == 0
+ 
++    def test_scheduled(self):
++        request = SimpleReq('foo')
++        state.task_scheduled(request)
++        assert request in state.scheduled_requests
++        assert request not in state.reserved_requests
++        assert state.requests[request.id] is request
++
++    def test_reserved_discards_scheduled(self):
++        request = SimpleReq('foo')
++        state.task_scheduled(request)
++        assert request in state.scheduled_requests
++
++        state.task_reserved(request)
++        assert request not in state.scheduled_requests
++        assert request in state.reserved_requests
++
++    def test_ready_discards_scheduled(self):
++        request = SimpleReq('foo')
++        state.task_scheduled(request)
++        assert request in state.scheduled_requests
++
++        state.task_ready(request)
++        assert request not in state.scheduled_requests
++        assert request.id not in state.requests
++
++    def test_scheduled_is_noop_when_already_reserved(self):
++        """Regression: with a threaded timer (``celery.utils.timer2.Timer``,
++        used by the non-eventloop pools) an ETA already in the past fires on
++        the timer thread immediately, so ``apply_eta_task()`` ->
++        ``task_reserved()`` can run *before* the strategy reaches
++        ``task_scheduled()``.  Re-adding the request to
++        ``scheduled_requests`` then would misreport its state and let
++        ``Consumer.on_close()`` drop a still-running task from ``requests``.
++        """
++        request = SimpleReq('foo')
++        state.task_reserved(request)
++
++        state.task_scheduled(request)
++
++        assert request not in state.scheduled_requests
++        assert request in state.reserved_requests
++        assert state.requests[request.id] is request
++
++    def test_scheduled_is_noop_when_already_active(self):
++        request = SimpleReq('foo')
++        state.task_accepted(request)
++
++        state.task_scheduled(request)
++
++        assert request not in state.scheduled_requests
++        assert request in state.active_requests
++        assert state.requests[request.id] is request
++
++    def test_reset_state_clears_scheduled(self):
++        state.task_scheduled(SimpleReq('foo'))
++        assert len(state.scheduled_requests) == 1
++        state.reset_state()
++        assert len(state.scheduled_requests) == 0
++
+ 
+ class test_state_configuration():
+ 
+     @staticmethod
+     def import_state():
+-        with patch.dict(sys.modules):
+-            del sys.modules['celery.worker.state']
+-            return import_module('celery.worker.state')
++        worker_package = import_module('celery.worker')
++        original = sys.modules['celery.worker.state']
++        try:
++            with patch.dict(sys.modules):
++                del sys.modules['celery.worker.state']
++                return import_module('celery.worker.state')
++        finally:
++            # ``import_module`` also rebinds the ``state`` attribute on the
++            # ``celery.worker`` package, and ``patch.dict`` only restores
++            # ``sys.modules``.  Without putting the original back, every
++            # later ``from celery.worker import state`` would hand out this
++            # throwaway copy -- with its own empty ``requests`` /
++            # ``*_requests`` containers -- while the rest of celery (e.g.
++            # ``celery.worker.consumer.consumer``) keeps using the real
++            # ones, so any test touching both would silently work on two
++            # different sets of state.
++            worker_package.state = original
+ 
+     @patch.dict(os.environ, {
+         'CELERY_WORKER_REVOKES_MAX': '50001',
+diff --git a/t/unit/worker/test_strategy.py b/t/unit/worker/test_strategy.py
+index b2b829c4f4..8bf8d07ad0 100644
+--- a/t/unit/worker/test_strategy.py
++++ b/t/unit/worker/test_strategy.py
+@@ -64,6 +64,12 @@ def add(x, y):
+ 
+         self.add = add
+ 
++    def teardown_method(self):
++        # ETA/countdown strategies register requests in the real global
++        # `state.requests`/`state.scheduled_requests`, so clear them here to
++        # avoid leaking strongly-referenced requests into later tests.
++        state.reset_state()
++
+     def get_message_class(self):
+         return self.TaskMessage
+ 
+@@ -250,6 +256,36 @@ def test_eta_task(self):
+             assert C.was_scheduled()
+             C.consumer.qos.increment_eventually.assert_called_with()
+ 
++    def test_eta_task_registers_request_in_state(self):
++        # Regression test for #5321: a task with an ETA/countdown must be
++        # discoverable via `state.requests` (e.g. by the `query_task` remote
++        # control command) before its ETA elapses, not only afterwards.
++        with self._context(self.add.s(2, 2).set(countdown=10)) as C:
++            C()
++            req = C.get_request()
++            assert state.requests[req.id] is req
++            assert req not in state.reserved_requests
++
++    def test_eta_task_timer_entry_attached_before_scheduled_visible(self):
++        # Regression test: task_scheduled() must run *after* the timer
++        # entry is attached to the request, not before. Otherwise a
++        # concurrent on_close() (the timer runs on its own thread for
++        # non-eventloop pools) could observe the request in
++        # scheduled_requests with no entry to cancel yet.
++        seen_entry_when_scheduled = []
++
++        def fake_task_scheduled(request):
++            seen_entry_when_scheduled.append(
++                getattr(request, '_eta_timer_entry', None))
++
++        with patch('celery.worker.strategy.task_scheduled',
++                   side_effect=fake_task_scheduled):
++            with self._context(self.add.s(2, 2).set(countdown=10)) as C:
++                C()
++
++        assert seen_entry_when_scheduled
++        assert seen_entry_when_scheduled[0] is not None
++
+     def test_eta_task_utc_disabled(self):
+         with self._context(self.add.s(2, 2).set(countdown=10), utc=False) as C:
+             C()
