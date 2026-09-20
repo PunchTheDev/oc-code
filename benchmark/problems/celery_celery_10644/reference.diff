@@ -1,0 +1,154 @@
+diff --git a/celery/canvas.py b/celery/canvas.py
+index 37702fe58e..80ec636966 100644
+--- a/celery/canvas.py
++++ b/celery/canvas.py
+@@ -59,6 +59,20 @@ def maybe_unroll_group(group):
+         return group.tasks[0] if size == 1 else group
+ 
+ 
++def _is_empty_group(task):
++    """Return True if the task is a group with no members.
++
++    Shared by canvas construction (_chain.__or__) and both execution
++    paths -- the worker path (_chain.prepare_steps) and the eager path
++    (_chain.apply) -- so all three agree on which groups are skipped.
++    """
++    return (
++        isinstance(task, group) and
++        isinstance(task.tasks, (list, tuple)) and
++        not task.tasks
++    )
++
++
+ def task_name_from(task):
+     return getattr(task, 'name', task)
+ 
+@@ -973,6 +987,9 @@ def __call__(self, *args, **kwargs):
+             return self.apply_async(args, kwargs)
+ 
+     def __or__(self, other):
++        if _is_empty_group(other):
++            # chain | group() -> chain (empty group is a no-op)
++            return self
+         if isinstance(other, group):
+             # unroll group with one member
+             other = maybe_unroll_group(other)
+@@ -1237,12 +1254,7 @@ def prepare_steps(self, args, kwargs, tasks,
+                 # when groups are nested, they are unrolled - all tasks within
+                 # groups should be called in parallel
+                 task = maybe_unroll_group(task)
+-                if (
+-                    isinstance(task, group) and
+-                    isinstance(task.tasks, (list, tuple)) and
+-                    not task.tasks and
+-                    (steps or prev_task)
+-                ):
++                if _is_empty_group(task) and (steps or prev_task):
+                     continue
+ 
+             # first task gets partial args from chain
+@@ -1340,7 +1352,13 @@ def apply(self, args=None, kwargs=None, **options):
+         args = args if args else ()
+         kwargs = kwargs if kwargs else {}
+         last, (fargs, fkwargs) = None, (args, kwargs)
+-        for task in self.tasks:
++        tasks = list(self.tasks)
++        for index, task in enumerate(tasks):
++            if _is_empty_group(task) and (
++                    index < len(tasks) - 1 or last is not None):
++                # Skip empty groups, mirroring _chain.prepare_steps:
++                # an empty group is a no-op, unless it is the only task.
++                continue
+             res = task.clone().apply(
+                 (last.get(),) if last else fargs, fkwargs,
+                 **dict(self.options, **options))
+diff --git a/t/smoke/tests/test_canvas.py b/t/smoke/tests/test_canvas.py
+index b6c69e7639..6a04dc18e9 100644
+--- a/t/smoke/tests/test_canvas.py
++++ b/t/smoke/tests/test_canvas.py
+@@ -67,6 +67,17 @@ def test_upgrade_to_chord_inside_chains(self, celery_setup: CeleryTestSetup):
+         assert actual.count(b"b") == 1
+         redis_connection.delete(redis_key)
+ 
++    def test_chain_skips_empty_group_on_worker(self, celery_setup: CeleryTestSetup):
++        """Empty groups are no-ops: the worker runs the surrounding tasks."""
++        queue = celery_setup.worker.worker_queue
++        sig = chain(
++            add.s(2, 2).set(queue=queue),
++            group().set(queue=queue),
++            add.s(2).set(queue=queue),
++        )
++        res = sig.apply_async()
++        assert res.get(timeout=RESULT_TIMEOUT) == 6
++
+ 
+ class test_chord:
+     def test_sanity(self, celery_setup: CeleryTestSetup):
+diff --git a/t/unit/tasks/test_canvas.py b/t/unit/tasks/test_canvas.py
+index d55779d543..a90bcbad07 100644
+--- a/t/unit/tasks/test_canvas.py
++++ b/t/unit/tasks/test_canvas.py
+@@ -620,6 +620,63 @@ def tasks():
+         assert prepared_tasks[0].task == self.add.name
+         assert isinstance(results[0], AsyncResult)
+ 
++    def test_trailing_empty_group_is_skipped_in_eager_chain_apply(self):
++        # The eager path (_chain.apply) must agree with the worker path
++        # (_chain.prepare_steps, fixed in #10321): empty groups are skipped.
++        c = chain(self.add.s(2, 2), group(app=self.app))
++
++        assert isinstance(c, _chain)
++        assert c.apply().get() == 4
++
++    def test_middle_empty_group_is_skipped_in_eager_chain_apply(self):
++        # chain() reduces its arguments with __or__, which drops the
++        # empty group at construction time, so no chord upgrade happens
++        # and both execution paths agree.
++        c = chain(
++            self.add.s(2, 2), group(app=self.app), self.add.s(2),
++        )
++
++        assert isinstance(c, _chain)
++        prepared, _ = c.prepare_steps((), {}, c.tasks)
++
++        assert [t.task for t in prepared] == [self.add.name, self.add.name]
++        assert c.apply().get() == 6
++
++    def test_empty_group_is_skipped_in_directly_constructed_chain_apply(self):
++        # _chain.__or__ drops empty groups, so only a directly constructed or
++        # deserialized chain still carries one into the eager path.
++        c = _chain(self.add.s(2, 2), group(app=self.app),
++                   self.add.s(2), app=self.app)
++        assert c.apply().get() == 6
++
++    def test_trailing_empty_group_is_skipped_in_directly_constructed_chain(
++            self):
++        c = _chain(self.add.s(2, 2), group(app=self.app), app=self.app)
++        assert c.apply().get() == 4
++
++    def test_lone_empty_group_is_not_skipped_in_eager_chain_apply(self):
++        # Mirrors prepare_steps: an empty group survives when it is the
++        # only task.
++        c = _chain(group(app=self.app), app=self.app)
++        assert c.apply().get() == []
++
++    def test_empty_groups_are_dropped_at_chain_construction(self):
++        # _chain.__or__ treats an empty group as a no-op in any
++        # position: it is dropped instead of upgrading the chain
++        # into a chord with an empty header.
++        trailing = chain(self.add.s(2, 2), group(app=self.app))
++        assert isinstance(trailing, _chain)
++        assert [t.task for t in trailing.tasks] == [self.add.name]
++
++        middle = chain(self.add.s(2, 2), group(app=self.app), self.add.s(2))
++        assert isinstance(middle, _chain)
++        assert [t.task for t in middle.tasks] == [self.add.name, self.add.name]
++        assert not any(isinstance(task, chord) for task in middle.tasks)
++
++        leading = chain(group(app=self.app), self.add.s(2, 2))
++        assert isinstance(leading, _chain)
++        assert [t.task for t in leading.tasks] == [self.add.name]
++
+     def test_prepare_steps_set_last_task_id_to_chain(self):
+         last_task = self.add.s(2).set(task_id='42')
+         c = self.add.s(4) | last_task

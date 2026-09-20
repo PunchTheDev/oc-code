@@ -1,0 +1,377 @@
+diff --git a/celery/backends/database/__init__.py b/celery/backends/database/__init__.py
+index 330f6682b5d..d2a50fe2a09 100644
+--- a/celery/backends/database/__init__.py
++++ b/celery/backends/database/__init__.py
+@@ -136,13 +136,26 @@ def ResultSession(self, session_manager=None):
+             short_lived_sessions=self.short_lived_sessions,
+             **self.engine_options)
+ 
+-    def _store_result(self, task_id, result, state, traceback=None,
+-                      request=None, **kwargs):
++    def _query_task(self, session, task_id):
++        """Query task by id, falling back to deferring children if missing from database."""
++        try:
++            tasks = list(session.query(self.task_cls).filter(self.task_cls.task_id == task_id))
++            return tasks and tasks[0]
++        except DatabaseError as exc:
++            if 'children' in str(exc).lower():
++                from sqlalchemy.orm import defer
++                tasks = list(session.query(self.task_cls).options(
++                    defer(self.task_cls.children)
++                ).filter(self.task_cls.task_id == task_id))
++                return tasks and tasks[0]
++            raise
++
++    def _store_result(self, task_id, result, state,
++                      traceback=None, request=None, **kwargs):
+         """Store return value and state of an executed task."""
+         session = self.ResultSession()
+         with session_cleanup(session):
+-            task = list(session.query(self.task_cls).filter(self.task_cls.task_id == task_id))
+-            task = task and task[0]
++            task = self._query_task(session, task_id)
+             if not task:
+                 task = self.task_cls(task_id)
+                 task.task_id = task_id
+@@ -159,10 +172,10 @@ def _update_result(self, task, result, state, traceback=None,
+                                      traceback=traceback, request=request,
+                                      format_date=False, encode=True)
+ 
+-        # Exclude the primary key id and task_id columns
+-        # as we should not set it None
++        # Exclude the primary key id, task_id, and children columns
++        # as we should not set it None or handle children separately
+         columns = [column.name for column in self.task_cls.__table__.columns
+-                   if column.name not in {'id', 'task_id'}]
++                   if column.name not in {'id', 'task_id', 'children'}]
+ 
+         # Iterate through the columns name of the table
+         # to set the value from meta.
+@@ -171,12 +184,18 @@ def _update_result(self, task, result, state, traceback=None,
+             value = meta.get(column)
+             setattr(task, column, value)
+ 
++        if hasattr(task, 'children') and 'children' in self.task_cls.__table__.columns:
++            children = meta.get('children')
++            if children:
++                setattr(task, 'children', ensure_bytes(self.encode(children)))
++            else:
++                setattr(task, 'children', None)
++
+     def _get_task_meta_for(self, task_id):
+         """Get task meta-data for a task by id."""
+         session = self.ResultSession()
+         with session_cleanup(session):
+-            task = list(session.query(self.task_cls).filter(self.task_cls.task_id == task_id))
+-            task = task and task[0]
++            task = self._query_task(session, task_id)
+             if not task:
+                 task = self.task_cls(task_id)
+                 task.status = states.PENDING
+@@ -187,6 +206,8 @@ def _get_task_meta_for(self, task_id):
+                 data['args'] = self.decode(data['args'])
+             if data.get('kwargs', None) is not None:
+                 data['kwargs'] = self.decode(data['kwargs'])
++            if data.get('children', None) is not None:
++                data['children'] = self.decode(data['children'])
+             return self.meta_from_decoded(data)
+ 
+     def _decode_stored_result(self, payload):
+diff --git a/celery/backends/database/models.py b/celery/backends/database/models.py
+index 56fa9054883..4bcf90ef8dd 100644
+--- a/celery/backends/database/models.py
++++ b/celery/backends/database/models.py
+@@ -37,17 +37,23 @@ class Task(ResultModelBase):
+     date_done = sa.Column(sa.DateTime, default=_get_utc_now,
+                           onupdate=_get_utc_now, nullable=True, index=True)
+     traceback = sa.Column(sa.Text, nullable=True)
++    children = sa.Column(sa.LargeBinary, nullable=True)
+ 
+     def __init__(self, task_id):
+         self.task_id = task_id
+ 
+     def to_dict(self):
++        try:
++            children = self.children
++        except Exception:
++            children = None
+         return {
+             'task_id': self.task_id,
+             'status': self.status,
+             'result': self.result,
+             'traceback': self.traceback,
+             'date_done': self.date_done,
++            'children': children,
+         }
+ 
+     def __repr__(self):
+diff --git a/celery/backends/database/session.py b/celery/backends/database/session.py
+index 0aeceb86466..3fb1d77b77b 100644
+--- a/celery/backends/database/session.py
++++ b/celery/backends/database/session.py
+@@ -2,11 +2,12 @@
+ import time
+ 
+ from kombu.utils.compat import register_after_fork
+-from sqlalchemy import create_engine
++from sqlalchemy import create_engine, inspect, text
+ from sqlalchemy.exc import DatabaseError
+ from sqlalchemy.orm import sessionmaker
+ from sqlalchemy.pool import NullPool
+ 
++from celery.utils.log import get_logger
+ from celery.utils.time import get_exponential_backoff_interval
+ 
+ try:
+@@ -21,6 +22,8 @@
+ 
+ PREPARE_MODELS_MAX_RETRIES = 10
+ 
++logger = get_logger(__name__)
++
+ 
+ def _after_fork_cleanup_session(session):
+     session._after_fork()
+@@ -98,8 +101,40 @@ def prepare_models(self, engine):
+                         raise
+                 else:
+                     break
++            self._migrate_missing_columns(engine)
+             self.prepared = True
+ 
++    def _migrate_missing_columns(self, engine):
++        """Add missing nullable columns to existing tables if needed."""
++        try:
++            inspector = inspect(engine)
++            preparer = engine.dialect.identifier_preparer
++            for table in ResultModelBase.metadata.tables.values():
++                actual_name = table.name
++                schema = table.schema
++                if not inspector.has_table(actual_name, schema=schema):
++                    continue
++                existing_cols = {
++                    col['name'] for col in inspector.get_columns(actual_name, schema=schema)
++                }
++                for col in table.columns:
++                    if col.name not in existing_cols and col.nullable:
++                        col_type = col.type.compile(engine.dialect)
++                        table_name = preparer.format_table(table)
++                        col_name = preparer.quote_identifier(col.name)
++                        alter_stmt = f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"
++                        try:
++                            with engine.begin() as conn:
++                                conn.execute(text(alter_stmt))
++                        except Exception as exc:
++                            logger.warning(
++                                "Failed to add missing column %r to table %r. "
++                                "To enable storing task children, execute: %s. Error: %s",
++                                col.name, actual_name, alter_stmt, exc,
++                            )
++        except Exception as exc:
++            logger.warning("Failed to inspect or migrate database tables: %s", exc)
++
+     def session_factory(self, dburi, **kwargs):
+         engine, session = self.create_session(dburi, **kwargs)
+         self.prepare_models(engine)
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index 107e86d4f76..5c18241ae71 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -1298,6 +1298,19 @@ you to customize the table names:
+         'group': 'myapp_groupmeta',
+     }
+ 
++.. note::
++
++    Starting in Celery 5.7, the database result backend supports storing task
++    children in the ``children`` column of ``celery_taskmeta``.
++    Celery automatically attempts to add this missing column to existing tables
++    at startup. If your database user does not have DDL / ``ALTER TABLE`` permissions,
++    you can execute the migration manually:
++
++    .. code-block:: sql
++
++        ALTER TABLE celery_taskmeta ADD COLUMN children BLOB;  -- SQLite / MySQL
++        ALTER TABLE celery_taskmeta ADD COLUMN children BYTEA; -- PostgreSQL
++
+ .. setting:: database_engine_callback
+ 
+ ``database_engine_callback``
+diff --git a/t/unit/backends/test_database.py b/t/unit/backends/test_database.py
+index 7bf1b3f89f6..3c45aa3cd83 100644
+--- a/t/unit/backends/test_database.py
++++ b/t/unit/backends/test_database.py
+@@ -9,6 +9,7 @@
+ from celery import states, uuid
+ from celery.app.task import Context
+ from celery.exceptions import ImproperlyConfigured
++from celery.result import result_from_tuple
+ 
+ pytest.importorskip('sqlalchemy')
+ 
+@@ -593,6 +594,165 @@ def test_result_decode_does_not_unpickle_non_pickle_garbage(self):
+         with pytest.raises(Exception):
+             tb.get_task_meta(tid)
+ 
++    @pytest.mark.parametrize(
++        'result_serializer',
++        ['pickle', 'json'],
++        ids=['using pickle', 'using json']
++    )
++    def test_store_result_with_children(self, result_serializer):
++        self.app.conf.result_serializer = result_serializer
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tid = uuid()
++        child1 = self.app.AsyncResult(uuid())
++        child2 = self.app.AsyncResult(uuid())
++
++        request = Context()
++        request.children.extend([child1, child2])
++        tb.store_result(tid, 42, states.SUCCESS, request=request)
++        meta = tb.get_task_meta(tid)
++
++        assert meta['result'] == 42
++        assert len(meta['children']) == 2
++        deserialized = [result_from_tuple(c, self.app) for c in meta['children']]
++        assert [c.id for c in deserialized] == [child1.id, child2.id]
++
++    def test_async_result_children(self):
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tid = uuid()
++        child_id = uuid()
++        child = self.app.AsyncResult(child_id)
++
++        request = Context()
++        request.children.append(child)
++        tb.store_result(tid, 42, states.SUCCESS, request=request)
++
++        result = self.app.AsyncResult(tid, backend=tb)
++        children = result.children
++        assert children is not None
++        assert len(children) == 1
++        assert children[0].id == child_id
++
++    def test_store_result_no_children(self):
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tid = uuid()
++        tb.store_result(tid, 42, states.SUCCESS)
++        meta = tb.get_task_meta(tid)
++        assert meta['children'] is None
++        result = self.app.AsyncResult(tid)
++        assert result.children is None
++
++    def test_migrate_missing_columns(self):
++        import sqlalchemy as sa
++        engine = sa.create_engine('sqlite:///:memory:')
++        metadata = sa.MetaData()
++        sa.Table(
++            'celery_taskmeta', metadata,
++            sa.Column('id', sa.Integer, primary_key=True),
++            sa.Column('task_id', sa.String(155), unique=True),
++            sa.Column('status', sa.String(50)),
++            sa.Column('result', sa.LargeBinary, nullable=True),
++            sa.Column('date_done', sa.DateTime, nullable=True),
++            sa.Column('traceback', sa.Text, nullable=True),
++        )
++        metadata.create_all(engine)
++
++        session_mgr = SessionManager()
++        session_mgr.prepare_models(engine)
++
++        from sqlalchemy import inspect
++        inspector = inspect(engine)
++        cols = {c['name'] for c in inspector.get_columns('celery_taskmeta')}
++        assert 'children' in cols
++
++    def test_store_result_task_without_children_attribute(self):
++        tb = DatabaseBackend(self.uri, app=self.app)
++
++        class TaskWithoutChildren:
++            pass
++
++        dummy = TaskWithoutChildren()
++        tb._update_result(dummy, 42, states.SUCCESS)
++        assert not hasattr(dummy, 'children')
++
++    def test_migrate_missing_columns_failure_logs_warning_and_degrades_gracefully(self):
++        import sqlalchemy as sa
++        engine = sa.create_engine('sqlite:///:memory:')
++        metadata = sa.MetaData()
++        sa.Table(
++            'celery_taskmeta', metadata,
++            sa.Column('id', sa.Integer, primary_key=True),
++            sa.Column('task_id', sa.String(155), unique=True),
++            sa.Column('status', sa.String(50)),
++            sa.Column('result', sa.LargeBinary, nullable=True),
++            sa.Column('date_done', sa.DateTime, nullable=True),
++            sa.Column('traceback', sa.Text, nullable=True),
++        ).create(engine)
++
++        session_mgr = SessionManager()
++        failing_conn = Mock()
++        failing_conn.execute.side_effect = Exception("permission denied: ALTER TABLE")
++
++        class FailingBegin:
++            def __enter__(self):
++                return failing_conn
++
++            def __exit__(self, *args):
++                pass
++
++        with patch.object(engine, 'begin', return_value=FailingBegin()):
++            with patch('celery.backends.database.session.logger.warning') as mock_warn:
++                session_mgr.prepare_models(engine)
++                assert mock_warn.called
++                logged_msg = mock_warn.call_args[0][0]
++                assert "Failed to add missing column" in logged_msg
++
++        # Test backend tolerant read path on this database:
++        tb = DatabaseBackend('sqlite:///:memory:', app=self.app)
++        with engine.begin() as conn:
++            conn.execute(sa.text(
++                "INSERT INTO celery_taskmeta (task_id, status, result) VALUES ('test-tid', 'SUCCESS', :res)"
++            ), {'res': tb.encode(42)})
++
++        tb.session_manager.session_factory = lambda *a, **kw: sa.orm.sessionmaker(bind=engine)()
++        meta = tb.get_task_meta('test-tid')
++        assert meta['result'] == 42
++        assert meta['children'] is None
++
++    def test_query_task_fallback_on_operational_error(self):
++        tb = DatabaseBackend(self.uri, app=self.app)
++        tid = uuid()
++        session = Mock()
++
++        # Simulate first query failing with 'no such column: celery_taskmeta.children'
++        from sqlalchemy.exc import DatabaseError
++        err = DatabaseError("SELECT", {}, Exception("no such column: celery_taskmeta.children"))
++        query_mock = Mock()
++        query_mock.filter.side_effect = [err, [Mock(task_id=tid, to_dict=lambda: {'task_id': tid})]]
++        query_mock.options.return_value = query_mock
++        session.query.return_value = query_mock
++
++        res = tb._query_task(session, tid)
++        assert res.task_id == tid
++        assert query_mock.options.called
++
++    def test_migrate_missing_columns_ignores_exceptions(self):
++        session_mgr = SessionManager()
++        mock_engine = Mock()
++        with patch('celery.backends.database.session.inspect', side_effect=Exception("inspect error")):
++            with patch('celery.backends.database.session.logger.warning') as mock_warn:
++                # Must not raise and must log warning
++                session_mgr._migrate_missing_columns(mock_engine)
++                assert mock_warn.called
++
++    def test_migrate_missing_columns_when_table_not_exists(self):
++        session_mgr = SessionManager()
++        mock_engine = Mock()
++        mock_inspector = Mock()
++        mock_inspector.has_table.return_value = False
++        with patch('celery.backends.database.session.inspect', return_value=mock_inspector):
++            session_mgr._migrate_missing_columns(mock_engine)
++        mock_inspector.get_columns.assert_not_called()
++
+     def test_mark_as_started(self):
+         tb = DatabaseBackend(self.uri, app=self.app)
+         tid = uuid()

@@ -1,0 +1,230 @@
+diff --git a/changelog/fix_source_file_truncation_on_interrupted_autocorrect_20260916113654.md b/changelog/fix_source_file_truncation_on_interrupted_autocorrect_20260916113654.md
+new file mode 100644
+index 000000000000..4288733b21f5
+--- /dev/null
++++ b/changelog/fix_source_file_truncation_on_interrupted_autocorrect_20260916113654.md
+@@ -0,0 +1 @@
++* [#15720](https://github.com/rubocop/rubocop/issues/15720): Fix `rubocop -a` leaving the file empty when interrupted while writing the corrected source, by writing to a temporary file in the same directory and renaming it over the original. ([@koic][])
+diff --git a/lib/rubocop/cop/team.rb b/lib/rubocop/cop/team.rb
+index 7c1745b62dcb..7e41624e654e 100644
+--- a/lib/rubocop/cop/team.rb
++++ b/lib/rubocop/cop/team.rb
+@@ -178,7 +178,7 @@ def apply_correction(processed_source, new_source)
+         elsif defer_corrections
+           @updated_source = new_source
+         else
+-          File.write(processed_source.file_path, new_source)
++          RuboCop::Util.replace_file_contents(processed_source.file_path, new_source)
+         end
+       end
+ 
+diff --git a/lib/rubocop/runner.rb b/lib/rubocop/runner.rb
+index b94e1a922125..a113fb62df9f 100644
+--- a/lib/rubocop/runner.rb
++++ b/lib/rubocop/runner.rb
+@@ -446,7 +446,7 @@ def finalize_corrections(file, original_source, corrected_source)
+       if @options[:diff]
+         record_diff(file, original_source, corrected_source)
+       elsif corrected_source
+-        File.write(file, corrected_source)
++        Util.replace_file_contents(file, corrected_source)
+       end
+     end
+ 
+diff --git a/lib/rubocop/util.rb b/lib/rubocop/util.rb
+index e33b5f6cc721..be45eb8c4043 100644
+--- a/lib/rubocop/util.rb
++++ b/lib/rubocop/util.rb
+@@ -12,5 +12,63 @@ def self.silence_warnings
+     ensure
+       $VERBOSE = old_verbose
+     end
++
++    # Replaces the contents of `path` without a window in which the file is truncated
++    # but not yet rewritten, so that an interrupted run or a full disk cannot lose
++    # the original: the new contents are written next to the file and renamed over it,
++    # like `ResultCache#save`. `File.write` is used for the temporary file so text-mode
++    # semantics (the CRLF conversion on Windows) stay identical to a direct write.
++    # Where the temporary file cannot be created or renamed for lack of permission,
++    # a direct write is used as before.
++    def self.replace_file_contents(path, contents)
++      # Write through symlinks so that the rename replaces the real file and
++      # the symlink survives.
++      path = File.realpath(path)
++
++      # Opening a read-only file fails without truncating it, keeping the behavior
++      # a direct write always had.
++      return File.write(path, contents) unless File.writable?(path)
++
++      temp_path = "#{path}.#{Process.pid}.#{rand(1_000_000_000)}.rubocop.tmp"
++      begin
++        replace_via_temporary_file(path, temp_path, contents)
++      ensure
++        FileUtils.rm_f(temp_path)
++      end
++    rescue Errno::ENOENT
++      # The file vanished mid-run or is a dangling symlink: recreate it the way
++      # a direct write always has.
++      File.write(path, contents)
++    end
++
++    def self.replace_via_temporary_file(path, temp_path, contents)
++      # The directory refuses new files even though the file itself is writable,
++      # so a direct write is the only option left.
++      return File.write(path, contents) unless write_temporary_file(temp_path, contents)
++
++      begin
++        # A fresh file would get umask-default permissions on rename;
++        # keep the original's.
++        File.chmod(File.stat(path).mode, temp_path)
++        File.rename(temp_path, path)
++      rescue SystemCallError
++        # The replacement was refused, e.g. the file is open in another process on Windows.
++        # The contents already fit on disk, so a direct write is safe once the temporary copy
++        # no longer takes up that space.
++        FileUtils.rm_f(temp_path)
++        File.write(path, contents)
++      end
++    end
++    private_class_method :replace_via_temporary_file
++
++    # Space errors such as `ENOSPC` must propagate: a direct write would then
++    # truncate the file and fail, which is exactly the loss being avoided.
++    def self.write_temporary_file(temp_path, contents)
++      File.write(temp_path, contents)
++      true
++    rescue Errno::EACCES, Errno::EPERM
++      false
++    end
++    private_class_method :write_temporary_file
+   end
+ end
+diff --git a/spec/rubocop/cli/autocorrect_spec.rb b/spec/rubocop/cli/autocorrect_spec.rb
+index 5d4d4a034339..3caad1940f6d 100644
+--- a/spec/rubocop/cli/autocorrect_spec.rb
++++ b/spec/rubocop/cli/autocorrect_spec.rb
+@@ -4865,4 +4865,15 @@ def with_ruby_extractor(ruby_extractor)
+       expect(File.binread('example.rb')).to start_with('# frozen_string_literal: true')
+     end
+   end
++
++  if RUBY_ENGINE == 'ruby' && !RuboCop::Platform.windows?
++    it 'preserves the file permissions when autocorrecting' do
++      create_file('example.rb', 'do_something( 1 )')
++      File.chmod(0o755, 'example.rb')
++
++      expect(cli.run(['--autocorrect', '--only', 'Layout/SpaceInsideParens'])).to eq(0)
++      expect(File.read('example.rb')).to eq("do_something(1)\n")
++      expect(File.stat('example.rb').mode & 0o777).to eq(0o755)
++    end
++  end
+ end
+diff --git a/spec/rubocop/runner_spec.rb b/spec/rubocop/runner_spec.rb
+index f29bdedd8aed..b4ec1f35c08a 100644
+--- a/spec/rubocop/runner_spec.rb
++++ b/spec/rubocop/runner_spec.rb
+@@ -339,8 +339,8 @@ def INVALID_CODE; end
+           let(:third_fragment) { '"third"' }
+ 
+           it 'applies all corrections with a single write' do
+-            allow(File).to receive(:write).and_call_original
+-            expect(File).to receive(:write)
++            allow(RuboCop::Util).to receive(:replace_file_contents).and_call_original
++            expect(RuboCop::Util).to receive(:replace_file_contents)
+               .with(a_string_matching(/example\.rb\z/), anything)
+               .once
+               .and_call_original
+diff --git a/spec/rubocop/util_spec.rb b/spec/rubocop/util_spec.rb
+new file mode 100644
+index 000000000000..99795135bc84
+--- /dev/null
++++ b/spec/rubocop/util_spec.rb
+@@ -0,0 +1,88 @@
++# frozen_string_literal: true
++
++RSpec.describe RuboCop::Util, :isolated_environment do
++  include FileHelper
++
++  describe '.replace_file_contents' do
++    let(:path) { 'example.rb' }
++
++    before { create_file(path, 'original') }
++
++    it 'replaces the contents of the file' do
++      described_class.replace_file_contents(path, 'replaced')
++
++      expect(File.read(path)).to eq('replaced')
++    end
++
++    it 'leaves no temporary file behind' do
++      described_class.replace_file_contents(path, 'replaced')
++
++      expect(Dir.glob('*')).to eq([path])
++    end
++
++    it 'creates the file when it does not exist' do
++      described_class.replace_file_contents('missing.rb', 'created')
++
++      expect(File.read('missing.rb')).to eq('created')
++    end
++
++    it 'keeps the original contents and raises when the disk is full while writing the temporary file' do
++      allow(File).to receive(:write).and_raise(Errno::ENOSPC)
++
++      expect do
++        described_class.replace_file_contents(path, 'replaced')
++      end.to raise_error(Errno::ENOSPC)
++      expect(File.read(path)).to eq("original\n")
++      expect(Dir.glob('*')).to eq([path])
++    end
++
++    it 'falls back to a direct write when the temporary file cannot be created' do
++      allow(File).to receive(:write).and_call_original
++      allow(File).to receive(:write).with(
++        a_string_ending_with('.rubocop.tmp'), anything
++      ).and_raise(Errno::EACCES)
++
++      described_class.replace_file_contents(path, 'replaced')
++
++      expect(File.read(path)).to eq('replaced')
++      expect(Dir.glob('*')).to eq([path])
++    end
++
++    it 'falls back to a direct write when the rename fails' do
++      allow(File).to receive(:rename).and_raise(Errno::EACCES)
++
++      described_class.replace_file_contents(path, 'replaced')
++
++      expect(File.read(path)).to eq('replaced')
++      expect(Dir.glob('*')).to eq([path])
++    end
++
++    if RUBY_ENGINE == 'ruby' && !RuboCop::Platform.windows?
++      it 'preserves the file permissions' do
++        File.chmod(0o600, path)
++
++        described_class.replace_file_contents(path, 'replaced')
++
++        expect(File.stat(path).mode & 0o777).to eq(0o600)
++      end
++
++      it 'rewrites the target of a symlink and keeps the symlink' do
++        File.symlink(path, 'link.rb')
++
++        described_class.replace_file_contents('link.rb', 'replaced')
++
++        expect(File).to be_symlink('link.rb')
++        expect(File.read(path)).to eq('replaced')
++      end
++
++      it 'raises without truncating when the file is read-only', unless: Process.uid.zero? do
++        File.chmod(0o444, path)
++
++        expect do
++          described_class.replace_file_contents(path, 'replaced')
++        end.to raise_error(Errno::EACCES)
++        expect(File.read(path)).to eq("original\n")
++      end
++    end
++  end
++end

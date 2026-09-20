@@ -1,0 +1,654 @@
+diff --git a/release-notes/CREDITS b/release-notes/CREDITS
+index 7effdbf2cd..5c94197b6a 100644
+--- a/release-notes/CREDITS
++++ b/release-notes/CREDITS
+@@ -723,6 +723,8 @@ Burak KALAYCI (@kalayciburak)
+   [3.3.0]
+  * Fixed #6187: Make `InvokerHolder` access in `AnnotatedConstructor` lazy
+   [3.3.0]
++ * Fixed #6198: Make `InvokerHolder` access in `AnnotatedMethod` lazy
++  [3.3.0]
+ 
+ @laech
+  * Reported #6178: `JsonFormat.Feature.ACCEPT_CASE_INSENSITIVE_VALUES` does not work
+diff --git a/release-notes/VERSION b/release-notes/VERSION
+index 9d5a6c7061..35dedff6c2 100644
+--- a/release-notes/VERSION
++++ b/release-notes/VERSION
+@@ -56,6 +56,9 @@ Versions: 3.x (for earlier see VERSION-2.x)
+ #6187: Make `InvokerHolder` access in `AnnotatedConstructor` lazy
+  (requested by @cowtowncoder)
+  (fix by @kalayciburak)
++#6198: Make `InvokerHolder` access in `AnnotatedMethod` lazy
++ (requested by @cowtowncoder)
++ (fix by @kalayciburak)
+ #6188: `ThrowableDeserializer` does not resolve standard `Throwable` property
+   names against `PropertyNamingStrategy`
+  (fix by @cowtowncoder, w/ Claude code)
+diff --git a/src/main/java/tools/jackson/databind/deser/impl/MethodProperty.java b/src/main/java/tools/jackson/databind/deser/impl/MethodProperty.java
+index 4d8f4b78c9..bee0eb4a37 100644
+--- a/src/main/java/tools/jackson/databind/deser/impl/MethodProperty.java
++++ b/src/main/java/tools/jackson/databind/deser/impl/MethodProperty.java
+@@ -14,7 +14,6 @@
+ import tools.jackson.databind.introspect.*;
+ import tools.jackson.databind.jsontype.TypeDeserializer;
+ import tools.jackson.databind.util.Annotations;
+-import tools.jackson.databind.util.internal.UnreflectHandleSupplier;
+ 
+ import static java.lang.invoke.MethodType.methodType;
+ 
+@@ -26,16 +25,24 @@
+ public final class MethodProperty
+     extends SettableBeanProperty
+ {
++    // @since 3.3
++    private static final MethodType SETTER_TYPE = methodType(void.class, Object.class, Object.class);
++    // @since 3.3
++    private static final MethodType SETTER_RETURN_TYPE = methodType(Object.class, Object.class, Object.class);
++
+     protected final AnnotatedMember _annotated;
+ 
+     /**
+-     * Setter MethodHandle holder for modifying property value.
++     * Lazily resolved setter handle for modifying property value;
++     * {@code volatile} so a racy first use is safely published (duplicate
++     * resolution is harmless, handles are equivalent).
+      */
+-    protected final SetterHolder _setter = new SetterHolder(methodType(void.class, Object.class, Object.class));
++    protected volatile MethodHandle _setter;
+     /**
+-     * Setter MethodHandle holder for modifying property value and returning the modified bean.
++     * Lazily resolved setter handle for modifying property value and returning
++     * the modified bean; resolved same way as {@link #_setter}.
+      */
+-    protected final SetterHolder _setterReturn = new SetterHolder(methodType(Object.class, Object.class, Object.class));
++    protected volatile MethodHandle _setterReturn;
+ 
+     protected final boolean _skipNulls;
+ 
+@@ -52,12 +59,17 @@ protected MethodProperty(MethodProperty src, ValueDeserializer<?> deser,
+             NullValueProvider nva) {
+         super(src, deser, nva);
+         _annotated = src._annotated;
++        // same setter, so share handles already resolved (if any)
++        _setter = src._setter;
++        _setterReturn = src._setterReturn;
+         _skipNulls = NullsConstantProvider.isSkipper(nva);
+     }
+ 
+     protected MethodProperty(MethodProperty src, PropertyName newName) {
+         super(src, newName);
+         _annotated = src._annotated;
++        _setter = src._setter;
++        _setterReturn = src._setterReturn;
+         _skipNulls = src._skipNulls;
+     }
+ 
+@@ -129,7 +141,7 @@ public void deserializeAndSet(JsonParser p, DeserializationContext ctxt,
+             value = _valueDeserializer.deserializeWithType(p, ctxt, _valueTypeDeserializer);
+         }
+         try {
+-            _setter.get().invokeExact(instance, value);
++            _setterHandle().invokeExact(instance, value);
+         } catch (Throwable e) {
+             _throwAsJacksonE(p, e, value);
+         }
+@@ -137,7 +149,7 @@ public void deserializeAndSet(JsonParser p, DeserializationContext ctxt,
+ 
+     @Override
+     public Object deserializeSetAndReturn(JsonParser p,
+-    		DeserializationContext ctxt, Object instance) throws JacksonException
++            DeserializationContext ctxt, Object instance) throws JacksonException
+     {
+         Object value;
+         if (p.hasToken(JsonToken.VALUE_NULL)) {
+@@ -158,7 +170,7 @@ public Object deserializeSetAndReturn(JsonParser p,
+             value = _valueDeserializer.deserializeWithType(p, ctxt, _valueTypeDeserializer);
+         }
+         try {
+-            Object result = _setterReturn.get().invokeExact(instance, value);
++            Object result = _setterReturnHandle().invokeExact(instance, value);
+             return (result == null) ? instance : result;
+         } catch (Throwable e) {
+             _throwAsJacksonE(p, e, value);
+@@ -176,7 +188,7 @@ public final void set(DeserializationContext ctxt, Object instance, Object value
+             }
+         }
+         try {
+-            _setter.get().invokeExact(instance, value);
++            _setterHandle().invokeExact(instance, value);
+         } catch (Throwable e) {
+             _throwAsJacksonE(ctxt.getParser(), e, value);
+         }
+@@ -192,7 +204,7 @@ public Object setAndReturn(DeserializationContext ctxt,
+             }
+         }
+         try {
+-            Object result = _setterReturn.get().invokeExact(instance, value);
++            Object result = _setterReturnHandle().invokeExact(instance, value);
+             return (result == null) ? instance : result;
+         } catch (Throwable e) {
+             _throwAsJacksonE(ctxt.getParser(), e, value);
+@@ -200,21 +212,39 @@ public Object setAndReturn(DeserializationContext ctxt,
+         }
+     }
+ 
+-    class SetterHolder extends UnreflectHandleSupplier {
+-        SetterHolder(MethodType asType) {
+-            super(asType);
++    // @since 3.3
++    private MethodHandle _setterHandle() throws IllegalAccessException {
++        MethodHandle h = _setter;
++        if (h == null) {
++            h = _unreflectSetter().asType(SETTER_TYPE);
++            _setter = h;
+         }
++        return h;
++    }
+ 
+-        @Override
+-        protected MethodHandle unreflect() throws IllegalAccessException {
+-            if (_annotated instanceof AnnotatedMethod am) {
+-                return MethodHandles.lookup().unreflect(am.getAnnotated())
+-                        // [databind#5231] If it's varargs, disable varargs handling, 2025-July-25 (Since 3.0)
+-                        .asFixedArity();
+-            } else {
+-                AnnotatedField af = (AnnotatedField) _annotated;
+-                return MethodHandles.lookup().unreflectSetter(af.getAnnotated());
+-            }
++    // @since 3.3
++    private MethodHandle _setterReturnHandle() throws IllegalAccessException {
++        MethodHandle h = _setterReturn;
++        if (h == null) {
++            h = _unreflectSetter().asType(SETTER_RETURN_TYPE);
++            _setterReturn = h;
++        }
++        return h;
++    }
++
++    /*
++     * Note: resolved lazily, on first use, since access to non-public members
++     * is only enabled by {@link #fixAccess} which is called after construction.
++     *
++     * @since 3.3
++     */
++    private MethodHandle _unreflectSetter() throws IllegalAccessException {
++        if (_annotated instanceof AnnotatedMethod am) {
++            return MethodHandles.lookup().unreflect(am.getAnnotated())
++                    // [databind#5231] If it's varargs, disable varargs handling, 2025-July-25 (Since 3.0)
++                    .asFixedArity();
+         }
++        AnnotatedField af = (AnnotatedField) _annotated;
++        return MethodHandles.lookup().unreflectSetter(af.getAnnotated());
+     }
+ }
+diff --git a/src/main/java/tools/jackson/databind/introspect/AnnotatedConstructor.java b/src/main/java/tools/jackson/databind/introspect/AnnotatedConstructor.java
+index 6343b17347..c57bf9a621 100644
+--- a/src/main/java/tools/jackson/databind/introspect/AnnotatedConstructor.java
++++ b/src/main/java/tools/jackson/databind/introspect/AnnotatedConstructor.java
+@@ -2,6 +2,7 @@
+ 
+ import java.lang.invoke.MethodHandle;
+ import java.lang.invoke.MethodHandles;
++import java.lang.invoke.MethodType;
+ import java.lang.reflect.Constructor;
+ import java.lang.reflect.Member;
+ import java.lang.reflect.Parameter;
+@@ -16,6 +17,10 @@
+ public final class AnnotatedConstructor
+     extends AnnotatedWithParams
+ {
++    // Invocation types for the arity-specific handles; constant so no per-use lookup
++    private static final MethodType INVOKER_NULLARY_TYPE = methodType(Object.class);
++    private static final MethodType INVOKER_UNARY_TYPE = methodType(Object.class, Object.class);
++
+     protected final Constructor<?> _constructor;
+ 
+     /**
+@@ -144,7 +149,7 @@ public final Object call1(Object arg) throws Exception {
+     private MethodHandle invokerNullary() throws IllegalAccessException {
+         MethodHandle h = _invokerNullary;
+         if (h == null) {
+-            h = unreflect().asType(methodType(Object.class));
++            h = unreflect().asType(INVOKER_NULLARY_TYPE);
+             _invokerNullary = h;
+         }
+         return h;
+@@ -153,7 +158,7 @@ private MethodHandle invokerNullary() throws IllegalAccessException {
+     private MethodHandle invokerUnary() throws IllegalAccessException {
+         MethodHandle h = _invokerUnary;
+         if (h == null) {
+-            h = unreflect().asType(methodType(Object.class, Object.class));
++            h = unreflect().asType(INVOKER_UNARY_TYPE);
+             _invokerUnary = h;
+         }
+         return h;
+diff --git a/src/main/java/tools/jackson/databind/introspect/AnnotatedMethod.java b/src/main/java/tools/jackson/databind/introspect/AnnotatedMethod.java
+index f9bf260275..91268f0bc6 100644
+--- a/src/main/java/tools/jackson/databind/introspect/AnnotatedMethod.java
++++ b/src/main/java/tools/jackson/databind/introspect/AnnotatedMethod.java
+@@ -12,7 +12,6 @@
+ 
+ import tools.jackson.databind.JavaType;
+ import tools.jackson.databind.util.ClassUtil;
+-import tools.jackson.databind.util.internal.UnreflectHandleSupplier;
+ 
+ import static java.lang.invoke.MethodType.methodType;
+ 
+@@ -21,10 +20,20 @@
+ public final class AnnotatedMethod
+     extends AnnotatedWithParams
+ {
++    // Invocation types for the arity-specific handles; constant so no per-use lookup
++    private static final MethodType INVOKER_NULLARY_TYPE = methodType(Object.class);
++    private static final MethodType INVOKER_UNARY_TYPE = methodType(Object.class, Object.class);
++
+     final protected transient Method _method;
+-    final protected MethodHolder _invokerFixedArity = new MethodHolder(null);
+-    final protected MethodHolder _invokerNullary = new MethodHolder(methodType(Object.class));
+-    final protected MethodHolder _invokerUnary = new MethodHolder(methodType(Object.class, Object.class));
++
++    /**
++     * Lazily resolved invocation handles, one per arity we support;
++     * {@code volatile} so a racy first use is safely published (duplicate
++     * resolution is harmless, handles are equivalent).
++     */
++    protected volatile MethodHandle _invokerFixedArity;
++    protected volatile MethodHandle _invokerNullary;
++    protected volatile MethodHandle _invokerUnary;
+ 
+     // // Simple lazy-caching:
+ 
+@@ -93,7 +102,7 @@ public Class<?> getRawType() {
+     @Override
+     public final Object call() throws Exception {
+         try {
+-            return _invokerNullary.get().invokeExact();
++            return invokerNullary().invokeExact();
+         } catch (final Throwable e) {
+             throw sneakyThrow(e);
+         }
+@@ -102,7 +111,7 @@ public final Object call() throws Exception {
+     @Override
+     public final Object call(Object[] args) throws Exception {
+         try {
+-            return _invokerFixedArity.get().invokeWithArguments(args);
++            return invokerFixedArity().invokeWithArguments(args);
+         } catch (final Throwable e) {
+             throw sneakyThrow(e);
+         }
+@@ -111,7 +120,7 @@ public final Object call(Object[] args) throws Exception {
+     @Override
+     public final Object call1(Object arg) throws Exception {
+         try {
+-            return _invokerUnary.get().invokeExact(arg);
++            return invokerUnary().invokeExact(arg);
+         } catch (final Throwable e) {
+             throw sneakyThrow(e);
+         }
+@@ -119,7 +128,7 @@ public final Object call1(Object arg) throws Exception {
+ 
+     public final Object callOn(Object pojo) throws Exception {
+         try {
+-            return _invokerUnary.get().invokeExact(pojo);
++            return invokerUnary().invokeExact(pojo);
+         } catch (Throwable e) {
+             throw sneakyThrow(e);
+         }
+@@ -127,7 +136,7 @@ public final Object callOn(Object pojo) throws Exception {
+ 
+     public final Object callOnWith(Object pojo, Object... args) throws Exception {
+         try {
+-            MethodHandle invoker = _invokerFixedArity.get();
++            MethodHandle invoker = invokerFixedArity();
+             if (!Modifier.isStatic(_method.getModifiers())) {
+                 invoker = invoker.bindTo(pojo);
+             }
+@@ -137,6 +146,41 @@ public final Object callOnWith(Object pojo, Object... args) throws Exception {
+         }
+     }
+ 
++    private MethodHandle invokerNullary() throws IllegalAccessException {
++        MethodHandle h = _invokerNullary;
++        if (h == null) {
++            h = unreflect().asType(INVOKER_NULLARY_TYPE);
++            _invokerNullary = h;
++        }
++        return h;
++    }
++
++    private MethodHandle invokerUnary() throws IllegalAccessException {
++        MethodHandle h = _invokerUnary;
++        if (h == null) {
++            h = unreflect().asType(INVOKER_UNARY_TYPE);
++            _invokerUnary = h;
++        }
++        return h;
++    }
++
++    private MethodHandle invokerFixedArity() throws IllegalAccessException {
++        MethodHandle h = _invokerFixedArity;
++        if (h == null) {
++            h = unreflect().asFixedArity();
++            _invokerFixedArity = h;
++        }
++        return h;
++    }
++
++    /**
++     * Note: caller is expected to have called {@code ClassUtil.checkAndFixAccess()}
++     * already; access checks are suppressed for an accessible {@link Method}.
++     */
++    private MethodHandle unreflect() throws IllegalAccessException {
++        return MethodHandles.lookup().unreflect(_method);
++    }
++
+     /*
+     /**********************************************************************
+     /* AnnotatedMember impl
+@@ -255,15 +299,4 @@ public boolean equals(Object o) {
+         AnnotatedMethod other = (AnnotatedMethod) o;
+         return Objects.equals(_method, other._method);
+     }
+-
+-    class MethodHolder extends UnreflectHandleSupplier {
+-        MethodHolder(MethodType asType) {
+-            super(asType);
+-        }
+-
+-        @Override
+-        protected MethodHandle unreflect() throws IllegalAccessException {
+-            return MethodHandles.lookup().unreflect(_method);
+-        }
+-    }
+ }
+diff --git a/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java b/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java
+index f860fd8d2e..fabfbb48c2 100644
+--- a/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java
++++ b/src/main/java/tools/jackson/databind/ser/BeanPropertyWriter.java
+@@ -3,6 +3,7 @@
+ import java.lang.annotation.Annotation;
+ import java.lang.invoke.MethodHandle;
+ import java.lang.invoke.MethodHandles;
++import java.lang.invoke.MethodType;
+ import java.lang.reflect.Field;
+ import java.util.HashMap;
+ 
+@@ -26,7 +27,6 @@
+ import tools.jackson.databind.util.Annotations;
+ import tools.jackson.databind.util.ClassUtil;
+ import tools.jackson.databind.util.NameTransformer;
+-import tools.jackson.databind.util.internal.UnreflectHandleSupplier;
+ 
+ import static java.lang.invoke.MethodType.methodType;
+ 
+@@ -45,6 +45,8 @@
+ public class BeanPropertyWriter
+     extends PropertyWriter // which extends `ConcreteBeanPropertyBase`
+ {
++    private static final MethodType GETTER_TYPE = methodType(Object.class, Object.class);
++
+     /**
+      * Marker object used to indicate "do not serialize if empty"
+      */
+@@ -114,10 +116,12 @@ public class BeanPropertyWriter
+     protected final AnnotatedMember _member;
+ 
+     /**
+-     * Accessor method used to get property value.
+-     * Wrapped in a holder since MethodHandle is not serializable.
++     * Lazily resolved accessor handle used to get property value
++     * ({@code null} for virtual properties);
++     * {@code volatile} so a racy first use is safely published (duplicate
++     * resolution is harmless, handles are equivalent).
+      */
+-    protected final GetterHolder _accessor = new GetterHolder();
++    protected volatile MethodHandle _accessor;
+ 
+     /*
+     /**********************************************************************
+@@ -338,6 +342,7 @@ protected BeanPropertyWriter(BeanPropertyWriter base, PropertyName name) {
+         _declaredType = base._declaredType;
+ 
+         _member = base._member;
++        _accessor = base._accessor;
+ 
+         _serializer = base._serializer;
+         _nullSerializer = base._nullSerializer;
+@@ -363,6 +368,7 @@ protected BeanPropertyWriter(BeanPropertyWriter base, SerializedString name) {
+         _wrapperName = base._wrapperName;
+ 
+         _member = base._member;
++        _accessor = base._accessor;
+         _contextAnnotations = base._contextAnnotations;
+         _declaredType = base._declaredType;
+         _serializer = base._serializer;
+@@ -846,7 +852,7 @@ protected ValueSerializer<Object> _findAndAddDynamic(PropertySerializerMap map,
+      */
+     public final Object get(Object bean) throws Exception {
+         try {
+-            return _accessor.get().invokeExact(bean);
++            return _accessorHandle().invokeExact(bean);
+         } catch (Throwable e) {
+             throw sneakyThrow(e);
+         }
+@@ -940,22 +946,30 @@ public String toString() {
+         return sb.toString();
+     }
+ 
+-    class GetterHolder extends UnreflectHandleSupplier {
+-        public GetterHolder() {
+-            super(methodType(Object.class, Object.class));
++    private MethodHandle _accessorHandle() throws IllegalAccessException {
++        MethodHandle h = _accessor;
++        if (h == null) {
++            h = _unreflectAccessor();
++            _accessor = h;
+         }
++        return h;
++    }
+ 
+-        @Override
+-        protected MethodHandle unreflect() throws IllegalAccessException {
+-            if (_member instanceof AnnotatedField) {
+-                return MethodHandles.lookup().unreflectGetter((Field) _member.getMember());
+-            } else if (_member instanceof AnnotatedMethod method) {
+-                return MethodHandles.lookup().unreflect(method.getMember());
+-            } else {
+-                // 01-Dec-2014, tatu: Used to be illegal, but now explicitly allowed
+-                // for virtual props
+-                return null;
+-            }
++    /**
++     * Note: resolved lazily, on first use, since access to non-public members
++     * is only enabled by {@link #fixAccess} which is called after construction.
++     */
++    private MethodHandle _unreflectAccessor() throws IllegalAccessException {
++        MethodHandle h;
++        if (_member instanceof AnnotatedField) {
++            h = MethodHandles.lookup().unreflectGetter((Field) _member.getMember());
++        } else if (_member instanceof AnnotatedMethod method) {
++            h = MethodHandles.lookup().unreflect(method.getMember());
++        } else {
++            // 01-Dec-2014, tatu: Used to be illegal, but now explicitly allowed
++            // for virtual props
++            return null;
+         }
++        return h.asType(GETTER_TYPE);
+     }
+ }
+diff --git a/src/main/java/tools/jackson/databind/util/internal/UnreflectHandleSupplier.java b/src/main/java/tools/jackson/databind/util/internal/UnreflectHandleSupplier.java
+deleted file mode 100644
+index 06d82788dc..0000000000
+--- a/src/main/java/tools/jackson/databind/util/internal/UnreflectHandleSupplier.java
++++ /dev/null
+@@ -1,74 +0,0 @@
+-package tools.jackson.databind.util.internal;
+-
+-import java.lang.invoke.MethodHandle;
+-import java.lang.invoke.MethodType;
+-import java.util.function.Supplier;
+-
+-import tools.jackson.databind.util.ClassUtil;
+-
+-/**
+- * Lazy, memoized holder for a {@link MethodHandle} unreflected from a
+- * {@link java.lang.reflect.Member}.
+- *<p>
+- * Resolution is deferred until first actual use, for two reasons:
+- *<ul>
+- * <li>Access to non-public members is only enabled by
+- *   {@code ClassUtil.checkAndFixAccess()}, which callers apply via
+- *   {@code AnnotatedMember.fixAccess()} <i>after</i> the owning member has been
+- *   constructed. Unreflecting during construction could hence fail.
+- *   </li>
+- * <li>Many members are introspected but never actually invoked, so the handle
+- *   lookup is often avoidable altogether.
+- *   </li>
+- * </ul>
+- * The resolved handle is adapted once -- to the {@link MethodType} given to the
+- * constructor, or {@link MethodHandle#asFixedArity()} if that is {@code null} --
+- * and then memoized; resolution happens at most once per holder.
+- */
+-public abstract class UnreflectHandleSupplier implements Supplier<MethodHandle> {
+-    private final MethodType asType;
+-    private volatile MethodHandle cachedHandle;
+-
+-    public UnreflectHandleSupplier(MethodType asType) {
+-        this.asType = asType;
+-    }
+-
+-    @Override
+-    public MethodHandle get() {
+-        MethodHandle h = cachedHandle;
+-        if (h == null) {
+-            h = initialize();
+-        }
+-        return h;
+-    }
+-
+-    private synchronized MethodHandle initialize() {
+-        MethodHandle h = cachedHandle;
+-        if (h == null) {
+-            try {
+-                h = postprocess(unreflect());
+-            } catch (IllegalAccessException e) {
+-                throw ClassUtil.sneakyThrow(e);
+-            }
+-            cachedHandle = h;
+-        }
+-        return h;
+-    }
+-
+-    protected MethodHandle postprocess(MethodHandle mh) {
+-        if (mh == null) {
+-            return mh;
+-        }
+-        if (asType == null) {
+-            return mh.asFixedArity();
+-        }
+-        return mh.asType(asType);
+-    }
+-
+-    protected abstract MethodHandle unreflect() throws IllegalAccessException;
+-
+-    @Override
+-    public String toString() {
+-        return get().toString();
+-    }
+-}
+diff --git a/src/test/java/tools/jackson/databind/introspect/AnnotatedMemberEqualityTest.java b/src/test/java/tools/jackson/databind/introspect/AnnotatedMemberEqualityTest.java
+index 7ce938ae34..434e2dd30f 100644
+--- a/src/test/java/tools/jackson/databind/introspect/AnnotatedMemberEqualityTest.java
++++ b/src/test/java/tools/jackson/databind/introspect/AnnotatedMemberEqualityTest.java
+@@ -34,6 +34,12 @@ static class NoArgBean {
+         public NoArgBean() { }
+     }
+ 
++    static class FactoryBean {
++        public static FactoryBean create() {
++            return new FactoryBean();
++        }
++    }
++
+     private final ObjectMapper MAPPER = newJsonMapper();
+ 
+  // [databind#3187]
+@@ -123,6 +129,77 @@ public void annotatedConstructorNullaryCallBuildsOnlyNullaryInvoker() throws Exc
+         assertNull(constructor._invokerFixedArity);
+     }
+ 
++    // [databind#6198]
++    @Test
++    public void annotatedMethodDoesNotEagerlyConstructInvokers() {
++        DeserializationConfig context = MAPPER.deserializationConfig();
++        JavaType beanType = MAPPER.constructType(SomeBean.class);
++
++        AnnotatedClass instance = AnnotatedClassResolver.resolve(context, beanType, context);
++        AnnotatedMethod getter = instance.findMethod("getValue", new Class<?>[0]);
++        assertNotNull(getter);
++
++        assertNull(getter._invokerNullary);
++        assertNull(getter._invokerUnary);
++        assertNull(getter._invokerFixedArity);
++    }
++
++    // [databind#6198]
++    @Test
++    public void annotatedMethodCallOnBuildsOnlyUnaryInvoker() throws Exception {
++        DeserializationConfig context = MAPPER.deserializationConfig();
++        JavaType beanType = MAPPER.constructType(SomeBean.class);
++
++        AnnotatedClass instance = AnnotatedClassResolver.resolve(context, beanType, context);
++        AnnotatedMethod getter = instance.findMethod("getValue", new Class<?>[0]);
++        SomeBean bean = new SomeBean("x");
++
++        assertEquals("x", getter.callOn(bean));
++        assertNull(getter._invokerNullary);
++        assertNotNull(getter._invokerUnary);
++        assertNull(getter._invokerFixedArity);
++    }
++
++    // [databind#6198]
++    @Test
++    public void annotatedMethodCallOnWithBuildsOnlyFixedArityInvoker() throws Exception {
++        DeserializationConfig context = MAPPER.deserializationConfig();
++        JavaType beanType = MAPPER.constructType(SomeBean.class);
++
++        AnnotatedClass instance = AnnotatedClassResolver.resolve(context, beanType, context);
++        AnnotatedMethod setter = instance.findMethod("setValue", new Class<?>[] { String.class });
++        SomeBean bean = new SomeBean("old");
++
++        setter.callOnWith(bean, "new");
++        assertEquals("new", bean.getValue());
++        assertNull(setter._invokerNullary);
++        assertNull(setter._invokerUnary);
++        assertNotNull(setter._invokerFixedArity);
++    }
++
++    // [databind#6198]
++    @Test
++    public void annotatedMethodNullaryCallBuildsOnlyNullaryInvoker() throws Exception {
++        DeserializationConfig context = MAPPER.deserializationConfig();
++        JavaType beanType = MAPPER.constructType(FactoryBean.class);
++
++        AnnotatedClass instance = AnnotatedClassResolver.resolve(context, beanType, context);
++        AnnotatedMethod factory = null;
++        for (AnnotatedMethod m : instance.getFactoryMethods()) {
++            if ("create".equals(m.getName()) && m.getParameterCount() == 0) {
++                factory = m;
++                break;
++            }
++        }
++        assertNotNull(factory);
++
++        Object created = factory.call();
++        assertEquals(FactoryBean.class, created.getClass());
++        assertNotNull(factory._invokerNullary);
++        assertNull(factory._invokerUnary);
++        assertNull(factory._invokerFixedArity);
++    }
++
+     // [databind#3187]
+     @Test
+     public void testAnnotatedMethodEquality() {

@@ -1,0 +1,152 @@
+diff --git a/celery/canvas.py b/celery/canvas.py
+index e82c152b796..5c905dac8bb 100644
+--- a/celery/canvas.py
++++ b/celery/canvas.py
+@@ -459,6 +459,17 @@ def clone(self, args=None, kwargs=None, **opts):
+             args, kwargs, opts = self._merge(args, kwargs, opts)
+         else:
+             args, kwargs, opts = self.args, self.kwargs, self.options
++        # ``kwargs`` may still be ``self.kwargs`` by reference here: the
++        # no-override branch above, ``_merge`` returning ``self.kwargs``
++        # unchanged when no kwargs override is given, and its immutable
++        # short-circuit all pass it straight through.  Give the clone its
++        # own mapping so mutating ``clone.kwargs`` cannot corrupt the
++        # original (and sibling clones) -- #10560.  A shallow ``dict`` copy,
++        # not ``deepcopy``: canvas primitives keep live objects in kwargs
++        # (``chunks``/``xmap``/``xstarmap`` hold a task Signature and a lazy
++        # iterator) that must not be copied or consumed.
++        if kwargs is self.kwargs:
++            kwargs = dict(kwargs)
+         signature = Signature.from_dict({'task': self.task,
+                                          'args': tuple(args),
+                                          'kwargs': kwargs,
+diff --git a/t/integration/test_canvas.py b/t/integration/test_canvas.py
+index 8cd15502f12..80d92fdde66 100644
+--- a/t/integration/test_canvas.py
++++ b/t/integration/test_canvas.py
+@@ -1387,7 +1387,6 @@ def test_nested_group_chord_counting_mixed(self, manager):
+             [42, 42, *((42,) * gchild_count), 1337]
+         ]
+ 
+-    @pytest.mark.xfail(raises=TimeoutError, reason="#6734")
+     def test_nested_group_chord_body_chain(self, manager):
+         try:
+             manager.app.backend.ensure_chords_allowed()
+@@ -1397,19 +1396,16 @@ def test_nested_group_chord_body_chain(self, manager):
+         child_chord = chord(identity.si(42), chain((identity.s(),)))
+         group_sig = group((child_chord,))
+         res = group_sig.delay()
+-        # The result can be expected to timeout since it seems like its
+-        # underlying promise might not be getting fulfilled (ref #6734). Pick a
+-        # short timeout since we don't want to block for ages and this is a
+-        # fairly simple signature which should run pretty quickly.
++        # #6734: the GroupResult's promise here used to never be fulfilled even
++        # though the child tasks resolved, so `res.get()` timed out. Root cause
++        # was `Signature.clone()` aliasing `.kwargs`: freezing the outer group
++        # cloned the chord via `_chord.clone()`, which reassigns
++        # `signature.kwargs['body']` -- into a dict shared with the original,
++        # so the group's result wiring tracked a stale body signature. Fixed by
++        # the clone de-aliasing in this PR.
+         expected_result = [[42]]
+-        with pytest.raises(TimeoutError) as expected_excinfo:
+-            res.get(timeout=TIMEOUT / 10)
+-        # Get the child `AsyncResult` manually so that we don't have to wait
+-        # again for the `GroupResult`
+         assert res.children[0].get(timeout=TIMEOUT) == expected_result[0]
+         assert res.get(timeout=TIMEOUT) == expected_result
+-        # Re-raise the expected exception so this test will XFAIL
+-        raise expected_excinfo.value
+ 
+     def test_callback_called_by_group(self, manager, subtests):
+         if not manager.app.conf.result_backend.startswith("redis"):
+diff --git a/t/unit/tasks/test_canvas.py b/t/unit/tasks/test_canvas.py
+index 9f39eb8b211..3e0973e5156 100644
+--- a/t/unit/tasks/test_canvas.py
++++ b/t/unit/tasks/test_canvas.py
+@@ -262,6 +262,49 @@ def test_merge_immutable(self):
+         assert kwargs == {'foo': 1}
+         assert options == {'task_id': 3}
+ 
++    def test_clone_does_not_alias_kwargs(self):
++        # gh #10560: clone() used to hand back a signature that shared the
++        # original's kwargs dict, so mutating a clone corrupted the source
++        # (and every sibling clone). Mirrors the defensive copy already made
++        # for options.
++        original = self.add.s(1, 2)
++        original.kwargs['shared'] = {'nested': True}
++
++        clone_a = original.clone()
++        clone_b = original.clone()
++        assert clone_a.kwargs is not original.kwargs
++        assert clone_b.kwargs is not original.kwargs
++        assert clone_a.kwargs is not clone_b.kwargs
++
++        clone_a.kwargs['added_on_clone'] = 1
++        assert 'added_on_clone' not in original.kwargs
++        assert 'added_on_clone' not in clone_b.kwargs
++
++    def test_clone_does_not_alias_kwargs_with_non_kwargs_overrides(self):
++        # _merge() returns self.kwargs unchanged when no kwargs override is
++        # given, so clone(<option>) / clone(args=...) hit the same aliasing.
++        original = self.add.s(1, 2)
++        assert original.clone(priority=5).kwargs is not original.kwargs
++        assert original.clone(countdown=10).kwargs is not original.kwargs
++        assert original.clone(args=(3,)).kwargs is not original.kwargs
++
++    def test_clone_does_not_alias_kwargs_when_immutable(self):
++        # the immutable short-circuit in _merge() also returned self.kwargs.
++        original = self.add.si(1, 2)
++        clone = original.clone()
++        assert clone.kwargs is not original.kwargs
++        clone.kwargs['x'] = 1
++        assert 'x' not in original.kwargs
++
++    def test_clone_kwargs_copy_is_shallow(self):
++        # deliberately a shallow dict copy, not a deepcopy: canvas primitives
++        # keep live objects in kwargs (a task Signature, a lazy iterator for
++        # chunks/xmap/xstarmap) that must not be duplicated or consumed.
++        nested = {'keep_identity': True}
++        original = self.add.s(1, 2)
++        original.kwargs['nested'] = nested
++        assert original.clone().kwargs['nested'] is nested
++
+     def test_merge_options__none(self):
+         sig = self.add.si()
+         _, _, new_options = sig._merge()
+@@ -1834,21 +1877,32 @@ def test_freeze_tasks_body_is_group(self, subtests, group_type):
+         # We also expect the body to have no initial options - since all of the
+         # embedded body elements are confirmed to be `body_elem` this is valid
+         assert body_elem.options == {}
+-        # When we freeze the chord, its body will be cloned and options set
++        # Freezing the group clones every task it holds and freezes the clone;
++        # the frozen chord (now living in ``top_group.tasks``) is where the
++        # body is cloned and per-element ``group_index`` options are set.
+         top_group.freeze()
++        frozen_chord = list(top_group.tasks)[0]
+         with subtests.test(
+             msg="Validate body group indices count from 0 after freezing"
+         ):
+-            assert isinstance(chord_obj.body, group_type)
++            assert isinstance(frozen_chord.body, group_type)
+ 
+             assert all(
+                 embedded_body_elem is not body_elem
+-                for embedded_body_elem in chord_obj.body.tasks
++                for embedded_body_elem in frozen_chord.body.tasks
+             )
+             assert all(
+                 embedded_body_elem.options["group_index"] == i
+-                for i, embedded_body_elem in enumerate(chord_obj.body.tasks)
++                for i, embedded_body_elem in enumerate(frozen_chord.body.tasks)
++            )
++        # Freezing a group must not mutate a signature the caller still holds
++        # a reference to: the original chord and its body are left untouched.
++        with subtests.test(msg="Original chord signature is not mutated by freeze"):
++            assert all(
++                embedded_body_elem is body_elem
++                for embedded_body_elem in chord_obj.body.tasks
+             )
++            assert body_elem.options == {}
+ 
+     def test_freeze_tasks_is_not_group(self):
+         x = chord([self.add.s(2, 2)], body=self.add.s(), app=self.app)

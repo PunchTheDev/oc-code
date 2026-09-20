@@ -1,0 +1,1116 @@
+diff --git a/CHANGES/13655.bugfix.rst b/CHANGES/13655.bugfix.rst
+new file mode 100644
+index 00000000000..5bc3256da34
+--- /dev/null
++++ b/CHANGES/13655.bugfix.rst
+@@ -0,0 +1,8 @@
++Fixed unbounded memory growth on a client WebSocket connection. A frame
++protocol error detaches the reader but leaves the connection upgraded, so a
++peer could stream unlimited data into an internal buffer when the application
++never called :meth:`~aiohttp.ClientWebSocketResponse.receive`; that data is
++now discarded, since nothing can parse it. Data arriving before the reader is
++installed is bounded by ``read_bufsize``, which now applies to this buffer as
++well as to :attr:`~aiohttp.ClientResponse.content`
++-- by :user:`bdraco`.
+diff --git a/CHANGES/13743.bugfix.rst b/CHANGES/13743.bugfix.rst
+new file mode 120000
+index 00000000000..d8eba8e1c66
+--- /dev/null
++++ b/CHANGES/13743.bugfix.rst
+@@ -0,0 +1 @@
++13655.bugfix.rst
+\ No newline at end of file
+diff --git a/THREAT_MODEL.md b/THREAT_MODEL.md
+index d86f0744fe0..86ea1bb3dab 100644
+--- a/THREAT_MODEL.md
++++ b/THREAT_MODEL.md
+@@ -538,6 +538,7 @@ client-side, the writer adds masks to outgoing frames.
+ | 3.13 | Writer-side: large outbound message as single frame | D | Writer does not auto-fragment; a single `send_str(big_blob)` becomes one frame. Memory pressure on the local side and on intermediaries. | Low |
+ | 3.14 | Mask-on-send keys (Cython vs Python parity) | T | Divergence between `mask.pyx` and `helpers.py` `websocket_mask` would silently break receivers (one peer XORs with a different key than the other expects). | Low |
+ | 3.15 | Reader Cython vs pure-Python parity | T | Divergence between the two reader backends could let one silently accept a frame the other rejects, weakening protocol enforcement asymmetrically. | Low |
++| 3.16 | Post-error buffering on an upgraded connection | D | `WebSocketReader.feed_data` reports EOF only for a protocol error, and the connection stays upgraded with the reader detached. Were every later byte still buffered with nothing left to drain it, a peer that kept streaming after a deliberate frame error would exhaust memory on a client that never reads. | Medium |
+ 
+ **Mitigations.**
+ 
+@@ -556,6 +557,7 @@ client-side, the writer adds masks to outgoing frames.
+ | 3.13 | Writer single-frame size | None — caller-controlled. | **User**: chunk very large outbound payloads (beyond a few MiB) via fragmented messages; a single `send_*` becomes one frame and can pressure intermediaries. |
+ | 3.14 | Cython vs pure-Python mask parity | Both implement XOR on the same key cycling; behaviour identical. | Add a parameterised test that runs the mask helper against both backends side-by-side (see [§6.1](#61-highest-leverage-recommendations) #3). |
+ | 3.15 | Reader backend parity | `tests/test_websocket_parser.py` imports the single `WebSocketReader` symbol (whichever backend won the import), so each CI run only exercises one. | Parameterise like `tests/test_http_parser.py` does — explicitly import `WebSocketReaderPython` and `WebSocketReaderCython` (when available) and fixture-parametrise over both (see [§6.1](#61-highest-leverage-recommendations) #3). |
++| 3.16 | Post-error buffering bound | After a reader EOF, which only ever means a protocol error, `client_proto.py:data_received` discards what follows; the server closes instead (`web_protocol.py:data_received`). Bytes buffered *before* `set_parser()` are real frames the reader is entitled to, so they are bounded by pausing the transport at `read_bufsize` (default 256 KiB), resumed where the buffer is drained. An upgraded response that never installs a reader keeps that pause, and a paused transport is not told the peer hung up, so it is reclaimed when the response is closed or collected rather than when the peer goes away. | Discarded rather than paused or closed on; see the recap below for what each alternative cost. **User**: set `heartbeat` on long-lived sessions; a peer can keep the client reading and dropping bytes, and `heartbeat` is what reaps such a connection. |
+ 
+ **Past advisories / hardening (recap).**
+ 
+@@ -597,6 +599,18 @@ client-side, the writer adds masks to outgoing frames.
+   them once when the frame completes; if a frame arrives in more than
+   `max(1024, max_msg_size // 256)` reads, the pending reads are folded into
+   a single `bytearray` and cleared.
++- **Issue #13655** — a protocol error detaches the reader but leaves the
++  connection upgraded, so a peer could stream unbounded data into
++  `ResponseHandler._tail`: 32 MiB pushed at a client that never called
++  `receive()` produced 32 MiB of `_tail`. Fixed by discarding what arrives
++  after the reader's EOF (threat 3.16). Two alternatives were measured and
++  rejected: pausing hides the peer's FIN, so sockets accumulate instead of
++  memory; closing makes the transport unwritable, so a message queued before
++  the error cannot be answered, which broke the Autobahn client runner. The
++  pre-parser buffer is bounded by backpressure instead of discarded, since
++  those are frames the reader will want; it looked self-limiting, but the
++  window opens inside `resp.start()` and a `TraceConfig.on_request_end` doing
++  I/O held it open for 32 MiB.
+ 
+ ---
+ 
+diff --git a/aiohttp/base_protocol.py b/aiohttp/base_protocol.py
+index df3f8c089ac..0b6744d0e7a 100644
+--- a/aiohttp/base_protocol.py
++++ b/aiohttp/base_protocol.py
+@@ -24,6 +24,7 @@ class BaseProtocol(asyncio.Protocol):
+         "_drain_waiter",
+         "_connection_lost",
+         "_reading_paused",
++        "_buffer_paused",
+         "_upgraded",
+         "transport",
+     )
+@@ -35,6 +36,7 @@ def __init__(
+         self._paused = False
+         self._drain_waiter: asyncio.Future[None] | None = None
+         self._reading_paused = False
++        self._buffer_paused = False
+         self._parser = parser
+         self._upgraded = False
+ 
+@@ -69,6 +71,25 @@ def pause_reading(self) -> None:
+         if not self._upgraded:
+             assert self._parser is not None
+             self._parser.pause_reading()
++        self._pause_transport_reading()
++
++    def _pause_reading_for_buffer(self) -> None:
++        """Hold the transport for a buffer this protocol cannot drain yet.
++
++        One flag covers every buffer a protocol owns; the server already
++        multiplexes its message queue and its tail through it. Re-check the
++        conditions on resume rather than adding another flag.
++        """
++        self._buffer_paused = True
++        self._pause_transport_reading()
++
++    def _resume_reading_for_buffer(self) -> None:
++        """Release that hold, unless flow control is still holding it too."""
++        self._buffer_paused = False
++        if not self._reading_paused:
++            self._resume_transport_reading()
++
++    def _pause_transport_reading(self) -> None:
+         if self.transport is not None:
+             try:
+                 self.transport.pause_reading()
+@@ -77,9 +98,14 @@ def pause_reading(self) -> None:
+                 # ignored (see PAUSE_RESUME_READING_ERRORS; do not use suppress).
+                 pass
+ 
+-    def _reading_paused_for_msg_queue(self) -> bool:
+-        """Keep the transport paused for protocol-specific reasons (overridden)."""
+-        return False
++    def _resume_transport_reading(self) -> None:
++        if self.transport is not None:
++            try:
++                self.transport.resume_reading()
++            except PAUSE_RESUME_READING_ERRORS:
++                # Transport lacks flow control; nothing to resume. Intentionally
++                # ignored (see PAUSE_RESUME_READING_ERRORS; do not use suppress).
++                pass
+ 
+     def resume_reading(self, resume_parser: bool = True) -> None:
+         self._reading_paused = False
+@@ -90,18 +116,8 @@ def resume_reading(self, resume_parser: bool = True) -> None:
+ 
+         # Reading may have been paused again in the above call if there was a lot of
+         # compressed data still pending.
+-        if (
+-            not self._reading_paused
+-            and not self._reading_paused_for_msg_queue()
+-            and self.transport is not None
+-        ):
+-            try:
+-                self.transport.resume_reading()
+-            except PAUSE_RESUME_READING_ERRORS:
+-                # Transport lacks flow control; nothing to resume. Intentionally
+-                # ignored (see PAUSE_RESUME_READING_ERRORS; do not use suppress).
+-                pass
+-            self._reading_paused = False
++        if not self._reading_paused and not self._buffer_paused:
++            self._resume_transport_reading()
+ 
+     def connection_made(self, transport: asyncio.BaseTransport) -> None:
+         tr = cast(asyncio.Transport, transport)
+diff --git a/aiohttp/client_proto.py b/aiohttp/client_proto.py
+index e551914993e..3db4b7f8793 100644
+--- a/aiohttp/client_proto.py
++++ b/aiohttp/client_proto.py
+@@ -45,6 +45,8 @@ def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+ 
+         self._timer = None
+         self._tail = b""
++        self._payload_parser_failed = False
++        self._read_bufsize = DEFAULT_CHUNK_SIZE
+ 
+         self._read_timeout: float | None = None
+         self._read_timeout_handle: asyncio.TimerHandle | None = None
+@@ -183,7 +185,9 @@ def connection_lost(self, exc: BaseException | None) -> None:
+         self._parser = None
+         self._payload = None
+         self._payload_parser = None
++        self._payload_parser_failed = False
+         self._reading_paused = False
++        self._buffer_paused = False
+ 
+         super().connection_lost(reraised_exc)
+ 
+@@ -198,9 +202,24 @@ def pause_reading(self) -> None:
+     def resume_reading(self, resume_parser: bool = True) -> None:
+         was_paused = self._reading_paused
+         super().resume_reading(resume_parser)
+-        if was_paused:
++        # sock_read measures the peer, so it stays stopped while the tail
++        # bound is still holding the transport.
++        if was_paused and not self._buffer_paused:
+             self._reschedule_timeout()
+ 
++    def _drain_tail(self) -> None:
++        if self._tail:
++            data, self._tail = self._tail, b""
++            self.data_received(data)
++        # Tested empty-first so a read_bufsize of 0 cannot wedge the connection.
++        still_bound = bool(self._tail) and len(self._tail) >= self._read_bufsize
++        if self._buffer_paused and not still_bound:
++            self._resume_reading_for_buffer()
++        if self._reading_paused or self._buffer_paused:
++            # The drain restarted sock_read through data_received(); anything
++            # still holding the transport means it stays stopped.
++            self._drop_timeout()
++
+     def set_exception(
+         self,
+         exc: type[BaseException] | BaseException,
+@@ -222,9 +241,7 @@ def set_parser(
+ 
+         self._drop_timeout()
+ 
+-        if self._tail:
+-            data, self._tail = self._tail, b""
+-            self.data_received(data)
++        self._drain_tail()
+ 
+     def set_response_params(
+         self,
+@@ -242,6 +259,7 @@ def set_response_params(
+     ) -> None:
+         self._skip_payload = skip_payload
+ 
++        self._read_bufsize = read_bufsize
+         self._read_timeout = read_timeout
+ 
+         self._timeout_ceil_threshold = timeout_ceil_threshold
+@@ -260,9 +278,7 @@ def set_response_params(
+             max_headers=max_headers,
+         )
+ 
+-        if self._tail:
+-            data, self._tail = self._tail, b""
+-            self.data_received(data)
++        self._drain_tail()
+ 
+     def _drop_timeout(self) -> None:
+         if self._read_timeout_handle is not None:
+@@ -299,6 +315,12 @@ def _on_read_timeout(self) -> None:
+             set_exception(self._payload, exc)
+ 
+     def data_received(self, data: bytes) -> None:
++        if self._payload_parser_failed:
++            # Dropped, not closed on, so queued messages stay answerable and
++            # the peer's FIN still arrives. Discarded bytes are not progress,
++            # so they must not hold off sock_read either.
++            return
++
+         # If no data, then we are resuming decompression. We haven't received
+         # data from the socket, so we can avoid the reschedule overhead.
+         if data:
+@@ -308,18 +330,29 @@ def data_received(self, data: bytes) -> None:
+         if self._payload_parser is not None:
+             if self._data_received_cb is not None:
+                 self._data_received_cb()
+-            eof, tail = self._payload_parser.feed_data(data)
+-            if eof:
++            # WebSocketReader signals EOF only for a protocol error, never
++            # for a clean close, and has already put the error on the queue.
++            protocol_error, _ = self._payload_parser.feed_data(data)
++            if protocol_error:
+                 self._payload = None
+                 self._payload_parser = None
+-
+-                if tail:
+-                    self.data_received(tail)
++                self._payload_parser_failed = True
+             return
+ 
+         if self._upgraded or self._parser is None:
+             # i.e. websocket connection, websocket parser is not set yet
+             self._tail += data
++            # Nothing drains this until set_parser() runs, and an await
++            # after the 101 can hold that off; stop reading instead.
++            # Tested non-empty so a read_bufsize of 0 cannot pause on nothing.
++            if (
++                not self._buffer_paused
++                and self._tail
++                and len(self._tail) >= self._read_bufsize
++            ):
++                self._pause_reading_for_buffer()
++                # sock_read measures the peer; this pause is ours.
++                self._drop_timeout()
+             return
+ 
+         # parse http messages
+diff --git a/aiohttp/web_protocol.py b/aiohttp/web_protocol.py
+index 0b591ad128d..8fd73c84055 100644
+--- a/aiohttp/web_protocol.py
++++ b/aiohttp/web_protocol.py
+@@ -16,7 +16,7 @@
+ from propcache import under_cached_property
+ 
+ from .abc import AbstractAccessLogger, AbstractAsyncAccessLogger, AbstractStreamWriter
+-from .base_protocol import PAUSE_RESUME_READING_ERRORS, BaseProtocol
++from .base_protocol import BaseProtocol
+ from .helpers import (
+     DEFAULT_CHUNK_SIZE,
+     HeadersDictProxy,
+@@ -182,7 +182,6 @@ class RequestHandler(BaseProtocol, Generic[_Request]):
+         "_messages",
+         "_max_msg_queue_size",
+         "_msg_queue_resume_size",
+-        "_msg_queue_paused",
+         "_message_tail",
+         "_read_bufsize",
+         "_handler_waiter",
+@@ -227,9 +226,6 @@ def __init__(
+         # so we refill in batches instead of churning pause/resume per request.
+         self._msg_queue_resume_size = MAX_MSG_QUEUE_SIZE // 2
+         self._read_bufsize = read_bufsize
+-        # Set before super().__init__ so _reading_paused_for_msg_queue() is safe
+-        # if BaseProtocol ever triggers a resume during init.
+-        self._msg_queue_paused = False
+         parser = HttpRequestParser(
+             self,
+             loop,
+@@ -468,8 +464,8 @@ def set_parser(
+             self._payload_parser.feed_data(self._message_tail)
+             self._message_tail = b""
+ 
+-        if self._msg_queue_paused:
+-            self._resume_msg_queue_reading()
++        if self._buffer_paused:
++            self._resume_reading_if_drained()
+ 
+     def eof_received(self) -> None:
+         pass
+@@ -502,10 +498,10 @@ def data_received(self, data: bytes) -> None:
+             # Queue full: pause the transport (the parser already stopped
+             # emitting). start() resumes as it drains the queue.
+             if (
+-                not self._msg_queue_paused
++                not self._buffer_paused
+                 and len(self._messages) >= self._max_msg_queue_size
+             ):
+-                self._pause_msg_queue_reading()
++                self._pause_reading_for_buffer()
+ 
+             self._upgraded = upgraded
+             if upgraded and tail:
+@@ -515,10 +511,10 @@ def data_received(self, data: bytes) -> None:
+         elif self._payload_parser is None and self._upgraded and data:
+             self._message_tail += data
+             if (
+-                not self._msg_queue_paused
++                not self._buffer_paused
+                 and len(self._message_tail) >= self._read_bufsize
+             ):
+-                self._pause_msg_queue_reading()
++                self._pause_reading_for_buffer()
+ 
+         # feed payload
+         elif data:
+@@ -528,20 +524,7 @@ def data_received(self, data: bytes) -> None:
+             if eof:
+                 self.close()
+ 
+-    def _reading_paused_for_msg_queue(self) -> bool:
+-        return self._msg_queue_paused
+-
+-    def _pause_msg_queue_reading(self) -> None:
+-        self._msg_queue_paused = True
+-        if self.transport is not None:
+-            try:
+-                self.transport.pause_reading()
+-            except PAUSE_RESUME_READING_ERRORS:
+-                # Transport lacks flow control; nothing to pause. Intentionally
+-                # ignored (see PAUSE_RESUME_READING_ERRORS; do not use suppress).
+-                pass
+-
+-    def _resume_msg_queue_reading(self) -> None:
++    def _resume_reading_if_drained(self) -> None:
+         # Tested empty-first so a read_bufsize of 0 cannot wedge the connection.
+         if self._message_tail and len(self._message_tail) >= self._read_bufsize:
+             return
+@@ -553,14 +536,7 @@ def _resume_msg_queue_reading(self) -> None:
+             self.data_received(b"")
+             if len(self._messages) >= self._max_msg_queue_size:
+                 return
+-        self._msg_queue_paused = False
+-        if not self._reading_paused and self.transport is not None:
+-            try:
+-                self.transport.resume_reading()
+-            except PAUSE_RESUME_READING_ERRORS:
+-                # Transport lacks flow control; nothing to resume. Intentionally
+-                # ignored (see PAUSE_RESUME_READING_ERRORS; do not use suppress).
+-                pass
++        self._resume_reading_for_buffer()
+ 
+     def _replay_message_tail(self) -> None:
+         """Re-feed the bytes buffered behind a rejected upgrade.
+@@ -614,10 +590,10 @@ def _replay_message_tail(self) -> None:
+ 
+         if len(self._messages) >= self._max_msg_queue_size:
+             # Pause the transport, like in data_received().
+-            self._pause_msg_queue_reading()
+-        elif self._msg_queue_paused:
++            self._pause_reading_for_buffer()
++        elif self._buffer_paused:
+             # Resume reading now the tail has been parsed.
+-            self._resume_msg_queue_reading()
++            self._resume_reading_if_drained()
+ 
+         # This shouldn't be possible. If a future refactor results in this
+         # failing, then the code may need to be updated to set the waiter.
+@@ -766,10 +742,10 @@ async def start(self) -> None:
+             if self._parser is not None:
+                 self._parser.message_consumed()
+             if (
+-                self._msg_queue_paused
++                self._buffer_paused
+                 and len(self._messages) <= self._msg_queue_resume_size
+             ):
+-                self._resume_msg_queue_reading()
++                self._resume_reading_if_drained()
+ 
+             # time is only fetched if logging is enabled as otherwise
+             # its thrown away and never used.
+diff --git a/docs/client_reference.rst b/docs/client_reference.rst
+index 5ec5f204b11..9884f5d22fc 100644
+--- a/docs/client_reference.rst
++++ b/docs/client_reference.rst
+@@ -55,7 +55,7 @@ The client session supports the context manager protocol for self closing.
+                          requote_redirect_url=True, \
+                          trace_configs=None, \
+                          middlewares=(), \
+-                         read_bufsize=2**16, \
++                         read_bufsize=2**18, \
+                          max_line_size=8190, \
+                          max_field_size=8190, \
+                          max_headers=128, \
+@@ -230,7 +230,9 @@ The client session supports the context manager protocol for self closing.
+       .. versionadded:: 3.12
+ 
+    :param int read_bufsize: Size of the read buffer (:attr:`ClientResponse.content`).
+-                            64 KiB by default.
++                            256 KiB by default. On a WebSocket connection it
++                            also bounds what is buffered between the handshake
++                            and the reader being installed.
+ 
+       .. versionadded:: 3.7
+ 
+diff --git a/tests/test_client_proto.py b/tests/test_client_proto.py
+index 42e79978bf8..77e9021873f 100644
+--- a/tests/test_client_proto.py
++++ b/tests/test_client_proto.py
+@@ -11,7 +11,7 @@
+ from aiohttp.client_exceptions import ClientOSError, ServerDisconnectedError
+ from aiohttp.client_proto import ResponseHandler
+ from aiohttp.client_reqrep import ClientResponse
+-from aiohttp.helpers import TimerNoop
++from aiohttp.helpers import DEFAULT_CHUNK_SIZE, TimerNoop
+ from aiohttp.http_parser import HttpParser, RawResponseMessage
+ 
+ 
+@@ -427,3 +427,222 @@ async def test_response_start_records_upgrade(
+     await response.start(conn)
+     assert response._upgraded is expected
+     response.close()
++
++
++def _upgraded_proto(
++    loop: asyncio.AbstractEventLoop,
++    transport: mock.Mock,
++    read_bufsize: int = DEFAULT_CHUNK_SIZE,
++) -> ResponseHandler:
++    """A protocol that has completed the upgrade but has no parser installed."""
++    proto = ResponseHandler(loop=loop)
++    proto.connection_made(transport)
++    proto.set_response_params(read_bufsize=read_bufsize)
++    proto._upgraded = True
++    return proto
++
++
++def _failed_proto(
++    loop: asyncio.AbstractEventLoop, transport: mock.Mock
++) -> ResponseHandler:
++    """An upgraded protocol whose reader has reported a protocol error."""
++    proto = _upgraded_proto(loop, transport)
++    parser = mock.Mock()
++    parser.feed_data.return_value = (False, b"")
++    proto.set_parser(parser, mock.Mock())
++    parser.feed_data.return_value = (True, b"")
++    proto.data_received(b"bad frame")
++    return proto
++
++
++async def test_websocket_parser_error_discards_later_data() -> None:
++    """A WebSocket protocol error drops what follows instead of buffering it.
++
++    EOF is only ever reported for a protocol error, and the connection stays
++    upgraded, so without this the peer can stream unbounded data into ``_tail``.
++    """
++    transport = mock.Mock()
++    proto = _failed_proto(asyncio.get_running_loop(), transport)
++
++    assert proto._payload_parser_failed
++
++    # The peer keeps streaming; none of it is kept.
++    proto.data_received(b"x" * 65536)
++    assert proto._tail == b""
++    transport.close.assert_not_called()
++    transport.pause_reading.assert_not_called()
++
++
++async def test_parser_error_while_draining_tail_discards_data() -> None:
++    """A parser that errors on the drained tail still discards what follows.
++
++    The bad frame usually arrives with the handshake, so it is already in
++    ``_tail`` when ``set_parser()`` runs and the error fires during the drain
++    rather than on a later read.
++    """
++    transport = mock.Mock()
++    proto = _upgraded_proto(asyncio.get_running_loop(), transport)
++    proto._tail = b"bad frame"
++
++    parser = mock.Mock()
++    parser.feed_data.return_value = (True, b"")
++    proto.set_parser(parser, mock.Mock())
++
++    assert proto.should_close
++    assert proto._payload_parser_failed
++    proto.data_received(b"y" * 65536)
++    assert proto._tail == b""
++    transport.close.assert_not_called()
++
++
++@pytest.mark.parametrize("parser_eof", [False, True])
++async def test_tail_bounded_until_parser_is_installed(parser_eof: bool) -> None:
++    """Data buffered before ``set_parser()`` pauses reading, and always resumes.
++
++    An await after the 101, such as a tracing callback doing I/O, holds off
++    ``set_parser()`` while the peer keeps sending, so this buffer needs a bound.
++    The resume must happen whether the parser then accepts the drained bytes or
++    fails on them, or the transport is left paused with nothing to restart it.
++    """
++    transport = mock.Mock()
++    proto = _upgraded_proto(asyncio.get_running_loop(), transport, read_bufsize=1024)
++
++    proto.data_received(b"x" * 2048)
++    transport.pause_reading.assert_called_once_with()
++
++    parser = mock.Mock()
++    parser.feed_data.return_value = (parser_eof, b"")
++    proto.set_parser(parser, mock.Mock())
++
++    assert not proto._buffer_paused
++    transport.resume_reading.assert_called_once_with()
++    # Whatever arrives next is parsed or discarded, never accumulated.
++    proto.data_received(b"z" * 65536)
++    assert proto._tail == b""
++
++
++async def test_drain_elsewhere_does_not_lift_the_tail_pause() -> None:
++    """A resume from elsewhere must not lift the pause the tail bound took.
++
++    ``WebSocketDataQueue`` and ``StreamReader`` both call ``resume_reading()``
++    as they drain. Nothing would re-arm the bound afterwards, since it checks
++    ``_buffer_paused``, so the peer could refill the buffer it paused for.
++    """
++    transport = mock.Mock()
++    proto = _upgraded_proto(asyncio.get_running_loop(), transport, read_bufsize=1024)
++    proto.data_received(b"x" * 2048)
++    transport.pause_reading.assert_called_once_with()
++
++    proto.resume_reading()
++
++    assert proto._buffer_paused
++    transport.resume_reading.assert_not_called()
++
++
++async def test_discarded_data_does_not_hold_off_the_read_timeout() -> None:
++    """Bytes dropped after a protocol error are not progress.
++
++    Rescheduling on them would let a peer flood a dead connection forever
++    without ``sock_read`` ever reaping it.
++    """
++    transport = mock.Mock()
++    proto = _upgraded_proto(asyncio.get_running_loop(), transport)
++    parser = mock.Mock()
++    parser.feed_data.return_value = (False, b"")
++    proto.set_parser(parser, mock.Mock())
++    parser.feed_data.return_value = (True, b"")
++    proto.data_received(b"bad frame")
++    assert proto._payload_parser_failed
++
++    with mock.patch.object(proto, "_reschedule_timeout") as reschedule:
++        proto.data_received(b"x" * 65536)
++
++    reschedule.assert_not_called()
++
++
++async def test_tail_resume_leaves_the_timeout_stopped_for_another_pause() -> None:
++    """Draining the tail must not restart sock_read for someone else's pause.
++
++    The drain runs through ``data_received()``, which reschedules, so the
++    resume has to undo that while the queue still holds the transport.
++    """
++    transport = mock.Mock()
++    proto = _upgraded_proto(asyncio.get_running_loop(), transport, read_bufsize=1024)
++    proto.read_timeout = 30
++    proto.data_received(b"x" * 2048)
++    transport.pause_reading.assert_called_once_with()
++
++    # What WebSocketDataQueue does when it hits its high-water mark.
++    proto.pause_reading()
++
++    parser = mock.Mock()
++    parser.feed_data.return_value = (False, b"")
++    proto.set_parser(parser, mock.Mock())
++
++    assert proto._reading_paused
++    assert proto._read_timeout_handle is None
++    transport.resume_reading.assert_not_called()
++
++
++async def test_drain_that_refills_the_tail_stays_paused() -> None:
++    """A drain that cannot empty the buffer must leave the bound in force.
++
++    ``set_response_params()`` drains through ``data_received()``, which can
++    hand an upgraded tail straight back to the buffer it came from.
++    """
++    transport = mock.Mock()
++    proto = _upgraded_proto(asyncio.get_running_loop(), transport, read_bufsize=1024)
++    proto.read_timeout = 30
++    proto.data_received(b"x" * 2048)
++    transport.pause_reading.assert_called_once_with()
++
++    # No parser is installed, so the drain feeds the tail back to itself.
++    proto._drain_tail()
++
++    assert proto._tail == b"x" * 2048
++    assert proto._buffer_paused
++    transport.resume_reading.assert_not_called()
++    # The drain restarted sock_read on the way through; the pause is ours.
++    assert proto._read_timeout_handle is None
++
++
++async def test_drain_that_completes_a_response_leaves_the_clock_stopped() -> None:
++    """Resuming must not revive a timeout the drain deliberately dropped.
++
++    ``data_received()`` owns the read clock: it stops it when a response
++    completes with no body. Re-arming here would leave ``sock_read`` running
++    against a connection with nothing outstanding.
++    """
++    transport = mock.Mock()
++    proto = ResponseHandler(loop=asyncio.get_running_loop())
++    proto.connection_made(transport)
++    # A peer that speaks before the request fills the tail past the bound.
++    proto._read_bufsize = 64
++    proto.data_received(b"z" * 128)
++    assert proto._buffer_paused
++
++    # The drain then parses a complete, body-less response out of that tail.
++    proto._tail = b"HTTP/1.1 204 No Content\r\n\r\n"
++    proto.set_response_params(read_timeout=30)
++
++    assert proto._read_timeout_handle is None
++
++
++async def test_drain_leaves_the_clock_stopped_for_a_flow_control_pause() -> None:
++    """The drain restarts sock_read; any hold on the transport must stop it.
++
++    The tail bound is not the only reason reading can be held, so the rule is
++    about the transport rather than about which pause the drain just lifted.
++    """
++    transport = mock.Mock()
++    proto = _upgraded_proto(asyncio.get_running_loop(), transport)
++    proto.read_timeout = 30
++    proto._tail = b"frames"
++    # Held by flow control rather than the bound, so nothing here lifts it.
++    proto._reading_paused = True
++
++    parser = mock.Mock()
++    parser.feed_data.return_value = (False, b"")
++    proto.set_parser(parser, mock.Mock())
++
++    assert proto._read_timeout_handle is None
+diff --git a/tests/test_client_ws_functional.py b/tests/test_client_ws_functional.py
+index 628a55b49d2..1e8a36220d8 100644
+--- a/tests/test_client_ws_functional.py
++++ b/tests/test_client_ws_functional.py
+@@ -8,6 +8,8 @@
+ import struct
+ import sys
+ import zlib
++from collections.abc import AsyncIterator, Awaitable, Callable
++from types import SimpleNamespace
+ from typing import Literal, NoReturn
+ from unittest import mock
+ 
+@@ -25,7 +27,9 @@
+ )
+ from aiohttp._websocket.models import WS_DEFLATE_TRAILING, WSMessageBinary
+ from aiohttp._websocket.reader import WebSocketDataQueue
++from aiohttp.client_proto import ResponseHandler
+ from aiohttp.client_ws import ClientWSTimeout
++from aiohttp.helpers import DEFAULT_CHUNK_SIZE
+ from aiohttp.http import WS_KEY, WebSocketError, WSCloseCode
+ 
+ if sys.version_info >= (3, 11):
+@@ -34,6 +38,48 @@
+     import async_timeout
+ 
+ 
++@contextlib.asynccontextmanager
++async def _raw_ws_server(
++    handler: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]],
++    sock: socket.socket,
++) -> AsyncIterator[int]:
++    """Serve one raw WebSocket peer and tear it down without waiting on it."""
++    writers: list[asyncio.StreamWriter] = []
++
++    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
++        writers.append(writer)
++        await handler(reader, writer)
++
++    server = await asyncio.start_server(serve, sock=sock)
++    try:
++        yield sock.getsockname()[1]
++    finally:
++        for writer in writers:
++            # Abort: a paused peer never drains what is still queued.
++            writer.transport.abort()
++        server.close()
++        await server.wait_closed()
++
++
++async def _accept_ws(
++    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
++) -> None:
++    """Complete a raw WebSocket handshake; the caller writes the frames."""
++    request = await reader.readuntil(b"\r\n\r\n")
++    key = next(
++        line.split(b":", 1)[1].strip()
++        for line in request.split(b"\r\n")
++        if line.lower().startswith(b"sec-websocket-key")
++    )
++    accept = base64.b64encode(hashlib.sha1(key + WS_KEY).digest())
++    writer.write(
++        b"HTTP/1.1 101 Switching Protocols\r\n"
++        b"Upgrade: websocket\r\n"
++        b"Connection: Upgrade\r\n"
++        b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
++    )
++
++
+ class PatchableWebSocketDataQueue(WebSocketDataQueue):
+     """A WebSocketDataQueue that can be patched."""
+ 
+@@ -57,20 +103,11 @@ async def raw_server(
+         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+     ) -> None:
+         writers.append(writer)
+-        request = await reader.readuntil(b"\r\n\r\n")
+-        key = next(
+-            line.split(b":", 1)[1].strip()
+-            for line in request.split(b"\r\n")
+-            if line.lower().startswith(b"sec-websocket-key")
+-        )
+-        accept = base64.b64encode(hashlib.sha1(key + WS_KEY).digest())
++        await _accept_ws(reader, writer)
+         writer.write(
+-            b"HTTP/1.1 101 Switching Protocols\r\n"
+-            b"Upgrade: websocket\r\n"
+-            b"Connection: Upgrade\r\n"
+-            b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+             # One oversized read: empty unmasked TEXT frames, 2 bytes each.
+-            + b"\x81\x00" * sent
++            b"\x81\x00"
++            * sent
+         )
+         await writer.drain()
+ 
+@@ -787,6 +824,9 @@ async def handler(request: web.Request) -> web.WebSocketResponse:
+     assert msg.data.code == aiohttp.WSCloseCode.PROTOCOL_ERROR
+     assert str(msg.data) == "Received frame with non-zero reserved bits"
+     assert msg.extra is None
++    # Still writable when the error surfaces, so this is 1002, not 1006.
++    assert resp.close_code == aiohttp.WSCloseCode.PROTOCOL_ERROR
++    assert resp.exception() is None
+     await resp.close()
+ 
+ 
+@@ -1839,3 +1879,115 @@ async def handler(request: web.Request) -> web.WebSocketResponse:
+     assert resp._parser is not None
+     await resp.close()
+     assert resp._parser is None
++
++
++async def test_data_discarded_after_protocol_error(
++    unused_port_socket: socket.socket,
++) -> None:
++    """A frame error drops what follows instead of buffering it.
++
++    The connection stays upgraded with no parser installed, so every later byte
++    used to land in ``ResponseHandler._tail``; an application that never called
++    ``receive()`` never closed the connection, so the peer could stream until
++    the client ran out of memory.
++    """
++    flooded = asyncio.Event()
++
++    async def raw_server(
++        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
++    ) -> None:
++        await _accept_ws(reader, writer)
++        writer.write(
++            # A valid frame, then a protocol error in the same read.
++            b"\x81\x04ping"
++            # RSV1 set without permessage-deflate: a protocol error.
++            + b"\x41\x01x"
++        )
++        await writer.drain()
++        # 2 MiB in one write; buffering any of it would be obvious.
++        writer.write(b"A" * (2 * 1024 * 1024))
++        with contextlib.suppress(Exception):
++            await writer.drain()
++        flooded.set()
++
++    async with _raw_ws_server(raw_server, unused_port_socket) as port:
++        async with aiohttp.ClientSession() as session:
++            # No receive() call: the long-lived idle client of the report.
++            ws = await session.ws_connect(f"http://127.0.0.1:{port}/")
++            connection = ws._conn
++            assert connection is not None
++            protocol = connection.protocol
++            assert protocol is not None
++
++            # The drain only completes if the client read it all.
++            async with async_timeout.timeout(10):
++                await flooded.wait()
++
++            # Nothing the peer sent after the error was kept.
++            assert protocol._tail == b""
++            # Still open and reading, so the peer's FIN still arrives, and a
++            # frame queued before the error can still be answered.
++            assert protocol.transport is not None
++            msg = await ws.receive()
++            assert msg.type is WSMsgType.TEXT and msg.data == "ping"
++            await ws.send_str(msg.data)
++            await ws.close()
++
++
++async def test_tail_bounded_while_a_trace_callback_suspends(
++    unused_port_socket: socket.socket,
++) -> None:
++    """A tracing callback must not let the peer fill the pre-parser buffer.
++
++    ``_tail`` starts filling when the 101 is parsed, inside ``resp.start()``,
++    and nothing drains it until ``set_parser()`` runs. ``on_request_end`` is
++    public API and runs in between, so a handler doing any real I/O holds that
++    window open for as long as it takes.
++    """
++    paused = asyncio.Event()
++    tail_at_pause: list[int] = []
++    pause_for_buffer = ResponseHandler._pause_reading_for_buffer
++
++    def spy(self: ResponseHandler) -> None:
++        # The tail bound is this protocol's only buffer pause.
++        pause_for_buffer(self)
++        # set_parser() drains _tail moments later, so record it here.
++        tail_at_pause.append(len(self._tail))
++        paused.set()
++
++    async def raw_server(
++        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
++    ) -> None:
++        await _accept_ws(reader, writer)
++        # Valid frames, well past the bound, that only a reader may eat.
++        writer.write((b"\x81\x7e\xff\xff" + b"y" * 65535) * 32)
++        with contextlib.suppress(Exception):
++            await writer.drain()
++
++    trace = aiohttp.TraceConfig()
++
++    async def on_request_end(
++        session: aiohttp.ClientSession,
++        context: SimpleNamespace,
++        params: aiohttp.TraceRequestEndParams,
++    ) -> None:
++        # A handler shipping a metric, say. Hold the window open until the
++        # bound fires; an unbounded buffer never pauses, so let that case fall
++        # through to the assertion below rather than raising from here.
++        with contextlib.suppress(asyncio.TimeoutError):
++            async with async_timeout.timeout(5):
++                await paused.wait()
++
++    trace.on_request_end.append(on_request_end)
++
++    async with _raw_ws_server(raw_server, unused_port_socket) as port:
++        with mock.patch.object(ResponseHandler, "_pause_reading_for_buffer", spy):
++            async with aiohttp.ClientSession(trace_configs=[trace]) as session:
++                async with session.ws_connect(
++                    f"http://127.0.0.1:{port}/",
++                    # This peer never answers a close frame; do not wait for it.
++                    timeout=ClientWSTimeout(ws_close=0.1),
++                ):
++                    assert tail_at_pause, "the buffer was never bounded"
++                    # One read may already be in flight when the pause lands.
++                    assert tail_at_pause[0] <= 2 * DEFAULT_CHUNK_SIZE
+diff --git a/tests/test_web_functional.py b/tests/test_web_functional.py
+index f54078fd7e4..a75a08341cc 100644
+--- a/tests/test_web_functional.py
++++ b/tests/test_web_functional.py
+@@ -1805,13 +1805,13 @@ async def test_http1_pipelined_queue_resumes_after_drain(
+     handled: list[str] = []
+     all_handled = asyncio.Event()
+ 
+-    resume = RequestHandler._resume_msg_queue_reading
++    resume = RequestHandler._resume_reading_if_drained
+ 
+     def observe_resume(self: RequestHandler[web.Request]) -> None:
+         resume(self)
+         resumed.set()
+ 
+-    monkeypatch.setattr(RequestHandler, "_resume_msg_queue_reading", observe_resume)
++    monkeypatch.setattr(RequestHandler, "_resume_reading_if_drained", observe_resume)
+ 
+     async def handler(request: web.Request) -> web.Response:
+         if request.path == "/first":
+@@ -1930,7 +1930,7 @@ def observe_data_received(self: RequestHandler[web.Request], data: bytes) -> Non
+         data_received(self, data)
+         if self._message_tail:
+             max_tail = max(max_tail, len(self._message_tail))
+-            if self._msg_queue_paused:
++            if self._buffer_paused:
+                 reading_paused.set()
+ 
+     monkeypatch.setattr(RequestHandler, "data_received", observe_data_received)
+@@ -2006,7 +2006,7 @@ async def test_upgrade_tail_resumes_reading_after_websocket_prepare(
+ 
+     def observe_data_received(self: RequestHandler[web.Request], data: bytes) -> None:
+         data_received(self, data)
+-        if self._msg_queue_paused:
++        if self._buffer_paused:
+             reading_paused.set()
+ 
+     monkeypatch.setattr(RequestHandler, "data_received", observe_data_received)
+diff --git a/tests/test_web_protocol.py b/tests/test_web_protocol.py
+index a88dedba3b9..1b7ba67d660 100644
+--- a/tests/test_web_protocol.py
++++ b/tests/test_web_protocol.py
+@@ -51,7 +51,7 @@ def test_data_received_calls_data_received_cb(
+     dummy_reader[1].feed_data.assert_called_once_with(b"x")
+ 
+ 
+-def test_pause_msg_queue_reading_without_transport(
++def test_pause_reading_for_buffer_without_transport(
+     event_loop: asyncio.AbstractEventLoop,
+     dummy_manager: Server[BaseRequest],
+ ) -> None:
+@@ -59,12 +59,12 @@ def test_pause_msg_queue_reading_without_transport(
+     handler = RequestHandler(dummy_manager, loop=event_loop)
+     handler.transport = None
+ 
+-    handler._pause_msg_queue_reading()
++    handler._pause_reading_for_buffer()
+ 
+-    assert handler._msg_queue_paused is True
++    assert handler._buffer_paused is True
+ 
+ 
+-def test_resume_msg_queue_reading_after_upgrade_skips_reparse(
++def test_resume_reading_if_drained_after_upgrade_skips_reparse(
+     event_loop: asyncio.AbstractEventLoop,
+     dummy_manager: Server[BaseRequest],
+ ) -> None:
+@@ -73,18 +73,18 @@ def test_resume_msg_queue_reading_after_upgrade_skips_reparse(
+     transport = mock.Mock()
+     handler.transport = transport
+     handler._upgraded = True
+-    handler._msg_queue_paused = True
++    handler._buffer_paused = True
+     handler._reading_paused = False
+ 
+     with mock.patch.object(RequestHandler, "data_received") as data_received:
+-        handler._resume_msg_queue_reading()
++        handler._resume_reading_if_drained()
+ 
+     data_received.assert_not_called()
+-    assert handler._msg_queue_paused is False
++    assert handler._buffer_paused is False
+     transport.resume_reading.assert_called_once_with()
+ 
+ 
+-def test_resume_msg_queue_reading_without_transport(
++def test_resume_reading_if_drained_without_transport(
+     event_loop: asyncio.AbstractEventLoop,
+     dummy_manager: Server[BaseRequest],
+ ) -> None:
+@@ -92,14 +92,14 @@ def test_resume_msg_queue_reading_without_transport(
+     handler = RequestHandler(dummy_manager, loop=event_loop)
+     handler.transport = None
+     handler._upgraded = True  # skip the reparse branch
+-    handler._msg_queue_paused = True
++    handler._buffer_paused = True
+ 
+-    handler._resume_msg_queue_reading()
++    handler._resume_reading_if_drained()
+ 
+-    assert handler._msg_queue_paused is False
++    assert handler._buffer_paused is False
+ 
+ 
+-def test_resume_msg_queue_reading_stays_paused_for_full_tail(
++def test_resume_reading_if_drained_stays_paused_for_full_tail(
+     event_loop: asyncio.AbstractEventLoop,
+     dummy_manager: Server[BaseRequest],
+ ) -> None:
+@@ -112,16 +112,16 @@ def test_resume_msg_queue_reading_stays_paused_for_full_tail(
+     transport = mock.create_autospec(asyncio.Transport, spec_set=True, instance=True)
+     handler.transport = transport
+     handler._upgraded = True
+-    handler._msg_queue_paused = True
++    handler._buffer_paused = True
+     handler._message_tail = b"x" * 1024
+ 
+-    handler._resume_msg_queue_reading()
++    handler._resume_reading_if_drained()
+ 
+-    assert handler._msg_queue_paused is True
++    assert handler._buffer_paused is True
+     transport.resume_reading.assert_not_called()
+ 
+ 
+-def test_resume_msg_queue_reading_with_room_left_in_tail(
++def test_resume_reading_if_drained_with_room_left_in_tail(
+     event_loop: asyncio.AbstractEventLoop,
+     dummy_manager: Server[BaseRequest],
+ ) -> None:
+@@ -130,16 +130,16 @@ def test_resume_msg_queue_reading_with_room_left_in_tail(
+     transport = mock.create_autospec(asyncio.Transport, spec_set=True, instance=True)
+     handler.transport = transport
+     handler._upgraded = True
+-    handler._msg_queue_paused = True
++    handler._buffer_paused = True
+     handler._message_tail = b"x" * 1023
+ 
+-    handler._resume_msg_queue_reading()
++    handler._resume_reading_if_drained()
+ 
+-    assert handler._msg_queue_paused is False
++    assert handler._buffer_paused is False
+     transport.resume_reading.assert_called_once_with()
+ 
+ 
+-def test_resume_msg_queue_reading_with_zero_read_bufsize(
++def test_resume_reading_if_drained_with_zero_read_bufsize(
+     event_loop: asyncio.AbstractEventLoop,
+     dummy_manager: Server[BaseRequest],
+ ) -> None:
+@@ -152,11 +152,11 @@ def test_resume_msg_queue_reading_with_zero_read_bufsize(
+     transport = mock.create_autospec(asyncio.Transport, spec_set=True, instance=True)
+     handler.transport = transport
+     handler._upgraded = True
+-    handler._msg_queue_paused = True
++    handler._buffer_paused = True
+ 
+-    handler._resume_msg_queue_reading()
++    handler._resume_reading_if_drained()
+ 
+-    assert handler._msg_queue_paused is False
++    assert handler._buffer_paused is False
+     transport.resume_reading.assert_called_once_with()
+ 
+ 
+@@ -170,14 +170,14 @@ def test_set_parser_resumes_reading_paused_for_tail(
+     transport = mock.create_autospec(asyncio.Transport, spec_set=True, instance=True)
+     handler.transport = transport
+     handler._upgraded = True
+-    handler._msg_queue_paused = True
++    handler._buffer_paused = True
+     handler._message_tail = b"x" * 1024
+ 
+     handler.set_parser(dummy_reader[0])
+ 
+     dummy_reader[1].feed_data.assert_called_once_with(b"x" * 1024)
+     assert handler._message_tail == b""
+-    assert handler._msg_queue_paused is False
++    assert handler._buffer_paused is False
+     transport.resume_reading.assert_called_once_with()
+ 
+ 
+@@ -189,14 +189,14 @@ def test_resume_reading_stays_paused_for_msg_queue(
+     handler = RequestHandler(dummy_manager, loop=event_loop)
+     transport = mock.Mock()
+     handler.transport = transport
+-    handler._msg_queue_paused = True
++    handler._buffer_paused = True
+ 
+     handler.resume_reading()
+ 
+     transport.resume_reading.assert_not_called()
+ 
+ 
+-def test_pause_msg_queue_reading_ignores_unsupported_transport(
++def test_pause_reading_for_buffer_ignores_unsupported_transport(
+     event_loop: asyncio.AbstractEventLoop,
+     dummy_manager: Server[BaseRequest],
+ ) -> None:
+@@ -205,12 +205,12 @@ def test_pause_msg_queue_reading_ignores_unsupported_transport(
+     # Bare asyncio.Transport.pause_reading() raises NotImplementedError.
+     handler.transport = asyncio.Transport()
+ 
+-    handler._pause_msg_queue_reading()
++    handler._pause_reading_for_buffer()
+ 
+-    assert handler._msg_queue_paused is True
++    assert handler._buffer_paused is True
+ 
+ 
+-def test_resume_msg_queue_reading_ignores_unsupported_transport(
++def test_resume_reading_if_drained_ignores_unsupported_transport(
+     event_loop: asyncio.AbstractEventLoop,
+     dummy_manager: Server[BaseRequest],
+ ) -> None:
+@@ -219,8 +219,8 @@ def test_resume_msg_queue_reading_ignores_unsupported_transport(
+     # Bare asyncio.Transport.resume_reading() raises NotImplementedError.
+     handler.transport = asyncio.Transport()
+     handler._upgraded = True  # skip the reparse branch
+-    handler._msg_queue_paused = True
++    handler._buffer_paused = True
+ 
+-    handler._resume_msg_queue_reading()
++    handler._resume_reading_if_drained()
+ 
+-    assert handler._msg_queue_paused is False
++    assert handler._buffer_paused is False
