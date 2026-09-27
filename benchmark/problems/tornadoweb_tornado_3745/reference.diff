@@ -1,0 +1,464 @@
+diff --git a/tornado/iostream.py b/tornado/iostream.py
+index df8b12468..05467670a 100644
+--- a/tornado/iostream.py
++++ b/tornado/iostream.py
+@@ -635,7 +635,10 @@ def _signal_closed(self) -> None:
+                     self._ssl_connect_future.set_exception(self.error)
+                 else:
+                     self._ssl_connect_future.set_exception(StreamClosedError())
+-            self._ssl_connect_future.exception()
++            try:
++                self._ssl_connect_future.exception()
++            except asyncio.CancelledError:
++                pass
+             self._ssl_connect_future = None
+         if self._close_callback is not None:
+             cb = self._close_callback
+@@ -1201,7 +1204,7 @@ def start_tls(
+         server_side: bool,
+         ssl_options: dict[str, Any] | ssl.SSLContext | None = None,
+         server_hostname: str | None = None,
+-    ) -> Awaitable["SSLIOStream"]:
++    ) -> "Future[SSLIOStream]":
+         """Convert this `IOStream` to an `SSLIOStream`.
+ 
+         This enables protocols that begin in clear-text mode and
+@@ -1235,6 +1238,10 @@ def start_tls(
+            SSL certificates are validated by default; pass
+            ``ssl_options=dict(cert_reqs=ssl.CERT_NONE)`` or a
+            suitably-configured `ssl.SSLContext` to disable.
++
++        .. versionchanged:: 6.6
++           Cancelling the returned `.Future` before the handshake completes
++           now closes the new stream and its socket.
+         """
+         if (
+             self._read_future
+@@ -1270,6 +1277,13 @@ def start_tls(
+         ssl_stream._ssl_connect_future = future
+         ssl_stream.max_buffer_size = self.max_buffer_size
+         ssl_stream.read_chunk_size = self.read_chunk_size
++        # The socket now belongs to ssl_stream, which the caller can't see
++        # until the handshake completes. If the caller gives up (e.g. on a
++        # timeout) and cancels the future, close the stream so the socket
++        # is not leaked.
++        future.add_done_callback(
++            lambda f: ssl_stream.close() if f.cancelled() else None
++        )
+         return future
+ 
+     def _handle_connect(self) -> None:
+diff --git a/tornado/simple_httpclient.py b/tornado/simple_httpclient.py
+index a124c0389..d428bf21c 100644
+--- a/tornado/simple_httpclient.py
++++ b/tornado/simple_httpclient.py
+@@ -325,19 +325,22 @@ async def run(self) -> None:
+                 timeout = self.request.request_timeout
+             else:
+                 timeout = 0
+-            if timeout:
+-                self._timeout = self.io_loop.add_timeout(
+-                    self.start_time + timeout,
+-                    functools.partial(self._on_timeout, "while connecting"),
++            try:
++                stream = await self.tcp_client.connect(
++                    host,
++                    port,
++                    af=af,
++                    ssl_options=ssl_options,
++                    max_buffer_size=self.max_buffer_size,
++                    source_ip=source_ip,
++                    timeout=(
++                        self.start_time + timeout - self.io_loop.time()
++                        if timeout
++                        else None
++                    ),
+                 )
+-            stream = await self.tcp_client.connect(
+-                host,
+-                port,
+-                af=af,
+-                ssl_options=ssl_options,
+-                max_buffer_size=self.max_buffer_size,
+-                source_ip=source_ip,
+-            )
++            except gen.TimeoutError:
++                raise HTTPTimeoutError("Timeout while connecting") from None
+ 
+             if self.final_callback is None:
+                 # final_callback is cleared if we've hit our timeout.
+diff --git a/tornado/tcpclient.py b/tornado/tcpclient.py
+index 742e537dd..09be9203c 100644
+--- a/tornado/tcpclient.py
++++ b/tornado/tcpclient.py
+@@ -99,10 +99,13 @@ def start(
+         timeout: float = _INITIAL_CONNECT_TIMEOUT,
+         connect_timeout: float | datetime.timedelta | None = None,
+     ) -> "Future[Tuple[socket.AddressFamily, Any, IOStream]]":
+-        self.try_connect(iter(self.primary_addrs))
++        # Set the timeouts first: try_connect may fail synchronously, and
++        # on_connect_done will then skip ahead to the secondary addresses.
+         self.set_timeout(timeout)
+         if connect_timeout is not None:
+             self.set_connect_timeout(connect_timeout)
++        self.try_connect(iter(self.primary_addrs))
++        future_add_done_callback(self.future, self.on_future_done)
+         return self.future
+ 
+     def try_connect(self, addrs: Iterator[tuple[socket.AddressFamily, tuple]]) -> None:
+@@ -117,8 +120,16 @@ def try_connect(self, addrs: Iterator[tuple[socket.AddressFamily, tuple]]) -> No
+                     self.last_error or IOError("connection failed")
+                 )
+             return
+-        stream, future = self.connect(af, addr)
+-        self.streams.add(stream)
++        try:
++            stream, future = self.connect(af, addr)
++        except Exception as e:
++            # Report synchronous errors (e.g. an address family that is
++            # not supported on this system) through the same path as
++            # asynchronous ones, so we move on to the next address.
++            future = Future()
++            future.set_exception(e)
++        else:
++            self.streams.add(stream)
+         future_add_done_callback(
+             future, functools.partial(self.on_connect_done, addrs, af, addr)
+         )
+@@ -155,6 +166,16 @@ def on_connect_done(
+             self.future.set_result((af, addr, stream))
+             self.close_streams()
+ 
++    def on_future_done(
++        self, future: "Future[Tuple[socket.AddressFamily, Any, IOStream]]"
++    ) -> None:
++        if future.cancelled():
++            # The caller gave up (e.g. asyncio.wait_for). Close any
++            # connection attempts that are still in progress instead of
++            # leaving them open until the OS gives up on them.
++            self.clear_timeouts()
++            self.close_streams()
++
+     def set_timeout(self, timeout: float) -> None:
+         self.timeout = self.io_loop.add_timeout(
+             self.io_loop.time() + timeout, self.on_timeout
+@@ -272,17 +293,20 @@ async def connect(
+         # information here and reuse it on subsequent connections to
+         # the same host. (http://tools.ietf.org/html/rfc6555#section-4.2)
+         if ssl_options is not None:
+-            if timeout is not None:
+-                stream = await gen.with_timeout(
+-                    timeout,
+-                    stream.start_tls(
+-                        False, ssl_options=ssl_options, server_hostname=host
+-                    ),
+-                )
+-            else:
+-                stream = await stream.start_tls(
+-                    False, ssl_options=ssl_options, server_hostname=host
+-                )
++            tls_future = stream.start_tls(
++                False, ssl_options=ssl_options, server_hostname=host
++            )
++            try:
++                if timeout is not None:
++                    stream = await gen.with_timeout(timeout, tls_future)
++                else:
++                    stream = await tls_future
++            finally:
++                # If we're exiting early (timeout or cancellation), cancel
++                # the handshake so the new SSLIOStream (which now owns the
++                # socket) is closed. with_timeout does not do this for us.
++                # This is a no-op if the handshake has already completed.
++                tls_future.cancel()
+         return stream
+ 
+     def _create_stream(
+@@ -305,19 +329,12 @@ def _create_stream(
+             # - 127.0.0.1 for IPv4
+             # - ::1 for IPv6
+         socket_obj = socket.socket(af)
+-        if source_port_bind or source_ip_bind:
+-            # If the user requires binding also to a specific IP/port.
+-            try:
+-                socket_obj.bind((source_ip_bind, source_port_bind))
+-            except OSError:
+-                socket_obj.close()
+-                # Fail loudly if unable to use the IP/port.
+-                raise
+         try:
++            if source_port_bind or source_ip_bind:
++                # If the user requires binding also to a specific IP/port.
++                socket_obj.bind((source_ip_bind, source_port_bind))
+             stream = IOStream(socket_obj, max_buffer_size=max_buffer_size)
+-        except OSError as e:
+-            fu: Future[IOStream] = Future()
+-            fu.set_exception(e)
+-            return stream, fu
+-        else:
+-            return stream, stream.connect(addr)
++        except BaseException:
++            socket_obj.close()
++            raise
++        return stream, stream.connect(addr)
+diff --git a/tornado/test/iostream_test.py b/tornado/test/iostream_test.py
+index 841246ccb..e857d5a85 100644
+--- a/tornado/test/iostream_test.py
++++ b/tornado/test/iostream_test.py
+@@ -1152,6 +1152,17 @@ def test_check_hostname(self):
+                 # The server fails to connect, but the exact error is unspecified.
+                 yield server_future
+ 
++    @gen_test
++    def test_start_tls_cancellation(self):
++        # The server never responds to the handshake. Cancelling the client's
++        # start_tls future must close the underlying socket (#3614).
++        client_future = self.client_start_tls(dict(cert_reqs=ssl.CERT_NONE))
++        client_future.cancel()
++        self.assertTrue(client_future.cancelled())
++        # read_until_close only completes if the client's socket was closed.
++        assert self.server_stream is not None
++        yield self.server_stream.read_until_close()
++
+     @gen_test
+     def test_typed_memoryview(self):
+         # Test support of memoryviews with an item size greater than 1 byte.
+diff --git a/tornado/test/simple_httpclient_test.py b/tornado/test/simple_httpclient_test.py
+index 2e5c9eb59..f18a0a3db 100644
+--- a/tornado/test/simple_httpclient_test.py
++++ b/tornado/test/simple_httpclient_test.py
+@@ -28,15 +28,17 @@
+ from tornado.http1connection import _MAX_1XX_RESPONSES
+ from tornado.httputil import HTTPHeaders, ResponseStartLine
+ from tornado.ioloop import IOLoop
+-from tornado.iostream import UnsatisfiableReadError
++from tornado.iostream import IOStream, UnsatisfiableReadError
+ from tornado.locks import Event
+ from tornado.log import gen_log
+ from tornado.netutil import Resolver, bind_sockets
++from tornado.queues import Queue
+ from tornado.simple_httpclient import (
+     HTTPStreamClosedError,
+     HTTPTimeoutError,
+     SimpleAsyncHTTPClient,
+ )
++from tornado.tcpserver import TCPServer
+ from tornado.test import httpclient_test
+ from tornado.test.httpclient_test import (
+     ChunkHandler,
+@@ -896,6 +898,40 @@ def test_resolve_timeout(self):
+         self.io_loop.run_sync(lambda: gen.sleep(0))
+ 
+ 
++class TLSHandshakeTimeoutTestCase(AsyncTestCase):
++    # The server accepts the connection but never responds to the TLS
++    # handshake. The client's socket must be closed when the connect
++    # timeout expires (#2785).
++    @gen_test
++    def test_tls_handshake_timeout(self):
++        [listener] = bind_sockets(0, "127.0.0.1", socket.AF_INET)
++        port = listener.getsockname()[1]
++        streams: Queue[IOStream] = Queue()
++
++        class SilentServer(TCPServer):
++            def handle_stream(self, stream, address):
++                streams.put(stream)
++
++        server = SilentServer()
++        server.add_sockets([listener])
++        try:
++            with closing(SimpleAsyncHTTPClient(force_instance=True)) as client:
++                # The timeout must be long enough for the TCP connection to
++                # be established (which can be slow on windows), so that it
++                # expires during the TLS handshake.
++                with self.assertRaises(HTTPTimeoutError):
++                    yield client.fetch(
++                        "https://127.0.0.1:%d/" % port,
++                        connect_timeout=0.5,
++                        validate_cert=False,
++                    )
++            server_stream = yield streams.get()
++            # This only completes once the client has closed its socket.
++            yield server_stream.read_until_close()
++        finally:
++            server.stop()
++
++
+ class MaxHeaderSizeTest(AsyncHTTPTestCase):
+     def get_app(self):
+         class SmallHeaders(RequestHandler):
+diff --git a/tornado/test/tcpclient_test.py b/tornado/test/tcpclient_test.py
+index ade2d964b..c8470c8d1 100644
+--- a/tornado/test/tcpclient_test.py
++++ b/tornado/test/tcpclient_test.py
+@@ -12,8 +12,10 @@
+ # WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ # License for the specific language governing permissions and limitations
+ # under the License.
++import asyncio
+ import getpass
+ import socket
++import ssl
+ import typing
+ from contextlib import closing
+ 
+@@ -136,6 +138,57 @@ def test_refused_ipv4(self):
+         with self.assertRaises(IOError):
+             yield self.client.connect("127.0.0.1", port)
+ 
++    def tls_context(self):
++        context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
++        context.check_hostname = False
++        context.verify_mode = ssl.CERT_NONE
++        return context
++
++    # In the following tests the server accepts the connection but never
++    # responds to the TLS handshake. The client's socket must be closed when
++    # the connection attempt is abandoned (#3614). The server's
++    # read_until_close only completes once the client has closed it.
++
++    @gen_test
++    def test_connect_tls_timeout_closes_stream(self):
++        port = self.start_server(socket.AF_INET)
++        # The timeout must be long enough for the TCP connection to be
++        # established (which can be slow on windows), so that it expires
++        # during the TLS handshake.
++        with self.assertRaises(TimeoutError):
++            yield self.client.connect(
++                "127.0.0.1", port, ssl_options=self.tls_context(), timeout=0.5
++            )
++        assert self.server is not None
++        server_stream = yield self.server.queue.get()
++        yield server_stream.read_until_close()
++
++    async def do_test_connect_tls_cancel(self, timeout):
++        port = self.start_server(socket.AF_INET)
++        connect_future = asyncio.ensure_future(
++            self.client.connect(
++                "127.0.0.1", port, ssl_options=self.tls_context(), timeout=timeout
++            )
++        )
++        assert self.server is not None
++        server_stream = await self.server.queue.get()
++        # Wait for the start of the handshake so we know the client is past
++        # the TCP connection phase before cancelling.
++        await server_stream.read_bytes(1, partial=True)
++        connect_future.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await connect_future
++        await server_stream.read_until_close()
++
++    @gen_test
++    async def test_connect_tls_cancel_closes_stream(self):
++        await self.do_test_connect_tls_cancel(timeout=None)
++
++    @gen_test
++    async def test_connect_tls_cancel_with_timeout_closes_stream(self):
++        # A timeout is set but the caller cancels first.
++        await self.do_test_connect_tls_cancel(timeout=3600)
++
+     def test_source_ip_fail(self):
+         """Fail when trying to use the source IP Address '8.8.8.8'."""
+         self.assertRaises(
+@@ -146,6 +199,27 @@ def test_source_ip_fail(self):
+             source_ip="8.8.8.8",
+         )
+ 
++    @gen_test
++    def test_source_ip_mixed_families(self):
++        # Binding an IPv4 source_ip on an IPv6 socket fails (as does creating
++        # the socket, if IPv6 is unsupported); fall back to the IPv4 address.
++        port = self.start_server(socket.AF_INET)
++
++        class MixedResolver(Resolver):
++            async def resolve(self, host, port, family=socket.AF_UNSPEC):
++                return [
++                    (socket.AF_INET6, ("::1", port, 0, 0)),
++                    (socket.AF_INET, ("127.0.0.1", port)),
++                ]
++
++        client = TCPClient(resolver=MixedResolver())
++        try:
++            stream = yield client.connect("localhost", port, source_ip="127.0.0.1")
++            with closing(stream):
++                self.assertEqual(stream.socket.family, socket.AF_INET)
++        finally:
++            client.close()
++
+     def test_source_ip_success(self):
+         """Success when trying to use the source IP Address '127.0.0.1'."""
+         self.do_test_connect(socket.AF_INET, "127.0.0.1", source_ip="127.0.0.1")
+@@ -209,6 +283,8 @@ def setUp(self):
+         ] = {}
+         self.streams: dict[typing.Any, ConnectorTest.FakeStream] = {}
+         self.addrinfo = [(AF1, "a"), (AF1, "b"), (AF2, "c"), (AF2, "d")]
++        # Addresses for which create_stream raises synchronously.
++        self.sync_failures: set[typing.Any] = set()
+ 
+     def tearDown(self):
+         # Unless explicitly checked (and popped) in the test, we shouldn't
+@@ -218,6 +294,8 @@ def tearDown(self):
+         super().tearDown()
+ 
+     def create_stream(self, af, addr):
++        if addr in self.sync_failures:
++            raise OSError("sync failure for %s" % addr)
+         stream = ConnectorTest.FakeStream()
+         self.streams[addr] = stream
+         future: Future[ConnectorTest.FakeStream] = Future()
+@@ -336,6 +414,55 @@ def test_all_fail(self):
+         self.resolve_connect(AF1, "b", False)
+         self.assertRaises(IOError, future.result)
+ 
++    def test_sync_failure_first_address(self):
++        # A synchronous failure is treated like an immediate asynchronous
++        # one: move on to the next address and start the secondary family
++        # without waiting for the timeout.
++        self.sync_failures.add("a")
++        conn, future = self.start_connect(self.addrinfo)
++        self.assert_pending((AF1, "b"), (AF2, "c"))
++        self.resolve_connect(AF1, "b", True)
++        self.assertEqual(future.result(), (AF1, "b", self.streams["b"]))
++        self.resolve_connect(AF2, "c", True)
++        self.assertTrue(self.streams.pop("c").closed)
++
++    def test_sync_failure_whole_family(self):
++        # e.g. AF_INET6 sockets are not supported on this system.
++        self.sync_failures.update(["a", "b"])
++        conn, future = self.start_connect(self.addrinfo)
++        self.assert_pending((AF2, "c"))
++        self.resolve_connect(AF2, "c", True)
++        self.assertEqual(future.result(), (AF2, "c", self.streams["c"]))
++
++    def test_sync_failure_in_callback(self):
++        # Synchronous failures while starting the next attempt from a
++        # callback must not leave the connector hanging.
++        self.sync_failures.update(["b", "c", "d"])
++        conn, future = self.start_connect(self.addrinfo)
++        self.assert_pending((AF1, "a"))
++        self.resolve_connect(AF1, "a", False)
++        self.assert_pending()
++        with self.assertRaisesRegex(OSError, "sync failure"):
++            future.result()
++
++    def test_sync_failure_all(self):
++        self.sync_failures.update(["a", "b", "c", "d"])
++        conn, future = self.start_connect(self.addrinfo)
++        self.assert_pending()
++        with self.assertRaisesRegex(OSError, "sync failure"):
++            future.result()
++
++    def test_cancel(self):
++        conn, future = self.start_connect(self.addrinfo)
++        conn.on_timeout()
++        self.assert_pending((AF1, "a"), (AF2, "c"))
++        future.cancel()
++        # Run the loop to allow callbacks to be run.
++        self.io_loop.add_callback(self.stop)
++        self.wait()
++        self.assertTrue(self.streams.pop("a").closed)
++        self.assertTrue(self.streams.pop("c").closed)
++
+     def test_one_family_timeout_after_connect_timeout(self):
+         conn, future = self.start_connect([(AF1, "a"), (AF1, "b")])
+         self.assert_pending((AF1, "a"))

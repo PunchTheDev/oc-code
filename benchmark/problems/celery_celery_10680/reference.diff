@@ -1,0 +1,230 @@
+diff --git a/celery/backends/couchbase.py b/celery/backends/couchbase.py
+index f01cb958ad4..19362232b26 100644
+--- a/celery/backends/couchbase.py
++++ b/celery/backends/couchbase.py
+@@ -12,6 +12,17 @@
+ except ImportError:
+     Cluster = PasswordAuthenticator = None
+ 
++try:
++    from couchbase.exceptions import DocumentNotFoundException
++except ImportError:  # pragma: no cover
++    class DocumentNotFoundException(Exception):
++        """Stand-in so ``except`` clauses stay valid without the SDK."""
++
++try:
++    from couchbase.options import GetMultiOptions
++except ImportError:  # pragma: no cover
++    GetMultiOptions = None
++
+ try:
+     from couchbase_core._libcouchbase import FMT_AUTO
+ except ImportError:
+@@ -98,7 +109,12 @@ def connection(self):
+         return self._get_connection()
+ 
+     def get(self, key):
+-        return self.connection.get(key).content
++        try:
++            return self.connection.get(key).content
++        except DocumentNotFoundException:
++            # A missing document means no (or expired) result, not an error:
++            # the KV backend contract is to return None for absent keys.
++            return None
+ 
+     def set(self, key, value):
+         # Since 4.0.0 value is JSONType in couchbase lib, so parameter format isn't needed
+@@ -108,7 +124,28 @@ def set(self, key, value):
+             self.connection.upsert(key, value, ttl=self.expires)
+ 
+     def mget(self, keys):
+-        return self.connection.get_multi(keys)
++        # ``get_multi`` returns a MultiGetResult, which is neither a mapping
++        # (no ``.items()``) nor iterable, so the KV contract's
++        # ``_mget_to_results`` cannot consume it. By default it also raises
++        # on the first failed key. Ask the SDK to keep per-key results, then
++        # build the plain dict: a missing document means no result (None),
++        # any other per-key failure is a real error and is re-raised.
++        if GetMultiOptions is None:  # pragma: no cover - SDK without the option
++            return self.connection.get_multi(keys)
++        result = self.connection.get_multi(
++            keys, GetMultiOptions(return_exceptions=True))
++        values = {key: None for key in keys}
++        for key, res in result.results.items():
++            values[key] = res.content
++        for exc in result.exceptions.values():
++            if not isinstance(exc, DocumentNotFoundException):
++                raise exc
++        return values
+ 
+     def delete(self, key):
+-        self.connection.remove(key)
++        try:
++            self.connection.remove(key)
++        except DocumentNotFoundException:
++            # Deleting an absent (already expired or forgotten) key is a
++            # no-op, matching the other KV backends.
++            pass
+diff --git a/requirements/test-ci-default.txt b/requirements/test-ci-default.txt
+index f648436d433..3ce07587253 100644
+--- a/requirements/test-ci-default.txt
++++ b/requirements/test-ci-default.txt
+@@ -12,7 +12,11 @@
+ -r extras/thread.txt
+ -r extras/elasticsearch.txt
+ -r extras/couchdb.txt
+-# -r extras/couchbase.txt
++# The couchbase unit tests mock the SDK but import it (importorskip), so they
++# only run when it is installed. Mirrors extras/couchbase.txt minus the
++# platforms without wheels: no PyPy builds, no CPython 3.15 wheel, and the
++# Windows job only runs 3.14 which has no wheel either.
++couchbase>=3.0.0; platform_python_implementation != 'PyPy' and platform_system != 'Windows' and python_version < '3.15'
+ -r extras/arangodb.txt
+ -r extras/consul.txt
+ -r extras/cosmosdbsql.txt
+diff --git a/t/unit/backends/test_couchbase.py b/t/unit/backends/test_couchbase.py
+index b720b2525c5..7c5bacb7c3a 100644
+--- a/t/unit/backends/test_couchbase.py
++++ b/t/unit/backends/test_couchbase.py
+@@ -1,4 +1,5 @@
+ """Tests for the CouchbaseBackend."""
++import json
+ from datetime import timedelta
+ from unittest.mock import MagicMock, Mock, patch, sentinel
+ 
+@@ -19,6 +20,23 @@
+ 
+ pytest.importorskip('couchbase')
+ 
++from couchbase.exceptions import DocumentNotFoundException, TimeoutException  # noqa: E402
++
++
++class FakeGetResult:
++    def __init__(self, content):
++        self.content = content
++
++
++class FakeMultiGetResult:
++    """Mirrors the real couchbase 4.x MultiGetResult shape: no ``.items()``
++    and not iterable; successes in ``results``, per-key failures in
++    ``exceptions``."""
++
++    def __init__(self, results, exceptions=None):
++        self.results = results
++        self.exceptions = exceptions if exceptions is not None else {}
++
+ 
+ class test_CouchbaseBackend:
+ 
+@@ -61,6 +79,95 @@ def test_get(self):
+         assert x.get('1f3fab') == sentinel.retval
+         x._connection.get.assert_called_once_with('1f3fab')
+ 
++    def test_get_missing_document_returns_None(self):
++        x = CouchbaseBackend(app=self.app)
++        x._connection = Mock()
++        x._connection.get = Mock(
++            side_effect=DocumentNotFoundException('missing'))
++        # absent or expired results must surface as None, like every
++        # other KV backend, not as an exception through get_task_meta
++        assert x.get('1f3fab') is None
++        x._connection.get.assert_called_once_with('1f3fab')
++
++    def test_get_task_meta_pending_for_missing_document(self):
++        # the user-visible contract this PR is about: AsyncResult(id).state
++        # must read PENDING when the result document was never stored (or
++        # has expired), instead of raising
++        x = CouchbaseBackend(app=self.app)
++        x._connection = Mock()
++        x._connection.get = Mock(
++            side_effect=DocumentNotFoundException('missing'))
++        assert x.get_task_meta('1f3fab')['status'] == states.PENDING
++
++    def test_get_unrelated_sdk_errors_propagate(self):
++        # only DocumentNotFoundException maps to an absent result; any other
++        # SDK error (a timeout, say) must still reach the caller instead of
++        # silently reading as a pending result
++        x = CouchbaseBackend(app=self.app)
++        x._connection = Mock()
++        x._connection.get = Mock(side_effect=TimeoutException('timed out'))
++        with pytest.raises(TimeoutException):
++            x.get('1f3fab')
++
++    def test_mget_returns_plain_dict(self):
++        # get_multi() returns a MultiGetResult which _mget_to_results
++        # cannot consume (no .items(), not iterable): get_many()/
++        # GroupResult.restore() used to die with TypeError on it
++        x = CouchbaseBackend(app=self.app)
++        x._connection = Mock()
++        x._connection.get_multi = Mock(return_value=FakeMultiGetResult({
++            'celery-task-meta-a': FakeGetResult('va'),
++            'celery-task-meta-b': FakeGetResult('vb'),
++        }))
++        assert x.mget(['celery-task-meta-a', 'celery-task-meta-b']) == {
++            'celery-task-meta-a': 'va',
++            'celery-task-meta-b': 'vb',
++        }
++
++    def test_mget_asks_for_per_key_exceptions(self):
++        # by default get_multi() raises on the first failed key, which would
++        # lose every other result in the batch
++        x = CouchbaseBackend(app=self.app)
++        x._connection = Mock()
++        x._connection.get_multi = Mock(return_value=FakeMultiGetResult({}))
++        x.mget(['a'])
++        opts = x._connection.get_multi.call_args[0][1]
++        assert opts['return_exceptions'] is True
++
++    def test_mget_missing_document_is_None(self):
++        # a missing/expired document is an absent result, not an error
++        x = CouchbaseBackend(app=self.app)
++        x._connection = Mock()
++        x._connection.get_multi = Mock(return_value=FakeMultiGetResult(
++            {'a': FakeGetResult('va')},
++            {'b': DocumentNotFoundException('missing')},
++        ))
++        assert x.mget(['a', 'b']) == {'a': 'va', 'b': None}
++
++    def test_mget_other_error_propagates(self):
++        x = CouchbaseBackend(app=self.app)
++        x._connection = Mock()
++        x._connection.get_multi = Mock(return_value=FakeMultiGetResult(
++            {'a': FakeGetResult('va')},
++            {'b': TimeoutException('timed out')},
++        ))
++        with pytest.raises(TimeoutException):
++            x.mget(['a', 'b'])
++
++    def test_get_many_with_missing_document(self):
++        # the user-visible path: one ready result alongside an absent one
++        # must come back without TypeError and without hanging on the miss
++        x = CouchbaseBackend(app=self.app)
++        x._connection = Mock()
++        payload = json.dumps({'status': states.SUCCESS, 'result': 42})
++        x._connection.get_multi = Mock(return_value=FakeMultiGetResult(
++            {x.get_key_for_task('a'): FakeGetResult(payload)},
++            {x.get_key_for_task('b'): DocumentNotFoundException('missing')},
++        ))
++        results = dict(x.get_many(['a', 'b'], interval=0.001,
++                                  max_iterations=1))
++        assert results == {'a': {'status': states.SUCCESS, 'result': 42}}
++
+     def test_set_no_expires(self):
+         self.app.conf.couchbase_backend_settings = None
+         x = CouchbaseBackend(app=self.app)
+@@ -89,6 +196,15 @@ def test_delete(self):
+         assert x.delete('1f3fab') is None
+         x._connection.remove.assert_called_once_with('1f3fab')
+ 
++    def test_delete_missing_document_is_noop(self):
++        x = CouchbaseBackend(app=self.app)
++        x._connection = Mock()
++        x._connection.remove = Mock(
++            side_effect=DocumentNotFoundException('missing'))
++        # forget()/delete() on an already-expired or never-stored result
++        # must not raise, matching the other KV backends
++        assert x.delete('1f3fab') is None
++
+     def test_config_params(self):
+         self.app.conf.couchbase_backend_settings = {
+             'bucket': 'mycoolbucket',

@@ -1,0 +1,508 @@
+diff --git a/tornado/http1connection.py b/tornado/http1connection.py
+index fa14f2c225..fb6a7d84b7 100644
+--- a/tornado/http1connection.py
++++ b/tornado/http1connection.py
+@@ -22,6 +22,7 @@
+ import logging
+ import re
+ import types
++import zlib
+ from collections.abc import Awaitable, Callable
+ from typing import Optional, Type, cast
+ 
+@@ -768,9 +769,12 @@ async def data_received(self, chunk: bytes) -> None:
+         if self._decompressor:
+             compressed_data = chunk
+             while compressed_data:
+-                decompressed = self._decompressor.decompress(
+-                    compressed_data, self._chunk_size
+-                )
++                try:
++                    decompressed = self._decompressor.decompress(
++                        compressed_data, self._chunk_size
++                    )
++                except zlib.error as e:
++                    raise httputil.HTTPInputError("invalid gzip data: %s" % e)
+                 if decompressed:
+                     self._decompressed_body_size += len(decompressed)
+                     if self._decompressed_body_size > self._max_body_size:
+@@ -778,11 +782,14 @@ async def data_received(self, chunk: bytes) -> None:
+                     ret = self._delegate.data_received(decompressed)
+                     if ret is not None:
+                         await ret
+-                compressed_data = self._decompressor.unconsumed_tail
+-                if compressed_data and not decompressed:
++                tail = self._decompressor.unconsumed_tail
++                # A call that finishes a gzip member may return no output,
++                # but it must consume some input.
++                if not decompressed and len(tail) >= len(compressed_data):
+                     raise httputil.HTTPInputError(
+                         "encountered unconsumed gzip data without making progress"
+                     )
++                compressed_data = tail
+         else:
+             ret = self._delegate.data_received(chunk)
+             if ret is not None:
+@@ -790,17 +797,17 @@ async def data_received(self, chunk: bytes) -> None:
+ 
+     def finish(self) -> None:
+         if self._decompressor is not None:
+-            tail = self._decompressor.flush()
+-            if tail:
+-                # The tail should always be empty: decompress returned
+-                # all that it can in data_received and the only
+-                # purpose of the flush call is to detect errors such
+-                # as truncated input. If we did legitimately get a new
+-                # chunk at this point we'd need to change the
+-                # interface to make finish() a coroutine.
+-                raise ValueError(
+-                    "decompressor.flush returned data; possible truncated input"
+-                )
++            try:
++                # data_received has passed all the data to decompress, so
++                # this returns nothing; it checks for truncated input.
++                self._decompressor.flush()
++            except zlib.error as e:
++                # The wrapped delegate will never see finish(), and since this
++                # delegate has been finished, HTTP1Connection will not call
++                # our on_connection_close either. Close the wrapped delegate
++                # here so it gets exactly one of the two.
++                self._delegate.on_connection_close()
++                raise httputil.HTTPInputError("invalid gzip data: %s" % e)
+         return self._delegate.finish()
+ 
+     def on_connection_close(self) -> None:
+diff --git a/tornado/test/httpclient_test.py b/tornado/test/httpclient_test.py
+index df8bf45439..bb6c29893b 100644
+--- a/tornado/test/httpclient_test.py
++++ b/tornado/test/httpclient_test.py
+@@ -675,7 +675,7 @@ def test_invalid_gzip(self):
+         # test if client hangs on tricky invalid gzip
+         # curl/simple httpclient have different behavior (exception, logging)
+         with ExpectLog(
+-            gen_log, ".*Malformed HTTP message.*unconsumed gzip data", required=False
++            gen_log, ".*Malformed HTTP message.*invalid gzip data", required=False
+         ):
+             try:
+                 response = self.fetch("/invalid_gzip")
+diff --git a/tornado/test/httpserver_test.py b/tornado/test/httpserver_test.py
+index c4591fe672..93796d39b0 100644
+--- a/tornado/test/httpserver_test.py
++++ b/tornado/test/httpserver_test.py
+@@ -1126,6 +1126,28 @@ def test_gzip_case_insensitive(self):
+         )
+         self.assertEqual(json_decode(response.body), {"foo": ["bar"]})
+ 
++    def test_gzip_concatenated(self):
++        response = self.fetch(
++            "/",
++            method="POST",
++            body=gzip.compress(b"foo=") + gzip.compress(b"bar"),
++            headers={"Content-Encoding": "gzip"},
++        )
++        self.assertEqual(json_decode(response.body), {"foo": ["bar"]})
++
++    def test_gzip_invalid(self):
++        body = gzip.compress(b"foo=bar")
++        for invalid in [body + b"\0", body[:-1]]:
++            with self.subTest(invalid=invalid):
++                with ExpectLog(gen_log, ".*invalid gzip data", level=logging.INFO):
++                    response = self.fetch(
++                        "/",
++                        method="POST",
++                        body=invalid,
++                        headers={"Content-Encoding": "gzip"},
++                    )
++                self.assertEqual(response.code, 400)
++
+     def test_size_limit(self):
+         with ExpectLog(gen_log, ".*decompressed body too large", level=logging.INFO):
+             self.post_gzip("x" * 101)
+diff --git a/tornado/test/simple_httpclient_test.py b/tornado/test/simple_httpclient_test.py
+index 803b9b08d2..2e5c9eb59d 100644
+--- a/tornado/test/simple_httpclient_test.py
++++ b/tornado/test/simple_httpclient_test.py
+@@ -10,8 +10,10 @@
+ # implementation.
+ import collections
+ import errno
++import gzip
+ import logging
+ import os
++import random
+ import re
+ import socket
+ import ssl
+@@ -735,6 +737,64 @@ def test_too_many_1xx(self):
+                 self.fetch("/?num=%d" % (_MAX_1XX_RESPONSES + 1), raise_error=True)
+ 
+ 
++def gzip_members() -> list[bytes]:
++    # Each member is bigger than the connection's chunk_size (64KB), so that
++    # decompression goes through the max_length path of _GzipMessageDelegate.
++    # The first is incompressible, but seeded so that the handler and the
++    # test generate the same bytes without keeping them around.
++    return [random.Random(0).randbytes(100000), b"hello " * 20000]
++
++
++class GzipResponseHandler(RequestHandler):
++    def body(self, kind: str) -> bytes:
++        body = b"".join(gzip.compress(m) for m in gzip_members())
++        if kind == "truncated":
++            return body[:-1]
++        trailers = {
++            "concatenated": b"",
++            "trailing_nul": b"\0",
++            "trailing_garbage": b"garbage",
++        }
++        return body + trailers[kind]
++
++    def get(self, kind: str) -> None:
++        # Set Content-Encoding manually to avoid automatic gzip encoding.
++        self.set_header("Content-Encoding", "gzip")
++        self.write(self.body(kind))
++
++    def head(self, kind: str) -> None:
++        self.set_header("Content-Encoding", "gzip")
++        self.set_header("Content-Length", str(len(self.body(kind))))
++
++
++class GzipResponseTestCase(AsyncHTTPTestCase):
++    def get_http_client(self):
++        return SimpleAsyncHTTPClient(force_instance=True)
++
++    def get_app(self):
++        return Application([url("/(.*)", GzipResponseHandler)])
++
++    def test_concatenated(self):
++        response = self.fetch("/concatenated")
++        self.assertEqual(response.body, b"".join(gzip_members()))
++
++    def test_head(self):
++        response = self.fetch("/concatenated", method="HEAD")
++        self.assertEqual(response.code, 200)
++        self.assertEqual(response.body, b"")
++
++    def test_invalid(self):
++        for kind in ["trailing_nul", "trailing_garbage", "truncated"]:
++            with self.subTest(kind=kind):
++                with ExpectLog(
++                    gen_log,
++                    "Malformed HTTP message from None: invalid gzip data",
++                    level=logging.INFO,
++                ):
++                    with self.assertRaises(HTTPStreamClosedError):
++                        self.fetch("/" + kind, raise_error=True)
++
++
+ class HTTP204NoContentTestCase(AsyncHTTPTestCase):
+     def respond_204(self, request):
+         self.http1 = request.version.startswith("HTTP/1.")
+diff --git a/tornado/test/util_test.py b/tornado/test/util_test.py
+index 50d841aaad..f3c1708831 100644
+--- a/tornado/test/util_test.py
++++ b/tornado/test/util_test.py
+@@ -1,4 +1,6 @@
+ import datetime
++import gzip
++import random
+ import re
+ import sys
+ import textwrap
+@@ -9,6 +11,7 @@
+ from tornado.util import (
+     ArgReplacer,
+     Configurable,
++    GzipDecompressor,
+     exec_in,
+     import_object,
+     raise_exc_info,
+@@ -18,10 +21,126 @@
+ 
+ 
+ import unittest
++import warnings
++import zlib
+ 
+ from tornado.test.util import TestCase
+ 
+ 
++class GzipDecompressorTest(TestCase):
++    def members(self) -> list[bytes]:
++        return [
++            # Incompressible, so that members span many reads.
++            random.Random(0).randbytes(5000),
++            b"",
++            b"hello " * 2000,
++            b"x",
++        ]
++
++    def decompress(
++        self, data: bytes, read_size: int = 1024, max_length: int = 1024
++    ) -> bytes:
++        # Drive the decompressor the way _GzipMessageDelegate does.
++        decompressor = GzipDecompressor()
++        result = bytearray()
++        for i in range(0, len(data), read_size):
++            chunk = data[i : i + read_size]
++            while chunk:
++                output = decompressor.decompress(chunk, max_length)
++                self.assertLessEqual(len(output), max_length)
++                tail = decompressor.unconsumed_tail
++                self.assertTrue(output or len(tail) < len(chunk), "no progress")
++                chunk = tail
++                result += output
++        self.assertEqual(decompressor.flush(), b"")
++        return bytes(result)
++
++    def test_members(self):
++        streams = [gzip.compress(m) for m in self.members()]
++        cases = [streams[0], streams[2], b"".join(streams), b"".join(streams[1:])]
++        for data in cases:
++            for read_size in [1, 7, 100, 4096, len(data)]:
++                for max_length in [1, 100, 5000, 65536]:
++                    with self.subTest(
++                        len=len(data), read_size=read_size, max_length=max_length
++                    ):
++                        self.assertEqual(
++                            self.decompress(data, read_size, max_length),
++                            gzip.decompress(data),
++                        )
++
++    def test_member_ends_at_max_length(self):
++        # When the output of a member ends exactly at max_length, the next
++        # member must still be decompressed, even though the call that
++        # fills max_length may leave nothing more to read.
++        first = random.Random(0).randbytes(1000)
++        data = gzip.compress(first) + gzip.compress(b"second")
++        for max_length in [1000, 500, 100]:
++            for read_size in [len(data), 100]:
++                with self.subTest(max_length=max_length, read_size=read_size):
++                    self.assertEqual(
++                        self.decompress(data, read_size, max_length),
++                        first + b"second",
++                    )
++
++    def test_empty(self):
++        # A stream with no members, e.g. the body of a response to a HEAD request.
++        decompressor = GzipDecompressor()
++        self.assertEqual(decompressor.flush(), b"")
++
++    def test_trailing_data(self):
++        data = gzip.compress(b"hello")
++        for trailer in [b"\0", b"\0" * 16, b"\r\n", b"garbage", b"\x1f\x00"]:
++            for read_size in [1, 1024]:
++                with self.subTest(trailer=trailer, read_size=read_size):
++                    with self.assertRaises(zlib.error):
++                        self.decompress(data + trailer, read_size)
++
++    def test_truncated(self):
++        members = self.members()
++        first = gzip.compress(members[0])
++        second = gzip.compress(members[2])
++        for data in [
++            first[:-1],
++            first[: len(first) // 2],
++            first + second[:1],
++            first + second[:-1],
++        ]:
++            with self.subTest(len=len(data)):
++                with self.assertRaises(zlib.error):
++                    self.decompress(data)
++
++    def test_not_gzip(self):
++        for data in [b"<html>", zlib.compress(b"hello")]:
++            with self.subTest(data=data):
++                with self.assertRaises(zlib.error):
++                    self.decompress(data)
++
++    def test_flush_with_unconsumed_tail(self):
++        # A decompression bomb that the caller stops feeding back in after
++        # the first max_length bytes. flush must not decompress the rest.
++        compressor = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
++        block = b"\0" * (1024 * 1024)
++        bomb = b"".join(compressor.compress(block) for _ in range(16))
++        bomb += compressor.flush()
++        decompressor = GzipDecompressor()
++        self.assertEqual(len(decompressor.decompress(bomb, 1024)), 1024)
++        self.assertTrue(decompressor.unconsumed_tail)
++        with self.assertRaises(ValueError):
++            decompressor.flush()
++
++    def test_max_length_deprecated(self):
++        # Without max_length, all the members are decompressed in one call.
++        data = gzip.compress(b"hello") + gzip.compress(b" world")
++        decompressor = GzipDecompressor()
++        with warnings.catch_warnings(record=True) as w:
++            warnings.simplefilter("always")
++            self.assertEqual(decompressor.decompress(data), b"hello world")
++        self.assertEqual(len(w), 1)
++        self.assertIs(w[0].category, DeprecationWarning)
++        self.assertEqual(decompressor.flush(), b"")
++
++
+ class RaiseExcInfoTest(TestCase):
+     def test_two_arg_exception(self):
+         # This test would fail on python 3 if raise_exc_info were simply
+diff --git a/tornado/util.py b/tornado/util.py
+index 37b595e0b8..31a5e4e87d 100644
+--- a/tornado/util.py
++++ b/tornado/util.py
+@@ -17,6 +17,7 @@
+ import os
+ import re
+ import typing
++import warnings
+ import zlib
+ from collections.abc import Callable, Mapping, Sequence
+ from inspect import getfullargspec
+@@ -63,39 +64,140 @@ class GzipDecompressor:
+ 
+     The interface is like that of `zlib.decompressobj` (without some of the
+     optional arguments, but it understands gzip headers and checksums.
++
++    .. versionchanged:: 6.6
++
++       Streams containing multiple gzip members (as defined in :rfc:`1952`
++       section 2.2) are now decompressed in full; previously everything
++       after the first member was ignored. Any data after the last member
++       that is not the start of another member is now an error, as is a
++       stream that ends partway through a member.
+     """
+ 
+     def __init__(self) -> None:
++        # The decompressor for the member currently being read. It is None
++        # before the first member and between members, which are the only
++        # places the stream may validly end. (We can't create one up front
++        # and check its eof attribute instead, because a new decompressobj
++        # is not at eof, and an empty stream, such as the body of a
++        # response to a HEAD request, is valid, as it is for
++        # `gzip.decompress`.)
++        self._decompressobj: zlib._Decompress | None = None
++        # Input that has not been passed to ``_decompressobj``, because
++        # ``max_length`` cut a call short. This is what `unconsumed_tail`
++        # reports; callers must pass it back to `decompress`.
++        self._unconsumed_tail = b""
++
++    @staticmethod
++    def _new_decompressobj() -> "zlib._Decompress":
+         # Magic parameter makes zlib module understand gzip header
+         # http://stackoverflow.com/questions/1838699/how-can-i-decompress-a-gzip-stream-with-zlib
+         # This works on cpython and pypy, but not jython.
+-        self.decompressobj = zlib.decompressobj(16 + zlib.MAX_WBITS)
++        return zlib.decompressobj(16 + zlib.MAX_WBITS)
+ 
+     def decompress(self, value: bytes, max_length: int = 0) -> bytes:
+         """Decompress a chunk, returning newly-available data.
+ 
+-        Some data may be buffered for later processing; `flush` must
+-        be called when there is no more input data to ensure that
+-        all data was processed.
++        When there is no more input, call `flush` to check that the stream
++        was complete.
+ 
+         If ``max_length`` is given, some input data may be left over
+         in ``unconsumed_tail``; you must retrieve this value and pass
+         it back to a future call to `decompress` if it is not empty.
++        A call may return less than ``max_length``, or nothing at all,
++        even though ``unconsumed_tail`` is not empty (for example, at the
++        end of one gzip member and the start of the next), so keep
++        calling `decompress` until ``unconsumed_tail`` is empty.
++
++        Raises `zlib.error` if the input is not valid gzip data.
++
++        .. deprecated:: 6.6
++
++           Calling this method without ``max_length`` (or with
++           ``max_length=0``) is deprecated, because a small input can
++           decompress to an arbitrarily large output. In Tornado 7.0,
++           ``max_length`` will be required.
+         """
+-        return self.decompressobj.decompress(value, max_length)
++        if not max_length:
++            warnings.warn(
++                "GzipDecompressor.decompress without max_length is deprecated",
++                DeprecationWarning,
++                stacklevel=2,
++            )
++        result = self._decompress(value, max_length)
++        if not max_length:
++            # Without a limit, callers expect all the output at once, so we
++            # can't leave the start of the next member in unconsumed_tail.
++            while self._unconsumed_tail:
++                result += self._decompress(self._unconsumed_tail, 0)
++        return result
++
++    def _decompress(self, value: bytes, max_length: int) -> bytes:
++        # Each call makes one call to zlib; the caller loops over
++        # unconsumed_tail. This follows `gzip.decompress`, except that the
++        # header, CRC and length are checked by zlib itself.
++        if not value:
++            # Don't start a member (or report it as truncated) without data.
++            self._unconsumed_tail = b""
++            return b""
++        if self._decompressobj is None:
++            # This is the start of a member. zlib would reject anything
++            # else too, but with a less helpful message. value may be a
++            # single byte, in which case zlib checks the second one when it
++            # arrives.
++            if not b"\x1f\x8b".startswith(value[:2]):
++                raise zlib.error("expected a gzip member, got %r" % value[:2])
++            self._decompressobj = self._new_decompressobj()
++        result = self._decompressobj.decompress(value, max_length)
++        if self._decompressobj.eof:
++            # The rest of the input is the next member (or an error), so
++            # the caller must pass it back just like input that max_length
++            # held back. It is in unused_data; unconsumed_tail may hold a
++            # stale copy of it (a CPython bug), so don't look at that.
++            self._unconsumed_tail = self._decompressobj.unused_data
++            self._decompressobj = None
++        else:
++            self._unconsumed_tail = self._decompressobj.unconsumed_tail
++        return result
+ 
+     @property
+     def unconsumed_tail(self) -> bytes:
+         """Returns the unconsumed portion left over"""
+-        return self.decompressobj.unconsumed_tail
++        return self._unconsumed_tail
+ 
+     def flush(self) -> bytes:
+-        """Return any remaining buffered data not yet returned by decompress.
++        """Signals the end of the input.
++
++        Call this once, after the last call to `decompress`, to check that
++        the stream was complete. Raises `zlib.error` if the input ended
++        partway through a gzip member. Raises `ValueError` if
++        `unconsumed_tail` is not empty; it must be passed back to
++        `decompress` first.
++
++        Always returns an empty byte string, because `decompress` returns
++        all of the output. The return value is kept for compatibility with
++        `zlib.Decompress.flush`, whose interface this follows.
+ 
+-        Also checks for errors such as truncated input.
+         No other methods may be called on this object after `flush`.
++
++        .. versionchanged:: 6.6
++
++           Previously, this decompressed any remaining ``unconsumed_tail``
++           with no limit on the size of the output, and it did not detect
++           truncated input.
+         """
+-        return self.decompressobj.flush()
++        if self._unconsumed_tail:
++            raise ValueError(
++                "unconsumed_tail must be passed to decompress before flush"
++            )
++        if self._decompressobj is not None:
++            # A member has started but not ended. zlib is not holding back
++            # output that flushing it would return: when max_length cuts it
++            # off, the rest of the member, which includes at least its
++            # 8-byte trailer, is left in unconsumed_tail, which is empty. So
++            # zlib stopped because it ran out of input.
++            raise zlib.error("incomplete or truncated gzip stream")
++        return b""
+ 
+ 
+ def import_object(name: str) -> Any:

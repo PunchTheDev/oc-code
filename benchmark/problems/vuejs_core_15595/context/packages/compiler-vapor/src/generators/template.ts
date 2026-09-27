@@ -1,0 +1,350 @@
+import type { CodegenContext } from '../generate'
+import { DynamicFlag, type IRDynamicInfo, type IRTemplate } from '../ir'
+import { TemplateFlags } from '@vue/shared'
+import { genOperationWithInsertionState } from './operation'
+import {
+  type CodeFragment,
+  type CodeFragments,
+  IMPORT_EXPR_RE,
+  NEWLINE,
+  buildCodeFragment,
+  genCall,
+} from './utils'
+
+export function genTemplates(
+  templates: IRTemplate[],
+  context: CodegenContext,
+): string {
+  const result: string[] = []
+  templates.forEach(({ content, ns, root, static: isStatic }, i) => {
+    let args = JSON.stringify(content).replace(
+      // replace import expressions with string concatenation
+      IMPORT_EXPR_RE,
+      `" + $1 + "`,
+    )
+
+    const flags =
+      (root ? TemplateFlags.ROOT : 0) | (isStatic ? TemplateFlags.STATIC : 0)
+    if (flags || ns) {
+      args += `, ${flags}`
+    }
+
+    if (ns) {
+      args += `, ${ns}`
+    }
+
+    result.push(
+      `const ${context.tName(i)} = ${context.helper('template')}(${args})\n`,
+    )
+  })
+  return result.join('')
+}
+
+type FlushBeforeDynamic = (
+  dynamic: IRDynamicInfo,
+  push: (...items: CodeFragment[]) => number,
+) => void
+
+export function genSelf(
+  dynamic: IRDynamicInfo,
+  context: CodegenContext,
+  flushBeforeDynamic?: FlushBeforeDynamic,
+): CodeFragment[] {
+  const [frag, push] = buildCodeFragment()
+  const { id, template, operation, hasDynamicChild } = dynamic
+
+  if (id !== undefined && template !== undefined) {
+    push(NEWLINE, `const n${id} = ${context.tName(template)}()`)
+  }
+
+  if (operation) {
+    push(...genOperationWithInsertionState(operation, context))
+  }
+
+  if (hasDynamicChild) {
+    push(...genChildren(dynamic, context, push, `n${id}`, flushBeforeDynamic))
+  }
+
+  return frag
+}
+
+export function genChildren(
+  dynamic: IRDynamicInfo,
+  context: CodegenContext,
+  pushBlock: (...items: CodeFragment[]) => number,
+  from: CodeFragments = `n${dynamic.id}`,
+  flushBeforeDynamic?: FlushBeforeDynamic,
+): CodeFragment[] {
+  const [frag, push] = buildCodeFragment()
+  const { children } = dynamic
+
+  let offset = 0
+  /**
+   * `reusable` means the previous access target is a p* cursor that can be
+   * reassigned by the next lookup. Referenced n* variables must stay stable.
+   */
+  let prev:
+    | [variable: string, elementIndex: number, reusable: boolean]
+    | undefined
+
+  for (const [index, child] of children.entries()) {
+    if (child.flags & DynamicFlag.NON_TEMPLATE) {
+      offset--
+    }
+
+    if (child.flags & DynamicFlag.INSERT && child.template != null) {
+      // template node due to invalid nesting; anchored inserts locate their
+      // `<!>` placeholder first so INSERT_NODE can insert before it
+      if (child.anchor !== undefined) {
+        const elementIndex = index + offset
+        const variable = `n${child.anchor}`
+        pushBlock(
+          NEWLINE,
+          `const ${variable} = `,
+          ...genAccessPath(context, from, elementIndex, prev),
+        )
+        prev = [variable, elementIndex, false]
+      }
+      flushBeforeDynamic && flushBeforeDynamic(child, push)
+      push(...genSelf(child, context, flushBeforeDynamic))
+      continue
+    }
+
+    const id =
+      child.flags & DynamicFlag.REFERENCED
+        ? child.flags & DynamicFlag.INSERT
+          ? child.anchor
+          : child.id
+        : undefined
+    // A child created by its own operation (component, block, createElement-
+    // backed element) owns its subtree through genSelf; only children that
+    // sit in the parent template are descended into from here.
+    const ownsSubtree = child.operation !== undefined
+
+    if (id === undefined && (!child.hasDynamicChild || ownsSubtree)) {
+      flushBeforeDynamic && flushBeforeDynamic(child, push)
+      push(...genSelf(child, context, flushBeforeDynamic))
+      continue
+    }
+
+    const elementIndex = index + offset
+    const inlinePlaceholder =
+      id === undefined &&
+      canInlinePlaceholder(child) &&
+      child.template == null &&
+      child.operation === undefined &&
+      !(child.flags & (DynamicFlag.INSERT | DynamicFlag.NON_TEMPLATE))
+    const accessPath = genAccessPath(
+      context,
+      from,
+      elementIndex,
+      prev,
+      child.isText,
+    )
+
+    if (inlinePlaceholder) {
+      if (prev && prev[2]) {
+        push(
+          ...genChildren(
+            child,
+            context,
+            pushBlock,
+            ['(', prev[0], ' = ', ...accessPath, ')'],
+            flushBeforeDynamic,
+          ),
+        )
+        prev = [prev[0], elementIndex, true]
+        continue
+      }
+
+      if (
+        !hasAdjacentFollowingAccessChild(children, index, elementIndex, offset)
+      ) {
+        push(
+          ...genChildren(
+            child,
+            context,
+            pushBlock,
+            accessPath,
+            flushBeforeDynamic,
+          ),
+        )
+        continue
+      }
+    }
+
+    let variable: string
+    if (id === undefined && prev && prev[2]) {
+      variable = prev[0]
+      pushBlock(NEWLINE, `${variable} = `, ...accessPath)
+    } else {
+      // p for "placeholder" variables that are meant for possible reuse by
+      // other access paths
+      variable =
+        id === undefined ? context.pName(context.block.tempId++) : `n${id}`
+      pushBlock(
+        NEWLINE,
+        id === undefined ? `let ${variable} = ` : `const ${variable} = `,
+        ...accessPath,
+      )
+    }
+
+    if (id === child.anchor && (!child.hasDynamicChild || ownsSubtree)) {
+      flushBeforeDynamic && flushBeforeDynamic(child, push)
+      push(...genSelf(child, context, flushBeforeDynamic))
+    }
+
+    prev = [variable, elementIndex, id === undefined]
+    if (!ownsSubtree) {
+      push(
+        ...genChildren(child, context, pushBlock, variable, flushBeforeDynamic),
+      )
+    }
+  }
+
+  return frag
+}
+
+/**
+ * Build one DOM lookup path while preserving the fast sibling walk:
+ * adjacent nodes use _next(prev), otherwise fall back to _nthChild(parent).
+ */
+function genAccessPath(
+  { helper }: CodegenContext,
+  from: CodeFragments,
+  elementIndex: number,
+  prev: [variable: string, elementIndex: number, reusable: boolean] | undefined,
+  isText?: boolean,
+): CodeFragment[] {
+  const textHint = isText ? 'true' : undefined
+  if (prev) {
+    return elementIndex - prev[1] === 1
+      ? genCall(helper('next'), prev[0], textHint)
+      : genCall(helper('nthChild'), from, String(elementIndex), textHint)
+  }
+
+  if (elementIndex === 0) {
+    return genCall(helper('child'), from, textHint)
+  }
+
+  // adjacent to the first child: chain off it instead of an indexed lookup
+  if (elementIndex === 1) {
+    const firstChild = genCall(helper('child'), from)
+    return genCall(helper('next'), firstChild, textHint)
+  }
+  return genCall(helper('nthChild'), from, String(elementIndex), textHint)
+}
+
+/**
+ * Only inline a placeholder when materializing it would not save a parent
+ * lookup. If its child tree needs the parent more than once, keep p* so the
+ * generated code does not duplicate _child/_nthChild work.
+ */
+function canInlinePlaceholder(dynamic: IRDynamicInfo): boolean {
+  return (
+    dynamic.hasDynamicChild === true && countParentAccessUsages(dynamic) === 1
+  )
+}
+
+/**
+ * A following access can reuse the current placeholder cursor only when it is
+ * the next DOM sibling. Gapped siblings need _nthChild(parent, index) instead.
+ * Kept in lockstep with genChildren's traversal rules.
+ */
+function hasAdjacentFollowingAccessChild(
+  children: IRDynamicInfo[],
+  index: number,
+  elementIndex: number,
+  offset: number,
+): boolean {
+  let futureOffset = offset
+  for (let i = index + 1; i < children.length; i++) {
+    const child = children[i]
+    if (child.flags & DynamicFlag.NON_TEMPLATE) {
+      futureOffset--
+    }
+    // appends produce no access and occupy no element slot; anchored inserts
+    // locate their `<!>` placeholder and always carry REFERENCED
+    if (child.flags & DynamicFlag.INSERT && child.anchor === undefined) {
+      continue
+    }
+    if (!!(child.flags & DynamicFlag.REFERENCED) || child.hasDynamicChild) {
+      return i + futureOffset - elementIndex === 1
+    }
+  }
+
+  return false
+}
+
+/**
+ * Mirrors genChildren's traversal closely enough to count how many emitted
+ * access paths would start from this placeholder's parent. This is the guard
+ * that keeps inline placeholders from duplicating parent lookups.
+ */
+function countParentAccessUsages(dynamic: IRDynamicInfo): number {
+  let usages = 0
+  let offset = 0
+  let prev: [elementIndex: number, reusable: boolean] | undefined
+
+  for (const [index, child] of dynamic.children.entries()) {
+    if (child.flags & DynamicFlag.NON_TEMPLATE) {
+      offset--
+    }
+
+    if (
+      child.flags & DynamicFlag.INSERT &&
+      child.template != null &&
+      child.anchor === undefined
+    ) {
+      // trailing template-inserts append without locating anything; anchored
+      // ones fall through to the generic path, which resolves their id to
+      // `child.anchor` exactly like genChildren does
+      continue
+    }
+
+    const id =
+      child.flags & DynamicFlag.REFERENCED
+        ? child.flags & DynamicFlag.INSERT
+          ? child.anchor
+          : child.id
+        : undefined
+
+    if (id === undefined && !child.hasDynamicChild) {
+      continue
+    }
+
+    const elementIndex = index + offset
+    const usesParent = !prev || elementIndex - prev[0] !== 1
+    const inlinePlaceholder =
+      id === undefined &&
+      canInlinePlaceholder(child) &&
+      child.template == null &&
+      child.operation === undefined &&
+      !(child.flags & (DynamicFlag.INSERT | DynamicFlag.NON_TEMPLATE))
+
+    if (inlinePlaceholder) {
+      if (prev && prev[1]) {
+        if (usesParent) usages++
+        prev = [elementIndex, true]
+        continue
+      }
+
+      if (
+        !hasAdjacentFollowingAccessChild(
+          dynamic.children,
+          index,
+          elementIndex,
+          offset,
+        )
+      ) {
+        if (usesParent) usages++
+        continue
+      }
+    }
+
+    if (usesParent) usages++
+    prev = [elementIndex, id === undefined]
+  }
+
+  return usages
+}
