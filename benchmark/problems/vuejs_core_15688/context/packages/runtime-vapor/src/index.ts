@@ -1,0 +1,97 @@
+// public APIs
+export { createVaporApp, createVaporSSRApp } from './apiCreateApp'
+export {
+  defineVaporComponent,
+  type DefineVaporComponent,
+  type DefineVaporSetupFnComponent,
+  type VaporPublicProps,
+  type VaporRenderResult,
+} from './apiDefineComponent'
+export { defineVaporAsyncComponent } from './apiDefineAsyncComponent'
+export { vaporInteropPlugin } from './vdomInterop'
+export type { VaporDirective } from './directives/custom'
+export { VaporTeleport } from './components/Teleport'
+export { VaporKeepAlive } from './components/KeepAlive'
+export {
+  defineVaporCustomElement,
+  defineVaporSSRCustomElement,
+  VaporElement,
+  type VaporElementConstructor,
+} from './apiDefineCustomElement'
+
+// compiler-use only
+export { extend } from '@vue/shared'
+export { insert, remove, type Block } from './block'
+export { setInsertionState } from './insertionState'
+export {
+  createComponent,
+  createComponentWithFallback,
+  createAssetComponent,
+  createPlainElement,
+  isVaporComponent,
+  type FunctionalVaporComponent,
+  type VaporComponentInstance,
+} from './component'
+export { renderEffect } from './renderEffect'
+export { createSlot } from './componentSlots'
+export { withOnce } from './once'
+export { template } from './dom/template'
+export { createTextNode, child, nthChild, next, txt } from './dom/node'
+export {
+  setText,
+  setHtml,
+  setClass,
+  setClassName,
+  setStyle,
+  setAttr,
+  setValue,
+  setProp,
+  setDOMProp,
+  setDynamicProps,
+  setElementText,
+} from './dom/prop'
+export {
+  on,
+  onBinding,
+  delegate,
+  delegateEvents,
+  setDynamicEvents,
+  createInvoker,
+  withVaporModifiers,
+  withVaporKeys,
+} from './dom/event'
+export { createIf } from './apiCreateIf'
+export { createKeyedFragment } from './apiCreateFragment'
+export {
+  createFor,
+  createForSlots,
+  createSelector,
+  getRestElement,
+  getDefaultValue,
+} from './apiCreateFor'
+export {
+  createTemplateRefSetter,
+  setStaticTemplateRef,
+  setTemplateRefBinding,
+} from './apiTemplateRef'
+export { useVaporCssVars } from './helpers/useCssVars'
+export { setBlockKey } from './helpers/setKey'
+export { createDynamicComponent } from './apiCreateDynamicComponent'
+export { applyVShow } from './directives/vShow'
+export {
+  applyTextModel,
+  applyRadioModel,
+  applyCheckboxModel,
+  applySelectModel,
+  applyDynamicModel,
+} from './directives/vModel'
+export { withVaporDirectives } from './directives/custom'
+export { isFragment, VaporFragment, DynamicFragment } from './fragment'
+export { VaporTransition } from './components/Transition'
+export { VaporTransitionGroup } from './components/TransitionGroup'
+
+// types
+export type { VaporComponent, VaporComponentOptions } from './component'
+export type { VaporSlot } from './componentSlots'
+export type { VaporTransitionHooks } from './block'
+export type { VaporKeepAliveContext } from './keepAlive'

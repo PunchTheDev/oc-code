@@ -1,0 +1,3291 @@
+import {
+  type Ref,
+  nextTick,
+  onUpdated,
+  ref,
+  withModifiers,
+} from '@vue/runtime-dom'
+import {
+  VaporKeepAlive,
+  VaporTeleport,
+  createComponent,
+  createDynamicComponent,
+  createIf,
+  createKeyedFragment,
+  createSlot,
+  defineVaporComponent,
+  delegateEvents,
+  renderEffect,
+  setClass,
+  setDynamicProps,
+  setInsertionState,
+  setProp,
+  setStyle,
+  template,
+} from '../src'
+import { compile, makeRender, renderParity } from './_utils'
+import {
+  VaporBlockShape,
+  VaporDynamicComponentFlags,
+  VaporIfFlags,
+  stringifyStyle,
+} from '@vue/shared'
+import { setElementText } from '../src/dom/prop'
+
+const define = makeRender<any>()
+delegateEvents('click')
+
+describe('attribute fallthrough', () => {
+  it('should allow attrs to fallthrough', async () => {
+    const t0 = template('<div>', 1)
+    const { component: Child } = define({
+      props: ['foo'],
+      setup(props: any) {
+        const n0 = t0() as Element
+        renderEffect(() => setElementText(n0, props.foo))
+        return n0
+      },
+    })
+
+    const foo = ref(1)
+    const id = ref('a')
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            foo: () => foo.value,
+            id: () => id.value,
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    expect(host.innerHTML).toBe('<div id="a">1</div>')
+
+    foo.value++
+    await nextTick()
+    expect(host.innerHTML).toBe('<div id="a">2</div>')
+
+    id.value = 'b'
+    await nextTick()
+    expect(host.innerHTML).toBe('<div id="b">2</div>')
+  })
+
+  it('should only allow whitelisted fallthrough on functional component with optional props', async () => {
+    const click = vi.fn()
+    const childUpdated = vi.fn()
+
+    const count = ref(0)
+
+    function inc() {
+      count.value++
+      click()
+    }
+
+    const Hello = () =>
+      createComponent(Child, {
+        foo: () => count.value + 1,
+        id: () => 'test',
+        class: () => 'c' + count.value,
+        style: () => ({
+          color: count.value ? 'red' : 'green',
+        }),
+        onClick: () => inc,
+      })
+
+    const { component: Child } = define((props: any) => {
+      childUpdated()
+      const n0 = template(
+        '<div class="c2" style="font-weight: bold"></div>',
+        1,
+      )() as Element
+      renderEffect(() => setElementText(n0, props.foo))
+      return n0
+    })
+
+    const { host } = define(Hello).render()
+    expect(host.innerHTML).toBe(
+      '<div class="c2 c0" style="font-weight: bold; color: green;">1</div>',
+    )
+
+    const node = host.children[0] as HTMLElement
+
+    // not whitelisted
+    expect(node.getAttribute('id')).toBe(null)
+    expect(node.getAttribute('foo')).toBe(null)
+
+    // whitelisted: style, class, event listeners
+    expect(node.getAttribute('class')).toBe('c2 c0')
+    expect(node.style.color).toBe('green')
+    expect(node.style.fontWeight).toBe('bold')
+    node.dispatchEvent(new CustomEvent('click'))
+    expect(click).toHaveBeenCalled()
+
+    await nextTick()
+    expect(childUpdated).toHaveBeenCalled()
+    expect(node.getAttribute('id')).toBe(null)
+    expect(node.getAttribute('foo')).toBe(null)
+    expect(node.getAttribute('class')).toBe('c2 c1')
+    expect(node.style.color).toBe('red')
+    expect(node.style.fontWeight).toBe('bold')
+  })
+
+  it('should preserve root bindings excluded from functional fallthrough', async () => {
+    const title = ref('one')
+    const { component: Child } = define((props: any) => {
+      const n0 = template('<div></div>', 1)() as Element
+      renderEffect(() => setProp(n0, 'title', `child:${props.title}`))
+      return n0
+    })
+
+    const { host } = define({
+      setup() {
+        return createComponent(Child, {
+          title: () => title.value,
+        })
+      },
+    }).render()
+
+    expect(host.innerHTML).toBe('<div title="child:one"></div>')
+
+    title.value = 'two'
+    await nextTick()
+    expect(host.innerHTML).toBe('<div title="child:two"></div>')
+  })
+
+  it('should only allow whitelisted fallthrough on functional component dynamic root branch', async () => {
+    const show = ref(false)
+    const parentClass = ref('c0')
+
+    const t0 = template('<div class="c2">off</div>', 1)
+    const t1 = template('<div class="c2">on</div>', 1)
+    const { component: Child } = define(() => {
+      return createIf(
+        () => show.value,
+        () => t1(),
+        () => t0(),
+      )
+    })
+
+    const { host } = define(() =>
+      createComponent(Child, {
+        foo: () => 'bar',
+        id: () => 'test',
+        class: () => parentClass.value,
+      }),
+    ).render()
+
+    const assertRoot = (text: string) => {
+      const node = host.children[0] as HTMLElement
+      expect(node.textContent).toBe(text)
+      expect(node.getAttribute('id')).toBe(null)
+      expect(node.getAttribute('foo')).toBe(null)
+      expect(node.classList.contains('c2')).toBe(true)
+      expect(node.classList.contains(parentClass.value)).toBe(true)
+    }
+
+    assertRoot('off')
+
+    show.value = true
+    await nextTick()
+    assertRoot('on')
+
+    parentClass.value = 'c1'
+    await nextTick()
+    assertRoot('on')
+  })
+
+  it('should allow all attrs on functional component with declared props', async () => {
+    const click = vi.fn()
+    const childUpdated = vi.fn()
+    const count = ref(0)
+
+    function inc() {
+      count.value++
+      click()
+    }
+
+    const Hello = () =>
+      createComponent(Child, {
+        foo: () => count.value + 1,
+        id: () => 'test',
+        class: () => 'c' + count.value,
+        style: () => ({ color: count.value ? 'red' : 'green' }),
+        onClick: () => inc,
+      })
+
+    const Child = defineVaporComponent((props: any) => {
+      childUpdated()
+      const n0 = template(
+        '<div class="c2" style="font-weight: bold"></div>',
+        1,
+      )() as Element
+      renderEffect(() => setElementText(n0, props.foo))
+      return n0
+    })
+
+    // @ts-expect-error
+    Child.props = ['foo']
+
+    const { host } = define(Hello).render()
+    const node = host.children[0] as HTMLElement
+
+    expect(node.getAttribute('id')).toBe('test')
+    expect(node.getAttribute('foo')).toBe(null) // declared as prop
+    expect(node.getAttribute('class')).toBe('c2 c0')
+    expect(node.style.color).toBe('green')
+    expect(node.style.fontWeight).toBe('bold')
+    node.dispatchEvent(new CustomEvent('click'))
+    expect(click).toHaveBeenCalled()
+
+    await nextTick()
+    expect(childUpdated).toHaveBeenCalled()
+    expect(node.getAttribute('id')).toBe('test')
+    expect(node.getAttribute('foo')).toBe(null)
+    expect(node.getAttribute('class')).toBe('c2 c1')
+    expect(node.style.color).toBe('red')
+    expect(node.style.fontWeight).toBe('bold')
+  })
+
+  it('should fallthrough for nested components', async () => {
+    const click = vi.fn()
+    const childUpdated = vi.fn()
+    const grandChildUpdated = vi.fn()
+
+    const Hello = {
+      setup() {
+        const count = ref(0)
+
+        function inc() {
+          count.value++
+          click()
+        }
+
+        return createComponent(Child, {
+          foo: () => count.value + 1,
+          id: () => 'test',
+          class: () => 'c' + count.value,
+          style: () => ({
+            color: count.value ? 'red' : 'green',
+          }),
+          onClick: () => inc,
+        })
+      },
+    }
+
+    const Child = defineVaporComponent({
+      setup(props: any) {
+        onUpdated(childUpdated)
+        // HOC simply passing props down.
+        // this will result in merging the same attrs, but should be deduped by
+        // `mergeProps`.
+        return createComponent(GrandChild, props, null, true)
+      },
+    })
+
+    const GrandChild = defineVaporComponent({
+      props: {
+        id: String,
+        foo: Number,
+      },
+      setup(props) {
+        onUpdated(grandChildUpdated)
+        const n0 = template(
+          '<div class="c2" style="font-weight: bold"></div>',
+          1,
+        )() as Element
+        renderEffect(() => {
+          setProp(n0, 'id', props.id)
+          setElementText(n0, props.foo)
+        })
+        return n0
+      },
+    })
+
+    const { host } = define(Hello).render()
+    expect(host.innerHTML).toBe(
+      '<div class="c2 c0" style="font-weight: bold; color: green;" id="test">1</div>',
+    )
+
+    const node = host.children[0] as HTMLElement
+
+    // with declared props, any parent attr that isn't a prop falls through
+    expect(node.getAttribute('id')).toBe('test')
+    expect(node.getAttribute('class')).toBe('c2 c0')
+    expect(node.style.color).toBe('green')
+    expect(node.style.fontWeight).toBe('bold')
+    node.dispatchEvent(new CustomEvent('click'))
+    expect(click).toHaveBeenCalled()
+
+    // ...while declared ones remain props
+    expect(node.hasAttribute('foo')).toBe(false)
+
+    await nextTick()
+    // child should not update, due to it not accessing props
+    // this is a optimization in vapor mode
+    expect(childUpdated).not.toHaveBeenCalled()
+    expect(grandChildUpdated).toHaveBeenCalled()
+    expect(node.getAttribute('id')).toBe('test')
+    expect(node.getAttribute('class')).toBe('c2 c1')
+    expect(node.style.color).toBe('red')
+    expect(node.style.fontWeight).toBe('bold')
+
+    expect(node.hasAttribute('foo')).toBe(false)
+  })
+
+  it('should not fallthrough with inheritAttrs: false', () => {
+    const Parent = defineVaporComponent({
+      setup() {
+        return createComponent(Child, { foo: () => 1, class: () => 'parent' })
+      },
+    })
+
+    const Child = defineVaporComponent({
+      props: ['foo'],
+      inheritAttrs: false,
+      setup(props) {
+        const n0 = template('<div></div>', 1)() as Element
+        renderEffect(() => setElementText(n0, props.foo))
+        return n0
+      },
+    })
+
+    const { html } = define(Parent).render()
+
+    // should not contain class
+    expect(html()).toMatch(`<div>1</div>`)
+  })
+
+  it('explicit spreading with inheritAttrs: false', () => {
+    const click = vi.fn()
+    const Parent = defineVaporComponent({
+      setup() {
+        return createComponent(Child, {
+          foo: () => 1,
+          class: () => 'parent',
+          onClick: () => click,
+        })
+      },
+    })
+
+    const Child = defineVaporComponent({
+      props: ['foo'],
+      inheritAttrs: false,
+      setup(props, { attrs }) {
+        const n0 = template('<div>', 1)() as Element
+        renderEffect(() => {
+          setElementText(n0, props.foo)
+          setDynamicProps(n0, [{ class: 'child' }, attrs])
+        })
+        return n0
+      },
+    })
+
+    const { host, html } = define(Parent).render()
+
+    // should merge parent/child classes
+    expect(html()).toMatch(`<div class="child parent">1</div>`)
+    ;(host.children[0] as HTMLElement).click()
+    expect(click).toHaveBeenCalledTimes(1)
+  })
+
+  it('should warn when fallthrough fails on non-single-root', () => {
+    const Parent = {
+      setup() {
+        return createComponent(Child, {
+          foo: () => 1,
+          class: () => 'parent',
+          onBar: () => () => {},
+        })
+      },
+    }
+
+    const Child = defineVaporComponent({
+      props: ['foo'],
+      render() {
+        return [template('<div></div>')(), template('<div></div>')()]
+      },
+    })
+
+    define(Parent).render()
+
+    expect(`Extraneous non-props attributes (class)`).toHaveBeenWarned()
+    expect(`Extraneous non-emits event listeners`).toHaveBeenWarned()
+  })
+
+  it('should warn when fallthrough fails on teleport root node', () => {
+    const Parent = {
+      render() {
+        return createComponent(Child, { class: () => 'parent' })
+      },
+    }
+
+    const target = document.createElement('div')
+    const Child = defineVaporComponent({
+      render() {
+        return createComponent(
+          VaporTeleport,
+          { to: () => target },
+          {
+            default: () => template('<div></div>')(),
+          },
+        )
+      },
+    })
+
+    document.body.appendChild(target)
+    define(Parent).render()
+
+    expect(`Extraneous non-props attributes (class)`).toHaveBeenWarned()
+  })
+
+  it('should warn when fallthrough fails on dynamic teleport root branch', async () => {
+    const show = ref(false)
+    const target = document.createElement('div')
+    document.body.appendChild(target)
+
+    const fallback = template('<div>fallback</div>', 1)
+    const teleported = template('<div>teleported</div>')
+    const { component: Child } = define(() =>
+      createIf(
+        () => show.value,
+        () =>
+          createComponent(
+            VaporTeleport,
+            { to: () => target },
+            {
+              default: () => teleported(),
+            },
+          ),
+        () => fallback(),
+      ),
+    )
+
+    const { host } = define(() =>
+      createComponent(Child, { class: () => 'parent' }),
+    ).render()
+
+    expect((host.children[0] as HTMLElement).className).toBe('parent')
+
+    show.value = true
+    await nextTick()
+
+    expect(`Extraneous non-props attributes (class)`).toHaveBeenWarned()
+  })
+
+  it('should dedupe same listeners when $attrs is used during render', () => {
+    const click = vi.fn()
+    const count = ref(0)
+
+    function inc() {
+      count.value++
+      click()
+    }
+
+    const Parent = {
+      render() {
+        return createComponent(Child, { onClick: () => inc })
+      },
+    }
+
+    const Child = defineVaporComponent({
+      setup(_, { attrs }) {
+        const n0 = template('<div></div>', 1)() as any
+        n0.$evtclick = withModifiers(() => {}, ['prevent', 'stop'])
+        renderEffect(() => setDynamicProps(n0, [attrs]))
+        return n0
+      },
+    })
+
+    const { host } = define(Parent).render()
+    const node = host.children[0] as HTMLElement
+    node.dispatchEvent(new CustomEvent('click'))
+    expect(click).toHaveBeenCalledTimes(1)
+    expect(count.value).toBe(1)
+  })
+
+  it('should not warn when context.attrs is used during render', () => {
+    const Parent = {
+      render() {
+        return createComponent(Child, {
+          foo: () => 1,
+          class: () => 'parent',
+          onBar: () => () => {},
+        })
+      },
+    }
+
+    const Child = defineVaporComponent({
+      props: ['foo'],
+      render(_ctx, $props, $emit, $attrs, $slots) {
+        const n0 = template('<div></div>')() as Element
+        const n1 = template('<div></div>')() as Element
+        renderEffect(() => {
+          setDynamicProps(n1, [$attrs])
+        })
+        return [n0, n1]
+      },
+    })
+
+    const { html } = define(Parent).render()
+
+    expect(`Extraneous non-props attributes`).not.toHaveBeenWarned()
+    expect(`Extraneous non-emits event listeners`).not.toHaveBeenWarned()
+
+    expect(html()).toBe(`<div></div><div class="parent"></div>`)
+  })
+
+  it('should not warn when context.attrs is used during render (functional)', () => {
+    const Parent = {
+      render() {
+        return createComponent(Child, {
+          foo: () => 1,
+          class: () => 'parent',
+          onBar: () => () => {},
+        })
+      },
+    }
+
+    const { component: Child } = define((_: any, { attrs }: any) => {
+      const n0 = template('<div></div>')() as Element
+      const n1 = template('<div></div>')() as Element
+      renderEffect(() => {
+        setDynamicProps(n1, [attrs])
+      })
+      return [n0, n1]
+    })
+
+    Child.props = ['foo']
+
+    const { html } = define(Parent).render()
+
+    expect(`Extraneous non-props attributes`).not.toHaveBeenWarned()
+    expect(`Extraneous non-emits event listeners`).not.toHaveBeenWarned()
+    expect(html()).toBe(`<div></div><div class="parent"></div>`)
+  })
+
+  it('should not warn when functional component has optional props', () => {
+    const Parent = {
+      render() {
+        return createComponent(Child, {
+          foo: () => 1,
+          class: () => 'parent',
+          onBar: () => () => {},
+        })
+      },
+    }
+
+    const { component: Child } = define((props: any) => {
+      const n0 = template('<div></div>')() as Element
+      const n1 = template('<div></div>')() as Element
+      renderEffect(() => {
+        setClass(n1, props.class)
+      })
+      return [n0, n1]
+    })
+
+    const { html } = define(Parent).render()
+
+    expect(`Extraneous non-props attributes`).not.toHaveBeenWarned()
+    expect(`Extraneous non-emits event listeners`).not.toHaveBeenWarned()
+    expect(html()).toBe(`<div></div><div class="parent"></div>`)
+  })
+
+  it('should warn when functional component has props and does not use attrs', () => {
+    const Parent = {
+      render() {
+        return createComponent(Child, {
+          foo: () => 1,
+          class: () => 'parent',
+          onBar: () => () => {},
+        })
+      },
+    }
+
+    const { component: Child } = define(() => [
+      template('<div></div>')(),
+      template('<div></div>')(),
+    ])
+
+    Child.props = ['foo']
+
+    const { html } = define(Parent).render()
+
+    expect(`Extraneous non-props attributes`).toHaveBeenWarned()
+    expect(`Extraneous non-emits event listeners`).toHaveBeenWarned()
+    expect(html()).toBe(`<div></div><div></div>`)
+  })
+
+  it('should not warn when only emits is defined', () => {
+    const Parent = {
+      render() {
+        return createComponent(Child, {
+          onBar: () => () => {},
+        })
+      },
+    }
+
+    const Child = defineVaporComponent({
+      emits: ['bar'],
+      render() {
+        const n0 = template('<div></div>')() as Element
+        const n1 = template('<div></div>')() as Element
+
+        return [n0, n1]
+      },
+    })
+
+    define(Parent).render()
+    expect(`Extraneous non-emits event listeners`).not.toHaveBeenWarned()
+  })
+
+  it('should not let listener fallthrough when declared in emits (stateful)', () => {
+    const Child = defineVaporComponent({
+      emits: ['click'],
+      render(_ctx, $props, $emit, $attrs, $slots) {
+        const n0 = template('<button>hello</button>')() as any
+        n0.$evtclick = () => {
+          $emit('click', 'custom')
+        }
+        return n0
+      },
+    })
+
+    const onClick = vi.fn()
+    const App = defineVaporComponent({
+      render() {
+        return createComponent(
+          Child,
+          {
+            onClick: () => onClick,
+          },
+          null,
+          true,
+        )
+      },
+    })
+
+    const { host } = define(App).render()
+    const node = host.children[0] as HTMLElement
+    node.click()
+    expect(onClick).toHaveBeenCalledTimes(1)
+    expect(onClick).toHaveBeenCalledWith('custom')
+  })
+
+  it('should not let listener fallthrough when declared in emits (functional)', () => {
+    const { component: Child } = define((_: any, { emit }: any) => {
+      // should not be in props
+      expect((_ as any).onClick).toBeUndefined()
+      const n0 = template('<button></button>')() as any
+      n0.$evtclick = () => {
+        emit('click', 'custom')
+      }
+      return n0
+    })
+    Child.emits = ['click']
+
+    const onClick = vi.fn()
+    const App = defineVaporComponent({
+      render() {
+        return createComponent(Child, {
+          onClick: () => onClick,
+        })
+      },
+    })
+
+    const { host } = define(App).render()
+    const node = host.children[0] as HTMLElement
+    node.click()
+    expect(onClick).toHaveBeenCalledTimes(1)
+    expect(onClick).toHaveBeenCalledWith('custom')
+  })
+
+  it('should support fallthrough for single element + comments', () => {
+    const click = vi.fn()
+
+    const Hello = defineVaporComponent({
+      render() {
+        return createComponent(Child, {
+          class: () => 'foo',
+          onClick: () => click,
+        })
+      },
+    })
+
+    const Child = defineVaporComponent({
+      render() {
+        return [
+          template('<!--hello-->')(),
+          template('<button></button>')(),
+          template('<!--world-->')(),
+        ]
+      },
+    })
+
+    const { host } = define(Hello).render()
+
+    expect(host.innerHTML).toBe(
+      `<!--hello--><button class="foo"></button><!--world-->`,
+    )
+    const button = host.children[0] as HTMLElement
+    button.dispatchEvent(new CustomEvent('click'))
+    expect(click).toHaveBeenCalled()
+  })
+
+  it('should support fallthrough for nested element + comments', async () => {
+    const toggle = ref(false)
+    const Child = defineVaporComponent({
+      setup() {
+        const n0 = template('<!-- comment A -->')() as any
+        const n1 = createIf(
+          () => toggle.value,
+          () => template('<span>Foo</span>')(),
+          () => {
+            const n2 = template('<!-- comment B -->')() as any
+            const n3 = template('<div>Bar</div>')() as any
+            return [n2, n3]
+          },
+        )
+        return [n0, n1]
+      },
+    })
+
+    const Root = defineVaporComponent({
+      setup() {
+        return createComponent(Child, { class: () => 'red' })
+      },
+    })
+
+    const { host } = define(Root).render()
+
+    expect(host.innerHTML).toBe(
+      `<!-- comment A --><!-- comment B --><div class="red">Bar</div><!--if-->`,
+    )
+
+    toggle.value = true
+    await nextTick()
+    expect(host.innerHTML).toBe(
+      `<!-- comment A --><span class="red">Foo</span><!--if-->`,
+    )
+  })
+
+  it('should not fallthrough v-model listeners with corresponding declared prop', () => {
+    let textFoo = ''
+    let textBar = ''
+    const click = vi.fn()
+
+    const App = defineVaporComponent({
+      render() {
+        return createComponent(Child, {
+          modelValue: () => textFoo,
+          'onUpdate:modelValue': () => (val: string) => {
+            textFoo = val
+          },
+        })
+      },
+    })
+
+    const Child = defineVaporComponent({
+      props: ['modelValue'],
+      setup(_props, { emit }) {
+        return createComponent(GrandChild, {
+          modelValue: () => textBar,
+          'onUpdate:modelValue': () => (val: string) => {
+            textBar = val
+            emit('update:modelValue', 'from Child')
+          },
+        })
+      },
+    })
+
+    const GrandChild = defineVaporComponent({
+      props: ['modelValue'],
+      setup(_props, { emit }) {
+        const n0 = template('<button></button>')() as any
+        n0.$evtclick = () => {
+          click()
+          emit('update:modelValue', 'from GrandChild')
+        }
+        return n0
+      },
+    })
+
+    const { host } = define(App).render()
+    const node = host.children[0] as HTMLElement
+    node.click()
+    expect(click).toHaveBeenCalled()
+    expect(textBar).toBe('from GrandChild')
+    expect(textFoo).toBe('from Child')
+  })
+
+  it('should track this.$attrs access in slots', async () => {
+    const GrandChild = defineVaporComponent({
+      render() {
+        return createSlot('default')
+      },
+    })
+    const Child = defineVaporComponent({
+      components: { GrandChild },
+      render(_ctx, $props, $emit, $attrs, $slots) {
+        const n0 = template('<div></div>')() as any
+        setInsertionState(n0)
+        createComponent(GrandChild, null, {
+          default: () => {
+            const n1 = template(' ')()
+            renderEffect(() => setElementText(n1, $attrs.foo))
+            return n1
+          },
+        })
+        return n0
+      },
+    })
+
+    const obj = ref(1)
+    const App = defineVaporComponent({
+      render() {
+        return createComponent(Child, { foo: () => obj.value })
+      },
+    })
+
+    const { html } = define(App).render()
+    expect(html()).toBe('<div foo="1">1<!--slot--></div>')
+
+    obj.value = 2
+    await nextTick()
+    expect(html()).toBe('<div foo="2">2<!--slot--></div>')
+  })
+
+  it('should allow attrs to fallthrough on component with comment at root', async () => {
+    const t0 = template('<!--comment-->')
+    const t1 = template('<div>')
+    const { component: Child } = define({
+      props: ['foo'],
+      setup(props: any) {
+        const n0 = t0()
+        const n1 = t1()
+        renderEffect(() => setElementText(n1, props.foo))
+        return [n0, n1]
+      },
+    })
+
+    const foo = ref(1)
+    const id = ref('a')
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            foo: () => foo.value,
+            id: () => id.value,
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    expect(host.innerHTML).toBe('<!--comment--><div id="a">1</div>')
+
+    foo.value++
+    await nextTick()
+    expect(host.innerHTML).toBe('<!--comment--><div id="a">2</div>')
+
+    id.value = 'b'
+    await nextTick()
+    expect(host.innerHTML).toBe('<!--comment--><div id="b">2</div>')
+  })
+
+  it('if block', async () => {
+    const t0 = template('<div>foo</div>', 1)
+    const t1 = template('<div>bar</div>', 1)
+    const t2 = template('<div>baz</div>', 1)
+    const { component: Child } = define({
+      setup() {
+        const n0 = createIf(
+          () => true,
+          () => {
+            const n2 = t0()
+            return n2
+          },
+          () =>
+            createIf(
+              () => false,
+              () => {
+                const n4 = t1()
+                return n4
+              },
+              () => {
+                const n7 = t2()
+                return n7
+              },
+            ),
+        )
+        return n0
+      },
+    })
+
+    const id = ref('a')
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            id: () => id.value,
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    expect(host.innerHTML).toBe('<div id="a">foo</div><!--if-->')
+  })
+
+  it('should fallthrough attrs on v-else-if component root branch', async () => {
+    const data = ref({
+      loading: false,
+      id: 'foo',
+    })
+    const Child = compile(
+      `<script setup vapor>
+        defineProps({
+          loading: {
+            type: Boolean,
+            default: false
+          }
+        })
+      </script>
+      <template>
+        <div v-if="loading" class="simple-button">
+          loading === true
+        </div>
+        <div v-else-if="loading === false" class="simple-button">
+          loading === false
+        </div>
+      </template>`,
+      data,
+    )
+    const Parent = compile(
+      `<script setup vapor>
+        const data = _data
+        const Child = _components.Child
+      </script>
+      <template>
+        <Child :loading="data.loading" :id="data.id" class="custom-btn" />
+      </template>`,
+      data,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+
+    const root = () => host.querySelector('.simple-button') as HTMLElement
+    const assertRoot = (text: string) => {
+      const el = root()
+      expect(el.classList.contains('simple-button')).toBe(true)
+      expect(el.classList.contains('custom-btn')).toBe(true)
+      expect(el.id).toBe(data.value.id)
+      expect(el.textContent!.trim()).toBe(text)
+    }
+
+    assertRoot('loading === false')
+
+    data.value.id = 'bar'
+    await nextTick()
+    assertRoot('loading === false')
+
+    data.value.loading = true
+    await nextTick()
+    assertRoot('loading === true')
+
+    data.value.loading = false
+    await nextTick()
+    assertRoot('loading === false')
+  })
+
+  it('should not fallthrough attrs into nested slot branch', async () => {
+    const show = ref(false)
+    const Child = compile(
+      `<script setup vapor>
+        defineProps({
+          show: Boolean
+        })
+      </script>
+      <template>
+        <div v-if="!show">fallback</div>
+        <slot v-else-if="show" />
+      </template>`,
+      show,
+    )
+    const Parent = compile(
+      `<script setup vapor>
+        const show = _data
+        const Child = _components.Child
+      </script>
+      <template>
+        <Child :show="show" class="custom-btn">
+          <span>slot</span>
+        </Child>
+      </template>`,
+      show,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+
+    expect((host.querySelector('div') as HTMLElement).className).toBe(
+      'custom-btn',
+    )
+
+    show.value = true
+    await nextTick()
+    const span = host.querySelector('span') as HTMLElement
+    expect(span.className).toBe('')
+    expect(`Extraneous non-props attributes (class)`).toHaveBeenWarned()
+  })
+
+  it('should not fallthrough attrs into initially active nested slot branch', async () => {
+    const show = ref(true)
+    const Child = compile(
+      `<script setup vapor>
+        defineProps({
+          show: Boolean
+        })
+      </script>
+      <template>
+        <div v-if="!show">fallback</div>
+        <slot v-else-if="show" />
+      </template>`,
+      show,
+    )
+    const Parent = compile(
+      `<script setup vapor>
+        const show = _data
+        const Child = _components.Child
+      </script>
+      <template>
+        <Child :show="show" class="custom-btn">
+          <span>slot</span>
+        </Child>
+      </template>`,
+      show,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    const span = host.querySelector('span') as HTMLElement
+
+    expect(span.className).toBe('')
+    expect(`Extraneous non-props attributes (class)`).toHaveBeenWarned()
+  })
+
+  it('should not allow attrs to fallthrough on component with multiple roots', async () => {
+    const t0 = template('<span>')
+    const t1 = template('<div>')
+    const { component: Child } = define({
+      props: ['foo'],
+      setup(props: any) {
+        const n0 = t0()
+        const n1 = t1()
+        renderEffect(() => setElementText(n1, props.foo))
+        return [n0, n1]
+      },
+    })
+
+    const foo = ref(1)
+    const id = ref('a')
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            foo: () => foo.value,
+            id: () => id.value,
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    expect(host.innerHTML).toBe('<span></span><div>1</div>')
+    expect(`Extraneous non-props attributes (id)`).toHaveBeenWarned()
+  })
+
+  it('should not apply attrs to dynamic branch inside multi-root component', async () => {
+    const ok = ref(false)
+
+    const t0 = template('<div>one</div>', 1)
+    const t1 = template('<span>two</span>')
+
+    const { component: Child } = define({
+      setup() {
+        return [
+          createIf(
+            () => ok.value,
+            () => t0(),
+          ),
+          t1(),
+        ]
+      },
+    })
+
+    const { host } = define(() =>
+      createComponent(Child, { class: () => 'x' }),
+    ).render()
+
+    expect(`Extraneous non-props attributes (class)`).toHaveBeenWarned()
+
+    ok.value = true
+    await nextTick()
+
+    expect((host.querySelector('div') as HTMLElement).className).toBe('')
+  })
+
+  it('should warn for initially active multi-root dynamic root branch', async () => {
+    const ok = ref(true)
+
+    const t0 = template('<div>one</div>')
+    const t1 = template('<span>two</span>')
+    const t2 = template('<p>three</p>', 1)
+
+    const { component: Child } = define({
+      setup() {
+        return createIf(
+          () => ok.value,
+          () => [t0(), t1()],
+          () => t2(),
+        )
+      },
+    })
+
+    const { host } = define(() =>
+      createComponent(Child, { class: () => 'x' }),
+    ).render()
+
+    expect((host.querySelector('div') as HTMLElement).className).toBe('')
+    expect((host.querySelector('span') as HTMLElement).className).toBe('')
+    expect(`Extraneous non-props attributes (class)`).toHaveBeenWarned()
+
+    ok.value = false
+    await nextTick()
+
+    expect((host.querySelector('p') as HTMLElement).className).toBe('x')
+  })
+
+  it('should not allow attrs to fallthrough on component with single comment root', async () => {
+    const t0 = template('<!--comment-->')
+    const { component: Child } = define({
+      setup() {
+        const n0 = t0()
+        return [n0]
+      },
+    })
+
+    const id = ref('a')
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { id: () => id.value }, null, true)
+      },
+    }).render()
+    expect(host.innerHTML).toBe('<!--comment-->')
+    expect(`Extraneous non-props attributes (id)`).toHaveBeenWarned()
+  })
+
+  it('should not fallthrough if explicitly pass inheritAttrs: false', async () => {
+    const t0 = template('<div>', 1)
+    const { component: Child } = define({
+      props: ['foo'],
+      inheritAttrs: false,
+      setup(props: any) {
+        const n0 = t0() as Element
+        renderEffect(() => setElementText(n0, props.foo))
+        return n0
+      },
+    })
+
+    const foo = ref(1)
+    const id = ref('a')
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            foo: () => foo.value,
+            id: () => id.value,
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    expect(host.innerHTML).toBe('<div>1</div>')
+
+    foo.value++
+    await nextTick()
+    expect(host.innerHTML).toBe('<div>2</div>')
+
+    id.value = 'b'
+    await nextTick()
+    expect(host.innerHTML).toBe('<div>2</div>')
+  })
+
+  it('should pass through attrs in nested single root components', async () => {
+    const t0 = template('<div>', 1)
+    const { component: Grandson } = define({
+      props: ['custom-attr'],
+      setup(_: any, { attrs }: any) {
+        const n0 = t0() as Element
+        renderEffect(() => setElementText(n0, attrs.foo))
+        return n0
+      },
+    })
+
+    const { component: Child } = define({
+      setup() {
+        const n0 = createComponent(
+          Grandson,
+          {
+            'custom-attr': () => 'custom-attr',
+          },
+          null,
+          true,
+        )
+        return n0
+      },
+    })
+
+    const foo = ref(1)
+    const id = ref('a')
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            foo: () => foo.value,
+            id: () => id.value,
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    expect(host.innerHTML).toBe('<div foo="1" id="a">1</div>')
+
+    foo.value++
+    await nextTick()
+    expect(host.innerHTML).toBe('<div foo="2" id="a">2</div>')
+
+    id.value = 'b'
+    await nextTick()
+    expect(host.innerHTML).toBe('<div foo="2" id="b">2</div>')
+  })
+
+  it('should merge classes', async () => {
+    const rootClass = ref('root')
+    const parentClass = ref('parent')
+    const childClass = ref('child')
+
+    const t0 = template('<div>', 1 /* root */)
+    const Child = defineVaporComponent({
+      setup() {
+        const n = t0() as Element
+        renderEffect(() => {
+          // binding on template root generates incremental class setter
+          setClass(n, childClass.value)
+        })
+        return n
+      },
+    })
+
+    const Parent = defineVaporComponent({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            class: () => parentClass.value,
+          },
+          null,
+          true, // pass single root flag
+        )
+      },
+    })
+
+    const { host } = define({
+      setup() {
+        return createComponent(Parent, {
+          class: () => rootClass.value,
+        })
+      },
+    }).render()
+
+    const list = host.children[0].classList
+    // assert classes without being order-sensitive
+    function assertClasses(cls: string[]) {
+      expect(list.length).toBe(cls.length)
+      for (const c of cls) {
+        expect(list.contains(c)).toBe(true)
+      }
+    }
+
+    assertClasses(['root', 'parent', 'child'])
+
+    rootClass.value = 'root1'
+    await nextTick()
+    assertClasses(['root1', 'parent', 'child'])
+
+    parentClass.value = 'parent1'
+    await nextTick()
+    assertClasses(['root1', 'parent1', 'child'])
+
+    childClass.value = 'child1'
+    await nextTick()
+    assertClasses(['root1', 'parent1', 'child1'])
+  })
+
+  it('should merge styles', async () => {
+    const rootStyle: Ref<string | Record<string, string>> = ref('color:red')
+    const parentStyle: Ref<string | null> = ref('font-size:12px')
+    const childStyle = ref('font-weight:bold')
+
+    const t0 = template('<div>', 1 /* root */)
+    const Child = defineVaporComponent({
+      setup() {
+        const n = t0() as Element
+        renderEffect(() => {
+          // binding on template root generates incremental class setter
+          setStyle(n, childStyle.value)
+        })
+        return n
+      },
+    })
+
+    const Parent = defineVaporComponent({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            style: () => parentStyle.value,
+          },
+          null,
+          true, // pass single root flag
+        )
+      },
+    })
+
+    const { host } = define({
+      setup() {
+        return createComponent(Parent, {
+          style: () => rootStyle.value,
+        })
+      },
+    }).render()
+
+    const el = host.children[0] as HTMLElement
+
+    function getCSS() {
+      return el.style.cssText.replace(/\s+/g, '')
+    }
+
+    function assertStyles() {
+      const css = getCSS()
+      expect(css).toContain(stringifyStyle(rootStyle.value))
+      if (parentStyle.value) {
+        expect(css).toContain(stringifyStyle(parentStyle.value))
+      }
+      expect(css).toContain(stringifyStyle(childStyle.value))
+    }
+
+    assertStyles()
+
+    rootStyle.value = { color: 'green' }
+    await nextTick()
+    assertStyles()
+    expect(getCSS()).not.toContain('color:red')
+
+    parentStyle.value = null
+    await nextTick()
+    assertStyles()
+    expect(getCSS()).not.toContain('font-size:12px')
+
+    childStyle.value = 'font-weight:500'
+    await nextTick()
+    assertStyles()
+    expect(getCSS()).not.toContain('font-size:bold')
+  })
+
+  it('should fallthrough attrs to dynamic component', async () => {
+    const Comp = defineVaporComponent({
+      setup() {
+        const n1 = createDynamicComponent(
+          () => 'button',
+          null,
+          {
+            default: () => {
+              const n0 = createSlot('default', null)
+              return n0
+            },
+          },
+          VaporDynamicComponentFlags.SINGLE_ROOT,
+        )
+        return n1
+      },
+    })
+
+    const { html } = define({
+      setup() {
+        return createComponent(
+          Comp,
+          {
+            class: () => 'foo',
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+
+    expect(html()).toBe(
+      '<button class="foo"><!--slot--></button><!--dynamic-component-->',
+    )
+  })
+
+  it('parent value should take priority', async () => {
+    const parentVal = ref('parent')
+    const childVal = ref('child')
+
+    const t0 = template('<div>', 1 /* root */)
+    const Child = defineVaporComponent({
+      setup() {
+        const n = t0()
+        renderEffect(() => {
+          // prop bindings on template root generates extra `root: true` flag
+          setProp(n, 'id', childVal.value)
+          setProp(n, 'aria-x', childVal.value)
+          setDynamicProps(n, [{ 'aria-y': childVal.value }])
+        })
+        return n
+      },
+    })
+
+    const { host } = define({
+      setup() {
+        return createComponent(Child, {
+          id: () => parentVal.value,
+          'aria-x': () => parentVal.value,
+          'aria-y': () => parentVal.value,
+        })
+      },
+    }).render()
+
+    const el = host.children[0]
+    expect(el.id).toBe(parentVal.value)
+    expect(el.getAttribute('aria-x')).toBe(parentVal.value)
+    expect(el.getAttribute('aria-y')).toBe(parentVal.value)
+
+    childVal.value = 'child1'
+    await nextTick()
+    expect(el.id).toBe(parentVal.value)
+    expect(el.getAttribute('aria-x')).toBe(parentVal.value)
+    expect(el.getAttribute('aria-y')).toBe(parentVal.value)
+
+    parentVal.value = 'parent1'
+    await nextTick()
+    expect(el.id).toBe(parentVal.value)
+    expect(el.getAttribute('aria-x')).toBe(parentVal.value)
+    expect(el.getAttribute('aria-y')).toBe(parentVal.value)
+  })
+
+  it('empty string should not be passed to classList.add', async () => {
+    const t0 = template('<div>', 1 /* root */)
+    const Child = defineVaporComponent({
+      setup() {
+        const n = t0() as Element
+        renderEffect(() => {
+          setClass(n, {
+            foo: false,
+          })
+        })
+        return n
+      },
+    })
+
+    const Parent = defineVaporComponent({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            class: () => ({
+              bar: false,
+            }),
+          },
+          null,
+          true,
+        )
+      },
+    })
+
+    const { host } = define({
+      setup() {
+        return createComponent(Parent)
+      },
+    }).render()
+
+    const el = host.children[0]
+    expect(el.classList.length).toBe(0)
+  })
+
+  it('passes v-text to components as a reactive textContent prop', async () => {
+    const value = ref('<b>one</b>')
+    const Child = compile(
+      `<script setup vapor>
+        const props = defineProps(['textContent'])
+      </script>
+      <template><div>prop:{{ props.textContent }}</div></template>`,
+      ref(null),
+    )
+    const Parent = compile(
+      `<template><components.Child v-text="data" /></template>`,
+      value,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe('<div>prop:&lt;b&gt;one&lt;/b&gt;</div>')
+
+    value.value = '<i>two</i>'
+    await nextTick()
+    expect(host.innerHTML).toBe('<div>prop:&lt;i&gt;two&lt;/i&gt;</div>')
+  })
+
+  it('passes v-html to components as a reactive innerHTML prop', async () => {
+    const value = ref('<b>one</b>')
+    const Child = compile(
+      `<script setup vapor>
+        const props = defineProps(['innerHTML'])
+      </script>
+      <template><div>prop:{{ props.innerHTML }}</div></template>`,
+      ref(null),
+    )
+    const Parent = compile(
+      `<template><components.Child v-html="data" /></template>`,
+      value,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe('<div>prop:&lt;b&gt;one&lt;/b&gt;</div>')
+
+    value.value = '<i>two</i>'
+    await nextTick()
+    expect(host.innerHTML).toBe('<div>prop:&lt;i&gt;two&lt;/i&gt;</div>')
+  })
+
+  it('warns when v-text cannot fall through to a text root', () => {
+    const Child = compile(`<template>child</template>`, ref(null))
+    const Parent = compile(
+      `<template><components.Child v-text="data" /></template>`,
+      ref('foo'),
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.textContent).toBe('child')
+    expect(`Extraneous non-props attributes (textContent)`).toHaveBeenWarned()
+  })
+
+  it('warns when v-html cannot fall through to a text root', () => {
+    const Child = compile(`<template>child</template>`, ref(null))
+    const Parent = compile(
+      `<template><components.Child v-html="data" /></template>`,
+      ref('<b>foo</b>'),
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.textContent).toBe('child')
+    expect(`Extraneous non-props attributes (innerHTML)`).toHaveBeenWarned()
+  })
+
+  it('does not warn for filtered functional fallthrough on a text root', () => {
+    const { component: Child } = define(() => template('child')())
+    const Parent = compile(
+      `<template><components.Child v-text="data" /></template>`,
+      ref('foo'),
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.textContent).toBe('child')
+    expect(`Extraneous non-props attributes`).not.toHaveBeenWarned()
+  })
+
+  it('warns for unfiltered functional fallthrough on a text root when props are declared', () => {
+    const { component: Child } = define(() => template('child')())
+    Child.props = ['foo']
+    const Parent = compile(
+      `<template><components.Child v-text="data" /></template>`,
+      ref('foo'),
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.textContent).toBe('child')
+    // a functional component with declared props receives full fallthrough,
+    // and a text root cannot accept it — align with vdom's warning
+    expect(`Extraneous non-props attributes`).toHaveBeenWarned()
+  })
+
+  it('applies v-text fallthrough after switching dynamic components', async () => {
+    const state = ref({ current: 'A', content: '<b>one</b>' })
+    const A = compile(`<template><div>A</div></template>`, ref(null))
+    const B = compile(`<template><div>B</div></template>`, ref(null))
+    const Parent = compile(
+      `<template>
+        <component
+          :is="components[data.current]"
+          v-text="data.content"
+        />
+      </template>`,
+      state,
+      { A, B },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe(
+      '<div>&lt;b&gt;one&lt;/b&gt;</div><!--dynamic-component-->',
+    )
+
+    state.value = { ...state.value, current: 'B' }
+    await nextTick()
+    expect(host.innerHTML).toBe(
+      '<div>&lt;b&gt;one&lt;/b&gt;</div><!--dynamic-component-->',
+    )
+
+    state.value = { ...state.value, content: '<i>two</i>' }
+    await nextTick()
+    expect(host.innerHTML).toBe(
+      '<div>&lt;i&gt;two&lt;/i&gt;</div><!--dynamic-component-->',
+    )
+  })
+
+  it('applies v-html fallthrough after switching dynamic components', async () => {
+    const state = ref({ current: 'A', content: '<b>one</b>' })
+    const A = compile(`<template><div>A</div></template>`, ref(null))
+    const B = compile(`<template><div>B</div></template>`, ref(null))
+    const Parent = compile(
+      `<template>
+        <component
+          :is="components[data.current]"
+          v-html="data.content"
+        />
+      </template>`,
+      state,
+      { A, B },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe('<div><b>one</b></div><!--dynamic-component-->')
+
+    state.value = { ...state.value, current: 'B' }
+    await nextTick()
+    expect(host.innerHTML).toBe('<div><b>one</b></div><!--dynamic-component-->')
+
+    state.value = { ...state.value, content: '<i>two</i>' }
+    await nextTick()
+    expect(host.innerHTML).toBe('<div><i>two</i></div><!--dynamic-component-->')
+  })
+
+  it('does not accumulate fallthrough sources across dynamic component switches', async () => {
+    const state = ref({ current: 'A' })
+    // attrs bound onto a non-root element go through the full class merge
+    // instead of the root's incremental classList path, so a duplicated
+    // source shows up in the DOM
+    const compileInner = (text: string) =>
+      compile(
+        `<script setup vapor>
+          import { useAttrs } from 'vue'
+          defineOptions({ inheritAttrs: false })
+          const attrs = useAttrs()
+        </script>
+        <template><div><span v-bind="attrs">${text}</span></div></template>`,
+        ref(null),
+      )
+    const A = compileInner('A')
+    const B = compileInner('B')
+    const Child = compile(
+      `<template>
+        <component :is="components[data.current]" :foo="1" />
+      </template>`,
+      state,
+      { A, B },
+    )
+    const Parent = compile(
+      `<template><components.Child class="c" /></template>`,
+      ref(null),
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe(
+      '<div><span foo="1" class="c">A</span></div><!--dynamic-component-->',
+    )
+
+    for (const current of ['B', 'A', 'B']) {
+      state.value = { current }
+      await nextTick()
+    }
+    expect(host.innerHTML).toBe(
+      '<div><span foo="1" class="c">B</span></div><!--dynamic-component-->',
+    )
+  })
+
+  // #15277
+  it('should pass fallthrough attrs to declared props with inheritAttrs: false', () => {
+    const Child = compile(
+      `<script setup vapor>
+        const { class: className } = defineProps({ class: String })
+        defineOptions({ inheritAttrs: false })
+      </script>
+      <template>
+        <div :class="className">class prop = {{ className ?? 'DROPPED' }}</div>
+      </template>`,
+      ref(null),
+    )
+    const Middle = compile(
+      `<template><components.Child /></template>`,
+      ref(null),
+      { Child },
+    )
+    const App = compile(
+      `<template><components.Middle class="forwarded-marker" /></template>`,
+      ref(null),
+      { Middle },
+    )
+
+    const { host } = define(App).render()
+    expect(host.innerHTML).toBe(
+      '<div class="forwarded-marker">class prop = forwarded-marker</div>',
+    )
+  })
+
+  it('should not pass attrs through a component with inheritAttrs: false', () => {
+    const Child = compile(
+      `<script setup vapor>
+        const { class: className } = defineProps({ class: String })
+      </script>
+      <template>
+        <div :class="className">class prop = {{ className ?? 'DROPPED' }}</div>
+      </template>`,
+      ref(null),
+    )
+    const Middle = compile(
+      `<script setup vapor>
+        const Child = _components.Child
+        defineOptions({ inheritAttrs: false })
+      </script>
+      <template><Child /></template>`,
+      ref(null),
+      { Child },
+    )
+    const App = compile(
+      `<template><components.Middle class="forwarded-marker" /></template>`,
+      ref(null),
+      { Middle },
+    )
+
+    const { host } = define(App).render()
+    expect(host.innerHTML).toBe('<div>class prop = DROPPED</div>')
+  })
+
+  it('should apply dynamic attrs that appear after mount', async () => {
+    const t0 = template('<div>', 1)
+    const { component: Child } = define({
+      setup() {
+        return t0()
+      },
+    })
+
+    const attrs = ref<Record<string, any>>({})
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { $: [() => attrs.value] }, null, true)
+      },
+    }).render()
+    expect(host.innerHTML).toBe('<div></div>')
+
+    attrs.value = { id: 'late' }
+    await nextTick()
+    expect(host.innerHTML).toBe('<div id="late"></div>')
+
+    attrs.value = {}
+    await nextTick()
+    expect(host.innerHTML).toBe('<div></div>')
+  })
+
+  it('should clean up functional fallthrough when allowed keys are removed', async () => {
+    const attrs = ref<Record<string, any>>({ class: 'foo' })
+    const Fn = () => template('<div>', 1)()
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Fn as any,
+          { $: [() => attrs.value] },
+          null,
+          true,
+        )
+      },
+    }).render()
+    const node = host.children[0] as HTMLElement
+    expect(node.className).toBe('foo')
+
+    // class removed; id is not a functional fallthrough key, so the
+    // resolved fallthrough set becomes empty and must still diff away
+    // the previously applied class
+    attrs.value = { id: 'x' }
+    await nextTick()
+    expect(node.className).toBe('')
+    expect(node.getAttribute('id')).toBe(null)
+  })
+
+  it('should filter functional fallthrough forwarded to a component root', () => {
+    const t0 = template('<div>', 1)
+    const { component: Inner } = define({
+      setup() {
+        return t0()
+      },
+    })
+    const Fn = () => createComponent(Inner, null, null, true)
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Fn as any,
+          { id: () => 'x', class: () => 'c' },
+          null,
+          true,
+        )
+      },
+    }).render()
+    const node = host.children[0] as HTMLElement
+    expect(node.getAttribute('class')).toBe('c')
+    expect(node.getAttribute('id')).toBe(null)
+  })
+
+  it('should not fallthrough v-model listeners with a declared prop', () => {
+    const declared = vi.fn()
+    const undeclared = vi.fn()
+    const t0 = template('<div>', 1)
+    const { component: Child } = define({
+      props: ['foo'],
+      setup() {
+        return t0()
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Child,
+          {
+            'onUpdate:foo': () => declared,
+            'onUpdate:bar': () => undeclared,
+            id: () => 'x',
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    const node = host.children[0] as HTMLElement
+    expect(node.getAttribute('id')).toBe('x')
+    node.dispatchEvent(new CustomEvent('update:foo'))
+    expect(declared).not.toHaveBeenCalled()
+    node.dispatchEvent(new CustomEvent('update:bar'))
+    expect(undeclared).toHaveBeenCalled()
+  })
+
+  it('should not forward declared v-model listeners into a component root', () => {
+    const handler = vi.fn()
+    const t0 = template('<div>', 1)
+    const { component: Child } = define({
+      setup() {
+        return t0()
+      },
+    })
+    const { component: Middle } = define({
+      props: ['foo'],
+      setup() {
+        return createComponent(Child, null, null, true)
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Middle,
+          {
+            'onUpdate:foo': () => handler,
+            id: () => 'x',
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    const node = host.children[0] as HTMLElement
+    expect(node.getAttribute('id')).toBe('x')
+    node.dispatchEvent(new CustomEvent('update:foo'))
+    expect(handler).not.toHaveBeenCalled()
+  })
+
+  it('should stop updating fallthrough attrs on a root detached by branch switch', async () => {
+    const show = ref(true)
+    const id = ref('a')
+    const t0 = template('<div>foo</div>', 1)
+    const { component: Child } = define({
+      setup() {
+        return createIf(
+          () => show.value,
+          () => t0(),
+        )
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { id: () => id.value }, null, true)
+      },
+    }).render()
+
+    const initialRoot = host.querySelector('div')!
+    expect(initialRoot.getAttribute('id')).toBe('a')
+
+    show.value = false
+    await nextTick()
+    expect(initialRoot.isConnected).toBe(false)
+
+    id.value = 'b'
+    await nextTick()
+    // the branch scope owns the effect, so the detached root is not updated
+    expect(initialRoot.getAttribute('id')).toBe('a')
+
+    show.value = true
+    await nextTick()
+    expect(host.innerHTML).toBe('<div id="b">foo</div><!--if-->')
+  })
+
+  it('should stop updating fallthrough attrs on a detached nested branch root', async () => {
+    const outer = ref(true)
+    const inner = ref(true)
+    const id = ref('a')
+    const t0 = template('<div>outer</div>', 1)
+    const t1 = template('<p>inner</p>', 1)
+    const t2 = template('<span>inner-else</span>', 1)
+    const { component: Child } = define({
+      setup() {
+        return createIf(
+          () => outer.value,
+          () => t0(),
+          () =>
+            createIf(
+              () => inner.value,
+              () => t1(),
+              () => t2(),
+            ),
+        )
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { id: () => id.value }, null, true)
+      },
+    }).render()
+
+    outer.value = false
+    await nextTick()
+    const innerEl = host.querySelector('p')!
+    expect(innerEl.getAttribute('id')).toBe('a')
+
+    // switching only the inner branch stops the inner branch scope, which
+    // owns the effect for the inner root
+    inner.value = false
+    await nextTick()
+    expect(innerEl.isConnected).toBe(false)
+
+    id.value = 'b'
+    await nextTick()
+    expect(innerEl.getAttribute('id')).toBe('a')
+    expect(host.querySelector('span')!.getAttribute('id')).toBe('b')
+  })
+
+  it('should scope fallthrough for no-scope nested branch roots', async () => {
+    const outer = ref(true)
+    const inner = ref(true)
+    const id = ref('a')
+    const t0 = template('<div>outer</div>', 1)
+    const t1 = template('<p>inner</p>', 1)
+    const t2 = template('<span>inner-else</span>', 1)
+    const noScopeIfElse =
+      VaporBlockShape.SINGLE_ROOT |
+      (VaporBlockShape.SINGLE_ROOT << 2) |
+      VaporIfFlags.TRUE_NO_SCOPE |
+      VaporIfFlags.FALSE_NO_SCOPE
+    const { component: Child } = define({
+      setup() {
+        return createIf(
+          () => outer.value,
+          () => t0(),
+          () =>
+            createIf(
+              () => inner.value,
+              () => t1(),
+              () => t2(),
+              noScopeIfElse,
+            ),
+        )
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { id: () => id.value }, null, true)
+      },
+    }).render()
+
+    outer.value = false
+    await nextTick()
+    const innerEl = host.querySelector('p')!
+    expect(innerEl.getAttribute('id')).toBe('a')
+
+    // the no-scope inner branch received a retrofitted scope owning the
+    // effect; switching it stops that scope
+    inner.value = false
+    await nextTick()
+    expect(innerEl.isConnected).toBe(false)
+    id.value = 'b'
+    await nextTick()
+    expect(innerEl.getAttribute('id')).toBe('a')
+    const spanEl = host.querySelector('span')!
+    expect(spanEl.getAttribute('id')).toBe('b')
+
+    // switching the outer branch tears the nested chain down with it
+    outer.value = true
+    await nextTick()
+    expect(spanEl.isConnected).toBe(false)
+    id.value = 'c'
+    await nextTick()
+    expect(spanEl.getAttribute('id')).toBe('b')
+    expect(host.querySelector('div')!.getAttribute('id')).toBe('c')
+  })
+
+  it('should reapply fallthrough attrs across keyed root re-renders', async () => {
+    const key = ref(0)
+    const id = ref('a')
+    const t0 = template('<div>keyed</div>', 1)
+    const { component: Child } = define({
+      setup() {
+        return createKeyedFragment(
+          () => key.value,
+          () => t0(),
+        )
+      },
+    })
+    const { host } = define({
+      setup() {
+        return createComponent(Child, { id: () => id.value }, null, true)
+      },
+    }).render()
+    const first = host.querySelector('div')!
+    expect(first.getAttribute('id')).toBe('a')
+
+    key.value++
+    await nextTick()
+    const second = host.querySelector('div')!
+    expect(second).not.toBe(first)
+    expect(second.getAttribute('id')).toBe('a')
+
+    id.value = 'b'
+    await nextTick()
+    expect(second.getAttribute('id')).toBe('b')
+    // the replaced root's effect died with its branch scope
+    expect(first.getAttribute('id')).toBe('a')
+  })
+
+  it('should allow all attrs on a bare functional component with declared props', async () => {
+    const Fn = ((props: any) => {
+      const n0 = template('<div>', 1)() as Element
+      renderEffect(() => setElementText(n0, props.foo))
+      return n0
+    }) as any
+    Fn.props = ['foo']
+
+    const id = ref('a')
+    const { host } = define({
+      setup() {
+        return createComponent(
+          Fn,
+          { foo: () => 1, id: () => id.value },
+          null,
+          true,
+        )
+      },
+    }).render()
+
+    const node = host.children[0] as HTMLElement
+    // vdom: a functional component that declares props receives full
+    // fallthrough, not just the class/style/listener whitelist
+    expect(node.getAttribute('id')).toBe('a')
+    expect(node.getAttribute('foo')).toBe(null) // declared prop
+    expect(node.textContent).toBe('1')
+
+    id.value = 'b'
+    await nextTick()
+    expect(node.getAttribute('id')).toBe('b')
+  })
+
+  it('should freeze fallthrough on KeepAlive-cached components and catch up on reactivation', async () => {
+    const current = ref('one')
+    const id = ref('a')
+    const One = defineVaporComponent({
+      name: 'One',
+      setup() {
+        return template('<div>one</div>', 1)()
+      },
+    })
+    const Two = defineVaporComponent({
+      name: 'Two',
+      setup() {
+        return template('<span>two</span>', 1)()
+      },
+    })
+    const views: Record<string, any> = { one: One, two: Two }
+    const { host } = define({
+      setup() {
+        return createComponent(VaporKeepAlive as any, null, {
+          default: () =>
+            createDynamicComponent(() => views[current.value], {
+              id: () => id.value,
+            }),
+        })
+      },
+    }).render()
+
+    const oneEl = host.querySelector('div')!
+    expect(oneEl.getAttribute('id')).toBe('a')
+
+    current.value = 'two'
+    await nextTick()
+    expect(oneEl.isConnected).toBe(false)
+
+    id.value = 'b'
+    await nextTick()
+    // cached: committed inputs are frozen, the cached root must not update
+    expect(oneEl.getAttribute('id')).toBe('a')
+    expect(host.querySelector('span')!.getAttribute('id')).toBe('b')
+
+    current.value = 'one'
+    await nextTick()
+    // reactivated: committed inputs resume and the effect catches up
+    expect(oneEl.isConnected).toBe(true)
+    expect(oneEl.getAttribute('id')).toBe('b')
+  })
+
+  it('should not inherit attrs into a dynamic branch inside slot content', async () => {
+    const show = ref(true)
+    const Child = compile(`<template><slot /></template>`, ref(null))
+    const Middle = compile(
+      `<script setup vapor>
+        const Child = _components.Child
+        const show = _data
+      </script>
+      <template>
+        <Child>
+          <div v-if="show">if</div>
+          <span v-else>else</span>
+        </Child>
+      </template>`,
+      show,
+      { Child },
+    )
+    const App = compile(
+      `<template><components.Middle class="parent" /></template>`,
+      ref(null),
+      { Middle },
+    )
+
+    const { host } = define(App).render()
+    // a slot outlet root cannot receive fallthrough attrs
+    expect(host.querySelector('div')!.className).toBe('')
+    expect(`Extraneous non-props attributes (class)`).toHaveBeenWarnedTimes(1)
+
+    // the slot boundary still holds after the inner branch switches
+    show.value = false
+    await nextTick()
+    expect(host.querySelector('span')!.className).toBe('')
+  })
+
+  it('should preserve style merging order from static and v-bind props', () => {
+    const Child = defineVaporComponent({
+      setup() {
+        return template('<div></div>')()
+      },
+    })
+    const Parent = compile(
+      '<template><components.Child style="color:red" v-bind="data.attrs" /></template>',
+      { attrs: { style: { color: 'blue' } } } as any,
+      { Child },
+    )
+
+    const { html } = define(Parent).render()
+    expect(html()).toBe('<div style="color: blue;"></div>')
+  })
+
+  // #15442
+  it.each([true, false])(
+    'should merge static component listeners with v-on object bindings (static first: %s)',
+    async staticFirst => {
+      const calls: string[] = []
+      const onStatic = () => calls.push('static')
+      const onObject = () => calls.push('object')
+      const onExtra = () => calls.push('extra')
+      const data = ref<{
+        onStatic: () => void
+        listeners: Record<string, Function | Function[] | null | undefined>
+      }>({ onStatic, listeners: { click: onObject } })
+      const Child = compile(
+        '<template><button>click</button></template>',
+        ref(null),
+      )
+      const bindings = staticFirst
+        ? '@click="data.onStatic" v-on="data.listeners"'
+        : 'v-on="data.listeners" @click="data.onStatic"'
+      const Parent = compile(
+        `<template><components.Child ${bindings} /></template>`,
+        data,
+        { Child },
+      )
+
+      const { host } = define(Parent).render()
+      const button = host.querySelector('button')!
+      button.click()
+      expect(calls).toEqual(
+        staticFirst ? ['static', 'object'] : ['object', 'static'],
+      )
+
+      calls.length = 0
+      data.value.listeners.click = [onObject, onExtra]
+      await nextTick()
+      button.click()
+      expect(calls).toEqual(
+        staticFirst
+          ? ['static', 'object', 'extra']
+          : ['object', 'extra', 'static'],
+      )
+
+      for (const listeners of [{ click: onStatic }, { click: null }, {}]) {
+        calls.length = 0
+        data.value.listeners = listeners
+        await nextTick()
+        button.click()
+        expect(calls).toEqual(['static'])
+      }
+    },
+  )
+
+  it('should not fallthrough reserved props from v-bind object', () => {
+    const data = ref({
+      attrs: { key: 'a', ref_for: true, ref_key: 'r', id: 'foo' },
+      attrKeys: [] as string[],
+    })
+    const Child = compile(
+      `<script setup vapor>
+        import { useAttrs } from 'vue'
+        _data.value.attrKeys = Object.keys(useAttrs())
+      </script>
+      <template><div /></template>`,
+      data,
+    )
+    const Parent = compile(
+      `<template><components.Child v-bind="data.attrs" /></template>`,
+      data,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe('<div id="foo"></div>')
+    expect(data.value.attrKeys).toEqual(['id'])
+  })
+
+  it('should not fallthrough nullish dynamic argument', () => {
+    const data = ref({ name: null as string | null, onFoo: () => {} })
+    const Child = compile('<template><div>child</div></template>', data)
+    const Parent = compile(
+      `<template><components.Child @[data.name]="data.onFoo" /></template>`,
+      data,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe('<div>child</div>')
+  })
+
+  test('should not pass fallthrough attrs to the fallback of a slot outlet root', async () => {
+    const cls: Record<string, string> = {}
+    const { vdom, vapor } = await renderParity(
+      {
+        A: `<template><div id="a">A</div></template>`,
+        Child: `<template><slot><components.A /></slot></template>`,
+        App: `<template><components.Child class="outer" /></template>`,
+      },
+      () => ref(null),
+      (_data, root, mode) => {
+        cls[mode] = root.querySelector('#a')!.className
+      },
+    )
+    expect(cls.vdom).toBe('')
+    expect(cls.vapor).toBe(cls.vdom)
+    expect(vapor.text).toBe(vdom.text)
+    expect('Extraneous non-props attributes (class)').toHaveBeenWarned()
+  })
+
+  test('should drop a dynamic attr whose name is nullish', async () => {
+    const initial: Record<string, string> = {}
+    const zero: Record<string, string> = {}
+    const { vdom, vapor } = await renderParity(
+      {
+        Child: `<template><p>{{ Object.keys($attrs).join() }}</p></template>`,
+        App: `<template><div :[data.name]="data.v">x</div><components.Child :[data.name]="data.v" /></template>`,
+      },
+      () => ref<any>({ name: null, v: 'v' }),
+      async (data, root, mode) => {
+        initial[mode] = root.innerHTML
+        data.value.name = 'foo'
+        await nextTick()
+        data.value.name = 0
+        await nextTick()
+        zero[mode] = root.innerHTML
+        data.value.name = undefined
+      },
+    )
+    expect(initial.vdom).toBe('<div>x</div><p></p>')
+    expect(initial.vapor).toBe(initial.vdom)
+    expect(zero.vdom).toBe('<div>x</div><p></p>')
+    expect(zero.vapor).toBe(zero.vdom)
+    expect(vdom.after).toBe('<div>x</div><p></p>')
+    expect(vapor.after).toBe(vdom.after)
+  })
+
+  // #15625: a root's own class / style and the fallthrough one are two
+  // layers; each step compares what the root shows with vdom
+  async function layerParity(
+    read: (el: Element) => string,
+    srcs: Record<string, string>,
+    makeData: () => Ref<any>,
+    steps: ((data: Ref<any>) => void)[],
+  ): Promise<string[]> {
+    const seen: Record<string, string[]> = { vdom: [], vapor: [] }
+    await renderParity(srcs, makeData, async (data, root, mode) => {
+      seen[mode].push(read(root.firstElementChild!))
+      for (const step of steps) {
+        step(data)
+        await nextTick()
+        seen[mode].push(read(root.firstElementChild!))
+      }
+    })
+    expect(seen.vapor).toEqual(seen.vdom)
+    return seen.vdom
+  }
+  const classParity = layerParity.bind(null, el =>
+    Array.from(el.classList).sort().join(' '),
+  )
+  const styleParity = layerParity.bind(null, el =>
+    (el.getAttribute('style') || '')
+      .split(';')
+      .map(s => s.trim())
+      .filter(Boolean)
+      .sort()
+      .join('; '),
+  )
+
+  test('keeps the template class when an overlapping fallthrough class changes', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><div class="shared">x</div></template>`,
+        App: `<template><components.Child :class="data.cls" /></template>`,
+      },
+      () => ref({ cls: 'shared extra' }),
+      [
+        data => (data.value.cls = ''),
+        data => (data.value.cls = 'other'),
+        data => (data.value.cls = null),
+      ],
+    )
+    expect(seen).toEqual(['extra shared', 'shared', 'other shared', 'shared'])
+  })
+
+  test('keeps a class held by both the root binding and the fallthrough until both drop it', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><div :class="data.child">x</div></template>`,
+        App: `<template><components.Child :class="data.parent" /></template>`,
+      },
+      () => ref({ child: 'shared', parent: 'shared' }),
+      [
+        data => (data.value.child = ''),
+        data => (data.value.parent = ''),
+        data => (data.value.child = 'shared'),
+      ],
+    )
+    expect(seen).toEqual(['shared', 'shared', '', 'shared'])
+  })
+
+  test('keeps the fallthrough class when the root binding moves away from it', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><div :class="data.child">x</div></template>`,
+        App: `<template><components.Child :class="data.parent" /></template>`,
+      },
+      () => ref({ child: 'a', parent: 'a' }),
+      [data => (data.value.child = 'b'), data => (data.value.parent = 'c')],
+    )
+    expect(seen).toEqual(['a', 'a b', 'b c'])
+  })
+
+  test('keeps a static class folded into the root binding across fallthrough changes', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><div class="shared" :class="data.child">x</div></template>`,
+        App: `<template><components.Child :class="data.parent" /></template>`,
+      },
+      () => ref({ child: 'own', parent: 'shared own extra' }),
+      [data => (data.value.parent = ''), data => (data.value.child = '')],
+    )
+    expect(seen).toEqual(['extra own shared', 'own shared', 'shared'])
+  })
+
+  test('keeps a root v-bind class across fallthrough changes', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><div class="s" v-bind="data.obj">x</div></template>`,
+        App: `<template><components.Child :class="data.parent" /></template>`,
+      },
+      () => ref({ obj: { class: 'o' }, parent: 's o p' }),
+      [
+        data => (data.value.parent = ''),
+        data => (data.value.obj = { class: '' }),
+      ],
+    )
+    expect(seen).toEqual(['o p s', 'o s', 's'])
+  })
+
+  test('keeps a setClassName root class across fallthrough changes', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><div class="a" :class="{ b: data.ok }">x</div></template>`,
+        App: `<template><components.Child :class="data.parent" /></template>`,
+      },
+      () => ref({ ok: true, parent: 'a b' }),
+      [
+        data => (data.value.parent = ''),
+        data => (data.value.ok = false),
+        data => (data.value.parent = 'b'),
+      ],
+    )
+    expect(seen).toEqual(['a b', 'a b', 'a', 'a b'])
+  })
+
+  test('keeps the template class when fallthrough class sources are removed one by one', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><div class="c">x</div></template>`,
+        App: `<template><components.Child :class="data.x" v-bind="data.attrs" /></template>`,
+      },
+      () => ref({ x: 'x c', attrs: { class: 'y c' } }),
+      [
+        data => (data.value.x = ''),
+        data => (data.value.attrs = {}),
+        data => (data.value.x = 'x'),
+      ],
+    )
+    expect(seen).toEqual(['c x y', 'c y', 'c', 'c x'])
+  })
+
+  test('keeps a dynamic element root class across fallthrough changes', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><component :is="'div'" v-bind="data.obj" class="c">x</component></template>`,
+        App: `<template><components.Child :class="data.parent" /></template>`,
+      },
+      () => ref({ obj: { class: 'o' }, parent: 'c o p' }),
+      [data => (data.value.parent = ''), data => (data.value.obj = {})],
+    )
+    expect(seen).toEqual(['c o p', 'c o', 'c'])
+  })
+
+  test('keeps the template class through a nested fallthrough chain', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><div class="c">x</div></template>`,
+        Parent: `<template><components.Child :class="data.p" /></template>`,
+        App: `<template><components.Parent :class="data.gp" /></template>`,
+      },
+      () => ref({ gp: 'g c', p: 'p c' }),
+      [
+        data => (data.value.gp = ''),
+        data => (data.value.p = ''),
+        data => (data.value.gp = 'g'),
+      ],
+    )
+    expect(seen).toEqual(['c g p', 'c p', 'c', 'c g'])
+  })
+
+  test('keeps the template class when the fallthrough class arrives after mount', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><div class="s">x</div></template>`,
+        App: `<template><components.Child v-bind="data.attrs" /></template>`,
+      },
+      () => ref({ attrs: {} }),
+      [
+        data => (data.value.attrs = { class: 's a' }),
+        data => (data.value.attrs = {}),
+      ],
+    )
+    expect(seen).toEqual(['s', 'a s', 's'])
+  })
+
+  // coverage guard: the DOM does not split a class token on a non-ASCII space
+  test('does not split a template class token on a non-breaking space', async () => {
+    const seen = await classParity(
+      {
+        Child: `<template><div class="a&#160;b">x</div></template>`,
+        App: `<template><components.Child :class="data.parent" /></template>`,
+      },
+      () => ref({ parent: 'a' }),
+      [data => (data.value.parent = '')],
+    )
+    expect(seen).toEqual(['a a b', 'a b'])
+  })
+
+  test('restores the template style when an overlapping fallthrough style changes', async () => {
+    const seen = await styleParity(
+      {
+        Child: `<template><div style="color: red; font-weight: bold">x</div></template>`,
+        App: `<template><components.Child :style="data.sty" /></template>`,
+      },
+      () => ref({ sty: 'color: blue; background-color: lightblue' }),
+      [
+        data => (data.value.sty = ''),
+        data => (data.value.sty = { color: 'green' }),
+        data => (data.value.sty = null),
+      ],
+    )
+    expect(seen).toEqual([
+      'background-color: lightblue; color: blue; font-weight: bold',
+      'color: red; font-weight: bold',
+      'color: green; font-weight: bold',
+      'color: red; font-weight: bold',
+    ])
+  })
+
+  test('lets the fallthrough style win while the root binding changes, then restores the binding', async () => {
+    const seen = await styleParity(
+      {
+        Child: `<template><div :style="data.child">x</div></template>`,
+        App: `<template><components.Child :style="data.parent" /></template>`,
+      },
+      () => ref({ child: 'color: red', parent: 'color: blue' }),
+      [
+        data => (data.value.child = 'color: green'),
+        data => (data.value.parent = ''),
+        data => (data.value.child = 'color: red'),
+      ],
+    )
+    expect(seen).toEqual([
+      'color: blue',
+      'color: blue',
+      'color: green',
+      'color: red',
+    ])
+  })
+
+  test('restores a static style folded into the root binding when the fallthrough drops that property', async () => {
+    const seen = await styleParity(
+      {
+        Child: `<template><div style="color: red" :style="data.child">x</div></template>`,
+        App: `<template><components.Child :style="data.parent" /></template>`,
+      },
+      () =>
+        ref({
+          child: { fontWeight: 'bold' },
+          parent: { color: 'blue', margin: '1px' },
+        }),
+      [
+        data => (data.value.parent = { margin: '2px' }),
+        data => (data.value.parent = {}),
+      ],
+    )
+    expect(seen).toEqual([
+      'color: blue; font-weight: bold; margin: 1px',
+      'color: red; font-weight: bold; margin: 2px',
+      'color: red; font-weight: bold',
+    ])
+  })
+
+  test('merges the root binding and the fallthrough style when both change in one tick', async () => {
+    const seen = await styleParity(
+      {
+        Child: `<template><div :style="data.child">x</div></template>`,
+        App: `<template><components.Child :style="data.parent" /></template>`,
+      },
+      () => ref({ child: 'color: red', parent: 'color: blue' }),
+      [
+        data => {
+          data.value.child = 'color: green'
+          data.value.parent = ''
+        },
+        data => {
+          data.value.child = 'color: red'
+          data.value.parent = 'color: blue'
+        },
+      ],
+    )
+    expect(seen).toEqual(['color: blue', 'color: green', 'color: blue'])
+  })
+
+  test('restores the template style of a root inside a branch', async () => {
+    const seen = await styleParity(
+      {
+        Child: `<template><div v-if="data.ok" style="color: red">x</div><span v-else style="color: red">y</span></template>`,
+        App: `<template><components.Child :style="data.parent" /></template>`,
+      },
+      () => ref({ ok: true, parent: 'color: blue' }),
+      [
+        data => (data.value.parent = ''),
+        data => (data.value.ok = false),
+        data => (data.value.parent = 'color: blue'),
+        data => (data.value.parent = ''),
+      ],
+    )
+    expect(seen).toEqual([
+      'color: blue',
+      'color: red',
+      'color: red',
+      'color: blue',
+      'color: red',
+    ])
+  })
+
+  test('restores a root v-bind style when the fallthrough spread drops it', async () => {
+    const seen = await styleParity(
+      {
+        Child: `<template><div v-bind="data.obj">x</div></template>`,
+        App: `<template><components.Child v-bind="data.attrs" /></template>`,
+      },
+      () =>
+        ref({
+          obj: { style: { color: 'red' } },
+          attrs: { style: { color: 'blue' }, id: 'a' },
+        }),
+      [
+        data => (data.value.attrs = { id: 'a' }),
+        data => (data.value.attrs = { style: { color: 'blue' } }),
+        data => (data.value.attrs = {}),
+      ],
+    )
+    expect(seen).toEqual([
+      'color: blue',
+      'color: red',
+      'color: blue',
+      'color: red',
+    ])
+  })
+
+  test('merges a mixed root binding and a fallthrough spread through their changes', async () => {
+    const seen = await styleParity(
+      {
+        Child: `<template><div :class="data.a" v-bind="data.obj" :style="data.s">x</div></template>`,
+        App: `<template><components.Child v-bind="data.attrs" /></template>`,
+      },
+      () =>
+        ref({
+          a: 'a',
+          obj: { class: 'o', style: { color: 'red', margin: '1px' } },
+          s: { padding: '1px' },
+          attrs: { class: 'a o', style: { color: 'blue' } },
+        }),
+      [
+        data => (data.value.attrs = {}),
+        data => (data.value.attrs = { class: 'a', style: { margin: '3px' } }),
+        data => (data.value.obj = {}),
+        data => (data.value.attrs = {}),
+      ],
+    )
+    expect(seen).toEqual([
+      'color: blue; margin: 1px; padding: 1px',
+      'color: red; margin: 1px; padding: 1px',
+      'color: red; margin: 3px; padding: 1px',
+      'margin: 3px; padding: 1px',
+      'padding: 1px',
+    ])
+  })
+
+  test('keeps the root css vars when the fallthrough style arrives late, changes and goes', async () => {
+    const seen = await styleParity(
+      {
+        Child: `<script setup>const data = _data</script>
+          <template><div>x</div></template>
+          <style>div { color: v-bind('data.color') }</style>`,
+        App: `<template><components.Child v-bind="data.attrs" /></template>`,
+      },
+      () => ref({ attrs: {}, color: 'red' }),
+      [
+        data => (data.value.attrs = { style: 'color: blue' }),
+        data => (data.value.color = 'purple'),
+        data => (data.value.attrs = { style: 'color: green' }),
+        data => (data.value.attrs = {}),
+      ],
+    )
+    expect(seen).toEqual([
+      '--v51566ce1: red',
+      '--v51566ce1: red; color: blue',
+      '--v51566ce1: purple; color: blue',
+      '--v51566ce1: purple; color: green',
+      '--v51566ce1: purple',
+    ])
+  })
+
+  test('keeps the root css vars when the root binding is removed after the fallthrough style', async () => {
+    const seen = await styleParity(
+      {
+        Child: `<script setup>const data = _data</script>
+          <template><div :style="data.own">x</div></template>
+          <style>div { color: v-bind('data.color') }</style>`,
+        App: `<template><components.Child v-bind="data.attrs" /></template>`,
+      },
+      () =>
+        ref({
+          own: { width: '1px' },
+          attrs: { style: { color: 'blue' } },
+          color: 'red',
+        }),
+      [
+        data => (data.value.color = 'purple'),
+        data => (data.value.attrs = {}),
+        data => (data.value.own = null),
+      ],
+    )
+    expect(seen).toEqual([
+      '--v51566ce1: red; color: blue; width: 1px',
+      '--v51566ce1: purple; color: blue; width: 1px',
+      '--v51566ce1: purple; width: 1px',
+      '--v51566ce1: purple',
+    ])
+  })
+
+  // coverage guard: v-show keeps owning display across the merge
+  test('keeps v-show in charge of display across fallthrough style changes', async () => {
+    const seen = await styleParity(
+      {
+        Child: `<template><div v-show="data.show" style="color: red">x</div></template>`,
+        App: `<template><components.Child :style="data.parent" /></template>`,
+      },
+      () => ref({ show: true, parent: 'display: flex' }),
+      [
+        data => (data.value.show = false),
+        data => (data.value.parent = ''),
+        data => (data.value.show = true),
+      ],
+    )
+    expect(seen).toEqual([
+      'color: red; display: flex',
+      'color: red; display: none',
+      'color: red; display: none',
+      'color: red',
+    ])
+  })
+
+  // #15635: a root's own listeners and the fallthrough ones are two layers
+  // too; vdom composes them into one handler list, own first, instead of
+  // letting either replace the other
+  const calls: string[] = []
+  const on = (label: string) => () => calls.push(label)
+  const clickParity = layerParity.bind(null, (el: Element) => {
+    calls.length = 0
+    ;(el as HTMLElement).click()
+    return calls.join(' ')
+  })
+
+  test('dynamic component root listener runs before the fallthrough one', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><component :is="'button'" @click="data.root">x</component></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), parent: on('parent') }),
+      [
+        data => (data.value.root = on('root2')),
+        data => (data.value.parent = on('parent2')),
+      ],
+    )
+    expect(seen).toEqual(['root parent', 'root2 parent', 'root2 parent2'])
+  })
+
+  test('v-bind root listener runs before the fallthrough one', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="{ onClick: data.root }">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), parent: on('parent') }),
+      [
+        data => (data.value.root = on('root2')),
+        data => (data.value.parent = on('parent2')),
+      ],
+    )
+    expect(seen).toEqual(['root parent', 'root2 parent', 'root2 parent2'])
+  })
+
+  test('$attrs bound back on the root registers each handler once', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="$attrs">x</button></template>`,
+        App: `<template><components.Child @click="data.a" v-on="{ click: data.b }" /></template>`,
+      },
+      () => ref({ a: on('a'), b: on('b') }),
+      [data => (data.value.a = on('a2'))],
+    )
+    expect(seen).toEqual(['a b', 'a2 b'])
+  })
+
+  test('root list holding the fallthrough handler keeps its own', async () => {
+    const parent = on('parent')
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="{ onClick: [data.root, data.parent] }">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), parent }),
+      [],
+    )
+    expect(seen).toEqual(['root parent'])
+  })
+
+  test('fallthrough listener bound after mount', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="{ onClick: data.root }">x</button></template>`,
+        App: `<template><components.Child v-bind="data.parentProps" /></template>`,
+      },
+      () => ref({ root: on('root'), parentProps: {} as any }),
+      [
+        data => (data.value.parentProps = { onClick: on('parent') }),
+        data => (data.value.parentProps = { onClick: on('parent2') }),
+        data => (data.value.parentProps = {}),
+      ],
+    )
+    expect(seen).toEqual(['root', 'root parent', 'root parent2', 'root'])
+  })
+
+  test('root drops its own listener and binds it again', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="data.rootProps">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () =>
+        ref({
+          rootProps: { onClick: on('root') } as any,
+          parent: on('parent'),
+        }),
+      [
+        data => (data.value.rootProps = {}),
+        data => (data.value.rootProps = { id: 'a' }),
+        data => (data.value.rootProps = { onClick: on('root2') }),
+      ],
+    )
+    expect(seen).toEqual(['root parent', 'parent', 'parent', 'root2 parent'])
+  })
+
+  test('once root listener next to a plain fallthrough one', async () => {
+    const seen: Record<string, string[]> = { vdom: [], vapor: [] }
+    await renderParity(
+      {
+        Child: `<template><button v-bind="{ onClickOnce: data.root }">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), parent: on('parent') }),
+      async (data, root, mode) => {
+        const click = () => {
+          calls.length = 0
+          ;(root.firstElementChild as HTMLElement).click()
+          return calls.join(' ')
+        }
+        // a vdom invoker ignores events fired in the tick it was attached in
+        await new Promise(r => setTimeout(r, 2))
+        seen[mode].push(click(), click())
+        data.value.root = on('root2')
+        await nextTick()
+        seen[mode].push(click())
+      },
+    )
+    expect(seen.vapor).toEqual(seen.vdom)
+    expect(seen.vdom).toEqual(['root parent', 'parent', 'parent'])
+  })
+
+  test('stopImmediatePropagation in the root listener stops the fallthrough one', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="{ onClick: data.root }">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () =>
+        ref({
+          root: (e: Event) => {
+            calls.push('root')
+            e.stopImmediatePropagation()
+          },
+          parent: on('parent'),
+        }),
+      [],
+    )
+    expect(seen).toEqual(['root'])
+  })
+
+  test('static root listener runs before the fallthrough one', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button @click="data.root">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), parent: on('parent') }),
+      [data => (data.value.parent = on('parent2'))],
+    )
+    expect(seen).toEqual(['root parent', 'root parent2'])
+  })
+
+  test('v-on object root listener runs before the fallthrough one', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-on="{ click: data.root }">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), parent: on('parent') }),
+      [
+        data => (data.value.root = on('root2')),
+        data => (data.value.parent = on('parent2')),
+      ],
+    )
+    expect(seen).toEqual(['root parent', 'root2 parent', 'root2 parent2'])
+  })
+
+  test('v-on object root listener keeps a camelCase event name', async () => {
+    const seen = await layerParity(
+      el =>
+        ['myEvent', 'my-event']
+          .map(name => {
+            calls.length = 0
+            el.dispatchEvent(new CustomEvent(name))
+            return calls.join(' ')
+          })
+          .join(','),
+      {
+        Child: `<template><div v-on="{ myEvent: data.root }">x</div></template>`,
+        App: `<template><components.Child @my-event="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), parent: on('parent') }),
+      [],
+    )
+    expect(seen).toEqual(['root,parent'])
+  })
+
+  test('a handler listed twice by the parent runs twice on a root without its own', async () => {
+    const parent = on('parent')
+    const seen = await clickParity(
+      {
+        Child: `<template><button>x</button></template>`,
+        App: `<template><components.Child v-bind="{ onClick: [data.parent, data.parent] }" /></template>`,
+      },
+      () => ref({ parent }),
+      [],
+    )
+    expect(seen).toEqual(['parent parent'])
+  })
+
+  // `el.click()` would call a listener mistakenly written as the `click`
+  // property, so a real event is dispatched
+  test('a static listener next to an expanded v-bind literal stays bound', async () => {
+    const seen = await layerParity(
+      el => {
+        calls.length = 0
+        el.dispatchEvent(new MouseEvent('click'))
+        return `${el.id} ${calls.join(' ')}`
+      },
+      {
+        Child: `<template><button v-bind="{ id: 'btn' }" @click="data.root">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), parent: on('parent') }),
+      [data => (data.value.parent = on('parent2'))],
+    )
+    expect(seen).toEqual(['btn root parent', 'btn root parent2'])
+  })
+
+  test('a static listener with a constant dynamic name joins the merge', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-on="data.events" @['click']="data.root">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () =>
+        ref({
+          events: { click: on('object') } as any,
+          root: on('root'),
+          parent: on('parent'),
+        }),
+      [data => (data.value.root = on('root2'))],
+    )
+    expect(seen).toEqual(['object root parent', 'object root2 parent'])
+  })
+
+  test('v-bind and v-on object listeners on the same root both stay', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="data.rootProps" v-on="data.events">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () =>
+        ref({
+          rootProps: { onClick: on('bind') } as any,
+          events: { click: on('object') } as any,
+          parent: on('parent'),
+        }),
+      [
+        data => (data.value.events = {}),
+        data => (data.value.events = { click: on('object2') }),
+        data => (data.value.rootProps = {}),
+        data => (data.value.rootProps = { onClick: on('bind2') }),
+      ],
+    )
+    expect(seen).toEqual([
+      'bind object parent',
+      'bind parent',
+      'bind object2 parent',
+      'object2 parent',
+      'bind2 object2 parent',
+    ])
+  })
+
+  test('v-on object before v-bind on the same root keeps the template order', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-on="data.events" v-bind="data.rootProps">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () =>
+        ref({
+          rootProps: { onClick: on('bind') } as any,
+          events: { click: on('object') } as any,
+          parent: on('parent'),
+        }),
+      [
+        data => (data.value.rootProps = { onClick: on('bind2') }),
+        data => (data.value.events = { click: on('object2') }),
+      ],
+    )
+    expect(seen).toEqual([
+      'object bind parent',
+      'object bind2 parent',
+      'object2 bind2 parent',
+    ])
+  })
+
+  test('a handler listed twice by the root runs twice', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="{ onClick: [data.root, data.root] }">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), parent: on('parent') }),
+      [],
+    )
+    expect(seen).toEqual(['root root parent'])
+  })
+
+  test('a handler listed twice by the parent runs twice', async () => {
+    const parent = on('parent')
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="{ onClick: data.root }">x</button></template>`,
+        App: `<template><components.Child v-bind="{ onClick: [data.parent, data.parent] }" /></template>`,
+      },
+      () => ref({ root: on('root'), parent }),
+      [],
+    )
+    expect(seen).toEqual(['root parent parent'])
+  })
+
+  // vdom caches a member-expression handler behind a wrapper, so binding the
+  // fallthrough listener back statically runs it twice there as well
+  test('static listener bound back from $attrs runs twice like vdom', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button @click="$attrs.onClick">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ parent: on('parent') }),
+      [],
+    )
+    expect(seen).toEqual(['parent parent'])
+  })
+
+  test('v-on object before a static listener keeps the template order', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-on="data.events" @click="data.root">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () =>
+        ref({
+          events: { click: on('object') } as any,
+          root: on('root'),
+          parent: on('parent'),
+        }),
+      [
+        data => (data.value.root = on('root2')),
+        data => (data.value.events = { click: on('object2') }),
+      ],
+    )
+    expect(seen).toEqual([
+      'object root parent',
+      'object root2 parent',
+      'object2 root2 parent',
+    ])
+  })
+
+  test('v-bind before a static listener keeps the template order', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="data.rootProps" @click="data.root">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () =>
+        ref({
+          rootProps: { onClick: on('bind') } as any,
+          root: on('root'),
+          parent: on('parent'),
+        }),
+      [
+        data => (data.value.rootProps = { onClick: on('bind2') }),
+        data => (data.value.root = on('root2')),
+      ],
+    )
+    expect(seen).toEqual([
+      'bind root parent',
+      'bind2 root parent',
+      'bind2 root2 parent',
+    ])
+  })
+
+  test(':onClick root listener runs before the fallthrough one', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button :onClick="data.root">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), parent: on('parent') }),
+      [
+        data => (data.value.root = on('root2')),
+        data => (data.value.parent = on('parent2')),
+      ],
+    )
+    expect(seen).toEqual(['root parent', 'root2 parent', 'root2 parent2'])
+  })
+
+  test(':onClick merges with a v-on object and a static listener in template order', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button :onClick="data.bound" v-on="data.events" @click="data.root">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () =>
+        ref({
+          bound: on('bound'),
+          events: { click: on('object') } as any,
+          root: on('root'),
+          parent: on('parent'),
+        }),
+      [data => (data.value.bound = on('bound2'))],
+    )
+    expect(seen).toEqual([
+      'bound object root parent',
+      'bound2 object root parent',
+    ])
+  })
+
+  test('a merged static listener keeps the receiver of a member expression', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="data.rest" @click="data.controller.handleClick">x</button></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => {
+        const controller = {
+          handleClick() {
+            // `this` is the reactive proxy of the controller
+            calls.push(
+              this && this.handleClick === controller.handleClick
+                ? 'this'
+                : 'lost',
+            )
+          },
+        }
+        return ref({ rest: { id: 'a' }, controller, parent: on('parent') })
+      },
+      [],
+    )
+    expect(seen).toEqual(['this parent'])
+  })
+
+  test('root inside a v-if branch', async () => {
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-if="data.show" v-bind="{ onClick: data.root }">x</button><span v-else>y</span></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ show: true, root: on('root'), parent: on('parent') }),
+      [
+        data => (data.value.root = on('root2')),
+        data => (data.value.show = false),
+        data => (data.value.show = true),
+      ],
+    )
+    expect(seen).toEqual([
+      'root parent',
+      'root2 parent',
+      'parent',
+      'root2 parent',
+    ])
+  })
+
+  test('the same handler in both layers runs once', async () => {
+    const shared = on('shared')
+    const seen = await clickParity(
+      {
+        Child: `<template><button v-bind="{ onClick: data.shared }">x</button></template>`,
+        App: `<template><components.Child @click="data.shared" /></template>`,
+      },
+      () => ref({ shared }),
+      [],
+    )
+    expect(seen).toEqual(['shared'])
+  })
+
+  test('listeners forwarded through a component root', async () => {
+    const seen = await clickParity(
+      {
+        Inner: `<template><button v-bind="{ onClick: data.root }">x</button></template>`,
+        Child: `<template><components.Inner @click="data.mid" /></template>`,
+        App: `<template><components.Child @click="data.parent" /></template>`,
+      },
+      () => ref({ root: on('root'), mid: on('mid'), parent: on('parent') }),
+      [data => (data.value.mid = on('mid2'))],
+    )
+    expect(seen).toEqual(['root mid parent', 'root mid2 parent'])
+  })
+})

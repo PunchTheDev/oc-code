@@ -1,0 +1,1469 @@
+diff --git a/Changelog.rst b/Changelog.rst
+index 1f5ecf0069f..cb20ea380fb 100644
+--- a/Changelog.rst
++++ b/Changelog.rst
+@@ -21,6 +21,11 @@ Unreleased
+ - The ``retry_policy`` argument passed to ``before_task_publish`` signal receivers
+   and used to publish ``task-sent`` events is now always a dictionary containing
+   the merged configured and per-call retry options, never ``None`` (#10708).
++- Add ``--concurrency=auto`` / ``worker_concurrency = "auto"`` to size the
++  prefork pool from the cgroup CPU quota and the CPU affinity mask (#10328).
++  ``worker_concurrency`` is no longer coerced to an integer at config load, so
++  code reading ``app.conf.worker_concurrency`` directly may see ``"auto"`` or a
++  numeric string such as ``"4"``; the worker converts it at startup.
+ 
+ .. _version-5.7.0a1:
+ 
+diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index 84150ce5407..a72d54b994e 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -334,7 +334,8 @@ def __repr__(self):
+         ),
+         soft_shutdown_timeout=Option(0.0, type='float'),
+         enable_soft_shutdown_on_idle=Option(False, type='bool'),
+-        concurrency=Option(None, type='int'),
++        # 'any' preserves "auto"; validated in WorkController.setup_instance.
++        concurrency=Option(None, type='any'),
+         consumer=Option('celery.worker.consumer:Consumer', type='string'),
+         direct=Option(False, type='bool', old={'celery_worker_direct'}),
+         disable_rate_limits=Option(
+diff --git a/celery/bin/worker.py b/celery/bin/worker.py
+index cd4d62c0614..9b7d289b993 100644
+--- a/celery/bin/worker.py
++++ b/celery/bin/worker.py
+@@ -15,10 +15,32 @@
+ from celery.platforms import EX_FAILURE, EX_OK, detached, maybe_drop_privileges
+ from celery.utils.log import get_logger
+ from celery.utils.nodenames import default_nodename, host_format, node_format
++from celery.utils.sysinfo import AUTO_CONCURRENCY, is_auto_concurrency
+ 
+ logger = get_logger(__name__)
+ 
+ 
++def _concurrency_value(ctx, _param, value):
++    """Parse ``--concurrency`` accepting an integer or the ``auto`` sentinel.
++
++    Falls through to ``ctx.obj.app.conf.worker_concurrency`` when the CLI
++    value is empty or zero, matching the existing behavior.
++    """
++    if not value:
++        return ctx.obj.app.conf.worker_concurrency
++    if is_auto_concurrency(value):
++        return AUTO_CONCURRENCY
++    try:
++        parsed = int(value)
++    except (TypeError, ValueError):
++        parsed = -1
++    if parsed < 0:
++        raise click.BadParameter(
++            f"must be a non-negative integer or 'auto', got {value!r}"
++        )
++    return parsed or ctx.obj.app.conf.worker_concurrency
++
++
+ class CeleryBeat(ParamType):
+     """Celery Beat flag."""
+ 
+@@ -193,15 +215,18 @@ def detach(path, argv, logfile=None, pidfile=None, uid=None,
+                    "Only supported with Redis brokers.")
+ @click.option('-c',
+               '--concurrency',
+-              type=int,
++              type=str,
+               metavar="<concurrency>",
+-              callback=lambda ctx, _,
+-              value: value or ctx.obj.app.conf.worker_concurrency,
++              callback=_concurrency_value,
+               cls=CeleryOption,
+               help_group="Pool Options",
+-              help="Number of child processes processing the queue.  "
+-                   "The default is the number of CPUs available"
+-                   " on your system.")
++              help="Number of child processes processing the queue. "
++                   "The default is the number of CPUs available "
++                   "on your system. Use 'auto' to size the prefork "
++                   "pool from the cgroup CPU quota and CPU affinity "
++                   "mask (Linux only). For the threads, gevent, "
++                   "eventlet and solo pools 'auto' is a no-op and "
++                   "uses the number of CPUs available to the process.")
+ @click.option('-P',
+               '--pool',
+               default='prefork',
+diff --git a/celery/utils/sysinfo.py b/celery/utils/sysinfo.py
+index 52fc45e5474..f775f1dad54 100644
+--- a/celery/utils/sysinfo.py
++++ b/celery/utils/sysinfo.py
+@@ -2,11 +2,201 @@
+ from __future__ import annotations
+ 
+ import os
++import posixpath
+ from math import ceil
++from typing import NamedTuple
+ 
+ from kombu.utils.objects import cached_property
+ 
+-__all__ = ('load_average', 'df')
++__all__ = (
++    'load_average', 'df',
++    'AUTO_CONCURRENCY', 'is_auto_concurrency', 'available_cpu_count',
++    'cgroup_cpu_quota', 'CpuBudget', 'cpu_budget',
++)
++
++
++#: Sentinel string accepted by ``worker_concurrency`` / ``--concurrency``
++#: to request cgroup-aware auto-sizing on Linux.
++AUTO_CONCURRENCY = 'auto'
++
++CGROUP_ROOT = '/sys/fs/cgroup'
++PROC_SELF_CGROUP = '/proc/self/cgroup'
++
++
++def is_auto_concurrency(value) -> bool:
++    """Return True if ``value`` is the ``auto`` concurrency sentinel.
++
++    Accepts case-insensitive ``"auto"`` with surrounding whitespace stripped.
++    """
++    return (
++        isinstance(value, str)
++        and value.strip().lower() == AUTO_CONCURRENCY
++    )
++
++
++def available_cpu_count() -> int:
++    """Return the number of CPUs this process may run on.
++
++    Honors the scheduler affinity mask (``taskset``, cpusets,
++    ``docker run --cpuset-cpus``) via :func:`os.process_cpu_count` on
++    Python 3.13+ or :func:`os.sched_getaffinity` on older Linux. Falls
++    back to :func:`os.cpu_count` (or 2 if undetermined) where neither
++    is available.
++    """
++    count = None
++    if hasattr(os, 'process_cpu_count'):
++        count = os.process_cpu_count()
++    elif hasattr(os, 'sched_getaffinity'):
++        try:
++            count = len(os.sched_getaffinity(0))
++        except OSError:
++            pass
++    return count or os.cpu_count() or 2
++
++
++def _read_text(path: str) -> str | None:
++    try:
++        with open(path) as fh:
++            return fh.read()
++    except OSError:
++        return None
++
++
++def _parse_quota(quota_us: str, period_us: str) -> float | None:
++    """Return ``quota / period`` in CPUs, or None when no quota applies.
++
++    cgroup v2 reports ``max`` and cgroup v1 reports ``-1`` for an
++    unlimited quota; both resolve to None.
++    """
++    try:
++        quota = int(quota_us)
++        period = int(period_us)
++    except ValueError:
++        return None
++    if quota <= 0 or period <= 0:
++        return None
++    return quota / period
++
++
++def _cgroup_paths() -> tuple[str | None, str | None, str]:
++    """Return this process's (v2 path, v1 cpu-controller path, v1 mount).
++
++    Parsed from ``/proc/self/cgroup``. Either path is None when the
++    corresponding hierarchy is absent. Paths are relative to the cgroup
++    mount and always start with ``/``. The v1 mount is the controller list
++    of the cpu hierarchy (``cpu,cpuacct``), ``cpu`` when not found.
++    """
++    content = _read_text(PROC_SELF_CGROUP)
++    if content is None:
++        return None, None, 'cpu'
++    v2_path = v1_path = None
++    v1_mount = 'cpu'
++    for line in content.splitlines():
++        parts = line.split(':', 2)
++        if len(parts) != 3:
++            continue
++        hierarchy, controllers, path = parts
++        if hierarchy == '0' and controllers == '':
++            v2_path = path
++        elif 'cpu' in controllers.split(','):
++            v1_path, v1_mount = path, controllers
++    return v2_path, v1_path, v1_mount
++
++
++def _ancestors(path: str) -> list[str]:
++    """Return ``path`` and every ancestor up to and including the root.
++
++    ``'/a/b'`` -> ``['/a/b', '/a', '/']``. A path that does not start
++    with ``/`` (a v1 hierarchy seen from inside a private cgroup
++    namespace can yield ``/../..`` shapes) is normalised first.
++    """
++    norm = posixpath.normpath('/' + path.lstrip('/'))
++    out = [norm]
++    while norm != '/':
++        norm = posixpath.dirname(norm)
++        out.append(norm)
++    return out
++
++
++def _read_v2_quota(cgroup_dir: str) -> tuple[str, str] | None:
++    content = _read_text(posixpath.join(cgroup_dir, 'cpu.max'))
++    parts = content.split() if content else []
++    return (parts[0], parts[1]) if len(parts) == 2 else None
++
++
++def _read_v1_quota(cgroup_dir: str) -> tuple[str, str] | None:
++    quota = _read_text(posixpath.join(cgroup_dir, 'cpu.cfs_quota_us'))
++    period = _read_text(posixpath.join(cgroup_dir, 'cpu.cfs_period_us'))
++    if quota is None or period is None:
++        return None
++    return quota.strip(), period.strip()
++
++
++def _min_quota(base: str, cgroup_path: str, read) -> float | None:
++    """Smallest quota found at ``cgroup_path`` and each of its ancestors.
++
++    ``read(dir)`` returns ``(quota_us, period_us)`` strings or None.
++    """
++    quotas = []
++    for rel in _ancestors(cgroup_path):
++        raw = read(posixpath.join(base, rel.lstrip('/')))
++        cpus = _parse_quota(*raw) if raw else None
++        if cpus is not None:
++            quotas.append(cpus)
++    return min(quotas) if quotas else None
++
++
++def cgroup_cpu_quota() -> float | None:
++    """Return the CFS CPU quota (in CPUs) that applies to this process.
++
++    Walks from the process's own cgroup (``/proc/self/cgroup``, or the
++    mount root when unreadable) up to the root and returns the minimum
++    quota, trying cgroup v2 then v1. None when no quota applies.
++    """
++    v2_path, v1_path, v1_mount = _cgroup_paths()
++    if v2_path is None and v1_path is None:
++        v2_path = v1_path = '/'
++    if v2_path is not None:
++        cpus = _min_quota(CGROUP_ROOT, v2_path, _read_v2_quota)
++        if cpus is not None:
++            return cpus
++    if v1_path is not None:
++        # Try the mount named after the hierarchy (``cpu,cpuacct``) first,
++        # then the usual ``cpu`` symlink, which some hosts do not create.
++        for mount in dict.fromkeys((v1_mount, 'cpu')):
++            cpus = _min_quota(posixpath.join(CGROUP_ROOT, mount), v1_path, _read_v1_quota)
++            if cpus is not None:
++                return cpus
++    return None
++
++
++class CpuBudget(NamedTuple):
++    """Result of :func:`cpu_budget`."""
++
++    #: Concurrency to use.
++    count: int
++    #: Affinity-aware CPU count, see :func:`available_cpu_count`.
++    available: int
++    #: cgroup CFS quota in CPUs, or None when no quota applies or the
++    #: quota was not consulted.
++    quota: float | None
++
++
++def cpu_budget(use_cgroup_quota: bool = True) -> CpuBudget:
++    """Return the CPU budget for sizing a worker pool.
++
++    Starts from :func:`available_cpu_count`. When ``use_cgroup_quota`` is
++    True (CPU-bound pools), caps it to ``ceil(quota)`` of any cgroup CFS
++    quota, clamped to ``[1, available]``. ``ceil`` follows joblib/loky so a
++    fractional quota is fully used; see :setting:`worker_concurrency`.
++    """
++    available = available_cpu_count()
++    if not use_cgroup_quota:
++        return CpuBudget(available, available, None)
++    quota = cgroup_cpu_quota()
++    if quota is None:
++        return CpuBudget(available, available, None)
++    return CpuBudget(min(available, max(1, ceil(quota))), available, quota)
+ 
+ 
+ if hasattr(os, 'getloadavg'):
+diff --git a/celery/worker/worker.py b/celery/worker/worker.py
+index 45e5fa9bb4a..f22ccd3bb05 100644
+--- a/celery/worker/worker.py
++++ b/celery/worker/worker.py
+@@ -30,6 +30,7 @@
+ from celery.utils.log import mlevel
+ from celery.utils.log import worker_logger as logger
+ from celery.utils.nodenames import default_nodename, worker_direct
++from celery.utils.sysinfo import cpu_budget, is_auto_concurrency
+ from celery.utils.text import str_to_list
+ from celery.utils.threads import bound_open_broker_sockets, default_socket_timeout
+ 
+@@ -70,6 +71,12 @@ class WorkController:
+     pool = None
+     semaphore = None
+ 
++    #: (level, format, args) for a concurrency-resolution message produced in
++    #: :meth:`setup_instance`, which runs before logging is configured (via
++    #: :meth:`on_init_blueprint`). Emitted in :meth:`on_start` instead, where
++    #: handlers are attached and the message actually reaches the operator.
++    _pending_concurrency_log = None
++
+     #: contains the exit code if a :exc:`SystemExit` event is handled.
+     exitcode = None
+ 
+@@ -105,7 +112,24 @@ def setup_instance(self, queues=None, ready_callback=None, pidfile=None,
+         self.setup_queues(queues, exclude_queues)
+         self.setup_includes(str_to_list(include))
+ 
+-        # Set default concurrency
++        # ``worker_concurrency`` uses ``type='any'`` so the ``"auto"`` sentinel
++        # is preserved through config load. Coerce any other string form
++        # (env vars, direct ``app.conf.worker_concurrency = "4"``) back to int
++        # here; invalid strings fall through to the cpu_count default below.
++        if (isinstance(self.concurrency, str)
++                and not is_auto_concurrency(self.concurrency)):
++            try:
++                self.concurrency = int(self.concurrency)
++            except ValueError:
++                self._pending_concurrency_log = (
++                    'warning',
++                    "worker_concurrency=%r is not a valid integer or "
++                    "'auto'; falling back to billiard.cpu_count().",
++                    (self.concurrency,),
++                )
++                self.concurrency = None
++
++        # Set default concurrency. ``auto`` is resolved after ``worker_init``.
+         if not self.concurrency:
+             try:
+                 self.concurrency = cpu_count()
+@@ -128,6 +152,8 @@ def setup_instance(self, queues=None, ready_callback=None, pidfile=None,
+ 
+         # Initialize bootsteps
+         self.pool_cls = _concurrency.get_implementation(self.pool_cls)
++        if is_auto_concurrency(self.concurrency):
++            self._resolve_auto_concurrency()
+         self.steps = []
+         self.on_init_blueprint()
+         self.blueprint = self.Blueprint(
+@@ -138,6 +164,44 @@ def setup_instance(self, queues=None, ready_callback=None, pidfile=None,
+         )
+         self.blueprint.apply(self, **kwargs)
+ 
++    def _resolve_auto_concurrency(self):
++        # Runs after ``worker_init`` so handlers that monkey-patch there do so
++        # before the pool module is imported. Only prefork is CPU-bound, so
++        # only prefork is capped to the cgroup quota.
++        from celery.concurrency.prefork import TaskPool as PreforkPool
++
++        # The CLI hands over a class, so map it back to its alias.
++        target = f'{self.pool_cls.__module__}:{self.pool_cls.__qualname__}'
++        pool_name = next(
++            (alias for alias, path in _concurrency.ALIASES.items()
++             if path == target),
++            target,
++        )
++        is_cpu_bound = (
++            isinstance(self.pool_cls, type)
++            and issubclass(self.pool_cls, PreforkPool)
++        )
++        budget = cpu_budget(use_cgroup_quota=is_cpu_bound)
++        self.concurrency = budget.count
++        if not is_cpu_bound:
++            self._pending_concurrency_log = (
++                'info',
++                "worker_concurrency='auto' only sizes the prefork pool; "
++                "using available cpus=%d for pool=%s.",
++                (self.concurrency, pool_name),
++            )
++        else:
++            quota = (
++                'no cgroup cpu quota found' if budget.quota is None
++                else f'cgroup cpu quota={budget.quota:.2f}'
++            )
++            self._pending_concurrency_log = (
++                'info',
++                "worker_concurrency='auto' resolved to %d "
++                "(pool=%s, %s, available cpus=%d).",
++                (self.concurrency, pool_name, quota, budget.available),
++            )
++
+     def on_init_blueprint(self):
+         pass
+ 
+@@ -148,6 +212,10 @@ def on_after_init(self, **kwargs):
+         pass
+ 
+     def on_start(self):
++        if self._pending_concurrency_log is not None:
++            level, fmt, args = self._pending_concurrency_log
++            getattr(logger, level)(fmt, *args)
++            self._pending_concurrency_log = None
+         if self.pidfile:
+             self.pidlock = create_pidlock(self.pidfile)
+ 
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index 9f2a0408e06..5d4efe96539 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -3515,6 +3515,37 @@ on the host will be used.
+ The command-line equivalent is the
+ :option:`--concurrency <celery worker --concurrency>` argument.
+ 
++.. versionadded:: 5.7
++   The ``"auto"`` value.
++
++Accepts an integer or the string ``"auto"``. Setting it to ``"auto"``
++(equivalent to passing ``--concurrency=auto``) sizes the ``prefork``
++pool from the CPU resources available to the worker process on Linux:
++
++* the scheduler affinity mask (``taskset``, cpusets,
++  ``docker run --cpuset-cpus``), read via :func:`os.process_cpu_count`
++  or :func:`os.sched_getaffinity`, and
++* the cgroup CFS bandwidth quota (``cpu.max`` on cgroup v2,
++  ``cpu.cfs_quota_us`` / ``cpu.cfs_period_us`` on cgroup v1). The
++  worker's own cgroup is resolved from ``/proc/self/cgroup`` and every
++  ancestor up to the root is inspected; the smallest quota found wins,
++  so a limit set on a Kubernetes pod, a Docker container or a systemd
++  slice (``CPUQuota=``) is honored.
++
++The result is ``ceil(quota)``, clamped to at least 1 and at most the
++affinity CPU count. A fractional quota of 1.5 CPUs therefore yields 2
++processes, so the whole quota can be consumed at the cost of some CFS
++throttling; integer quotas are unaffected. When no quota is set the
++affinity CPU count is used and the worker logs at INFO level that no
++quota was found.
++
++For greenlet pools (``gevent``, ``eventlet``), the thread pool and the
++``solo`` pool, ``"auto"`` is a no-op and resolves to the affinity CPU
++count: concurrency for the IO pools is bound by memory and file
++descriptors, not CPU, and ``solo`` always runs one task at a time. On
++non-Linux platforms or when no cgroup CPU controller is mounted,
++``"auto"`` resolves to the affinity CPU count as well.
++
+ .. setting:: worker_prefetch_multiplier
+ 
+ ``worker_prefetch_multiplier``
+diff --git a/docs/userguide/workers.rst b/docs/userguide/workers.rst
+index 68edc38b8d0..9679de3609f 100644
+--- a/docs/userguide/workers.rst
++++ b/docs/userguide/workers.rst
+@@ -448,6 +448,15 @@ of worker processes/threads can be changed using the
+ :option:`--concurrency <celery worker --concurrency>` argument and defaults
+ to the number of CPUs available on the machine.
+ 
++.. versionadded:: 5.7
++   ``--concurrency=auto``.
++
++Inside a container or a systemd unit with a CPU limit the host CPU count
++overstates what the worker may use. Passing ``--concurrency=auto`` sizes
++the prefork pool from the cgroup CPU quota and the CPU affinity mask
++instead (Linux only); for the threads, gevent, eventlet and solo pools it
++is a no-op. See :setting:`worker_concurrency` for details.
++
+ .. admonition:: Number of processes (multiprocessing/prefork pool)
+ 
+     More pool processes are usually better, but there's a cut-off point where
+diff --git a/t/integration/test_worker.py b/t/integration/test_worker.py
+index c2158ec2b95..5a9be167726 100644
+--- a/t/integration/test_worker.py
++++ b/t/integration/test_worker.py
+@@ -1,10 +1,14 @@
+ import subprocess
++import sys
++import time
++from uuid import uuid4
+ 
+ import pytest
+ 
+ from celery import Celery
++from celery.utils.sysinfo import cpu_budget
+ 
+-from .conftest import flaky
++from .conftest import TEST_BROKER, flaky
+ from .tasks import add
+ 
+ TIMEOUT = 10
+@@ -90,6 +94,44 @@ class MyCustomCelery(Celery):
+     assert hasattr(app.Task, 'apply_async_on_commit')
+ 
+ 
++@flaky
++def test_concurrency_auto_sizes_prefork_pool(tmp_path):
++    """``celery worker -c auto`` resolves concurrency and sizes the real pool."""
++    hostname = f'auto-{uuid4().hex[:8]}@integration'
++    log_path = tmp_path / 'worker.log'
++    app = Celery(broker=TEST_BROKER)
++    expected = cpu_budget().count
++
++    with open(log_path, 'wb') as log:
++        worker = subprocess.Popen(
++            [sys.executable, '-m', 'celery', '-b', TEST_BROKER, 'worker',
++             '-P', 'prefork', '-c', 'auto', '-n', hostname, '-l', 'INFO',
++             '--without-mingle', '--without-gossip', '--without-heartbeat'],
++            stdout=log, stderr=subprocess.STDOUT)
++        try:
++            stats = None
++            deadline = time.monotonic() + 30
++            while not stats and time.monotonic() < deadline:
++                assert worker.poll() is None, log_path.read_text()
++                stats = app.control.inspect(
++                    destination=[hostname], timeout=1).stats()
++            assert stats, log_path.read_text()
++            assert stats[hostname]['pool']['max-concurrency'] == expected
++        finally:
++            worker.terminate()
++            try:
++                worker.wait(timeout=30)
++            except subprocess.TimeoutExpired:
++                worker.kill()
++                worker.wait()
++            app.close()
++
++    assert (
++        f"worker_concurrency='auto' resolved to {expected} (pool=prefork"
++        in log_path.read_text()
++    )
++
++
+ @flaky
+ def test_pidbox_reset_after_repeated_control_errors(manager):
+     def assert_ping():
+diff --git a/t/smoke/tests/test_concurrency_auto.py b/t/smoke/tests/test_concurrency_auto.py
+new file mode 100644
+index 00000000000..714cba32b82
+--- /dev/null
++++ b/t/smoke/tests/test_concurrency_auto.py
+@@ -0,0 +1,261 @@
++"""Smoke tests for ``--concurrency=auto`` (cgroup-aware concurrency).
++
++These tests run real workers in Docker containers with real CFS quotas
++(``cpu_quota``/``cpu_period`` on the container), so the cgroup files read by
++``celery.utils.sysinfo.cpu_budget()`` are written by the kernel —
++nothing is mocked. They complement the unit tests in
++``t/unit/utils/test_sysinfo.py``, which exercise the parsing logic against
++synthetic files.
++"""
++
++from __future__ import annotations
++
++import os
++from time import sleep
++
++import pytest
++from pytest_celery import CeleryTestSetup, CeleryTestWorker, CeleryWorkerContainer, defaults
++from pytest_docker_tools import container, fxtr
++
++from t.smoke.workers.dev import SmokeWorkerContainer
++
++RESULT_TIMEOUT = 30
++CPU_PERIOD = 100_000
++
++
++@pytest.fixture
++def worker_cpu_quota() -> int:
++    """CFS quota (µs per period) applied to the worker container.
++
++    Defaults to 2 CPUs; override per test class. ``-1`` means no quota
++    (``cpu.max = max``).
++    """
++    return 2 * CPU_PERIOD
++
++
++@pytest.fixture
++def worker_cpuset_cpus() -> str | None:
++    """CPU affinity applied to the worker container (``--cpuset-cpus``).
++
++    None means unpinned; override per test class.
++    """
++    return None
++
++
++# Same container as t/smoke/workers/dev.py, plus a CFS quota. Module-level
++# definition shadows the default worker container for tests in this file only.
++default_worker_container = container(
++    image="{celery_dev_worker_image.id}",
++    ports=fxtr("default_worker_ports"),
++    environment=fxtr("default_worker_env"),
++    network="{default_pytest_celery_network.name}",
++    volumes={
++        "{default_worker_volume.name}": defaults.DEFAULT_WORKER_VOLUME,
++        os.path.abspath(os.getcwd()): {
++            "bind": "/celery",
++            "mode": "rw",
++        },
++    },
++    wrapper_class=SmokeWorkerContainer,
++    timeout=defaults.DEFAULT_WORKER_CONTAINER_TIMEOUT,
++    command=fxtr("default_worker_command"),
++    cpu_quota=fxtr("worker_cpu_quota"),
++    cpu_period=CPU_PERIOD,
++    cpuset_cpus=fxtr("worker_cpuset_cpus"),
++)
++
++
++@pytest.fixture
++def default_worker_container_cls() -> type[CeleryWorkerContainer]:
++    return SmokeWorkerContainer
++
++
++@pytest.fixture(scope="session")
++def default_worker_container_session_cls() -> type[CeleryWorkerContainer]:
++    return SmokeWorkerContainer
++
++
++def container_cpu_count(worker: CeleryTestWorker) -> int:
++    """CPUs in the affinity mask inside the worker container (host CPUs
++    unless ``--cpuset-cpus`` is set; unaffected by the CFS quota)."""
++    exit_code, output = worker.container.exec_run(
++        'python -c "import os; print(len(os.sched_getaffinity(0)))"'
++    )
++    assert exit_code == 0, output
++    return int(output.decode().strip())
++
++
++def get_pool_stats(setup: CeleryTestSetup, worker: CeleryTestWorker, attempts: int = 10) -> dict:
++    """Fetch the worker's pool stats over the control channel, with retries
++    while the worker finishes booting."""
++    last = None
++    for _ in range(attempts):
++        last = setup.app.control.inspect(
++            destination=[worker.hostname()], timeout=3
++        ).stats()
++        if last and worker.hostname() in last:
++            return last[worker.hostname()]["pool"]
++        sleep(1)
++    raise AssertionError(f"No stats reply from {worker.hostname()}: {last!r}")
++
++
++class test_auto_prefork_with_quota:
++    """quota=2 CPUs + prefork: pool must size to the quota, not the host."""
++
++    @pytest.fixture
++    def default_worker_command(self, default_worker_container_cls: type[CeleryWorkerContainer]) -> list[str]:
++        return default_worker_container_cls.command("--concurrency=auto", "--pool=prefork")
++
++    def test_pool_size_matches_cgroup_quota(self, celery_setup: CeleryTestSetup):
++        worker = celery_setup.worker
++        expected = min(container_cpu_count(worker), 2)
++        worker.assert_log_exists(
++            f"worker_concurrency='auto' resolved to {expected} (pool=prefork, cgroup cpu quota=2.00",
++            timeout=RESULT_TIMEOUT,
++        )
++        pool = get_pool_stats(celery_setup, worker)
++        assert pool["max-concurrency"] == expected
++        assert len(pool["processes"]) == expected
++
++
++class test_auto_prefork_fractional_quota:
++    """quota=0.5 CPU + prefork: ceil() to 1 process, never 0."""
++
++    @pytest.fixture
++    def worker_cpu_quota(self) -> int:
++        return CPU_PERIOD // 2
++
++    @pytest.fixture
++    def default_worker_command(self, default_worker_container_cls: type[CeleryWorkerContainer]) -> list[str]:
++        return default_worker_container_cls.command("--concurrency=auto", "--pool=prefork")
++
++    def test_fractional_quota_rounds_up_to_one(self, celery_setup: CeleryTestSetup):
++        worker = celery_setup.worker
++        worker.assert_log_exists(
++            "worker_concurrency='auto' resolved to 1 (pool=prefork, cgroup cpu quota=0.50",
++            timeout=RESULT_TIMEOUT,
++        )
++        pool = get_pool_stats(celery_setup, worker)
++        assert pool["max-concurrency"] == 1
++        assert len(pool["processes"]) == 1
++
++
++class test_auto_prefork_no_quota:
++    """No CFS quota (``cpu.max = max``): auto falls back to host CPU count."""
++
++    @pytest.fixture
++    def worker_cpu_quota(self) -> int:
++        return -1  # Docker: no quota
++
++    @pytest.fixture
++    def default_worker_command(self, default_worker_container_cls: type[CeleryWorkerContainer]) -> list[str]:
++        return default_worker_container_cls.command("--concurrency=auto", "--pool=prefork")
++
++    def test_no_quota_falls_back_to_host_cpu_count(self, celery_setup: CeleryTestSetup):
++        worker = celery_setup.worker
++        expected = container_cpu_count(worker)
++        worker.assert_log_exists(
++            f"worker_concurrency='auto' resolved to {expected} (pool=prefork, no cgroup cpu quota found",
++            timeout=RESULT_TIMEOUT,
++        )
++        pool = get_pool_stats(celery_setup, worker)
++        assert pool["max-concurrency"] == expected
++
++
++class test_auto_prefork_cpuset_no_quota:
++    """No CFS quota but pinned to one core (``--cpuset-cpus=0``): auto must
++    size from the affinity mask, not the host CPU count."""
++
++    @pytest.fixture
++    def worker_cpu_quota(self) -> int:
++        return -1
++
++    @pytest.fixture
++    def worker_cpuset_cpus(self) -> str:
++        return "0"
++
++    @pytest.fixture
++    def default_worker_command(self, default_worker_container_cls: type[CeleryWorkerContainer]) -> list[str]:
++        return default_worker_container_cls.command("--concurrency=auto", "--pool=prefork")
++
++    def test_cpuset_caps_pool_size(self, celery_setup: CeleryTestSetup):
++        worker = celery_setup.worker
++        worker.assert_log_exists(
++            "worker_concurrency='auto' resolved to 1 (pool=prefork, no cgroup cpu quota found, available cpus=1)",
++            timeout=RESULT_TIMEOUT,
++        )
++        pool = get_pool_stats(celery_setup, worker)
++        assert pool["max-concurrency"] == 1
++        assert len(pool["processes"]) == 1
++
++
++class test_auto_threads_noop:
++    """quota=2 CPUs + threads pool: auto is a documented no-op for
++    non-CPU-bound pools and must NOT cap to the quota."""
++
++    @pytest.fixture
++    def default_worker_command(self, default_worker_container_cls: type[CeleryWorkerContainer]) -> list[str]:
++        return default_worker_container_cls.command("--concurrency=auto", "--pool=threads")
++
++    def test_threads_pool_ignores_quota(self, celery_setup: CeleryTestSetup):
++        worker = celery_setup.worker
++        worker.assert_log_exists(
++            "worker_concurrency='auto' only sizes the prefork pool",
++            timeout=RESULT_TIMEOUT,
++        )
++        expected = container_cpu_count(worker)
++        pool = get_pool_stats(celery_setup, worker)
++        assert pool["max-concurrency"] == expected
++
++
++class test_auto_solo_noop:
++    """quota=2 CPUs + solo pool: solo runs one task at a time, so auto is a
++    documented no-op and must NOT consult the quota."""
++
++    @pytest.fixture
++    def default_worker_command(self, default_worker_container_cls: type[CeleryWorkerContainer]) -> list[str]:
++        return default_worker_container_cls.command("--concurrency=auto", "--pool=solo")
++
++    def test_solo_pool_is_noop(self, celery_setup: CeleryTestSetup):
++        worker = celery_setup.worker
++        worker.assert_log_exists(
++            "worker_concurrency='auto' only sizes the prefork pool",
++            timeout=RESULT_TIMEOUT,
++        )
++        worker.assert_log_does_not_exist("worker_concurrency='auto' resolved to")
++        pool = get_pool_stats(celery_setup, worker)
++        assert pool["max-concurrency"] == 1
++
++
++class test_default_concurrency_unchanged:
++    """Regression guard: without ``auto``, a quota'd worker still sizes the
++    pool from the host CPU count exactly as before this feature."""
++
++    @pytest.fixture
++    def worker_cpu_quota(self) -> int:
++        return CPU_PERIOD  # 1 CPU — distinguishable from any multi-CPU host
++
++    def test_default_ignores_cgroup_quota(self, celery_setup: CeleryTestSetup):
++        worker = celery_setup.worker
++        host_cpus = container_cpu_count(worker)
++        if host_cpus < 2:
++            pytest.skip("Need >1 host CPU to distinguish quota from host count")
++        worker.assert_log_does_not_exist("worker_concurrency='auto'")
++        pool = get_pool_stats(celery_setup, worker)
++        assert pool["max-concurrency"] == host_cpus
++
++
++class test_auto_explicit_int_quota_interaction:
++    """An explicit integer always wins over the quota — auto only applies
++    when requested."""
++
++    @pytest.fixture
++    def default_worker_command(self, default_worker_container_cls: type[CeleryWorkerContainer]) -> list[str]:
++        return default_worker_container_cls.command("--concurrency=3", "--pool=prefork")
++
++    def test_explicit_int_overrides_quota(self, celery_setup: CeleryTestSetup):
++        worker = celery_setup.worker
++        worker.assert_log_does_not_exist("worker_concurrency='auto'")
++        pool = get_pool_stats(celery_setup, worker)
++        assert pool["max-concurrency"] == 3
++        assert len(pool["processes"]) == 3
+diff --git a/t/unit/bin/test_worker.py b/t/unit/bin/test_worker.py
+index baa73385d6c..9944622da37 100644
+--- a/t/unit/bin/test_worker.py
++++ b/t/unit/bin/test_worker.py
+@@ -1,11 +1,13 @@
+ import os
+ from unittest.mock import Mock, patch
+ 
++import click
+ import pytest
+ from click.testing import CliRunner
+ 
+ from celery.app.log import Logging
+ from celery.bin.celery import celery
++from celery.bin.worker import _concurrency_value
+ from celery.worker.consumer.tasks import Tasks
+ 
+ 
+@@ -125,3 +127,51 @@ def test_disable_prefetch_ignored_for_non_redis_brokers(mock_app, mock_consumer)
+ 
+     # Should not modify can_consume method for non-Redis brokers
+     assert mock_consumer.task_consumer.channel.qos.can_consume == original_can_consume
++
++
++def _mk_ctx(config_concurrency):
++    """Build a minimal click context for _concurrency_value callback tests."""
++    ctx = Mock()
++    ctx.obj.app.conf.worker_concurrency = config_concurrency
++    return ctx
++
++
++class test_concurrency_value_callback:
++
++    def test_explicit_integer_string_parses(self):
++        assert _concurrency_value(_mk_ctx(None), None, '4') == 4
++
++    def test_auto_sentinel_normalized(self):
++        assert _concurrency_value(_mk_ctx(None), None, 'auto') == 'auto'
++
++    @pytest.mark.parametrize('raw', ['AUTO', 'Auto', ' auto ', '\tauto\n'])
++    def test_auto_sentinel_case_and_whitespace_insensitive(self, raw):
++        assert _concurrency_value(_mk_ctx(None), None, raw) == 'auto'
++
++    def test_empty_string_falls_back_to_config(self):
++        ctx = _mk_ctx(config_concurrency=8)
++        assert _concurrency_value(ctx, None, '') == 8
++
++    def test_none_falls_back_to_config(self):
++        ctx = _mk_ctx(config_concurrency='auto')
++        assert _concurrency_value(ctx, None, None) == 'auto'
++
++    def test_zero_falls_back_to_config(self):
++        # Existing behavior: ``--concurrency=0`` falls through to config,
++        # matching what ``value or fallback`` did with type=int.
++        ctx = _mk_ctx(config_concurrency=4)
++        assert _concurrency_value(ctx, None, '0') == 4
++
++    def test_invalid_string_raises_bad_parameter(self):
++        with pytest.raises(click.BadParameter):
++            _concurrency_value(_mk_ctx(None), None, 'garbage')
++
++    @pytest.mark.parametrize('raw', ['-1', '-8'])
++    def test_negative_integer_raises_bad_parameter(self, raw):
++        with pytest.raises(click.BadParameter):
++            _concurrency_value(_mk_ctx(None), None, raw)
++
++    def test_invalid_string_mentions_auto_in_message(self):
++        with pytest.raises(click.BadParameter) as exc_info:
++            _concurrency_value(_mk_ctx(None), None, 'bogus')
++        assert 'auto' in str(exc_info.value).lower()
+diff --git a/t/unit/utils/test_sysinfo.py b/t/unit/utils/test_sysinfo.py
+index 25c8ff5f886..599b4390a5f 100644
+--- a/t/unit/utils/test_sysinfo.py
++++ b/t/unit/utils/test_sysinfo.py
+@@ -1,9 +1,12 @@
+ import importlib
++import ntpath
+ import os
++from unittest.mock import patch
+ 
+ import pytest
+ 
+-from celery.utils.sysinfo import df, load_average
++from celery.utils.sysinfo import (AUTO_CONCURRENCY, PROC_SELF_CGROUP, CpuBudget, _ancestors, available_cpu_count,
++                                  cgroup_cpu_quota, cpu_budget, df, is_auto_concurrency, load_average)
+ 
+ try:
+     posix = importlib.import_module('posix')
+@@ -33,3 +36,262 @@ def test_df():
+     assert x.available
+     assert x.capacity
+     assert x.stat
++
++
++class test_is_auto_concurrency:
++
++    @pytest.mark.parametrize('value', [
++        'auto', 'AUTO', 'Auto', ' auto ', '\tauto\n',
++    ])
++    def test_recognized(self, value):
++        assert is_auto_concurrency(value) is True
++
++    @pytest.mark.parametrize('value', [
++        None, '', '0', '4', 4, 'autopilot', 'auto4', object(),
++    ])
++    def test_not_recognized(self, value):
++        assert is_auto_concurrency(value) is False
++
++    def test_sentinel_value(self):
++        # The exported constant matches what is_auto_concurrency accepts.
++        assert is_auto_concurrency(AUTO_CONCURRENCY)
++
++
++def _fake_fs(files):
++    """Patch ``_read_text`` to serve ``files`` ({path: content})."""
++    return patch(
++        'celery.utils.sysinfo._read_text',
++        side_effect=lambda path: files.get(path),
++    )
++
++
++def _available(n):
++    return patch('celery.utils.sysinfo.available_cpu_count', return_value=n)
++
++
++V2_MAX = '/sys/fs/cgroup/cpu.max'
++V1_QUOTA = '/sys/fs/cgroup/cpu/cpu.cfs_quota_us'
++V1_PERIOD = '/sys/fs/cgroup/cpu/cpu.cfs_period_us'
++PROC_V2 = '0::/kubepods/burstable/pod1/ctr1\n'
++PROC_V1 = (
++    '12:cpu,cpuacct:/docker/abc\n'
++    '11:memory:/docker/abc\n'
++    '1:name=systemd:/docker/abc\n'
++)
++
++
++class test_available_cpu_count:
++
++    def test_prefers_process_cpu_count(self):
++        with patch('celery.utils.sysinfo.os') as os_mock:
++            os_mock.process_cpu_count.return_value = 3
++            os_mock.sched_getaffinity.return_value = {0, 1}
++            os_mock.cpu_count.return_value = 8
++            assert available_cpu_count() == 3
++            os_mock.sched_getaffinity.assert_not_called()
++
++    def test_process_cpu_count_none_uses_cpu_count(self):
++        with patch('celery.utils.sysinfo.os', spec=['process_cpu_count', 'cpu_count']) as os_mock:
++            os_mock.process_cpu_count.return_value = None
++            os_mock.cpu_count.return_value = 8
++            assert available_cpu_count() == 8
++
++    def test_falls_back_to_sched_getaffinity(self):
++        with patch('celery.utils.sysinfo.os', spec=['sched_getaffinity', 'cpu_count']) as os_mock:
++            os_mock.sched_getaffinity.return_value = {0, 1}
++            os_mock.cpu_count.return_value = 8
++            assert available_cpu_count() == 2
++
++    def test_affinity_oserror_falls_back_to_cpu_count(self):
++        with patch('celery.utils.sysinfo.os', spec=['sched_getaffinity', 'cpu_count']) as os_mock:
++            os_mock.sched_getaffinity.side_effect = OSError('nope')
++            os_mock.cpu_count.return_value = 8
++            assert available_cpu_count() == 8
++
++    def test_no_affinity_api_uses_cpu_count(self):
++        with patch('celery.utils.sysinfo.os', spec=['cpu_count']) as os_mock:
++            os_mock.cpu_count.return_value = 8
++            assert available_cpu_count() == 8
++
++    def test_cpu_count_none_uses_default_two(self):
++        with patch('celery.utils.sysinfo.os', spec=['cpu_count']) as os_mock:
++            os_mock.cpu_count.return_value = None
++            assert available_cpu_count() == 2
++
++
++@pytest.mark.parametrize('path, expected', [
++    ('/', ['/']),
++    ('/a/b', ['/a/b', '/a', '/']),
++    ('a/b', ['/a/b', '/a', '/']),
++    # v1 seen from inside a private cgroup namespace.
++    ('/../..', ['/']),
++])
++def test_ancestors(path, expected):
++    assert _ancestors(path) == expected
++
++
++class test_cgroup_cpu_quota:
++
++    @pytest.mark.timeout(5)
++    def test_paths_are_posix_on_windows(self):
++        # cgroup paths are POSIX; with os.path == ntpath the ancestor walk
++        # never reached '/' and hung worker startup on Windows.
++        files = {
++            PROC_SELF_CGROUP: PROC_V2,
++            '/sys/fs/cgroup/kubepods/burstable/pod1/cpu.max': '200000 100000\n',
++        }
++        with patch.object(os, 'path', ntpath), _fake_fs(files):
++            assert cgroup_cpu_quota() == 2.0
++        with patch.object(os, 'path', ntpath), _fake_fs({}):
++            assert cgroup_cpu_quota() is None
++
++    def test_no_files_returns_none(self):
++        with _fake_fs({}):
++            assert cgroup_cpu_quota() is None
++
++    def test_v2_root_when_proc_unavailable(self):
++        # No /proc/self/cgroup: only the mount root is inspected, which is
++        # the process's own cgroup inside a private cgroup namespace.
++        with _fake_fs({V2_MAX: '200000 100000\n'}):
++            assert cgroup_cpu_quota() == 2.0
++
++    def test_v2_max_returns_none(self):
++        with _fake_fs({V2_MAX: 'max 100000\n'}):
++            assert cgroup_cpu_quota() is None
++
++    def test_v2_own_cgroup_from_proc(self):
++        files = {
++            PROC_SELF_CGROUP: PROC_V2,
++            '/sys/fs/cgroup/kubepods/burstable/pod1/ctr1/cpu.max': '150000 100000\n',
++        }
++        with _fake_fs(files):
++            assert cgroup_cpu_quota() == 1.5
++
++    def test_v2_ancestor_limit_is_honored(self):
++        # cgroupns=host: the leaf has no quota, the pod-level ancestor does.
++        files = {
++            PROC_SELF_CGROUP: PROC_V2,
++            '/sys/fs/cgroup/kubepods/burstable/pod1/ctr1/cpu.max': 'max 100000\n',
++            '/sys/fs/cgroup/kubepods/burstable/pod1/cpu.max': '300000 100000\n',
++        }
++        with _fake_fs(files):
++            assert cgroup_cpu_quota() == 3.0
++
++    def test_v2_minimum_along_chain_wins(self):
++        files = {
++            PROC_SELF_CGROUP: PROC_V2,
++            '/sys/fs/cgroup/kubepods/burstable/pod1/ctr1/cpu.max': '400000 100000\n',
++            '/sys/fs/cgroup/kubepods/burstable/pod1/cpu.max': '200000 100000\n',
++            '/sys/fs/cgroup/kubepods/cpu.max': '800000 100000\n',
++        }
++        with _fake_fs(files):
++            assert cgroup_cpu_quota() == 2.0
++
++    def test_v2_root_cgroup_line(self):
++        # Private cgroup namespace: /proc/self/cgroup reports "0::/".
++        files = {
++            PROC_SELF_CGROUP: '0::/\n',
++            V2_MAX: '200000 100000\n',
++        }
++        with _fake_fs(files):
++            assert cgroup_cpu_quota() == 2.0
++
++    def test_v1_quota_from_proc(self):
++        files = {
++            PROC_SELF_CGROUP: PROC_V1,
++            '/sys/fs/cgroup/cpu/docker/abc/cpu.cfs_quota_us': '200000\n',
++            '/sys/fs/cgroup/cpu/docker/abc/cpu.cfs_period_us': '100000\n',
++        }
++        with _fake_fs(files):
++            assert cgroup_cpu_quota() == 2.0
++
++    def test_v1_mount_without_cpu_symlink(self):
++        # Only /sys/fs/cgroup/cpu,cpuacct is mounted, with no cpu symlink.
++        files = {
++            PROC_SELF_CGROUP: PROC_V1,
++            '/sys/fs/cgroup/cpu,cpuacct/docker/abc/cpu.cfs_quota_us': '200000\n',
++            '/sys/fs/cgroup/cpu,cpuacct/docker/abc/cpu.cfs_period_us': '100000\n',
++        }
++        with _fake_fs(files):
++            assert cgroup_cpu_quota() == 2.0
++
++    def test_v1_root_when_proc_unavailable(self):
++        with _fake_fs({V1_QUOTA: '200000\n', V1_PERIOD: '100000\n'}):
++            assert cgroup_cpu_quota() == 2.0
++
++    def test_v1_disabled_quota_returns_none(self):
++        # cgroup v1 uses -1 to mean "no quota".
++        with _fake_fs({V1_QUOTA: '-1\n', V1_PERIOD: '100000\n'}):
++            assert cgroup_cpu_quota() is None
++
++    def test_v1_ancestor_limit_is_honored(self):
++        files = {
++            PROC_SELF_CGROUP: PROC_V1,
++            '/sys/fs/cgroup/cpu/docker/abc/cpu.cfs_quota_us': '-1\n',
++            '/sys/fs/cgroup/cpu/docker/abc/cpu.cfs_period_us': '100000\n',
++            '/sys/fs/cgroup/cpu/docker/cpu.cfs_quota_us': '50000\n',
++            '/sys/fs/cgroup/cpu/docker/cpu.cfs_period_us': '100000\n',
++        }
++        with _fake_fs(files):
++            assert cgroup_cpu_quota() == 0.5
++
++    def test_malformed_v2_falls_through_to_v1(self):
++        # A hybrid host can expose both hierarchies. Garbage in cpu.max must
++        # not mask a valid v1 quota.
++        files = {
++            V2_MAX: 'not a number\n',
++            V1_QUOTA: '200000\n',
++            V1_PERIOD: '100000\n',
++        }
++        with _fake_fs(files):
++            assert cgroup_cpu_quota() == 2.0
++
++    def test_malformed_v2_only_returns_none(self):
++        with _fake_fs({V2_MAX: 'not a number\n'}):
++            assert cgroup_cpu_quota() is None
++
++    def test_malformed_v1_returns_none(self):
++        with _fake_fs({V1_QUOTA: 'x\n', V1_PERIOD: '100000\n'}):
++            assert cgroup_cpu_quota() is None
++
++    def test_unreadable_files_return_none(self):
++        # _read_text swallows OSError (permission denied etc.) as None.
++        with patch('celery.utils.sysinfo.open', side_effect=PermissionError('denied'), create=True):
++            assert cgroup_cpu_quota() is None
++
++    def test_proc_line_without_cpu_controller_is_ignored(self):
++        files = {
++            PROC_SELF_CGROUP: '11:memory:/docker/abc\n',
++            V1_QUOTA: '200000\n',
++            V1_PERIOD: '100000\n',
++        }
++        with _fake_fs(files):
++            # No cpu controller path and no v2 path: falls back to root.
++            assert cgroup_cpu_quota() == 2.0
++
++
++class test_cpu_budget:
++
++    def test_use_cgroup_quota_false_skips_quota(self):
++        with _available(8), patch('celery.utils.sysinfo.cgroup_cpu_quota') as q:
++            assert cpu_budget(use_cgroup_quota=False) == CpuBudget(8, 8, None)
++            q.assert_not_called()
++
++    def test_no_quota_returns_available(self):
++        with _available(8), patch('celery.utils.sysinfo.cgroup_cpu_quota', return_value=None):
++            assert cpu_budget() == CpuBudget(8, 8, None)
++
++    def test_quota_returns_ceil(self):
++        # 1.5 CPU quota -> ceil == 2.
++        with _available(8), patch('celery.utils.sysinfo.cgroup_cpu_quota', return_value=1.5):
++            assert cpu_budget() == CpuBudget(2, 8, 1.5)
++
++    def test_quota_clamped_to_available(self):
++        # A quota larger than the affinity set must not over-report.
++        with _available(4), patch('celery.utils.sysinfo.cgroup_cpu_quota', return_value=80.0):
++            assert cpu_budget() == CpuBudget(4, 4, 80.0)
++
++    def test_sub_one_quota_rounds_up_to_one(self):
++        # ceil(0.3) == 1, never 0.
++        with _available(8), patch('celery.utils.sysinfo.cgroup_cpu_quota', return_value=0.3):
++            assert cpu_budget() == CpuBudget(1, 8, 0.3)
+diff --git a/t/unit/worker/test_worker.py b/t/unit/worker/test_worker.py
+index 7fe8b23b739..b62c6584538 100644
+--- a/t/unit/worker/test_worker.py
++++ b/t/unit/worker/test_worker.py
+@@ -19,6 +19,7 @@
+ from kombu.utils.uuid import uuid
+ 
+ import t.skip
++from celery import signals
+ from celery.apps.worker import safe_say
+ from celery.bootsteps import CLOSE, RUN, TERMINATE, StartStopStep
+ from celery.concurrency.base import BasePool
+@@ -27,6 +28,7 @@
+ from celery.platforms import EX_FAILURE
+ from celery.utils.nodenames import worker_direct
+ from celery.utils.serialization import pickle
++from celery.utils.sysinfo import CpuBudget
+ from celery.utils.timer2 import Timer
+ from celery.worker import autoscale, components, consumer, state
+ from celery.worker import worker as worker_module
+@@ -965,6 +967,288 @@ def test_with_autoscaler(self):
+         )
+         assert worker.autoscaler
+ 
++    def test_concurrency_explicit_int_unchanged(self):
++        worker = self.app.WorkController(
++            concurrency=4, pool_cls='prefork', loglevel=0,
++        )
++        assert worker.concurrency == 4
++
++    def test_concurrency_string_int_is_coerced(self):
++        # Env vars and direct ``app.conf.worker_concurrency = "4"`` set
++        # the value as a string; worker.setup_instance must coerce it.
++        worker = self.app.WorkController(
++            concurrency='4', pool_cls='prefork', loglevel=0,
++        )
++        assert worker.concurrency == 4
++
++    def test_concurrency_string_garbage_falls_back_to_cpu_count(self):
++        # Invalid strings are treated as unset and fall through to cpu_count,
++        # with a warning so the operator sees their config was rejected.
++        # self.logger is worker_module.logger, mocked in setup_method.
++        with patch('celery.worker.worker.cpu_count', return_value=7):
++            worker = self.app.WorkController(
++                concurrency='not-a-number',
++                pool_cls='prefork',
++                loglevel=0,
++            )
++        assert worker.concurrency == 7
++        # The message is deferred to on_start() because setup_instance()
++        # runs before logging is configured.
++        worker.on_start()
++        warning_calls = [
++            call for call in self.logger.warning.call_args_list
++            if any('not-a-number' in str(a) for a in call.args)
++        ]
++        assert warning_calls, (
++            f"expected warning mentioning 'not-a-number'; "
++            f"got: {self.logger.warning.call_args_list}"
++        )
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_resolution_logged_on_start(
++        self, mock_budget,
++    ):
++        # setup_instance() runs before logging handlers exist, so the
++        # resolution message must be deferred to on_start() or it is
++        # silently dropped in a real worker (caught by the smoke tests).
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls='prefork', loglevel=0,
++        )
++        assert not self.logger.info.called
++        assert worker._pending_concurrency_log is not None
++        worker.on_start()
++        info_calls = [
++            call for call in self.logger.info.call_args_list
++            if "worker_concurrency='auto' resolved to" in str(call.args)
++        ]
++        assert info_calls
++        assert worker._pending_concurrency_log is None
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_prefork_caps_to_cgroup(
++        self, mock_budget,
++    ):
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls='prefork', loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=True)
++        assert worker.concurrency == 2
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_solo_no_cap(self, mock_budget):
++        # solo.TaskPool hard-codes ``limit = 1``; ``concurrency`` only feeds
++        # prefetch there, so the cgroup quota is not consulted.
++        mock_budget.return_value = CpuBudget(8, 8, None)
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls='solo', loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=False)
++        assert worker.concurrency == 8
++        worker.on_start()
++        assert any(
++            "only sizes the prefork pool" in call.args[0]
++            and 'solo' in call.args
++            for call in self.logger.info.call_args_list
++        )
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_prefork_subclass_caps_to_cgroup(
++        self, mock_budget,
++    ):
++        # Classification is by ``issubclass``, so a user subclass living in
++        # an arbitrary module is still treated as CPU-bound.
++        from celery.concurrency.prefork import TaskPool as PreforkPool
++
++        class MyPool(PreforkPool):
++            pass
++        MyPool.__module__ = 'myproj.pools'
++
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls=MyPool, loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=True)
++        assert worker.concurrency == 2
++        assert worker.pool_cls is MyPool
++        assert worker._pending_concurrency_log[2][1].startswith('myproj.pools:')
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_no_quota_logged(self, mock_budget):
++        # No cgroup quota anywhere in the chain: the INFO line says so
++        # instead of silently reporting the host count.
++        mock_budget.return_value = CpuBudget(8, 8, None)
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls='prefork', loglevel=0,
++        )
++        assert worker.concurrency == 8
++        worker.on_start()
++        assert any(
++            'no cgroup cpu quota found' in str(call.args)
++            for call in self.logger.info.call_args_list
++        )
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_resolved_after_worker_init(self, mock_budget):
++        # worker_init handlers may monkey-patch (gevent/eventlet), so the pool
++        # class must not be imported before the signal is sent.
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        from celery.concurrency.prefork import TaskPool as PreforkPool
++        seen = []
++
++        def on_worker_init(sender, **kwargs):
++            seen.append((sender.pool_cls, sender.concurrency))
++
++        signals.worker_init.connect(on_worker_init, weak=False)
++        try:
++            with patch(
++                'celery.worker.worker._concurrency.get_implementation',
++                wraps=worker_module._concurrency.get_implementation,
++            ) as gi:
++                worker = self.app.WorkController(
++                    concurrency='auto', pool_cls='prefork', loglevel=0,
++                )
++        finally:
++            signals.worker_init.disconnect(on_worker_init)
++        assert seen == [('prefork', 'auto')]
++        gi.assert_called_once_with('prefork')
++        assert worker.pool_cls is PreforkPool
++        assert worker.concurrency == 2
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_gevent_no_cap(self, mock_budget):
++        # gevent is an optional extra; skip if not installed in this env.
++        pytest.importorskip('gevent')
++        mock_budget.return_value = CpuBudget(8, 8, None)
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls='gevent', loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=False)
++        assert worker.concurrency == 8
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_eventlet_no_cap(self, mock_budget):
++        # eventlet is an optional extra; skip if not installed in this env.
++        pytest.importorskip('eventlet')
++        mock_budget.return_value = CpuBudget(8, 8, None)
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls='eventlet', loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=False)
++        assert worker.concurrency == 8
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_threads_no_cap(self, mock_budget):
++        mock_budget.return_value = CpuBudget(8, 8, None)
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls='threads', loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=False)
++        assert worker.concurrency == 8
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_case_insensitive(self, mock_budget):
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        worker = self.app.WorkController(
++            concurrency='AUTO', pool_cls='prefork', loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=True)
++        assert worker.concurrency == 2
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_processes_alias_caps_to_cgroup(
++        self, mock_budget,
++    ):
++        # ``processes`` is the legacy alias for prefork; treat as CPU-bound.
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls='processes', loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=True)
++        assert worker.concurrency == 2
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_dotted_import_path_caps_to_cgroup(
++        self, mock_budget,
++    ):
++        # Celery docs use the dotted-path form for custom pool registration:
++        # ``worker_pool = 'celery.concurrency.prefork:TaskPool'``.
++        # It resolves to the prefork class, so ``auto`` must cap to cgroup.
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        worker = self.app.WorkController(
++            concurrency='auto',
++            pool_cls='celery.concurrency.prefork:TaskPool',
++            loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=True)
++        assert worker.concurrency == 2
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_class_object_caps_to_cgroup(
++        self, mock_budget,
++    ):
++        # If a caller passes the resolved class directly (instead of a name),
++        # branching must still recognize it as CPU-bound.
++        from celery.concurrency.prefork import TaskPool as PreforkPool
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls=PreforkPool, loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=True)
++        assert worker.concurrency == 2
++        # The CLI passes a class; the log must still name the alias.
++        assert worker._pending_concurrency_log[2][1] == 'prefork'
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_cli_overrides_config(self, mock_budget):
++        # The explicit ``concurrency`` arg (CLI ``-c``) wins over
++        # ``worker_concurrency`` in config via ``either``; ``auto`` rides
++        # through that precedence like any other value.
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        self.app.conf.worker_concurrency = 4
++        worker = self.app.WorkController(
++            concurrency='auto', pool_cls='prefork', loglevel=0,
++        )
++        mock_budget.assert_called_once_with(use_cgroup_quota=True)
++        assert worker.concurrency == 2  # auto-resolved, not the config 4
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_from_config(self, mock_budget):
++        # ``worker_concurrency = "auto"`` set in config (no CLI override)
++        # resolves the same way.
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        self.app.conf.worker_concurrency = 'auto'
++        worker = self.app.WorkController(pool_cls='prefork', loglevel=0)
++        mock_budget.assert_called_once_with(use_cgroup_quota=True)
++        assert worker.concurrency == 2
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_int_cli_overrides_config_auto(self, mock_budget):
++        # The reverse: an explicit integer on the CLI wins over
++        # ``worker_concurrency = "auto"`` in config, and the cgroup read is
++        # never attempted.
++        self.app.conf.worker_concurrency = 'auto'
++        worker = self.app.WorkController(
++            concurrency=8, pool_cls='prefork', loglevel=0,
++        )
++        mock_budget.assert_not_called()
++        assert worker.concurrency == 8
++
++    @patch('celery.worker.worker.cpu_budget')
++    def test_concurrency_auto_with_autoscale(self, mock_budget):
++        # ``auto`` resolves without crashing when ``--autoscale`` is also
++        # given; the autoscale bounds take over sizing (max/min), while the
++        # resolved value is what min falls back to when autoscale is absent.
++        mock_budget.return_value = CpuBudget(2, 8, 2.0)
++        worker = self.app.WorkController(
++            concurrency='auto', autoscale=[10, 3], pool_cls='prefork',
++            loglevel=0,
++        )
++        assert worker.concurrency == 2
++        assert worker.max_concurrency == 10
++        assert worker.min_concurrency == 3
++
+     @t.skip.if_win32
+     @pytest.mark.sleepdeprived_patched_module(autoscale)
+     def test_with_autoscaler_file_descriptor_safety(self, sleepdeprived):

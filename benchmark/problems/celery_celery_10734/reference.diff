@@ -1,0 +1,208 @@
+diff --git a/celery/worker/consumer/consumer.py b/celery/worker/consumer/consumer.py
+index 72fc1070039..0725e47e295 100644
+--- a/celery/worker/consumer/consumer.py
++++ b/celery/worker/consumer/consumer.py
+@@ -8,7 +8,7 @@
+ import logging
+ import os
+ import warnings
+-from collections import defaultdict
++from collections import defaultdict, deque
+ from time import sleep
+ 
+ from billiard.common import restart_state
+@@ -250,7 +250,7 @@ def __init__(self, on_task_request,
+             # connect again.
+             self.app.conf.broker_connection_timeout = None
+ 
+-        self._pending_operations = []
++        self._pending_operations = deque()
+ 
+         self.steps = []
+         self.blueprint = self.Blueprint(
+@@ -260,6 +260,10 @@ def __init__(self, on_task_request,
+         self.blueprint.apply(self, **dict(worker_options or {}, **kwargs))
+ 
+     def call_soon(self, p, *args, **kwargs):
++        """Schedule a callback.
++
++        Callback ordering is not guaranteed across pool implementations.
++        """
+         p = ppartial(p, *args, **kwargs)
+         if self.hub:
+             return self.hub.call_soon(p)
+@@ -294,7 +298,7 @@ def perform_pending_operations(self):
+         if not self.hub:
+             while self._pending_operations:
+                 try:
+-                    self._pending_operations.pop()()
++                    self._pending_operations.popleft()()
+                 except Exception as exc:  # pylint: disable=broad-except
+                     logger.exception('Pending callback raised: %r', exc)
+ 
+diff --git a/t/integration/tasks.py b/t/integration/tasks.py
+index 8160ada39e5..bd70116cb7a 100644
+--- a/t/integration/tasks.py
++++ b/t/integration/tasks.py
+@@ -8,7 +8,7 @@
+ from celery.canvas import signature
+ from celery.exceptions import Reject, SoftTimeLimitExceeded
+ from celery.utils.log import get_task_logger
+-from celery.worker.control import control_command
++from celery.worker.control import add_consumer, cancel_consumer, control_command, inspect_command
+ 
+ LEGACY_TASKS_DISABLED = True
+ try:
+@@ -36,6 +36,20 @@ def pidbox_reset_error(state, **kwargs):
+     raise RuntimeError('pidbox reset integration test')
+ 
+ 
++@control_command(args=[('queue', str)], visible=False)
++def schedule_add_then_cancel_consumer(state, queue, **kwargs):
++    """Schedule two queue operations in one pidbox callback."""
++    add_consumer(state, queue)
++    cancel_consumer(state, queue)
++    return {"scheduled": queue}
++
++
++@inspect_command(visible=False)
++def pending_operations_count(state, **kwargs):
++    """Return the number of deferred consumer operations."""
++    return len(state.consumer._pending_operations)
++
++
+ @shared_task
+ def identity(x):
+     """Return the argument."""
+diff --git a/t/smoke/tests/test_control.py b/t/smoke/tests/test_control.py
+index 93533ccdb05..00831f7a77f 100644
+--- a/t/smoke/tests/test_control.py
++++ b/t/smoke/tests/test_control.py
+@@ -8,6 +8,8 @@
+ from t.integration.tasks import add
+ from t.smoke.tasks import long_running_task, summarize_results
+ 
++PENDING_OPERATIONS_QUEUE = "pending_operations_queue"
++
+ 
+ class test_control:
+     def test_sanity(self, celery_setup: CeleryTestSetup):
+@@ -61,6 +63,55 @@ def test_report_with_multiserver_result_backend(self, celery_setup: CeleryTestSe
+             app.conf.result_backend = orig_backend
+ 
+ 
++class test_pending_operation_order:
++    @pytest.fixture
++    def default_worker_command(self, default_worker_container_cls):
++        return default_worker_container_cls.command(
++            "--pool=gevent",
++            "--concurrency=1",
++        )
++
++    def test_add_then_cancel_consumer_preserves_order(
++        self,
++        celery_setup: CeleryTestSetup,
++    ):
++        app = celery_setup.app
++        worker = celery_setup.worker
++        destination = [worker.hostname()]
++
++        replies = app.control.broadcast(
++            "schedule_add_then_cancel_consumer",
++            arguments={"queue": PENDING_OPERATIONS_QUEUE},
++            destination=destination,
++            reply=True,
++            timeout=RESULT_TIMEOUT,
++        )
++        assert replies == [
++            {worker.hostname(): {"scheduled": PENDING_OPERATIONS_QUEUE}}
++        ]
++
++        @retry(stop=stop_after_attempt(20), wait=wait_fixed(0.5), reraise=True)
++        def wait_until_pending_operations_are_drained() -> None:
++            replies = app.control.broadcast(
++                "pending_operations_count",
++                destination=destination,
++                reply=True,
++                timeout=RESULT_TIMEOUT,
++            )
++            assert replies == [{worker.hostname(): 0}]
++
++        wait_until_pending_operations_are_drained()
++
++        active_queues = app.control.inspect(
++            destination=destination,
++            timeout=RESULT_TIMEOUT,
++        ).active_queues()
++        assert active_queues is not None
++        assert PENDING_OPERATIONS_QUEUE not in {
++            queue["name"] for queue in active_queues[worker.hostname()]
++        }
++
++
+ class test_revoke_chord_member:
+     @pytest.fixture
+     def default_worker_app(self, default_worker_app: Celery) -> Celery:
+diff --git a/t/smoke/workers/docker/dev b/t/smoke/workers/docker/dev
+index 87ede5c9572..16d9de674ce 100644
+--- a/t/smoke/workers/docker/dev
++++ b/t/smoke/workers/docker/dev
+@@ -40,7 +40,7 @@ WORKDIR /celery
+ COPY --chown=test_user:test_user . /celery
+ RUN pip install --no-cache-dir --upgrade \
+     pip \
+-    -e /celery[redis,pymemcache,pydantic,sqs] \
++    -e /celery[gevent,redis,pymemcache,pydantic,sqs] \
+     "${PYTEST_CELERY_PKG}"
+ # --force-reinstall: pip keeps the PyPI copy when the Git checkout reports
+ # the same version string.
+diff --git a/t/unit/worker/test_consumer.py b/t/unit/worker/test_consumer.py
+index d4ef0f7713f..7aec01c8e63 100644
+--- a/t/unit/worker/test_consumer.py
++++ b/t/unit/worker/test_consumer.py
+@@ -1311,7 +1311,7 @@ def test_perform_pending_operations_all_success(self):
+         mock_operation_2 = Mock()
+ 
+         # Add mock operations to _pending_operations
+-        c._pending_operations = [mock_operation_1, mock_operation_2]
++        c._pending_operations = deque([mock_operation_1, mock_operation_2])
+ 
+         # Call perform_pending_operations
+         c.perform_pending_operations()
+@@ -1323,6 +1323,18 @@ def test_perform_pending_operations_all_success(self):
+         # Ensure all pending operations are cleared
+         assert len(c._pending_operations) == 0
+ 
++    def test_perform_pending_operations_in_scheduling_order(self):
++        c = self.get_consumer(no_hub=True)
++        operations = []
++
++        c.call_soon(operations.append, 'first')
++        c.call_soon(operations.append, 'second')
++
++        c.perform_pending_operations()
++
++        assert operations == ['first', 'second']
++        assert len(c._pending_operations) == 0
++
+     def test_perform_pending_operations_with_exception(self):
+         """
+         Test that pending operations are processed even if one raises an exception, and
+@@ -1335,7 +1347,7 @@ def test_perform_pending_operations_with_exception(self):
+         mock_operation_success = Mock()
+ 
+         # Add operations to _pending_operations
+-        c._pending_operations = [mock_operation_fail, mock_operation_success]
++        c._pending_operations = deque([mock_operation_fail, mock_operation_success])
+ 
+         # Patch logger to avoid logging during the test
+         with patch('celery.worker.consumer.consumer.logger.exception') as mock_logger:
+@@ -1402,7 +1414,7 @@ def test_call_soon_ack_logs_callback_exception(self):
+     def test_call_soon_ack_does_not_append_to_pending_ops(self):
+         """Ack/reject callbacks must not be deferred to _pending_operations."""
+         c = self.get_consumer(no_hub=True)
+-        c._pending_operations = []
++        c._pending_operations = deque()
+         callback = Mock()
+ 
+         c.call_soon_ack(callback)

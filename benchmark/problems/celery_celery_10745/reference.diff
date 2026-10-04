@@ -1,0 +1,425 @@
+diff --git a/CONTRIBUTORS.txt b/CONTRIBUTORS.txt
+index dc866d5dd58..ceedb08a75f 100644
+--- a/CONTRIBUTORS.txt
++++ b/CONTRIBUTORS.txt
+@@ -314,3 +314,4 @@ Benjamin Chrobot, 2026/08/18
+ Phan Kỳ, 2026/08/28
+ Arockia Rajamanickam, 2026/08/29
+ Michał Furgała, 2026/09/29
++Hassan Rady, 2026/09/30
+diff --git a/celery/events/dispatcher.py b/celery/events/dispatcher.py
+index 6a2a65bbecd..f5bbb2a777c 100644
+--- a/celery/events/dispatcher.py
++++ b/celery/events/dispatcher.py
+@@ -69,6 +69,7 @@ def __init__(self, connection=None, hostname=None, enabled=True,
+         self.on_send_buffered = on_send_buffered
+         self._group_buffer = defaultdict(list)
+         self.mutex = threading.Lock()
++        self._closed = False
+         self.producer = None
+         self._outbound_buffer = deque()
+         self.serializer = serializer or self.app.conf.event_serializer
+@@ -98,11 +99,13 @@ def __exit__(self, *exc_info):
+         self.close()
+ 
+     def enable(self):
+-        self.producer = Producer(self.channel or self.connection,
+-                                 exchange=self.exchange,
+-                                 serializer=self.serializer,
+-                                 auto_declare=False)
+-        self.enabled = True
++        with self.mutex:
++            self.producer = Producer(self.channel or self.connection,
++                                     exchange=self.exchange,
++                                     serializer=self.serializer,
++                                     auto_declare=False)
++            self._closed = False
++            self.enabled = True
+         for callback in self.on_enabled:
+             callback()
+ 
+@@ -117,6 +120,8 @@ def publish(self, type, fields, producer,
+                 blind=False, Event=Event, **kwargs):
+         """Publish event using custom :class:`~kombu.Producer`.
+ 
++        The supplied producer remains usable after this dispatcher is closed.
++
+         Arguments:
+             type (str): Event type name, with group separated by dash (`-`).
+                 fields: Dictionary of event fields, must be json serializable.
+@@ -132,13 +137,16 @@ def publish(self, type, fields, producer,
+             utcoffset (Callable): Function returning the current
+                 utc offset in hours.
+         """
+-        clock = None if blind else self.clock.forward()
+-        event = Event(type, hostname=self.hostname, utcoffset=utcoffset(),
+-                      pid=self.pid, clock=clock, **fields)
++        event = self._prepare_event(type, fields, blind=blind, Event=Event)
+         with self.mutex:
+             return self._publish(event, producer,
+                                  routing_key=type.replace('-', '.'), **kwargs)
+ 
++    def _prepare_event(self, type, fields, blind=False, Event=Event):
++        clock = None if blind else self.clock.forward()
++        return Event(type, hostname=self.hostname, utcoffset=utcoffset(),
++                     pid=self.pid, clock=clock, **fields)
++
+     def _publish(self, event, producer, routing_key, retry=False,
+                  retry_policy=None, utcoffset=utcoffset):
+         if producer is None:
+@@ -194,20 +202,34 @@ def send(self, type, blind=False, utcoffset=utcoffset, retry=False,
+                 elif self.on_send_buffered:
+                     self.on_send_buffered()
+             else:
+-                return self.publish(type, fields, self.producer, blind=blind,
+-                                    Event=Event, retry=retry,
+-                                    retry_policy=retry_policy)
++                event = self._prepare_event(type, fields, blind=blind,
++                                            Event=Event)
++                with self.mutex:
++                    if self._closed:
++                        return
++                    return self._publish(
++                        event, self.producer,
++                        routing_key=type.replace('-', '.'), retry=retry,
++                        retry_policy=retry_policy,
++                    )
+ 
+     def flush(self, errors=True, groups=True):
+-        """Flush the outbound buffer."""
++        """Flush buffered events.
++
++        Buffers are retained while closed so they can be flushed after enable().
++        """
+         if errors:
+-            buf = list(self._outbound_buffer)
+-            self._outbound_buffer.clear()
+             with self.mutex:
++                if self._closed:
++                    return
++                buf = list(self._outbound_buffer)
++                self._outbound_buffer.clear()
+                 for event, routing_key in buf:
+                     self._publish(event, self.producer, routing_key)
+         if groups:
+             with self.mutex:
++                if self._closed:
++                    return
+                 for group, events in self._group_buffer.items():
+                     if not events:
+                         continue
+@@ -223,9 +245,14 @@ def extend_buffer(self, other):
+         self._outbound_buffer.extend(other._outbound_buffer)
+ 
+     def close(self):
+-        """Close the event dispatcher."""
+-        self.mutex.locked() and self.mutex.release()
+-        self.producer = None
++        """Close the dispatcher's own publishing path.
++
++        This can block for as long as an in-flight publish or flush takes.
++        Caller-supplied producers remain usable through :meth:`publish`.
++        """
++        with self.mutex:
++            self._closed = True
++            self.producer = None
+ 
+     def _get_publisher(self):
+         return self.producer
+diff --git a/t/smoke/tests/test_thread_safe.py b/t/smoke/tests/test_thread_safe.py
+index 47563e6cbec..702138ba69a 100644
+--- a/t/smoke/tests/test_thread_safe.py
++++ b/t/smoke/tests/test_thread_safe.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ from concurrent.futures import ThreadPoolExecutor
++from threading import Event
+ from unittest.mock import Mock
+ 
+ import pytest
+@@ -71,3 +72,64 @@ def thread_worker():
+                 executor.submit(thread_worker)
+ 
+         assert signal_was_called.call_count == threads_count
++
++    def test_event_dispatcher_close_waits_for_in_flight_publish(
++        self,
++        celery_setup: CeleryTestSetup,
++    ):
++        """Close waits for sends while explicit producers remain usable."""
++        publish_started = Event()
++        finish_publish = Event()
++        close_started = Event()
++        close_finished = Event()
++        published_ids = []
++
++        with celery_setup.app.connection_for_write() as connection:
++            dispatcher = celery_setup.app.events.Dispatcher(
++                connection, buffer_while_offline=False,
++            )
++            producer = dispatcher.producer
++            original_publish = producer.publish
++
++            def blocking_publish(*args, **kwargs):
++                publish_started.set()
++                if not finish_publish.wait(10):
++                    raise TimeoutError("event publish was not allowed to finish")
++                result = original_publish(*args, **kwargs)
++                published_ids.append(args[0]["uuid"])
++                return result
++
++            def close_dispatcher():
++                close_started.set()
++                try:
++                    dispatcher.close()
++                finally:
++                    close_finished.set()
++
++            producer.publish = blocking_publish
++            with ThreadPoolExecutor(max_workers=2) as pool:
++                publisher = pool.submit(
++                    dispatcher.send, "task-sent", uuid="in-flight-event",
++                )
++                try:
++                    assert publish_started.wait(10)
++                    closer = pool.submit(close_dispatcher)
++                    assert close_started.wait(10)
++                    assert not close_finished.wait(0.2), (
++                        "close() returned while publish() was still in progress"
++                    )
++                finally:
++                    finish_publish.set()
++
++                publisher.result(timeout=10)
++                closer.result(timeout=10)
++
++            assert dispatcher.producer is None
++            assert published_ids == ["in-flight-event"]
++
++            dispatcher.send("task-sent", uuid="closed-send")
++            # close() detaches the producer; explicit publication still works.
++            dispatcher.publish(
++                "task-sent", {"uuid": "explicit-event"}, producer,
++            )
++            assert published_ids == ["in-flight-event", "explicit-event"]
+diff --git a/t/unit/app/test_amqp.py b/t/unit/app/test_amqp.py
+index eceb37725b9..ee0799d9c08 100644
+--- a/t/unit/app/test_amqp.py
++++ b/t/unit/app/test_amqp.py
+@@ -532,6 +532,21 @@ def test_send_task_sent_event_uses_default_retry_policy(self):
+             'max_retries': 3, 'interval_start': 0,
+         }
+ 
++    def test_send_task_sent_event_after_dispatcher_close(self):
++        self.app.conf.task_send_sent_event = True
++        dispatcher = self.app.amqp._event_dispatcher
++        dispatcher.close()
++        producer = Mock(name='producer')
++
++        self.app.amqp.send_task_message(producer, 'foo', self.simple_message)
++
++        assert producer.publish.call_count == 2
++        event_call = producer.publish.call_args_list[1]
++        assert event_call.args[0]['type'] == 'task-sent'
++        assert event_call.args[0]['uuid'] == self.simple_message.headers['id']
++        assert event_call.kwargs['routing_key'] == 'task.sent'
++        assert dispatcher.producer is None
++
+     def test_send_task_message__with_delivery_mode(self):
+         prod = Mock(name='producer')
+         self.app.amqp.send_task_message(
+diff --git a/t/unit/events/test_events.py b/t/unit/events/test_events.py
+index ec95297d6b8..b77fd929ee9 100644
+--- a/t/unit/events/test_events.py
++++ b/t/unit/events/test_events.py
+@@ -1,9 +1,11 @@
+ import socket
++import threading
+ from unittest.mock import Mock, call
+ 
+ import pytest
+ 
+ from celery.events import Event
++from celery.events.dispatcher import EventDispatcher
+ from celery.events.receiver import CLIENT_CLOCK_SKEW
+ from celery.exceptions import ImproperlyConfigured
+ 
+@@ -131,6 +133,39 @@ def test_flush_no_groups_no_errors(self):
+         eventer = self.app.events.Dispatcher(Mock())
+         eventer.flush(errors=False, groups=False)
+ 
++    @pytest.mark.parametrize('flush_kwargs', [
++        {'groups': False},
++        {'errors': False},
++    ])
++    def test_flush_after_close_is_noop(self, flush_kwargs):
++        connection = Mock()
++        connection.transport.driver_type = 'amqp'
++        eventer = self.app.events.Dispatcher(connection, enabled=False)
++        eventer._publish = Mock()
++        error_event = Event('worker-heartbeat')
++        group_event = Event('task-received', uuid='buffered-task')
++        eventer._outbound_buffer.append((error_event, 'worker.heartbeat'))
++        eventer._group_buffer['task'].append(group_event)
++
++        eventer.close()
++        eventer.flush(**flush_kwargs)
++
++        eventer._publish.assert_not_called()
++        assert list(eventer._outbound_buffer) == [
++            (error_event, 'worker.heartbeat'),
++        ]
++        assert eventer._group_buffer['task'] == [group_event]
++
++        eventer.enable()
++        eventer.flush()
++
++        assert eventer._publish.call_args_list == [
++            call(error_event, eventer.producer, 'worker.heartbeat'),
++            call([group_event], eventer.producer, 'task.multi'),
++        ]
++        assert not eventer._outbound_buffer
++        assert not eventer._group_buffer['task']
++
+     def test_send_skipped_after_close_when_producer_is_none(self):
+         # Regression for #10273. After close() during a broker reconnect
+         # the dispatcher's producer is cleared but ``enabled`` stays True,
+@@ -306,6 +341,137 @@ def test_enter_exit(self):
+                 assert _d
+             d.close.assert_called_with()
+ 
++    @pytest.mark.parametrize('explicit_producer', [False, True])
++    def test_close_waits_for_in_flight_publish(self, explicit_producer):
++        publish_started = threading.Event()
++        finish_publish = threading.Event()
++        close_started = threading.Event()
++        close_finished = threading.Event()
++        errors = []
++
++        class BlockingProducer(MockProducer):
++            def publish(self, msg, *args, **kwargs):
++                publish_started.set()
++                if not finish_publish.wait(5):
++                    raise TimeoutError('publish was not allowed to finish')
++                super().publish(msg, *args, **kwargs)
++
++        producer = BlockingProducer()
++        connection = Mock()
++        connection.transport.driver_type = 'amqp'
++        eventer = EventDispatcher(connection, enabled=False,
++                                  buffer_while_offline=False, app=self.app)
++        eventer.producer = producer
++        eventer.enabled = True
++
++        def send():
++            try:
++                if explicit_producer:
++                    eventer.publish('task-sent', {}, producer)
++                else:
++                    eventer.send('task-sent')
++            except Exception as exc:  # pragma: no cover - asserted below
++                errors.append(exc)
++
++        def close():
++            close_started.set()
++            try:
++                eventer.close()
++            except Exception as exc:  # pragma: no cover - asserted below
++                errors.append(exc)
++            finally:
++                close_finished.set()
++
++        publisher = threading.Thread(target=send)
++        publisher.start()
++        assert publish_started.wait(5)
++
++        closer = threading.Thread(target=close)
++        closer.start()
++        assert close_started.wait(5)
++        close_was_blocked = not close_finished.wait(0.1)
++
++        finish_publish.set()
++        publisher.join(5)
++        closer.join(5)
++
++        assert close_was_blocked
++        assert not publisher.is_alive()
++        assert not closer.is_alive()
++        assert not errors
++        assert producer.has_event('task-sent')
++        assert eventer.producer is None
++
++    def test_close_prevents_send_prepared_before_shutdown(self):
++        event_started = threading.Event()
++        finish_event = threading.Event()
++        errors = []
++        producer = MockProducer()
++        connection = Mock()
++        connection.transport.driver_type = 'amqp'
++        eventer = EventDispatcher(connection, enabled=False,
++                                  buffer_while_offline=False, app=self.app)
++        eventer.producer = producer
++        eventer.enabled = True
++
++        def blocking_event(*args, **kwargs):
++            event_started.set()
++            if not finish_event.wait(5):
++                raise TimeoutError('event creation was not allowed to finish')
++            return Event(*args, **kwargs)
++
++        def publish():
++            try:
++                eventer.send('task-sent', Event=blocking_event)
++            except Exception as exc:  # pragma: no cover - asserted below
++                errors.append(exc)
++
++        publisher = threading.Thread(target=publish)
++        publisher.start()
++        assert event_started.wait(5)
++
++        eventer.close()
++        finish_event.set()
++        publisher.join(5)
++
++        assert not publisher.is_alive()
++        assert not errors
++        assert not producer.sent
++
++    def test_publish_with_explicit_producer_after_close(self):
++        connection = Mock()
++        connection.transport.driver_type = 'amqp'
++        eventer = EventDispatcher(connection, enabled=False,
++                                  buffer_while_offline=False, app=self.app)
++        own_producer = eventer.producer = MockProducer()
++        eventer.enabled = True
++        producer = MockProducer()
++
++        eventer.close()
++        eventer.publish('task-sent', {'uuid': 'caller-task'}, producer)
++        eventer.send('task-sent', uuid='dispatcher-task')
++
++        event = producer.has_event('task-sent')
++        assert event
++        assert event['uuid'] == 'caller-task'
++        assert not own_producer.sent
++        assert eventer.producer is None
++
++    def test_enable_reopens_closed_dispatcher(self):
++        connection = Mock()
++        connection.transport.driver_type = 'amqp'
++        eventer = EventDispatcher(connection, enabled=False, app=self.app)
++
++        eventer.close()
++        assert eventer._closed
++        assert eventer.producer is None
++
++        eventer.enable()
++        assert eventer.enabled
++        assert not eventer._closed
++        assert eventer.producer is not None
++        eventer.close()
++
+     def test_enable_disable_callbacks(self):
+         on_enable = Mock()
+         on_disable = Mock()

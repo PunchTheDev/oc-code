@@ -1,0 +1,375 @@
+diff --git a/tokio/src/blocking.rs b/tokio/src/blocking.rs
+index f3c621dacbe..52b48082eb2 100644
+--- a/tokio/src/blocking.rs
++++ b/tokio/src/blocking.rs
+@@ -2,7 +2,7 @@ cfg_rt! {
+     #[cfg(not(target_os = "emscripten"))]
+     pub(crate) use crate::runtime::spawn_blocking;
+ 
+-    cfg_fs! {
++    cfg_io_blocking! {
+         #[cfg(not(target_os = "emscripten"))]
+         #[allow(unused_imports)]
+         pub(crate) use crate::runtime::spawn_mandatory_blocking;
+@@ -32,8 +32,10 @@ cfg_rt! {
+         crate::task::coop::cooperative(std::future::ready(Ok(f())))
+     }
+ 
+-    #[cfg(all(target_os = "emscripten", feature = "fs"))]
+-    #[allow(dead_code)] // unit tests replace this with the `fs::mocks` version
++    #[cfg(all(target_os = "emscripten", any(feature = "fs", feature = "io-std")))]
++    // `fs` unit tests use the `fs::mocks` version instead, so this is unused
++    // when `io-std` is disabled.
++    #[allow(dead_code)]
+     pub(crate) fn spawn_mandatory_blocking<F, R>(f: F) -> Option<JoinHandle<R>>
+     where
+         F: FnOnce() -> R + Send + 'static,
+@@ -58,7 +60,7 @@ cfg_not_rt! {
+         panic!("requires the `rt` Tokio feature flag")
+     }
+ 
+-    cfg_fs! {
++    cfg_io_blocking! {
+         pub(crate) fn spawn_mandatory_blocking<F, R>(_f: F) -> Option<JoinHandle<R>>
+         where
+             F: FnOnce() -> R + Send + 'static,
+diff --git a/tokio/src/io/blocking.rs b/tokio/src/io/blocking.rs
+index 0fce78993b0..05a63f5a59a 100644
+--- a/tokio/src/io/blocking.rs
++++ b/tokio/src/io/blocking.rs
+@@ -16,6 +16,8 @@ pub(crate) struct Blocking<T> {
+     state: State<T>,
+     /// `true` if the lower IO layer needs flushing.
+     need_flush: bool,
++    /// `true` if operations are spawned with `spawn_mandatory_blocking`.
++    mandatory: bool,
+ }
+ 
+ #[derive(Debug)]
+@@ -28,6 +30,9 @@ pub(crate) const DEFAULT_MAX_BUF_SIZE: usize = 2 * 1024 * 1024;
+ 
+ #[derive(Debug)]
+ enum State<T> {
++    /// Holds `None` if an operation could not be spawned, normally because the
++    /// runtime is shutting down. `inner` is gone in that case, so all further
++    /// operations fail.
+     Idle(Option<Buf>),
+     Busy(sys::Blocking<(io::Result<usize>, Buf, T)>),
+ }
+@@ -45,11 +50,45 @@ cfg_io_blocking! {
+                 inner: Some(inner),
+                 state: State::Idle(Some(Buf::with_capacity(0))),
+                 need_flush: false,
++                mandatory: false,
++            }
++        }
++
++        /// Like `new`, but operations are spawned with
++        /// `spawn_mandatory_blocking`, so an operation that was started before
++        /// the runtime began shutting down still runs.
++        ///
++        /// # Safety
++        ///
++        /// Same as `new`.
++        #[cfg_attr(not(feature = "io-std"), allow(dead_code))]
++        pub(crate) unsafe fn new_mandatory(inner: T) -> Blocking<T> {
++            Blocking {
++                inner: Some(inner),
++                state: State::Idle(Some(Buf::with_capacity(0))),
++                need_flush: false,
++                mandatory: true,
+             }
+         }
+     }
+ }
+ 
++/// Runs `f` on the blocking pool.
++///
++/// Returns `None` if `mandatory` is set and the operation could not be
++/// spawned, normally because the runtime is shutting down.
++fn spawn<F, R>(mandatory: bool, f: F) -> Option<sys::Blocking<R>>
++where
++    F: FnOnce() -> R + Send + 'static,
++    R: Send + 'static,
++{
++    if mandatory {
++        sys::spawn_mandatory_blocking(f)
++    } else {
++        Some(sys::run(f))
++    }
++}
++
+ impl<T> AsyncRead for Blocking<T>
+ where
+     T: Read + Unpin + Send + 'static,
+@@ -62,7 +101,9 @@ where
+         loop {
+             match self.state {
+                 State::Idle(ref mut buf_cell) => {
+-                    let mut buf = buf_cell.take().unwrap();
++                    let Some(mut buf) = buf_cell.take() else {
++                        return Poll::Ready(Err(gone()));
++                    };
+ 
+                     if !buf.is_empty() {
+                         buf.copy_to(dst);
+@@ -73,11 +114,17 @@ where
+                     let mut inner = self.inner.take().unwrap();
+ 
+                     let max_buf_size = cmp::min(dst.remaining(), DEFAULT_MAX_BUF_SIZE);
+-                    self.state = State::Busy(sys::run(move || {
+-                        // SAFETY: the requirements are satisfied by `Blocking::new`.
++                    let rx = spawn(self.mandatory, move || {
++                        // SAFETY: the caller of `Blocking::new` or `Blocking::new_mandatory`
++                        // promised that `inner` meets the requirements of `read_from`.
+                         let res = unsafe { buf.read_from(&mut inner, max_buf_size) };
+                         (res, buf, inner)
+-                    }));
++                    });
++
++                    let Some(rx) = rx else {
++                        return Poll::Ready(Err(gone()));
++                    };
++                    self.state = State::Busy(rx);
+                 }
+                 State::Busy(ref mut rx) => {
+                     let (res, mut buf, inner) = ready!(Pin::new(rx).poll(cx))?;
+@@ -114,19 +161,26 @@ where
+         loop {
+             match self.state {
+                 State::Idle(ref mut buf_cell) => {
+-                    let mut buf = buf_cell.take().unwrap();
++                    let Some(mut buf) = buf_cell.take() else {
++                        return Poll::Ready(Err(gone()));
++                    };
+ 
+                     assert!(buf.is_empty());
+ 
+                     let n = buf.copy_from(src, DEFAULT_MAX_BUF_SIZE);
+                     let mut inner = self.inner.take().unwrap();
+ 
+-                    self.state = State::Busy(sys::run(move || {
++                    let rx = spawn(self.mandatory, move || {
+                         let n = buf.len();
+                         let res = buf.write_to(&mut inner).map(|()| n);
+ 
+                         (res, buf, inner)
+-                    }));
++                    });
++
++                    let Some(rx) = rx else {
++                        return Poll::Ready(Err(gone()));
++                    };
++                    self.state = State::Busy(rx);
+                     self.need_flush = true;
+ 
+                     return Poll::Ready(Ok(n));
+@@ -150,13 +204,20 @@ where
+                 // The buffer is not used here
+                 State::Idle(ref mut buf_cell) => {
+                     if need_flush {
+-                        let buf = buf_cell.take().unwrap();
++                        let Some(buf) = buf_cell.take() else {
++                            return Poll::Ready(Err(gone()));
++                        };
+                         let mut inner = self.inner.take().unwrap();
+ 
+-                        self.state = State::Busy(sys::run(move || {
++                        let rx = spawn(self.mandatory, move || {
+                             let res = inner.flush().map(|()| 0);
+                             (res, buf, inner)
+-                        }));
++                        });
++
++                        let Some(rx) = rx else {
++                            return Poll::Ready(Err(gone()));
++                        };
++                        self.state = State::Busy(rx);
+ 
+                         self.need_flush = false;
+                     } else {
+@@ -337,3 +398,7 @@ cfg_fs! {
+         }
+     }
+ }
++
++fn gone() -> io::Error {
++    io::Error::other(crate::util::error::RUNTIME_SHUTTING_DOWN_ERROR)
++}
+diff --git a/tokio/src/io/mod.rs b/tokio/src/io/mod.rs
+index 01316854f45..716f8cc8aaa 100644
+--- a/tokio/src/io/mod.rs
++++ b/tokio/src/io/mod.rs
+@@ -299,6 +299,7 @@ cfg_io_blocking! {
+     mod sys {
+         // TODO: don't rename
+         pub(crate) use crate::blocking::spawn_blocking as run;
++        pub(crate) use crate::blocking::spawn_mandatory_blocking;
+         pub(crate) use crate::blocking::JoinHandle as Blocking;
+     }
+ }
+diff --git a/tokio/src/io/stderr.rs b/tokio/src/io/stderr.rs
+index 43388c3f6ff..1b7399169c7 100644
+--- a/tokio/src/io/stderr.rs
++++ b/tokio/src/io/stderr.rs
+@@ -84,7 +84,7 @@ cfg_io_std! {
+         // SAFETY: The `Read` implementation of `std` does not read from the
+         // buffer it is borrowing and correctly reports the length of the data
+         // written into the buffer.
+-        let blocking = unsafe { Blocking::new(std) };
++        let blocking = unsafe { Blocking::new_mandatory(std) };
+         Stderr {
+             std: SplitByUtf8BoundaryIfWindows::new(blocking),
+         }
+diff --git a/tokio/src/io/stdout.rs b/tokio/src/io/stdout.rs
+index 47de6156d70..856431e330d 100644
+--- a/tokio/src/io/stdout.rs
++++ b/tokio/src/io/stdout.rs
+@@ -172,7 +172,7 @@ cfg_io_std! {
+         // SAFETY: The `Read` implementation of `std` does not read from the
+         // buffer it is borrowing and correctly reports the length of the data
+         // written into the buffer.
+-        let blocking = unsafe { Blocking::new(std) };
++        let blocking = unsafe { Blocking::new_mandatory(std) };
+         Stdout {
+             std: SplitByUtf8BoundaryIfWindows::new(blocking),
+         }
+diff --git a/tokio/src/runtime/blocking/mod.rs b/tokio/src/runtime/blocking/mod.rs
+index 0e6fa204004..2d58acdf13d 100644
+--- a/tokio/src/runtime/blocking/mod.rs
++++ b/tokio/src/runtime/blocking/mod.rs
+@@ -8,7 +8,7 @@ pub(crate) use pool::{spawn_blocking, BlockingPool, Spawner};
+ 
+ mod sharded;
+ 
+-cfg_fs! {
++cfg_io_blocking! {
+     pub(crate) use pool::spawn_mandatory_blocking;
+ }
+ 
+diff --git a/tokio/src/runtime/blocking/pool.rs b/tokio/src/runtime/blocking/pool.rs
+index 3c9da2d3808..fb9f530134d 100644
+--- a/tokio/src/runtime/blocking/pool.rs
++++ b/tokio/src/runtime/blocking/pool.rs
+@@ -244,11 +244,11 @@ where
+     rt.spawn_blocking(func)
+ }
+ 
+-cfg_fs! {
++cfg_io_blocking! {
+     #[cfg_attr(any(
+         all(loom, not(test)), // the function is covered by loom tests
+         test,
+-        target_os = "emscripten", // fs uses the inline shim
++        target_os = "emscripten", // fs and io-std use the inline shim
+     ), allow(dead_code))]
+     /// Runs the provided function on an executor dedicated to blocking
+     /// operations. Tasks will be scheduled as mandatory, meaning they are
+@@ -388,12 +388,12 @@ impl Spawner {
+         }
+     }
+ 
+-    cfg_fs! {
++    cfg_io_blocking! {
+         #[track_caller]
+         #[cfg_attr(any(
+             all(loom, not(test)), // the function is covered by loom tests
+             test,
+-            target_os = "emscripten", // fs uses the inline shim
++            target_os = "emscripten", // fs and io-std use the inline shim
+         ), allow(dead_code))]
+         pub(crate) fn spawn_mandatory_blocking<F, R>(&self, rt: &Handle, func: F) -> Option<JoinHandle<R>>
+         where
+diff --git a/tokio/src/runtime/mod.rs b/tokio/src/runtime/mod.rs
+index 55bd4f87e2d..b4edd130ca6 100644
+--- a/tokio/src/runtime/mod.rs
++++ b/tokio/src/runtime/mod.rs
+@@ -568,7 +568,7 @@ cfg_rt! {
+         pub(crate) use blocking::Mandatory;
+     }
+ 
+-    cfg_fs! {
++    cfg_io_blocking! {
+         // Emscripten uses the inline shim in `crate::blocking`.
+         #[cfg_attr(target_os = "emscripten", allow(unused_imports))]
+         pub(crate) use blocking::spawn_mandatory_blocking;
+diff --git a/tokio/src/runtime/tests/loom_blocking.rs b/tokio/src/runtime/tests/loom_blocking.rs
+index cf1021ed5e8..494172216dd 100644
+--- a/tokio/src/runtime/tests/loom_blocking.rs
++++ b/tokio/src/runtime/tests/loom_blocking.rs
+@@ -74,6 +74,46 @@ fn spawn_mandatory_blocking_should_run_even_when_shutting_down_from_other_thread
+     });
+ }
+ 
++#[test]
++fn mandatory_blocking_io_write_should_always_run() {
++    use crate::io::blocking::Blocking;
++    use crate::io::AsyncWriteExt;
++    use crate::runtime::tests::loom_oneshot;
++    use std::io;
++
++    struct Writer(Option<loom_oneshot::Sender<()>>);
++
++    impl io::Write for Writer {
++        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++            if let Some(tx) = self.0.take() {
++                tx.send(());
++            }
++            Ok(buf.len())
++        }
++
++        fn flush(&mut self) -> io::Result<()> {
++            Ok(())
++        }
++    }
++
++    loom::model(|| {
++        let rt = runtime::Builder::new_current_thread().build().unwrap();
++
++        let (tx, rx) = loom_oneshot::channel();
++        let _enter = rt.enter();
++        runtime::spawn_blocking(|| {});
++
++        // SAFETY: `Writer` does not implement `Read`.
++        let mut writer = unsafe { Blocking::new_mandatory(Writer(Some(tx))) };
++        loom::future::block_on(writer.write_all(b"hello")).unwrap();
++
++        drop(rt);
++
++        // This call will deadlock if the write doesn't run.
++        let () = rx.recv();
++    });
++}
++
+ #[test]
+ fn spawn_blocking_when_paused() {
+     loom::model(|| {
+diff --git a/tokio/tests/rt_handle_block_on.rs b/tokio/tests/rt_handle_block_on.rs
+index 581ed27ca97..4f1b8b2c779 100644
+--- a/tokio/tests/rt_handle_block_on.rs
++++ b/tokio/tests/rt_handle_block_on.rs
+@@ -163,6 +163,24 @@ rt_test! {
+         assert_eq!(inner_err.to_string(), "background task failed");
+     }
+ 
++    #[test]
++    fn stdout_shutdown_before_started() {
++        use tokio::io::AsyncWriteExt;
++        let rt = rt();
++        let _enter = rt.enter();
++        rt.shutdown_timeout(Duration::from_secs(1000));
++
++        let err = Handle::current()
++            .block_on(async { tokio::io::stdout().write_all(b"x").await })
++            .unwrap_err();
++        assert!(tokio::runtime::is_rt_shutdown_err(&err));
++
++        let err = Handle::current()
++            .block_on(async { tokio::io::stderr().write_all(b"x").await })
++            .unwrap_err();
++        assert!(tokio::runtime::is_rt_shutdown_err(&err));
++    }
++
+     #[test]
+     fn basic_spawn_blocking() {
+         use tokio::task::spawn_blocking;

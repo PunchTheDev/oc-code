@@ -1,0 +1,1350 @@
+// NOTE: This test is implemented based on the case of `runtime-core/__test__/componentProps.spec.ts`.
+
+import {
+  // currentInstance,
+  inject,
+  isShallow,
+  nextTick,
+  provide,
+  ref,
+  toRefs,
+  watch,
+} from '@vue/runtime-dom'
+import {
+  createComponent,
+  defineVaporComponent,
+  renderEffect,
+  template,
+} from '../src'
+import { resolveDynamicProps } from '../src/componentProps'
+import { compile, makeRender, renderParity } from './_utils'
+import { setElementText } from '../src/dom/prop'
+
+const define = makeRender<any>()
+
+describe('component: props', () => {
+  test('stateful', () => {
+    let props: any
+    let attrs: any
+
+    const { render } = define({
+      props: ['fooBar', 'barBaz'],
+      setup(_props: any, { attrs: _attrs }: any) {
+        props = _props
+        attrs = _attrs
+        return []
+      },
+    })
+
+    render({ fooBar: () => 1, bar: () => 2 })
+    expect(props).toEqual({ fooBar: 1 })
+    expect(attrs).toEqual({ bar: 2 })
+
+    // test passing kebab-case and resolving to camelCase
+    render({ 'foo-bar': () => 2, bar: () => 3, baz: () => 4 })
+    expect(props).toEqual({ fooBar: 2 })
+    expect(attrs).toEqual({ bar: 3, baz: 4 })
+
+    // test updating kebab-case should not delete it (#955)
+    render({ 'foo-bar': () => 3, bar: () => 3, baz: () => 4, barBaz: () => 5 })
+    expect(props).toEqual({ fooBar: 3, barBaz: 5 })
+    expect(attrs).toEqual({ bar: 3, baz: 4 })
+
+    // remove the props with camelCase key (#1412)
+    render({ qux: () => 5 })
+    expect(props).toEqual({})
+    expect(attrs).toEqual({ qux: 5 })
+  })
+
+  test('stateful with setup', () => {
+    let props: any
+    let attrs: any
+
+    const { render } = define({
+      props: ['foo'],
+      setup(_props: any, { attrs: _attrs }: any) {
+        props = _props
+        attrs = _attrs
+        return []
+      },
+    })
+
+    render({ foo: () => 1, bar: () => 2 })
+    expect(props).toEqual({ foo: 1 })
+    expect(attrs).toEqual({ bar: 2 })
+
+    render({ foo: () => 2, bar: () => 3, baz: () => 4 })
+    expect(props).toEqual({ foo: 2 })
+    expect(attrs).toEqual({ bar: 3, baz: 4 })
+
+    render({ qux: () => 5 })
+    expect(props).toEqual({})
+    expect(attrs).toEqual({ qux: 5 })
+  })
+
+  test('functional with declaration', () => {
+    let props: any
+    let attrs: any
+
+    const { component: Comp, render } = define(
+      (_props: any, { attrs: _attrs }: any) => {
+        props = _props
+        attrs = _attrs
+        return []
+      },
+    )
+    Comp.props = ['foo']
+
+    render({ foo: () => 1, bar: () => 2 })
+    expect(props).toEqual({ foo: 1 })
+    expect(attrs).toEqual({ bar: 2 })
+
+    render({ foo: () => 2, bar: () => 3, baz: () => 4 })
+    expect(props).toEqual({ foo: 2 })
+    expect(attrs).toEqual({ bar: 3, baz: 4 })
+
+    render({ qux: () => 5 })
+    expect(props).toEqual({})
+    expect(attrs).toEqual({ qux: 5 })
+  })
+
+  test('functional without declaration', () => {
+    let props: any
+    let attrs: any
+
+    const { render } = define((_props: any, { attrs: _attrs }: any) => {
+      props = _props
+      attrs = _attrs
+      return []
+    })
+
+    render({ foo: () => 1 })
+    expect(props).toEqual({ foo: 1 })
+    expect(attrs).toEqual({ foo: 1 })
+    expect(props).toBe(attrs)
+
+    render({ bar: () => 2 })
+    expect(props).toEqual({ bar: 2 })
+    expect(attrs).toEqual({ bar: 2 })
+    expect(props).toBe(attrs)
+  })
+
+  test('functional defineVaporComponent without declaration', () => {
+    let props: any
+    let attrs: any
+
+    const { render } = define(
+      defineVaporComponent((_props: any, { attrs: _attrs }: any) => {
+        props = _props
+        attrs = _attrs
+        return []
+      }),
+    )
+
+    render({ foo: () => 1 })
+    expect(props).toEqual({})
+    expect(attrs).toEqual({ foo: 1 })
+
+    render({ bar: () => 2 })
+    expect(props).toEqual({})
+    expect(attrs).toEqual({ bar: 2 })
+  })
+
+  test('boolean casting', () => {
+    let props: any
+    const { render } = define({
+      props: {
+        foo: Boolean,
+        bar: Boolean,
+        baz: Boolean,
+        qux: Boolean,
+      },
+      setup(_props: any) {
+        props = _props
+        return []
+      },
+    })
+
+    render({
+      // absent should cast to false
+      bar: () => '', // empty string should cast to true
+      baz: () => 'baz', // same string should cast to true
+      qux: () => 'ok', // other values should be left in-tact (but raise warning)
+    })
+
+    expect(props.foo).toBe(false)
+    expect(props.bar).toBe(true)
+    expect(props.baz).toBe(true)
+    expect(props.qux).toBe('ok')
+    expect('type check failed for prop "qux"').toHaveBeenWarned()
+  })
+
+  test('default value', () => {
+    let props: any
+    const defaultFn = vi.fn(() => ({ a: 1 }))
+    const defaultBaz = vi.fn(() => ({ b: 1 }))
+
+    const { render } = define({
+      props: {
+        foo: {
+          default: 1,
+        },
+        bar: {
+          default: defaultFn,
+        },
+        baz: {
+          type: Function,
+          default: defaultBaz,
+        },
+      },
+      setup(_props: any) {
+        props = _props
+        return []
+      },
+    })
+
+    render({ foo: () => 2 })
+    expect(props.foo).toBe(2)
+    expect(props.bar).toEqual({ a: 1 })
+    expect(props.baz).toEqual(defaultBaz)
+    expect(defaultFn).toHaveBeenCalledTimes(1)
+    expect(defaultBaz).toHaveBeenCalledTimes(0)
+
+    // #999: updates should not cause default factory of unchanged prop to be
+    // called again
+    render({ foo: () => 3 })
+
+    expect(props.foo).toBe(3)
+    expect(props.bar).toEqual({ a: 1 })
+
+    render({ bar: () => ({ b: 2 }) })
+    expect(props.foo).toBe(1)
+    expect(props.bar).toEqual({ b: 2 })
+
+    render({
+      foo: () => 3,
+      bar: () => ({ b: 3 }),
+    })
+    expect(props.foo).toBe(3)
+    expect(props.bar).toEqual({ b: 3 })
+
+    render({ bar: () => ({ b: 4 }) })
+    expect(props.foo).toBe(1)
+    expect(props.bar).toEqual({ b: 4 })
+  })
+
+  test('using inject in default value factory', () => {
+    let props: any
+
+    const Child = defineVaporComponent({
+      props: {
+        test: {
+          default: () => inject('test', 'default'),
+        },
+      },
+      setup(_props) {
+        props = _props
+        return []
+      },
+    })
+
+    const { render } = define({
+      setup() {
+        provide('test', 'injected')
+        return createComponent(Child)
+      },
+    })
+
+    render()
+
+    expect(props.test).toBe('injected')
+  })
+
+  test('optimized props updates', async () => {
+    const t0 = template('<div>')
+    const { component: Child } = define({
+      props: ['foo'],
+      setup(props: any) {
+        const n0 = t0()
+        renderEffect(() => setElementText(n0, props.foo))
+        return n0
+      },
+    })
+
+    const foo = ref(1)
+    const id = ref('a')
+    const { host } = define({
+      setup() {
+        return { foo, id }
+      },
+      render(_ctx: Record<string, any>) {
+        return createComponent(
+          Child,
+          {
+            foo: () => _ctx.foo,
+            id: () => _ctx.id,
+          },
+          null,
+          true,
+        )
+      },
+    }).render()
+    expect(host.innerHTML).toBe('<div id="a">1</div>')
+
+    foo.value++
+    await nextTick()
+    expect(host.innerHTML).toBe('<div id="a">2</div>')
+
+    id.value = 'b'
+    await nextTick()
+    expect(host.innerHTML).toBe('<div id="b">2</div>')
+  })
+
+  describe('validator', () => {
+    test('validator should be called with two arguments', () => {
+      const mockFn = vi.fn((...args: any[]) => true)
+      const props = {
+        foo: () => 1,
+        bar: () => 2,
+      }
+
+      const t0 = template('<div/>')
+      define({
+        props: {
+          foo: {
+            type: Number,
+            validator: (value: any, props: any) => mockFn(value, props),
+          },
+          bar: {
+            type: Number,
+          },
+        },
+        setup() {
+          return t0()
+        },
+      }).render(props)
+
+      expect(mockFn).toHaveBeenCalledWith(1, { foo: 1, bar: 2 })
+    })
+
+    test('validator should not be able to mutate other props', async () => {
+      const mockFn = vi.fn((...args: any[]) => true)
+      define({
+        props: {
+          foo: {
+            type: Number,
+            validator: (value: any, props: any) => !!(props.bar = 1),
+          },
+          bar: {
+            type: Number,
+            validator: (value: any) => mockFn(value),
+          },
+        },
+        setup() {
+          const t0 = template('<div/>')
+          const n0 = t0()
+          return n0
+        },
+      }).render!({
+        foo() {
+          return 1
+        },
+        bar() {
+          return 2
+        },
+      })
+
+      expect(
+        `Set operation on key "bar" failed: target is readonly.`,
+      ).toHaveBeenWarnedLast()
+      expect(mockFn).toHaveBeenCalledWith(2)
+    })
+  })
+
+  test('warn props mutation', () => {
+    let props: any
+    const { render } = define({
+      props: ['foo'],
+      setup(_props: any) {
+        props = _props
+        return []
+      },
+    })
+    render({ foo: () => 1 })
+    expect(props.foo).toBe(1)
+
+    props.foo = 2
+    expect(`Attempt to mutate prop "foo" failed`).toHaveBeenWarned()
+  })
+
+  test('warn absent required props', () => {
+    define({
+      props: {
+        bool: { type: Boolean, required: true },
+        str: { type: String, required: true },
+        num: { type: Number, required: true },
+      },
+      setup() {
+        return []
+      },
+    }).render()
+    expect(`Missing required prop: "bool"`).toHaveBeenWarned()
+    expect(`Missing required prop: "str"`).toHaveBeenWarned()
+    expect(`Missing required prop: "num"`).toHaveBeenWarned()
+  })
+
+  // NOTE: type check is not supported in vapor
+  // test('warn on type mismatch', () => {})
+
+  // #3495
+  test('should not warn required props using kebab-case', async () => {
+    define({
+      props: {
+        fooBar: { type: String, required: true },
+      },
+      setup() {
+        return []
+      },
+    }).render({
+      ['foo-bar']: () => 'hello',
+    })
+    expect(`Missing required prop: "fooBar"`).not.toHaveBeenWarned()
+  })
+
+  test('props type support BigInt', () => {
+    const t0 = template('<div>')
+    const { host } = define({
+      props: {
+        foo: BigInt,
+      },
+      setup(props: any) {
+        const n0 = t0()
+        renderEffect(() => setElementText(n0, props.foo))
+        return n0
+      },
+    }).render({
+      foo: () =>
+        BigInt(BigInt(100000111)) + BigInt(2000000000) * BigInt(30000000),
+    })
+    expect(host.innerHTML).toBe('<div>60000000100000111</div>')
+  })
+
+  // #3474
+  test('should cache the value returned from the default factory to avoid unnecessary watcher trigger', async () => {
+    let count = 0
+
+    const { render, html } = define({
+      props: {
+        foo: {
+          type: Object,
+          default: () => ({ val: 1 }),
+        },
+        bar: Number,
+      },
+      setup(props: any) {
+        watch(
+          () => props.foo,
+          () => {
+            count++
+          },
+        )
+        const t0 = template('<h1></h1>')
+        const n0 = t0()
+        renderEffect(() => {
+          setElementText(n0, String(props.foo.val) + String(props.bar))
+        })
+        return n0
+      },
+    })
+
+    const foo = ref()
+    const bar = ref(0)
+    render({ foo: () => foo.value, bar: () => bar.value })
+    expect(html()).toBe(`<h1>10</h1>`)
+    expect(count).toBe(0)
+
+    bar.value++
+    await nextTick()
+    expect(html()).toBe(`<h1>11</h1>`)
+    expect(count).toBe(0)
+  })
+
+  // #3288
+  test('declared prop key should be present even if not passed', async () => {
+    let initialKeys: string[] = []
+    const changeSpy = vi.fn()
+    const passFoo = ref(false)
+
+    const Comp: any = {
+      props: {
+        foo: String,
+      },
+      setup(props: any) {
+        initialKeys = Object.keys(props)
+        const { foo } = toRefs(props)
+        watch(foo, changeSpy)
+        return []
+      },
+    }
+
+    define(() =>
+      createComponent(Comp, {
+        $: [() => (passFoo.value ? { foo: 'ok' } : {})],
+      }),
+    ).render()
+
+    expect(initialKeys).toMatchObject(['foo'])
+    passFoo.value = true
+    await nextTick()
+    expect(changeSpy).toHaveBeenCalledTimes(1)
+  })
+
+  test('should not warn invalid watch source when directly watching props', async () => {
+    const changeSpy = vi.fn()
+    const { render, html } = define({
+      props: {
+        foo: {
+          type: String,
+        },
+      },
+      setup(props: any) {
+        watch(props, changeSpy)
+        const t0 = template('<h1></h1>')
+        const n0 = t0()
+        renderEffect(() => {
+          setElementText(n0, String(props.foo))
+        })
+        return n0
+      },
+    })
+
+    const foo = ref('foo')
+    render({ foo: () => foo.value })
+    expect(html()).toBe(`<h1>foo</h1>`)
+    expect('Invalid watch source').not.toHaveBeenWarned()
+
+    foo.value = 'bar'
+    await nextTick()
+    expect(html()).toBe(`<h1>bar</h1>`)
+    expect(changeSpy).toHaveBeenCalledTimes(1)
+  })
+
+  test('directly watching props should be shallow', async () => {
+    const changeSpy = vi.fn()
+    let props: any
+    const { render } = define({
+      props: ['foo', 'bar'],
+      setup(_props: any) {
+        props = _props
+        watch(props, changeSpy)
+        return []
+      },
+    })
+
+    const foo = ref({ nested: { count: 0 } })
+    const bar = ref(1)
+    render({ foo: () => foo.value, bar: () => bar.value })
+
+    // nested mutation should not trigger, same as shallowReactive props in vdom
+    foo.value.nested.count++
+    await nextTick()
+    expect(changeSpy).toHaveBeenCalledTimes(0)
+
+    bar.value++
+    await nextTick()
+    expect(changeSpy).toHaveBeenCalledTimes(1)
+    expect(isShallow(props)).toBe(true)
+  })
+
+  test('support null in required + multiple-type declarations', () => {
+    const { render } = define({
+      props: {
+        foo: { type: [Function, null], required: true },
+      },
+      setup() {
+        return []
+      },
+    })
+
+    expect(() => {
+      render({ foo: () => () => {} })
+    }).not.toThrow()
+
+    expect(() => {
+      render({ foo: () => null })
+    }).not.toThrow()
+  })
+
+  // #5016
+  test('handling attr with undefined value', () => {
+    const { render, host } = define({
+      inheritAttrs: false,
+      setup(_: any, { attrs }: any) {
+        const t0 = template('<div></div>')
+        const n0 = t0()
+        renderEffect(() =>
+          setElementText(n0, JSON.stringify(attrs) + Object.keys(attrs)),
+        )
+        return n0
+      },
+    })
+
+    const attrs: any = { foo: () => undefined }
+    render(attrs)
+
+    expect(host.innerHTML).toBe(
+      `<div>${JSON.stringify(attrs) + Object.keys(attrs)}</div>`,
+    )
+  })
+
+  // #6915
+  test('should not mutate original props long-form definition object', () => {
+    const props = {
+      msg: {
+        type: String,
+      },
+    }
+    define({ props, setup: () => [] }).render({ msg: () => 'test' })
+
+    expect(Object.keys(props.msg).length).toBe(1)
+  })
+
+  test('should warn against reserved prop names', () => {
+    const { render } = define({
+      props: {
+        $foo: String,
+      },
+      setup: () => [],
+    })
+
+    render({ msg: () => 'test' })
+    expect(`Invalid prop name: "$foo"`).toHaveBeenWarned()
+  })
+
+  test('v-once preserves function-valued props', () => {
+    const cb = vi.fn(() => 'called')
+    const resolved: unknown[] = []
+    const Child = defineVaporComponent({
+      props: ['cb'],
+      setup(props: any) {
+        resolved.push(props.cb)
+        return []
+      },
+    })
+
+    define({
+      setup() {
+        return [
+          createComponent(Child, { cb: () => cb }, null, true, true),
+          createComponent(Child, { $: [{ cb: () => cb }] }, null, true, true),
+        ]
+      },
+    }).render()
+
+    expect(resolved[0]).toBe(cb)
+    expect(resolved[1]).toBe(cb)
+    expect(cb).not.toHaveBeenCalled()
+  })
+
+  test('v-once snapshots sources without caching computeds on them', () => {
+    const source = (() => ({ a: 1 })) as (() => any) & { _cache?: unknown }
+    const getter = (() => 2) as (() => any) & { _cache?: unknown }
+    const Child = defineVaporComponent({
+      props: ['a', 'b'],
+      setup(props: any) {
+        expect(props.a).toBe(1)
+        expect(props.b).toBe(2)
+        return []
+      },
+    })
+
+    // Nest one level: sources are only cached under an instance with a parent.
+    const Parent = defineVaporComponent({
+      setup() {
+        return createComponent(
+          Child,
+          { b: getter, $: [source] },
+          null,
+          true,
+          true,
+        )
+      },
+    })
+    define({
+      setup() {
+        return createComponent(Parent)
+      },
+    }).render()
+
+    expect(source._cache).toBeUndefined()
+    expect(getter._cache).toBeUndefined()
+  })
+
+  // #15227
+  test('declared class prop should be normalized', () => {
+    const data = ref({ skin: { b: true, c: false } })
+    const Child = compile(
+      `<script setup vapor>
+        const props = defineProps({ class: { type: String } })
+      </script>
+      <template><div>{{ props.class }}</div></template>`,
+      data,
+    )
+    const Parent = compile(
+      `<script setup vapor>
+        const data = _data
+        const Child = _components.Child
+      </script>
+      <template><Child class="a" :class="data.skin" /></template>`,
+      data,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe('<div>a b</div>')
+    expect('Invalid prop').not.toHaveBeenWarned()
+  })
+
+  test('declared class props merge static and v-bind sources', () => {
+    const data = ref({ attrs: { class: 'b' }, extra: 'c' })
+    const Child = compile(
+      `<script setup vapor>
+        const props = defineProps({ class: String })
+      </script>
+      <template><div>{{ props.class }}</div></template>`,
+      data,
+    )
+    const Parent = compile(
+      `<script setup vapor>
+        const data = _data
+        const Child = _components.Child
+      </script>
+      <template><Child class="a" v-bind="data.attrs" :class="data.extra" /></template>`,
+      data,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe('<div>a b c</div>')
+  })
+
+  test('declared event props merge static and v-on sources', () => {
+    const calls: string[] = []
+    const data = ref({
+      onStatic: () => calls.push('static'),
+      listeners: { click: () => calls.push('object') },
+    })
+    const Child = compile(
+      `<script setup vapor>
+        const props = defineProps({ onClick: null })
+        const trigger = () => {
+          const handlers = Array.isArray(props.onClick)
+            ? props.onClick
+            : [props.onClick]
+          handlers.forEach(handler => handler())
+        }
+      </script><template><button @click="trigger">click</button></template>`,
+      data,
+    )
+    const Parent = compile(
+      `<script setup vapor>
+        const data = _data
+        const Child = _components.Child
+      </script>
+      <template><Child @click="data.onStatic" v-on="data.listeners" /></template>`,
+      data,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    host.querySelector('button')!.click()
+
+    expect(calls).toEqual(['static', 'object'])
+  })
+
+  test('class prop should only normalize the value that was passed', () => {
+    let props: any
+    const fallback = ['a', 'b']
+    const { render } = define({
+      props: { class: { default: () => fallback } },
+      setup(_props: any) {
+        props = _props
+        return []
+      },
+    })
+
+    render({ class: () => '  a  b ' })
+    expect(props.class).toBe('  a  b ')
+
+    // class is absent or empty here, so the default is used as-is
+    render()
+    expect(props.class).toBe(fallback)
+
+    render({ class: () => undefined })
+    expect(props.class).toBe(fallback)
+  })
+
+  test('class prop should be normalized before Boolean casting', () => {
+    let props: any
+    const { render } = define({
+      props: { class: { type: Boolean } },
+      setup(_props: any) {
+        props = _props
+        return []
+      },
+    })
+
+    // `<Child class />` casts to true and must stay true
+    render({ class: () => '' })
+    expect(props.class).toBe(true)
+    expect('Invalid prop').not.toHaveBeenWarned()
+  })
+
+  // #15285
+  test('declared style prop should be normalized', () => {
+    const data = ref({ style: { color: 'red' } })
+    const Child = compile(
+      `<script setup vapor>
+        const props = defineProps({ style: { type: Object } })
+      </script>
+      <template><div>{{ JSON.stringify(props.style) }}</div></template>`,
+      data,
+    )
+    const Parent = compile(
+      `<script setup vapor>
+        const data = _data
+        const Child = _components.Child
+      </script>
+      <template><Child style="font-weight:bold" :style="data.style" /></template>`,
+      data,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(host.innerHTML).toBe(
+      '<div>{"font-weight":"bold","color":"red"}</div>',
+    )
+    expect('Invalid prop').not.toHaveBeenWarned()
+  })
+
+  test('style prop should only normalize the value that was passed', () => {
+    let props: any
+    const fallback = ['color:red']
+    const { render } = define({
+      props: { style: { default: () => fallback } },
+      setup(_props: any) {
+        props = _props
+        return []
+      },
+    })
+
+    render({ style: () => 'color: red' })
+    expect(props.style).toBe('color: red')
+
+    // style is absent or empty here, so the default is used as-is
+    render()
+    expect(props.style).toBe(fallback)
+
+    render({ style: () => undefined })
+    expect(props.style).toBe(fallback)
+
+    render({ style: () => 42 })
+    expect(props.style).toBe(42)
+
+    const styleFn = () => {}
+    render({ style: () => styleFn })
+    expect(props.style).toBe(styleFn)
+  })
+
+  describe('dynamic props source caching', () => {
+    test('v-bind object should be cached when child accesses multiple props', () => {
+      let sourceCallCount = 0
+      const obj = ref({ foo: 1, bar: 2, baz: 3 })
+
+      const t0 = template('<div></div>')
+      const Child = defineVaporComponent({
+        props: ['foo', 'bar', 'baz'],
+        setup(props: any) {
+          const n0 = t0()
+          // Child component accesses multiple props
+          renderEffect(() => {
+            setElementText(n0, `${props.foo}-${props.bar}-${props.baz}`)
+          })
+          return n0
+        },
+      })
+
+      const { host } = define({
+        setup() {
+          return createComponent(Child, {
+            $: [
+              () => {
+                sourceCallCount++
+                return obj.value
+              },
+            ],
+          })
+        },
+      }).render()
+
+      expect(host.innerHTML).toBe('<div>1-2-3</div>')
+      // Source should only be called once even though 3 props are accessed
+      expect(sourceCallCount).toBe(1)
+    })
+
+    test('v-bind object should update when source changes', async () => {
+      let sourceCallCount = 0
+      const obj = ref({ foo: 1, bar: 2 })
+
+      const t0 = template('<div></div>')
+      const Child = defineVaporComponent({
+        props: ['foo', 'bar'],
+        setup(props: any) {
+          const n0 = t0()
+          renderEffect(() => {
+            setElementText(n0, `${props.foo}-${props.bar}`)
+          })
+          return n0
+        },
+      })
+
+      const { host } = define({
+        setup() {
+          return createComponent(Child, {
+            $: [
+              () => {
+                sourceCallCount++
+                return obj.value
+              },
+            ],
+          })
+        },
+      }).render()
+
+      expect(host.innerHTML).toBe('<div>1-2</div>')
+      expect(sourceCallCount).toBe(1)
+
+      // Update source
+      obj.value = { foo: 10, bar: 20 }
+      await nextTick()
+
+      expect(host.innerHTML).toBe('<div>10-20</div>')
+      // Should be called again after source changes
+      expect(sourceCallCount).toBe(2)
+    })
+
+    test('v-bind object should not update child when resolved values are unchanged', async () => {
+      let childRenderCount = 0
+      const activeId = ref(0)
+
+      const t0 = template('<div></div>', 1)
+      const Child = defineVaporComponent({
+        props: ['active', 'tone'],
+        setup(props: any) {
+          const n0 = t0()
+          renderEffect(() => {
+            childRenderCount++
+            setElementText(n0, `${props.active}-${props.tone}`)
+          })
+          return n0
+        },
+      })
+
+      const { host } = define({
+        setup() {
+          return createComponent(Child, {
+            $: [
+              () => {
+                const active = activeId.value === 1
+                return {
+                  active,
+                  tone: 'stable',
+                  class: active ? 'active' : 'inactive',
+                }
+              },
+            ],
+          })
+        },
+      }).render()
+
+      expect(host.innerHTML).toBe('<div class="inactive">false-stable</div>')
+      expect(childRenderCount).toBe(1)
+
+      activeId.value = 2
+      await nextTick()
+
+      expect(host.innerHTML).toBe('<div class="inactive">false-stable</div>')
+      expect(childRenderCount).toBe(1)
+    })
+
+    test('v-bind object should be cached when child accesses multiple attrs', () => {
+      let sourceCallCount = 0
+      const obj = ref({ foo: 1, bar: 2, baz: 3 })
+
+      const t0 = template('<div></div>')
+      const Child = defineVaporComponent({
+        // No props declaration - all become attrs
+        setup(_: any, { attrs }: any) {
+          const n0 = t0()
+          renderEffect(() => {
+            setElementText(n0, `${attrs.foo}-${attrs.bar}-${attrs.baz}`)
+          })
+          return n0
+        },
+      })
+
+      const { host } = define({
+        setup() {
+          return createComponent(Child, {
+            $: [
+              () => {
+                sourceCallCount++
+                return obj.value
+              },
+            ],
+          })
+        },
+      }).render()
+
+      expect(host.innerHTML).toBe('<div foo="1" bar="2" baz="3">1-2-3</div>')
+      // Source should only be called once
+      expect(sourceCallCount).toBe(1)
+    })
+
+    test('mixed static and dynamic props', async () => {
+      let sourceCallCount = 0
+      const obj = ref({ foo: 1 })
+
+      const t0 = template('<div></div>')
+      const Child = defineVaporComponent({
+        props: ['id', 'foo', 'class'],
+        setup(props: any) {
+          const n0 = t0()
+          renderEffect(() => {
+            setElementText(n0, `${props.id}-${props.foo}-${props.class}`)
+          })
+          return n0
+        },
+      })
+
+      const { host } = define({
+        setup() {
+          return createComponent(Child, {
+            id: 'static',
+            $: [
+              () => {
+                sourceCallCount++
+                return obj.value
+              },
+              { class: 'bar' },
+            ],
+          })
+        },
+      }).render()
+
+      expect(host.innerHTML).toBe('<div>static-1-bar</div>')
+      expect(sourceCallCount).toBe(1)
+
+      obj.value = { foo: 2 }
+      await nextTick()
+
+      expect(host.innerHTML).toBe('<div>static-2-bar</div>')
+      expect(sourceCallCount).toBe(2)
+    })
+
+    test('static object source direct values are exposed as attrs', () => {
+      const t0 = template('<div></div>')
+      const Child = defineVaporComponent({
+        setup(_: any, { attrs }: any) {
+          const n0 = t0()
+          renderEffect(() => {
+            setElementText(n0, `${attrs.id}-${attrs.class}`)
+          })
+          return n0
+        },
+      })
+
+      const { host } = define({
+        setup() {
+          return createComponent(Child, {
+            $: [{ id: 'foo', class: 'bar' }],
+          })
+        },
+      }).render()
+
+      expect(host.innerHTML).toBe('<div id="foo" class="bar">foo-bar</div>')
+    })
+
+    test('resolveDynamicProps merges event listeners across sources', () => {
+      const first = vi.fn()
+      const second = vi.fn()
+      const third = vi.fn()
+      expect(
+        resolveDynamicProps({
+          onClick: () => first,
+          $: [
+            () => ({ onClick: [second, third] }),
+            { onClick: () => first },
+            () => ({ onClick: null }),
+          ],
+        }).onClick,
+      ).toEqual([first, second, third])
+    })
+
+    test('resolveDynamicProps supports direct values in static object sources', () => {
+      expect(
+        resolveDynamicProps({
+          id: 'foo',
+          class: 'base',
+          $: [() => ({ class: 'dynamic' }), { class: 'bar', title: 'baz' }],
+        }),
+      ).toEqual({
+        id: 'foo',
+        class: ['base', 'dynamic', 'bar'],
+        title: 'baz',
+      })
+    })
+  })
+
+  test.each([
+    ':class="data.classes"',
+    ':class="[data.classes]"',
+    'v-bind="data.input"',
+    'v-bind="{}" :class="data.classes"',
+    ':[data.key]="data.classes"',
+  ])('v-once snapshots normalized declared class props (%s)', async binding => {
+    const classes = { active: true }
+    const data = ref({
+      classes,
+      input: { class: classes },
+      key: 'class',
+      readClass: () => '',
+    })
+    const Child = compile(
+      `<script setup vapor>
+        const props = defineProps({ class: String })
+        _data.value.readClass = () => props.class
+      </script>
+      <template><div>{{ props.class }}</div></template>`,
+      data,
+    )
+    const Parent = compile(
+      `<template><components.Child v-once ${binding} /></template>`,
+      data,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(data.value.readClass()).toBe('active')
+    expect(host.innerHTML).toBe('<div>active</div>')
+
+    data.value.classes.active = false
+    await nextTick()
+
+    expect.soft(data.value.readClass()).toBe('active')
+    expect.soft(host.innerHTML).toBe('<div>active</div>')
+  })
+
+  test.each([
+    ':style="[data.styles]"',
+    ':style="data.styles"',
+    'v-bind="data.input"',
+    'v-bind="{}" :style="[data.styles]"',
+    ':[data.key]="[data.styles]"',
+  ])('v-once snapshots normalized declared style props (%s)', async binding => {
+    const styles = { color: 'red' }
+    const data = ref({
+      styles,
+      input: { style: [styles] },
+      key: 'style',
+      readStyle: () => ({ color: '' }),
+    })
+    const Child = compile(
+      `<script setup vapor>
+        const props = defineProps({ style: Object })
+        _data.value.readStyle = () => props.style
+      </script>
+      <template><div>{{ props.style.color }}</div></template>`,
+      data,
+    )
+    const Parent = compile(
+      `<template><components.Child v-once ${binding} /></template>`,
+      data,
+      { Child },
+    )
+
+    const { host } = define(Parent).render()
+    expect(data.value.readStyle()).toEqual({ color: 'red' })
+    expect(host.innerHTML).toBe('<div>red</div>')
+
+    data.value.styles.color = 'blue'
+    await nextTick()
+
+    expect.soft(data.value.readStyle()).toEqual({ color: 'red' })
+    expect.soft(host.innerHTML).toBe('<div>red</div>')
+  })
+
+  test.each([
+    [':on-click="data.first" v-bind="data.attrs"', ['second']],
+    ['v-bind="data.attrs" :on-click="data.first"', ['first']],
+    [
+      ':on-click="data.first" v-bind="data.attrs" :[data.key]="data.third"',
+      ['second'],
+    ],
+    ['v-bind="{ \'on-click\': data.first, ...data.attrs }"', ['second']],
+    [
+      ':on-click="data.first" v-bind="{ \'on-click\': data.third }"',
+      ['first', 'third'],
+    ],
+  ])(
+    'declared event props preserve raw key precedence (%s)',
+    async (binding, expected) => {
+      await renderParity(
+        {
+          Child: `<script setup>
+          const props = defineProps({ onClick: null })
+          const trigger = () => {
+            const handlers = Array.isArray(props.onClick)
+              ? props.onClick
+              : [props.onClick]
+            handlers.forEach(handler => handler())
+          }
+        </script><template><button @click="trigger">click</button></template>`,
+          App: `<template><components.Child ${binding} /></template>`,
+        },
+        () => {
+          const calls: string[] = []
+          return ref({
+            calls,
+            first: () => calls.push('first'),
+            attrs: { onClick: () => calls.push('second') },
+            third: () => calls.push('third'),
+            key: 'on-click',
+          })
+        },
+        async (data, root) => {
+          root.querySelector('button')!.click()
+          expect(data.value.calls).toEqual(expected)
+        },
+      )
+    },
+  )
+
+  test('declared event props update merged sources and restore defaults', async () => {
+    await renderParity(
+      {
+        Child: `<script setup>
+          const props = defineProps({
+            onClick: { default: () => () => _data.value.calls.push('default') }
+          })
+          const trigger = () => {
+            const handlers = Array.isArray(props.onClick)
+              ? props.onClick
+              : [props.onClick]
+            handlers.forEach(handler => handler())
+          }
+        </script><template><button @click="trigger">click</button></template>`,
+        App: `<template><components.Child v-on="data.listeners" v-bind="data.attrs" /></template>`,
+      },
+      () => {
+        const calls: string[] = []
+        const first = () => calls.push('first')
+        const second = () => calls.push('second')
+        return ref({
+          calls,
+          listeners: { click: [first, second] } as Record<string, unknown>,
+          attrs: { onClick: first } as Record<string, unknown>,
+        })
+      },
+      async (data, root) => {
+        const button = root.querySelector('button')!
+        button.click()
+        expect(data.value.calls).toEqual(['first', 'second'])
+
+        data.value.calls.length = 0
+        data.value.attrs = { 'on-click': () => data.value.calls.push('third') }
+        await nextTick()
+        button.click()
+        expect(data.value.calls).toEqual(['third'])
+
+        data.value.calls.length = 0
+        data.value.attrs = {}
+        await nextTick()
+        button.click()
+        expect(data.value.calls).toEqual(['first', 'second'])
+
+        data.value.calls.length = 0
+        data.value.listeners = {}
+        await nextTick()
+        button.click()
+        expect(data.value.calls).toEqual(['default'])
+      },
+    )
+  })
+
+  test.each([undefined, 'active'])(
+    'merged class props restore defaults when all sources are undefined (%s)',
+    async initialClass => {
+      await renderParity(
+        {
+          Child: `<script setup>
+            const props = defineProps({ class: { type: String, default: 'fallback' } })
+          </script><template><div>{{ props.class }}</div></template>`,
+          App: `<template><components.Child :class="data.extra" v-bind="data.attrs" /></template>`,
+        },
+        () =>
+          ref({
+            extra: initialClass,
+            attrs: { class: undefined as string | undefined },
+          }),
+        async (data, root) => {
+          expect(root.textContent).toBe(initialClass ?? 'fallback')
+
+          data.value.extra = undefined
+          await nextTick()
+          expect(root.textContent).toBe('fallback')
+
+          data.value.attrs.class = ''
+          await nextTick()
+          expect(root.textContent).toBe('')
+
+          data.value.attrs.class = undefined
+          await nextTick()
+          expect(root.textContent).toBe('fallback')
+
+          data.value.extra = data.value.attrs.class = 'shared'
+          await nextTick()
+          expect(root.textContent).toBe('shared')
+        },
+      )
+    },
+  )
+
+  test('prop validation does not mutate class and style source arrays', async () => {
+    await renderParity(
+      {
+        Child: `<script setup>
+          const props = defineProps({ class: String, style: Object })
+        </script><template><div>{{ props.class }}|{{ JSON.stringify(props.style) }}</div></template>`,
+        App: `<template><components.Child :class="data.classes" :style="data.styles" v-bind="data.attrs" /></template>`,
+      },
+      () =>
+        ref({
+          classes: ['a'],
+          styles: [{ color: 'red' }],
+          attrs: { class: 'b', style: { margin: '1px' } },
+        }),
+      async (data, root) => {
+        expect.soft(data.value.classes).toEqual(['a'])
+        expect.soft(data.value.styles).toEqual([{ color: 'red' }])
+        expect(root.textContent).toBe('a b|{"color":"red","margin":"1px"}')
+
+        data.value.attrs = { class: 'c', style: { padding: '2px' } }
+        await nextTick()
+        expect.soft(data.value.classes).toEqual(['a'])
+        expect.soft(data.value.styles).toEqual([{ color: 'red' }])
+        expect(root.textContent).toBe('a c|{"color":"red","padding":"2px"}')
+      },
+    )
+  })
+})
