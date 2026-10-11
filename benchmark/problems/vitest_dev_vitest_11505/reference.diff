@@ -1,0 +1,533 @@
+diff --git a/packages/browser/src/node/plugin.ts b/packages/browser/src/node/plugin.ts
+index 546025a3bd24..40f112a43593 100644
+--- a/packages/browser/src/node/plugin.ts
++++ b/packages/browser/src/node/plugin.ts
+@@ -61,6 +61,8 @@ export default (contribution: BrowserServerContribution): Plugin[] => {
+     }),
+     {
+       name: 'vitest:browser:in-source-tests',
++      // runs after `vitest:mocks`, so hoisted mocks can read `import.meta.vitest`
++      enforce: 'post',
+       transform: {
+         filter: {
+           code: /import\.meta\.vitest/,
+diff --git a/packages/mocker/src/node/esmWalker.ts b/packages/mocker/src/node/esmWalker.ts
+index 5da11657750f..24edb7c80c0a 100644
+--- a/packages/mocker/src/node/esmWalker.ts
++++ b/packages/mocker/src/node/esmWalker.ts
+@@ -42,7 +42,7 @@ interface Visitors {
+   onIdentifier?: (node: Positioned<Identifier>, info: IdentifierInfo, parentStack: Node[]) => void
+   onImportMeta?: (node: Positioned<MetaProperty>) => void
+   onDynamicImport?: (node: Positioned<ImportExpression>) => void
+-  onCallExpression?: (node: Positioned<CallExpression>) => void
++  onCallExpression?: (node: Positioned<CallExpression>, parentStack: Node[]) => void
+ }
+ 
+ const isNodeInPatternWeakSet = new WeakSet<_Node>()
+@@ -126,7 +126,7 @@ export function esmWalker(
+       }
+ 
+       if (node.type === 'CallExpression') {
+-        onCallExpression?.(node as Positioned<CallExpression>)
++        onCallExpression?.(node as Positioned<CallExpression>, parentStack)
+       }
+ 
+       if (node.type === 'MetaProperty' && node.meta.name === 'import') {
+diff --git a/packages/mocker/src/node/hoistMocks.ts b/packages/mocker/src/node/hoistMocks.ts
+index d2773aa19bd8..13a847eeba0c 100644
+--- a/packages/mocker/src/node/hoistMocks.ts
++++ b/packages/mocker/src/node/hoistMocks.ts
+@@ -1,12 +1,14 @@
+ import type {
+   ArrowFunctionExpression,
+   AwaitExpression,
++  BlockStatement,
+   CallExpression,
+   ExportDefaultDeclaration,
+   ExportNamedDeclaration,
+   Expression,
+   FunctionExpression,
+   Identifier,
++  IfStatement,
+   ImportDeclaration,
+   SpreadElement,
+   VariableDeclaration,
+@@ -256,17 +258,38 @@ export function hoistMocks(
+     }
+   }
+ 
++  function isImportMetaVitestCheck(node: Node): node is Positioned<IfStatement> {
++    if (node.type !== 'IfStatement') {
++      return false
++    }
++    const test = node.test as Positioned<Expression>
++    return code.slice(test.start, test.end) === 'import.meta.vitest'
++  }
++
++  const hoistConditions = new Map<Node, string>()
++  const inSourceBlocks = new Set<BlockStatement>()
++
++  // in-source `vi.mock` and `vi.hoisted` run only when their file is the test file
++  function addHoistedNode(
++    node: Positioned<CallExpression | VariableDeclaration | AwaitExpression>,
++    parentStack: Node[],
++  ) {
++    hoistedNodes.add(node)
++    const guard = parentStack.find(isImportMetaVitestCheck)
++    if (guard) {
++      const test = guard.test as Positioned<Expression>
++      // copied because the native loader rewrites `import.meta.vitest`
++      hoistConditions.set(node, s.slice(test.start, test.end))
++      if (guard.consequent.type === 'BlockStatement') {
++        inSourceBlocks.add(guard.consequent)
++      }
++    }
++  }
++
+   const usedUtilityExports = new Set<string>()
+-  let hasImportMetaVitest = false
+   let hasMockApiCall = false
+ 
+   esmWalker(ast, {
+-    onImportMeta(node) {
+-      const property = code.slice(node.end, node.end + 7) // '.vitest'.length
+-      if (property === '.vitest') {
+-        hasImportMetaVitest = true
+-      }
+-    },
+     onIdentifier(id, info, parentStack) {
+       const binding = idToImportMap.get(id.name)
+       if (!binding) {
+@@ -307,7 +330,7 @@ export function hoistMocks(
+       // )
+       // s.overwrite(node.end - 1, node.end, '))')
+     },
+-    onCallExpression(node) {
++    onCallExpression(node, parentStack) {
+       if (
+         node.callee.type === 'MemberExpression' &&
+         isIdentifier(node.callee.object) &&
+@@ -373,7 +396,7 @@ export function hoistMocks(
+               s.overwrite(moduleInfo.start, moduleInfo.end, s.slice(source.start, source.end))
+             }
+           }
+-          hoistedNodes.add(node)
++          addHoistedNode(node, parentStack)
+         }
+         // vi.doMock(import('./path')) -> vi.doMock('./path')
+         // vi.doMock(await import('./path')) -> vi.doMock('./path')
+@@ -421,14 +444,14 @@ export function hoistMocks(
+               'Cannot export hoisted variable. You can control hoisting behavior by placing the import from this file first.',
+             )
+             // hoist "const variable = vi.hoisted(() => {})"
+-            hoistedNodes.add(declarationNode)
++            addHoistedNode(declarationNode, parentStack)
+           } else {
+             const awaitedExpression = findNodeAround(ast, node.start, 'AwaitExpression')?.node as
+               | Positioned<AwaitExpression>
+               | undefined
+             // hoist "await vi.hoisted(async () => {})" or "vi.hoisted(() => {})"
+             const moveNode = awaitedExpression?.argument === node ? awaitedExpression : node
+-            hoistedNodes.add(moveNode)
++            addHoistedNode(moveNode, parentStack)
+           }
+         }
+       }
+@@ -503,45 +526,57 @@ export function hoistMocks(
+     }
+   }
+ 
+-  // validate that hoisted nodes are defined on the top level
+-  // ignore `import.meta.vitest` because it needs to be inside an IfStatement
+-  // and it can be used anywhere in the code (inside methods too)
+-  if (!hasImportMetaVitest) {
+-    for (const node of ast.body as Node[]) {
+-      hoistedNodes.delete(node as any)
+-      if (node.type === 'ExpressionStatement') {
+-        hoistedNodes.delete(node.expression as any)
+-      }
++  // validate that hoisted nodes are defined on the top level of the module
++  // or of an `if (import.meta.vitest)` block
++  const topLevelNodes: Node[] = [
++    ...ast.body,
++    ...Array.from(inSourceBlocks).flatMap((block) => block.body as Node[]),
++  ]
++  for (const node of topLevelNodes) {
++    hoistedNodes.delete(node as any)
++    if (node.type === 'ExpressionStatement') {
++      hoistedNodes.delete(node.expression as any)
+     }
++  }
+ 
+-    if (hoistedNodes.size) {
+-      const locations = createIndexLocationsMap(code)
+-      const map = options.getMap && new TraceMap(options.getMap() as any)
+-      const plural = hoistedNodes.size > 1
+-      const message = [
+-        `${hoistedNodes.size} call${plural ? 's' : ''} in "${relative(options.root || process.cwd(), id)}" ${plural ? 'were' : 'was'} defined outside of the module's top level scope:`,
+-        '',
+-        ...Array.from(hoistedNodes, (invalidNode) => {
+-          const currentLocation = locations.get(invalidNode.start)
+-          const originalLocation =
+-            map && currentLocation && originalPositionFor(map, currentLocation)
+-          const location =
+-            originalLocation?.column != null && originalLocation?.line != null
+-              ? ` at ${relative(options.root || process.cwd(), id)}:${originalLocation.line}:${originalLocation.column + 1}`
+-              : ''
+-          return `- ${getNodeName(getNodeCall(invalidNode))}${location}`
+-        }),
+-        '',
+-        `Although ${plural ? 'they appear nested, they' : 'it appears nested, it'} will be hoisted and executed before anything in this file. Move ${plural ? 'them' : 'it'} to the top level to reflect ${plural ? 'their' : 'its'} actual execution order.`,
+-        'See: https://vitest.dev/guide/mocking/modules#how-it-works',
+-      ].join('\n')
+-      throw new Error(message)
+-    }
++  if (hoistedNodes.size) {
++    const locations = createIndexLocationsMap(code)
++    const map = options.getMap && new TraceMap(options.getMap() as any)
++    const plural = hoistedNodes.size > 1
++    const topLevel = inSourceBlocks.size
++      ? 'the top level of the `if (import.meta.vitest)` block'
++      : 'the top level'
++    const message = [
++      `${hoistedNodes.size} call${plural ? 's' : ''} in "${relative(options.root || process.cwd(), id)}" ${plural ? 'were' : 'was'} defined outside of the module's top level scope:`,
++      '',
++      ...Array.from(hoistedNodes, (invalidNode) => {
++        const currentLocation = locations.get(invalidNode.start)
++        const originalLocation = map && currentLocation && originalPositionFor(map, currentLocation)
++        const location =
++          originalLocation?.column != null && originalLocation?.line != null
++            ? ` at ${relative(options.root || process.cwd(), id)}:${originalLocation.line}:${originalLocation.column + 1}`
++            : ''
++        return `- ${getNodeName(getNodeCall(invalidNode))}${location}`
++      }),
++      '',
++      `Although ${plural ? 'they appear nested, they' : 'it appears nested, it'} will be hoisted and executed before anything in this file. Move ${plural ? 'them' : 'it'} to ${topLevel} to reflect ${plural ? 'their' : 'its'} actual execution order.`,
++      'See: https://vitest.dev/guide/mocking/modules#how-it-works',
++    ].join('\n')
++    throw new Error(message)
+   }
+ 
+   // hoist vi.mock/vi.hoisted
+   for (const node of arrayNodes) {
+     const end = getNodeTail(code, node)
++    const condition = hoistConditions.get(node)
++    if (condition) {
++      // `var` keeps the declared names visible outside of the `if` block
++      if (node.type === 'VariableDeclaration') {
++        s.update(node.start, node.start + node.kind.length, 'var')
++      }
++      s.prependRight(node.start, `if (${condition}) { `)
++      s.appendLeft(node.end, ' }')
++    }
+     // don't hoist into itself if it's already at the top
+     if (hoistIndex === end || hoistIndex === node.start) {
+       hoistIndex = end
+diff --git a/test/e2e/test/mocking.test.ts b/test/e2e/test/mocking.test.ts
+index b79b3abb7fc1..2784652ca6fd 100644
+--- a/test/e2e/test/mocking.test.ts
++++ b/test/e2e/test/mocking.test.ts
+@@ -371,6 +371,56 @@ test('mock works without loading original', () => {
+   },
+ )
+ 
++// https://github.com/vitest-dev/vitest/issues/8653
++test.for(['node', 'playwright'])(
++  'in-source vi.mock applies only when its file is the test file (%s)',
++  async (mode) => {
++    const { stderr, errorTree } = await runInlineTests(
++      {
++        './src/name.js': `export const getName = () => 'original'`,
++        './src/b.js': `
++import { getName } from './name.js'
++export const greet = () => 'hello, ' + getName()
++
++if (import.meta.vitest) {
++  const { test, expect, vi } = import.meta.vitest
++  const mocks = vi.hoisted(() => ({ getName: vi.fn(() => 'b') }))
++  vi.mock('./name.js', () => mocks)
++  test('b mocks name.js', () => {
++    expect(greet()).toBe('hello, b')
++    expect(mocks.getName).toHaveBeenCalledOnce()
++  })
++}
++    `,
++        './src/a.js': `
++import { greet } from './b.js'
++
++if (import.meta.vitest) {
++  const { test, expect, vi } = import.meta.vitest
++  vi.mock('./name.js', () => ({ getName: () => 'a' }))
++  test('imported b does not mock name.js', () => {
++    expect(greet()).toBe('hello, a')
++  })
++}
++    `,
++      },
++      { ...modeToConfig(mode), includeSource: ['src/*.js'] },
++    )
++
++    expect(stderr).toBe('')
++    expect(errorTree()).toMatchInlineSnapshot(`
++      {
++        "src/a.js": {
++          "imported b does not mock name.js": "passed",
++        },
++        "src/b.js": {
++          "b mocks name.js": "passed",
++        },
++      }
++    `)
++  },
++)
++
+ test('doMock/doUnmock ordering is preserved in resolveMocks', async () => {
+   // This tests repeats doUnmock + doMock
+   //   vi.doUnmock('/mock-lib-0');
+diff --git a/test/e2e/test/no-module-runner.test.ts b/test/e2e/test/no-module-runner.test.ts
+index 729ab787bde5..061e336f52ab 100644
+--- a/test/e2e/test/no-module-runner.test.ts
++++ b/test/e2e/test/no-module-runner.test.ts
+@@ -449,6 +449,42 @@ test('add is only once', () => {
+     `)
+   })
+ 
++  test('in-source vi.hoisted and vi.mock work', async () => {
++    const { stderr, testTree } = await runNoViteModuleRunnerTests(
++      {
++        'name.js': `export const getName = () => 'original'`,
++        'in-source.js': /* js */ `
++import { getName } from './name.js'
++
++if (import.meta.vitest) {
++  const { test, expect, vi } = import.meta.vitest
++  const mocks = vi.hoisted(() => ({ getName: vi.fn(() => 'mocked') }))
++  vi.mock('./name.js', () => mocks)
++  test('mocks name.js', () => {
++    expect(getName()).toBe('mocked')
++    expect(mocks.getName).toHaveBeenCalledOnce()
++  })
++}
++    `,
++        'package.json': JSON.stringify({
++          name: '@test/native-in-source-mock',
++          type: 'module',
++        }),
++      },
++      {
++        includeSource: ['./in-source.js'],
++      },
++    )
++    expect(stderr).toBe('')
++    expect(testTree()).toMatchInlineSnapshot(`
++      {
++        "in-source.js": {
++          "mocks name.js": "passed",
++        },
++      }
++    `)
++  })
++
+   test('cannot import JS file without extension in ESM', async () => {
+     const { stderr, root } = await runNoViteModuleRunnerTests({
+       'add.js': /* js */ `
+diff --git a/test/unit/test/injector-mock.test.ts b/test/unit/test/injector-mock.test.ts
+index 3192ed763e37..503a6b087314 100644
+--- a/test/unit/test/injector-mock.test.ts
++++ b/test/unit/test/injector-mock.test.ts
+@@ -1474,7 +1474,7 @@ if (import.meta.vitest) {
+       `),
+     ).toMatchInlineSnapshot(`
+         "import { vi } from "vitest"
+-        vi.mock('faker')
++        if (import.meta.vitest) { vi.mock('faker') }
+         const __vi_import_0__ = await import("./calc");
+ 
+ 
+@@ -1491,6 +1491,141 @@ if (import.meta.vitest) {
+       `)
+   })
+ 
++  test('keeps the import.meta.vitest check for hoisted calls', () => {
++    expect(
++      hoistSimpleCode(`
++import { getName } from './name'
++
++export const greet = () => getName()
++
++if (import.meta.vitest) {
++  const { test, expect, vi } = import.meta.vitest
++  const mocks = vi.hoisted(() => ({ getName: vi.fn() }))
++  vi.mock('./name', () => mocks)
++  vi.unmock('./unmocked')
++  test('greet', () => {
++    expect(greet()).toBe(undefined)
++  })
++}
++      `),
++    ).toMatchInlineSnapshot(`
++      "import { vi } from "vitest"
++      if (import.meta.vitest) { var mocks = vi.hoisted(() => ({ getName: vi.fn() })) }
++      if (import.meta.vitest) { vi.mock('./name', () => mocks) }
++      if (import.meta.vitest) { vi.unmock('./unmocked') }
++      const __vi_import_0__ = await import("./name");
++
++
++
++      export const greet = () => __vi_import_0__.getName()
++
++      if (import.meta.vitest) {
++        const { test, expect, vi } = import.meta.vitest
++              test('greet', () => {
++          expect(greet()).toBe(undefined)
++        })
++      }"
++    `)
++  })
++
++  test('keeps the import.meta.vitest check for vi.hoisted declarations', () => {
++    expect(
++      hoistSimpleCode(`
++if (import.meta.vitest) {
++  const { vi } = import.meta.vitest
++  const getName = vi.hoisted(() => vi.fn())
++  let getAge = vi.hoisted(() => vi.fn())
++  var getRole = vi.hoisted(() => vi.fn())
++  vi.mock('./user', () => ({ getName, getAge, getRole }))
++}
++      `),
++    ).toMatchInlineSnapshot(`
++      "import { vi } from "vitest"
++      if (import.meta.vitest) { var getName = vi.hoisted(() => vi.fn()) }
++      if (import.meta.vitest) { var getAge = vi.hoisted(() => vi.fn()) }
++      if (import.meta.vitest) { var getRole = vi.hoisted(() => vi.fn()) }
++      if (import.meta.vitest) { vi.mock('./user', () => ({ getName, getAge, getRole })) }
++
++      if (import.meta.vitest) {
++        const { vi } = import.meta.vitest
++              }"
++    `)
++  })
++
++  test('keeps the import.meta.vitest check for destructured vi.hoisted declarations', () => {
++    expect(
++      hoistSimpleCode(`
++if (import.meta.vitest) {
++  const { vi } = import.meta.vitest
++  const { getName, ...user } = vi.hoisted(() => ({ getName: vi.fn(), age: 42 }))
++  const [getAge, getRole = vi.fn()] = vi.hoisted(() => [vi.fn()])
++  const { session: { token } } = vi.hoisted(() => ({ session: { token: 'secret' } }))
++  vi.mock('./user', () => ({ getName, getAge, getRole, user, token }))
++}
++      `),
++    ).toMatchInlineSnapshot(`
++      "import { vi } from "vitest"
++      if (import.meta.vitest) { var { getName, ...user } = vi.hoisted(() => ({ getName: vi.fn(), age: 42 })) }
++      if (import.meta.vitest) { var [getAge, getRole = vi.fn()] = vi.hoisted(() => [vi.fn()]) }
++      if (import.meta.vitest) { var { session: { token } } = vi.hoisted(() => ({ session: { token: 'secret' } })) }
++      if (import.meta.vitest) { vi.mock('./user', () => ({ getName, getAge, getRole, user, token })) }
++
++      if (import.meta.vitest) {
++        const { vi } = import.meta.vitest
++              }"
++    `)
++  })
++
++  test('keeps the import.meta.vitest check for awaited vi.hoisted declarations', () => {
++    expect(
++      hoistSimpleCode(`
++if (import.meta.vitest) {
++  const { vi } = import.meta.vitest
++  const { user } = await vi.hoisted(async () => {
++    const { default: user } = await import('./fixtures/user')
++    return { user }
++  })
++  vi.mock('./user', () => ({ getUser: () => user }))
++}
++      `),
++    ).toMatchInlineSnapshot(`
++      "import { vi } from "vitest"
++      if (import.meta.vitest) { var { user } = await vi.hoisted(async () => {
++          const { default: user } = await import('./fixtures/user')
++          return { user }
++        }) }
++      if (import.meta.vitest) { vi.mock('./user', () => ({ getUser: () => user })) }
++
++      if (import.meta.vitest) {
++        const { vi } = import.meta.vitest
++          }"
++    `)
++  })
++
++  test('keeps the import.meta.vitest check for vi.hoisted without a declaration', () => {
++    expect(
++      hoistSimpleCode(`
++if (import.meta.vitest) {
++  const { vi } = import.meta.vitest
++  vi.hoisted(() => {
++    process.env.API_URL = 'http://localhost'
++  })
++  await vi.hoisted(() => import('./polyfills'))
++}
++      `),
++    ).toMatchInlineSnapshot(`
++      "import { vi } from "vitest"
++      if (import.meta.vitest) { vi.hoisted(() => {
++          process.env.API_URL = 'http://localhost'
++        }) }
++      if (import.meta.vitest) { await vi.hoisted(() => import('./polyfills')) }
++
++      if (import.meta.vitest) {
++        const { vi } = import.meta.vitest
++          }"
++    `)
++  })
++
+   test('injects an error if a utility import is imported from an external module', () => {
+     expect(
+       hoistSimpleCode(`
+@@ -1750,7 +1885,34 @@ describe("some suite", () => {
+     `)
+   })
+ 
+-  it('ignores vi.mock position if import.meta.vitest is present', ({ onTestFinished }) => {
++  it('shows an error when hoisted methods are nested inside an import.meta.vitest block', () => {
++    expect(() =>
++      hoistSimpleCode(`
++import { getName } from './name'
++
++export const greet = () => getName()
++
++if (import.meta.vitest) {
++  const { test, expect, vi } = import.meta.vitest
++  test('greet', () => {
++    vi.mock('./name', () => ({ getName: () => 'mocked' }))
++    expect(greet()).toBe('mocked')
++  })
++}
++      `),
++    ).toThrowErrorMatchingInlineSnapshot(`
++      [Error: 1 call in "test.js" was defined outside of the module's top level scope:
++
++      - vi.mock('./name')
++
++      Although it appears nested, it will be hoisted and executed before anything in this file. Move it to the top level of the \`if (import.meta.vitest)\` block to reflect its actual execution order.
++      See: https://vitest.dev/guide/mocking/modules#how-it-works]
++    `)
++  })
++
++  it('allows hoisted methods on the top level of an import.meta.vitest block', ({
++    onTestFinished,
++  }) => {
+     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+     onTestFinished(() => warn.mockRestore())
+     const result = hoistSimpleCode(`
+@@ -1760,7 +1922,7 @@ if (import.meta.vitest) {
+       `)
+     expect(result).toMatchInlineSnapshot(`
+       "import { vi } from "vitest"
+-      vi.mock('./hello-world-1')
++      if (import.meta.vitest) { vi.mock('./hello-world-1') }
+ 
+       if (import.meta.vitest) {
+         }"

@@ -1,0 +1,140 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 2c98449797..93b03527fe 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -39,7 +39,7 @@ itoa = { version = "1", optional = true }
+ pin-project-lite = { version = "0.2.4", optional = true }
+ smallvec = { version = "1.12", features = ["const_generics", "const_new"], optional = true }
+ tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
+-want = { version = "0.3", optional = true }
++want = { version = "0.3.2", optional = true }
+ 
+ [dev-dependencies]
+ form_urlencoded = "1"
+@@ -352,3 +352,8 @@ required-features = ["full"]
+ name = "h1_shutdown_while_buffered"
+ path = "tests/h1_shutdown_while_buffered.rs"
+ required-features = ["full"]
++
++[[test]]
++name = "h1_ready_in_flight"
++path = "tests/h1_ready_in_flight.rs"
++required-features = ["full"]
+diff --git a/src/client/dispatch.rs b/src/client/dispatch.rs
+index 0d91a1d92e..37afa9f78d 100644
+--- a/src/client/dispatch.rs
++++ b/src/client/dispatch.rs
+@@ -182,6 +182,12 @@ impl<T, U> Receiver<T, U> {
+     pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(T, Callback<T, U>)>> {
+         match self.inner.poll_recv(cx) {
+             Poll::Ready(item) => {
++                // A want signaled after finding the queue empty can land after
++                // the Sender's `give()` for the message taken here, as can one
++                // signaled on a coop-budget Pending with a message queued.
++                // Withdraw it, or the Sender reports this connection as ready
++                // while it is still serving this message.
++                self.taker.unwant();
+                 Poll::Ready(item.map(|mut env| env.0.take().expect("envelope not dropped")))
+             }
+             Poll::Pending => {
+diff --git a/tests/h1_ready_in_flight.rs b/tests/h1_ready_in_flight.rs
+new file mode 100644
+index 0000000000..f2317ba308
+--- /dev/null
++++ b/tests/h1_ready_in_flight.rs
+@@ -0,0 +1,95 @@
++// Test: an HTTP/1 client connection must not report ready while a request is
++// in flight on it.
++//
++// The dispatch `Receiver` signals want when its queue reports `Pending`, and
++// `SendRequest::is_ready` reports that want. The signal can go stale: the
++// connection task can find its queue empty and a request land before it
++// signals, or tokio's coop budget can make the queue report `Pending` with a
++// request already in it. The request is then taken with want still set, so
++// `is_ready` stays true until the response is complete. Pools that return a
++// connection on `is_ready`, such as hyper-util's legacy client, then give that
++// connection to the next request, which waits behind the whole response.
++//
++// The coop path is deterministic, so the test drives that one.
++
++use std::future::Future;
++use std::io;
++use std::pin::Pin;
++use std::task::{Context, Poll};
++
++use bytes::Bytes;
++use futures_util::future::poll_fn;
++use http_body_util::Empty;
++use hyper::client::conn::http1::{self, Connection};
++use hyper::rt::{Read, ReadBufCursor, Write};
++use hyper::Request;
++
++/// Accepts every write and never answers, so a sent request stays in flight.
++struct SilentIo;
++
++impl Read for SilentIo {
++    fn poll_read(
++        self: Pin<&mut Self>,
++        _: &mut Context<'_>,
++        _: ReadBufCursor<'_>,
++    ) -> Poll<io::Result<()>> {
++        Poll::Pending
++    }
++}
++
++impl Write for SilentIo {
++    fn poll_write(
++        self: Pin<&mut Self>,
++        _: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        Poll::Ready(Ok(buf.len()))
++    }
++
++    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++
++    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(Ok(()))
++    }
++}
++
++/// Runs the connection task once; it never finishes, as the peer never answers.
++fn poll_conn(conn: &mut Connection<SilentIo, Empty<Bytes>>, cx: &mut Context<'_>) -> Poll<()> {
++    assert!(Pin::new(conn).poll(cx).is_pending());
++    Poll::Ready(())
++}
++
++#[tokio::test]
++async fn h1_connection_is_not_ready_while_a_request_is_in_flight() {
++    let (mut sender, mut conn) = http1::handshake(SilentIo).await.unwrap();
++
++    // Idle, the connection finds its queue empty and signals it is ready.
++    poll_fn(|cx| poll_conn(&mut conn, cx)).await;
++    assert!(sender.is_ready());
++
++    // Kept alive: dropping the response future cancels the request.
++    let _response = sender.send_request(Request::new(Empty::new()));
++    assert!(!sender.is_ready());
++
++    // Out of coop budget, the queue reports Pending with the request in it, so
++    // the connection signals ready again. A connection task preempted between
++    // finding its queue empty and signaling leaves the same stale signal.
++    poll_fn(|cx| {
++        while let Poll::Ready(restore) = tokio::task::coop::poll_proceed(cx) {
++            restore.made_progress();
++        }
++        poll_conn(&mut conn, cx)
++    })
++    .await;
++    tokio::task::yield_now().await;
++
++    // With a fresh budget it takes and writes the request, which then waits
++    // for a response that never comes.
++    poll_fn(|cx| poll_conn(&mut conn, cx)).await;
++    assert!(
++        !sender.is_ready(),
++        "connection reports ready with a request in flight"
++    );
++}

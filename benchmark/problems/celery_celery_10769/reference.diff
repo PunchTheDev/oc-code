@@ -1,0 +1,592 @@
+diff --git a/Changelog.rst b/Changelog.rst
+index f050affc951..388d9757570 100644
+--- a/Changelog.rst
++++ b/Changelog.rst
+@@ -12,6 +12,10 @@ an overview of what's new in Celery 5.6.
+ Unreleased
+ ==========
+ 
++- ``countdown`` and numeric ``expires`` now use elapsed seconds across DST
++  transitions instead of wall-clock arithmetic in task protocols 1 and 2.
++  Timedelta-based Beat schedules also continue running across DST fall-back
++  transitions (#10769, #6438).
+ - Fix ``%%`` in node and host format strings to produce a literal percent sign.
+   Previously ``%%h``, ``%%n`` and ``%%d`` expanded the variable after an extra
+   percent sign. Log and pid file paths passed through ``celery multi`` are formatted
+diff --git a/celery/app/amqp.py b/celery/app/amqp.py
+index 2b593291db1..22f5fc4cb02 100644
+--- a/celery/app/amqp.py
++++ b/celery/app/amqp.py
+@@ -2,7 +2,6 @@
+ import numbers
+ from collections import namedtuple
+ from collections.abc import Mapping
+-from datetime import timedelta
+ from weakref import WeakValueDictionary
+ 
+ from kombu import Connection, Consumer, Exchange, Producer, Queue, pools
+@@ -14,7 +13,7 @@
+ from celery.utils.nodenames import anon_nodename
+ from celery.utils.saferepr import saferepr
+ from celery.utils.text import indent as textindent
+-from celery.utils.time import maybe_make_aware
++from celery.utils.time import add_seconds_to_datetime, maybe_make_aware
+ 
+ from . import routes as _routes
+ 
+@@ -345,14 +344,14 @@ def as_task_v2(self, task_id, name, args=None, kwargs=None,
+             now = now or self.app.now()
+             timezone = timezone or self.app.timezone
+             eta = maybe_make_aware(
+-                now + timedelta(seconds=countdown), tz=timezone,
++                add_seconds_to_datetime(now, countdown), tz=timezone,
+             )
+         if isinstance(expires, numbers.Real):
+             self._verify_seconds(expires, 'expires')
+             now = now or self.app.now()
+             timezone = timezone or self.app.timezone
+             expires = maybe_make_aware(
+-                now + timedelta(seconds=expires), tz=timezone,
++                add_seconds_to_datetime(now, expires), tz=timezone,
+             )
+         if not isinstance(eta, str):
+             eta = eta and eta.isoformat()
+@@ -436,11 +435,11 @@ def as_task_v1(self, task_id, name, args=None, kwargs=None,
+         if countdown:  # convert countdown to ETA
+             self._verify_seconds(countdown, 'countdown')
+             now = now or self.app.now()
+-            eta = now + timedelta(seconds=countdown)
++            eta = add_seconds_to_datetime(now, countdown)
+         if isinstance(expires, numbers.Real):
+             self._verify_seconds(expires, 'expires')
+             now = now or self.app.now()
+-            expires = now + timedelta(seconds=expires)
++            expires = add_seconds_to_datetime(now, expires)
+         if not isinstance(eta, str):
+             eta = eta and eta.isoformat()
+         if not isinstance(expires, str):
+diff --git a/celery/utils/time.py b/celery/utils/time.py
+index ca30508966a..e54b29b5d6b 100644
+--- a/celery/utils/time.py
++++ b/celery/utils/time.py
+@@ -34,7 +34,7 @@
+     'LocalTimezone', 'timezone', 'maybe_timedelta',
+     'delta_resolution', 'remaining', 'rate', 'weekday',
+     'humanize_seconds', 'maybe_iso8601', 'is_naive',
+-    'make_aware', 'localize', 'to_utc', 'maybe_make_aware',
++    'add_seconds_to_datetime', 'make_aware', 'localize', 'to_utc', 'maybe_make_aware',
+     'ffwd', 'utcoffset', 'adjust_timestamp',
+     'get_exponential_backoff_interval',
+ )
+@@ -211,12 +211,13 @@ def delta_resolution(dt: datetime, delta: timedelta) -> datetime:
+     args = dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+     for res, predicate in resolutions:
+         if predicate(delta) >= 1.0:
+-            return datetime(*args[:res], tzinfo=dt.tzinfo)
++            # Keep the same occurrence when rounding a repeated local time.
++            return datetime(*args[:res], tzinfo=dt.tzinfo, fold=dt.fold)
+     return dt
+ 
+ 
+ def remaining(
+-        start: datetime, ends_in: timedelta, now: datetime | None = None,
++        start: datetime, ends_in: timedelta | ffwd, now: datetime | None = None,
+         relative: bool = False) -> timedelta:
+     """Calculate the real remaining time for a start date and a timedelta.
+ 
+@@ -224,7 +225,7 @@ def remaining(
+ 
+     Arguments:
+         start (~datetime.datetime): Starting date.
+-        ends_in (~datetime.timedelta): The end delta.
++        ends_in (~datetime.timedelta, ~celery.utils.time.ffwd): The end delta.
+         relative (bool): If enabled the end time will be calculated
+             using :func:`delta_resolution` (i.e., rounded to the
+             resolution of `ends_in`).
+@@ -235,7 +236,10 @@ def remaining(
+         ~datetime.timedelta: Remaining time.
+     """
+     now = now or datetime.now(datetime_timezone.utc)
+-    end_date = start + ends_in
++    if isinstance(ends_in, timedelta):
++        end_date = add_seconds_to_datetime(start, ends_in.total_seconds())
++    else:
++        end_date = start + ends_in
+     if relative:
+         end_date = delta_resolution(end_date, ends_in).replace(microsecond=0)
+ 
+@@ -333,6 +337,14 @@ def is_naive(dt: datetime) -> bool:
+     return dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None
+ 
+ 
++def add_seconds_to_datetime(dt: datetime, seconds: float) -> datetime:
++    """Add elapsed seconds, preserving naive datetime behavior."""
++    delta = timedelta(seconds=seconds)
++    if is_naive(dt):
++        return dt + delta
++    return (dt.astimezone(datetime_timezone.utc) + delta).astimezone(dt.tzinfo)
++
++
+ def _can_detect_ambiguous(tz: tzinfo) -> bool:
+     """Helper function to determine if a timezone can detect ambiguous times using dateutil."""
+ 
+diff --git a/docs/userguide/calling.rst b/docs/userguide/calling.rst
+index 5d236b5c512..03f6e702ed3 100644
+--- a/docs/userguide/calling.rst
++++ b/docs/userguide/calling.rst
+@@ -267,6 +267,13 @@ a shortcut to set ETA by seconds into the future.
+     >>> result.get()    # this takes at least 3 seconds to return
+     4
+ 
++.. note::
++
++    ``countdown`` and numeric ``expires`` values use elapsed seconds across
++    daylight saving time (DST) changes. A value of ``86400`` means 24 hours.
++    When the clock changes by one hour, an interval starting at noon ends
++    at 13:00 the next day across spring-forward, or 11:00 across fall-back.
++
+ The task is guaranteed to be executed at some time *after* the
+ specified date and time, but not necessarily at that exact time.
+ Possible reasons for broken deadlines may include many items waiting
+diff --git a/docs/userguide/periodic-tasks.rst b/docs/userguide/periodic-tasks.rst
+index 9d7f45dd836..2a943b12c44 100644
+--- a/docs/userguide/periodic-tasks.rst
++++ b/docs/userguide/periodic-tasks.rst
+@@ -159,7 +159,17 @@ be sent in 30 second intervals (the first task will be sent 30 seconds
+ after `celery beat` starts, and then every 30 seconds
+ after the last run).
+ 
+-A Crontab like schedule also exists, see the section on `Crontab schedules`_.
++.. note::
++
++    With the default ``relative=False``, numeric and
++    :class:`~datetime.timedelta` schedules use elapsed time across daylight
++    saving time (DST) changes. For example, ``timedelta(days=1)`` is a
++    24-hour interval. When the clock changes by one hour, a task last run
++    at noon becomes due at 13:00 the next day across spring-forward, or
++    11:00 across fall-back.
++
++    To run a task at the same local time every day, use :ref:`beat-crontab`.
++    For example, ``crontab(hour=12, minute=0)`` schedules a task at noon.
+ 
+ Like with :command:`cron`, the tasks may overlap if the first task doesn't complete
+ before the next. If that's a concern you should use a locking
+diff --git a/t/unit/app/test_amqp.py b/t/unit/app/test_amqp.py
+index ee0799d9c08..13789efcd53 100644
+--- a/t/unit/app/test_amqp.py
++++ b/t/unit/app/test_amqp.py
+@@ -347,6 +347,76 @@ def test_accepts_eta_string(self):
+         message = self.app.amqp.as_task_v1(uuid(), 'foo', eta=eta)
+         assert message.body['eta'] == eta
+ 
++    def test_countdown_across_spring_forward(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 3, 8, 1, 30, tzinfo=self.app.timezone)
++        assert now.isoformat() == '2026-03-08T01:30:00-05:00'
++
++        message = self.app.amqp.as_task_v1(uuid(), 'foo', now=now, countdown=90 * 60)
++
++        # DST changes the UTC offset from -05:00 to -04:00.
++        assert message.body['eta'] == '2026-03-08T04:00:00-04:00'
++        eta = datetime.fromisoformat(message.body['eta'])
++        assert eta.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=90)
++
++    def test_expires_across_spring_forward(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 3, 8, 1, 30, tzinfo=self.app.timezone)
++        assert now.isoformat() == '2026-03-08T01:30:00-05:00'
++
++        message = self.app.amqp.as_task_v1(uuid(), 'foo', now=now, expires=90 * 60)
++
++        # DST changes the UTC offset from -05:00 to -04:00.
++        assert message.body['expires'] == '2026-03-08T04:00:00-04:00'
++        expires = datetime.fromisoformat(message.body['expires'])
++        assert expires.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=90)
++
++    def test_countdown_across_fall_back(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 11, 1, 1, 30, tzinfo=self.app.timezone, fold=0)
++        assert now.isoformat() == '2026-11-01T01:30:00-04:00'
++
++        message = self.app.amqp.as_task_v1(uuid(), 'foo', now=now, countdown=90 * 60)
++
++        # DST changes the UTC offset from -04:00 to -05:00.
++        assert message.body['eta'] == '2026-11-01T02:00:00-05:00'
++        eta = datetime.fromisoformat(message.body['eta'])
++        assert eta.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=90)
++
++    def test_expires_across_fall_back(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 11, 1, 1, 30, tzinfo=self.app.timezone, fold=0)
++        assert now.isoformat() == '2026-11-01T01:30:00-04:00'
++
++        message = self.app.amqp.as_task_v1(uuid(), 'foo', now=now, expires=90 * 60)
++
++        # DST changes the UTC offset from -04:00 to -05:00.
++        assert message.body['expires'] == '2026-11-01T02:00:00-05:00'
++        expires = datetime.fromisoformat(message.body['expires'])
++        assert expires.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=90)
++
++    def test_countdown_from_second_occurrence_of_repeated_hour(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 11, 1, 1, 30, tzinfo=self.app.timezone, fold=1)
++        assert now.isoformat() == '2026-11-01T01:30:00-05:00'
++
++        message = self.app.amqp.as_task_v1(uuid(), 'foo', now=now, countdown=15 * 60)
++
++        assert message.body['eta'] == '2026-11-01T01:45:00-05:00'
++        eta = datetime.fromisoformat(message.body['eta'])
++        assert eta.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=15)
++
++    def test_expires_from_second_occurrence_of_repeated_hour(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 11, 1, 1, 30, tzinfo=self.app.timezone, fold=1)
++        assert now.isoformat() == '2026-11-01T01:30:00-05:00'
++
++        message = self.app.amqp.as_task_v1(uuid(), 'foo', now=now, expires=15 * 60)
++
++        assert message.body['expires'] == '2026-11-01T01:45:00-05:00'
++        expires = datetime.fromisoformat(message.body['expires'])
++        assert expires.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=15)
++
+ 
+ class test_AMQP_Base:
+     def setup_method(self):
+@@ -792,3 +862,73 @@ def t(i):
+         assert embed['callbacks'] == [utf8dict(t.s(1)), utf8dict(t.s(2))]
+         assert embed['errbacks'] == [utf8dict(t.s(3)), utf8dict(t.s(4))]
+         assert embed['chord'] == utf8dict(t.s(5))
++
++    def test_countdown_across_spring_forward(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 3, 8, 1, 30, tzinfo=self.app.timezone)
++        assert now.isoformat() == '2026-03-08T01:30:00-05:00'
++
++        message = self.app.amqp.as_task_v2(uuid(), 'foo', now=now, countdown=90 * 60)
++
++        # DST changes the UTC offset from -05:00 to -04:00.
++        assert message.headers['eta'] == '2026-03-08T04:00:00-04:00'
++        eta = datetime.fromisoformat(message.headers['eta'])
++        assert eta.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=90)
++
++    def test_expires_across_spring_forward(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 3, 8, 1, 30, tzinfo=self.app.timezone)
++        assert now.isoformat() == '2026-03-08T01:30:00-05:00'
++
++        message = self.app.amqp.as_task_v2(uuid(), 'foo', now=now, expires=90 * 60)
++
++        # DST changes the UTC offset from -05:00 to -04:00.
++        assert message.headers['expires'] == '2026-03-08T04:00:00-04:00'
++        expires = datetime.fromisoformat(message.headers['expires'])
++        assert expires.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=90)
++
++    def test_countdown_across_fall_back(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 11, 1, 1, 30, tzinfo=self.app.timezone, fold=0)
++        assert now.isoformat() == '2026-11-01T01:30:00-04:00'
++
++        message = self.app.amqp.as_task_v2(uuid(), 'foo', now=now, countdown=90 * 60)
++
++        # DST changes the UTC offset from -04:00 to -05:00.
++        assert message.headers['eta'] == '2026-11-01T02:00:00-05:00'
++        eta = datetime.fromisoformat(message.headers['eta'])
++        assert eta.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=90)
++
++    def test_expires_across_fall_back(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 11, 1, 1, 30, tzinfo=self.app.timezone, fold=0)
++        assert now.isoformat() == '2026-11-01T01:30:00-04:00'
++
++        message = self.app.amqp.as_task_v2(uuid(), 'foo', now=now, expires=90 * 60)
++
++        # DST changes the UTC offset from -04:00 to -05:00.
++        assert message.headers['expires'] == '2026-11-01T02:00:00-05:00'
++        expires = datetime.fromisoformat(message.headers['expires'])
++        assert expires.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=90)
++
++    def test_countdown_from_second_occurrence_of_repeated_hour(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 11, 1, 1, 30, tzinfo=self.app.timezone, fold=1)
++        assert now.isoformat() == '2026-11-01T01:30:00-05:00'
++
++        message = self.app.amqp.as_task_v2(uuid(), 'foo', now=now, countdown=15 * 60)
++
++        assert message.headers['eta'] == '2026-11-01T01:45:00-05:00'
++        eta = datetime.fromisoformat(message.headers['eta'])
++        assert eta.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=15)
++
++    def test_expires_from_second_occurrence_of_repeated_hour(self):
++        self.app.conf.timezone = 'America/New_York'
++        now = datetime(2026, 11, 1, 1, 30, tzinfo=self.app.timezone, fold=1)
++        assert now.isoformat() == '2026-11-01T01:30:00-05:00'
++
++        message = self.app.amqp.as_task_v2(uuid(), 'foo', now=now, expires=15 * 60)
++
++        assert message.headers['expires'] == '2026-11-01T01:45:00-05:00'
++        expires = datetime.fromisoformat(message.headers['expires'])
++        assert expires.astimezone(timezone.utc) - now.astimezone(timezone.utc) == timedelta(minutes=15)
+diff --git a/t/unit/app/test_schedules.py b/t/unit/app/test_schedules.py
+index 04d178001ba..dae466be2e6 100644
+--- a/t/unit/app/test_schedules.py
++++ b/t/unit/app/test_schedules.py
+@@ -124,6 +124,134 @@ def test_pickle(self):
+         s2 = fun(*args)
+         assert s1 == s2
+ 
++    def test_is_due_across_spring_forward(self):
++        # The task runs every 10 seconds. Now is exactly 10 elapsed seconds after
++        # the last run, so the task should be due now.
++        self.app.conf.timezone = 'Europe/Paris'
++        # The last run is 5 seconds before the clock jumps forward.
++        last_run_at = datetime(2020, 3, 29, 1, 59, 55, tzinfo=self.app.timezone)
++        now = datetime(2020, 3, 29, 3, 0, 5, tzinfo=self.app.timezone)
++        assert last_run_at.isoformat() == '2020-03-29T01:59:55+01:00'
++
++        # DST changes the UTC offset from +01:00 to +02:00.
++        assert now.isoformat() == '2020-03-29T03:00:05+02:00'
++        assert now.astimezone(timezone.utc) - last_run_at.astimezone(timezone.utc) == timedelta(seconds=10)
++
++        s = schedule(10, nowfun=lambda: now, app=self.app)
++        assert s.is_due(last_run_at) == (True, 10)
++
++    def test_is_due_across_spring_forward_relative(self):
++        # The task runs every hour with relative=True. Adding one elapsed hour gives
++        # 03:59:55+02:00, then rounding gives 03:00+02:00, which is exactly now.
++        self.app.conf.timezone = 'Europe/Paris'
++        # The last run is 5 seconds before the clock jumps forward.
++        last_run_at = datetime(2020, 3, 29, 1, 59, 55, tzinfo=self.app.timezone)
++        now = datetime(2020, 3, 29, 3, 0, tzinfo=self.app.timezone)
++        assert last_run_at.isoformat() == '2020-03-29T01:59:55+01:00'
++
++        # DST changes the UTC offset from +01:00 to +02:00.
++        assert now.isoformat() == '2020-03-29T03:00:00+02:00'
++        assert now.astimezone(timezone.utc) - last_run_at.astimezone(timezone.utc) == timedelta(seconds=5)
++
++        s = schedule(timedelta(hours=1), relative=True, nowfun=lambda: now, app=self.app)
++        assert s.is_due(last_run_at) == (True, 3600)
++
++    def test_is_not_due_before_spring_forward(self):
++        # The task runs every 10 seconds. Now is only 3 elapsed seconds after
++        # the last run, so the task should not be due yet, with 7 seconds remaining.
++        self.app.conf.timezone = 'Europe/Paris'
++        # The last run is 5 seconds before the clock jumps forward.
++        last_run_at = datetime(2020, 3, 29, 1, 59, 55, tzinfo=self.app.timezone)
++        now = datetime(2020, 3, 29, 1, 59, 58, tzinfo=self.app.timezone)
++        assert last_run_at.isoformat() == '2020-03-29T01:59:55+01:00'
++
++        # Both times are before the clock jumps from 02:00 to 03:00.
++        assert now.isoformat() == '2020-03-29T01:59:58+01:00'
++        assert now.astimezone(timezone.utc) - last_run_at.astimezone(timezone.utc) == timedelta(seconds=3)
++
++        s = schedule(10, nowfun=lambda: now, app=self.app)
++        assert s.is_due(last_run_at) == (False, 7)
++
++    def test_is_not_due_before_spring_forward_relative(self):
++        # The task runs every hour with relative=True. Adding one elapsed hour gives
++        # 03:59:55+02:00, then rounding gives 03:00+02:00, only 2 seconds after now.
++        self.app.conf.timezone = 'Europe/Paris'
++        # The last run is 5 seconds before the clock jumps forward.
++        last_run_at = datetime(2020, 3, 29, 1, 59, 55, tzinfo=self.app.timezone)
++        now = datetime(2020, 3, 29, 1, 59, 58, tzinfo=self.app.timezone)
++        assert last_run_at.isoformat() == '2020-03-29T01:59:55+01:00'
++
++        # Both times are before the clock jumps from 02:00 to 03:00.
++        assert now.isoformat() == '2020-03-29T01:59:58+01:00'
++        assert now.astimezone(timezone.utc) - last_run_at.astimezone(timezone.utc) == timedelta(seconds=3)
++
++        s = schedule(timedelta(hours=1), relative=True, nowfun=lambda: now, app=self.app)
++        assert s.is_due(last_run_at) == (False, 2)
++
++    def test_is_due_across_fall_back(self):
++        # The task runs every 10 seconds. Now is exactly 10 elapsed seconds after
++        # the last run, so the task should be due now.
++        self.app.conf.timezone = 'Europe/Paris'
++        # The last run is 5 seconds before the clock goes back.
++        last_run_at = datetime(2020, 10, 25, 2, 59, 55, tzinfo=self.app.timezone, fold=0)
++        now = datetime(2020, 10, 25, 2, 0, 5, tzinfo=self.app.timezone, fold=1)
++        assert last_run_at.isoformat() == '2020-10-25T02:59:55+02:00'
++
++        # DST changes the UTC offset from +02:00 to +01:00.
++        assert now.isoformat() == '2020-10-25T02:00:05+01:00'
++        assert now.astimezone(timezone.utc) - last_run_at.astimezone(timezone.utc) == timedelta(seconds=10)
++
++        s = schedule(10, nowfun=lambda: now, app=self.app)
++        assert s.is_due(last_run_at) == (True, 10)
++
++    def test_is_due_across_fall_back_relative(self):
++        # The task runs every hour with relative=True. Adding one elapsed hour gives
++        # 02:59:55+01:00 (fold=1), then rounding gives 02:00+01:00, which is exactly now.
++        self.app.conf.timezone = 'Europe/Paris'
++        # The last run is 5 seconds before the clock goes back.
++        last_run_at = datetime(2020, 10, 25, 2, 59, 55, tzinfo=self.app.timezone, fold=0)
++        now = datetime(2020, 10, 25, 2, 0, tzinfo=self.app.timezone, fold=1)
++        assert last_run_at.isoformat() == '2020-10-25T02:59:55+02:00'
++
++        # DST changes the UTC offset from +02:00 to +01:00.
++        assert now.isoformat() == '2020-10-25T02:00:00+01:00'
++        assert now.astimezone(timezone.utc) - last_run_at.astimezone(timezone.utc) == timedelta(seconds=5)
++
++        s = schedule(timedelta(hours=1), relative=True, nowfun=lambda: now, app=self.app)
++        assert s.is_due(last_run_at) == (True, 3600)
++
++    def test_is_not_due_before_fall_back(self):
++        # The task runs every 10 seconds. Now is only 3 elapsed seconds after
++        # the last run, so the task should not be due yet, with 7 seconds remaining.
++        self.app.conf.timezone = 'Europe/Paris'
++        # The last run is 5 seconds before the clock goes back.
++        last_run_at = datetime(2020, 10, 25, 2, 59, 55, tzinfo=self.app.timezone, fold=0)
++        now = datetime(2020, 10, 25, 2, 59, 58, tzinfo=self.app.timezone, fold=0)
++        assert last_run_at.isoformat() == '2020-10-25T02:59:55+02:00'
++
++        # Both times are in the first occurrence, before the clock goes back.
++        assert now.isoformat() == '2020-10-25T02:59:58+02:00'
++        assert now.astimezone(timezone.utc) - last_run_at.astimezone(timezone.utc) == timedelta(seconds=3)
++
++        s = schedule(10, nowfun=lambda: now, app=self.app)
++        assert s.is_due(last_run_at) == (False, 7)
++
++    def test_is_not_due_before_fall_back_relative(self):
++        # The task runs every hour with relative=True. Adding one elapsed hour gives
++        # 02:59:55+01:00 (fold=1), then rounding gives 02:00+01:00, 2 seconds after now.
++        self.app.conf.timezone = 'Europe/Paris'
++        # The last run is 5 seconds before the clock goes back.
++        last_run_at = datetime(2020, 10, 25, 2, 59, 55, tzinfo=self.app.timezone, fold=0)
++        now = datetime(2020, 10, 25, 2, 59, 58, tzinfo=self.app.timezone, fold=0)
++        assert last_run_at.isoformat() == '2020-10-25T02:59:55+02:00'
++
++        # Both times are in the first occurrence, before the clock goes back.
++        assert now.isoformat() == '2020-10-25T02:59:58+02:00'
++        assert now.astimezone(timezone.utc) - last_run_at.astimezone(timezone.utc) == timedelta(seconds=3)
++
++        s = schedule(timedelta(hours=1), relative=True, nowfun=lambda: now, app=self.app)
++        assert s.is_due(last_run_at) == (False, 2)
++
+ 
+ # Module-level helper used as crontab(nowfun=...) in pickling tests.
+ # Defined at top level so it is picklable/serializable.
+diff --git a/t/unit/utils/test_time.py b/t/unit/utils/test_time.py
+index ba47f9074e5..f83e5b2c745 100644
+--- a/t/unit/utils/test_time.py
++++ b/t/unit/utils/test_time.py
+@@ -5,6 +5,7 @@
+ from unittest.mock import Mock, patch
+ 
+ import pytest
++from dateutil import tz as dateutil_tz
+ 
+ if sys.version_info >= (3, 9):
+     from zoneinfo import ZoneInfo
+@@ -12,7 +13,7 @@
+     from backports.zoneinfo import ZoneInfo
+ 
+ from celery.utils.iso8601 import parse_iso8601
+-from celery.utils.time import (LocalTimezone, _is_imaginary, delta_resolution, ffwd,
++from celery.utils.time import (LocalTimezone, _is_imaginary, add_seconds_to_datetime, delta_resolution, ffwd,
+                                get_exponential_backoff_interval, humanize_seconds, localize, make_aware,
+                                maybe_iso8601, maybe_make_aware, maybe_timedelta, rate, remaining, timezone,
+                                utcoffset)
+@@ -230,6 +231,19 @@ def test_remaining():
+     assert next_run_edt == next_actual_time
+ 
+ 
++def test_remaining_across_fall_back():
++    paris_tz = ZoneInfo('Europe/Paris')
++    start = datetime(2020, 10, 25, 2, 59, 55, tzinfo=paris_tz, fold=0)
++    now = datetime(2020, 10, 25, 2, 0, 5, tzinfo=paris_tz, fold=1)
++    assert start.isoformat() == '2020-10-25T02:59:55+02:00'
++
++    # DST changes the UTC offset from +02:00 to +01:00.
++    assert now.isoformat() == '2020-10-25T02:00:05+01:00'
++    assert now.astimezone(_timezone.utc) - start.astimezone(_timezone.utc) == timedelta(seconds=10)
++
++    assert remaining(start, timedelta(seconds=10), now) == timedelta(0)
++
++
+ class test_timezone:
+ 
+     def test_get_timezone_with_zoneinfo(self):
+@@ -468,3 +482,83 @@ def test_valid_random_range(self, rr):
+         get_exponential_backoff_interval(
+             factor=40, retries=10, maximum=maximum, full_jitter=True)
+         rr.assert_called_once_with(maximum + 1)
++
++
++class test_add_seconds_to_datetime:
++
++    def test_across_spring_forward(self):
++        now = datetime(2026, 3, 8, 1, 30, tzinfo=ZoneInfo('America/New_York'))
++        assert now.isoformat() == '2026-03-08T01:30:00-05:00'
++
++        result = add_seconds_to_datetime(now, 90 * 60)
++
++        # DST changes the UTC offset from -05:00 to -04:00.
++        assert result.isoformat() == '2026-03-08T04:00:00-04:00'
++        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
++
++    def test_naive_datetime(self):
++        now = datetime(2026, 3, 8, 1, 30)
++
++        result = add_seconds_to_datetime(now, 90 * 60)
++
++        assert result == datetime(2026, 3, 8, 3, 0)
++
++    def test_across_fall_back(self):
++        now = datetime(2026, 11, 1, 1, 30, tzinfo=ZoneInfo('America/New_York'), fold=0)
++        assert now.isoformat() == '2026-11-01T01:30:00-04:00'
++
++        result = add_seconds_to_datetime(now, 90 * 60)
++
++        # DST changes the UTC offset from -04:00 to -05:00.
++        assert result.isoformat() == '2026-11-01T02:00:00-05:00'
++        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
++
++    def test_second_occurrence_of_repeated_hour(self):
++        now = datetime(2026, 11, 1, 1, 30, tzinfo=ZoneInfo('America/New_York'), fold=1)
++        assert now.isoformat() == '2026-11-01T01:30:00-05:00'
++
++        result = add_seconds_to_datetime(now, 15 * 60)
++
++        assert result.isoformat() == '2026-11-01T01:45:00-05:00'
++        assert result.fold == 1
++        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=15)
++
++    def test_local_timezone(self):
++        local_timezone = LocalTimezone()
++        now = datetime(2026, 6, 15, 1, 30, tzinfo=local_timezone)
++
++        result = add_seconds_to_datetime(now, 90 * 60)
++
++        # Adding 90 minutes must keep the correct local offset and elapsed duration.
++        assert result.utcoffset() == local_timezone.utcoffset(result)
++        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
++
++    def test_dateutil_timezone_across_spring_forward(self):
++        now = datetime(2026, 3, 8, 1, 30, tzinfo=dateutil_tz.gettz('America/New_York'))
++        assert now.isoformat() == '2026-03-08T01:30:00-05:00'
++
++        result = add_seconds_to_datetime(now, 90 * 60)
++
++        # DST skips an hour, so 90 elapsed minutes from 01:30 end at 04:00.
++        assert result.isoformat() == '2026-03-08T04:00:00-04:00'
++        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
++
++    def test_fixed_offset_timezone(self):
++        now = datetime(2026, 3, 8, 1, 30, tzinfo=_timezone(timedelta(hours=-5)))
++        assert now.isoformat() == '2026-03-08T01:30:00-05:00'
++
++        result = add_seconds_to_datetime(now, 90 * 60)
++
++        # A fixed UTC-05:00 offset stays the same even on a DST transition date.
++        assert result.isoformat() == '2026-03-08T03:00:00-05:00'
++        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)
++
++    def test_utc_timezone(self):
++        now = datetime(2026, 3, 8, 6, 30, tzinfo=_timezone.utc)
++        assert now.isoformat() == '2026-03-08T06:30:00+00:00'
++
++        result = add_seconds_to_datetime(now, 90 * 60)
++
++        # UTC input stays in UTC after adding 90 minutes.
++        assert result.isoformat() == '2026-03-08T08:00:00+00:00'
++        assert result.astimezone(_timezone.utc) - now.astimezone(_timezone.utc) == timedelta(minutes=90)

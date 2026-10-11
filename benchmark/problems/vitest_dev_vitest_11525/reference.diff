@@ -1,0 +1,2042 @@
+diff --git a/docs/config/maxworkers.md b/docs/config/maxworkers.md
+index acdc4e67bf1b..dda66c932e4d 100644
+--- a/docs/config/maxworkers.md
++++ b/docs/config/maxworkers.md
+@@ -58,3 +58,9 @@ vitest --maxWorkers=50%
+ :::
+ 
+ Vitest uses [`os.availableParallelism`](https://nodejs.org/api/os.html#osavailableparallelism) to know the maximum amount of parallelism available.
++
++## Browser Mode
++
++In [Browser Mode](/guide/browser/), every browser instance (a [project](/guide/projects) with `browser.enabled`, or an entry in [`browser.instances`](/config/browser/instances)) is a worker, so at most `maxWorkers` instances run at the same time. When another instance needs a slot, an idle headless instance is closed and opens again on its next run. An instance that is not headless stays open for the whole session, so its window is not closed between runs. The same number is the budget of pages shared by the open instances: a single instance runs up to `maxWorkers` test files in parallel in its own pages, and several instances split the budget between them, with at least one page each.
++
++An instance runs a single test file at a time when the browser is not headless, or when the provider does not support parallelism.
+diff --git a/packages/browser-playwright/src/playwright.ts b/packages/browser-playwright/src/playwright.ts
+index b945a5da2b50..5251b6c020e3 100644
+--- a/packages/browser-playwright/src/playwright.ts
++++ b/packages/browser-playwright/src/playwright.ts
+@@ -24,6 +24,7 @@ import type {
+   BrowserCommand,
+   BrowserModuleMocker,
+   BrowserProvider,
++  BrowserProviderCloseOptions,
+   BrowserProviderOption,
+   CDPSession,
+   TestProject,
+@@ -102,6 +103,7 @@ export function playwright(
+ }
+ 
+ interface WarmBrowser {
++  config: LaunchContext['config']
+   promise: Promise<Browser>
+   launchOptionsJson: string
+   pending: Set<WarmBrowser>
+@@ -140,15 +142,7 @@ function prewarmBrowser(project: LaunchContext, options: PlaywrightProviderOptio
+   if (warmBrowsers.has(project.config)) {
+     return
+   }
+-  let pending = pendingWarmBrowsers.get(project.vitest)
+-  if (!pending) {
+-    const pendingBrowsers = new Set<WarmBrowser>()
+-    pending = pendingBrowsers
+-    pendingWarmBrowsers.set(project.vitest, pendingBrowsers)
+-    // Browsers whose projects never initialize a provider (they have no test
+-    // files to run) are cleaned up when Vitest closes.
+-    project.vitest.onClose(() => closeWarmBrowsers(pendingBrowsers))
+-  }
++  const pending = getPendingWarmBrowsers(project.vitest)
+   const launchOptions = resolveLaunchOptions(
+     project.config.browser,
+     project.vitest.config.inspector,
+@@ -156,7 +150,8 @@ function prewarmBrowser(project: LaunchContext, options: PlaywrightProviderOptio
+     browserName,
+   )
+   const entry: WarmBrowser = {
+-    launchOptionsJson: JSON.stringify(launchOptions),
++    config: project.config,
++    launchOptionsJson: getWarmBrowserKey(browserName, launchOptions),
+     pending,
+     promise: (async () => {
+       debug?.('[%s] prewarming the browser', browserName)
+@@ -176,6 +171,41 @@ function prewarmBrowser(project: LaunchContext, options: PlaywrightProviderOptio
+   warmBrowsers.set(project.config, entry)
+ }
+ 
++function getWarmBrowserKey(browserName: string, launchOptions: LaunchOptions): string {
++  return JSON.stringify([browserName, launchOptions])
++}
++
++function getPendingWarmBrowsers(vitest: LaunchContext['vitest']): Set<WarmBrowser> {
++  let pending = pendingWarmBrowsers.get(vitest)
++  if (!pending) {
++    const pendingBrowsers = new Set<WarmBrowser>()
++    pending = pendingBrowsers
++    pendingWarmBrowsers.set(vitest, pendingBrowsers)
++    // Browsers whose projects never initialize a provider (they have no test
++    // files to run) are cleaned up when Vitest closes.
++    vitest.onClose(() => closeWarmBrowsers(pendingBrowsers))
++  }
++  return pending
++}
++
++// the pool closes an idle instance to start another project; the browser
++// process stays warm so the next project adopts it instead of launching one
++function keepWarmBrowser(
++  project: LaunchContext,
++  browser: Promise<Browser>,
++  launchOptionsJson: string,
++) {
++  const pending = getPendingWarmBrowsers(project.vitest)
++  const entry: WarmBrowser = {
++    config: project.config,
++    launchOptionsJson,
++    pending,
++    promise: browser,
++  }
++  pending.add(entry)
++  warmBrowsers.set(project.config, entry)
++}
++
+ function takeWarmBrowser(config: LaunchContext['config']): WarmBrowser | undefined {
+   const warm = warmBrowsers.get(config)
+   if (warm) {
+@@ -185,6 +215,26 @@ function takeWarmBrowser(config: LaunchContext['config']): WarmBrowser | undefin
+   return warm
+ }
+ 
++// fewer browsers are prewarmed than there are projects and the pool starts
++// projects in test order, so a browser prepared for another project is
++// adopted when it is the same browser launched with the same options
++function takeAnyWarmBrowser(
++  vitest: LaunchContext['vitest'],
++  launchOptionsJson: string,
++): WarmBrowser | undefined {
++  const pending = pendingWarmBrowsers.get(vitest)
++  if (!pending) {
++    return
++  }
++  for (const warm of pending) {
++    if (warm.launchOptionsJson === launchOptionsJson) {
++      pending.delete(warm)
++      warmBrowsers.delete(warm.config)
++      return warm
++    }
++  }
++}
++
+ async function closeWarmBrowsers(pending: Set<WarmBrowser>): Promise<void> {
+   const closing = Array.from(pending, (warm) =>
+     warm.promise.then((browser) => browser.close()).catch(() => {}),
+@@ -245,6 +295,8 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
+   public browserName: PlaywrightBrowser
+ 
+   private browserPromise: Promise<Browser> | null = null
++  // set for a locally launched browser, which can be kept warm for another project
++  private launchOptionsJson: string | null = null
+   private closing = false
+   private armedContexts = new WeakMap<BrowserContext, Promise<void>>()
+ 
+@@ -369,20 +421,26 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
+         )
+         this.browser = this.persistentContext.browser()!
+       } else {
+-        const warm = takeWarmBrowser(this.project.config)
+-        if (warm && warm.launchOptionsJson === JSON.stringify(launchOptions)) {
++        const launchOptionsJson = getWarmBrowserKey(this.browserName, launchOptions)
++        let warm = takeWarmBrowser(this.project.config)
++        if (warm && warm.launchOptionsJson !== launchOptionsJson) {
++          debug?.('[%s] discarding the prewarmed browser, launch options changed', this.browserName)
++          void warm.promise.then((browser) => browser.close()).catch(() => {})
++          warm = undefined
++        }
++        warm ??= takeAnyWarmBrowser(this.project.vitest, launchOptionsJson)
++        if (warm) {
+           const browser = await warm.promise.catch(() => null)
+           if (browser?.isConnected()) {
+             debug?.('[%s] adopting the prewarmed browser', this.browserName)
+             this.browser = browser
+             this.browserPromise = null
++            this.launchOptionsJson = launchOptionsJson
+             return this.browser
+           }
+-        } else if (warm) {
+-          debug?.('[%s] discarding the prewarmed browser, launch options changed', this.browserName)
+-          void warm.promise.then((browser) => browser.close()).catch(() => {})
+         }
+         this.browser = await playwright[this.browserName].launch(launchOptions)
++        this.launchOptionsJson = launchOptionsJson
+       }
+       this.browserPromise = null
+       return this.browser
+@@ -731,10 +789,6 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
+         String(disposable),
+       )
+       await disposable?.close()
+-      this.pages.clear()
+-      this.contexts.clear()
+-      this.browser = null
+-      this.browserPromise = null
+       throw new Error(`[vitest] The provider was closed.`)
+     }
+   }
+@@ -752,7 +806,7 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
+     } as any // overloaded CDPSession type is too tricky in monorepo
+   }
+ 
+-  async close(): Promise<void> {
++  async close(options?: BrowserProviderCloseOptions): Promise<void> {
+     process.off('SIGTERM', this.onSIGTERM)
+ 
+     debug?.('[%s] closing provider', this.browserName)
+@@ -768,6 +822,28 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
+     }
+     const browser = this.browser
+     this.browser = null
++    const closed = this.closeContexts()
++    if (options?.keepWarm && browser && this.launchOptionsJson && browser.isConnected()) {
++      // registered before the contexts are closed, so the project that takes
++      // over the pool slot finds the browser right away and waits for it
++      const kept = closed.then(
++        () => browser,
++        async (error) => {
++          await browser.close().catch(() => {})
++          throw error
++        },
++      )
++      keepWarmBrowser(this.project, kept, this.launchOptionsJson)
++      await kept
++      debug?.('[%s] provider is closed, the browser is kept warm', this.browserName)
++      return
++    }
++    await closed
++    await browser?.close()
++    debug?.('[%s] provider is closed', this.browserName)
++  }
++
++  private async closeContexts(): Promise<void> {
+     await Promise.all(Array.from(this.pages.values(), (p) => p.close()))
+     this.pages.clear()
+     if (this.persistentContext) {
+@@ -776,8 +852,6 @@ export class PlaywrightBrowserProvider implements BrowserProvider {
+       await Promise.all(Array.from(this.contexts.values(), (c) => c.close()))
+     }
+     this.contexts.clear()
+-    await browser?.close()
+-    debug?.('[%s] provider is closed', this.browserName)
+   }
+ }
+ 
+diff --git a/packages/browser/src/client/orchestrator.ts b/packages/browser/src/client/orchestrator.ts
+index 26ea4a27111d..e1215da7066b 100644
+--- a/packages/browser/src/client/orchestrator.ts
++++ b/packages/browser/src/client/orchestrator.ts
+@@ -18,6 +18,8 @@ import { getUiAPI } from './ui'
+ import { getBrowserState, getConfig } from './utils'
+ 
+ const ID_ALL = '__vitest_all__'
++// the next document gets this long to fire "load" before the unload counts as a broken iframe
++const IFRAME_UNLOAD_TIMEOUT = 5_000
+ 
+ export class IframeOrchestrator {
+   private cancelled = false
+@@ -243,17 +245,9 @@ export class IframeOrchestrator {
+       iframe.onload = () => {
+         const href = this.getIframeHref(iframe)
+         debug('iframe loaded with href', href)
++        this.iframeLoads.set(iframe, (this.iframeLoads.get(iframe) ?? 0) + 1)
+         if (href !== iframe.src) {
+-          reject(
+-            this.dispatchIframeError(
+-              new Error(
+-                `Cannot connect to the iframe. ` +
+-                  `Did you change the location or submitted a form? ` +
+-                  "If so, don't forget to call `event.preventDefault()` to avoid reloading the page.\n\n" +
+-                  `Received URL: ${href || 'unknown due to CORS'}\nExpected: ${iframe.src}`,
+-              ),
+-            ),
+-          )
++          reject(this.dispatchIframeError(this.createConnectError(iframe, href)))
+         } else if (this.iframes.has(iframeId)) {
+           const events = this.iframeEvents.get(iframe)
+           if (events?.size) {
+@@ -262,9 +256,11 @@ export class IframeOrchestrator {
+             )
+           } else {
+             this.warnReload(iframe, iframeId)
++            this.watchUnload(iframe, iframeId)
+           }
+         } else {
+           this.iframes.set(iframeId, iframe)
++          this.watchUnload(iframe, iframeId)
+           this.waitForReady(iframeId)
+             .then(() =>
+               this.sendEventToIframe({
+@@ -346,6 +342,39 @@ export class IframeOrchestrator {
+   }
+ 
+   private loggedIframe = new WeakSet<HTMLIFrameElement>()
++  private iframeLoads = new WeakMap<HTMLIFrameElement, number>()
++
++  private createConnectError(iframe: HTMLIFrameElement, href: string | undefined) {
++    return new Error(
++      `Cannot connect to the iframe. ` +
++        `Did you change the location or submitted a form? ` +
++        "If so, don't forget to call `event.preventDefault()` to avoid reloading the page.\n\n" +
++        `Received URL: ${href || 'unknown due to CORS'}\nExpected: ${iframe.src}`,
++    )
++  }
++
++  // Firefox and WebKit fire no "load" for a document that failed to load
++  // (an empty response, a refused connection), so the tester that navigated
++  // away during a test would keep the run waiting forever
++  private watchUnload(iframe: HTMLIFrameElement, iframeId: string) {
++    const loads = this.iframeLoads.get(iframe) ?? 0
++    iframe.contentWindow?.addEventListener(
++      'pagehide',
++      () => {
++        setTimeout(() => {
++          if (
++            this.iframes.get(iframeId) !== iframe ||
++            !this.iframeEvents.get(iframe)?.size ||
++            this.iframeLoads.get(iframe) !== loads
++          ) {
++            return
++          }
++          this.dispatchIframeError(this.createConnectError(iframe, this.getIframeHref(iframe)))
++        }, IFRAME_UNLOAD_TIMEOUT)
++      },
++      { once: true },
++    )
++  }
+ 
+   private createWarningMessage(iframeId: string, location: string) {
+     return (
+diff --git a/packages/browser/src/node/middlewares/testerMiddleware.ts b/packages/browser/src/node/middlewares/testerMiddleware.ts
+index 3d35a66f1ec3..8762ec68af7e 100644
+--- a/packages/browser/src/node/middlewares/testerMiddleware.ts
++++ b/packages/browser/src/node/middlewares/testerMiddleware.ts
+@@ -11,7 +11,7 @@ export function createTesterMiddleware(
+       return next()
+     }
+     const url = new URL(req.url, 'http://localhost')
+-    if (url.pathname !== browserServer.prefixTesterUrl || !url.searchParams.has('sessionId')) {
++    if (url.pathname !== browserServer.prefixTesterUrl) {
+       return next()
+     }
+ 
+diff --git a/packages/browser/src/node/project.ts b/packages/browser/src/node/project.ts
+index 2b71edadabcd..c41a2cec2eed 100644
+--- a/packages/browser/src/node/project.ts
++++ b/packages/browser/src/node/project.ts
+@@ -6,6 +6,7 @@ import type {
+   BrowserCommand,
+   BrowserCommandContext,
+   BrowserProvider,
++  BrowserProviderCloseOptions,
+   ProjectBrowser as IProjectBrowser,
+   ResolvedConfig,
+   TestProject,
+@@ -27,7 +28,7 @@ export class ProjectBrowser implements IProjectBrowser {
+   // transformIndexHtml plugin pipeline each time
+   public testerHtmlTransformed: Promise<string> | undefined
+ 
+-  public provider!: BrowserProvider
++  public provider: BrowserProvider | undefined
+   public vitest: Vitest
+   public vite: ViteDevServer
+   public config: ResolvedConfig
+@@ -80,7 +81,9 @@ export class ProjectBrowser implements IProjectBrowser {
+     if (name in this.parent.commands) {
+       return this.parent.commands[name](context, ...args)
+     }
+-    throw new Error(`Provider ${this.provider.name} does not support command "${name}".`)
++    throw new Error(
++      `Provider ${this.config.browser.provider?.name} does not support command "${name}".`,
++    )
+   }) as any
+ 
+   wrapSerializedConfig(): SerializedConfig {
+@@ -107,6 +110,16 @@ export class ProjectBrowser implements IProjectBrowser {
+     }
+   }
+ 
++  async closeBrowserProvider(options?: BrowserProviderCloseOptions): Promise<void> {
++    const provider = this.provider
++    if (!provider) {
++      return
++    }
++    // detach first so the next run can create a new provider while this one closes
++    this.provider = undefined
++    await provider.close(options)
++  }
++
+   public parseErrorStacktrace(e: TestError, options: StackTraceParserOptions = {}): ParsedStack[] {
+     return this.parent.parseErrorStacktrace(e, options)
+   }
+diff --git a/packages/browser/src/node/rpc.ts b/packages/browser/src/node/rpc.ts
+index 7139d0da84d4..547bbc62cc90 100644
+--- a/packages/browser/src/node/rpc.ts
++++ b/packages/browser/src/node/rpc.ts
+@@ -127,6 +127,11 @@ export function setupBrowserRpc(
+     }
+ 
+     wss.handleUpgrade(request, socket, head, (ws) => {
++      // the pool closed this instance, its pages can still reconnect while they close
++      if (!project.browser?.provider) {
++        ws.terminate()
++        return
++      }
+       wss.emit('connection', ws, request)
+ 
+       const { rpc, offCancel } = setupClient(project, rpcId, ws, { sessionId })
+@@ -235,7 +240,7 @@ export function setupBrowserRpc(
+     const mockResolver = new ServerMockResolver(globalServer.vite, {
+       moduleDirectories: project.config?.deps?.moduleDirectories,
+     })
+-    const mocker = project.browser?.provider.mocker
++    const mocker = project.browser?.provider?.mocker
+ 
+     const rpc = createBirpc<WebSocketBrowserEvents, WebSocketBrowserHandlers>(
+       {
+@@ -415,9 +420,9 @@ export function setupBrowserRpc(
+           return vitest.state.getCountOfFailedTests()
+         },
+         async wdioSwitchContext(direction) {
+-          const provider = project.browser!.provider
++          const provider = project.browser?.provider
+           if (!provider) {
+-            throw new Error('Commands are only available for browser tests.')
++            throw new Error(`The browser of the "${project.name}" project is closed.`)
+           }
+           if (provider.name !== 'webdriverio') {
+             throw new Error('Switch context is only available for WebDriverIO provider.')
+@@ -430,9 +435,11 @@ export function setupBrowserRpc(
+         },
+         async triggerCommand(sessionId, command, testPath, payload) {
+           debug?.('[%s] Triggering command "%s"', sessionId, command)
+-          const provider = project.browser!.provider
++          const provider = project.browser?.provider
+           if (!provider) {
+-            throw new Error('Commands are only available for browser tests.')
++            throw new Error(
++              `Cannot run the "${command}" command because the browser of the "${project.name}" project is closed.`,
++            )
+           }
+           const context = Object.assign(
+             {
+diff --git a/packages/browser/src/node/serverTester.ts b/packages/browser/src/node/serverTester.ts
+index 1adde689dcfd..25c88cd2687f 100644
+--- a/packages/browser/src/node/serverTester.ts
++++ b/packages/browser/src/node/serverTester.ts
+@@ -47,7 +47,7 @@ export async function resolveTester(
+       : await globalServer.injectorJs
+ 
+   const injector = replacer(injectorJs, {
+-    __VITEST_PROVIDER__: JSON.stringify(project.browser!.provider.name),
++    __VITEST_PROVIDER__: JSON.stringify(browserProject.config.browser.provider?.name || 'preview'),
+     __VITEST_CONFIG__: JSON.stringify(browserProject.wrapSerializedConfig()),
+     __VITEST_VITE_CONFIG__: JSON.stringify({
+       root: browserProject.vite.config.root,
+diff --git a/packages/vitest/src/node/config/pluginHarness.ts b/packages/vitest/src/node/config/pluginHarness.ts
+index da989bed6527..d4d016d30887 100644
+--- a/packages/vitest/src/node/config/pluginHarness.ts
++++ b/packages/vitest/src/node/config/pluginHarness.ts
+@@ -13,6 +13,10 @@ export class PluginHarness {
+    * @internal
+    */
+   public _browserLastPort = defaultBrowserPort
++  /**
++   * @internal
++   */
++  public _prewarmedBrowsers = 0
+ 
+   constructor(
+     public logger: Logger = new Logger(),
+diff --git a/packages/vitest/src/node/core.ts b/packages/vitest/src/node/core.ts
+index 294ae1513f36..a264c6b53b60 100644
+--- a/packages/vitest/src/node/core.ts
++++ b/packages/vitest/src/node/core.ts
+@@ -291,6 +291,7 @@ export class Vitest {
+     // reuse the same browser ports as the previous run instead of letting the
+     // reused harness keep incrementing them
+     this._harness._browserLastPort = defaultBrowserPort
++    this._harness._prewarmedBrowsers = 0
+     // harness mimics `vitest` access like in `node/create.ts`
+     this._harness.setVitest(undefined)
+     const config = await resolveConfig(
+diff --git a/packages/vitest/src/node/plugins/browserLoader.ts b/packages/vitest/src/node/plugins/browserLoader.ts
+index 533560af100b..89e42486f575 100644
+--- a/packages/vitest/src/node/plugins/browserLoader.ts
++++ b/packages/vitest/src/node/plugins/browserLoader.ts
+@@ -185,6 +185,7 @@ export async function createClusterServer(
+   // Start browser launches now so their latency overlaps Vite server creation.
+   // Entries that cannot run browser tests are skipped because they will never
+   // initialize a provider that could adopt and close the prepared browser.
++  const harness = vitest._harness
+   for (const child of children) {
+     if (
+       child.hidden ||
+@@ -196,7 +197,14 @@ export async function createClusterServer(
+     // The Vite server is shared, but each child carries its own resolved
+     // provider and browser options, so it must be prewarmed independently.
+     const projectConfig = child.projectConfig
+-    projectConfig.browser.provider?.prewarm?.({ config: projectConfig, vitest })
++    const prewarm = projectConfig.browser.provider?.prewarm
++    // the pool runs at most `maxWorkers` browser instances at a time,
++    // the rest would only sit idle until their project gets a turn
++    if (!prewarm || harness._prewarmedBrowsers >= projectConfig.maxWorkers) {
++      continue
++    }
++    harness._prewarmedBrowsers++
++    prewarm({ config: projectConfig, vitest })
+   }
+ 
+   const server = await createViteServer(viteConfig)
+diff --git a/packages/vitest/src/node/pool.ts b/packages/vitest/src/node/pool.ts
+index 01d6dc4aad45..b8607c699bab 100644
+--- a/packages/vitest/src/node/pool.ts
++++ b/packages/vitest/src/node/pool.ts
+@@ -1,6 +1,7 @@
+ import type { Awaitable } from '@vitest/utils'
+ import type { ContextTestEnvironment } from '../types/worker'
+ import type { Vitest } from './core'
++import type { BrowserPool } from './pools/browser'
+ import type { PoolTask } from './pools/types'
+ import type { TestProject } from './project'
+ import type { TestSpecification } from './test-specification'
+@@ -55,7 +56,7 @@ export function createPool(ctx: Vitest): ProcessPool {
+   const Sequencer = ctx.config.sequence.sequencer
+   const sequencer = new Sequencer(ctx)
+ 
+-  let browserPool: ProcessPool | undefined
++  let browserPool: BrowserPool | undefined
+ 
+   async function executeTests(
+     method: 'run' | 'collect',
+@@ -199,11 +200,7 @@ export function createPool(ctx: Vitest): ProcessPool {
+ 
+       if (browserSpecs.length) {
+         browserPool ??= createBrowserPool(ctx)
+-        if (method === 'collect') {
+-          promises.push(browserPool.collectTests(browserSpecs))
+-        } else {
+-          promises.push(browserPool.runTests(browserSpecs))
+-        }
++        promises.push(browserPool.runTests(method, browserSpecs, { maxWorkers }))
+       }
+ 
+       const groupResults = await Promise.allSettled(promises)
+@@ -230,7 +227,7 @@ export function createPool(ctx: Vitest): ProcessPool {
+     async close() {
+       await Promise.all([
+         pool.close(),
+-        browserPool?.close?.(),
++        browserPool?.close(),
+         ...ctx.projects.map((project) => project.typechecker?.stop()),
+       ])
+     },
+diff --git a/packages/vitest/src/node/pools/browser.ts b/packages/vitest/src/node/pools/browser.ts
+index 5fcdabddf420..524596bd165e 100644
+--- a/packages/vitest/src/node/pools/browser.ts
++++ b/packages/vitest/src/node/pools/browser.ts
+@@ -3,209 +3,371 @@ import type { DeferPromise } from '@vitest/utils/helpers'
+ import type { FileSpecification } from '../../runtime/runner/types'
+ import type { Traces } from '../../utils/traces'
+ import type { Vitest } from '../core'
+-import type { ProcessPool } from '../pool'
+ import type { TestProject } from '../project'
+ import type { TestSpecification } from '../test-specification'
+-import type { BrowserProvider, CDPSession } from '../types/browser'
++import type { BrowserProviderCloseOptions, CDPSession } from '../types/browser'
+ import crypto from 'node:crypto'
+ import { statfsSync } from 'node:fs'
+-import { readFile } from 'node:fs/promises'
+ import { createDefer } from '@vitest/utils/helpers'
+ import { stringify } from 'flatted'
+ import { createDebugger } from '../../utils/debugger'
+-import { detectCodeBlock } from '../../utils/test-helpers'
++import { getSpecificationDocblock } from '../../utils/test-helpers'
+ import { BrowserConnectionError } from '../errors'
+ 
+ const debug = createDebugger('vitest:browser:pool')
+ 
+ const PROVIDER_CLOSE_TIMEOUT = 10_000
+ 
+-export function createBrowserPool(vitest: Vitest): ProcessPool {
+-  const providers = new Set<BrowserProvider>()
++export interface BrowserPool {
++  runTests: (
++    method: 'run' | 'collect',
++    specs: TestSpecification[],
++    options: { maxWorkers: number },
++  ) => Promise<void>
++  close: () => Promise<void>
++}
++
++interface BrowserTask {
++  project: TestProject
++  files: FileSpecification[]
++  method: 'run' | 'collect'
++  // providers without a per-session mocker share a single mock registry
++  // and some of them cannot drive several pages, so the instance runs alone
++  exclusive: boolean
++  result: DeferPromise<void>
++}
+ 
+-  const projectPools = new WeakMap<TestProject, BrowserPool>()
++export function createBrowserPool(vitest: Vitest): BrowserPool {
++  // every browser instance is a worker; at most `maxWorkers` of them are open
++  const workers = new Map<TestProject, BrowserWorker>()
++  const activeWorkers = new Set<BrowserWorker>()
++  const queue: BrowserTask[] = []
++  const exitPromises = new Set<Promise<void>>()
++  let maxWorkers = 1
++  let exclusiveRunning = false
+ 
+-  const ensurePool = (project: TestProject) => {
+-    if (projectPools.has(project)) {
+-      return projectPools.get(project)!
++  function getThreadsCount(project: TestProject) {
++    const config = project.config.browser
++    if (!config.headless || !project.browser?.provider?.supportsParallelism) {
++      return 1
+     }
+ 
+-    debug?.('creating pool for project %s', project.name)
++    const { maxWorkers, providedOptions } = project.config
++    if (providedOptions.maxWorkers) {
++      return maxWorkers
++    }
+ 
+-    const pool: BrowserPool = new BrowserPool(project, {
+-      maxWorkers: getThreadsCount(project),
+-    })
+-    projectPools.set(project, pool)
+-    vitest.onCancel(() => {
+-      pool.cancel()
+-    })
++    // if there are more than ~12 threads (optimistically), the main thread chokes
++    // https://github.com/vitest-dev/vitest/issues/7871
++    return Math.min(12, maxWorkers)
++  }
+ 
+-    return pool
++  // `maxWorkers` is also the budget of pages shared by the active instances:
++  // every instance gets a fair share, and pages above the core count only
++  // add contention and memory
++  function getPageAllowance(worker: BrowserWorker): number {
++    let openPages = 0
++    for (const active of activeWorkers) {
++      openPages += active.pageCount
++    }
++    const share = Math.ceil(maxWorkers / Math.max(activeWorkers.size, 1))
++    const free = Math.max(0, maxWorkers - openPages)
++    return Math.max(1, Math.min(worker.maxPages, share, worker.pageCount + free))
+   }
+ 
+-  const runWorkspaceTests = async (method: 'run' | 'collect', specs: TestSpecification[]) => {
+-    const groupedFiles = new Map<TestProject, FileSpecification[]>()
+-    const testFilesCode = new Map<string, string>()
+-    const testFileTags = new WeakMap<TestSpecification, string[]>()
++  function stopWorker(worker: BrowserWorker) {
++    workers.delete(worker.project)
++    const exit = worker
++      .stop({ keepWarm: true })
++      .catch((error) => {
++        vitest.logger.error(
++          `Failed to close the browser for the "${worker.project.name}" project.`,
++          error,
++        )
++      })
++      .finally(() => {
++        exitPromises.delete(exit)
++      })
++    exitPromises.add(exit)
++  }
++
++  // the user watches the pages of a headed instance, so it stays open
++  function canEvict(project: TestProject): boolean {
++    return project.config.browser.headless
++  }
++
++  function countEvictableWorkers(): number {
++    let count = 0
++    for (const worker of workers.values()) {
++      if (canEvict(worker.project)) {
++        count++
++      }
++    }
++    return count
++  }
+ 
+-    await Promise.all(
+-      specs.map(async (spec) => {
+-        let code = testFilesCode.get(spec.moduleId)
+-        // TODO: this really should be done only once when collecting specifications
+-        if (code == null) {
+-          code = await readFile(spec.moduleId, 'utf-8').catch(() => '')
+-          testFilesCode.set(spec.moduleId, code)
++  function evictIdleWorker(except: BrowserWorker | undefined): boolean {
++    // the map keeps the least recently used worker first
++    for (const worker of workers.values()) {
++      if (worker !== except && !activeWorkers.has(worker) && canEvict(worker.project)) {
++        debug?.('closing the idle browser of %s to free a worker slot', worker.project.name)
++        stopWorker(worker)
++        return true
++      }
++    }
++    return false
++  }
++
++  // an instance that still has an idle browser runs first, so a slot
++  // is not freed by closing the browser of an instance that runs next
++  function nextTaskIndex(): number {
++    const head = queue[0]
++    const index = queue.findIndex((task) => {
++      const worker = workers.get(task.project)
++      return task.exclusive === head.exclusive && !!worker && !activeWorkers.has(worker)
++    })
++    return index === -1 ? 0 : index
++  }
++
++  function schedule(): void {
++    while (queue.length) {
++      if (exclusiveRunning || activeWorkers.size >= maxWorkers) {
++        return
++      }
++      const index = nextTaskIndex()
++      const task = queue[index]
++      if (task.exclusive && activeWorkers.size > 0) {
++        return
++      }
++
++      let worker = workers.get(task.project)
++      if (worker && activeWorkers.has(worker)) {
++        return
++      }
++
++      const required = worker || !canEvict(task.project) ? 0 : 1
++      while (countEvictableWorkers() + required > maxWorkers) {
++        if (!evictIdleWorker(worker)) {
++          break
+         }
+-        const { tags } = detectCodeBlock(code)
+-        testFileTags.set(spec, tags)
+-      }),
+-    )
++      }
+ 
+-    // to keep the sorting, we need to iterate over specs separately
+-    for (const spec of specs) {
+-      const { project, moduleId, testLines, testIds, testNamePattern, testTagsFilter } = spec
+-      const files = groupedFiles.get(project) || []
+-      files.push({
+-        filepath: moduleId,
+-        testLocations: testLines,
+-        testIds,
+-        testNamePattern,
+-        testTagsFilter,
+-        fileTags: testFileTags.get(spec),
+-      })
+-      groupedFiles.set(project, files)
++      if (!worker) {
++        debug?.('creating a worker for project %s', task.project.name)
++        worker = new BrowserWorker(task.project, {
++          getMaxPages: getThreadsCount,
++          getPageAllowance,
++        })
++        workers.set(task.project, worker)
++      }
++
++      queue.splice(index, 1)
++      activeWorkers.add(worker)
++      exclusiveRunning = task.exclusive
++
++      const current = worker
++      worker
++        .runTests(task.method, task.files)
++        .then(
++          () => task.result.resolve(),
++          (error) => task.result.reject(error),
++        )
++        .finally(() => {
++          activeWorkers.delete(current)
++          exclusiveRunning = false
++          workers.delete(current.project)
++          workers.set(current.project, current)
++          schedule()
++          // the finished instance released its share of the page budget
++          activeWorkers.forEach((active) => active.grow())
++        })
++    }
++  }
++
++  function cancel() {
++    for (const task of queue.splice(0)) {
++      task.result.resolve()
+     }
++    workers.forEach((worker) => worker.cancel())
++  }
++
++  async function runTests(
++    method: 'run' | 'collect',
++    specs: TestSpecification[],
++    options: { maxWorkers: number },
++  ): Promise<void> {
++    maxWorkers = options.maxWorkers
+ 
+     let isCancelled = false
+     vitest.onCancel(() => {
+       isCancelled = true
++      cancel()
+     })
+ 
+-    const initialisedPools = await Promise.all(
+-      Array.from(groupedFiles.entries(), async ([project, files]) => {
+-        await project._initBrowserProvider()
++    const groupedFiles = await groupSpecifications(specs)
+ 
+-        if (!project.browser) {
+-          throw new TypeError(
+-            `The browser server was not initialized${project.name ? ` for the "${project.name}" project` : ''}. This is a bug in Vitest. Please, open a new issue with reproduction.`,
+-          )
+-        }
++    const tasks = await Promise.all(
++      Array.from(
++        groupedFiles.entries(),
++        async ([project, files]): Promise<BrowserTask | undefined> => {
++          await project._initBrowserProvider()
+ 
+-        if (isCancelled) {
+-          return
+-        }
++          const provider = project.browser?.provider
++          if (!provider) {
++            throw new TypeError(
++              `The browser was not initialized${project.name ? ` for the "${project.name}" project` : ''}. This is a bug in Vitest. Please, open a new issue with reproduction.`,
++            )
++          }
+ 
+-        debug?.('provider is ready for %s project', project.name)
++          if (isCancelled) {
++            return
++          }
+ 
+-        const pool = ensurePool(project)
+-        vitest.state.clearFiles(
+-          project,
+-          files.map((f) => f.filepath),
+-        )
+-        providers.add(project.browser!.provider)
++          debug?.('provider is ready for %s project', project.name)
+ 
+-        return {
+-          pool,
+-          provider: project.browser!.provider,
+-          runTests: () => pool.runTests(method, files),
+-        }
+-      }),
++          vitest.state.clearFiles(
++            project,
++            files.map((f) => f.filepath),
++          )
++
++          return {
++            project,
++            files,
++            method,
++            exclusive: !provider.mocker || !provider.supportsParallelism,
++            result: createDefer<void>(),
++          }
++        },
++      ),
+     )
+ 
+     if (isCancelled) {
+       return
+     }
+ 
+-    const parallelPools: (() => Promise<void>)[] = []
+-    const nonParallelPools: (() => Promise<void>)[] = []
+-
+-    for (const pool of initialisedPools) {
+-      if (!pool) {
+-        // this means it was cancelled
++    const parallelTasks: BrowserTask[] = []
++    const exclusiveTasks: BrowserTask[] = []
++    for (const task of tasks) {
++      if (!task) {
+         return
+       }
+-
+-      if (pool.provider.mocker && pool.provider.supportsParallelism) {
+-        parallelPools.push(pool.runTests)
++      if (task.exclusive) {
++        exclusiveTasks.push(task)
+       } else {
+-        nonParallelPools.push(pool.runTests)
++        parallelTasks.push(task)
+       }
+     }
+ 
+-    await Promise.all(parallelPools.map((runTests) => runTests()))
+-
+-    for (const runTests of nonParallelPools) {
+-      if (isCancelled) {
+-        return
+-      }
+-
+-      await runTests()
++    // exclusive instances go last so they don't stall the parallel ones
++    const ordered = [...parallelTasks, ...exclusiveTasks]
++    queue.push(...ordered)
++    schedule()
++
++    const results = await Promise.allSettled(ordered.map((task) => task.result))
++    const errors = results
++      .filter((result) => result.status === 'rejected')
++      .map((result) => result.reason)
++    if (errors.length === 1) {
++      throw errors[0]
++    }
++    if (errors.length > 1) {
++      throw new AggregateError(errors, 'Errors occurred while running browser tests.')
+     }
+   }
+ 
+-  function getThreadsCount(project: TestProject) {
+-    const config = project.config.browser
+-    if (!config.headless || !project.browser!.provider.supportsParallelism) {
+-      return 1
++  async function close() {
++    for (const task of queue.splice(0)) {
++      task.result.resolve()
+     }
++    const stopping = Array.from(workers.values(), (worker) => worker.stop())
++    workers.clear()
++    activeWorkers.clear()
++    await Promise.all([...stopping, ...exitPromises])
++    // pages can be opened outside of the pool (`vitest.standalone`)
++    await Promise.all(vitest.projects.map((project) => closeProvider(project)))
++    vitest._browserSessions.sessionIds.clear()
++    vitest.projects.forEach((project) => {
++      project.browser?.state.orchestrators.forEach((orchestrator) => {
++        orchestrator.$close()
++      })
++    })
++    debug?.('browser pool closed all providers')
++  }
+ 
+-    const { maxWorkers, providedOptions } = project.config
+-    if (providedOptions.maxWorkers) {
+-      return maxWorkers
+-    }
++  return { runTests, close }
++}
+ 
+-    // if there are more than ~12 threads (optimistically), the main thread chokes
+-    // https://github.com/vitest-dev/vitest/issues/7871
+-    return Math.min(12, maxWorkers)
+-  }
++async function groupSpecifications(
++  specs: TestSpecification[],
++): Promise<Map<TestProject, FileSpecification[]>> {
++  const groupedFiles = new Map<TestProject, FileSpecification[]>()
++  // browser instances of a project share the same test files
++  const code = new Map<string, Promise<string>>()
++  const docblocks = await Promise.all(specs.map((spec) => getSpecificationDocblock(spec, code)))
++
++  specs.forEach((spec, index) => {
++    const { project, moduleId, testLines, testIds, testNamePattern, testTagsFilter } = spec
++    const files = groupedFiles.get(project) || []
++    files.push({
++      filepath: moduleId,
++      testLocations: testLines,
++      testIds,
++      testNamePattern,
++      testTagsFilter,
++      fileTags: docblocks[index].tags,
++    })
++    groupedFiles.set(project, files)
++  })
+ 
+-  return {
+-    name: 'browser',
+-    async close() {
+-      // a frozen or crashed browser never answers the close message;
+-      // don't wait for it forever, the browser process is killed
+-      // when this process exits anyway
+-      await Promise.all(
+-        Array.from(providers, (provider) => {
+-          let timer: ReturnType<typeof setTimeout>
+-          return Promise.race([
+-            Promise.resolve(provider.close()).finally(() => clearTimeout(timer)),
+-            new Promise<void>((resolve) => {
+-              timer = setTimeout(() => {
+-                vitest.logger.warn(
+-                  `The browser did not close within ${PROVIDER_CLOSE_TIMEOUT}ms. The browser process will be killed when the process exits.`,
+-                )
+-                resolve()
+-              }, PROVIDER_CLOSE_TIMEOUT)
+-              timer.unref()
+-            }),
+-          ])
+-        }),
+-      )
+-      vitest._browserSessions.sessionIds.clear()
+-      providers.clear()
+-      vitest.projects.forEach((project) => {
+-        project.browser?.state.orchestrators.forEach((orchestrator) => {
+-          orchestrator.$close()
+-        })
+-      })
+-      debug?.('browser pool closed all providers')
+-    },
+-    runTests: (files) => runWorkspaceTests('run', files),
+-    collectTests: (files) => runWorkspaceTests('collect', files),
++  return groupedFiles
++}
++
++async function closeProvider(
++  project: TestProject,
++  options?: BrowserProviderCloseOptions,
++): Promise<void> {
++  const browser = project.browser
++  if (!browser?.provider) {
++    return
+   }
++  debug?.('closing the browser provider of %s', project.name)
++  // a frozen or crashed browser never answers the close message;
++  // don't wait for it forever, the browser process is killed
++  // when this process exits anyway
++  let timer: ReturnType<typeof setTimeout>
++  await Promise.race([
++    browser.closeBrowserProvider(options).finally(() => clearTimeout(timer)),
++    new Promise<void>((resolve) => {
++      timer = setTimeout(() => {
++        project.vitest.logger.warn(
++          `The browser did not close within ${PROVIDER_CLOSE_TIMEOUT}ms. The browser process will be killed when the process exits.`,
++        )
++        resolve()
++      }, PROVIDER_CLOSE_TIMEOUT)
++      timer.unref()
++    }),
++  ])
+ }
+ 
+ function escapePathToRegexp(path: string): string {
+   return path.replace(/[/\\.?*()^${}|[\]+]/g, '\\$&')
+ }
+ 
+-class BrowserPool {
++class BrowserWorker {
+   private _queue: FileSpecification[] = []
++  private _method: 'run' | 'collect' = 'run'
+   private _promise: DeferPromise<void> | undefined
++  private _error: Error | undefined
+   private _providedContext: string | undefined
+ 
++  // every page this worker opened or adopted, busy ones are running a file
++  private sessions = new Set<string>()
++  private busySessions = new Set<string>()
++  private openingSessions = new Set<string>()
+   private readySessions: Set<string>
++  private started = false
++  private _maxPages = 1
++  private _parallel = false
+ 
+   private _traces: Traces
+   private _otel: {
+@@ -214,16 +376,17 @@ class BrowserPool {
+   }
+ 
+   constructor(
+-    private project: TestProject,
++    public project: TestProject,
+     private options: {
+-      maxWorkers: number
++      getMaxPages: (project: TestProject) => number
++      getPageAllowance: (worker: BrowserWorker) => number
+     },
+   ) {
+     this._traces = project.vitest._traces
+     this._otel = this._traces.startContextSpan('vitest.browser')
+     this._otel.span.setAttributes({
+       'vitest.project': project.name,
+-      'vitest.browser.provider': this.project.browser!.provider.name,
++      'vitest.browser.provider': project.config.browser.provider?.name,
+     })
+     this.readySessions = project._browserReadySessions
+   }
+@@ -233,54 +396,136 @@ class BrowserPool {
+     this._otel.span.end()
+   }
+ 
+-  public reject(error: Error): void {
++  public reject(error: Error, sessionId?: string): void {
+     // if user cancels the test run manually, ignore the error and exit gracefully
+-    if (this.project.vitest.isCancelling && error instanceof BrowserConnectionError) {
+-      this._promise?.resolve()
+-    } else {
+-      this._promise?.reject(error)
++    if (!this.project.vitest.isCancelling || !(error instanceof BrowserConnectionError)) {
++      this._error ??= error
++    }
++    if (sessionId) {
++      this.busySessions.delete(sessionId)
+     }
+-    this._promise = undefined
+     this.cancel()
++    // other pages finish the file they are running first
++    if (!this.busySessions.size) {
++      this.settle()
++    }
++  }
++
++  private settle(): void {
++    const promise = this._promise
++    const error = this._error
++    this._promise = undefined
++    this._error = undefined
++    this._otel.span.end()
++    if (error) {
++      promise?.reject(error)
++    } else {
++      promise?.resolve()
++    }
+   }
+ 
+   get orchestrators() {
+     return this.project.browser!.state.orchestrators
+   }
+ 
++  get pageCount(): number {
++    return this.sessions.size
++  }
++
++  get maxPages(): number {
++    return this._maxPages
++  }
++
+   async runTests(method: 'run' | 'collect', files: FileSpecification[]): Promise<void> {
+-    this._promise ??= createDefer<void>()
++    const promise = (this._promise ??= createDefer<void>())
+ 
+     if (!files.length) {
+       debug?.('no tests found, finishing test run immediately')
+-      this._promise.resolve()
+-      return this._promise
++      promise.resolve()
++      return promise
+     }
+ 
++    this._method = method
++    this._queue.push(...files)
++
++    // the provider is closed when the pool frees the slot of an idle instance,
++    // so a worker that reopens the instance starts a new one
++    await this.project._initBrowserProvider()
++    if (!this._queue.length) {
++      debug?.('the run was cancelled while the provider was starting')
++      this._promise = undefined
++      promise.resolve()
++      return promise
++    }
++    this.started = true
++    this._maxPages = this.options.getMaxPages(this.project)
++    // decided once per instance: the budget can add pages later, and a provider
++    // that cannot share state between pages (persistent context) needs to know upfront
++    this._parallel = this._maxPages > 1
+     this._providedContext = stringify(this.project.getProvidedContext())
+ 
+-    this._queue.push(...files)
++    for (const sessionId of [...this.readySessions]) {
++      if (!this._queue.length) {
++        break
++      }
++      this.readySessions.delete(sessionId)
++      // the page was closed while it was idle
++      if (!this.orchestrators.has(sessionId)) {
++        this.sessions.delete(sessionId)
++        continue
++      }
++      this.sessions.add(sessionId)
++      this.runNextTest(method, sessionId)
++    }
++
++    await this.openPages().catch((error) => this.reject(error))
++    debug?.('all sessions are created')
++    return promise
++  }
+ 
+-    this.readySessions.forEach((sessionId) => {
+-      if (this._queue.length) {
++  // opens more pages when the budget allows it, e.g. after another instance finished
++  grow(): void {
++    if (!this.started || !this._promise || !this._queue.length) {
++      return
++    }
++    this.openPages().catch((error) => this.reject(error))
++  }
++
++  // a page that was closed or crashed is gone from the orchestrators,
++  // but this worker would still count it as open
++  private pruneClosedSessions(): void {
++    for (const sessionId of this.sessions) {
++      if (this.openingSessions.has(sessionId) || this.busySessions.has(sessionId)) {
++        continue
++      }
++      if (!this.readySessions.has(sessionId) || !this.orchestrators.has(sessionId)) {
++        debug?.('[%s] the page is closed, forgetting the session', sessionId)
++        this.sessions.delete(sessionId)
+         this.readySessions.delete(sessionId)
+-        this.runNextTest(method, sessionId)
+       }
+-    })
+-
+-    if (this.orchestrators.size >= this.options.maxWorkers) {
+-      debug?.('all orchestrators are ready, not creating more')
+-      return this._promise
+     }
++  }
+ 
++  private async openPages(): Promise<void> {
++    const method = this._method
++    this.pruneClosedSessions()
+     // open the minimum amount of tabs
+     // if there is only 1 file running, we don't need 8 tabs running
+-    const workerCount = Math.min(this.options.maxWorkers - this.orchestrators.size, files.length)
++    const allowance = this.options.getPageAllowance(this)
++    // pages that are still opening will take the next queued files
++    const unassigned = this._queue.length - this.openingSessions.size
++    const count = Math.min(allowance - this.sessions.size, unassigned)
++    if (count <= 0) {
++      debug?.('all pages are open, not creating more')
++      return
++    }
+ 
++    const parallel = this._parallel
+     const promises: Promise<void>[] = []
+-    for (let i = 0; i < workerCount; i++) {
++    for (let i = 0; i < count; i++) {
+       const sessionId = crypto.randomUUID()
+-      this.project.vitest._browserSessions.sessionIds.add(sessionId)
++      this.sessions.add(sessionId)
++      this.openingSessions.add(sessionId)
+       const project = this.project.name
+       debug?.('[%s] creating session for %s', sessionId, project)
+       const page = this._traces
+@@ -292,22 +537,47 @@ class BrowserPool {
+               'vitest.browser.session_id': sessionId,
+             },
+           },
+-          () => this.openPage(sessionId, { parallel: workerCount > 1 }),
++          () => this.openPage(sessionId, { parallel }),
++        )
++        .then(
++          () => {
++            this.openingSessions.delete(sessionId)
++            // start running tests on the page when it's ready
++            this.runNextTest(method, sessionId)
++          },
++          (error) => {
++            this.openingSessions.delete(sessionId)
++            this.sessions.delete(sessionId)
++            throw error
++          },
+         )
+-        .then(() => {
+-          // start running tests on the page when it's ready
+-          this.runNextTest(method, sessionId)
+-        })
+       promises.push(page)
+     }
+     await Promise.all(promises)
+-    debug?.('all sessions are created')
+-    return this._promise
++  }
++
++  async stop(options?: BrowserProviderCloseOptions): Promise<void> {
++    this.cancel()
++    const sessions = this.project.vitest._browserSessions
++    const sessionIds = [...this.sessions]
++    const orchestrators = sessionIds.map((sessionId) => {
++      const orchestrator = this.orchestrators.get(sessionId)
++      this.orchestrators.delete(sessionId)
++      sessions.destroySession(sessionId)
++      return orchestrator
++    })
++    this.sessions.clear()
++    this.busySessions.clear()
++    this.readySessions.clear()
++    await closeProvider(this.project, options)
++    // the pages are closed now, so a late reconnect is not reported as an unknown session
++    sessionIds.forEach((sessionId) => sessions.sessionIds.delete(sessionId))
++    orchestrators.forEach((orchestrator) => orchestrator?.$close())
+   }
+ 
+   private async openPage(sessionId: string, options: { parallel: boolean }): Promise<void> {
+     await this.project._openBrowserPage(sessionId, {
+-      reject: (error) => this.reject(error),
++      reject: (error) => this.reject(error, sessionId),
+       parallel: options.parallel,
+     })
+   }
+@@ -323,7 +593,7 @@ class BrowserPool {
+       return session.concurrencyId
+     }
+     const used = new Set<number>()
+-    for (const id of this.orchestrators.keys()) {
++    for (const id of this.sessions) {
+       const concurrencyId = sessions.getSession(id)?.concurrencyId
+       if (concurrencyId) {
+         used.add(concurrencyId)
+@@ -350,19 +620,18 @@ class BrowserPool {
+   }
+ 
+   private finishSession(sessionId: string): void {
++    this.busySessions.delete(sessionId)
+     this.readySessions.add(sessionId)
+ 
+-    // the last worker finished running tests
+-    if (this.readySessions.size === this.orchestrators.size) {
+-      this._otel.span.end()
+-      this._promise?.resolve()
+-      this._promise = undefined
++    // the last page finished running tests
++    if (!this.busySessions.size) {
++      this.settle()
+       debug?.('[%s] all tests finished running', sessionId)
+     } else {
+       debug?.(
+-        `did not finish sessions for ${sessionId}: |ready - %s| |overall - %s|`,
+-        [...this.readySessions].join(', '),
+-        [...this.orchestrators.keys()].join(', '),
++        `did not finish sessions for ${sessionId}: |busy - %s| |overall - %s|`,
++        [...this.busySessions].join(', '),
++        [...this.sessions].join(', '),
+       )
+     }
+   }
+@@ -395,6 +664,7 @@ class BrowserPool {
+     }
+ 
+     const orchestrator = this.getOrchestrator(sessionId)
++    this.busySessions.add(sessionId)
+     debug?.('[%s] run test %s', sessionId, file)
+ 
+     // warm the transform cache while the iframe is booting so the test
+@@ -442,17 +712,18 @@ class BrowserPool {
+           .catch((error) => {
+             // if user cancels the test run manually, ignore the error and exit gracefully
+             if (this.project.vitest.isCancelling && error instanceof BrowserConnectionError) {
+-              this.cancel()
+-              this._promise?.resolve()
+-              this._promise = undefined
+               debug?.('[%s] browser connection was closed', sessionId)
++              this.reject(error, sessionId)
+               return
+             }
+             debug?.('[%s] error during %s test run: %s', sessionId, file, error)
+-            this.reject(new Error(`Failed to run the test ${file.filepath}.`, { cause: error }))
++            this.reject(
++              new Error(`Failed to run the test ${file.filepath}.`, { cause: error }),
++              sessionId,
++            )
+           })
+       })
+-      .catch((err) => this.reject(err))
++      .catch((err) => this.reject(err, sessionId))
+   }
+ 
+   async setBreakpoint(sessionId: string, file: string) {
+@@ -460,7 +731,10 @@ class BrowserPool {
+       return
+     }
+ 
+-    const provider = this.project.browser!.provider
++    const provider = this.project.browser?.provider
++    if (!provider) {
++      return
++    }
+     const browser = this.project.config.browser.name
+ 
+     if (shouldIgnoreDebugger(provider.name, browser)) {
+@@ -492,7 +766,6 @@ function shouldIgnoreDebugger(provider: string, browser: string) {
+   }
+   return browser !== 'chromium'
+ }
+-
+ // Best-effort workaround for chromium/playwright bug
+ // https://issues.chromium.org/issues/530892387
+ 
+@@ -505,8 +778,9 @@ const debugGC = createDebugger('vitest:browser:gc')
+ 
+ async function maybeCollectChromiumGarbage(project: TestProject, sessionId: string): Promise<void> {
+   // trigger only on linux/chromium/playwright
+-  const provider = project.browser!.provider
++  const provider = project.browser?.provider
+   if (
++    !provider ||
+     (!forceChromiumGC && process.platform !== 'linux') ||
+     provider.name !== 'playwright' ||
+     project.config.browser.name !== 'chromium' ||
+diff --git a/packages/vitest/src/node/project.ts b/packages/vitest/src/node/project.ts
+index 9c1555d7102e..132939f2a940 100644
+--- a/packages/vitest/src/node/project.ts
++++ b/packages/vitest/src/node/project.ts
+@@ -473,7 +473,8 @@ export class TestProject {
+       parallel?: boolean
+     },
+   ): Promise<void> {
+-    if (!this.browser) {
++    const provider = this.browser?.provider
++    if (!this.browser || !provider) {
+       throw new Error(`browser is not initialized`)
+     }
+ 
+@@ -490,7 +491,7 @@ export class TestProject {
+     const sessionPromise = this.vitest._browserSessions.createSession(sessionId, this, pool, {
+       otelCarrier,
+     })
+-    const pagePromise = this.browser.provider.openPage(sessionId, url.toString(), {
++    const pagePromise = provider.openPage(sessionId, url.toString(), {
+       parallel: pool.parallel ?? false,
+     })
+     await Promise.all([sessionPromise, pagePromise])
+@@ -498,7 +499,8 @@ export class TestProject {
+ 
+   /** @internal */
+   public async _standalone(): Promise<void> {
+-    if (!this.isBrowserEnabled()) {
++    // headless pages are opened by the first run, within the `maxWorkers` limit
++    if (!this.isBrowserEnabled() || this.config.browser.headless) {
+       return
+     }
+ 
+diff --git a/packages/vitest/src/node/types/browser.ts b/packages/vitest/src/node/types/browser.ts
+index bc72a54ca75b..bcccf03ce4e7 100644
+--- a/packages/vitest/src/node/types/browser.ts
++++ b/packages/vitest/src/node/types/browser.ts
+@@ -56,7 +56,17 @@ export interface BrowserProvider {
+   getCommandsContext: (sessionId: string) => Record<string, unknown>
+   openPage: (sessionId: string, url: string, options: { parallel: boolean }) => Promise<void>
+   getCDPSession?: (sessionId: string) => Promise<CDPSession>
+-  close: () => Awaitable<void>
++  close: (options?: BrowserProviderCloseOptions) => Awaitable<void>
++}
++
++export interface BrowserProviderCloseOptions {
++  /**
++   * The instance is closed to free a slot for another project and can be
++   * opened again later, so the provider may keep the browser process alive
++   * for the next instance instead of launching a new one.
++   * @default false
++   */
++  keepWarm?: boolean
+ }
+ 
+ export type BrowserBuiltinProvider = 'webdriverio' | 'playwright' | 'preview'
+@@ -456,9 +466,14 @@ export interface BrowserServerContribution {
+ export interface ProjectBrowser {
+   vite: ViteDevServer
+   state: BrowserServerState
+-  provider: BrowserProvider
++  /**
++   * The provider of the open browser instance. It is `undefined` until the instance
++   * starts running tests and after the instance is closed to free a worker slot.
++   */
++  provider: BrowserProvider | undefined
+   close: () => Promise<void>
+   initBrowserProvider: (project: TestProject) => Promise<void>
++  closeBrowserProvider: (options?: BrowserProviderCloseOptions) => Promise<void>
+   parseStacktrace: (stack: string) => ParsedStack[]
+   parseErrorStacktrace: (error: TestError, options?: StackTraceParserOptions) => ParsedStack[]
+   registerCommand: <K extends keyof BrowserCommands>(
+diff --git a/packages/vitest/src/public/node.ts b/packages/vitest/src/public/node.ts
+index 6f80d5db1a7a..67724c46ed88 100644
+--- a/packages/vitest/src/public/node.ts
++++ b/packages/vitest/src/public/node.ts
+@@ -113,6 +113,7 @@ export type {
+   BrowserModuleMocker,
+   BrowserOrchestrator,
+   BrowserProvider,
++  BrowserProviderCloseOptions,
+   BrowserProviderOption,
+   BrowserScript,
+   BrowserServerContribution,
+diff --git a/test/browser/specs/bail-out.test.ts b/test/browser/specs/bail-out.test.ts
+index 72a166d6c68c..74ae2f34ce0c 100644
+--- a/test/browser/specs/bail-out.test.ts
++++ b/test/browser/specs/bail-out.test.ts
+@@ -66,3 +66,27 @@ test('vitest bails out when the iframe is no longer accessible', async () => {
+   expect(stderr).toContain('Received URL: http://')
+   expect(stderr).toContain('Expected: http://')
+ })
++
++// Firefox fires no "load" event for a document that failed to load, so the
++// orchestrator has to notice the unload itself instead of waiting forever
++test.runIf(
++  provider.name === 'playwright' && instances.some((instance) => instance.browser !== 'webkit'),
++)('vitest bails out when the iframe navigates to an unreachable address', async () => {
++  const { stderr } = await runInlineBrowserTests(
++    {
++      'navigate.test.ts': `
++          import { test } from 'vitest'
++
++          test('navigates away', async () => {
++            location.href = 'http://127.0.0.1:1/'
++            await new Promise(() => {})
++          })
++        `,
++    },
++    {
++      browser: { instances: instances.filter((instance) => instance.browser !== 'webkit') },
++    },
++    { fails: true },
++  )
++  expect(stderr).toMatch(/Cannot connect to the iframe/)
++})
+diff --git a/test/browser/specs/instance-concurrency.test.ts b/test/browser/specs/instance-concurrency.test.ts
+new file mode 100644
+index 000000000000..df3f429b4ae6
+--- /dev/null
++++ b/test/browser/specs/instance-concurrency.test.ts
+@@ -0,0 +1,471 @@
++import type { TestModule, TestProject, Vitest } from 'vitest/node'
++import { mkdtempSync, rmSync } from 'node:fs'
++import { tmpdir } from 'node:os'
++import { playwright } from '@vitest/browser-playwright'
++import { join } from 'pathe'
++import { expect, onTestFinished, test } from 'vitest'
++import { instances, provider, runInlineBrowserTests } from './utils'
++
++const [{ browser }] = instances
++const names = ['first', 'second', 'third']
++
++function countOpenInstances(vitest: Vitest) {
++  return vitest.projects.filter((project) => project.browser!.state.orchestrators.size > 0).length
++}
++
++function getSessionIds(vitest: Vitest): Set<string> {
++  return (vitest as any)._browserSessions.sessionIds
++}
++
++function countOpenPages(project: TestModule['project']) {
++  return project.browser!.state.orchestrators.size
++}
++
++function createFiles(body: string) {
++  return Object.fromEntries(
++    names.map((name) => [
++      `${name}.test.ts`,
++      `
++      import { test } from 'vitest'
++      test('runs in ${name}', async () => {
++        ${body}
++      })
++    `,
++    ]),
++  )
++}
++
++function createInstances() {
++  return names.map((name) => ({ browser, name, include: [`${name}.test.ts`] }))
++}
++
++test.runIf(provider.name === 'playwright')(
++  'runs one browser instance at a time when maxWorkers is 1',
++  async () => {
++    const events: string[] = []
++    const openInstances: number[] = []
++
++    const { stderr, testTree } = await runInlineBrowserTests(
++      createFiles('await new Promise(resolve => setTimeout(resolve, 100))'),
++      {
++        maxWorkers: 1,
++        browser: { instances: createInstances() },
++        reporters: [
++          {
++            onTestModuleStart(module: TestModule) {
++              events.push(`start ${module.project.name}`)
++              openInstances.push(countOpenInstances(module.project.vitest))
++            },
++            onTestModuleEnd(module: TestModule) {
++              events.push(`end ${module.project.name}`)
++            },
++          },
++        ],
++      },
++    )
++
++    expect(stderr).toBe('')
++    expect(testTree()).toMatchInlineSnapshot(`
++      {
++        "first.test.ts": {
++          "runs in first": "passed",
++        },
++        "second.test.ts": {
++          "runs in second": "passed",
++        },
++        "third.test.ts": {
++          "runs in third": "passed",
++        },
++      }
++    `)
++
++    // every instance finishes before the next one opens
++    expect(events).toHaveLength(names.length * 2)
++    for (let i = 0; i < events.length; i += 2) {
++      const name = events[i].replace('start ', '')
++      expect(events[i + 1]).toBe(`end ${name}`)
++    }
++    expect(openInstances).toEqual([1, 1, 1])
++  },
++)
++
++test.runIf(provider.name === 'playwright')(
++  'runs up to maxWorkers browser instances at the same time',
++  async () => {
++    const openInstances: number[] = []
++    const openPages: number[] = []
++
++    const { stderr, testTree } = await runInlineBrowserTests(
++      {
++        ...createFiles(`
++          const { commands } = await import('vitest/browser')
++          await vi.waitFor(async () => {
++            expect(await commands.openInstances()).toBeGreaterThanOrEqual(2)
++          }, { timeout: 10_000 })
++        `),
++        // the third instance only runs after one of the others is finished
++        'third.test.ts': `
++          import { test } from 'vitest'
++          test('runs in third', () => {})
++        `,
++      },
++      {
++        maxWorkers: 2,
++        globals: true,
++        browser: {
++          instances: createInstances(),
++          commands: {
++            openInstances(context) {
++              return countOpenInstances(context.project.vitest)
++            },
++          },
++        },
++        reporters: [
++          {
++            onTestModuleStart(module: TestModule) {
++              openInstances.push(countOpenInstances(module.project.vitest))
++              openPages.push(countOpenPages(module.project))
++            },
++          },
++        ],
++      },
++    )
++
++    expect(stderr).toBe('')
++    expect(testTree()).toMatchInlineSnapshot(`
++      {
++        "first.test.ts": {
++          "runs in first": "passed",
++        },
++        "second.test.ts": {
++          "runs in second": "passed",
++        },
++        "third.test.ts": {
++          "runs in third": "passed",
++        },
++      }
++    `)
++    expect(Math.max(...openInstances)).toBe(2)
++    // the running instances split the budget of 2 pages, and the last
++    // instance has a single file, so none of them opens a second page
++    expect(openPages).toEqual([1, 1, 1])
++  },
++)
++
++test.runIf(provider.name === 'playwright')(
++  'reruns instances that were closed to free a worker slot',
++  async () => {
++    const files: Record<string, string> = {
++      'label.ts': `export const label = 'label'`,
++    }
++    for (const name of names) {
++      files[`${name}.test.ts`] = `
++        import { expect, test } from 'vitest'
++        import { label } from './label'
++        test('reads the label in ${name}', () => {
++          expect(label).toBe('label')
++        })
++      `
++    }
++
++    const { fs, vitest, ctx } = await runInlineBrowserTests(files, {
++      watch: true,
++      maxWorkers: 1,
++      browser: { instances: createInstances() },
++      reporters: ['default'],
++    })
++
++    await vitest.waitForStdout(`Test Files  ${names.length} passed`)
++
++    vitest.resetOutput()
++    fs.editFile('label.ts', (content) => `${content}\n`)
++    await vitest.waitForStdout(`Test Files  ${names.length} passed`)
++
++    expect(vitest.stderr).toBe('')
++    // only the instance that is still open keeps its session
++    expect(getSessionIds(ctx!).size).toBe(1)
++  },
++)
++
++test.runIf(provider.name === 'playwright')(
++  'opens a new page when the page of an instance was closed',
++  async () => {
++    const { fs, vitest } = await runInlineBrowserTests(
++      {
++        'label.ts': `export const label = 'label'`,
++        'closing.test.ts': `
++          import { test } from 'vitest'
++          import { commands } from 'vitest/browser'
++          import { label } from './label'
++          test('closes its own page', async () => {
++            if (label === 'label') {
++              await commands.closePage()
++            }
++          })
++        `,
++      },
++      {
++        watch: true,
++        maxWorkers: 1,
++        browser: {
++          instances: [{ browser, name: names[0] }],
++          commands: {
++            async closePage(context) {
++              await context.page.close()
++            },
++          },
++        },
++        reporters: ['default'],
++      },
++    )
++
++    expect(vitest.stdout).toMatch(/Errors {2}1 error/)
++
++    vitest.resetOutput()
++    fs.editFile('label.ts', () => `export const label = 'fixed'`)
++    await vitest.waitForStdout('Test Files  1 passed')
++
++    expect(vitest.stderr).toBe('')
++  },
++)
++
++test.runIf(provider.name === 'playwright')(
++  'does not share a persistent context between the pages of an instance',
++  async () => {
++    const userDataDir = mkdtempSync(join(tmpdir(), 'vitest-persistent-context-'))
++    onTestFinished(() => rmSync(userDataDir, { recursive: true, force: true }))
++
++    const files: Record<string, string> = {
++      'quick.test.ts': `
++        import { test } from 'vitest'
++        test('runs in quick', () => {})
++      `,
++    }
++    for (let i = 0; i < 4; i++) {
++      files[`slow-${i}.test.ts`] = `
++        import { expect, test } from 'vitest'
++        import { commands } from 'vitest/browser'
++        test('runs alone in its context', async () => {
++          await new Promise(resolve => setTimeout(resolve, 300))
++          expect(await commands.pagesInContext()).toBe(1)
++        })
++      `
++    }
++
++    const { stderr, testTree } = await runInlineBrowserTests(files, {
++      maxWorkers: 2,
++      browser: {
++        instances: [
++          {
++            browser,
++            name: 'slow',
++            include: ['slow-*.test.ts'],
++            provider: playwright({ persistentContext: userDataDir }),
++          },
++          { browser, name: 'quick', include: ['quick.test.ts'] },
++        ],
++        commands: {
++          pagesInContext(context) {
++            return context.context.pages().length
++          },
++        },
++      },
++    })
++
++    expect(stderr).toMatchInlineSnapshot(`
++      "The persistentContext option is ignored because tests are running in parallel.
++      "
++    `)
++    expect(testTree()).toMatchInlineSnapshot(`
++      {
++        "quick.test.ts": {
++          "runs in quick": "passed",
++        },
++        "slow-0.test.ts": {
++          "runs alone in its context": "passed",
++        },
++        "slow-1.test.ts": {
++          "runs alone in its context": "passed",
++        },
++        "slow-2.test.ts": {
++          "runs alone in its context": "passed",
++        },
++        "slow-3.test.ts": {
++          "runs alone in its context": "passed",
++        },
++      }
++    `)
++  },
++)
++
++test.runIf(provider.name === 'playwright')(
++  'finishes the run after every instance, even when one of them fails',
++  async () => {
++    const events: string[] = []
++
++    const { ctx, root, testTree } = await runInlineBrowserTests(
++      {
++        'failing.test.ts': `
++          import { test } from 'vitest'
++          import { commands } from 'vitest/browser'
++          test('closes its own page', async () => {
++            await commands.closePage()
++          })
++        `,
++        'slow.test.ts': `
++          import { test } from 'vitest'
++          test('runs in slow', async () => {
++            await new Promise(resolve => setTimeout(resolve, 500))
++          })
++        `,
++      },
++      {
++        maxWorkers: 2,
++        browser: {
++          instances: [
++            { browser, name: 'failing', include: ['failing.test.ts'] },
++            { browser, name: 'slow', include: ['slow.test.ts'] },
++          ],
++          commands: {
++            async closePage(context) {
++              await context.page.close()
++            },
++          },
++        },
++        reporters: [
++          {
++            onTestModuleEnd(module: TestModule) {
++              events.push(`end ${module.project.name}`)
++            },
++            onTestRunEnd() {
++              events.push('run end')
++            },
++          },
++        ],
++      },
++    )
++
++    expect(events).toEqual(['end slow', 'run end'])
++    expect(testTree()).toMatchInlineSnapshot(`
++      {
++        "failing.test.ts": {
++          "closes its own page": "pending",
++        },
++        "slow.test.ts": {
++          "runs in slow": "passed",
++        },
++      }
++    `)
++    expect(
++      ctx!.state.getUnhandledErrors().map((error: any) => error.message.replace(root, '<root>')),
++    ).toMatchInlineSnapshot(`
++      [
++        "Failed to run the test <root>/failing.test.ts.",
++      ]
++    `)
++  },
++)
++
++test.runIf(provider.name === 'playwright')(
++  'reuses the pages of instances that stayed open on rerun',
++  async () => {
++    const files: Record<string, string> = {
++      'label.ts': `export const label = 'label'`,
++    }
++    for (const name of names) {
++      files[`${name}.test.ts`] = `
++        import { test } from 'vitest'
++        import { commands } from 'vitest/browser'
++        import { label } from './label'
++        test('records the page in ${name}', async () => {
++          await commands.recordSession(label)
++        })
++      `
++    }
++    const runs: Record<string, string>[] = []
++
++    const { fs, vitest } = await runInlineBrowserTests(files, {
++      watch: true,
++      maxWorkers: 2,
++      browser: {
++        instances: createInstances(),
++        commands: {
++          recordSession(context) {
++            runs.at(-1)![context.project.name] = context.sessionId
++          },
++        },
++      },
++      reporters: [
++        'default',
++        {
++          onTestRunStart() {
++            runs.push({})
++          },
++        },
++      ],
++    })
++
++    await vitest.waitForStdout(`Test Files  ${names.length} passed`)
++
++    vitest.resetOutput()
++    fs.editFile('label.ts', (content) => `${content}\n`)
++    await vitest.waitForStdout(`Test Files  ${names.length} passed`)
++
++    expect(vitest.stderr).toBe('')
++    const [first, second] = runs
++    // the closed instance takes the slot of whichever open instance finishes first
++    expect(names.filter((name) => first[name] === second[name])).toHaveLength(2)
++  },
++)
++
++test.runIf(provider.name === 'playwright' && browser === 'chromium')(
++  'keeps headed instances open across reruns',
++  async () => {
++    const files: Record<string, string> = {
++      'label.ts': `export const label = 'label'`,
++    }
++    for (const name of names) {
++      files[`${name}.test.ts`] = `
++        import { expect, test } from 'vitest'
++        import { label } from './label'
++        test('reads the label in ${name}', () => {
++          expect(label).toBe('label')
++        })
++      `
++    }
++
++    const opened: string[] = []
++    const { fs, vitest } = await runInlineBrowserTests(files, {
++      watch: true,
++      maxWorkers: 1,
++      browser: {
++        headless: false,
++        ui: false,
++        instances: createInstances(),
++        // the headless shell has no window, so the pool sees a headed instance
++        // while the test runs on the browser CI installs with `--only-shell`
++        provider: playwright({ launchOptions: { channel: 'chromium-headless-shell' } }),
++      },
++      reporters: [
++        'default',
++        {
++          onBrowserInit(project: TestProject) {
++            opened.push(project.name)
++          },
++        },
++      ],
++    })
++    await vitest.waitForStdout(`Test Files  ${names.length} passed`)
++    expect(opened.sort()).toEqual([...names].sort())
++
++    for (let i = 0; i < 2; i++) {
++      opened.length = 0
++      vitest.resetOutput()
++      fs.editFile('label.ts', (content) => `${content}\n`)
++      await vitest.waitForStdout(`Test Files  ${names.length} passed`)
++      // every instance stays open, so none of them is initialized again
++      expect(opened).toEqual([])
++    }
++    expect(vitest.stderr).toBe('')
++  },
++)
+diff --git a/test/browser/specs/prewarm.test.ts b/test/browser/specs/prewarm.test.ts
+index 52d701335dcb..fdf250de40c7 100644
+--- a/test/browser/specs/prewarm.test.ts
++++ b/test/browser/specs/prewarm.test.ts
+@@ -105,6 +105,27 @@ test('prewarm uses the provider from the resolved instance project', async () =>
+   expect(prewarmed).toEqual([{ browser: target, name: target }])
+ })
+ 
++test('prewarms at most maxWorkers instances', async () => {
++  const { prewarmed, spyProvider } = spyOnPrewarm()
++  const browser = instances[0].browser!
++
++  const result = await runInlineBrowserTests(
++    {
++      'basic.test.ts': basicTest,
++    },
++    {
++      maxWorkers: 2,
++      browser: {
++        provider: spyProvider,
++        instances: ['first', 'second', 'third'].map((name) => ({ browser, name })),
++      },
++    },
++  )
++
++  expect(result.stderr).toBe('')
++  expect(prewarmed).toEqual(['first', 'second'])
++})
++
+ test('does not prewarm a project without test files', async () => {
+   const { prewarmed, spyProvider } = spyOnPrewarm()
+   let projectNames: string[] = []
+diff --git a/test/browser/specs/utils.ts b/test/browser/specs/utils.ts
+index c4d899c6e7b1..59993dc5daa1 100644
+--- a/test/browser/specs/utils.ts
++++ b/test/browser/specs/utils.ts
+@@ -6,6 +6,12 @@ import { instances, provider } from '../settings'
+ 
+ export { instances, provider } from '../settings'
+ 
++// every browser instance is a worker, so `runVitest`'s default of a single
++// worker would run the instances one after another
++function getMaxWorkers(instanceCount: number) {
++  return Math.max(instanceCount, 1)
++}
++
+ export async function runInlineBrowserTests(
+   structure: TestFsStructure,
+   config?: RunVitestConfig,
+@@ -16,6 +22,7 @@ export async function runInlineBrowserTests(
+     {
+       watch: false,
+       reporters: 'none',
++      maxWorkers: getMaxWorkers(config?.browser?.instances?.length ?? instances.length),
+       ...config,
+       browser: {
+         enabled: true,
+@@ -39,6 +46,7 @@ export async function runBrowserTests(
+     {
+       watch: false,
+       reporters: 'none',
++      maxWorkers: getMaxWorkers(config?.browser?.instances?.length ?? instances.length),
+       ...config,
+       browser: { headless: true, ...config?.browser },
+       $viteConfig: viteOverrides,
