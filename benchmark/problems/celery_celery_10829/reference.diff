@@ -1,0 +1,255 @@
+diff --git a/celery/canvas.py b/celery/canvas.py
+index 0b62c22954b..420b8ee8765 100644
+--- a/celery/canvas.py
++++ b/celery/canvas.py
+@@ -1420,7 +1420,7 @@ def prepare_steps(self, args, kwargs, tasks,
+                 # for chords we freeze by pretending it's a normal
+                 # signature instead of a group.
+                 tasks.pop()
+-                results.pop()
++                body_res = results.pop()
+                 try:
+                     task = chord(
+                         task, body=prev_task,
+@@ -1435,10 +1435,20 @@ def prepare_steps(self, args, kwargs, tasks,
+                         task, body=prev_task,
+                         root_id=root_id, app=app,
+                     )
+-                # Do not overwrite prev_res here; it may intentionally be a GroupResult (see #8903).
+-                # But we must reset prev_task after the pop so we don't link a chord to its own body
+-                # when use_link/task_protocol==1.
++                # Reset prev_task after the pop so we don't link a chord to
++                # its own body when use_link/task_protocol==1.
+                 prev_task = tasks[-1] if tasks else None
++                # The rest of the chain is linked to the body's result,
++                # directly or through the GroupResult of a following chord.
++                # Unlink it so it is linked to the chord's result below;
++                # otherwise the body's id is in the result tree twice
++                # (#9608), which chord.freeze() rejects (#8890).
++                node = results[-1] if results else None
++                while node is not None and node.parent is not body_res:
++                    node = node.parent
++                if node is not None:
++                    node.parent = None
++                    prev_res = node
+ 
+             if is_last_task:
+                 # chain(task_id=id) means task id is set for the last task
+diff --git a/t/canvas_helpers.py b/t/canvas_helpers.py
+new file mode 100644
+index 00000000000..f18d4f82fa0
+--- /dev/null
++++ b/t/canvas_helpers.py
+@@ -0,0 +1,16 @@
++def ids_in_as_tuple(tuple_repr):
++    """Return the id of every node in an as_tuple() tree."""
++    ids = []
++
++    def walk(tup):
++        if tup is None:
++            return
++        (res, nodes) = tup
++        (node_id, parent) = res
++        ids.append(node_id)
++        for child in nodes or ():
++            walk(child)
++        walk(parent)
++
++    walk(tuple_repr)
++    return ids
+diff --git a/t/integration/test_canvas.py b/t/integration/test_canvas.py
+index e58674271a5..e97c03683fb 100644
+--- a/t/integration/test_canvas.py
++++ b/t/integration/test_canvas.py
+@@ -14,6 +14,7 @@
+ from celery.exceptions import ChordError, ImproperlyConfigured, TimeoutError
+ from celery.result import AsyncResult, GroupResult, ResultSet
+ from celery.signals import before_task_publish, task_received
++from t.canvas_helpers import ids_in_as_tuple
+ 
+ from . import tasks
+ from .conftest import TEST_BACKEND, check_for_logs, flaky, get_active_redis_channels, get_redis_connection
+@@ -1304,6 +1305,63 @@ def test_chain_forwards_args_past_leading_empty_steps(self, manager):
+         c = _chain(_chain(group(), add.s(10)), add.s(20), app=manager.app)
+         assert c.apply_async((5,)).get(timeout=TIMEOUT) == 35
+ 
++    @flaky
++    @pytest.mark.parametrize('with_task_id', [False, True])
++    def test_chain_of_two_groups_as_tuple_holds_each_task_once(self, manager, with_task_id):
++        """Regression test for https://github.com/celery/celery/issues/9608.
++
++        The task after a group becomes the body of a chord, and the rest of
++        the chain must be linked to the chord's result only. as_tuple() must
++        list every node once, with or without a task_id.
++        """
++        try:
++            manager.app.backend.ensure_chords_allowed()
++        except NotImplementedError as e:
++            raise pytest.skip(e.args[0])
++
++        options = {'task_id': str(uuid.uuid4())} if with_task_id else {}
++        c = chain(
++            add.si(1, 0),
++            group(add.s(1), add.s(2)),
++            group(tsum.s(), tsum.s()),
++            tsum.s(),
++            add.s(1),
++            **options,
++        )
++        res = c.apply_async()
++        ids = ids_in_as_tuple(res.as_tuple())
++
++        # The first task, two tasks and a GroupResult per group, two last tasks.
++        assert len(ids) == len(set(ids)) == 9, ids
++        assert res.get(timeout=TIMEOUT) == 11
++
++    @flaky
++    def test_chord_with_chain_body_with_task_id(self, manager):
++        """Regression test for https://github.com/celery/celery/issues/8890.
++
++        A chain with a task_id and a group inside used to make the chord
++        raise RuntimeError('Recursive result parents') when it was frozen
++        before it was sent.
++        """
++        try:
++            manager.app.backend.ensure_chords_allowed()
++        except NotImplementedError as e:
++            raise pytest.skip(e.args[0])
++
++        body = chain(
++            add.si(1, 0),
++            group(add.si(1, 1), add.si(1, 2)),
++            add.si(2, 2) | add.si(3, 3),
++            task_id=str(uuid.uuid4()),
++        )
++        c = chord([add.si(1, 1), add.si(1, 2)], body)
++        c.freeze()
++        res = c.apply_async()
++        ids = ids_in_as_tuple(res.as_tuple())
++
++        assert len(ids) == len(set(ids)), ids
++        assert res.get(timeout=TIMEOUT) == 6
++
+ 
+ class test_result_set:
+ 
+diff --git a/t/smoke/tests/test_canvas.py b/t/smoke/tests/test_canvas.py
+index 447c0b088cb..c9c77030f06 100644
+--- a/t/smoke/tests/test_canvas.py
++++ b/t/smoke/tests/test_canvas.py
+@@ -4,8 +4,9 @@
+ from pytest_celery import RESULT_TIMEOUT, CeleryTestSetup
+ 
+ from celery.canvas import chain, chord, group, signature
++from t.canvas_helpers import ids_in_as_tuple
+ from t.integration.conftest import get_redis_connection
+-from t.integration.tasks import ExpectedException, add, fail, identity, redis_echo
++from t.integration.tasks import ExpectedException, add, fail, identity, redis_echo, tsum
+ 
+ 
+ class test_signature:
+@@ -102,6 +103,28 @@ def test_chain_skips_empty_group_on_worker(self, celery_setup: CeleryTestSetup):
+         res = sig.apply_async()
+         assert res.get(timeout=RESULT_TIMEOUT) == 6
+ 
++    @pytest.mark.parametrize("with_task_id", [False, True])
++    def test_chain_of_two_groups_as_tuple_holds_each_task_once(
++        self, celery_setup: CeleryTestSetup, with_task_id: bool
++    ):
++        """https://github.com/celery/celery/issues/9608"""
++        queue = celery_setup.worker.worker_queue
++        options = {"task_id": str(uuid.uuid4())} if with_task_id else {}
++        sig = chain(
++            add.si(1, 0).set(queue=queue),
++            group(add.s(1).set(queue=queue), add.s(2).set(queue=queue)),
++            group(tsum.s().set(queue=queue), tsum.s().set(queue=queue)),
++            tsum.s().set(queue=queue),
++            add.s(1).set(queue=queue),
++            **options,
++        )
++        res = sig.apply_async(queue=queue)
++        ids = ids_in_as_tuple(res.as_tuple())
++
++        # The first task, two tasks and a GroupResult per group, two last tasks.
++        assert len(ids) == len(set(ids)) == 9, ids
++        assert res.get(timeout=RESULT_TIMEOUT) == 11
++
+ 
+ class test_chord:
+     def test_sanity(self, celery_setup: CeleryTestSetup):
+diff --git a/t/unit/tasks/test_canvas.py b/t/unit/tasks/test_canvas.py
+index 9ecdb43c839..c645fc09dc1 100644
+--- a/t/unit/tasks/test_canvas.py
++++ b/t/unit/tasks/test_canvas.py
+@@ -16,6 +16,7 @@
+                            xstarmap)
+ from celery.exceptions import Ignore, Reject
+ from celery.result import AsyncResult, EagerResult, GroupResult, result_from_tuple
++from t.canvas_helpers import ids_in_as_tuple
+ 
+ SIG = Signature({
+     'task': 'TASK',
+@@ -1427,9 +1428,12 @@ def link_chain(sig):
+         assert signature(flat_chain.tasks[1].options['link'][0]) == signature('link_b')
+         assert signature(flat_chain.tasks[1].options['link_error'][0]) == signature('link_ab')
+ 
+-    def test_group_in_center_of_chain(self):
++    @pytest.mark.parametrize('options', [{}, {'task_id': 'last-task-id'}])
++    def test_group_in_center_of_chain(self, options):
++        # With an option, chain() keeps its steps and the group is upgraded
++        # in prepare_steps, which must not link the body's result twice.
+         t1 = chain(self.add.si(1, 1), group(self.add.si(1, 1), self.add.si(1, 1)),
+-                   self.add.si(1, 1) | self.add.si(1, 1))
++                   self.add.si(1, 1) | self.add.si(1, 1), **options)
+         t2 = chord([self.add.si(1, 1), self.add.si(1, 1)], t1)
+         t2.freeze()  # should not raise
+ 
+@@ -1466,6 +1470,48 @@ def test_consecutive_groups_in_chain_preserve_group_results_in_as_tuple(self, ta
+         ):
+             assert sizes.count(n) >= 2, sizes
+ 
++    @pytest.mark.parametrize('task_protocol', [2, 1])
++    @pytest.mark.parametrize('method', ['apply_async', 'freeze'])
++    @pytest.mark.parametrize('task_id', [None, 'last-task-id'])
++    def test_groups_in_chain_as_tuple_holds_each_task_once(self, task_id, method, task_protocol):
++        # Regression for #9608: as_tuple() must hold every task of the chain
++        # once, with or without a task_id. The task after a group becomes the
++        # body of a chord, and the rest of the chain must be linked to the
++        # chord's result only, not to the body's result as well.
++        self.app.conf.task_protocol = task_protocol
++        n = 3
++        options = {'task_id': task_id} if task_id else {}
++        canvas = chain(
++            self.add.si(0, 0),
++            group([chain(self.add.si(i, 0), self.add.si(0, i)) for i in range(n)]),
++            group([chain(self.add.si(i, 1), self.add.si(1, i)) for i in range(n)]),
++            self.add.si(2, 0),
++            self.add.s(3),
++            **options,
++        )
++        ids = ids_in_as_tuple(getattr(canvas, method)().as_tuple())
++
++        # The first task, 2 * n tasks and a GroupResult per group, two last tasks.
++        assert len(ids) == len(set(ids)) == 1 + 2 * (2 * n + 1) + 2, ids
++
++    @pytest.mark.parametrize('task_protocol', [2, 1])
++    def test_group_before_chord_in_chain_as_tuple_holds_each_task_once(self, task_protocol):
++        # Regression for #9608: here the rest of the chain is linked to the
++        # task after the group through the GroupResult of the next chord.
++        self.app.conf.task_protocol = task_protocol
++        canvas = chain(
++            self.add.si(0, 0),
++            group(self.add.si(1, 1), self.add.si(1, 2)),
++            self.add.si(2, 2),
++            chord([self.add.si(3, 3), self.add.si(3, 4)], self.add.si(4, 4)),
++            self.add.si(5, 5),
++            task_id='last-task-id',
++        )
++        ids = ids_in_as_tuple(canvas.apply_async().as_tuple())
++
++        # Eight tasks and two GroupResults.
++        assert len(ids) == len(set(ids)) == 10, ids
++
+     def test_upgrade_to_chord_on_chain(self):
+         group1 = group(self.add.si(10, 10), self.add.si(10, 10))
+         group2 = group(self.xsum.s(), self.xsum.s())

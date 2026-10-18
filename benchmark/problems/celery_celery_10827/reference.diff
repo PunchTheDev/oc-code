@@ -1,0 +1,330 @@
+diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index a72d54b994e..da0078fc7e8 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -219,6 +219,7 @@ def __repr__(self):
+             timedelta(days=1),
+             type='float', old={'celery_task_result_expires'},
+         ),
++        chord_expires=Option(None, type='float'),
+         persistent=Option(None, type='bool'),
+         extended=Option(False, type='bool'),
+         serializer=Option('json'),
+diff --git a/celery/backends/redis.py b/celery/backends/redis.py
+index 2b7fe8e54d7..3ea3487f9c4 100644
+--- a/celery/backends/redis.py
++++ b/celery/backends/redis.py
+@@ -399,6 +399,7 @@ def __init__(self, host=None, port=None, db=None, password=None,
+                  connection_pool=None, **kwargs):
+         super().__init__(expires_type=int, **kwargs)
+         _get = self.app.conf.get
++        self._chord_expires = _get('result_chord_expires')
+         if self.redis is None:
+             raise ImproperlyConfigured(E_REDIS_MISSING.strip())
+ 
+@@ -741,8 +742,20 @@ def _unpack_chord_result(self, tup, decode,
+             raise chord_error
+         return retval
+ 
++    @property
++    def chord_expires(self):
++        if self._chord_expires is None:
++            return self.expires
++        return self.prepare_expires(self._chord_expires, type=int)
++
++    def _set_chord_key(self, key, value):
++        if isinstance(value, str) and len(value) > self._MAX_STR_VALUE_SIZE:
++            raise BackendStoreError('value too large for Redis backend')
++        set_key = partial(self.client.set, ex=self.chord_expires or None)
++        return self.ensure(set_key, (key, value))
++
+     def set_chord_size(self, group_id, chord_size):
+-        self.set(self.get_key_for_group(group_id, '.s'), chord_size)
++        self._set_chord_key(self.get_key_for_group(group_id, '.s'), chord_size)
+ 
+     def apply_chord(self, header_result_args, body, **kwargs):
+         # If any of the child results of this chord are complex (ie. group
+@@ -754,7 +767,9 @@ def apply_chord(self, header_result_args, body, **kwargs):
+         if not isinstance(header_result_args[1], _regen):
+             header_result = self.app.GroupResult(*header_result_args)
+             if any(isinstance(nr, GroupResult) for nr in header_result.results):
+-                header_result.save(backend=self)
++                self._set_chord_key(
++                    self.get_key_for_group(header_result.id),
++                    self.encode({'result': header_result.as_tuple()}))
+ 
+     @cached_property
+     def _chord_zset(self):
+@@ -785,11 +800,17 @@ def on_chord_part_return(self, request, state, result,
+                 if self._chord_zset
+                 else pipe.rpush(jkey, encoded).llen(jkey)
+             ).get(tkey).get(skey)
+-            if self.expires:
++            expires = self.chord_expires
++            if expires:
+                 pipeline = pipeline \
+-                    .expire(jkey, self.expires) \
+-                    .expire(tkey, self.expires) \
+-                    .expire(skey, self.expires)
++                    .expire(jkey, expires) \
++                    .expire(tkey, expires) \
++                    .expire(skey, expires)
++                if self.expires:
++                    # The group key can also hold a GroupResult the user
++                    # saved, so never shorten it below result_expires.
++                    pipeline = pipeline.expire(
++                        self.get_key_for_group(gid), max(expires, self.expires))
+ 
+             _, readycount, totaldiff, chord_size_bytes = pipeline.execute()[:4]
+ 
+diff --git a/docs/userguide/canvas.rst b/docs/userguide/canvas.rst
+index 01cf41bf08f..c2ccb9e96df 100644
+--- a/docs/userguide/canvas.rst
++++ b/docs/userguide/canvas.rst
+@@ -1065,6 +1065,10 @@ Example decorated task:
+     def another_task(project):
+         do_something()
+ 
++A chord whose header tasks take longer than :setting:`result_expires` can
++lose its bookkeeping, and its body then never runs. Set
++:setting:`result_chord_expires` for chords that run that long.
++
+ By default the synchronization step is implemented by having a recurring task
+ poll the completion of the group every second, calling the signature when
+ ready.
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index 5b4cde24a62..a1583d5d175 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -1041,6 +1041,31 @@ on backend specifications).
+     When using the database or filesystem backend, ``celery beat`` must be
+     running for the results to be expired.
+ 
++See :setting:`result_chord_expires` for chords whose header tasks run longer
++than this.
++
++.. setting:: result_chord_expires
++
++``result_chord_expires``
++~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. versionadded:: 5.7
++
++Default: Same as :setting:`result_expires`.
++
++Time (in seconds, or a :class:`~datetime.timedelta` object) a chord's
++bookkeeping is kept after the chord starts or after one of its header tasks
++finishes. If it runs out before the next header task finishes, the chord's
++body never runs, so set it longer than the slowest header task.
++A value of 0 means the chord's bookkeeping never expires while the chord is
++open, and the saved header of a chord with nested groups never expires.
++The bookkeeping of a chord that never completes, for example after a lost
++header task, is then never removed.
++
++.. note::
++
++    For the moment this only works with the Redis backend.
++
+ .. setting:: result_cache_max
+ 
+ ``result_cache_max``
+diff --git a/t/integration/test_redis_backend.py b/t/integration/test_redis_backend.py
+index 0cd616c5750..6b47a510172 100644
+--- a/t/integration/test_redis_backend.py
++++ b/t/integration/test_redis_backend.py
+@@ -1,8 +1,10 @@
+ import threading
++from types import SimpleNamespace
+ 
+ import pytest
+ 
+ from celery import states, uuid
++from celery.result import AsyncResult, GroupResult
+ from t.integration.conftest import get_active_redis_channels
+ from t.integration.tasks import identity
+ 
+@@ -205,3 +207,27 @@ def run():
+         channel for channel in get_active_redis_channels()
+         if channel.startswith(b'celery-task-meta-')]
+     assert meta_channels == []
++
++
++@pytest.mark.celery(result_expires=60, result_chord_expires=600)
++def test_chord_expires(app):
++    if not app.conf.result_backend.startswith('redis'):
++        pytest.skip('Requires redis result backend.')
++
++    backend = app.backend
++    group_id = uuid()
++    header = GroupResult(group_id, [GroupResult(uuid(), [AsyncResult(uuid())])])
++    request = SimpleNamespace(id=uuid(), group=group_id, group_index=0, chord=None)
++    keys = [backend.get_key_for_group(group_id, suffix)
++            for suffix in ('', '.j', '.s')]
++    try:
++        backend.apply_chord((group_id, header.results), None)
++        backend.set_chord_size(group_id, 2)
++        assert 60 < backend.client.ttl(keys[2]) <= 600
++        backend.on_chord_part_return(request, states.SUCCESS, 1)
++
++        for key in keys:
++            assert 60 < backend.client.ttl(key) <= 600
++        assert GroupResult.restore(group_id, backend=backend) == header
++    finally:
++        backend.client.delete(*keys)
+diff --git a/t/unit/backends/test_redis.py b/t/unit/backends/test_redis.py
+index 5b39ee36eaf..7b7dd9cf1d7 100644
+--- a/t/unit/backends/test_redis.py
++++ b/t/unit/backends/test_redis.py
+@@ -114,8 +114,10 @@ def setex(self, key, expires, value):
+         self.set(key, value)
+         self.expire(key, expires)
+ 
+-    def set(self, key, value):
++    def set(self, key, value, ex=None):
+         self.keyspace[key] = value
++        if ex:
++            self.expire(key, ex)
+ 
+     def expire(self, key, expires):
+         self.expiry[key] = expires
+@@ -1920,7 +1922,21 @@ def test_set_chord_size(self):
+         b = self.Backend('redis://', app=self.app)
+         gid = uuid()
+         b.set_chord_size(gid, 10)
+-        b.client.set.assert_called_with(b.get_key_for_group(gid, '.s'), 10)
++        b.client.set.assert_called_with(
++            b.get_key_for_group(gid, '.s'), 10, ex=86400)
++
++    @pytest.mark.parametrize('chord_expires,ex', [
++        (600, 600),
++        (timedelta(hours=1), 3600),
++        (0, None),
++    ])
++    def test_set_chord_size_uses_chord_expires(self, chord_expires, ex):
++        self.app.conf.result_chord_expires = chord_expires
++        b = self.Backend('redis://', app=self.app)
++        gid = uuid()
++        b.set_chord_size(gid, 10)
++        b.client.set.assert_called_with(
++            b.get_key_for_group(gid, '.s'), 10, ex=ex)
+ 
+     def test_expires_is_None(self):
+         b = self.Backend(expires=None, app=self.app)
+@@ -2143,6 +2159,33 @@ def test_on_chord_part_return(self):
+             call(jkey, 86400), call(tkey, 86400), call(skey, 86400),
+         ])
+ 
++    @pytest.mark.parametrize('result_expires,group_expires', [
++        (100, 600),
++        (86400, 86400),
++        (None, None),
++    ])
++    def test_on_chord_part_return_uses_chord_expires(
++            self, result_expires, group_expires):
++        self.app.conf.result_expires = result_expires
++        self.app.conf.result_chord_expires = 600
++        self.b = self.Backend(app=self.app)
++        task = self.create_task(0)
++        self.b.client.expire.reset_mock()
++        self.b.on_chord_part_return(task.request, states.SUCCESS, 0)
++        jkey = self.b.get_key_for_group('group_id', '.j')
++        tkey = self.b.get_key_for_group('group_id', '.t')
++        skey = self.b.get_key_for_group('group_id', '.s')
++        gkey = self.b.get_key_for_group('group_id')
++        expected = [call(jkey, 600), call(tkey, 600), call(skey, 600)]
++        if group_expires:
++            expected.append(call(gkey, group_expires))
++        assert self.b.client.expire.call_args_list == expected
++
++    def test_set_chord_key_raises_error_on_large_value(self):
++        with pytest.raises(BackendStoreError):
++            self.b._set_chord_key(
++                'key', 'x' * (self.b._MAX_STR_VALUE_SIZE + 1))
++
+     def test_on_chord_part_return__unordered(self):
+         self.app.conf.result_backend_transport_options = dict(
+             result_chord_ordered=False,
+@@ -2329,7 +2372,7 @@ def test_on_chord_part_return__ChordError(self):
+             self.b.client.pipeline = ContextMock()
+             raise_on_second_call(self.b.client.pipeline, ChordError())
+             self.b.client.pipeline.return_value.zadd().zcount().get().get().expire(
+-            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
++            ).expire().expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
+             task = self.app._tasks['add'] = Mock(name='add_task')
+             self.b.on_chord_part_return(request, states.SUCCESS, 10)
+             task.backend.fail_from_current_stack.assert_called_with(
+@@ -2345,7 +2388,7 @@ def test_on_chord_part_return__ChordError__unordered(self):
+             self.b.client.pipeline = ContextMock()
+             raise_on_second_call(self.b.client.pipeline, ChordError())
+             self.b.client.pipeline.return_value.rpush().llen().get().get().expire(
+-            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
++            ).expire().expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
+             task = self.app._tasks['add'] = Mock(name='add_task')
+             self.b.on_chord_part_return(request, states.SUCCESS, 10)
+             task.backend.fail_from_current_stack.assert_called_with(
+@@ -2361,7 +2404,7 @@ def test_on_chord_part_return__ChordError__ordered(self):
+             self.b.client.pipeline = ContextMock()
+             raise_on_second_call(self.b.client.pipeline, ChordError())
+             self.b.client.pipeline.return_value.zadd().zcount().get().get().expire(
+-            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
++            ).expire().expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
+             task = self.app._tasks['add'] = Mock(name='add_task')
+             self.b.on_chord_part_return(request, states.SUCCESS, 10)
+             task.backend.fail_from_current_stack.assert_called_with(
+@@ -2373,7 +2416,7 @@ def test_on_chord_part_return__other_error(self):
+             self.b.client.pipeline = ContextMock()
+             raise_on_second_call(self.b.client.pipeline, RuntimeError())
+             self.b.client.pipeline.return_value.zadd().zcount().get().get().expire(
+-            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
++            ).expire().expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
+             task = self.app._tasks['add'] = Mock(name='add_task')
+             self.b.on_chord_part_return(request, states.SUCCESS, 10)
+             task.backend.fail_from_current_stack.assert_called_with(
+@@ -2389,7 +2432,7 @@ def test_on_chord_part_return__other_error__unordered(self):
+             self.b.client.pipeline = ContextMock()
+             raise_on_second_call(self.b.client.pipeline, RuntimeError())
+             self.b.client.pipeline.return_value.rpush().llen().get().get().expire(
+-            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
++            ).expire().expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
+             task = self.app._tasks['add'] = Mock(name='add_task')
+             self.b.on_chord_part_return(request, states.SUCCESS, 10)
+             task.backend.fail_from_current_stack.assert_called_with(
+@@ -2405,7 +2448,7 @@ def test_on_chord_part_return__other_error__ordered(self):
+             self.b.client.pipeline = ContextMock()
+             raise_on_second_call(self.b.client.pipeline, RuntimeError())
+             self.b.client.pipeline.return_value.zadd().zcount().get().get().expire(
+-            ).expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
++            ).expire().expire().expire().execute.return_value = (1, 1, 0, b'1', 4, 5, 6)
+             task = self.app._tasks['add'] = Mock(name='add_task')
+             self.b.on_chord_part_return(request, states.SUCCESS, 10)
+             task.backend.fail_from_current_stack.assert_called_with(
+@@ -2439,14 +2482,27 @@ def complex_header_result(self):
+     ])
+     def test_apply_chord_complex_header(self, results, assert_save_called):
+         mock_group_result = Mock()
++        mock_group_result.return_value.id = "gid11"
+         mock_group_result.return_value.results = results
++        mock_group_result.return_value.as_tuple.return_value = (("gid11", None), [])
+         self.app.GroupResult = mock_group_result
+         header_result_args = ("gid11", results)
+         self.b.apply_chord(header_result_args, None)
+         if assert_save_called:
+-            mock_group_result.return_value.save.assert_called_once_with(backend=self.b)
++            self.b.client.set.assert_called_once_with(
++                self.b.get_key_for_group("gid11"),
++                self.b.encode({"result": (("gid11", None), [])}),
++                ex=86400,
++            )
+         else:
+-            mock_group_result.return_value.save.assert_not_called()
++            self.b.client.set.assert_not_called()
++
++    def test_apply_chord_complex_header_uses_chord_expires(self):
++        self.app.conf.result_chord_expires = 600
++        self.b = self.Backend(app=self.app)
++        self.b.apply_chord(("gid11", (GroupResult("foo", []),)), None)
++        _, kwargs = self.b.client.set.call_args
++        assert kwargs == {"ex": 600}
+ 
+     def test_on_chord_part_return_timeout(self, complex_header_result):
+         tasks = [self.create_task(i) for i in range(10)]

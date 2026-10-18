@@ -1,0 +1,588 @@
+diff --git a/celery/schedules.py b/celery/schedules.py
+index c218eb9d956..3f8d59b63db 100644
+--- a/celery/schedules.py
++++ b/celery/schedules.py
+@@ -177,7 +177,19 @@ def is_due(self, last_run_at: datetime) -> tuple[bool, datetime]:
+         rem_delta = self.remaining_estimate(last_run_at)
+         remaining_s = max(rem_delta.total_seconds(), 0)
+         if remaining_s == 0:
+-            return schedstate(is_due=True, next=self.seconds)
++            next_s = self.seconds
++            if self.relative:
++                # The next rounded deadline can differ from the interval,
++                # especially across DST or after a late run / restart. Realign
++                # to the next rounded clock boundary and do not check past it.
++                now = self.maybe_make_aware(self.now())
++                now = now.astimezone(last_run_at.tzinfo)
++                next_s = self.remaining_estimate(now).total_seconds()
++                if next_s <= 0:
++                    # Preserve the interval for subsecond rounding and
++                    # zero or negative intervals with no future boundary.
++                    next_s = self.seconds
++            return schedstate(is_due=True, next=next_s)
+         return schedstate(is_due=False, next=remaining_s)
+ 
+     def __repr__(self) -> str:
+diff --git a/celery/utils/time.py b/celery/utils/time.py
+index 5ae2e1e0ec2..0e346e438c4 100644
+--- a/celery/utils/time.py
++++ b/celery/utils/time.py
+@@ -217,6 +217,22 @@ def delta_resolution(dt: datetime, delta: timedelta) -> datetime:
+     return dt
+ 
+ 
++def _relative_end_dates(dt: datetime, delta: timedelta) -> list[datetime]:
++    """Return UTC occurrences of a rounded local deadline."""
++    rounded = delta_resolution(dt, delta).replace(microsecond=0)
++    dates = []
++    for fold in (0, 1):
++        candidate = rounded.replace(fold=fold)
++        if _is_imaginary(candidate, candidate.tzinfo):
++            resolved = dateutil_tz.resolve_imaginary(candidate)
++            # Some timezone implementations misidentify rollback times as
++            # gaps. A genuine gap must resolve forwards, never backwards.
++            if resolved > candidate:
++                candidate = resolved
++        dates.append(candidate.astimezone(timezone.utc))
++    return dates
++
++
+ def remaining(
+         start: datetime, ends_in: timedelta | ffwd, now: datetime | None = None,
+         relative: bool = False) -> timedelta:
+@@ -224,6 +240,10 @@ def remaining(
+ 
+     For example, "how many seconds left for 30 seconds after start?"
+ 
++    For relative schedules, the deadline is the last rounded local boundary at
++    or before ``start + ends_in`` in real time, never at or before ``start``;
++    day intervals use calendar days.
++
+     Arguments:
+         start (~datetime.datetime): Starting date.
+         ends_in (~datetime.timedelta, ~celery.utils.time.ffwd): The end delta.
+@@ -237,12 +257,40 @@ def remaining(
+         ~datetime.timedelta: Remaining time.
+     """
+     now = now or datetime.now(datetime_timezone.utc)
+-    if isinstance(ends_in, timedelta):
++    if isinstance(ends_in, timedelta) and not (
++            relative and ends_in >= timedelta(days=1)):
+         end_date = add_seconds_to_datetime(start, ends_in.total_seconds())
+     else:
++        # Day-resolution relative schedules advance by local calendar days.
++        # An elapsed-time addition can land on the wrong date across DST.
+         end_date = start + ends_in
+     if relative:
+-        end_date = delta_resolution(end_date, ends_in).replace(microsecond=0)
++        candidates = _relative_end_dates(end_date, ends_in)
++        start_utc = start.astimezone(timezone.utc)
++        if ends_in >= timedelta(days=1):
++            # Use the first midnight after start, including a repeated
++            # midnight whose first occurrence has already passed.
++            future = [dt for dt in candidates if dt > start_utc]
++            end_date = min(future, default=end_date.astimezone(timezone.utc))
++        else:
++            end_utc = start_utc + ends_in
++            # Rounding may enter an ambiguous period even when the
++            # unrounded time is outside it. Choose by the UTC occurrence.
++            before_end = [dt for dt in candidates if dt <= end_utc]
++            rounded = max(before_end) if before_end else min(candidates)
++            if ends_in >= timedelta(minutes=1) and rounded <= start_utc:
++                # A partial-hour rollback can put the rounded boundary
++                # before start. Consider both the next clock boundary and
++                # the calendar boundary, including both occurrences.
++                unit = (timedelta(hours=1) if ends_in >= timedelta(hours=1)
++                        else timedelta(minutes=1))
++                candidates += _relative_end_dates(end_date + unit, ends_in)
++                candidates += _relative_end_dates(start + ends_in, ends_in)
++                future = [dt for dt in candidates if dt > start_utc]
++                before_end = [dt for dt in future if dt <= end_utc]
++                rounded = (max(before_end) if before_end
++                           else min(future, default=end_utc))
++            end_date = rounded
+ 
+     # Using UTC to calculate real time difference.
+     # Python by default uses wall time in arithmetic between datetimes with
+diff --git a/docs/userguide/periodic-tasks.rst b/docs/userguide/periodic-tasks.rst
+index 2a943b12c44..0fa389d1b51 100644
+--- a/docs/userguide/periodic-tasks.rst
++++ b/docs/userguide/periodic-tasks.rst
+@@ -257,6 +257,18 @@ Available Fields
+     second, minute, hour or day depending on the period of the
+     :class:`~datetime.timedelta`.
+ 
++    Intervals of a day or more advance by local calendar days before
++    rounding to midnight. For example, ``timedelta(days=1)`` becomes due
++    at the next midnight even when a DST change makes the day 23 or 25
++    hours long. If midnight falls in a DST gap, the deadline moves forward
++    by the change in UTC offset to an existing local time.
++    If midnight occurs twice, the first occurrence after the previous run
++    is used.
++
++    When an entry runs late, such as after a :program:`celery beat` restart,
++    the next check aligns to the next rounded clock boundary rather than
++    drifting from the actual execution time.
++
+     By default `relative` is false, the frequency isn't rounded and will be
+     relative to the time when :program:`celery beat` was started.
+ 
+diff --git a/t/integration/test_beat.py b/t/integration/test_beat.py
+index 499813e69ff..ead4692365f 100644
+--- a/t/integration/test_beat.py
++++ b/t/integration/test_beat.py
+@@ -1,9 +1,11 @@
+-from datetime import datetime, timedelta
++from datetime import datetime, timedelta, timezone
+ from threading import Event, Thread
+ from time import monotonic, sleep
+ from uuid import uuid4
++from zoneinfo import ZoneInfo
+ 
+ import pytest
++from dateutil import tz as dateutil_tz
+ 
+ from celery import beat
+ from celery.schedules import crontab
+@@ -12,6 +14,155 @@
+ from .conftest import flaky
+ 
+ 
++class test_beat_interval_timezones:
++    @flaky
++    @pytest.mark.usefixtures('celery_session_worker')
++    @pytest.mark.parametrize('tz_factory', [
++        pytest.param(ZoneInfo, id='zoneinfo'),
++        pytest.param(dateutil_tz.gettz, id='dateutil'),
++    ])
++    @pytest.mark.parametrize(
++        'timezone_name,interval,relative,last_run,due_at,next_due_at', [
++            pytest.param(
++                'America/New_York', timedelta(days=1), True,
++                datetime(2026, 11, 1, 0, 30), datetime(2026, 11, 2),
++                datetime(2026, 11, 3),
++                id='daily-fall-back',
++            ),
++            pytest.param(
++                'America/New_York', timedelta(days=1), True,
++                datetime(2026, 3, 7, 23, 30), datetime(2026, 3, 8),
++                datetime(2026, 3, 9),
++                id='daily-spring-forward',
++            ),
++            pytest.param(
++                'America/New_York', timedelta(days=1), True,
++                datetime(2026, 3, 8, 0, 30), datetime(2026, 3, 9),
++                datetime(2026, 3, 10),
++                id='daily-across-spring-forward',
++            ),
++            pytest.param(
++                'America/New_York', timedelta(hours=1), True,
++                datetime(2026, 3, 8, 1, 30), datetime(2026, 3, 8, 3),
++                datetime(2026, 3, 8, 4),
++                id='hourly-across-spring-forward',
++            ),
++            pytest.param(
++                'Australia/Lord_Howe', timedelta(hours=1), True,
++                datetime(2026, 10, 4, 1, 15), datetime(2026, 10, 4, 2, 30),
++                datetime(2026, 10, 4, 3),
++                id='hourly-half-hour-spring-forward',
++            ),
++            pytest.param(
++                'Africa/Cairo', timedelta(days=1), True,
++                datetime(2026, 4, 23, 23, 30), datetime(2026, 4, 24, 1),
++                datetime(2026, 4, 25),
++                id='daily-cairo-midnight-gap',
++            ),
++            pytest.param(
++                'America/Havana', timedelta(days=1), True,
++                datetime(2026, 3, 7, 23, 30), datetime(2026, 3, 8, 1),
++                datetime(2026, 3, 9),
++                id='daily-havana-midnight-gap',
++            ),
++            pytest.param(
++                'America/Goose_Bay', timedelta(days=1), True,
++                datetime(2000, 10, 28, 23, 30, fold=1),
++                datetime(2000, 10, 29, fold=1),
++                datetime(2000, 10, 30),
++                id='daily-repeated-midnight',
++            ),
++            pytest.param(
++                'Pacific/Chatham', timedelta(hours=2), True,
++                datetime(2026, 4, 5, 2, 45),
++                datetime(2026, 4, 5, 3, fold=1),
++                datetime(2026, 4, 5, 5),
++                id='two-hours-after-repeated-period',
++            ),
++            pytest.param(
++                'Australia/Lord_Howe', timedelta(hours=1), True,
++                datetime(2026, 4, 5, 1), datetime(2026, 4, 5, 2),
++                datetime(2026, 4, 5, 3),
++                id='hourly-half-hour-fall-back',
++            ),
++            pytest.param(
++                'America/New_York', timedelta(days=1), False,
++                datetime(2026, 11, 1, 0, 30), datetime(2026, 11, 1, 23, 30),
++                datetime(2026, 11, 2, 23, 30),
++                id='elapsed-day-fall-back',
++            ),
++            pytest.param(
++                'America/New_York', timedelta(days=1), False,
++                datetime(2026, 3, 7, 23, 30), datetime(2026, 3, 9, 0, 30),
++                datetime(2026, 3, 10, 0, 30),
++                id='elapsed-day-spring-forward',
++            ),
++            pytest.param(
++                'Africa/Cairo', timedelta(days=1), False,
++                datetime(2026, 4, 23, 23, 30), datetime(2026, 4, 25, 0, 30),
++                datetime(2026, 4, 26, 0, 30),
++                id='elapsed-day-midnight-gap',
++            ),
++        ],
++    )
++    def test_dispatches_once_at_deadline(
++        self, app, monkeypatch, timezone_name, interval, relative,
++        last_run, due_at, next_due_at, tz_factory,
++    ):
++        zone = tz_factory(timezone_name)
++        app.conf.timezone = zone
++        last_run = last_run.replace(tzinfo=zone)
++        due_utc = due_at.replace(tzinfo=zone).astimezone(timezone.utc)
++        now = last_run
++        # Control only Beat's clock; the broker and worker use real time.
++        monkeypatch.setattr(app, 'now', lambda: now)
++        task_id = uuid4().hex
++        scheduler = beat.Scheduler(app=app, lazy=True)
++        entry = scheduler.add(
++            name='timezone-interval', task=add.name, args=(1, 2),
++            schedule=interval, relative=relative, last_run_at=last_run,
++            options={'task_id': task_id},
++        )
++
++        assert scheduler.tick() > 0
++        assert scheduler.schedule[entry.name].total_run_count == 0
++
++        # Move through the transition without waiting for wall-clock time.
++        now = (due_utc - timedelta(seconds=1)).astimezone(zone)
++        assert scheduler.tick() > 0
++        assert scheduler.schedule[entry.name].total_run_count == 0
++
++        now = due_utc.astimezone(zone)
++        assert scheduler.tick() == 0
++        assert app.AsyncResult(task_id).get(timeout=30) == 3
++        assert scheduler.schedule[entry.name].total_run_count == 1
++        last_dispatch = scheduler.schedule[entry.name].last_run_at
++        assert last_dispatch.astimezone(timezone.utc) == due_utc
++
++        # Further ticks must not dispatch the same deadline again.
++        assert scheduler.tick() > 0
++        now = (due_utc + timedelta(seconds=1)).astimezone(zone)
++        assert scheduler.tick() > 0
++        assert scheduler.schedule[entry.name].total_run_count == 1
++
++        # Keep the populated heap and verify the following run as well.
++        next_due_utc = next_due_at.replace(tzinfo=zone).astimezone(timezone.utc)
++        next_task_id = uuid4().hex
++        scheduler.schedule[entry.name].options['task_id'] = next_task_id
++        now = (next_due_utc - timedelta(seconds=1)).astimezone(zone)
++        assert scheduler.tick() > 0
++        assert scheduler.schedule[entry.name].total_run_count == 1
++
++        now = next_due_utc.astimezone(zone)
++        assert scheduler.tick() == 0
++        assert app.AsyncResult(next_task_id).get(timeout=30) == 3
++        assert scheduler.schedule[entry.name].total_run_count == 2
++        last_dispatch = scheduler.schedule[entry.name].last_run_at
++        assert last_dispatch.astimezone(timezone.utc) == next_due_utc
++        assert scheduler.tick() > 0
++        assert scheduler.schedule[entry.name].total_run_count == 2
++
++
+ class test_beat_cron_starting_deadline:
+     @flaky
+     @pytest.mark.usefixtures('celery_session_worker')
+diff --git a/t/unit/app/test_beat.py b/t/unit/app/test_beat.py
+index 99a8a75a1fe..339426db3ba 100644
+--- a/t/unit/app/test_beat.py
++++ b/t/unit/app/test_beat.py
+@@ -446,6 +446,35 @@ def test_ticks_microseconds(self):
+         expected_time = now_ts + 0.5 - 0.010
+         assert scheduler._heap[0].time == expected_time
+ 
++    def test_tick_daily_relative_spring_forward(self, monkeypatch):
++        self.app.conf.timezone = 'America/New_York'
++        tz = ZoneInfo('America/New_York')
++        now = datetime(2026, 3, 8, tzinfo=tz)
++        monkeypatch.setattr(self.app, 'now', lambda: now)
++        scheduler = mScheduler(app=self.app, lazy=True)
++        entry = scheduler.add(
++            name='daily', task='t.fake.task',
++            schedule=timedelta(days=1), relative=True,
++            last_run_at=datetime(2026, 3, 7, tzinfo=tz),
++        )
++
++        assert scheduler.tick() == 0
++        assert scheduler.schedule[entry.name].total_run_count == 1
++
++        # The next midnight is 23 elapsed hours away, including heap drift.
++        next_delay = scheduler._heap[0].time - now.timestamp()
++        assert next_delay == pytest.approx(82800, abs=0.02, rel=0)
++
++        now = datetime(2026, 3, 8, 23, 59, 59, tzinfo=tz)
++        assert scheduler.tick() > 0
++        assert scheduler.schedule[entry.name].total_run_count == 1
++
++        now = datetime(2026, 3, 9, tzinfo=tz)
++        assert scheduler.tick() == 0
++        assert scheduler.schedule[entry.name].total_run_count == 2
++        assert scheduler.tick() > 0
++        assert scheduler.schedule[entry.name].total_run_count == 2
++
+     def test_ticks_schedule_change(self):
+         # initialise schedule and check heap is not initialized
+         scheduler = mScheduler(app=self.app)
+diff --git a/t/unit/app/test_schedules.py b/t/unit/app/test_schedules.py
+index dae466be2e6..0bd952fea67 100644
+--- a/t/unit/app/test_schedules.py
++++ b/t/unit/app/test_schedules.py
+@@ -7,6 +7,7 @@
+ from unittest.mock import Mock
+ 
+ import pytest
++from dateutil import tz as dateutil_tz
+ 
+ from celery.exceptions import ImproperlyConfigured
+ from celery.schedules import ParseException, crontab, crontab_parser, schedule, solar
+@@ -252,6 +253,233 @@ def test_is_not_due_before_fall_back_relative(self):
+         s = schedule(timedelta(hours=1), relative=True, nowfun=lambda: now, app=self.app)
+         assert s.is_due(last_run_at) == (False, 2)
+ 
++    @pytest.mark.parametrize('relative', [False, True])
++    @pytest.mark.parametrize('interval,relative_next', [
++        pytest.param(timedelta(seconds=0.1), 0.1, id='subsecond'),
++        pytest.param(timedelta(seconds=1), 0.25, id='second'),
++        pytest.param(timedelta(0), 0, id='zero'),
++        pytest.param(timedelta(seconds=-1), 0, id='negative'),
++    ])
++    def test_next_check_for_short_intervals(
++        self, interval, relative_next, relative,
++    ):
++        now = datetime(2026, 1, 1, microsecond=750000, tzinfo=timezone.utc)
++        s = schedule(
++            interval, relative=relative, nowfun=lambda: now, app=self.app,
++        )
++        next_check = (relative_next if relative
++                      else max(interval.total_seconds(), 0))
++        assert s.is_due(now - timedelta(seconds=10)) == (True, next_check)
++
++    @pytest.mark.parametrize('relative,expected_next', [
++        (True, 30),
++        (False, 3600),
++    ])
++    def test_next_check_realigns_after_late_run(self, relative, expected_next):
++        # When an hourly task runs late at 10:59:30, relative=True realigns
++        # to the next hour boundary (11:00:00) in 30 seconds.
++        last_run_at = datetime(2026, 1, 1, 9, 0, 0, tzinfo=timezone.utc)
++        now = datetime(2026, 1, 1, 10, 59, 30, tzinfo=timezone.utc)
++        s = schedule(
++            timedelta(hours=1), relative=relative, nowfun=lambda: now,
++            app=self.app,
++        )
++        assert s.is_due(last_run_at) == (True, expected_next)
++
++    @pytest.mark.parametrize('tz_factory', [
++        pytest.param(ZoneInfo, id='zoneinfo'),
++        pytest.param(dateutil_tz.gettz, id='dateutil'),
++    ])
++    @pytest.mark.parametrize('zone,interval,last_run_at,due_at,next_check', [
++        pytest.param(
++            'America/New_York', timedelta(days=1),
++            datetime(2026, 11, 1, 0, 30), datetime(2026, 11, 2),
++            86400,
++            id='daily-fall-back',
++        ),
++        pytest.param(
++            'America/New_York', timedelta(days=2),
++            datetime(2026, 10, 31, 0, 30), datetime(2026, 11, 2),
++            172800,
++            id='two-days-fall-back',
++        ),
++        pytest.param(
++            'America/New_York', timedelta(days=1),
++            datetime(2026, 3, 7, 23, 30), datetime(2026, 3, 8),
++            82800,
++            id='daily-spring-forward',
++        ),
++        pytest.param(
++            'America/New_York', timedelta(days=1),
++            datetime(2026, 3, 8, 0, 30), datetime(2026, 3, 9),
++            86400,
++            id='daily-across-spring-forward',
++        ),
++        pytest.param(
++            'America/New_York', timedelta(hours=1),
++            datetime(2026, 3, 8, 1, 30), datetime(2026, 3, 8, 3),
++            3600,
++            id='hourly-across-spring-forward',
++        ),
++        pytest.param(
++            'Australia/Lord_Howe', timedelta(hours=1),
++            datetime(2026, 10, 4, 1, 15), datetime(2026, 10, 4, 2, 30),
++            1800,
++            id='hourly-half-hour-spring-forward',
++        ),
++        pytest.param(
++            'America/New_York', timedelta(days=2),
++            datetime(2026, 3, 6, 23, 30), datetime(2026, 3, 8),
++            169200,
++            id='two-days-spring-forward',
++        ),
++        pytest.param(
++            'Australia/Lord_Howe', timedelta(hours=1),
++            datetime(2026, 4, 5, 1), datetime(2026, 4, 5, 2),
++            3600,
++            id='hourly-half-hour-fall-back',
++        ),
++        pytest.param(
++            'America/New_York', timedelta(hours=1),
++            datetime(2026, 11, 1, 1, 15),
++            datetime(2026, 11, 1, 1, fold=1),
++            3600,
++            id='hourly-repeated-hour',
++        ),
++        pytest.param(
++            'America/Havana', timedelta(days=1),
++            datetime(2026, 3, 7, 23, 30), datetime(2026, 3, 8, 1),
++            82800,
++            id='daily-midnight-spring-forward',
++        ),
++        pytest.param(
++            'America/Havana', timedelta(days=2),
++            datetime(2026, 3, 6, 23, 30), datetime(2026, 3, 8, 1),
++            169200,
++            id='two-days-midnight-spring-forward',
++        ),
++        pytest.param(
++            'America/Havana', timedelta(days=1),
++            datetime(2026, 10, 31, 23, 30), datetime(2026, 11, 1),
++            90000,
++            id='daily-midnight-fall-back',
++        ),
++        pytest.param(
++            'Asia/Singapore', timedelta(hours=1),
++            datetime(1945, 9, 11, 23),
++            datetime(1945, 9, 11, 23, fold=1),
++            3600,
++            id='hourly-ninety-minute-fall-back',
++        ),
++        pytest.param(
++            'Pacific/Nauru', timedelta(hours=1),
++            datetime(1942, 8, 28, 23),
++            datetime(1942, 8, 28, 22, fold=1),
++            3600,
++            id='hourly-two-and-half-hours-fall-back',
++        ),
++        pytest.param(
++            'Asia/Kathmandu', timedelta(days=1),
++            datetime(1985, 12, 31, 23, 50), datetime(1986, 1, 1, 0, 15),
++            85500,
++            id='daily-quarter-hour-midnight-gap',
++        ),
++        pytest.param(
++            'Pacific/Apia', timedelta(days=1),
++            datetime(2011, 12, 29, 23, 30), datetime(2011, 12, 31),
++            86400,
++            id='daily-skipped-date',
++        ),
++        pytest.param(
++            'Pacific/Kwajalein', timedelta(days=1),
++            datetime(1969, 9, 30, 0, 30), datetime(1969, 10, 1),
++            86400,
++            id='daily-twenty-three-hour-fall-back',
++        ),
++        pytest.param(
++            'America/Goose_Bay', timedelta(days=1),
++            datetime(2000, 10, 28, 23, 30, fold=1),
++            datetime(2000, 10, 29, fold=1),
++            86400,
++            id='daily-second-midnight',
++        ),
++        pytest.param(
++            'America/Goose_Bay', timedelta(hours=1),
++            datetime(2000, 10, 28, 23, 1), datetime(2000, 10, 29),
++            3600,
++            id='hourly-first-midnight',
++        ),
++        pytest.param(
++            'America/Goose_Bay', timedelta(hours=1),
++            datetime(2000, 10, 28, 23, 1, fold=1),
++            datetime(2000, 10, 29, fold=1),
++            3600,
++            id='hourly-second-midnight',
++        ),
++        pytest.param(
++            'Pacific/Chatham', timedelta(hours=2),
++            datetime(2026, 4, 5, 2, 45),
++            datetime(2026, 4, 5, 3, fold=1),
++            7200,
++            id='two-hours-after-repeated-period',
++        ),
++        pytest.param(
++            'Antarctica/Casey', timedelta(days=1),
++            datetime(2010, 3, 4, 23, 30, fold=1),
++            datetime(2010, 3, 5, fold=1),
++            86400,
++            id='daily-three-hours-fall-back',
++        ),
++        pytest.param(
++            'Africa/Cairo', timedelta(days=1),
++            datetime(2026, 4, 23, 23, 30), datetime(2026, 4, 24, 1),
++            82800,
++            id='daily-cairo-midnight-gap',
++        ),
++    ])
++    def test_relative_schedule_across_dst(
++        self, zone, interval, last_run_at, due_at, next_check,
++        tz_factory,
++    ):
++        self.app.conf.timezone = tz_factory(zone)
++        last_run_at = last_run_at.replace(tzinfo=self.app.timezone)
++        due_at = due_at.replace(tzinfo=self.app.timezone)
++        now = last_run_at
++        s = schedule(
++            interval, relative=True, nowfun=lambda: now, app=self.app,
++        )
++        expected_remaining = (
++            due_at.astimezone(timezone.utc) - now.astimezone(timezone.utc)
++        ).total_seconds()
++
++        assert s.is_due(last_run_at) == (False, expected_remaining)
++
++        now = due_at.astimezone(timezone.utc) - timedelta(seconds=1)
++        assert s.is_due(last_run_at) == (False, 1)
++
++        now = due_at
++        assert s.is_due(last_run_at) == (True, next_check)
++
++        now = due_at.astimezone(timezone.utc) + timedelta(seconds=10)
++        assert s.is_due(last_run_at) == (True, next_check - 10)
++
++    @pytest.mark.parametrize('last_run_at', [
++        datetime(2026, 11, 1, 0, 30),
++        datetime(2026, 3, 7, 23, 30),
++    ])
++    def test_non_relative_daily_schedule_uses_elapsed_time(
++        self, last_run_at,
++    ):
++        self.app.conf.timezone = 'America/New_York'
++        last_run_at = last_run_at.replace(tzinfo=self.app.timezone)
++        now = last_run_at
++        s = schedule(timedelta(days=1), nowfun=lambda: now, app=self.app)
++
++        assert s.is_due(last_run_at) == (False, 86400)
++
++        now = last_run_at.astimezone(timezone.utc) + timedelta(days=1)
++        assert s.is_due(last_run_at) == (True, 86400)
++
+ 
+ # Module-level helper used as crontab(nowfun=...) in pickling tests.
+ # Defined at top level so it is picklable/serializable.

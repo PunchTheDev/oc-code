@@ -1,0 +1,284 @@
+diff --git a/packages/reactivity/__tests__/watch.spec.ts b/packages/reactivity/__tests__/watch.spec.ts
+index 6a020402175..8daad52938c 100644
+--- a/packages/reactivity/__tests__/watch.spec.ts
++++ b/packages/reactivity/__tests__/watch.spec.ts
+@@ -4,6 +4,7 @@ import {
+   WatchErrorCodes,
+   type WatchOptions,
+   computed,
++  onEffectCleanup,
+   onWatcherCleanup,
+   ref,
+   watch,
+@@ -254,4 +255,113 @@ describe('watch', () => {
+     value.value = true
+     expect(value.value).toBe(false)
+   })
++
++  // #15765
++  test.each([false, true])(
++    'should preserve callback cleanups when getter values are unchanged (multiple sources: %s)',
++    multiple => {
++      const source = ref(1)
++      const onCleanup = vi.fn()
++      const onWatcherCleanupSpy = vi.fn()
++      const cb = vi.fn((_value, _oldValue, cleanup) => {
++        cleanup(onCleanup)
++        onWatcherCleanup(onWatcherCleanupSpy)
++      })
++      const getter = () => source.value > 0
++      const stop = watch(multiple ? [getter] : getter, cb, { immediate: true })
++
++      source.value++
++      expect(cb).toHaveBeenCalledTimes(1)
++      expect(onCleanup).not.toHaveBeenCalled()
++      expect(onWatcherCleanupSpy).not.toHaveBeenCalled()
++
++      stop()
++      expect(onCleanup).toHaveBeenCalledTimes(1)
++      expect(onWatcherCleanupSpy).toHaveBeenCalledTimes(1)
++    },
++  )
++
++  test('should clean up getter effects separately from watch callbacks', () => {
++    const source = ref(1)
++    const calls: string[] = []
++    const stop = watch(
++      () => {
++        calls.push('getter')
++        onEffectCleanup(() => calls.push('getter cleanup'))
++        return source.value > 0
++      },
++      (_value, _oldValue, onCleanup) => {
++        calls.push('callback')
++        onCleanup(() => calls.push('callback cleanup'))
++      },
++      { immediate: true },
++    )
++    expect(calls).toEqual(['getter', 'callback'])
++
++    calls.length = 0
++    source.value++
++    expect(calls).toEqual(['getter cleanup', 'getter'])
++
++    calls.length = 0
++    source.value = 0
++    expect(calls).toEqual([
++      'getter cleanup',
++      'getter',
++      'callback cleanup',
++      'callback',
++    ])
++
++    calls.length = 0
++    stop()
++    expect(calls).toEqual(['getter cleanup', 'callback cleanup'])
++  })
++
++  test('should preserve mixed cleanup registration order in watchEffect', () => {
++    const source = ref(0)
++    const calls: string[] = []
++    const stop = watch(onCleanup => {
++      source.value
++      onWatcherCleanup(() => calls.push('watcher'))
++      onEffectCleanup(() => calls.push('effect'))
++      onCleanup(() => calls.push('bound'))
++    })
++    expect(calls).toEqual([])
++
++    source.value++
++    expect(calls).toEqual(['watcher', 'effect', 'bound'])
++
++    calls.length = 0
++    stop()
++    expect(calls).toEqual(['watcher', 'effect', 'bound'])
++    stop()
++    expect(calls).toEqual(['watcher', 'effect', 'bound'])
++  })
++
++  test('should preserve cleanups registered during synchronous cleanup reentry', () => {
++    const source = ref(0)
++    const cleaned: number[] = []
++    const active = new Set<number>()
++    const stop = watch(
++      source,
++      value => {
++        active.add(value)
++        onWatcherCleanup(() => {
++          cleaned.push(value)
++          active.delete(value)
++          if (value === 0 && source.value === 1) {
++            source.value = 2
++          }
++        })
++      },
++      { immediate: true },
++    )
++
++    source.value = 1
++    expect(cleaned).toEqual([0])
++    expect([...active]).toEqual([2, 1])
++
++    stop()
++    expect(cleaned).toEqual([0, 2, 1])
++    expect(active.size).toBe(0)
++  })
+ })
+diff --git a/packages/reactivity/src/watch.ts b/packages/reactivity/src/watch.ts
+index 98d160f931c..92e737f4810 100644
+--- a/packages/reactivity/src/watch.ts
++++ b/packages/reactivity/src/watch.ts
+@@ -91,11 +91,13 @@ export function onWatcherCleanup(
+ ): void {
+   if (owner) {
+     const { call } = owner.options
+-    if (call) {
+-      owner.cleanups[owner.cleanupsLength++] = () =>
+-        call(cleanupFn, WatchErrorCodes.WATCH_CLEANUP)
++    const cleanup = call
++      ? () => call(cleanupFn, WatchErrorCodes.WATCH_CLEANUP)
++      : cleanupFn
++    if (owner.cb) {
++      ;(owner.cbCleanups || (owner.cbCleanups = [])).push(cleanup)
+     } else {
+-      owner.cleanups[owner.cleanupsLength++] = cleanupFn
++      owner.cleanups[owner.cleanupsLength++] = cleanup
+     }
+   } else if (__DEV__ && !failSilently) {
+     warn(
+@@ -109,6 +111,7 @@ export class WatcherEffect extends ReactiveEffect {
+   forceTrigger: boolean
+   isMultiSource: boolean
+   oldValue: any
++  cbCleanups?: (() => void)[]
+   boundCleanup: typeof onWatcherCleanup = fn =>
+     onWatcherCleanup(fn, false, this)
+ 
+@@ -210,6 +213,24 @@ export class WatcherEffect extends ReactiveEffect {
+     }
+   }
+ 
++  cleanupCallback(): void {
++    const cleanups = this.cbCleanups
++    if (cleanups) {
++      // Cleanups may synchronously trigger the watcher again.
++      this.cbCleanups = undefined
++      for (let i = 0, l = cleanups.length; i < l; i++) {
++        cleanups[i]()
++      }
++    }
++  }
++
++  stop(): void {
++    if (this.active) {
++      super.stop()
++      this.cleanupCallback()
++    }
++  }
++
+   run(initialRun = false): void {
+     const oldValue = this.oldValue
+     const newValue = (this.oldValue = super.run())
+@@ -229,7 +250,7 @@ export class WatcherEffect extends ReactiveEffect {
+         : hasChanged(newValue, oldValue))
+     ) {
+       // cleanup before running cb again
+-      cleanup(this)
++      this.cleanupCallback()
+       const currentWatcher = activeWatcher
+       activeWatcher = this
+       try {
+diff --git a/packages/runtime-core/__tests__/apiWatch.spec.ts b/packages/runtime-core/__tests__/apiWatch.spec.ts
+index b23d2a49aca..3bf3382c11f 100644
+--- a/packages/runtime-core/__tests__/apiWatch.spec.ts
++++ b/packages/runtime-core/__tests__/apiWatch.spec.ts
+@@ -2116,6 +2116,89 @@ describe('api: watch', () => {
+     createApp(App).mount(root)
+     expect(onCleanup).toBeCalledTimes(0)
+   })
++
++  // #15765
++  test.each(['pre', 'post', 'sync'] as const)(
++    'should preserve watcher cleanup when the getter value is unchanged (flush: %s)',
++    async flush => {
++      const count = ref(1)
++      const calls: string[] = []
++      const scope = effectScope()
++
++      scope.run(() => {
++        watch(
++          () => count.value > 0,
++          (value, _, onCleanup) => {
++            calls.push(`callback:${value}`)
++            onCleanup(() => calls.push(`onCleanup:${value}`))
++            onWatcherCleanup(() => calls.push(`onWatcherCleanup:${value}`))
++          },
++          { immediate: true, flush },
++        )
++      })
++      expect(calls).toEqual(['callback:true'])
++
++      count.value = 2
++      await nextTick()
++      expect(calls).toEqual(['callback:true'])
++
++      count.value = 0
++      await nextTick()
++      expect(calls).toEqual([
++        'callback:true',
++        'onCleanup:true',
++        'onWatcherCleanup:true',
++        'callback:false',
++      ])
++
++      count.value = -1
++      await nextTick()
++      expect(calls).toEqual([
++        'callback:true',
++        'onCleanup:true',
++        'onWatcherCleanup:true',
++        'callback:false',
++      ])
++
++      scope.stop()
++      expect(calls).toEqual([
++        'callback:true',
++        'onCleanup:true',
++        'onWatcherCleanup:true',
++        'callback:false',
++        'onCleanup:false',
++        'onWatcherCleanup:false',
++      ])
++      scope.stop()
++      expect(calls).toHaveLength(6)
++    },
++  )
++
++  test('should preserve cleanups registered during synchronous cleanup reentry', () => {
++    const source = ref(0)
++    const cleaned: number[] = []
++    const live = new Set<number>()
++    const stop = watch(
++      source,
++      (value, _, onCleanup) => {
++        live.add(value)
++        onCleanup(() => {
++          cleaned.push(value)
++          live.delete(value)
++          if (source.value === 1) {
++            source.value = 2
++          }
++        })
++      },
++      { immediate: true, flush: 'sync' },
++    )
++
++    source.value = 1
++    stop()
++
++    expect.soft(cleaned).toEqual([0, 2, 1])
++    expect.soft([...live]).toEqual([])
++  })
+ })
+ 
+ function getEffectsCount(scope: EffectScope): number {

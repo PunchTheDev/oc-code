@@ -1,0 +1,269 @@
+diff --git a/docs/config/browser/instances.md b/docs/config/browser/instances.md
+index 446545ea6820..ea924b39148b 100644
+--- a/docs/config/browser/instances.md
++++ b/docs/config/browser/instances.md
+@@ -38,6 +38,8 @@ export default defineConfig({
+ For more examples, refer to the ["Multiple Setups" guide](/guide/browser/multiple-setups).
+ :::
+ 
++The [`globalSetup`](/config/globalsetup) files of the config that defines `instances` run once for all of them, not once per instance, and receive the project of that config. Values they provide with `project.provide` are available in every instance. Global setup files defined in an instance run only for that instance.
++
+ List of available `browser` options:
+ 
+ - `browser` (the name of the browser)
+diff --git a/packages/vitest/src/node/core.ts b/packages/vitest/src/node/core.ts
+index a264c6b53b60..a0f71f81448b 100644
+--- a/packages/vitest/src/node/core.ts
++++ b/packages/vitest/src/node/core.ts
+@@ -1639,13 +1639,20 @@ export class Vitest {
+         clearTimeout(this._rerunTimer)
+         await this.runningPromise?.catch(noop)
+ 
+-        const teardownProjects = [...this.projects]
+-        if (this.coreWorkspaceProject && !teardownProjects.includes(this.coreWorkspaceProject)) {
+-          teardownProjects.push(this.coreWorkspaceProject)
++        const teardownProjects = new Set<TestProject>()
++        for (const project of this.projects) {
++          // the project that declares browser instances runs their global setup
++          if (project._instanceParent) {
++            teardownProjects.add(project._instanceParent)
++          }
++          teardownProjects.add(project)
++        }
++        if (this.coreWorkspaceProject) {
++          teardownProjects.add(this.coreWorkspaceProject)
+         }
+         const teardownErrors: unknown[] = []
+         // do teardown before closing the server
+-        for (const project of teardownProjects.reverse()) {
++        for (const project of [...teardownProjects].reverse()) {
+           await project._teardownGlobalSetup().catch((error) => {
+             teardownErrors.push(error)
+           })
+diff --git a/packages/vitest/src/node/project.ts b/packages/vitest/src/node/project.ts
+index 132939f2a940..aaf9f0ea4c45 100644
+--- a/packages/vitest/src/node/project.ts
++++ b/packages/vitest/src/node/project.ts
+@@ -11,7 +11,7 @@ import crypto from 'node:crypto'
+ import { readFileSync } from 'node:fs'
+ import { rm } from 'node:fs/promises'
+ import { tmpdir } from 'node:os'
+-import { deepMerge, nanoid, slash } from '@vitest/utils/helpers'
++import { deepMerge, nanoid, slash, toArray } from '@vitest/utils/helpers'
+ import { isAbsolute, join, relative } from 'pathe'
+ import pm from 'picomatch'
+ import { createDefinesScript } from '../utils/config-helpers'
+@@ -142,9 +142,11 @@ export class TestProject {
+       return this._provided
+     }
+     // globalSetup can run even if core workspace is not part of the test run
+-    // so we need to inherit its provided context
++    // so we need to inherit its provided context. Browser instances inherit
++    // the context of the project that runs their global setup
++    const parent = this._instanceParent ?? this.vitest.getRootProject()
+     return {
+-      ...this.vitest.getRootProject().getProvidedContext(),
++      ...parent.getProvidedContext(),
+       ...this._provided,
+     }
+   }
+@@ -221,6 +223,13 @@ export class TestProject {
+       return
+     }
+ 
++    // the project that declares browser instances runs their inherited global setup once
++    const parent = this._instanceParent
++    await parent?._initializeGlobalSetup()
++    const globalSetup = parent
++      ? toArray(this.config.globalSetup).filter((file) => !parent.config.globalSetup.includes(file))
++      : this.config.globalSetup
++
+     const native = this.runner instanceof NativeModuleRunner
+     // global setup is imported by this process, so its imports are only known to a resolve hook
+     const canRecord =
+@@ -229,7 +238,7 @@ export class TestProject {
+       !this.config.globalSetup.length ||
+       trackNativeImports()
+ 
+-    this._globalSetups = await loadGlobalSetupFiles(this.runner, this.config.globalSetup)
++    this._globalSetups = await loadGlobalSetupFiles(this.runner, globalSetup)
+     if (canRecord) {
+       this.vitest.cache._dependencies.recordGlobalSetup(
+         this,
+@@ -431,6 +440,11 @@ export class TestProject {
+   /** @internal */
+   public _parent?: TestProject
+ 
++  /** @internal */
++  get _instanceParent(): TestProject | undefined {
++    return this._parent?._parentBrowser ? this._parent : undefined
++  }
++
+   /**
+    * Closes the project and all associated resources. This can only be called once; the closing promise is cached until the server restarts.
+    * If the resources are needed again, create a new project.
+diff --git a/test/e2e/test/global-setup.test.ts b/test/e2e/test/global-setup.test.ts
+index 1504ac6dfa04..31ee504fd448 100644
+--- a/test/e2e/test/global-setup.test.ts
++++ b/test/e2e/test/global-setup.test.ts
+@@ -1,6 +1,6 @@
+ import { resolve } from 'pathe'
+-import { expect, it } from 'vitest'
+-import { runVitest } from '../../test-utils'
++import { describe, expect, it } from 'vitest'
++import { runInlineTests, runVitest, ts } from '../../test-utils'
+ 
+ it('should fail', async () => {
+   const root = resolve(import.meta.dirname, '../fixtures/global-setup-fail')
+@@ -75,3 +75,151 @@ it('respects root', async () => {
+ 
+   expect(stderr).toBe('')
+ })
++
++describe('browser instances', () => {
++  const globalSetup = ts`
++    import { appendFileSync } from 'node:fs'
++    import { resolve } from 'node:path'
++
++    export default function setup(project) {
++      const name = project.name || '<root>'
++      const log = (event) => {
++        appendFileSync(resolve(project.config.root, 'global-setup.log'), event + ' ' + name + '\n')
++      }
++      log('setup')
++      project.provide('setupProject', name)
++      project.onTestsRerun(() => log('rerun'))
++      return () => log('teardown')
++    }
++  `
++
++  const injectTest = (expected: string) => ts`
++    import { expect, inject, test } from 'vitest'
++
++    test('injects the value provided by the global setup', () => {
++      expect(inject('setupProject')).toBe('${expected}')
++    })
++  `
++
++  it('runs the root global setup once', async () => {
++    const { ctx, vitest, errorTree, fs } = await runInlineTests(
++      {
++        'global-setup.js': globalSetup,
++        'basic.test.js': injectTest('<root>'),
++        'vitest.config.js': ts`
++          import { playwright } from '@vitest/browser-playwright'
++          import { defineConfig } from 'vitest/config'
++
++          export default defineConfig({
++            test: {
++              globalSetup: './global-setup.js',
++              browser: {
++                enabled: true,
++                headless: true,
++                provider: playwright(),
++                instances: [
++                  { browser: 'chromium', name: 'chromium-1' },
++                  { browser: 'chromium', name: 'chromium-2' },
++                ],
++              },
++            },
++          })
++        `,
++      },
++      { watch: true },
++    )
++
++    await ctx!.rerunTestSpecifications(
++      ctx!.state.getTestModules().map((testModule) => testModule.toTestSpecification()),
++    )
++    await ctx!.close()
++
++    expect(vitest.stderr).toBe('')
++    expect(errorTree({ project: true })).toMatchInlineSnapshot(`
++      {
++        "chromium-1": {
++          "basic.test.js": {
++            "injects the value provided by the global setup": "passed",
++          },
++        },
++        "chromium-2": {
++          "basic.test.js": {
++            "injects the value provided by the global setup": "passed",
++          },
++        },
++      }
++    `)
++    expect(fs.readFile('global-setup.log')).toMatchInlineSnapshot(`
++      "setup <root>
++      rerun <root>
++      teardown <root>
++      "
++    `)
++  })
++
++  it('runs the global setup of the project that declares the instances once', async () => {
++    const { stderr, errorTree, fs } = await runInlineTests({
++      'global-setup.js': globalSetup,
++      'instance-setup.js': ts`
++        import { appendFileSync } from 'node:fs'
++        import { resolve } from 'node:path'
++
++        export default function setup(project) {
++          appendFileSync(resolve(project.config.root, 'global-setup.log'), 'instance setup ' + project.name + '\n')
++        }
++      `,
++      'basic.test.js': injectTest('app'),
++      'vitest.config.js': ts`
++        import { playwright } from '@vitest/browser-playwright'
++        import { defineConfig } from 'vitest/config'
++
++        export default defineConfig({
++          test: {
++            globalSetup: './global-setup.js',
++            projects: [
++              {
++                test: {
++                  name: 'app',
++                  globalSetup: './global-setup.js',
++                  browser: {
++                    enabled: true,
++                    headless: true,
++                    provider: playwright(),
++                    instances: [
++                      { browser: 'chromium', name: 'chromium-1', globalSetup: './instance-setup.js' },
++                      { browser: 'chromium', name: 'chromium-2' },
++                    ],
++                  },
++                },
++              },
++            ],
++          },
++        })
++      `,
++    })
++
++    expect(stderr).toBe('')
++    expect(errorTree({ project: true })).toMatchInlineSnapshot(`
++      {
++        "chromium-1": {
++          "basic.test.js": {
++            "injects the value provided by the global setup": "passed",
++          },
++        },
++        "chromium-2": {
++          "basic.test.js": {
++            "injects the value provided by the global setup": "passed",
++          },
++        },
++      }
++    `)
++    expect(fs.readFile('global-setup.log')).toMatchInlineSnapshot(`
++      "setup app
++      instance setup chromium-1
++      setup <root>
++      teardown <root>
++      teardown app
++      "
++    `)
++  })
++})

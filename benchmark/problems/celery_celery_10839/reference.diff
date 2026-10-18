@@ -1,0 +1,224 @@
+diff --git a/celery/worker/autoscale.py b/celery/worker/autoscale.py
+index e5b9024cade..13321b61d07 100644
+--- a/celery/worker/autoscale.py
++++ b/celery/worker/autoscale.py
+@@ -47,6 +47,13 @@ def create(self, w):
+         )
+         return scaler if not w.use_eventloop else None
+ 
++    def start(self, w):
++        if not w.use_eventloop:
++            on_task_received = getattr(w.autoscaler, 'on_task_received', None)
++            if on_task_received is not None:
++                w.consumer.on_task_message.add(on_task_received)
++        super().start(w)
++
+     def register_with_event_loop(self, w, hub):
+         w.consumer.on_task_message.add(w.autoscaler.maybe_scale)
+         hub.call_repeatedly(
+@@ -71,6 +78,7 @@ def __init__(self, pool, max_concurrency,
+         self.min_concurrency = min_concurrency
+         self.keepalive = keepalive
+         self._last_scale_up = None
++        self._last_task_received = None
+         self.worker = worker
+ 
+         assert self.keepalive, 'cannot scale down too fast.'
+@@ -92,9 +100,14 @@ def _maybe_scale(self, req=None):
+             return True
+ 
+     def maybe_scale(self, req=None):
++        if req is not None:
++            self.on_task_received(req)
+         if self._maybe_scale(req):
+             self.pool.maintain_pool()
+ 
++    def on_task_received(self, req):
++        self._last_task_received = monotonic()
++
+     def update(self, max=None, min=None):
+         with self.mutex:
+             if max is not None:
+@@ -113,8 +126,13 @@ def scale_up(self, n):
+         return self._grow(n)
+ 
+     def scale_down(self, n):
+-        if self._last_scale_up and (
+-                monotonic() - self._last_scale_up > self.keepalive):
++        last_active = self._last_scale_up
++        last_received = self._last_task_received
++        if last_received is not None and (
++                last_active is None or last_received > last_active):
++            last_active = last_received
++        if last_active is not None and (
++                monotonic() - last_active > self.keepalive):
+             return self._shrink(n)
+ 
+     def _grow(self, n):
+diff --git a/docs/userguide/workers.rst b/docs/userguide/workers.rst
+index 4b0cc92bc59..058261b5433 100644
+--- a/docs/userguide/workers.rst
++++ b/docs/userguide/workers.rst
+@@ -919,6 +919,12 @@ based on load:
+ - The autoscaler adds more pool processes when there is work to do,
+     - and starts removing processes when the workload is low.
+ 
++Before removing processes, it waits for the keepalive period (30 seconds
++by default) to pass since the last task was accepted for immediate execution
++or the pool was grown. Tasks routed through ETA/countdown or rate-limit
++scheduling do not reset this timer.
++Set the ``AUTOSCALE_KEEPALIVE`` environment variable to change this period.
++
+ It's enabled by the :option:`--autoscale <celery worker --autoscale>` option,
+ which needs two numbers: the maximum and minimum number of pool processes:
+ 
+diff --git a/t/smoke/tests/test_autoscale.py b/t/smoke/tests/test_autoscale.py
+new file mode 100644
+index 00000000000..4782dbfa134
+--- /dev/null
++++ b/t/smoke/tests/test_autoscale.py
+@@ -0,0 +1,42 @@
++from __future__ import annotations
++
++import pytest
++from pytest_celery import CeleryTestSetup
++
++from celery import group
++from t.smoke.tasks import long_running_task
++
++RESULT_TIMEOUT = 30
++
++
++class test_autoscale_keepalive:
++    @pytest.fixture
++    def default_worker_command(self, default_worker_container_cls):
++        return default_worker_container_cls.command("--pool=prefork", "--autoscale=2,1")
++
++    @pytest.fixture
++    def default_worker_env(self, default_worker_env: dict) -> dict:
++        default_worker_env["AUTOSCALE_KEEPALIVE"] = "5"
++        return default_worker_env
++
++    def test_short_gaps_do_not_replace_pool_processes(self, celery_setup: CeleryTestSetup):
++        worker = celery_setup.worker
++        queue = worker.worker_queue
++        inspector = celery_setup.app.control.inspect(
++            destination=[worker.hostname()], timeout=RESULT_TIMEOUT,
++        )
++
++        burst = group(long_running_task.si(2).set(queue=queue) for _ in range(2))
++        assert burst.delay().get(timeout=RESULT_TIMEOUT) == [True, True]
++        stats = inspector.stats()
++        assert stats is not None
++        processes = set(stats[worker.hostname()]["pool"]["processes"])
++        assert len(processes) == 2
++
++        # Receipts continue beyond the keepalive measured from the initial growth.
++        # Each gap is short enough that the same processes should handle the next burst.
++        for _ in range(3):
++            assert burst.delay().get(timeout=RESULT_TIMEOUT) == [True, True]
++            stats = inspector.stats()
++            assert stats is not None
++            assert set(stats[worker.hostname()]["pool"]["processes"]) == processes
+diff --git a/t/unit/worker/test_autoscale.py b/t/unit/worker/test_autoscale.py
+index c5f459b5ff0..077537f7c4e 100644
+--- a/t/unit/worker/test_autoscale.py
++++ b/t/unit/worker/test_autoscale.py
+@@ -1,4 +1,5 @@
+ import sys
++from threading import Event, Thread
+ from time import monotonic
+ from unittest.mock import Mock, patch
+ 
+@@ -35,6 +36,33 @@ def num_processes(self):
+ 
+ class test_WorkerComponent:
+ 
++    def test_start_without_event_loop(self):
++        parent = Mock(name='parent')
++        parent.autoscale = True
++        parent.use_eventloop = False
++        parent.consumer.on_task_message = set()
++        parent.steps = []
++        step = autoscale.WorkerComponent(parent)
++        step.include(parent)
++        step.start(parent)
++        assert (parent.autoscaler.on_task_received in
++                parent.consumer.on_task_message)
++        parent.autoscaler.start.assert_called_once_with()
++
++    def test_start_custom_autoscaler_without_task_callback(self):
++        parent = Mock(name='parent')
++        parent.autoscale = True
++        parent.use_eventloop = False
++        parent.consumer.on_task_message = set()
++        parent.steps = []
++        scaler = Mock(spec=['start'])
++        parent.autoscaler_cls = Mock(return_value=scaler)
++        step = autoscale.WorkerComponent(parent)
++        step.include(parent)
++        step.start(parent)
++        assert not parent.consumer.on_task_message
++        scaler.start.assert_called_once_with()
++
+     def test_register_with_event_loop(self):
+         parent = Mock(name='parent')
+         parent.autoscale = True
+@@ -76,6 +104,57 @@ class test_Autoscaler:
+     def setup_method(self):
+         self.pool = MockPool(3)
+ 
++    def test_task_receipt_does_not_wait_for_pool_resize(self):
++        scaler = autoscale.Autoscaler(self.pool, 10, 3)
++        received = Event()
++
++        def receive_task():
++            scaler.on_task_received(Mock(name='request'))
++            received.set()
++
++        receiver = Thread(target=receive_task)
++        with scaler.mutex:
++            receiver.start()
++            received_while_locked = received.wait(timeout=5)
++        receiver.join(timeout=5)
++        assert received_while_locked
++
++    def test_last_scale_up_in_custom_subclass(self):
++        class Scaler(autoscale.Autoscaler):
++            def scale_up(self, n):
++                self._last_scale_up = autoscale.monotonic()
++                return self._grow(n)
++
++        scaler = Scaler(self.pool, 10, 3, keepalive=30)
++        with patch('celery.worker.autoscale.monotonic', return_value=100):
++            scaler.scale_up(7)
++        with patch('celery.worker.autoscale.monotonic', return_value=131):
++            scaler.scale_down(7)
++        assert self.pool.num_processes == 3
++
++    @pytest.mark.parametrize('use_eventloop', [True, False])
++    def test_keepalive_after_task_received(self, use_eventloop):
++        scaler = autoscale.Autoscaler(self.pool, 10, 3, keepalive=30)
++        req = Mock(name='request')
++        with patch('celery.worker.autoscale.monotonic', return_value=100):
++            scaler.scale_up(7)
++        with patch('celery.worker.autoscale.monotonic', return_value=200):
++            with patch.object(state, 'reserved_requests', [req] * 10):
++                if use_eventloop:
++                    scaler.maybe_scale(req)
++                else:
++                    scaler.on_task_received(req)
++
++        with patch('celery.worker.autoscale.monotonic', return_value=201):
++            scaler.maybe_scale()
++        assert self.pool.num_processes == 10
++        with patch('celery.worker.autoscale.monotonic', return_value=230):
++            scaler.maybe_scale()
++        assert self.pool.num_processes == 10
++        with patch('celery.worker.autoscale.monotonic', return_value=231):
++            scaler.maybe_scale()
++        assert self.pool.num_processes == 3
++
+     def test_stop(self):
+ 
+         class Scaler(autoscale.Autoscaler):

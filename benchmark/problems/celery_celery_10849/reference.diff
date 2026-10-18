@@ -1,0 +1,198 @@
+diff --git a/celery/concurrency/prefork.py b/celery/concurrency/prefork.py
+index d7050b86321..0a38823b35e 100644
+--- a/celery/concurrency/prefork.py
++++ b/celery/concurrency/prefork.py
+@@ -39,6 +39,10 @@
+ logger = get_logger(__name__)
+ warning, debug = logger.warning, logger.debug
+ 
++#: Host name of the worker this pool process belongs to, set by
++#: :func:`process_initializer` for :func:`process_destructor`.
++_process_hostname = None
++
+ 
+ def process_initializer(app, hostname):
+     """Pool child process initializer.
+@@ -91,7 +95,9 @@ def process_initializer(app, hostname):
+                                       app=app)
+     from celery.worker import state as worker_state
+     worker_state.reset_state()
+-    signals.worker_process_init.send(sender=None)
++    global _process_hostname
++    _process_hostname = hostname
++    signals.worker_process_init.send(sender=hostname)
+ 
+ 
+ def process_destructor(pid, exitcode):
+@@ -100,7 +106,7 @@ def process_destructor(pid, exitcode):
+     Dispatch the :signal:`worker_process_shutdown` signal.
+     """
+     signals.worker_process_shutdown.send(
+-        sender=None, pid=pid, exitcode=exitcode,
++        sender=_process_hostname, pid=pid, exitcode=exitcode,
+     )
+ 
+ 
+diff --git a/celery/concurrency/solo.py b/celery/concurrency/solo.py
+index e7e9c7f3ba4..f3a979a2e1d 100644
+--- a/celery/concurrency/solo.py
++++ b/celery/concurrency/solo.py
+@@ -17,7 +17,9 @@ def __init__(self, *args, **kwargs):
+         super().__init__(*args, **kwargs)
+         self.on_apply = apply_target
+         self.limit = 1
+-        signals.worker_process_init.send(sender=None)
++        # The worker passes (app, hostname) as initargs to every pool.
++        initargs = self.options.get('initargs') or (None, None)
++        signals.worker_process_init.send(sender=initargs[1])
+ 
+     def _get_info(self):
+         info = super()._get_info()
+diff --git a/docs/userguide/signals.rst b/docs/userguide/signals.rst
+index 4fd938fa343..6021b225ae4 100644
+--- a/docs/userguide/signals.rst
++++ b/docs/userguide/signals.rst
+@@ -613,7 +613,42 @@ Provides arguments:
+ ``worker_process_init``
+ ~~~~~~~~~~~~~~~~~~~~~~~
+ 
+-Dispatched in all pool child processes when they start.
++Dispatched in each pool process when it starts: in every child process of
++the prefork pool, and once in the main process when a solo pool is created.
++The threads, gevent and eventlet pools don't send it.
++
++The sender is the host name (node name) of the worker the process belongs
++to, the value given to :option:`celery worker -n`, such as
++``worker1@example.com``, as for :signal:`celeryd_init`. Connecting with a
++sender sets up only what that worker needs:
++
++.. code-block:: python
++
++    from celery.signals import worker_process_init
++
++    @worker_process_init.connect(sender='db@example.com')
++    def setup_db_connection(**kwargs):
++        ...
++
++A handler connected without a sender is called for every worker, and can
++check the sender itself:
++
++.. code-block:: python
++
++    from celery.signals import worker_process_init
++
++    @worker_process_init.connect
++    def setup_connections(sender=None, **kwargs):
++        if sender in ('db1@example.com', 'db2@example.com'):
++            ...
++
++.. versionchanged:: 5.7
++
++    The sender used to be :const:`None` in every case; it is now the host
++    name of the worker. A solo pool created directly, outside a worker,
++    still sends :const:`None`. Handlers connected without a sender are
++    unaffected, so only a handler that checks for ``sender is None`` itself
++    needs updating.
+ 
+ Note that handlers attached to this signal mustn't be blocking
+ for more than 4 seconds, or the process will be killed assuming
+@@ -624,7 +659,15 @@ it failed to start.
+ ``worker_process_shutdown``
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+-Dispatched in all pool child processes just before they exit.
++Dispatched in all prefork pool child processes just before they exit.
++
++The sender is the host name of the worker the process belongs to, as for
++:signal:`worker_process_init`, so a handler connected with a sender can
++tear down what the matching :signal:`worker_process_init` handler set up.
++
++.. versionchanged:: 5.7
++
++    The sender used to be :const:`None`.
+ 
+ Note: There's no guarantee that this signal will be dispatched,
+ similarly to :keyword:`finally` blocks it's impossible to guarantee that
+diff --git a/t/unit/concurrency/test_prefork.py b/t/unit/concurrency/test_prefork.py
+index d8924ec8396..dc758f094c9 100644
+--- a/t/unit/concurrency/test_prefork.py
++++ b/t/unit/concurrency/test_prefork.py
+@@ -162,6 +162,7 @@ def test_process_initializer(self, _get_start_method, _signals, set_mp_process_t
+             _signals.reset.assert_any_call(*WORKER_SIGRESET)
+             assert app.loader.init_worker.call_count
+             on_worker_process_init.assert_called()
++            assert on_worker_process_init.call_args.kwargs['sender'] == 'awesome.worker.com'
+             assert _tls.current_app is app
+             set_mp_process_title.assert_called_with(
+                 'celeryd', hostname='awesome.worker.com',
+@@ -230,9 +231,29 @@ def test_pdeath_sig(self, _get_start_method, _set_pdeathsig, set_mp_process_titl
+             process_initializer(app, 'awesome.worker.com')
+         _set_pdeathsig.assert_called_once_with('SIGKILL')
+ 
++    @patch('celery.platforms.set_pdeathsig')
++    @patch('celery.concurrency.prefork.get_start_method', return_value='fork')
++    def test_worker_process_init_sender_is_hostname(self, _get_start_method, _set_pdeathsig,
++                                                    set_mp_process_title, restore_logging):
++        from celery import signals
++        from celery.concurrency.prefork import process_initializer
++        on_db_worker = Mock()
++        signals.worker_process_init.connect(on_db_worker, sender='db@example.com')
++        try:
++            with self.Celery(loader=self.Loader) as app:
++                app.conf = AttributeDict(DEFAULTS)
++                process_initializer(app, 'web@example.com')
++                on_db_worker.assert_not_called()
++                process_initializer(app, 'db@example.com')
++                on_db_worker.assert_called_once()
++                assert mp._process_hostname == 'db@example.com'
++        finally:
++            signals.worker_process_init.disconnect(on_db_worker, sender='db@example.com')
++
+ 
+ class test_process_destructor:
+ 
++    @patch('celery.concurrency.prefork._process_hostname', None)
+     @patch('celery.concurrency.prefork.signals')
+     def test_process_destructor(self, signals):
+         mp.process_destructor(13, -3)
+@@ -240,6 +261,14 @@ def test_process_destructor(self, signals):
+             sender=None, pid=13, exitcode=-3,
+         )
+ 
++    @patch('celery.concurrency.prefork._process_hostname', 'db@example.com')
++    @patch('celery.concurrency.prefork.signals')
++    def test_process_destructor_sender_is_hostname(self, signals):
++        mp.process_destructor(13, 0)
++        signals.worker_process_shutdown.send.assert_called_with(
++            sender='db@example.com', pid=13, exitcode=0,
++        )
++
+ 
+ class MockPool:
+     started = False
+diff --git a/t/unit/concurrency/test_solo.py b/t/unit/concurrency/test_solo.py
+index c26f839a5e5..6fe593e84c0 100644
+--- a/t/unit/concurrency/test_solo.py
++++ b/t/unit/concurrency/test_solo.py
+@@ -29,3 +29,21 @@ def test_on_worker_process_init_called(self):
+         signals.worker_process_init.connect(on_worker_process_init)
+         solo.TaskPool()
+         assert on_worker_process_init.call_count == 1
++
++    def test_on_worker_process_init_sender_is_hostname(self):
++        on_worker_process_init = Mock()
++        signals.worker_process_init.connect(on_worker_process_init)
++        try:
++            solo.TaskPool(initargs=(Mock(), 'solo@example.com'))
++            assert on_worker_process_init.call_args.kwargs['sender'] == 'solo@example.com'
++        finally:
++            signals.worker_process_init.disconnect(on_worker_process_init)
++
++    def test_on_worker_process_init_sender_without_initargs(self):
++        on_worker_process_init = Mock()
++        signals.worker_process_init.connect(on_worker_process_init)
++        try:
++            solo.TaskPool()
++            assert on_worker_process_init.call_args.kwargs['sender'] is None
++        finally:
++            signals.worker_process_init.disconnect(on_worker_process_init)

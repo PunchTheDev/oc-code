@@ -1,0 +1,365 @@
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index 1327c48216e..5b332588032 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -1155,11 +1155,27 @@ def __init__(self, *args, **kwargs):
+         if hasattr(self.key_t, '__func__'):  # pragma: no cover
+             self.key_t = self.key_t.__func__  # remove binding
+         super().__init__(*args, **kwargs)
++        self._chord_expires = self.app.conf.get('result_chord_expires')
+         self._add_global_keyprefix()
+         self._encode_prefixes()
+         if self.implements_incr:
+             self.apply_chord = self._apply_chord_incr
+ 
++    @property
++    def chord_expires(self):
++        if self._chord_expires is None:
++            return self.expires
++        return self.prepare_expires(self._chord_expires, type=int)
++
++    @property
++    def _chord_result_expires(self):
++        # Header results and a saved GroupResult are also read by users, so
++        # never keep them for less than result_expires (0 means no expiry).
++        expires = self.chord_expires
++        if not expires or not self.expires:
++            return 0
++        return max(expires, self.expires)
++
+     def _add_global_keyprefix(self):
+         """
+         This method prepends the global keyprefix to the existing keyprefixes.
+@@ -1381,6 +1397,8 @@ def _apply_chord_incr(self, header_result_args, body, **kwargs):
+         self.ensure_chords_allowed()
+         header_result = self.app.GroupResult(*header_result_args)
+         header_result.save(backend=self)
++        self.expire(self.get_key_for_group(header_result.id),
++                    self._chord_result_expires)
+ 
+     def on_chord_part_return(self, request, state, result, **kwargs):
+         if not self.implements_incr:
+@@ -1449,8 +1467,16 @@ def on_chord_part_return(self, request, state, result, **kwargs):
+             finally:
+                 deps.delete()
+                 self.delete(key)
++                # The chord is done: give the header results back their
++                # normal lifetime.
++                for dep in deps.results:
++                    self.expire(self.get_key_for_task(dep.id), self.expires)
+         else:
+-            self.expire(key, self.expires)
++            self.expire(key, self.chord_expires)
++            # The last part joins every header result, so keep this one too.
++            self.expire(self.get_key_for_group(gid), self._chord_result_expires)
++            self.expire(self.get_key_for_task(request.id),
++                        self._chord_result_expires)
+ 
+ 
+ class KeyValueStoreBackend(BaseKeyValueStoreBackend, SyncBackendMixin):
+diff --git a/celery/backends/cache.py b/celery/backends/cache.py
+index 488270ee4de..25337d1afcb 100644
+--- a/celery/backends/cache.py
++++ b/celery/backends/cache.py
+@@ -5,11 +5,22 @@
+ from celery.exceptions import ImproperlyConfigured
+ from celery.utils import deprecated
+ from celery.utils.functional import LRUCache
++from celery.utils.log import get_logger
+ 
+ from .base import KeyValueStoreBackend
+ 
+ __all__ = ('CacheBackend',)
+ 
++logger = get_logger(__name__)
++
++# Memcached reads a longer expiry as an absolute Unix time.
++MAX_RELATIVE_EXPIRES = 30 * 24 * 60 * 60
++
++W_CHORD_EXPIRES_TOO_LONG = """\
++result_chord_expires is over 30 days, which memcached reads as an absolute \
++time, so chord keys will expire at once.\
++"""
++
+ REQUIRES_BACKEND = """\
+ The Memcached backend requires the 'pymemcache' library. \
+ The 'pylibmc' and 'python-memcached' libraries are no longer used.\
+@@ -208,6 +219,9 @@ def __init__(self, app, expires=None, backend=None,
+             raise ImproperlyConfigured(UNKNOWN_BACKEND.format(
+                 self.backend, ', '.join(backends)))
+         self._encode_prefixes()  # rencode the keyprefixes
++        if (self._chord_expires is not None
++                and self.chord_expires > MAX_RELATIVE_EXPIRES):
++            logger.warning(W_CHORD_EXPIRES_TOO_LONG)
+ 
+     def get(self, key):
+         return self.client.get(key)
+@@ -223,7 +237,7 @@ def delete(self, key):
+ 
+     def _apply_chord_incr(self, header_result_args, body, **kwargs):
+         chord_key = self.get_key_for_chord(header_result_args[0])
+-        self.client.set(chord_key, 0, self.expires or 0)
++        self.client.set(chord_key, 0, self.chord_expires or 0)
+         return super()._apply_chord_incr(
+             header_result_args, body, **kwargs)
+ 
+diff --git a/celery/backends/redis.py b/celery/backends/redis.py
+index 71f560a2f14..db529b60b96 100644
+--- a/celery/backends/redis.py
++++ b/celery/backends/redis.py
+@@ -400,7 +400,6 @@ def __init__(self, host=None, port=None, db=None, password=None,
+                  connection_pool=None, **kwargs):
+         super().__init__(expires_type=int, **kwargs)
+         _get = self.app.conf.get
+-        self._chord_expires = _get('result_chord_expires')
+         failure_expires = _get('result_failure_expires')
+         self.failure_expires = (
+             self.expires if failure_expires is None
+@@ -754,12 +753,6 @@ def _unpack_chord_result(self, tup, decode,
+             raise chord_error
+         return retval
+ 
+-    @property
+-    def chord_expires(self):
+-        if self._chord_expires is None:
+-            return self.expires
+-        return self.prepare_expires(self._chord_expires, type=int)
+-
+     def _set_chord_key(self, key, value):
+         if isinstance(value, str) and len(value) > self._MAX_STR_VALUE_SIZE:
+             raise BackendStoreError('value too large for Redis backend')
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index 49a66656294..3a75eac28ee 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -1091,8 +1091,11 @@ Default: Same as :setting:`result_expires`.
+ 
+ Time (in seconds, or a :class:`~datetime.timedelta` object) a chord's
+ bookkeeping is kept after the chord starts or after one of its header tasks
+-finishes. If it runs out before the next header task finishes, the chord's
+-body never runs, so set it longer than the slowest header task.
++finishes. With the cache backend, each header task's result is also kept that
++long after the task finishes, and never for less than :setting:`result_expires`.
++When the chord finishes, the header results get :setting:`result_expires` back.
++If it runs out before the chord's last header task finishes, the chord's body
++never runs, so set it longer than the chord's total run time.
+ A value of 0 means the chord's bookkeeping never expires while the chord is
+ open, and the saved header of a chord with nested groups never expires.
+ The bookkeeping of a chord that never completes, for example after a lost
+@@ -1100,7 +1103,10 @@ header task, is then never removed.
+ 
+ .. note::
+ 
+-    For the moment this only works with the Redis backend.
++    For the moment this only works with the cache and Redis backends.
++
++    Memcached reads an expiry over 30 days as an absolute time, so keep this
++    setting at 30 days or less with the cache backend.
+ 
+ .. setting:: result_failure_expires
+ 
+diff --git a/t/integration/test_cache_backend.py b/t/integration/test_cache_backend.py
+new file mode 100644
+index 00000000000..706bffe72bf
+--- /dev/null
++++ b/t/integration/test_cache_backend.py
+@@ -0,0 +1,30 @@
++import time
++from types import SimpleNamespace
++
++import pytest
++
++from celery import states, uuid
++from celery.result import AsyncResult, GroupResult
++
++
++@pytest.mark.celery(result_expires=1, result_chord_expires=60)
++def test_chord_expires(app):
++    if not app.conf.result_backend.startswith('cache+memcached'):
++        pytest.skip('Requires memcached cache result backend.')
++
++    backend = app.backend
++    group_id, task_id = uuid(), uuid()
++    header = GroupResult(group_id, [AsyncResult(task_id), AsyncResult(uuid())])
++    request = SimpleNamespace(id=task_id, group=group_id, chord={})
++    try:
++        backend.apply_chord((group_id, header.results), None)
++        backend.store_result(task_id, 1, states.SUCCESS)
++        backend.on_chord_part_return(request, states.SUCCESS, 1)
++        time.sleep(2)
++
++        assert backend.get_task_meta(task_id, cache=False)['result'] == 1
++        assert GroupResult.restore(group_id, backend=backend) == header
++    finally:
++        backend.forget(task_id)
++        backend.delete_group(group_id)
++        backend.delete(backend.get_key_for_chord(group_id))
+diff --git a/t/smoke/tests/test_memcached_backend.py b/t/smoke/tests/test_memcached_backend.py
+index a3cdbac0493..7251f101581 100644
+--- a/t/smoke/tests/test_memcached_backend.py
++++ b/t/smoke/tests/test_memcached_backend.py
+@@ -10,9 +10,9 @@
+ import pytest
+ from pytest_celery import RESULT_TIMEOUT, CeleryBackendCluster, CeleryTestSetup, MemcachedTestBackend
+ 
+-from celery import states
++from celery import Celery, states
+ from celery.canvas import chord, group
+-from t.integration.tasks import add, identity, tsum
++from t.integration.tasks import add, identity, sleeping, tsum
+ 
+ # Larger than the default memcached item size limit (1 MB).
+ TOO_LARGE_RESULT_SIZE = 2 * 1024 * 1024
+@@ -45,3 +45,19 @@ def test_too_large_result_is_not_silently_dropped(self, celery_setup: CeleryTest
+         with pytest.raises(Exception):
+             res.get(timeout=RESULT_TIMEOUT)
+         assert res.state == states.FAILURE
++
++
++class test_memcached_backend_chord_expires:
++    @pytest.fixture
++    def default_worker_app(self, default_worker_app: Celery) -> Celery:
++        app = default_worker_app
++        app.conf.result_expires = 2
++        app.conf.result_chord_expires = 60
++        return app
++
++    def test_chord_outlives_result_expires(self, celery_setup: CeleryTestSetup):
++        queue = celery_setup.worker.worker_queue
++        header = group(sleeping.si(4).set(queue=queue) for _ in range(3))
++        sig = chord(header, identity.s().set(queue=queue))
++        res = sig.apply_async(queue=queue)
++        assert res.get(timeout=RESULT_TIMEOUT) == [None, None, None]
+diff --git a/t/unit/backends/test_base.py b/t/unit/backends/test_base.py
+index 936ba24654b..8c2d0e89928 100644
+--- a/t/unit/backends/test_base.py
++++ b/t/unit/backends/test_base.py
+@@ -1757,6 +1757,7 @@ def callback(result):
+             deps = GR.restore.return_value = Mock(name='DEPS')
+             deps.__len__ = Mock()
+             deps.__len__.return_value = 10
++            deps.results = []
+             b.incr = Mock()
+             b.incr.return_value = 10
+             b.expire = Mock()
+diff --git a/t/unit/backends/test_cache.py b/t/unit/backends/test_cache.py
+index b85132ef553..3e3961046bb 100644
+--- a/t/unit/backends/test_cache.py
++++ b/t/unit/backends/test_cache.py
+@@ -1,7 +1,8 @@
+ import sys
+ import types
+ from contextlib import contextmanager
+-from unittest.mock import Mock, patch
++from datetime import timedelta
++from unittest.mock import Mock, call, patch
+ 
+ import pytest
+ from kombu.utils.encoding import bytes_to_str, ensure_bytes, str_to_bytes
+@@ -85,6 +86,7 @@ def test_on_chord_part_return(self, restore):
+         deps = Mock()
+         deps.__len__ = Mock()
+         deps.__len__.return_value = 2
++        deps.results = []
+         restore.return_value = deps
+         task = Mock()
+         task.name = 'foobarbaz'
+@@ -95,6 +97,7 @@ def test_on_chord_part_return(self, restore):
+             uuid(),
+             [self.app.AsyncResult(uuid()) for _ in range(3)],
+         )
++        task.request.id = uuid()
+         task.request.group = result_args[0]
+         tb.apply_chord(result_args, None)
+ 
+@@ -106,6 +109,74 @@ def test_on_chord_part_return(self, restore):
+         deps.join_native.assert_called_with(propagate=True, timeout=3.0)
+         deps.delete.assert_called_with()
+ 
++    @pytest.mark.parametrize(
++        'result_expires,chord_expires,expected_chord,expected_result', [
++            (100, 600, 600, 600),
++            (86400, 600, 600, 86400),
++            (100, None, 100, 100),
++            (100, 0, 0, 0),
++            (None, 600, 600, 0),
++        ])
++    @patch('celery.result.GroupResult.restore')
++    def test_chord_uses_chord_expires(self, restore, result_expires,
++                                      chord_expires, expected_chord,
++                                      expected_result):
++        self.app.conf.result_expires = result_expires
++        self.app.conf.result_chord_expires = chord_expires
++        tb = CacheBackend(backend='memory://', app=self.app)
++        restore.return_value.__len__ = Mock(return_value=2)
++        task = Mock()
++        task.request.id = uuid()
++        task.request.group = gid = uuid()
++        task.request.chord = {}
++        with patch.object(tb.client, 'set') as client_set, \
++                patch.object(tb, 'expire') as expire:
++            tb.apply_chord((gid, []), None)
++        client_set.assert_any_call(
++            tb.get_key_for_chord(gid), 0, expected_chord or 0)
++        expire.assert_called_once_with(
++            tb.get_key_for_group(gid), expected_result)
++        tb.client.set(tb.get_key_for_chord(gid), 0)
++        with patch.object(tb, 'expire') as expire:
++            tb.on_chord_part_return(task.request, states.SUCCESS, 1)
++        expire.assert_has_calls([
++            call(tb.get_key_for_chord(gid), expected_chord),
++            call(tb.get_key_for_group(gid), expected_result),
++            call(tb.get_key_for_task(task.request.id), expected_result),
++        ])
++
++    @patch('celery.result.GroupResult.restore')
++    def test_on_chord_part_return_resets_header_results(self, restore):
++        self.app.conf.result_expires = 100
++        self.app.conf.result_chord_expires = 0
++        tb = CacheBackend(backend='memory://', app=self.app)
++        task = Mock()
++        task.name = 'foobarbaz'
++        self.app.tasks['foobarbaz'] = task
++        task.request.id = uuid()
++        task.request.group = gid = uuid()
++        task.request.chord = signature(task)
++        header = [self.app.AsyncResult(uuid()) for _ in range(2)]
++        restore.return_value.__len__ = Mock(return_value=1)
++        restore.return_value.results = header
++        tb.client.set(tb.get_key_for_chord(gid), 0)
++        with patch.object(tb, 'expire') as expire:
++            tb.on_chord_part_return(task.request, states.SUCCESS, 1)
++        assert expire.call_args_list == [
++            call(tb.get_key_for_task(result.id), 100) for result in header]
++
++    def test_warns_on_chord_expires_over_30_days(self):
++        self.app.conf.result_chord_expires = timedelta(days=31)
++        with patch('celery.backends.cache.logger') as logger:
++            CacheBackend(backend='memory://', app=self.app)
++        logger.warning.assert_called_once()
++
++    def test_no_warning_on_chord_expires_within_30_days(self):
++        self.app.conf.result_chord_expires = timedelta(days=30)
++        with patch('celery.backends.cache.logger') as logger:
++            CacheBackend(backend='memory://', app=self.app)
++        logger.warning.assert_not_called()
++
+     def test_mget(self):
+         self.tb._set_with_state('foo', 1, states.SUCCESS)
+         self.tb._set_with_state('bar', 2, states.SUCCESS)
+@@ -497,6 +568,7 @@ def test_chord_with_pymemcache_signatures(self, restore):
+ 
+                 deps = Mock()
+                 deps.__len__ = Mock(return_value=2)
++                deps.results = []
+                 restore.return_value = deps
+                 task = Mock()
+                 task.name = 'foobarbaz'
+@@ -507,6 +579,7 @@ def test_chord_with_pymemcache_signatures(self, restore):
+                     uuid(),
+                     [self.app.AsyncResult(uuid()) for _ in range(2)],
+                 )
++                task.request.id = uuid()
+                 task.request.group = result_args[0]
+                 b.apply_chord(result_args, None)
+ 

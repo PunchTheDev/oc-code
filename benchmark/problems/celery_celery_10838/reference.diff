@@ -1,0 +1,161 @@
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index 19837ca74a9..fd9843f5a6b 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -339,6 +339,20 @@ def _fail_chain(self, chain, exc, traceback=None,
+                 if chord_body is not None:
+                     chain_elems.append(chord_body)
+ 
++    def _errback_arity_greater(self, errback, n):
++        header = errback.type.__header__
++        if not errback.immutable and (errback.args or errback.kwargs):
++            try:
++                # Only count remaining arguments; task_id precedes stored args
++                # at invocation, although partial binds them from the left.
++                return arity_greater(
++                    partial(header, *errback.args, **errback.kwargs), n,
++                )
++            except (TypeError, ValueError):
++                # Keep invalid calls isolated by the original classification.
++                return arity_greater(header, n)
++        return arity_greater(header, n)
++
+     def _call_task_errbacks(self, request, exc, traceback):
+         old_signature = []
+         for errback in request.errbacks:
+@@ -358,7 +372,9 @@ def _call_task_errbacks(self, request, exc, traceback):
+                         # workaround to support tasks with bind=True executed as
+                         # link errors. Otherwise, retries can't be used
+                         not isinstance(errback.type.__header__, partial) and
+-                        arity_greater(errback.type.__header__, 1)
++                        # Classify the arguments still supplied by the failure,
++                        # not arguments already stored on a mutable signature.
++                        self._errback_arity_greater(errback, 1)
+                 ):
+                     try:
+                         errback(request, exc, traceback)
+diff --git a/t/integration/tasks.py b/t/integration/tasks.py
+index bd70116cb7a..ac6263c30b3 100644
+--- a/t/integration/tasks.py
++++ b/t/integration/tasks.py
+@@ -506,6 +506,16 @@ def errback_new_style(request, exc, tb):
+     return request.id
+ 
+ 
++@shared_task
++def errback_old_style_with_args(request_id, label):
++    redis_echo(label, redis_key=request_id)
++
++
++@shared_task
++def errback_new_style_with_args(request, exc, tb, label):
++    redis_echo(label, redis_key=request.id)
++
++
+ @shared_task
+ def replaced_with_me():
+     return True
+diff --git a/t/integration/test_canvas.py b/t/integration/test_canvas.py
+index e97c03683fb..62cae8364a0 100644
+--- a/t/integration/test_canvas.py
++++ b/t/integration/test_canvas.py
+@@ -118,6 +118,22 @@ def compare_group_ids_in_redis(redis_key='redis-group-ids'):
+ 
+ 
+ class test_link_error:
++    @pytest.mark.parametrize('make_errback', [
++        lambda: tasks.errback_old_style_with_args.s('stored'),
++        lambda: tasks.errback_old_style_with_args.s(label='stored'),
++        lambda: tasks.errback_new_style_with_args.s('stored'),
++    ], ids=['old-style-args', 'old-style-kwargs', 'new-style-args'])
++    def test_mutable_errback_with_stored_arguments(self, make_errback, manager):
++        if not manager.app.conf.result_backend.startswith('redis'):
++            raise pytest.skip('Requires redis result backend.')
++        fail_sig = fail.s()
++        fail_sig_id = fail_sig.freeze().id
++        get_redis_connection().delete(fail_sig_id)
++        fail_sig.link_error(make_errback())
++        with pytest.raises(ExpectedException):
++            fail_sig.delay().get(timeout=TIMEOUT)
++        await_redis_echo({'stored'}, redis_key=fail_sig_id)
++
+     @flaky
+     def test_link_error_eager(self):
+         exception = ExpectedException("Task expected to fail", "test")
+diff --git a/t/unit/backends/test_base.py b/t/unit/backends/test_base.py
+index 4d2b1f37ef3..a752ff0384a 100644
+--- a/t/unit/backends/test_base.py
++++ b/t/unit/backends/test_base.py
+@@ -656,6 +656,72 @@ def test_mark_as_failure__errback(self):
+         b.mark_as_failure('id', exc, request=request)
+         assert self.errback.last_result == 5
+ 
++    @pytest.mark.parametrize('use_kwargs', [False, True])
++    @pytest.mark.parametrize('eager', [False, True])
++    def test_old_style_errback_with_partial_arguments(self, use_kwargs, eager):
++        calls = []
++
++        @self.app.task(shared=False)
++        def old_errback(task_id, foo, bar, baz):
++            calls.append((task_id, foo, bar, baz))
++
++        self.app.conf.task_always_eager = eager
++        errback = (old_errback.s(foo=1, bar=2, baz=3) if use_kwargs
++                   else old_errback.s(1, 2, 3))
++        request = Context(id='failed-id', root_id='root-id',
++                          errbacks=[errback], delivery_info={})
++        if eager:
++            self.b._call_task_errbacks(request, ValueError(), None)
++            assert calls == [('failed-id', 1, 2, 3)]
++        else:
++            with patch('celery.backends.base.group') as mock_group:
++                self.b._call_task_errbacks(request, ValueError(), None)
++            mock_group.assert_called_once_with([errback], app=self.app)
++            mock_group.return_value.apply_async.assert_called_once_with(
++                ('failed-id',), parent_id='failed-id', root_id='root-id')
++            assert calls == []
++
++    @pytest.mark.parametrize('args,kwargs', [
++        ((1, 2, 3), {}),
++        ((), {'nope': 1}),
++        ((1,), {'task_id': 2}),
++    ])
++    def test_invalid_partial_errback_does_not_halt_other_errbacks(self, args, kwargs):
++        calls = []
++
++        @self.app.task(shared=False)
++        def bad_errback(task_id, foo):
++            raise AssertionError('invalid errback must not execute')
++
++        @self.app.task(shared=False)
++        def other_errback(task_id):
++            calls.append(task_id)
++
++        self.b._store_result = Mock()
++        bad = bad_errback.s(*args, **kwargs)
++        other = other_errback.s()
++        request = Context(id='failed-id', root_id='root-id',
++                          errbacks=[bad, other], delivery_info={})
++        with patch('celery.backends.base.group') as mock_group:
++            self.b.mark_as_failure('failed-id', ValueError(), request=request)
++        # The original header is new-style: a bad call is logged in isolation.
++        mock_group.assert_called_once_with([other], app=self.app)
++        mock_group.return_value.apply_async.assert_called_once_with(
++            ('failed-id',), parent_id='failed-id', root_id='root-id')
++
++    def test_new_style_errback_with_partial_arguments(self):
++        calls = []
++
++        @self.app.task(shared=False)
++        def new_errback(request, exc, traceback, label):
++            calls.append((request, exc, traceback, label))
++
++        request = Context(id='failed-id', errbacks=[new_errback.s('label')],
++                          delivery_info={})
++        exc = ValueError('failed')
++        self.b._call_task_errbacks(request, exc, 'traceback')
++        assert calls == [(request, exc, 'traceback', 'label')]
++
+     @patch('celery.backends.base.group')
+     def test_class_based_task_can_be_used_as_error_callback(self, mock_group):
+         b = BaseBackend(app=self.app)

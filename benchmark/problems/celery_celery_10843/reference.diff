@@ -1,0 +1,337 @@
+diff --git a/celery/app/defaults.py b/celery/app/defaults.py
+index 55f100856f1..cced577a07a 100644
+--- a/celery/app/defaults.py
++++ b/celery/app/defaults.py
+@@ -310,6 +310,7 @@ def __repr__(self):
+         queues=Option(type='dict'),
+         queue_max_priority=Option(None, type='int'),
+         reject_on_worker_lost=Option(type='bool'),
++        retry_on_worker_lost=Option(False, type='bool'),
+         remote_tracebacks=Option(False, type='bool'),
+         repr_maxlevels=Option(3, type='int'),
+         routes=Option(type='any'),
+diff --git a/celery/app/task.py b/celery/app/task.py
+index bd1b6721c36..5afb75c499d 100644
+--- a/celery/app/task.py
++++ b/celery/app/task.py
+@@ -358,6 +358,17 @@ class Task:
+     #: what you're doing.
+     reject_on_worker_lost = None
+ 
++    #: When enabled, a task whose worker process exits abruptly is sent
++    #: again the same way :meth:`retry` would, so :attr:`max_retries` and
++    #: :attr:`default_retry_delay` apply.  Once the retries run out the
++    #: task fails instead of being re-queued.
++    #:
++    #: Takes precedence over :attr:`reject_on_worker_lost`, which is still
++    #: used if sending the retry fails.
++    #: The default is taken from the :setting:`task_retry_on_worker_lost`
++    #: setting.
++    retry_on_worker_lost = None
++
+     #: Tuple of expected exceptions.
+     #:
+     #: These are errors that are expected in normal operation
+@@ -405,6 +416,7 @@ class Task:
+         ('acks_on_failure', 'task_acks_on_failure'),
+         ('acks_on_timeout', 'task_acks_on_timeout'),
+         ('reject_on_worker_lost', 'task_reject_on_worker_lost'),
++        ('retry_on_worker_lost', 'task_retry_on_worker_lost'),
+         ('ignore_result', 'task_ignore_result'),
+         ('store_eager_result', 'task_store_eager_result'),
+         ('store_errors_even_if_ignored', 'task_store_errors_even_if_ignored'),
+diff --git a/celery/worker/request.py b/celery/worker/request.py
+index 3e84353be39..ffcbb3618f3 100644
+--- a/celery/worker/request.py
++++ b/celery/worker/request.py
+@@ -702,14 +702,26 @@ def on_failure(self, exc_info, send_failed_event=True, return_ok=False):
+         elif isinstance(exc, Retry):
+             return self.on_retry(exc_info)
+ 
++        is_worker_lost = isinstance(exc, WorkerLostError)
++        max_retries_exceeded = False
++        if is_worker_lost and self.task.retry_on_worker_lost:
++            max_retries = self.task.max_retries
++            max_retries_exceeded = (
++                max_retries is not None and self._context.retries >= max_retries
++            )
++            # If sending the retry fails, fall through so the message is
++            # still rejected/requeued as it would be without this setting.
++            if not max_retries_exceeded and self._retry_worker_lost(exc, exc_info):
++                return
++
+         # (acks_late) acknowledge after result stored.
+         requeue = False
+-        is_worker_lost = isinstance(exc, WorkerLostError)
+         if self.task.acks_late:
+             is_timeout = isinstance(exc, TimeLimitExceeded)
+             ack_flag = self.task.acks_on_timeout if is_timeout else self.task.acks_on_failure
+             reject = (
+-                (self.task.reject_on_worker_lost and is_worker_lost)
++                (self.task.reject_on_worker_lost and is_worker_lost
++                 and not max_retries_exceeded)
+                 or (is_timeout and not ack_flag)
+             )
+             if reject:
+@@ -761,6 +773,39 @@ def on_failure(self, exc_info, send_failed_event=True, return_ok=False):
+             error('Task handler raised error: %r', exc,
+                   exc_info=exc_info.exc_info)
+ 
++    def _retry_worker_lost(self, exc, exc_info):
++        """Retry the task after its worker was lost, return False if not retried."""
++        task = self.task
++        request = self._context
++        countdown = task.default_retry_delay
++        try:
++            task.signature_from_request(
++                request, countdown=countdown, retries=request.retries + 1,
++            ).apply_async()
++        except Exception as send_exc:
++            error('Failed to retry task %s[%s] after worker was lost: %r',
++                  self.task_name, self.id, send_exc, exc_info=True)
++            return False
++
++        task.backend.mark_as_retry(
++            self.id, exc, exc_info.traceback, request=request,
++        )
++        if task.acks_late:
++            self.acknowledge()
++        self.send_event('task-retried',
++                        exception=safe_repr(exc),
++                        traceback=safe_str(exc_info.traceback))
++
++        reason = Retry(exc=exc, when=countdown)
++        task.request_stack.push(request)
++        try:
++            task.on_retry(exc, self.id, self.args, self.kwargs, exc_info)
++            send_retry(task, request=request, reason=reason, einfo=exc_info)
++        finally:
++            task.request_stack.pop()
++        info('Task %s[%s] retry: %s', self.task_name, self.id, reason)
++        return True
++
+     def _worker_lost_info(self, exc):
+         if isinstance(exc, SystemExit):
+             code = exc.code
+diff --git a/docs/userguide/configuration.rst b/docs/userguide/configuration.rst
+index c187a889a2a..49a66656294 100644
+--- a/docs/userguide/configuration.rst
++++ b/docs/userguide/configuration.rst
+@@ -729,7 +729,43 @@ worker.
+ .. warning::
+ 
+     Enabling this can cause message loops; make sure you know
+-    what you're doing.
++    what you're doing. See :setting:`task_retry_on_worker_lost` for a way
++    to limit how many times a task is sent again.
++
++.. setting:: task_retry_on_worker_lost
++
++``task_retry_on_worker_lost``
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++.. versionadded:: 5.7
++
++Default: Disabled.
++
++When the worker process executing a task exits abruptly (e.g. it's killed
++by the OOM killer), send the task again the same way
++:meth:`Task.retry() <celery.app.task.Task.retry>` would, instead of
++re-queuing the original message. This means
++:attr:`~celery.app.task.Task.max_retries` and
++:attr:`~celery.app.task.Task.default_retry_delay` apply, and once the
++retries run out the task is marked as failed.
++
++This takes precedence over :setting:`task_reject_on_worker_lost`. If
++sending the retry fails, the task falls back to the normal
++:setting:`task_reject_on_worker_lost` behaviour.
++
++A few things to keep in mind:
++
++- The task is sent again after
++  :attr:`~celery.app.task.Task.default_retry_delay` (180 seconds by
++  default), not right away.
++- These retries count towards the same
++  :attr:`~celery.app.task.Task.max_retries` as calls to
++  :meth:`Task.retry() <celery.app.task.Task.retry>` made by the task itself.
++- It also applies when :setting:`task_acks_late` is disabled.
++- It only covers a pool child process dying while the main worker process
++  keeps running. If the whole worker is killed (for example the container
++  is OOM-killed), nothing is left to retry the task, so this setting has
++  no effect.
+ 
+ .. setting:: task_default_rate_limit
+ 
+diff --git a/t/smoke/tasks.py b/t/smoke/tasks.py
+index 93a7aae10cf..c2f240c6131 100644
+--- a/t/smoke/tasks.py
++++ b/t/smoke/tasks.py
+@@ -66,6 +66,12 @@ def self_termination_sigkill():
+     os.kill(os.getpid(), SIGKILL)
+ 
+ 
++@shared_task(default_retry_delay=0, max_retries=2)
++def self_termination_sigkill_with_retries():
++    """Forceful termination, with a limited number of retries."""
++    os.kill(os.getpid(), SIGKILL)
++
++
+ @shared_task
+ def self_termination_system_exit():
+     """Triggers a system exit to simulate a critical stop of the Celery worker."""
+diff --git a/t/smoke/tests/test_tasks.py b/t/smoke/tests/test_tasks.py
+index 86e3a44f019..08bedfe89cc 100644
+--- a/t/smoke/tests/test_tasks.py
++++ b/t/smoke/tests/test_tasks.py
+@@ -9,7 +9,8 @@
+ from t.integration.tasks import add, add_ignore_result, identity
+ from t.smoke.conftest import SuiteOperations, TaskTermination
+ from t.smoke.tasks import (noop, replace_with_task, self_termination_delay_timeout,
+-                           soft_time_limit_lower_than_time_limit, soft_time_limit_must_exceed_time_limit)
++                           self_termination_sigkill_with_retries, soft_time_limit_lower_than_time_limit,
++                           soft_time_limit_must_exceed_time_limit)
+ 
+ 
+ class test_apply_async:
+@@ -123,6 +124,29 @@ def test_terminated_task_logs_correct_error(
+         celery_setup.worker.assert_log_exists(expected_log)
+ 
+ 
++class test_retry_on_worker_lost:
++    @pytest.fixture
++    def default_worker_app(self, default_worker_app: Celery) -> Celery:
++        app = default_worker_app
++        app.conf.worker_prefetch_multiplier = 1
++        app.conf.worker_concurrency = 1
++        app.conf.task_acks_late = True
++        app.conf.task_reject_on_worker_lost = True
++        app.conf.task_retry_on_worker_lost = True
++        return app
++
++    def test_task_fails_when_retries_run_out(self, celery_setup: CeleryTestSetup):
++        worker = celery_setup.worker
++        sig = self_termination_sigkill_with_retries.si().set(queue=worker.worker_queue)
++        res = sig.apply_async()
++
++        with pytest.raises(WorkerLostError):
++            res.get(timeout=RESULT_TIMEOUT)
++
++        assert worker.logs().count(f"{sig.name}[{res.id}] received") == 3
++        assert worker.logs().count(f"{sig.name}[{res.id}] retry:") == 2
++
++
+ class test_replace:
+     @pytest.fixture
+     def celery_worker_cluster(
+diff --git a/t/unit/worker/test_request.py b/t/unit/worker/test_request.py
+index 304df0a52aa..c7465e64f7a 100644
+--- a/t/unit/worker/test_request.py
++++ b/t/unit/worker/test_request.py
+@@ -431,6 +431,107 @@ def test_on_failure_WorkerLostError_rejects_with_requeue(self):
+             req_logger, req.connection_errors, True)
+         req.task.backend.mark_as_failure.assert_not_called()
+ 
++    def _worker_lost_request(self, retries=0):
++        try:
++            raise WorkerLostError()
++        except WorkerLostError:
++            einfo = ExceptionInfo(internal=True)
++
++        req = self.get_request(self.add.s(2, 2).set(retries=retries))
++        req.task.acks_late = True
++        req.task.reject_on_worker_lost = True
++        req.task.retry_on_worker_lost = True
++        req.task.max_retries = 3
++        req.task.backend = Mock()
++        return req, einfo
++
++    def test_on_failure_WorkerLostError_retry_on_worker_lost(self):
++        req, einfo = self._worker_lost_request(retries=1)
++
++        retry_handler = Mock()
++        task_retry.connect(retry_handler)
++        try:
++            with patch('celery.canvas.Signature.apply_async') as apply_async, \
++                    patch.object(req.task, 'on_retry') as on_retry:
++                req.on_failure(einfo)
++        finally:
++            task_retry.disconnect(retry_handler)
++
++        apply_async.assert_called_once()
++        req.on_ack.assert_called_once()
++        req.on_reject.assert_not_called()
++        req.task.backend.mark_as_retry.assert_called_once()
++        req.task.backend.mark_as_failure.assert_not_called()
++        assert any(
++            c.args and c.args[0] == 'task-retried'
++            for c in req.eventer.send.call_args_list
++        )
++        on_retry.assert_called_once()
++        assert isinstance(on_retry.call_args.args[0], WorkerLostError)
++        assert on_retry.call_args.args[1] == req.id
++        retry_handler.assert_called_once()
++        assert isinstance(retry_handler.call_args.kwargs['reason'], Retry)
++
++    def test_on_failure_WorkerLostError_retry_on_worker_lost_options(self):
++        req, einfo = self._worker_lost_request(retries=1)
++        req.task.default_retry_delay = 30
++
++        with patch.object(req.task, 'signature_from_request') as sfr:
++            req.on_failure(einfo)
++
++        _, kwargs = sfr.call_args
++        assert kwargs['retries'] == 2
++        assert kwargs['countdown'] == 30
++        sfr.return_value.apply_async.assert_called_once_with()
++
++    def test_on_failure_WorkerLostError_retry_on_worker_lost_exhausted(self):
++        req, einfo = self._worker_lost_request(retries=3)
++
++        with patch('celery.canvas.Signature.apply_async') as apply_async:
++            req.on_failure(einfo)
++
++        # No retries left: the task fails instead of being re-queued.
++        apply_async.assert_not_called()
++        req.on_reject.assert_not_called()
++        req.on_ack.assert_called_once()
++        req.task.backend.mark_as_failure.assert_called_once()
++
++    def test_on_failure_WorkerLostError_retry_on_worker_lost_send_fails(self):
++        req, einfo = self._worker_lost_request()
++
++        with patch('celery.canvas.Signature.apply_async',
++                   side_effect=ConnectionError('broker down')):
++            req.on_failure(einfo)
++
++        # Falls back to reject_on_worker_lost, so the task isn't lost.
++        req.on_reject.assert_called_with(
++            req_logger, req.connection_errors, True)
++        req.task.backend.mark_as_retry.assert_not_called()
++        req.task.backend.mark_as_failure.assert_not_called()
++
++    def test_on_failure_WorkerLostError_retry_on_worker_lost_send_fails_no_reject(self):
++        req, einfo = self._worker_lost_request()
++        req.task.reject_on_worker_lost = False
++
++        with patch('celery.canvas.Signature.apply_async',
++                   side_effect=ConnectionError('broker down')):
++            req.on_failure(einfo)
++
++        req.on_reject.assert_not_called()
++        req.task.backend.mark_as_retry.assert_not_called()
++        req.task.backend.mark_as_failure.assert_called_once()
++
++    def test_on_failure_WorkerLostError_retry_on_worker_lost_no_acks_late(self):
++        req, einfo = self._worker_lost_request()
++        req.task.acks_late = False
++
++        with patch('celery.canvas.Signature.apply_async') as apply_async:
++            req.on_failure(einfo)
++
++        apply_async.assert_called_once()
++        req.on_ack.assert_not_called()
++        req.task.backend.mark_as_failure.assert_not_called()
++
+     def test_on_failure_WorkerLostError_redelivered_None(self):
+         try:
+             raise WorkerLostError()

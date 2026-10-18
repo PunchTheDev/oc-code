@@ -1,0 +1,460 @@
+diff --git a/celery/app/utils.py b/celery/app/utils.py
+index ddbebd1472a..6039873ff74 100644
+--- a/celery/app/utils.py
++++ b/celery/app/utils.py
+@@ -335,6 +335,40 @@ def _unpickle_app_v2(cls, kwargs):
+     return cls(**kwargs)
+ 
+ 
++def _redact_azure_connection_string(connection_string, mask='**'):
++    """Redact sensitive credentials in Azure Storage connection strings.
++
++    Azure connection strings use semicolon-separated key=value pairs.
++    This function redacts known secret keys while preserving other fields.
++
++    Args:
++        connection_string: The Azure connection string to redact.
++        mask: The mask string to replace secrets with (default: '**').
++
++    Returns:
++        The redacted connection string with AccountKey and SharedAccessSignature
++        values replaced by the mask.
++    """
++    # Azure matches connection string keys case-insensitively
++    secret_keys = {'accountkey', 'sharedaccesssignature'}
++    redacted_parts = []
++    for part in connection_string.split(';'):
++        key, sep, value = part.partition('=')
++        if sep and key.strip().lower() in secret_keys:
++            # Redact the entire value of secret keys
++            part = f'{key}={mask}'
++        else:
++            # Redact sig parameters in endpoint URLs (case-insensitive)
++            # Pattern: (?|&)sig=VALUE, preserving the parameter name and separator
++            if value:
++                # Use case-insensitive regex to find and redact sig parameters
++                value = re.sub(r'([?&]sig=)[^&;#]*', r'\1' + mask, value, flags=re.IGNORECASE)
++                part = f'{key}={value}'
++        redacted_parts.append(part)
++
++    return ';'.join(redacted_parts)
++
++
+ def sanitize_url(url, mask='*' * 8):
+     """Sanitize URL, masking passwords.
+ 
+@@ -345,6 +379,7 @@ def sanitize_url(url, mask='*' * 8):
+     - Redis Sentinel multi-node URLs (e.g. ``sentinel://:secret@h1:26379;sentinel://:secret@h2:26379/0``
+       or ``sentinel://:secret@h1:26379;h2:26379/0``)
+     - URLs with query strings containing semicolons (e.g. ``redis://user:secret@localhost:6379?a=1;b=2``)
++    - Azure Storage connection strings (e.g. ``azureblockblob://AccountKey=SECRET;...``)
+ 
+     Fails closed on malformed URLs to prevent credential leakage.
+     """
+@@ -368,6 +403,15 @@ def _mask_uinfo(uinfo):
+ 
+         scheme, _, rest = url.partition('://')
+ 
++        # Azure connection strings use semicolon-separated key=value pairs
++        # Handle them specially before generic URL parsing
++        if scheme == 'azureblockblob':
++            # For Azure, treat the entire remainder as the connection string
++            # Azure connection strings can contain ? and # within SAS tokens or endpoint URLs
++            # so we must not split at these characters
++            redacted_connection_string = _redact_azure_connection_string(rest, mask=mask)
++            return f'{scheme}://{redacted_connection_string}'
++
+         # Separate authority from path/query/fragment
+         idx = len(rest)
+         for sep in ('/', '?', '#'):
+diff --git a/celery/backends/azureblockblob.py b/celery/backends/azureblockblob.py
+index 3ab0a9fc8e6..9560a5d564c 100644
+--- a/celery/backends/azureblockblob.py
++++ b/celery/backends/azureblockblob.py
+@@ -3,6 +3,7 @@
+ from kombu.utils import cached_property
+ from kombu.utils.encoding import bytes_to_str
+ 
++from celery.app.utils import _redact_azure_connection_string
+ from celery.exceptions import ImproperlyConfigured
+ from celery.utils.log import get_logger
+ 
+@@ -188,17 +189,12 @@ def as_uri(self, include_password=False):
+                 f'{self._connection_string}'
+             )
+ 
+-        # Azure matches connection string keys case-insensitively, and a
+-        # SharedAccessSignature is as much a secret as an AccountKey.
+-        secret_keys = {'accountkey', 'sharedaccesssignature'}
+-        redacted_connection_string_parts = []
+-        for part in self._connection_string.split(';'):
+-            key, sep, _ = part.partition('=')
+-            if sep and key.strip().lower() in secret_keys:
+-                part = f'{key}=**'
+-            redacted_connection_string_parts.append(part)
++        # Use shared helper to redact Azure connection string secrets
++        redacted_connection_string = _redact_azure_connection_string(
++            self._connection_string, mask='**'
++        )
+ 
+         return (
+             f'{AZURE_BLOCK_BLOB_CONNECTION_PREFIX}'
+-            f'{";".join(redacted_connection_string_parts)}'
++            f'{redacted_connection_string}'
+         )
+diff --git a/t/unit/app/test_utils.py b/t/unit/app/test_utils.py
+index 72faa58dd64..d5507b440f2 100644
+--- a/t/unit/app/test_utils.py
++++ b/t/unit/app/test_utils.py
+@@ -127,6 +127,76 @@ def test_censors_multiserver_backend_url(self):
+         assert 'user:********@172.19.26.240:11211' in censored['result_backend']
+         assert 'user:********@172.19.26.242:11211' in censored['result_backend']
+ 
++    def test_censors_azure_account_key_in_backend_url(self):
++        conf = {
++            'result_backend': (
++                'azureblockblob://'
++                'DefaultEndpointsProtocol=https;'
++                'AccountName=acct;'
++                'AccountKey=SECRET==;'
++                'EndpointSuffix=core.windows.net'
++            ),
++        }
++        censored = filter_hidden_settings(conf)
++        assert 'SECRET==' not in censored['result_backend']
++        assert 'AccountKey=********' in censored['result_backend']
++
++    def test_censors_azure_shared_access_signature_in_backend_url(self):
++        conf = {
++            'result_backend': (
++                'azureblockblob://'
++                'BlobEndpoint=https://name.blob.core.windows.net/;'
++                'SharedAccessSignature=sv=2022-11-02&sig=signature'
++            ),
++        }
++        censored = filter_hidden_settings(conf)
++        assert 'signature' not in censored['result_backend']
++        assert 'SharedAccessSignature=********' in censored['result_backend']
++
++    def test_censors_azure_sas_token_beginning_with_question_mark(self):
++        """Test that SAS tokens beginning with ? are fully redacted in filter_hidden_settings."""
++        conf = {
++            'result_backend': (
++                'azureblockblob://'
++                'DefaultEndpointsProtocol=https;'
++                'AccountName=acct;'
++                'SharedAccessSignature=?sv=2022-11-02&sig=SECRET'
++            ),
++        }
++        censored = filter_hidden_settings(conf)
++        assert 'SECRET' not in censored['result_backend']
++        assert 'sv=2022-11-02' not in censored['result_backend']
++        assert 'SharedAccessSignature=********' in censored['result_backend']
++
++    def test_censors_azure_sas_signature_in_blob_endpoint(self):
++        """Test that sig parameters in BlobEndpoint are redacted in filter_hidden_settings."""
++        conf = {
++            'result_backend': (
++                'azureblockblob://'
++                'BlobEndpoint=https://acct.blob.core.windows.net/?sv=2022-11-02&sig=SECRET;'
++                'AccountName=acct'
++            ),
++        }
++        censored = filter_hidden_settings(conf)
++        assert 'SECRET' not in censored['result_backend']
++        assert 'sig=********' in censored['result_backend']
++        assert 'sv=2022-11-02' in censored['result_backend']
++
++    def test_censors_azure_account_key_containing_hash(self):
++        """Test that AccountKey values containing # are fully redacted in filter_hidden_settings."""
++        conf = {
++            'result_backend': (
++                'azureblockblob://'
++                'AccountName=acct;'
++                'AccountKey=SEC#RET;'
++                'EndpointSuffix=core.windows.net'
++            ),
++        }
++        censored = filter_hidden_settings(conf)
++        assert 'SEC#RET' not in censored['result_backend']
++        assert 'RET' not in censored['result_backend']
++        assert 'AccountKey=********' in censored['result_backend']
++
+ 
+ class test_bugreport:
+ 
+@@ -169,6 +239,66 @@ def test_bugreport_with_redis_password_containing_both_comma_and_at(self):
+         assert 'p,a@ss' not in report_user
+         assert 'redis://user:********@localhost:6379/0' in report_user
+ 
++    def test_bugreport_with_azure_account_key(self):
++        self.app.conf.result_backend = (
++            'azureblockblob://'
++            'DefaultEndpointsProtocol=https;'
++            'AccountName=acct;'
++            'AccountKey=SECRET==;'
++            'EndpointSuffix=core.windows.net'
++        )
++        report = bugreport(self.app)
++        assert 'SECRET==' not in report
++        assert 'AccountKey=********' in report
++
++    def test_bugreport_with_azure_shared_access_signature(self):
++        self.app.conf.result_backend = (
++            'azureblockblob://'
++            'BlobEndpoint=https://name.blob.core.windows.net/;'
++            'SharedAccessSignature=sv=2022-11-02&sig=signature'
++        )
++        report = bugreport(self.app)
++        assert 'signature' not in report
++        assert 'SharedAccessSignature=********' in report
++
++    def test_bugreport_with_azure_sas_token_beginning_with_question_mark(self):
++        """Test that SAS tokens beginning with ? are fully redacted in bugreport."""
++        self.app.conf.result_backend = (
++            'azureblockblob://'
++            'DefaultEndpointsProtocol=https;'
++            'AccountName=acct;'
++            'SharedAccessSignature=?sv=2022-11-02&sig=SECRET'
++        )
++        report = bugreport(self.app)
++        assert 'SECRET' not in report
++        assert 'sv=2022-11-02' not in report
++        assert 'SharedAccessSignature=********' in report
++
++    def test_bugreport_with_azure_sas_signature_in_blob_endpoint(self):
++        """Test that sig parameters in BlobEndpoint are redacted in bugreport."""
++        self.app.conf.result_backend = (
++            'azureblockblob://'
++            'BlobEndpoint=https://acct.blob.core.windows.net/?sv=2022-11-02&sig=SECRET;'
++            'AccountName=acct'
++        )
++        report = bugreport(self.app)
++        assert 'SECRET' not in report
++        assert 'sig=********' in report
++        assert 'sv=2022-11-02' in report
++
++    def test_bugreport_with_azure_account_key_containing_hash(self):
++        """Test that AccountKey values containing # are fully redacted in bugreport."""
++        self.app.conf.result_backend = (
++            'azureblockblob://'
++            'AccountName=acct;'
++            'AccountKey=SEC#RET;'
++            'EndpointSuffix=core.windows.net'
++        )
++        report = bugreport(self.app)
++        assert 'SEC#RET' not in report
++        assert 'RET' not in report
++        assert 'AccountKey=********' in report
++
+ 
+ class test_sanitize_url:
+ 
+@@ -296,3 +426,119 @@ def test_sentinel_mixed_auth_with_empty_chunk(self):
+         url = 'sentinel://u1:p1@h1:26379;;h2:26379;u3:p3@h3:26379/0'
+         expected = 'sentinel://u1:********@h1:26379;h2:26379;u3:********@h3:26379/0'
+         assert sanitize_url(url) == expected
++
++    def test_azure_connection_string_account_key_redaction(self):
++        url = (
++            'azureblockblob://'
++            'DefaultEndpointsProtocol=https;'
++            'AccountName=acct;'
++            'AccountKey=SECRET==;'
++            'EndpointSuffix=core.windows.net'
++        )
++        sanitized = sanitize_url(url)
++        assert 'SECRET==' not in sanitized
++        assert 'AccountName=acct' in sanitized
++        assert 'EndpointSuffix=core.windows.net' in sanitized
++        assert 'AccountKey=********' in sanitized
++
++    def test_azure_connection_string_shared_access_signature_redaction(self):
++        url = (
++            'azureblockblob://'
++            'BlobEndpoint=https://name.blob.core.windows.net/;'
++            'SharedAccessSignature=sv=2022-11-02&sig=signature'
++        )
++        sanitized = sanitize_url(url)
++        assert 'signature' not in sanitized
++        assert 'SharedAccessSignature=********' in sanitized
++        assert 'BlobEndpoint=https://name.blob.core.windows.net/' in sanitized
++
++    def test_azure_connection_string_case_insensitive_key(self):
++        url = (
++            'azureblockblob://'
++            'AccountName=name;'
++            'accountkey=SECRET'
++        )
++        sanitized = sanitize_url(url)
++        assert 'SECRET' not in sanitized
++        assert 'accountkey=********' in sanitized
++
++    def test_azure_connection_string_uppercase_key(self):
++        url = (
++            'azureblockblob://'
++            'AccountName=name;'
++            'ACCOUNTKEY=SECRET'
++        )
++        sanitized = sanitize_url(url)
++        assert 'SECRET' not in sanitized
++        assert 'ACCOUNTKEY=********' in sanitized
++
++    def test_azure_sas_token_beginning_with_question_mark(self):
++        """Test that SAS tokens beginning with ? are fully redacted."""
++        url = (
++            'azureblockblob://'
++            'DefaultEndpointsProtocol=https;'
++            'AccountName=acct;'
++            'SharedAccessSignature=?sv=2022-11-02&sig=SECRET'
++        )
++        sanitized = sanitize_url(url)
++        assert 'SECRET' not in sanitized
++        assert 'sv=2022-11-02' not in sanitized
++        assert 'sig=SECRET' not in sanitized
++        assert 'SharedAccessSignature=********' in sanitized
++        assert 'AccountName=acct' in sanitized
++
++    def test_azure_sas_signature_in_blob_endpoint(self):
++        """Test that sig parameters in BlobEndpoint URLs are redacted."""
++        url = (
++            'azureblockblob://'
++            'BlobEndpoint=https://acct.blob.core.windows.net/?sv=2022-11-02&sig=SECRET;'
++            'AccountName=acct'
++        )
++        sanitized = sanitize_url(url)
++        assert 'SECRET' not in sanitized
++        assert 'sig=********' in sanitized
++        assert 'sv=2022-11-02' in sanitized
++        assert 'BlobEndpoint=https://acct.blob.core.windows.net/' in sanitized
++        assert 'AccountName=acct' in sanitized
++
++    def test_azure_account_key_containing_hash(self):
++        """Test that AccountKey values containing # are fully redacted."""
++        url = (
++            'azureblockblob://'
++            'AccountName=acct;'
++            'AccountKey=SEC#RET;'
++            'EndpointSuffix=core.windows.net'
++        )
++        sanitized = sanitize_url(url)
++        assert 'SEC#RET' not in sanitized
++        assert 'RET' not in sanitized
++        assert 'AccountKey=********' in sanitized
++        assert 'AccountName=acct' in sanitized
++        assert 'EndpointSuffix=core.windows.net' in sanitized
++
++    def test_azure_case_insensitive_signature_parameter(self):
++        """Test that sig parameter is redacted case-insensitively."""
++        url = (
++            'azureblockblob://'
++            'BlobEndpoint=https://acct.blob.core.windows.net/?SIG=SECRET;'
++            'AccountName=acct'
++        )
++        sanitized = sanitize_url(url)
++        assert 'SECRET' not in sanitized
++        assert 'SIG=********' in sanitized
++        assert 'BlobEndpoint=https://acct.blob.core.windows.net/' in sanitized
++
++    def test_azure_multiple_query_parameters_in_endpoint(self):
++        """Test that unrelated query parameters are preserved while sig is redacted."""
++        url = (
++            'azureblockblob://'
++            'BlobEndpoint=https://acct.blob.core.windows.net/?sv=version&sig=SECRET&comp=list;'
++            'AccountName=acct'
++        )
++        sanitized = sanitize_url(url)
++        assert 'SECRET' not in sanitized
++        assert 'sig=********' in sanitized
++        assert 'sv=version' in sanitized
++        assert 'comp=list' in sanitized
++        assert 'BlobEndpoint=https://acct.blob.core.windows.net/' in sanitized
++        assert 'AccountName=acct' in sanitized
+diff --git a/t/unit/backends/test_azureblockblob.py b/t/unit/backends/test_azureblockblob.py
+index a5b1ecbae80..8eba4ee678b 100644
+--- a/t/unit/backends/test_azureblockblob.py
++++ b/t/unit/backends/test_azureblockblob.py
+@@ -305,3 +305,83 @@ def test_as_uri_exclude_password_case_insensitive_key(self):
+             "AccountName=name;"
+             "accountkey=**"
+         )
++
++    def test_as_uri_exclude_sas_token_beginning_with_question_mark(self):
++        """Test that SAS tokens beginning with ? are fully redacted."""
++        backend = AzureBlockBlobBackend(
++            app=self.app,
++            url=(
++                "azureblockblob://"
++                "DefaultEndpointsProtocol=https;"
++                "AccountName=acct;"
++                "SharedAccessSignature=?sv=2022-11-02&sig=SECRET"
++            )
++        )
++        result = backend.as_uri(include_password=False)
++        assert "SECRET" not in result
++        assert "sv=2022-11-02" not in result
++        assert "SharedAccessSignature=**" in result
++        assert "AccountName=acct" in result
++
++    def test_as_uri_exclude_sas_signature_in_blob_endpoint(self):
++        """Test that sig parameters in BlobEndpoint URLs are redacted."""
++        backend = AzureBlockBlobBackend(
++            app=self.app,
++            url=(
++                "azureblockblob://"
++                "BlobEndpoint=https://acct.blob.core.windows.net/?sv=2022-11-02&sig=SECRET;"
++                "AccountName=acct"
++            )
++        )
++        result = backend.as_uri(include_password=False)
++        assert "SECRET" not in result
++        assert "sig=**" in result
++        assert "sv=2022-11-02" in result
++        assert "BlobEndpoint=https://acct.blob.core.windows.net/" in result
++
++    def test_as_uri_exclude_account_key_containing_hash(self):
++        """Test that AccountKey values containing # are fully redacted."""
++        backend = AzureBlockBlobBackend(
++            app=self.app,
++            url=(
++                "azureblockblob://"
++                "AccountName=acct;"
++                "AccountKey=SEC#RET;"
++                "EndpointSuffix=core.windows.net"
++            )
++        )
++        result = backend.as_uri(include_password=False)
++        assert "SEC#RET" not in result
++        assert "RET" not in result
++        assert "AccountKey=**" in result
++        assert "AccountName=acct" in result
++
++    def test_as_uri_case_insensitive_signature_parameter(self):
++        """Test that sig parameter is redacted case-insensitively."""
++        backend = AzureBlockBlobBackend(
++            app=self.app,
++            url=(
++                "azureblockblob://"
++                "BlobEndpoint=https://acct.blob.core.windows.net/?SIG=SECRET;"
++                "AccountName=acct"
++            )
++        )
++        result = backend.as_uri(include_password=False)
++        assert "SECRET" not in result
++        assert "SIG=**" in result
++
++    def test_as_uri_multiple_query_parameters_in_endpoint(self):
++        """Test that unrelated query parameters are preserved while sig is redacted."""
++        backend = AzureBlockBlobBackend(
++            app=self.app,
++            url=(
++                "azureblockblob://"
++                "BlobEndpoint=https://acct.blob.core.windows.net/?sv=version&sig=SECRET&comp=list;"
++                "AccountName=acct"
++            )
++        )
++        result = backend.as_uri(include_password=False)
++        assert "SECRET" not in result
++        assert "sig=**" in result
++        assert "sv=version" in result
++        assert "comp=list" in result

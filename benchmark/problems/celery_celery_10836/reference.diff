@@ -1,0 +1,172 @@
+diff --git a/celery/backends/base.py b/celery/backends/base.py
+index 61c066b87ce..19837ca74a9 100644
+--- a/celery/backends/base.py
++++ b/celery/backends/base.py
+@@ -298,7 +298,11 @@ def _fail_chain(self, chain, exc, traceback=None,
+             chain_elem_ctx.update(chain_elem_ctx.options)
+             chain_elem_ctx.id = chain_elem_ctx.options.get('task_id')
+             chain_elem_ctx.group = chain_elem_ctx.options.get('group_id')
++            # Only check state for chord members to avoid requiring a result backend
++            # for ordinary chains. The already_failed check is only used when
++            # calling on_chord_part_return() for chord members below.
+             already_failed = (
++                'chord' in chain_elem_ctx.options and
+                 chain_elem_ctx.id is not None and
+                 self.get_state(chain_elem_ctx.id) in states.PROPAGATE_STATES
+             )
+diff --git a/t/smoke/tests/test_disabled_backend.py b/t/smoke/tests/test_disabled_backend.py
+new file mode 100644
+index 00000000000..256398b60f0
+--- /dev/null
++++ b/t/smoke/tests/test_disabled_backend.py
+@@ -0,0 +1,85 @@
++"""Smoke test for DisabledBackend chain failure handling.
++
++Regression test for issue where _fail_chain() called get_state() for plain chain
++elements, causing NotImplementedError with DisabledBackend.
++"""
++
++from __future__ import annotations
++
++import uuid
++from time import monotonic, sleep
++
++import pytest
++from pytest_celery import RESULT_TIMEOUT, CeleryTestSetup
++
++from celery.canvas import chain
++from t.integration.conftest import get_redis_connection
++from t.integration.tasks import fail, identity, redis_echo
++
++
++@pytest.fixture
++def celery_backend_cluster() -> None:
++    """No backend cluster needed for DisabledBackend."""
++    return None
++
++
++@pytest.fixture
++def celery_setup_config(celery_setup_config: dict) -> dict:
++    """Disable result backend for testing DisabledBackend behavior.
++
++    Configures the client-side app to use DisabledBackend.
++    """
++    celery_setup_config["result_backend"] = "disabled://"
++    return celery_setup_config
++
++
++@pytest.fixture
++def default_worker_app(default_worker_app) -> object:
++    """Configure worker to use DisabledBackend.
++
++    Direct attribute assignment lands in conf.changes, which is what
++    pytest-celery serializes into the worker container config; the
++    celery_setup_config dict alone only configures the client side.
++    """
++    default_worker_app.conf.result_backend = "disabled://"
++    return default_worker_app
++
++
++class test_disabled_backend:
++    def test_chain_failure_with_disabled_backend(self, celery_setup: CeleryTestSetup):
++        """Regression test: plain chain failure with DisabledBackend can execute link_error callback.
++
++        Verifies that when a plain chain fails with DisabledBackend, the link_error
++        callback is still called, proving _fail_chain() doesn't raise NotImplementedError.
++        """
++        redis_key = str(uuid.uuid4())
++        queue = celery_setup.worker.worker_queue
++
++        # Create a chain where the first (non-final) task fails
++        sig = chain(
++            fail.si().set(queue=queue),
++            identity.si("should_not_run").set(queue=queue),
++        )
++
++        # Add a link_error callback that writes to Redis
++        errback_msg = "failure_handled"
++        sig.link_error(redis_echo.si(errback_msg, redis_key).set(queue=queue))
++
++        # Apply the chain (res.get() is not used because DisabledBackend raises NotImplementedError)
++        sig.apply_async()
++
++        # Wait for the worker to process and the callback to execute
++        redis_connection = get_redis_connection()
++        deadline = monotonic() + RESULT_TIMEOUT
++        actual = []
++
++        try:
++            while monotonic() < deadline:
++                actual = redis_connection.lrange(redis_key, 0, -1)
++                if actual:
++                    break
++                sleep(0.1)
++
++            assert actual == [b"failure_handled"]
++        finally:
++            redis_connection.delete(redis_key)
+diff --git a/t/unit/backends/test_base.py b/t/unit/backends/test_base.py
+index 7c39b67c608..4d2b1f37ef3 100644
+--- a/t/unit/backends/test_base.py
++++ b/t/unit/backends/test_base.py
+@@ -832,6 +832,33 @@ def test_fail_chain_skips_a_chord_without_a_body(self):
+ 
+         store_result.assert_not_called()
+ 
++    def test_fail_chain_does_not_call_get_state_for_plain_chain(self):
++        """Regression test for issue where _fail_chain called get_state()
++        for ordinary chain elements, causing NotImplementedError with DisabledBackend."""
++        # Plain chain element without chord option
++        after = signature('after', options={'task_id': 'after-id'})
++
++        with patch.object(self.b, 'store_result'), \
++                patch.object(self.b, 'get_state') as get_state:
++            self.b._fail_chain([after], ValueError('boom failed'))
++
++        # get_state should not be called for plain chain elements
++        get_state.assert_not_called()
++
++    def test_fail_chain_calls_get_state_for_chord_member(self):
++        """Ensure chord members still perform state lookup for duplicate failure protection."""
++        # Chord member has 'chord' in options
++        options = {'task_id': 'member-id', 'chord': signature('outer'), 'group_id': 'gid'}
++        member = signature('member', options=options)
++
++        with patch.object(self.b, 'store_result'), \
++                patch.object(self.b, 'get_state', return_value=states.PENDING) as get_state, \
++                patch.object(self.b, 'on_chord_part_return'):
++            self.b._fail_chain([member], ValueError('header failed'))
++
++        # get_state should be called for chord members
++        get_state.assert_called_once_with('member-id')
++
+     def test_chord_error_from_stack_resolves_the_current_exception_for_the_chain(self):
+         after = signature('after', options={'task_id': 'after-id'})
+         callback = signature('body', options={'task_id': 'body-id', 'chain': [after]})
+@@ -1988,6 +2015,26 @@ def test_chain_with_chord_raises_error(self):
+              group(self.add.s(2, 2),
+                    self.add.s(5, 6)) | self.add.s()).delay()
+ 
++    def test_fail_chain_with_plain_chain(self):
++        """Regression test: _fail_chain should work with DisabledBackend for plain chains."""
++        backend = DisabledBackend(self.app)
++        # Plain chain element without chord option
++        after = signature('after', options={'task_id': 'after-id'})
++
++        # Should not raise NotImplementedError
++        backend._fail_chain([after], ValueError('boom failed'))
++
++    def test_fail_chain_with_chord_member_raises(self):
++        """Chord members still require a result backend."""
++        backend = DisabledBackend(self.app)
++        # Chord member has 'chord' in options
++        options = {'task_id': 'member-id', 'chord': signature('outer'), 'group_id': 'gid'}
++        member = signature('member', options=options)
++
++        # Should raise NotImplementedError for chord members
++        with pytest.raises(NotImplementedError):
++            backend._fail_chain([member], ValueError('header failed'))
++
+ 
+ class test_as_uri:
+ 
